@@ -167,6 +167,7 @@ fn inventories(with_digests: bool) -> (LocalInventory, RemoteInventory) {
         LocalInventory {
             root: source,
             entries: local,
+            skipped: Vec::new(),
         },
         RemoteInventory {
             root_exists: true,

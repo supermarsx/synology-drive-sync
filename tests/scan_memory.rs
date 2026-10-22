@@ -134,6 +134,7 @@ fn local_inventory(count: usize) -> LocalInventory {
     LocalInventory {
         root: source,
         entries,
+        skipped: Vec::new(),
     }
 }
 

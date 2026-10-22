@@ -29,6 +29,7 @@ fn public_planner_rejects_equal_md5_and_crc32_when_sha256_differs() {
                 content_md5: Some(local_fingerprint),
             },
         )]),
+        skipped: Vec::new(),
     };
     let remote = RemoteInventory {
         root_exists: true,

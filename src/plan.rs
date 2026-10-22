@@ -1,11 +1,15 @@
+use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::PathBuf;
 
 use crate::api::{RemoteEntry, RemoteInventory};
 use crate::cancel::CancellationToken;
 use crate::integrity::{ContentMatch, ContentMd5};
-use crate::local::{EntryKind, IgnoreRules, LocalEntry, LocalInventory};
-use crate::path::{RemoteRoot, depth, is_dsm_managed, validate_relative};
+use crate::local::{
+    EntryKind, IgnoreRules, LocalEntry, LocalInventory, SkipReason, SkippedEntry,
+    fold_has_ancestor_in,
+};
+use crate::path::{RemoteRoot, depth, is_dsm_managed, nfc, portable_fold, validate_relative};
 use crate::{Error, Result};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -211,6 +215,12 @@ pub struct UploadAction {
     pub local: LocalEntry,
     pub remote_path: String,
     pub reason: ChangeReason,
+    /// What the destination held at plan time, when this upload overwrites a file.
+    ///
+    /// `None` when nothing was there (or a directory that a pre-delete removes first). The executor
+    /// re-checks it immediately before writing, so an upload never overwrites a remote file that
+    /// changed after the plan compared it.
+    pub expected_remote: Option<RemoteSnapshot>,
 }
 
 #[derive(Clone, Debug)]
@@ -288,6 +298,12 @@ pub struct SyncPlan {
     pub unchanged_files: usize,
     pub protected_entries: usize,
     pub upload_bytes: u64,
+    /// Paths this plan neither carries nor deletes, and why, sorted by path.
+    ///
+    /// The local walk's skips, plus the spelling conflicts the planner could not resolve. Each one
+    /// used to fail the whole run; now only its own path is left alone, on both sides, and the run
+    /// reports it.
+    pub skipped: Vec<SkippedEntry>,
 }
 
 impl SyncPlan {
@@ -327,14 +343,16 @@ pub fn select_deletion_guard_hashes(
     remote: &RemoteInventory,
     rules: &IgnoreRules,
 ) -> BTreeSet<String> {
+    let pairs = Correspondence::build(local, remote);
     let mut selected = BTreeSet::new();
     for entry in remote.entries.values() {
-        if entry.kind != EntryKind::File || is_protected(entry, rules) {
+        // An empty file's content is known without reading it, so its deletion is guarded by its
+        // size alone. See `deletion_snapshot`.
+        if entry.kind != EntryKind::File || entry.size == 0 || is_protected(entry, rules) {
             continue;
         }
-        let is_delete_candidate = local
-            .entries
-            .get(&entry.relative)
+        let is_delete_candidate = pairs
+            .local_of(local, &entry.relative)
             .is_none_or(|local_entry| local_entry.kind != EntryKind::File);
         if is_delete_candidate {
             selected.insert(entry.relative.clone());
@@ -358,17 +376,21 @@ pub fn select_comparison_remote_digests(
     remote: &RemoteInventory,
     rules: &IgnoreRules,
 ) -> BTreeSet<String> {
+    let pairs = Correspondence::build(local, remote);
     let mut selected = BTreeSet::new();
     for local_entry in local.entries.values() {
-        if local_entry.kind != EntryKind::File {
+        // Two empty files are identical by definition, so `compare_files` never asks for their
+        // digests. Asking DSM to hash one anyway costs a background task per empty file, and its
+        // answer for an empty file is exactly the behaviour nobody has verified.
+        if local_entry.kind != EntryKind::File || local_entry.size == 0 {
             continue;
         }
-        let Some(remote_entry) = remote.entries.get(&local_entry.relative) else {
+        let Some(remote_entry) = pairs.remote_of(remote, &local_entry.relative) else {
             continue;
         };
         if remote_entry.kind == EntryKind::File
             && remote_entry.size == local_entry.size
-            && local_mtime_seconds(local_entry) == remote_entry.mtime_seconds
+            && mtimes_agree(local_entry.mtime_ms, remote_entry.mtime_seconds)
             && !is_protected(remote_entry, rules)
         {
             selected.insert(remote_entry.relative.clone());
@@ -407,10 +429,14 @@ pub fn select_strong_remote_digests(
         return selected;
     }
 
+    let pairs = Correspondence::build(local, remote);
     let mut missing_by_size_name_and_mtime: BTreeMap<(u64, String, i64), BTreeSet<String>> =
         BTreeMap::new();
     for entry in local.entries.values() {
-        if entry.kind != EntryKind::File || remote.entries.contains_key(&entry.relative) {
+        if entry.kind != EntryKind::File
+            || entry.size == 0
+            || pairs.remote_of(remote, &entry.relative).is_some()
+        {
             continue;
         }
         let (parent, name) = relative_parent_and_name(&entry.relative);
@@ -422,7 +448,8 @@ pub fn select_strong_remote_digests(
 
     for entry in remote.entries.values() {
         if entry.kind != EntryKind::File
-            || local.entries.contains_key(&entry.relative)
+            || entry.size == 0
+            || pairs.local_of(local, &entry.relative).is_some()
             || is_protected(entry, rules)
             || has_local_file_ancestor(&entry.relative, local)
         {
@@ -507,7 +534,10 @@ pub fn build_plan(
     for relative in local.entries.keys() {
         root.join(relative)?;
     }
-    validate_portable_case_mapping(root, local, remote, rules)?;
+    let pairs = Correspondence::build(local, remote);
+    let (shield, mut skipped) = resolve_spellings(local, remote, rules, options.delete);
+    skipped.extend(local.skipped.iter().cloned());
+    skipped.sort_by(|left, right| left.relative.cmp(&right.relative));
 
     let mut plan = SyncPlan {
         source_root: local.root.clone(),
@@ -521,6 +551,7 @@ pub fn build_plan(
         unchanged_files: 0,
         protected_entries: 0,
         upload_bytes: 0,
+        skipped,
     };
 
     if !remote.root_exists {
@@ -545,7 +576,7 @@ pub fn build_plan(
         if local
             .entries
             .keys()
-            .any(|relative| relative.starts_with(&prefix))
+            .any(|relative| pairs.remote_relative(relative).starts_with(&prefix))
         {
             return Err(Error::ProtectedConflict(mount.remote_path.clone()));
         }
@@ -553,8 +584,15 @@ pub fn build_plan(
 
     let mut predeleted = BTreeSet::new();
     for entry in local.entries.values() {
-        let Some(remote_entry) = remote.entries.get(&entry.relative) else {
-            schedule_missing(root, &mut plan, entry)?;
+        if shield.covers(&entry.relative) {
+            continue;
+        }
+        // The remote spelling of this path: the local one, unless the destination already holds
+        // the same name under a different Unicode normalisation. Writing to the local spelling
+        // then would create a second, visually identical entry beside it.
+        let remote_relative = pairs.remote_relative(&entry.relative);
+        let Some(remote_entry) = remote.entries.get(remote_relative.as_ref()) else {
+            schedule_missing(root, &mut plan, entry, &remote_relative)?;
             continue;
         };
 
@@ -563,7 +601,14 @@ pub fn build_plan(
             (EntryKind::File, EntryKind::File) => {
                 match compare_files(entry, remote_entry, options.compare) {
                     None => plan.unchanged_files += 1,
-                    Some(reason) => schedule_upload(root, &mut plan, entry, reason)?,
+                    Some(reason) => schedule_upload(
+                        root,
+                        &mut plan,
+                        entry,
+                        &remote_relative,
+                        reason,
+                        Some(overwritten_snapshot(remote_entry)),
+                    )?,
                 }
             }
             (local_kind, remote_kind) if !options.delete => {
@@ -581,14 +626,19 @@ pub fn build_plan(
                     options.compare,
                     &mut predeleted,
                 )?;
-                schedule_create(root, &mut plan, entry, ChangeReason::TypeReplaced)?;
+                schedule_create(
+                    root,
+                    &mut plan,
+                    entry,
+                    &remote_relative,
+                    ChangeReason::TypeReplaced,
+                )?;
             }
             (EntryKind::File, EntryKind::Directory) => {
-                let subtree = remote_subtree(&remote.entries, &entry.relative);
-                if subtree
-                    .iter()
-                    .any(|candidate| is_protected(candidate, rules))
-                {
+                let subtree = remote_subtree(&remote.entries, &remote_entry.relative);
+                if subtree.iter().any(|candidate| {
+                    is_protected(candidate, rules) || shield.covers(&candidate.relative)
+                }) {
                     return Err(Error::ProtectedConflict(remote_entry.remote_path.clone()));
                 }
                 for candidate in subtree {
@@ -600,13 +650,23 @@ pub fn build_plan(
                         &mut predeleted,
                     )?;
                 }
-                schedule_upload(root, &mut plan, entry, ChangeReason::TypeReplaced)?;
+                // The directory is pre-deleted first, so the path is expected to be empty.
+                schedule_upload(
+                    root,
+                    &mut plan,
+                    entry,
+                    &remote_relative,
+                    ChangeReason::TypeReplaced,
+                    None,
+                )?;
             }
         }
     }
 
     if options.compare == CompareMode::Content {
-        replace_uploads_with_server_copies(root, &mut plan, local, remote, rules, options)?;
+        replace_uploads_with_server_copies(
+            &mut plan, local, remote, rules, options, &pairs, &shield,
+        )?;
     }
 
     if options.delete {
@@ -615,11 +675,17 @@ pub fn build_plan(
             if is_protected(entry, rules) {
                 plan.protected_entries += 1;
                 add_ancestor_directories(&entry.relative, &mut protected_dirs);
+            } else if shield.covers(&entry.relative) {
+                // Kept, so its ancestors stay non-empty and must be kept too: a non-recursive
+                // delete of one would only be refused by DSM, failing the run.
+                add_ancestor_directories(&entry.relative, &mut protected_dirs);
             }
         }
 
         for entry in remote.entries.values() {
-            if local.entries.contains_key(&entry.relative) || predeleted.contains(&entry.relative) {
+            if pairs.local_of(local, &entry.relative).is_some()
+                || predeleted.contains(&entry.relative)
+            {
                 continue;
             }
             // Never propose deleting something the run was told not to look at.
@@ -629,6 +695,11 @@ pub fn build_plan(
             if is_protected(entry, rules)
                 || (entry.kind == EntryKind::Directory && protected_dirs.contains(&entry.relative))
             {
+                continue;
+            }
+            // A path the local walk skipped, or whose spelling the plan could not resolve, is
+            // not absent locally. Its state is unknown, and unknown is never grounds to delete.
+            if shield.covers(&entry.relative) {
                 continue;
             }
             let destination_guard = plan
@@ -667,62 +738,343 @@ pub fn build_plan(
     Ok(plan)
 }
 
-/// Refuse two spellings that differ only by case, because Synology Drive clients cannot hold both.
+/// How local spellings pair with remote ones whose bytes differ but whose name does not.
 ///
-/// Entries the plan will never touch are skipped, and that is the finding rather than a detail. This
-/// check folds every path on both sides, and the remote walk used to descend into DSM-managed
-/// directories in full — so a share whose recycle bin had accumulated `Report.pdf` and `report.pdf`
-/// on different days, or a photo share with two `@eaDir` thumbnail directories for `Photo.JPG` and
-/// `photo.jpg`, failed *every* `sync`, `plan`, `status` and `resync` invocation with
-/// `UnsafeRemotePath` naming a path the tool documents as never synchronized. `--exclude '#recycle/'`
-/// did not help, because the check ran before and independently of the rules, and the operator's only
-/// remedy was to empty the NAS recycle bin or delete thumbnails: a destructive action taken to work
-/// around a portability warning about files that are never copied anywhere.
+/// Exact byte equality pairs almost everything, and then this holds nothing and costs one
+/// `is_ascii` per key. What it adds is the pair whose spellings differ only by Unicode
+/// normalisation: macOS writes `café` decomposed (NFD), Windows and Synology Drive write it composed
+/// (NFC), and DSM stores whichever bytes it was given. Keyed by bytes alone, the two were planned
+/// as an upload of the NFD name -- a second, visually identical remote entry -- and, under
+/// `--delete`, a deletion of the NFC one. On APFS the executor's local re-check then found the
+/// "deleted" name present, kept it and re-uploaded it, and every later run repeated the cycle and
+/// failed reconciliation.
 ///
-/// Local keys need no filtering: the walk already prunes both DSM-managed names and excluded ones
-/// before they reach an inventory.
-fn validate_portable_case_mapping(
-    root: &RemoteRoot,
+/// Each side keeps its own bytes for I/O. Only the pairing is normalisation-insensitive: a local
+/// entry is read from its local spelling and written to its partner's remote spelling.
+#[derive(Debug, Default)]
+pub(crate) struct Correspondence {
+    /// Local spelling to remote spelling, for pairs that differ.
+    to_remote: BTreeMap<String, String>,
+    /// The reverse.
+    to_local: BTreeMap<String, String>,
+}
+
+impl Correspondence {
+    pub(crate) fn build(local: &LocalInventory, remote: &RemoteInventory) -> Self {
+        let mut pairs = Self::default();
+        let local_odd = non_nfc_by_nfc(local.entries.keys());
+        let remote_odd = non_nfc_by_nfc(remote.entries.keys());
+        if local_odd.is_empty() && remote_odd.is_empty() {
+            return pairs;
+        }
+        // Only an unambiguous one-to-one pairing is made. Anything else is a collision, which
+        // `resolve_spellings` reports and shields, so leaving it unpaired here is never acted on.
+        for (composed, spellings) in &local_odd {
+            let [local_spelling] = spellings.as_slice() else {
+                continue;
+            };
+            if remote.entries.contains_key(*local_spelling) {
+                continue;
+            }
+            let mut candidates: Vec<&str> = remote_odd.get(composed).cloned().unwrap_or_default();
+            if remote.entries.contains_key(composed.as_str()) {
+                candidates.push(composed);
+            }
+            let [remote_spelling] = candidates.as_slice() else {
+                continue;
+            };
+            if local.entries.contains_key(*remote_spelling) {
+                continue;
+            }
+            pairs.insert(local_spelling, remote_spelling);
+        }
+        for (composed, spellings) in &remote_odd {
+            let [remote_spelling] = spellings.as_slice() else {
+                continue;
+            };
+            if pairs.to_local.contains_key(*remote_spelling)
+                || local.entries.contains_key(*remote_spelling)
+                || local_odd.contains_key(composed)
+                || remote.entries.contains_key(composed.as_str())
+                || !local.entries.contains_key(composed.as_str())
+            {
+                continue;
+            }
+            pairs.insert(composed, remote_spelling);
+        }
+        pairs
+    }
+
+    fn insert(&mut self, local: &str, remote: &str) {
+        self.to_remote.insert(local.to_owned(), remote.to_owned());
+        self.to_local.insert(remote.to_owned(), local.to_owned());
+    }
+
+    /// The remote spelling of a local path.
+    ///
+    /// A path inside a paired directory takes the directory's remote spelling even when it has no
+    /// remote partner of its own yet. Otherwise a new file in the NFD `café/` would be uploaded to
+    /// an NFD parent, and DSM would create that second directory to hold it.
+    pub(crate) fn remote_relative<'a>(&self, local_relative: &'a str) -> Cow<'a, str> {
+        if self.to_remote.is_empty() {
+            return Cow::Borrowed(local_relative);
+        }
+        if let Some(remote) = self.to_remote.get(local_relative) {
+            return Cow::Owned(remote.clone());
+        }
+        let mut current = local_relative;
+        while let Some((parent, _)) = current.rsplit_once('/') {
+            if let Some(remote) = self.to_remote.get(parent) {
+                return Cow::Owned(format!("{remote}{}", &local_relative[parent.len()..]));
+            }
+            current = parent;
+        }
+        Cow::Borrowed(local_relative)
+    }
+
+    pub(crate) fn remote_of<'r>(
+        &self,
+        remote: &'r RemoteInventory,
+        local_relative: &str,
+    ) -> Option<&'r RemoteEntry> {
+        remote
+            .entries
+            .get(self.remote_relative(local_relative).as_ref())
+    }
+
+    pub(crate) fn local_of<'l>(
+        &self,
+        local: &'l LocalInventory,
+        remote_relative: &str,
+    ) -> Option<&'l LocalEntry> {
+        match self.to_local.get(remote_relative) {
+            Some(local_relative) => local.entries.get(local_relative),
+            None => local.entries.get(remote_relative),
+        }
+    }
+
+    /// True for a remote spelling that is the partner of a differently spelled local entry.
+    pub(crate) fn is_paired_remote(&self, remote_relative: &str) -> bool {
+        self.to_local.contains_key(remote_relative)
+    }
+}
+
+/// The keys that are not already NFC, grouped by their NFC form.
+fn non_nfc_by_nfc<'a>(keys: impl Iterator<Item = &'a String>) -> BTreeMap<String, Vec<&'a str>> {
+    let mut odd: BTreeMap<String, Vec<&'a str>> = BTreeMap::new();
+    for key in keys {
+        if let Cow::Owned(composed) = nfc(key) {
+            odd.entry(composed).or_default().push(key);
+        }
+    }
+    odd
+}
+
+/// Paths a plan must neither carry nor delete: what the local walk skipped, and spelling classes
+/// the plan could not resolve.
+///
+/// Held as portable folds, so a skipped `Docs/` also shields a remote `DOCS/` beneath it. On a
+/// case-insensitive source those are one directory, and the walk never looked inside it.
+#[derive(Debug, Default)]
+pub(crate) struct Shield {
+    folds: BTreeSet<String>,
+}
+
+impl Shield {
+    /// True for `relative` itself and everything beneath a shielded path.
+    pub(crate) fn covers(&self, relative: &str) -> bool {
+        if self.folds.is_empty() {
+            return false;
+        }
+        let fold = portable_fold(relative);
+        self.folds.contains(&fold) || fold_has_ancestor_in(&fold, &self.folds)
+    }
+}
+
+/// Up to two distinct spellings per side of one portable fold.
+#[derive(Debug, Default)]
+struct Spellings<'a> {
+    local: Option<&'a str>,
+    local_other: Option<&'a str>,
+    remote: Option<&'a str>,
+    remote_other: Option<&'a str>,
+}
+
+fn note_spelling<'a>(first: &mut Option<&'a str>, other: &mut Option<&'a str>, spelling: &'a str) {
+    match first {
+        None => *first = Some(spelling),
+        Some(existing) if *existing == spelling => {}
+        Some(_) => {
+            if other.is_none() {
+                *other = Some(spelling);
+            }
+        }
+    }
+}
+
+/// Decide, for every path, whether its spelling can be carried, and shield the ones that cannot.
+///
+/// Synology Drive clients cannot hold two names that differ only by case or Unicode normalisation.
+/// This used to be enforced by failing the whole run at the first such pair, which made a case-only
+/// rename -- `Report.pdf` to `report.pdf`, `Photos/` to `photos/`, an ordinary action on Windows and
+/// macOS -- a permanent failure that not even `--delete` could get past. Each fold class is now
+/// decided on its own:
+///
+/// * one spelling on each side, the same bytes: the ordinary case, nothing to do;
+/// * one spelling on each side, equal after NFC: the same name, paired by [`Correspondence`];
+/// * one spelling on each side, differing by case: a rename. A mirror run carries it as an upload
+///   of the new spelling plus a deletion of the old one, so the run converges. Without `--delete`
+///   the old spelling cannot be removed, and writing the new one beside it would create exactly the
+///   pair Drive clients cannot hold, so the class is skipped and reported;
+/// * two spellings on one side: a genuine collision. Skipped and reported, both spellings untouched.
+///
+/// A skipped class shields its whole subtree on both sides, and every other path is planned as
+/// usual. Protected remote entries take no part, because the plan never touches them: a recycle bin
+/// holding `Report.pdf` and `report.pdf` from different days is not a conflict.
+fn resolve_spellings(
     local: &LocalInventory,
     remote: &RemoteInventory,
     rules: &IgnoreRules,
-) -> Result<()> {
-    let mut seen = BTreeMap::<String, String>::new();
-    let considered = local.entries.keys().chain(
-        remote
-            .entries
-            .values()
-            .filter(|entry| !is_protected(entry, rules))
-            .map(|entry| &entry.relative),
-    );
-    for relative in considered {
-        let mut prefix = String::new();
-        for component in relative.split('/') {
-            if !prefix.is_empty() {
-                prefix.push('/');
+    delete: bool,
+) -> (Shield, Vec<SkippedEntry>) {
+    let mut classes: BTreeMap<String, Spellings<'_>> = BTreeMap::new();
+    let considered = local
+        .entries
+        .keys()
+        .map(|relative| (relative.as_str(), true))
+        .chain(
+            remote
+                .entries
+                .values()
+                .filter(|entry| !is_protected(entry, rules))
+                .map(|entry| (entry.relative.as_str(), false)),
+        );
+    for (relative, is_local) in considered {
+        let fold = portable_fold(relative);
+        // Every ancestor is decided as well as the path itself. The fold of a prefix is the same
+        // prefix of the fold, cut at the same `/`, so one fold per path serves all of them.
+        let fold_cuts = fold
+            .match_indices('/')
+            .map(|(index, _)| index)
+            .chain(std::iter::once(fold.len()));
+        let spelling_cuts = relative
+            .match_indices('/')
+            .map(|(index, _)| index)
+            .chain(std::iter::once(relative.len()));
+        for (fold_cut, spelling_cut) in fold_cuts.zip(spelling_cuts) {
+            let key = &fold[..fold_cut];
+            if !classes.contains_key(key) {
+                classes.insert(key.to_owned(), Spellings::default());
             }
-            prefix.push_str(component);
-            let folded = prefix.to_lowercase();
-            if let Some(first) = seen.get(&folded)
-                && first != &prefix
-            {
-                return Err(Error::UnsafeRemotePath {
-                    path: format!("{}/{}", root.as_str(), prefix),
-                    reason: format!(
-                        "{first:?} and {prefix:?} differ only by case and cannot coexist portably on Synology Drive clients"
-                    ),
-                });
+            let class = classes.get_mut(key).expect("inserted above");
+            let spelling = &relative[..spelling_cut];
+            if is_local {
+                note_spelling(&mut class.local, &mut class.local_other, spelling);
+            } else {
+                note_spelling(&mut class.remote, &mut class.remote_other, spelling);
             }
-            seen.entry(folded).or_insert_with(|| prefix.clone());
         }
     }
-    Ok(())
+
+    // The walk's own skips come first: they are reported already, and anything under them is
+    // covered without a second report.
+    let mut blocked: BTreeSet<String> = local
+        .skipped
+        .iter()
+        .map(|skip| portable_fold(&skip.relative))
+        .collect();
+    let mut skipped = Vec::new();
+    // Folds sort every ancestor before its descendants, so a blocked class is always seen before
+    // anything beneath it, which it already covers and does not report again.
+    for (fold, class) in &classes {
+        if blocked.contains(fold) || fold_has_ancestor_in(fold, &blocked) {
+            continue;
+        }
+        let mut reports: Vec<(&str, SkipReason)> = Vec::new();
+        if let (Some(first), Some(second)) = (class.local, class.local_other) {
+            reports.push((
+                first,
+                SkipReason::LocalCaseCollision {
+                    other: second.to_owned(),
+                },
+            ));
+            reports.push((
+                second,
+                SkipReason::LocalCaseCollision {
+                    other: first.to_owned(),
+                },
+            ));
+        } else if let (Some(first), Some(second)) = (class.remote, class.remote_other) {
+            reports.push((
+                first,
+                SkipReason::RemoteCaseCollision {
+                    other: second.to_owned(),
+                },
+            ));
+            reports.push((
+                second,
+                SkipReason::RemoteCaseCollision {
+                    other: first.to_owned(),
+                },
+            ));
+            if let Some(local_spelling) = class
+                .local
+                .filter(|spelling| *spelling != first && *spelling != second)
+            {
+                reports.push((
+                    local_spelling,
+                    SkipReason::RemoteCaseCollision {
+                        other: first.to_owned(),
+                    },
+                ));
+            }
+        } else if let (Some(local_spelling), Some(remote_spelling)) = (class.local, class.remote)
+            && local_spelling != remote_spelling
+            && nfc(local_spelling) != nfc(remote_spelling)
+            && !delete
+        {
+            reports.push((
+                local_spelling,
+                SkipReason::CaseRenameNeedsDelete {
+                    remote: remote_spelling.to_owned(),
+                },
+            ));
+        }
+        if reports.is_empty() {
+            continue;
+        }
+        blocked.insert(fold.clone());
+        skipped.extend(reports.into_iter().map(|(relative, reason)| SkippedEntry {
+            relative: relative.to_owned(),
+            reason,
+        }));
+    }
+
+    (Shield { folds: blocked }, skipped)
 }
 
-fn schedule_missing(root: &RemoteRoot, plan: &mut SyncPlan, entry: &LocalEntry) -> Result<()> {
+fn schedule_missing(
+    root: &RemoteRoot,
+    plan: &mut SyncPlan,
+    entry: &LocalEntry,
+    remote_relative: &str,
+) -> Result<()> {
     match entry.kind {
-        EntryKind::Directory => schedule_create(root, plan, entry, ChangeReason::MissingRemote),
-        EntryKind::File => schedule_upload(root, plan, entry, ChangeReason::MissingRemote),
+        EntryKind::Directory => schedule_create(
+            root,
+            plan,
+            entry,
+            remote_relative,
+            ChangeReason::MissingRemote,
+        ),
+        EntryKind::File => schedule_upload(
+            root,
+            plan,
+            entry,
+            remote_relative,
+            ChangeReason::MissingRemote,
+            None,
+        ),
     }
 }
 
@@ -730,11 +1082,12 @@ fn schedule_create(
     root: &RemoteRoot,
     plan: &mut SyncPlan,
     entry: &LocalEntry,
+    remote_relative: &str,
     reason: ChangeReason,
 ) -> Result<()> {
     plan.creates.push(CreateAction {
         relative: entry.relative.clone(),
-        remote_path: root.join(&entry.relative)?,
+        remote_path: root.join(remote_relative)?,
         reason,
     });
     Ok(())
@@ -744,15 +1097,29 @@ fn schedule_upload(
     root: &RemoteRoot,
     plan: &mut SyncPlan,
     entry: &LocalEntry,
+    remote_relative: &str,
     reason: ChangeReason,
+    expected_remote: Option<RemoteSnapshot>,
 ) -> Result<()> {
     plan.upload_bytes = plan.upload_bytes.saturating_add(entry.size);
     plan.uploads.push(UploadAction {
         local: entry.clone(),
-        remote_path: root.join(&entry.relative)?,
+        remote_path: root.join(remote_relative)?,
         reason,
+        expected_remote,
     });
     Ok(())
+}
+
+/// The plan-time state of a remote file an upload is about to overwrite.
+fn overwritten_snapshot(remote: &RemoteEntry) -> RemoteSnapshot {
+    RemoteSnapshot {
+        kind: remote.kind,
+        size: remote.size,
+        mtime_seconds: remote.mtime_seconds,
+        content_md5: remote.content_md5,
+        require_mtime: true,
+    }
 }
 
 fn push_predelete(
@@ -792,11 +1159,16 @@ fn compare_files(
     if local.size != remote.size {
         return Some(ChangeReason::SizeDiffers);
     }
-    let mtime_differs = local_mtime_seconds(local) != remote.mtime_seconds;
+    let mtime_differs = !mtimes_agree(local.mtime_ms, remote.mtime_seconds);
     match mode {
         CompareMode::Force => Some(ChangeReason::Forced),
         CompareMode::SizeOnly => None,
         CompareMode::Metadata => mtime_differs.then_some(ChangeReason::MtimeDiffers),
+        // Two empty files are identical by definition. Their digests are never selected, so
+        // without this the pair would read as an unverifiable difference and upload every run.
+        CompareMode::Content if local.size == 0 => {
+            mtime_differs.then_some(ChangeReason::MtimeDiffers)
+        }
         CompareMode::Content => match (local.content_md5, remote.content_md5) {
             (Some(local_digest), Some(remote_digest)) => {
                 // `Md5Only` is the normal outcome now, not a degraded one: remote
@@ -825,12 +1197,13 @@ fn compare_files(
 }
 
 fn replace_uploads_with_server_copies(
-    root: &RemoteRoot,
     plan: &mut SyncPlan,
     local: &LocalInventory,
     remote: &RemoteInventory,
     rules: &IgnoreRules,
     options: &PlanOptions,
+    pairs: &Correspondence,
+    shield: &Shield,
 ) -> Result<()> {
     if !options.server_copy {
         return Ok(());
@@ -843,7 +1216,7 @@ fn replace_uploads_with_server_copies(
         .collect();
     let mut local_by_content: BTreeMap<(u64, ContentMd5, i64), Vec<usize>> = BTreeMap::new();
     for (index, upload) in plan.uploads.iter().enumerate() {
-        if remote.entries.contains_key(&upload.local.relative) {
+        if upload.local.size == 0 || pairs.remote_of(remote, &upload.local.relative).is_some() {
             continue;
         }
         let digest = upload.local.content_md5.ok_or_else(|| {
@@ -868,9 +1241,11 @@ fn replace_uploads_with_server_copies(
         BTreeMap::new();
     for entry in remote.entries.values() {
         if entry.kind != EntryKind::File
-            || local.entries.contains_key(&entry.relative)
+            || entry.size == 0
+            || pairs.local_of(local, &entry.relative).is_some()
             || is_protected(entry, rules)
             || predeleted.contains(entry.relative.as_str())
+            || shield.covers(&entry.relative)
         {
             continue;
         }
@@ -915,7 +1290,7 @@ fn replace_uploads_with_server_copies(
                 from_relative: source.relative.clone(),
                 from_remote_path: source.remote_path.clone(),
                 to_relative: upload.local.relative.clone(),
-                to_remote_path: root.join(&upload.local.relative)?,
+                to_remote_path: upload.remote_path.clone(),
                 local: upload.local.clone(),
                 expected_size,
                 content_md5: digest,
@@ -950,10 +1325,22 @@ fn remote_subtree<'a>(
     entries: &'a std::collections::BTreeMap<String, RemoteEntry>,
     relative: &str,
 ) -> Vec<&'a RemoteEntry> {
+    // Range queries on the ordered map: the entry itself, then its descendants, which sort
+    // contiguously after `relative/`. Filtering every entry instead cost the whole inventory per
+    // type-conflict candidate.
     let prefix = format!("{relative}/");
     entries
-        .values()
-        .filter(|entry| entry.relative == relative || entry.relative.starts_with(&prefix))
+        .get(relative)
+        .into_iter()
+        .chain(
+            entries
+                .range::<str, _>((
+                    std::ops::Bound::Included(prefix.as_str()),
+                    std::ops::Bound::Unbounded,
+                ))
+                .take_while(|(candidate, _)| candidate.starts_with(&prefix))
+                .map(|(_, entry)| entry),
+        )
         .collect()
 }
 
@@ -967,12 +1354,53 @@ fn local_mtime_seconds(local: &LocalEntry) -> i64 {
     local.mtime_ms.div_euclid(1000)
 }
 
+/// Whether a local modification time and a File Station one describe the same moment, given the
+/// precision each side actually carries.
+///
+/// File Station reports whole seconds. The local side carries milliseconds, which an upload sends
+/// as they are. Whether DSM floors or rounds them is unverified (audit U-1). So this asks whether the
+/// remote second is what DSM would have stored for this local time under either convention:
+///
+/// * the local time has a non-zero sub-second part: it agrees with its floor (DSM truncates) or its
+///   half-up rounding (DSM rounds) and with nothing else. `3.2 s` agrees with `3` only, `3.7 s` with
+///   `3` or `4`;
+/// * the local time is a whole second (no sub-second part, as on FAT, many SMB servers, or a time
+///   that itself came back from File Station): floor and round coincide, so only that exact second
+///   agrees. Whole-second against whole-second one second apart is a change.
+///
+/// Anything beyond that granularity counts as changed. A blanket +/-1 s tolerance was tried and
+/// rejected: it made every same-size edit that moved the mtime by up to a second invisible in
+/// `--compare metadata`.
+///
+/// The residual is inherent, not a choice: an edit that keeps the size and lands in the same second
+/// (or the same rounding bucket) as the previous version is undetectable in `--compare metadata`,
+/// because File Station cannot say anything finer. `--compare content` compares digests for every
+/// pair this accepts, because `select_comparison_remote_digests` applies this same test.
+///
+/// Copy-candidate matching stays exact on purpose -- it authorises a server copy and a guarded
+/// delete -- and remote-to-remote snapshot checks never use this.
+///
+/// The one definition every local-to-remote comparison uses -- the planner's re-upload decision,
+/// its digest selection, the post-upload "did DSM keep the time" latch and the executor's
+/// destination checks -- so no two of them can disagree about whether a file changed.
+pub fn mtimes_agree(local_mtime_ms: i64, remote_mtime_seconds: i64) -> bool {
+    let floored = local_mtime_ms.div_euclid(1000);
+    let rounded = local_mtime_ms.saturating_add(500).div_euclid(1000);
+    remote_mtime_seconds == floored || remote_mtime_seconds == rounded
+}
+
 fn deletion_snapshot(
     entry: &RemoteEntry,
     remote_entries: &BTreeMap<String, RemoteEntry>,
     compare: CompareMode,
 ) -> Result<RemoteSnapshot> {
-    let content_md5 = if compare.requires_deletion_digest() && entry.kind == EntryKind::File {
+    // An empty file has exactly one possible content, so the size guard the executor re-checks
+    // before deleting already proves it. Requiring a digest on top meant one DSM hash task per empty
+    // remote file, and a mirror run that failed outright if DSM declines to hash an empty file.
+    let content_md5 = if compare.requires_deletion_digest()
+        && entry.kind == EntryKind::File
+        && entry.size > 0
+    {
         let fingerprint = entry.content_md5.ok_or_else(|| {
             Error::Message(format!(
                 "content-mode deletion requires a plan-time MD5/CRC32/SHA-256 fingerprint for {:?}",
@@ -989,10 +1417,19 @@ fn deletion_snapshot(
     } else {
         None
     };
-    let has_descendants = entry.kind == EntryKind::Directory
-        && remote_entries
-            .keys()
-            .any(|relative| relative.starts_with(&format!("{}/", entry.relative)));
+    // A range query: descendants sort contiguously after `relative/`, so the first key at or after
+    // the prefix answers the question. Scanning every key -- with a fresh `format!` per key -- made
+    // a first mirror run with D remote-only directories cost D x N allocations.
+    let has_descendants = entry.kind == EntryKind::Directory && {
+        let prefix = format!("{}/", entry.relative);
+        remote_entries
+            .range::<str, _>((
+                std::ops::Bound::Included(prefix.as_str()),
+                std::ops::Bound::Unbounded,
+            ))
+            .next()
+            .is_some_and(|(relative, _)| relative.starts_with(&prefix))
+    };
     Ok(RemoteSnapshot {
         kind: entry.kind,
         size: entry.size,
@@ -1387,9 +1824,18 @@ pub fn build_status_page(
 ) -> Result<StatusPage> {
     let limit = query.limit.clamp(1, STATUS_PAGE_SIZE_MAX);
 
+    // Rows are keyed by the local spelling. A remote entry that is the same name under another
+    // Unicode normalisation is that row's remote side, exactly as `build_plan` pairs it, rather
+    // than a second row claiming the file is missing on one side and extra on the other.
+    let pairs = Correspondence::build(local, remote);
     let mut keys: BTreeSet<&str> = BTreeSet::new();
-    for relative in local.entries.keys().chain(remote.entries.keys()) {
+    for relative in local.entries.keys() {
         if query.scope.matches(relative) {
+            keys.insert(relative.as_str());
+        }
+    }
+    for relative in remote.entries.keys() {
+        if query.scope.matches(relative) && !pairs.is_paired_remote(relative) {
             keys.insert(relative.as_str());
         }
     }
@@ -1407,7 +1853,20 @@ pub fn build_status_page(
     let after = query.cursor.map(StatusCursor::as_str);
 
     for relative in keys {
-        let entry = classify(root, local, remote, excluded, rules, query, relative)?;
+        let local_entry = local.entries.get(relative);
+        let remote_entry = match local_entry {
+            Some(_) => pairs.remote_of(remote, relative),
+            None => remote.entries.get(relative),
+        };
+        let entry = classify(
+            root,
+            local_entry,
+            remote_entry,
+            excluded,
+            rules,
+            query,
+            relative,
+        )?;
         accumulate(&mut stats, &entry);
 
         if !query.states.admits(entry.state.kind()) || !matches_filter(relative, query.filter) {
@@ -1582,16 +2041,14 @@ fn accumulate(stats: &mut StatusStats, entry: &StatusEntry) {
 
 fn classify(
     root: &RemoteRoot,
-    local: &LocalInventory,
-    remote: &RemoteInventory,
+    local_entry: Option<&LocalEntry>,
+    remote_entry: Option<&RemoteEntry>,
     excluded: &BTreeSet<String>,
     rules: &IgnoreRules,
     query: &StatusQuery<'_>,
     relative: &str,
 ) -> Result<StatusEntry> {
     let compare = query.compare;
-    let local_entry = local.entries.get(relative);
-    let remote_entry = remote.entries.get(relative);
 
     let kind = local_entry
         .map(|entry| entry.kind)
@@ -1688,6 +2145,7 @@ mod tests {
                     )
                 })
                 .collect(),
+            skipped: Vec::new(),
         }
     }
 
@@ -2108,44 +2566,502 @@ mod tests {
         );
     }
 
+    fn skips(plan: &SyncPlan) -> Vec<(&str, &'static str)> {
+        plan.skipped
+            .iter()
+            .map(|skip| (skip.relative.as_str(), skip.reason.as_str()))
+            .collect()
+    }
+
+    fn deleted(plan: &SyncPlan) -> Vec<&str> {
+        plan.pre_deletes
+            .iter()
+            .chain(&plan.post_deletes)
+            .map(|action| action.relative.as_str())
+            .collect()
+    }
+
+    fn uploaded(plan: &SyncPlan) -> Vec<(&str, &str)> {
+        plan.uploads
+            .iter()
+            .map(|action| (action.local.relative.as_str(), action.remote_path.as_str()))
+            .collect()
+    }
+
+    /// N-2 without `--delete`: a case-only rename cannot be carried, because the old spelling may
+    /// not be removed and the new one may not be written beside it. It is skipped and reported,
+    /// with its subtree on both sides, and every other path still syncs. It used to fail the run.
     #[test]
-    fn rejects_case_variant_paths_across_and_within_remote_inventory() {
+    fn a_case_only_rename_without_delete_is_skipped_and_the_rest_still_syncs() {
         let root = RemoteRoot::parse("/share/root").unwrap();
         let local_inventory = local(&[
             ("folder", EntryKind::Directory, 0, 0),
             ("folder/local.bin", EntryKind::File, 1, 1_000),
+            ("other.txt", EntryKind::File, 2, 2_000),
         ]);
         let remote_inventory = remote(&[
             ("Folder", EntryKind::Directory, 0, 0),
             ("Folder/remote.bin", EntryKind::File, 1, 1),
         ]);
-        assert!(matches!(
-            build_plan(
+        let plan = build_plan(
+            &root,
+            &local_inventory,
+            &remote_inventory,
+            &rules(&[]),
+            &options(false),
+        )
+        .unwrap();
+        assert_eq!(skips(&plan), [("folder", "case-rename-needs-delete")]);
+        assert!(plan.skipped[0].reason.detail().contains("\"Folder\""));
+        assert_eq!(
+            uploaded(&plan),
+            [("other.txt", "/share/root/other.txt")],
+            "the renamed subtree is left alone and nothing else is held back"
+        );
+        assert!(plan.creates.is_empty());
+    }
+
+    /// N-2 under `--delete`: the rename converges as an upload of the new spelling and a deletion
+    /// of the old one, for a file and for a directory with its contents.
+    #[test]
+    fn a_case_only_rename_under_delete_converges_as_upload_and_delete() {
+        let root = RemoteRoot::parse("/share/root").unwrap();
+        let plan = build_plan(
+            &root,
+            &local(&[
+                ("report.pdf", EntryKind::File, 5, 5_000),
+                ("photos", EntryKind::Directory, 0, 0),
+                ("photos/a.jpg", EntryKind::File, 3, 3_000),
+            ]),
+            &remote(&[
+                ("Report.pdf", EntryKind::File, 5, 5),
+                ("Photos", EntryKind::Directory, 0, 0),
+                ("Photos/a.jpg", EntryKind::File, 3, 3),
+            ]),
+            &rules(&[]),
+            &options(true),
+        )
+        .unwrap();
+        assert!(plan.skipped.is_empty(), "{:?}", plan.skipped);
+        assert_eq!(
+            plan.creates
+                .iter()
+                .map(|create| create.remote_path.as_str())
+                .collect::<Vec<_>>(),
+            ["/share/root/photos"]
+        );
+        assert_eq!(
+            uploaded(&plan),
+            [
+                ("photos/a.jpg", "/share/root/photos/a.jpg"),
+                ("report.pdf", "/share/root/report.pdf"),
+            ]
+        );
+        assert_eq!(deleted(&plan), ["Photos/a.jpg", "Photos", "Report.pdf"]);
+    }
+
+    /// Two remote spellings of one name are a genuine collision. Neither is changed or deleted, the
+    /// local spelling is not written beside them, both are named, and the rest of the tree syncs.
+    #[test]
+    fn a_remote_case_collision_is_skipped_on_both_sides_and_never_deleted() {
+        let root = RemoteRoot::parse("/share/root").unwrap();
+        for delete in [false, true] {
+            let plan = build_plan(
+                &root,
+                &local(&[
+                    ("keep.txt", EntryKind::File, 1, 1_000),
+                    ("Report.pdf", EntryKind::File, 9, 9_000),
+                ]),
+                &remote(&[
+                    ("keep.txt", EntryKind::File, 1, 1),
+                    ("Report.pdf", EntryKind::File, 1, 1),
+                    ("report.pdf", EntryKind::File, 1, 1),
+                    ("Archive", EntryKind::Directory, 0, 0),
+                    ("archive", EntryKind::Directory, 0, 0),
+                    ("stale.txt", EntryKind::File, 1, 1),
+                ]),
+                &rules(&[]),
+                &options(delete),
+            )
+            .unwrap();
+            assert_eq!(
+                skips(&plan),
+                [
+                    ("Archive", "remote-case-collision"),
+                    ("Report.pdf", "remote-case-collision"),
+                    ("archive", "remote-case-collision"),
+                    ("report.pdf", "remote-case-collision"),
+                ]
+            );
+            assert!(
+                plan.uploads.is_empty(),
+                "the changed Report.pdf is held back"
+            );
+            if delete {
+                assert_eq!(deleted(&plan), ["stale.txt"]);
+            } else {
+                assert!(deleted(&plan).is_empty());
+            }
+        }
+    }
+
+    /// Two local spellings are still never carried, whichever inventory reached the planner. The
+    /// walk normally removes them first; the planner refuses them independently.
+    #[test]
+    fn a_local_case_collision_is_skipped_and_its_remote_spellings_are_never_deleted() {
+        let root = RemoteRoot::parse("/share/root").unwrap();
+        let plan = build_plan(
+            &root,
+            &local(&[
+                ("Data.bin", EntryKind::File, 1, 1_000),
+                ("data.bin", EntryKind::File, 2, 2_000),
+                ("keep.txt", EntryKind::File, 1, 1_000),
+            ]),
+            &remote(&[
+                ("DATA.BIN", EntryKind::File, 1, 1),
+                ("keep.txt", EntryKind::File, 1, 1),
+            ]),
+            &rules(&[]),
+            &options(true),
+        )
+        .unwrap();
+        assert_eq!(
+            skips(&plan),
+            [
+                ("Data.bin", "local-case-collision"),
+                ("data.bin", "local-case-collision"),
+            ]
+        );
+        assert!(plan.uploads.is_empty());
+        assert!(deleted(&plan).is_empty());
+    }
+
+    /// N-1's safety half: a path the walk skipped exists locally, so neither it, nor anything
+    /// beneath it, nor any case spelling of it is a mirror deletion candidate -- and its ancestors
+    /// stay too, because they are not empty.
+    #[test]
+    fn paths_the_walk_skipped_are_never_deleted_and_are_reported() {
+        let root = RemoteRoot::parse("/share/root").unwrap();
+        let mut local_inventory = local(&[
+            ("keep.txt", EntryKind::File, 1, 1_000),
+            ("dir", EntryKind::Directory, 0, 0),
+        ]);
+        local_inventory.skipped = vec![
+            SkippedEntry {
+                relative: "Linked".to_owned(),
+                reason: SkipReason::LinkOrReparsePoint,
+            },
+            SkippedEntry {
+                relative: "dir/system.dat".to_owned(),
+                reason: SkipReason::WindowsAttributes,
+            },
+        ];
+        let remote_inventory = remote(&[
+            ("keep.txt", EntryKind::File, 1, 1),
+            ("Linked", EntryKind::Directory, 0, 0),
+            ("Linked/inner.txt", EntryKind::File, 1, 1),
+            ("LINKED", EntryKind::Directory, 0, 0),
+            ("dir", EntryKind::Directory, 0, 0),
+            ("dir/system.dat", EntryKind::File, 1, 1),
+            ("dir/SYSTEM.DAT", EntryKind::File, 1, 1),
+            ("gone", EntryKind::Directory, 0, 0),
+            ("gone/system.dat", EntryKind::File, 1, 1),
+            ("stale.txt", EntryKind::File, 1, 1),
+        ]);
+        let plan = build_plan(
+            &root,
+            &local_inventory,
+            &remote_inventory,
+            &rules(&[]),
+            &options(true),
+        )
+        .unwrap();
+        assert_eq!(deleted(&plan), ["gone/system.dat", "gone", "stale.txt"]);
+        assert_eq!(
+            skips(&plan),
+            [
+                ("Linked", "link-or-reparse-point"),
+                ("dir/system.dat", "windows-attributes"),
+            ]
+        );
+    }
+
+    /// N-5: an NFD local name and its NFC remote spelling are one entry. Nothing is uploaded beside
+    /// the remote spelling, nothing is deleted, and a change is written to the spelling the
+    /// destination already holds -- including for a new file inside a paired directory.
+    #[test]
+    fn unicode_normalisation_variants_pair_instead_of_upload_and_delete() {
+        let root = RemoteRoot::parse("/share/root").unwrap();
+        let composed = "caf\u{e9}";
+        let decomposed = "cafe\u{301}";
+        for (local_name, remote_name) in [(decomposed, composed), (composed, decomposed)] {
+            let file = |name: &str| format!("{name}.txt");
+            let inner = |name: &str, child: &str| format!("{name}/{child}");
+            let local_inventory = local(&[
+                (&file(local_name), EntryKind::File, 4, 4_000),
+                (local_name, EntryKind::Directory, 0, 0),
+                (&inner(local_name, "same.txt"), EntryKind::File, 2, 2_000),
+                (&inner(local_name, "new.txt"), EntryKind::File, 3, 3_000),
+            ]);
+            let remote_inventory = remote(&[
+                (&file(remote_name), EntryKind::File, 4, 1),
+                (remote_name, EntryKind::Directory, 0, 0),
+                (&inner(remote_name, "same.txt"), EntryKind::File, 2, 2),
+                (&inner(remote_name, "stale.txt"), EntryKind::File, 1, 1),
+            ]);
+            let plan = build_plan(
                 &root,
                 &local_inventory,
                 &remote_inventory,
                 &rules(&[]),
-                &options(false),
-            ),
-            Err(Error::UnsafeRemotePath { reason, .. })
-                if reason.contains("differ only by case")
-        ));
+                &options(true),
+            )
+            .unwrap();
+            assert!(plan.skipped.is_empty(), "{:?}", plan.skipped);
+            assert!(
+                plan.creates.is_empty(),
+                "the directory already exists remotely"
+            );
+            assert_eq!(plan.unchanged_files, 1);
+            let new_inner = inner(local_name, "new.txt");
+            let changed = file(local_name);
+            let new_target = format!("/share/root/{}", inner(remote_name, "new.txt"));
+            let changed_target = format!("/share/root/{}", file(remote_name));
+            let mut expected = vec![
+                (new_inner.as_str(), new_target.as_str()),
+                (changed.as_str(), changed_target.as_str()),
+            ];
+            expected.sort();
+            assert_eq!(uploaded(&plan), expected);
+            assert_eq!(
+                deleted(&plan),
+                [inner(remote_name, "stale.txt").as_str()],
+                "only the genuinely remote-only entry is deleted"
+            );
 
-        let remote_collision = remote(&[
-            ("Archive", EntryKind::Directory, 0, 0),
-            ("archive", EntryKind::Directory, 0, 0),
-        ]);
-        assert!(matches!(
-            build_plan(
+            // The status listing pairs the same way: one row per name, not missing + remote-only.
+            let page = build_status_page(
                 &root,
-                &local(&[]),
-                &remote_collision,
+                &local_inventory,
+                &remote_inventory,
+                &BTreeSet::new(),
                 &rules(&[]),
-                &options(false),
-            ),
-            Err(Error::UnsafeRemotePath { reason, .. })
-                if reason.contains("differ only by case")
-        ));
+                &StatusQuery {
+                    scope: &Scope::root(),
+                    compare: CompareMode::Metadata,
+                    filter: None,
+                    states: StateFilter::All,
+                    include_excluded: false,
+                    limit: 50,
+                    cursor: None,
+                    local_complete: true,
+                    remote_complete: true,
+                },
+            )
+            .unwrap();
+            assert_eq!(page.stats.remote_only_entries, 1);
+            assert_eq!(page.stats.missing_remote_files, 1);
+            assert_eq!(page.stats.in_sync_files, 1);
+        }
+    }
+
+    /// The digest selections pair the same way the planner does, so a paired file gets the remote
+    /// digest its comparison needs and is not taken for a deletion candidate.
+    #[test]
+    fn digest_selection_follows_unicode_pairing() {
+        let local_inventory = local(&[("cafe\u{301}.txt", EntryKind::File, 4, 4_000)]);
+        let remote_inventory = remote(&[("caf\u{e9}.txt", EntryKind::File, 4, 4)]);
+        assert_eq!(
+            select_comparison_remote_digests(&local_inventory, &remote_inventory, &rules(&[])),
+            BTreeSet::from(["caf\u{e9}.txt".to_owned()])
+        );
+        assert!(
+            select_deletion_guard_hashes(&local_inventory, &remote_inventory, &rules(&[]))
+                .is_empty()
+        );
+    }
+
+    /// N-7: two empty files are equal without a digest, so content mode neither asks DSM to hash
+    /// them nor uploads them every run, and an empty remote-only file is deleted on its size guard.
+    #[test]
+    fn empty_files_need_no_digest_to_compare_or_to_delete() {
+        let root = RemoteRoot::parse("/share/root").unwrap();
+        let local_inventory = local(&[
+            ("empty.txt", EntryKind::File, 0, 1_000),
+            ("keep.txt", EntryKind::File, 1, 1_000),
+        ]);
+        let mut remote_inventory = remote(&[
+            ("empty.txt", EntryKind::File, 0, 1),
+            ("keep.txt", EntryKind::File, 1, 1),
+            ("gone.txt", EntryKind::File, 0, 1),
+        ]);
+        remote_inventory
+            .entries
+            .get_mut("keep.txt")
+            .unwrap()
+            .content_md5 = Some(digest(1));
+        let mut local_inventory = local_inventory;
+        local_inventory
+            .entries
+            .get_mut("keep.txt")
+            .unwrap()
+            .content_md5 = Some(digest(1));
+
+        assert_eq!(
+            select_comparison_remote_digests(&local_inventory, &remote_inventory, &rules(&[])),
+            BTreeSet::from(["keep.txt".to_owned()])
+        );
+        assert!(
+            select_deletion_guard_hashes(&local_inventory, &remote_inventory, &rules(&[]))
+                .is_empty()
+        );
+        let plan = build_plan(
+            &root,
+            &local_inventory,
+            &remote_inventory,
+            &rules(&[]),
+            &content_options(true, false),
+        )
+        .unwrap();
+        assert!(plan.uploads.is_empty());
+        assert_eq!(plan.unchanged_files, 2);
+        assert_eq!(deleted(&plan), ["gone.txt"]);
+        assert_eq!(plan.post_deletes[0].snapshot.size, 0);
+        assert_eq!(plan.post_deletes[0].snapshot.content_md5, None);
+    }
+
+    /// A file withheld after the walk (it changed while being hashed) is shielded on every
+    /// spelling: its NFC remote partner is neither deleted nor overwritten, and it is reported.
+    #[test]
+    fn a_withheld_path_is_never_deleted_on_any_spelling() {
+        let root = RemoteRoot::parse("/share/root").unwrap();
+        let mut local_inventory = local(&[
+            ("cafe\u{301}.txt", EntryKind::File, 4, 4_000),
+            ("keep.txt", EntryKind::File, 1, 1_000),
+        ]);
+        local_inventory.withhold(
+            "cafe\u{301}.txt",
+            SkipReason::Deferred {
+                detail: "changed while hashing".to_owned(),
+            },
+        );
+        let plan = build_plan(
+            &root,
+            &local_inventory,
+            &remote(&[
+                ("caf\u{e9}.txt", EntryKind::File, 9, 9),
+                ("keep.txt", EntryKind::File, 1, 1),
+            ]),
+            &rules(&[]),
+            &options(true),
+        )
+        .unwrap();
+        assert!(deleted(&plan).is_empty());
+        assert!(plan.uploads.is_empty());
+        assert_eq!(skips(&plan), [("cafe\u{301}.txt", "deferred")]);
+    }
+
+    /// An overwrite carries the remote state it was planned against; a new file carries none.
+    #[test]
+    fn an_overwrite_records_the_remote_file_it_replaces() {
+        let root = RemoteRoot::parse("/share/root").unwrap();
+        let plan = build_plan(
+            &root,
+            &local(&[
+                ("changed.txt", EntryKind::File, 4, 5_000),
+                ("new.txt", EntryKind::File, 3, 2_000),
+            ]),
+            &remote(&[("changed.txt", EntryKind::File, 7, 3)]),
+            &rules(&[]),
+            &options(false),
+        )
+        .unwrap();
+        let expected: Vec<_> = plan
+            .uploads
+            .iter()
+            .map(|upload| {
+                (
+                    upload.local.relative.as_str(),
+                    upload
+                        .expected_remote
+                        .as_ref()
+                        .map(|snapshot| (snapshot.kind, snapshot.size, snapshot.mtime_seconds)),
+                )
+            })
+            .collect();
+        assert_eq!(
+            expected,
+            [
+                ("changed.txt", Some((EntryKind::File, 7, 3))),
+                ("new.txt", None),
+            ]
+        );
+    }
+
+    #[test]
+    fn mtimes_agree_under_floor_or_round_and_nothing_wider() {
+        // A DSM that floors: 3.7 s is stored as 3.
+        assert!(mtimes_agree(3_700, 3));
+        // A DSM that rounds: 3.7 s is stored as 4, and 3.5 s rounds half-up to 4.
+        assert!(mtimes_agree(3_700, 4));
+        assert!(mtimes_agree(3_500, 4));
+        // Below .5 both conventions give the same second, so the next one is a change.
+        assert!(mtimes_agree(3_200, 3));
+        assert!(!mtimes_agree(3_200, 4));
+        // 1.2 s apart is a change even though both readings are fine-grained locally.
+        assert!(!mtimes_agree(4_200, 3));
+        assert!(!mtimes_agree(1_800, 3));
+        // Whole second against whole second: exact, so one second apart is a change.
+        assert!(mtimes_agree(3_000, 3));
+        assert!(!mtimes_agree(3_000, 2));
+        assert!(!mtimes_agree(3_000, 4));
+        // Before the epoch, floor and round still mean what they mean.
+        assert!(mtimes_agree(-1, -1));
+        assert!(mtimes_agree(-1, 0));
+        assert!(mtimes_agree(-1_500, -2));
+        assert!(mtimes_agree(-1_500, -1));
+        assert!(!mtimes_agree(-1_000, 0));
+        assert!(!mtimes_agree(i64::MIN, i64::MAX));
+        assert!(!mtimes_agree(i64::MAX, i64::MIN));
+    }
+
+    /// N-8: the descendant test is a range query. Siblings that sort between a directory and its
+    /// children (`a-b` sorts between `a` and `a/`) must not be mistaken for descendants.
+    #[test]
+    fn descendant_queries_respect_component_boundaries() {
+        let inventory = remote(&[
+            ("a", EntryKind::Directory, 0, 0),
+            ("a-b", EntryKind::Directory, 0, 0),
+            ("a-b/x", EntryKind::File, 1, 1),
+            ("a/x", EntryKind::File, 1, 1),
+            ("b", EntryKind::Directory, 0, 0),
+            ("b-c", EntryKind::File, 1, 1),
+        ]);
+        let snapshot = |relative: &str| {
+            deletion_snapshot(
+                &inventory.entries[relative],
+                &inventory.entries,
+                CompareMode::Metadata,
+            )
+            .unwrap()
+        };
+        assert!(!snapshot("a").require_mtime, "a has a descendant");
+        assert!(!snapshot("a-b").require_mtime);
+        assert!(snapshot("b").require_mtime, "b-c is a sibling, not a child");
+        assert_eq!(
+            remote_subtree(&inventory.entries, "a")
+                .iter()
+                .map(|entry| entry.relative.as_str())
+                .collect::<Vec<_>>(),
+            ["a", "a/x"]
+        );
+        assert_eq!(
+            remote_subtree(&inventory.entries, "b")
+                .iter()
+                .map(|entry| entry.relative.as_str())
+                .collect::<Vec<_>>(),
+            ["b"]
+        );
     }
 
     /// A case collision the plan will never touch must not fail the run.
@@ -2186,23 +3102,28 @@ mod tests {
             )
             .unwrap_or_else(|error| panic!("{collision:?}: {error}"));
             assert_eq!(plan.uploads.len(), 1);
+            assert!(plan.skipped.is_empty(), "{collision:?}");
         }
 
-        // A collision between two paths the plan *would* touch is still refused.
-        assert!(matches!(
-            build_plan(
-                &root,
-                &local(&[]),
-                &remote(&[
-                    ("Payload", EntryKind::Directory, 0, 0),
-                    ("payload", EntryKind::Directory, 0, 0),
-                ]),
-                &rules(&["cache/"]),
-                &options(false),
-            ),
-            Err(Error::UnsafeRemotePath { reason, .. })
-                if reason.contains("differ only by case")
-        ));
+        // A collision between two paths the plan *would* touch is reported, and left alone.
+        let plan = build_plan(
+            &root,
+            &local(&[]),
+            &remote(&[
+                ("Payload", EntryKind::Directory, 0, 0),
+                ("payload", EntryKind::Directory, 0, 0),
+            ]),
+            &rules(&["cache/"]),
+            &options(false),
+        )
+        .unwrap();
+        assert_eq!(
+            skips(&plan),
+            [
+                ("Payload", "remote-case-collision"),
+                ("payload", "remote-case-collision"),
+            ]
+        );
     }
 
     #[test]
@@ -2343,9 +3264,11 @@ mod tests {
         assert_eq!(plan.uploads[0].reason, ChangeReason::ContentDiffers);
     }
 
+    /// 3.499 s floors and rounds to 3, so a remote 4 is a change. (3.5 s or later would round to 4
+    /// and agree: DSM may have stored it that way.)
     #[test]
     fn content_mode_detects_mtime_only_changes_at_file_station_resolution() {
-        let mut local = local(&[("mtime-only.bin", EntryKind::File, 4, 3_999)]);
+        let mut local = local(&[("mtime-only.bin", EntryKind::File, 4, 3_499)]);
         let mut remote = remote(&[("mtime-only.bin", EntryKind::File, 4, 4)]);
         local.entries.get_mut("mtime-only.bin").unwrap().content_md5 = Some(digest(6));
         remote
@@ -2667,6 +3590,7 @@ mod status_tests {
                     )
                 })
                 .collect(),
+            skipped: Vec::new(),
         }
     }
 
@@ -3639,6 +4563,7 @@ mod scoped_deletion_tests {
                     )
                 })
                 .collect(),
+            skipped: Vec::new(),
         }
     }
 
@@ -3814,6 +4739,7 @@ mod resync_ticket_tests {
             },
             remote_path: format!("/share/root/{relative}"),
             reason: ChangeReason::Forced,
+            expected_remote: None,
         }
     }
 
@@ -3833,6 +4759,7 @@ mod resync_ticket_tests {
             unchanged_files: 0,
             protected_entries: 0,
             upload_bytes,
+            skipped: Vec::new(),
         }
     }
 

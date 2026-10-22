@@ -40,6 +40,9 @@ ignore = "0.4.33"
 keyring-core = "1.0.0"
 md-5 = { version = "0.11.0", default-features = false }
 hmac = "0.13.0"
+# Already in the tree through `url` -> `idna`; named directly so path comparison can fold
+# NFC and NFD spellings of one name together (see `path::nfc`).
+icu_normalizer = { version = "2.3.0", default-features = false, features = ["compiled_data"] }
 # `rustls-no-provider` rather than `rustls`: reqwest's `rustls` feature hard-wires
 # the aws-lc-rs provider, whose RNG falls back to /dev/urandom with an
 # RNDGETENTCNT wait when the kernel has no getrandom(2). On a headless NAS that

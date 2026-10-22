@@ -168,7 +168,7 @@ impl CacheState {
 }
 
 /// What a status answer's digests cost, for the `cache` object in the status output.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CacheReport {
     pub state: CacheState,
     pub digests_reused: usize,
@@ -176,6 +176,9 @@ pub struct CacheReport {
     /// The oldest observation any served digest rests on; the honest "as of" for the whole answer.
     pub oldest_evidence_epoch: Option<i64>,
     pub canary_checked: usize,
+    /// Every condition the cache met this pass instead of working normally. Published with the
+    /// answer, so a cache that has quietly stopped helping says so.
+    pub issues: Vec<CacheIssue>,
 }
 
 impl CacheReport {
@@ -186,7 +189,97 @@ impl CacheReport {
             digests_computed: 0,
             oldest_evidence_epoch: None,
             canary_checked: 0,
+            issues: Vec::new(),
         }
+    }
+}
+
+/// A condition a configured cache met instead of working normally: why it was declined, why stored
+/// evidence was not used, or why something could not be written or cleaned up.
+///
+/// Every one of these used to be silent. The cache is disposable and none of them changes an
+/// answer -- each degrades to "recompute live" -- but a cache that has quietly stopped working costs
+/// the operator every scan it was meant to save, and a dashboard that cannot say so shows a fast
+/// answer turning slow for no stated reason. So each is a named record a caller logs and publishes.
+///
+/// `code` is a stable machine tag; `severity` is `warning` for a fault someone may need to fix and
+/// `info` for an expected retirement (another build or profile wrote the file).
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct CacheIssue {
+    pub code: String,
+    pub severity: String,
+    /// The file or directory concerned.
+    pub path: String,
+    /// What went wrong, including the operating system's error where there was one.
+    pub cause: String,
+}
+
+impl CacheIssue {
+    pub const PROFILE_NAME_UNSAFE: &'static str = "cache-profile-name-unsafe";
+    pub const DIRECTORY_UNUSABLE: &'static str = "cache-directory-unusable";
+    pub const FILE_UNSAFE: &'static str = "cache-file-unsafe";
+    pub const FILE_UNREADABLE: &'static str = "cache-file-unreadable";
+    pub const FILE_CORRUPT: &'static str = "cache-file-corrupt";
+    pub const FILE_RETIRED: &'static str = "cache-file-retired";
+    pub const RECORDS_REJECTED: &'static str = "cache-records-rejected";
+    pub const STORE_FAILED: &'static str = "cache-store-failed";
+    pub const ROLLUP_STORE_FAILED: &'static str = "cache-rollup-store-failed";
+    pub const CLEANUP_FAILED: &'static str = "cache-cleanup-failed";
+    pub const EVICTION_FAILED: &'static str = "cache-eviction-failed";
+    pub const DISCARD_FAILED: &'static str = "cache-discard-failed";
+    pub const CANARY_MISMATCH: &'static str = "cache-canary-mismatch";
+    pub const CLOCK_UNREADABLE: &'static str = "cache-clock-unreadable";
+    pub const ROLLUP_DIRECTORY_UNREADABLE: &'static str = "rollup-directory-unreadable";
+    pub const ROLLUP_UNREADABLE: &'static str = "rollup-unreadable";
+    pub const ROLLUP_CORRUPT: &'static str = "rollup-corrupt";
+    pub const ROLLUP_FOREIGN: &'static str = "rollup-foreign";
+
+    pub fn warning(code: &str, path: &Path, cause: impl Into<String>) -> Self {
+        Self::new(code, "warning", path, cause)
+    }
+
+    pub fn info(code: &str, path: &Path, cause: impl Into<String>) -> Self {
+        Self::new(code, "info", path, cause)
+    }
+
+    fn new(code: &str, severity: &str, path: &Path, cause: impl Into<String>) -> Self {
+        Self {
+            code: code.to_owned(),
+            severity: severity.to_owned(),
+            path: path.display().to_string(),
+            cause: cause.into(),
+        }
+    }
+
+    /// The canary found a served digest that live evidence contradicts. Raised by the caller, which
+    /// is the one that compared, and named here so every cache condition shares one vocabulary.
+    pub fn canary_mismatch(cache_file: &Path, relative: &str) -> Self {
+        Self::warning(
+            Self::CANARY_MISMATCH,
+            cache_file,
+            format!("stored digest for {relative:?} disagreed with live evidence; file discarded"),
+        )
+    }
+
+    pub fn is_warning(&self) -> bool {
+        self.severity == "warning"
+    }
+}
+
+impl std::fmt::Display for CacheIssue {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{}: {}: {}", self.code, self.path, self.cause)
+    }
+}
+
+impl std::error::Error for CacheIssue {}
+
+/// Remove a temporary or stale file, reporting anything but "already gone".
+fn remove_reporting(path: &Path, code: &str) -> Result<(), CacheIssue> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(CacheIssue::warning(code, path, error.to_string())),
     }
 }
 
@@ -309,29 +402,63 @@ pub struct StatusCache {
     /// and read in another, and threading it through the writer's signature would let a caller
     /// pass a value that contradicts what the reader actually did.
     canary_at: std::cell::Cell<i64>,
+    /// Conditions met while serving or writing, in the order they happened, one per code and path.
+    issues: std::cell::RefCell<Vec<CacheIssue>>,
 }
 
 impl StatusCache {
-    /// Bind to a profile's cache, or decline.
+    /// Bind to a profile's cache, or say exactly why not.
     ///
-    /// Declines rather than fails: an unusable directory means the query runs exactly as it did
-    /// before this module existed. `None` is never an error the caller reports.
-    pub fn open(options: CacheOptions, now: i64) -> Option<Self> {
+    /// A refusal is not a failure of the query, which then runs exactly as it did before this module
+    /// existed -- but it is a condition the caller must log and publish, never drop: a cache that
+    /// was configured and silently never used is indistinguishable from one that works.
+    pub fn open(options: CacheOptions, now: i64) -> Result<Self, CacheIssue> {
         if !name_is_safe(&options.profile) {
-            return None;
+            return Err(CacheIssue::warning(
+                CacheIssue::PROFILE_NAME_UNSAFE,
+                &options.directory,
+                format!(
+                    "profile name {:?} cannot be used as a cache file name",
+                    options.profile
+                ),
+            ));
         }
-        if !directory_is_private(&options.directory) {
-            return None;
-        }
+        directory_is_private(&options.directory).map_err(|cause| {
+            CacheIssue::warning(CacheIssue::DIRECTORY_UNUSABLE, &options.directory, cause)
+        })?;
         let path = options
             .directory
             .join(format!("{}.ndjson", options.profile));
-        Some(Self {
+        Ok(Self {
             options,
             path,
             now,
             canary_at: std::cell::Cell::new(0),
+            issues: std::cell::RefCell::new(Vec::new()),
         })
+    }
+
+    /// Every condition met so far by this handle, for the caller to log and publish.
+    pub fn issues(&self) -> Vec<CacheIssue> {
+        self.issues.borrow().clone()
+    }
+
+    fn note(&self, issue: CacheIssue) {
+        let mut issues = self.issues.borrow_mut();
+        if !issues
+            .iter()
+            .any(|known| known.code == issue.code && known.path == issue.path)
+        {
+            issues.push(issue);
+        }
+    }
+
+    fn corrupt(&self, cause: impl Into<String>) {
+        self.note(CacheIssue::warning(
+            CacheIssue::FILE_CORRUPT,
+            &self.path,
+            cause,
+        ));
     }
 
     pub fn path(&self) -> &Path {
@@ -397,17 +524,32 @@ impl StatusCache {
         if self.options.refresh || comparison.is_empty() {
             return true;
         }
-        let Some(reader) = self.open_validated() else {
-            return true;
+        let reader = match self.open_validated() {
+            Ok(Some(reader)) => reader,
+            // Nothing stored yet: an ordinary cold pass, not a condition.
+            Ok(None) => return true,
+            Err(issue) => {
+                self.note(issue);
+                return true;
+            }
         };
         let mut reader = reader;
         let mut line = String::new();
 
         // The header decides whether any of the rest describes this query at all.
-        let Some(header) = read_header(&mut reader, &mut line) else {
-            return false;
+        let header = match read_header(&mut reader, &mut line) {
+            Ok(header) => header,
+            Err(cause) => {
+                self.corrupt(cause);
+                return false;
+            }
         };
-        if !self.header_matches(&header) {
+        if let Err(cause) = self.header_matches(&header) {
+            self.note(CacheIssue::info(
+                CacheIssue::FILE_RETIRED,
+                &self.path,
+                cause,
+            ));
             return true;
         }
 
@@ -427,10 +569,6 @@ impl StatusCache {
             (header.generated_at.rem_euclid(stride as i64)) as usize
         };
         let expiry = self.now.saturating_sub(self.options.max_age_seconds);
-        let racy_floor = header
-            .generated_at
-            .saturating_sub(RACY_WINDOW_SECONDS)
-            .saturating_mul(1000);
 
         let mut previous: Option<String> = None;
         let mut eligible = 0_usize;
@@ -441,17 +579,28 @@ impl StatusCache {
             match reader.read_line(&mut line) {
                 Ok(0) => break,
                 Ok(_) => {}
-                Err(_) => return false,
+                Err(error) => {
+                    self.note(CacheIssue::warning(
+                        CacheIssue::FILE_UNREADABLE,
+                        &self.path,
+                        error.to_string(),
+                    ));
+                    return false;
+                }
             }
             let trimmed = line.trim_end_matches(['\n', '\r']);
             if trimmed == END_SENTINEL {
                 ended = true;
                 break;
             }
-            let Ok(record) = serde_json::from_str::<RecordRef<'_>>(trimmed) else {
-                // One unparseable line means the file is not what this module wrote. Abandon all of
-                // it rather than reason about which half is trustworthy.
-                return false;
+            let record = match serde_json::from_str::<RecordRef<'_>>(trimmed) {
+                Ok(record) => record,
+                Err(error) => {
+                    // One unparseable line means the file is not what this module wrote. Abandon
+                    // all of it rather than reason about which half is trustworthy.
+                    self.corrupt(format!("unparseable record: {error}"));
+                    return false;
+                }
             };
             // Ordering is part of the format: it is what lets the writer merge without holding the
             // whole file, and a violation is the cheapest available proof of a mangled file.
@@ -459,6 +608,7 @@ impl StatusCache {
                 .as_deref()
                 .is_some_and(|last| record.p.as_ref() <= last)
             {
+                self.corrupt(format!("record {:?} is out of order", record.p));
                 return false;
             }
             previous = Some(record.p.clone().into_owned());
@@ -466,13 +616,26 @@ impl StatusCache {
             if record.t > self.now || record.t < expiry {
                 continue;
             }
+            // Racy relative to when *this record* was observed, not when the file was written. A
+            // scoped pass rewrites the file under a new `generated_at` but carries out-of-scope
+            // records with their old observation time, so a floor taken from the header let a
+            // record that was racy when it was observed become servable after the next scoped
+            // rewrite. `min` keeps the header's floor for a record stamped in the future, which
+            // the expiry check above already refuses anyway.
+            let racy_floor = record
+                .t
+                .min(header.generated_at)
+                .saturating_sub(RACY_WINDOW_SECONDS)
+                .saturating_mul(1000);
             if record.m >= racy_floor {
                 continue;
             }
             let (Some(local_md5), Some(remote_md5)) =
                 (parse_md5(&record.lmd5), parse_md5(&record.rmd5))
             else {
-                continue;
+                // This writer only ever writes 32 hex digits, so anything else is damage.
+                self.corrupt(format!("record {:?} carries a malformed digest", record.p));
+                return false;
             };
             if !comparison.contains(record.p.as_ref()) {
                 continue;
@@ -529,6 +692,9 @@ impl StatusCache {
         // A file without its sentinel was truncated, so nothing read from it is trusted. Only a
         // trusted read carries an audit epoch forward: a rejected file is about to be rewritten
         // from scratch, and evidence gathered afresh has not been sampled at all.
+        if !ended {
+            self.corrupt("file ends without its end marker (truncated)");
+        }
         if ended {
             self.canary_at.set(if audit_due {
                 self.now
@@ -575,8 +741,13 @@ impl StatusCache {
     }
 
     /// Remove the cache file. Used when the canary fails, and safe to call at any time.
-    pub fn discard(&self) {
-        let _ = fs::remove_file(&self.path);
+    ///
+    /// A file that cannot be removed is reported: it would be read again by the next pass, which
+    /// the canary would then have to catch a second time.
+    pub fn discard(&self) -> Result<(), CacheIssue> {
+        remove_reporting(&self.path, CacheIssue::DISCARD_FAILED).inspect_err(|issue| {
+            self.note(issue.clone());
+        })
     }
 
     /// Rewrite the cache as the union of this run's observations and the still-usable stored ones.
@@ -609,6 +780,20 @@ impl StatusCache {
         remote: &RemoteInventory,
         comparison: &BTreeSet<String>,
         scoped: bool,
+    ) -> Result<(), CacheIssue> {
+        self.store_io(local, remote, comparison, scoped)
+            .map_err(|error| {
+                CacheIssue::warning(CacheIssue::STORE_FAILED, &self.path, error.to_string())
+            })
+            .inspect_err(|issue| self.note(issue.clone()))
+    }
+
+    fn store_io(
+        &self,
+        local: &LocalInventory,
+        remote: &RemoteInventory,
+        comparison: &BTreeSet<String>,
+        scoped: bool,
     ) -> std::io::Result<()> {
         // One unusable stored record discards the whole stored file rather than half of it — the
         // policy `read_into` documents and applies, for the same reason: nothing here can tell which
@@ -617,6 +802,11 @@ impl StatusCache {
         // again from this run's observations alone. It costs a second pass only in the case where
         // the stored file was corrupt, and that file is about to be replaced regardless.
         if self.write_merged(local, remote, comparison, scoped, true)? == Merge::CarriedRejected {
+            self.note(CacheIssue::warning(
+                CacheIssue::RECORDS_REJECTED,
+                &self.path,
+                "stored records could not be carried forward; rewritten from this pass alone",
+            ));
             self.write_merged(local, remote, comparison, scoped, false)?;
         }
         Ok(())
@@ -748,18 +938,18 @@ impl StatusCache {
         match outcome {
             Ok(Merge::Written) => {
                 if let Err(error) = fs::rename(&temporary, &self.path) {
-                    let _ = fs::remove_file(&temporary);
+                    self.clean_up(&temporary);
                     return Err(error);
                 }
                 self.enforce_directory_limit();
                 Ok(Merge::Written)
             }
             Ok(Merge::CarriedRejected) => {
-                let _ = fs::remove_file(&temporary);
+                self.clean_up(&temporary);
                 Ok(Merge::CarriedRejected)
             }
             Err(error) => {
-                let _ = fs::remove_file(&temporary);
+                self.clean_up(&temporary);
                 Err(error)
             }
         }
@@ -838,6 +1028,23 @@ impl StatusCache {
         stats: &StatusStats,
         report: &CacheReport,
         scoped: bool,
+    ) -> Result<(), CacheIssue> {
+        self.store_rollup_io(stats, report, scoped)
+            .map_err(|error| {
+                CacheIssue::warning(
+                    CacheIssue::ROLLUP_STORE_FAILED,
+                    &self.rollup_path(),
+                    error.to_string(),
+                )
+            })
+            .inspect_err(|issue| self.note(issue.clone()))
+    }
+
+    fn store_rollup_io(
+        &self,
+        stats: &StatusStats,
+        report: &CacheReport,
+        scoped: bool,
     ) -> std::io::Result<()> {
         if scoped {
             return Ok(());
@@ -879,27 +1086,51 @@ impl StatusCache {
         })();
         if let Err(error) = write {
             drop(writer);
-            let _ = fs::remove_file(&temporary);
+            self.clean_up(&temporary);
             return Err(error);
         }
         drop(writer);
         if let Err(error) = fs::rename(&temporary, &target) {
-            let _ = fs::remove_file(&temporary);
+            self.clean_up(&temporary);
             return Err(error);
         }
         Ok(())
     }
 
-    fn header_matches(&self, header: &Header) -> bool {
-        header.schema == SCHEMA
-            && header.digest_strength == DIGEST_STRENGTH
-            && header.binary == env!("SDSYNC_VERSION")
-            && header.platform == std::env::consts::OS
-            && header.profile == self.options.profile
-            && header.source == self.options.source
-            && header.remote == self.options.remote
-            && header.compare == self.options.compare
-            && header.generated_at <= self.now
+    /// Remove a temporary file after a failed write, reporting a removal that itself fails: the
+    /// leftover would otherwise sit in the directory, uncounted, until the same PID came round.
+    fn clean_up(&self, temporary: &Path) {
+        if let Err(issue) = remove_reporting(temporary, CacheIssue::CLEANUP_FAILED) {
+            self.note(issue);
+        }
+    }
+
+    /// Whether a stored header describes this query, and if not, which field says so.
+    fn header_matches(&self, header: &Header) -> Result<(), String> {
+        let mismatch = if header.schema != SCHEMA {
+            "schema"
+        } else if header.digest_strength != DIGEST_STRENGTH {
+            "digest strength"
+        } else if header.binary != env!("SDSYNC_VERSION") {
+            "package version"
+        } else if header.platform != std::env::consts::OS {
+            "platform"
+        } else if header.profile != self.options.profile {
+            "profile"
+        } else if header.source != self.options.source {
+            "source"
+        } else if header.remote != self.options.remote {
+            "destination"
+        } else if header.compare != self.options.compare {
+            "compare mode"
+        } else if header.generated_at > self.now {
+            "write time (in the future)"
+        } else {
+            return Ok(());
+        };
+        Err(format!(
+            "written for a different {mismatch}; recomputed live and rewritten"
+        ))
     }
 
     /// Open the cache file only if it still looks like a private package file.
@@ -912,22 +1143,43 @@ impl StatusCache {
     /// `unsafe`, which this crate forbids. It is not needed: a directory this process can open that
     /// is not group- or other-writable can only have been written by this user or by root, and root
     /// is outside any threat model this check could serve.
-    fn open_validated(&self) -> Option<BufReader<fs::File>> {
-        let metadata = fs::symlink_metadata(&self.path).ok()?;
+    ///
+    /// `Ok(None)` is the one silent outcome, and only for a file that does not exist yet.
+    fn open_validated(&self) -> Result<Option<BufReader<fs::File>>, CacheIssue> {
+        let unsafe_file =
+            |cause: &str| CacheIssue::warning(CacheIssue::FILE_UNSAFE, &self.path, cause);
+        let unreadable = |error: std::io::Error| {
+            CacheIssue::warning(CacheIssue::FILE_UNREADABLE, &self.path, error.to_string())
+        };
+        let metadata = match fs::symlink_metadata(&self.path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(unreadable(error)),
+        };
         if !metadata.is_file() {
-            return None;
+            return Err(unsafe_file(
+                "not a regular file (a link, directory or device)",
+            ));
         }
         if metadata.len() > FILE_LIMIT_BYTES {
-            return None;
+            return Err(unsafe_file(&format!(
+                "{} bytes exceeds the {FILE_LIMIT_BYTES}-byte ceiling",
+                metadata.len()
+            )));
         }
         #[cfg(unix)]
         {
             use std::os::unix::fs::MetadataExt as _;
-            if metadata.nlink() != 1 || metadata.mode() & 0o077 != 0 {
-                return None;
+            if metadata.nlink() != 1 {
+                return Err(unsafe_file("has more than one hard link"));
+            }
+            if metadata.mode() & 0o077 != 0 {
+                return Err(unsafe_file("is readable or writable by group or other"));
             }
         }
-        fs::File::open(&self.path).ok().map(BufReader::new)
+        fs::File::open(&self.path)
+            .map(|file| Some(BufReader::new(file)))
+            .map_err(unreadable)
     }
 
     /// Keep the whole directory inside its byte ceiling by removing whole profile files, oldest
@@ -937,18 +1189,39 @@ impl StatusCache {
     /// Necessary because the package's own `cache_prune` filters on plain files at the top of
     /// `$cache_root` and cannot see into this subdirectory, so nothing else bounds these bytes.
     fn enforce_directory_limit(&self) {
-        let Ok(entries) = fs::read_dir(&self.options.directory) else {
-            return;
+        let directory = &self.options.directory;
+        let eviction_failed = |path: &Path, error: std::io::Error| {
+            CacheIssue::warning(CacheIssue::EVICTION_FAILED, path, error.to_string())
+        };
+        let entries = match fs::read_dir(directory) {
+            Ok(entries) => entries,
+            Err(error) => {
+                self.note(eviction_failed(directory, error));
+                return;
+            }
         };
         let mut files: Vec<(i64, u64, PathBuf)> = Vec::new();
         let mut total = 0_u64;
-        for entry in entries.flatten() {
-            let Ok(metadata) = entry.metadata() else {
-                continue;
+        for entry in entries {
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(error) => {
+                    self.note(eviction_failed(directory, error));
+                    continue;
+                }
+            };
+            let metadata = match entry.metadata() {
+                Ok(metadata) => metadata,
+                Err(error) => {
+                    self.note(eviction_failed(&entry.path(), error));
+                    continue;
+                }
             };
             if !metadata.is_file() {
                 continue;
             }
+            // Ordering only, so not a condition: a file whose time cannot be read sorts as oldest
+            // and is evicted first, which for a disposable cache file is the safe direction.
             let modified = metadata
                 .modified()
                 .ok()
@@ -970,8 +1243,9 @@ impl StatusCache {
             if path == self.path {
                 continue;
             }
-            if fs::remove_file(&path).is_ok() {
-                total = total.saturating_sub(length);
+            match fs::remove_file(&path) {
+                Ok(()) => total = total.saturating_sub(length),
+                Err(error) => self.note(eviction_failed(&path, error)),
             }
         }
     }
@@ -1038,13 +1312,29 @@ impl<'a> CarriedRecords<'a> {
             seen_any: false,
             peeked: None,
         };
-        let Some(mut reader) = cache.open_validated() else {
-            return stream;
+        // Each refusal here is noted exactly as `read_into` notes it, and deduplicated against it:
+        // carrying nothing forward is the right outcome, but it is still a condition.
+        let mut reader = match cache.open_validated() {
+            Ok(Some(reader)) => reader,
+            Ok(None) => return stream,
+            Err(issue) => {
+                cache.note(issue);
+                return stream;
+            }
         };
-        let Some(header) = read_header(&mut reader, &mut stream.line) else {
-            return stream;
+        let header = match read_header(&mut reader, &mut stream.line) {
+            Ok(header) => header,
+            Err(cause) => {
+                cache.corrupt(cause);
+                return stream;
+            }
         };
-        if !cache.header_matches(&header) {
+        if let Err(cause) = cache.header_matches(&header) {
+            cache.note(CacheIssue::info(
+                CacheIssue::FILE_RETIRED,
+                &cache.path,
+                cause,
+            ));
             return stream;
         }
         stream.reader = Some(reader);
@@ -1093,7 +1383,8 @@ impl<'a> CarriedRecords<'a> {
             let (Some(local_md5), Some(remote_md5)) =
                 (parse_md5(&record.lmd5), parse_md5(&record.rmd5))
             else {
-                continue;
+                // Damage, as in `read_into`; the caller reports the rejection.
+                return false;
             };
             let entry = StoredEntry {
                 size: record.s,
@@ -1157,12 +1448,16 @@ impl StoredEntry {
     }
 }
 
-fn read_header(reader: &mut BufReader<fs::File>, line: &mut String) -> Option<Header> {
+/// Read the header line, or say why the file has none that can be trusted.
+fn read_header(reader: &mut BufReader<fs::File>, line: &mut String) -> Result<Header, String> {
     line.clear();
-    if reader.read_line(line).ok()? == 0 {
-        return None;
+    match reader.read_line(line) {
+        Ok(0) => return Err("file is empty".to_owned()),
+        Ok(_) => {}
+        Err(error) => return Err(format!("header could not be read: {error}")),
     }
-    serde_json::from_str::<Header>(line.trim_end_matches(['\n', '\r'])).ok()
+    serde_json::from_str::<Header>(line.trim_end_matches(['\n', '\r']))
+        .map_err(|error| format!("header is not valid: {error}"))
 }
 
 /// Spacing between canary picks, sized from the record count the header claims.
@@ -1195,21 +1490,19 @@ fn create_private(path: &Path) -> std::io::Result<fs::File> {
 
 /// A directory is usable only if it is a real directory, not a symbolic link, and grants no write
 /// access to group or other. See [`StatusCache::open_validated`] for why ownership is not compared.
-fn directory_is_private(path: &Path) -> bool {
-    let Ok(metadata) = fs::symlink_metadata(path) else {
-        return false;
-    };
+fn directory_is_private(path: &Path) -> Result<(), String> {
+    let metadata = fs::symlink_metadata(path).map_err(|error| error.to_string())?;
     if !metadata.is_dir() {
-        return false;
+        return Err("not a directory (a link or a file)".to_owned());
     }
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt as _;
         if metadata.mode() & 0o022 != 0 {
-            return false;
+            return Err("writable by group or other".to_owned());
         }
     }
-    true
+    Ok(())
 }
 
 /// The profile name becomes a filename, so it is constrained exactly as the package's own
@@ -1439,6 +1732,10 @@ pub struct RollupAggregate {
     pub total_unavailable_reason: Option<String>,
     /// Per-profile rows, in profile order, for a reader that renders them individually.
     pub profiles: Vec<RollupDocument>,
+    /// Every rollup file that was present and not used, and why. A profile whose document is here
+    /// also appears in `profiles_never_observed` when it was expected; this says what to fix.
+    #[serde(default)]
+    pub issues: Vec<CacheIssue>,
 }
 
 /// Compose the whole-NAS figure from every rollup in `directory`.
@@ -1452,26 +1749,72 @@ pub struct RollupAggregate {
 /// Reads nothing but the rollup files themselves. No digest cache, no source file, no network.
 pub fn compose_rollups(directory: &Path, expected: Option<&[String]>, now: i64) -> RollupAggregate {
     let mut documents: BTreeMap<String, RollupDocument> = BTreeMap::new();
-    if let Ok(entries) = fs::read_dir(directory) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if !path.to_string_lossy().ends_with(".rollup.json") {
-                continue;
+    let mut issues = Vec::new();
+    match fs::read_dir(directory) {
+        Ok(entries) => {
+            for entry in entries {
+                let entry = match entry {
+                    Ok(entry) => entry,
+                    Err(error) => {
+                        issues.push(CacheIssue::warning(
+                            CacheIssue::ROLLUP_DIRECTORY_UNREADABLE,
+                            directory,
+                            error.to_string(),
+                        ));
+                        continue;
+                    }
+                };
+                let path = entry.path();
+                if !path.to_string_lossy().ends_with(".rollup.json") {
+                    continue;
+                }
+                let text = match fs::read_to_string(&path) {
+                    Ok(text) => text,
+                    Err(error) => {
+                        issues.push(CacheIssue::warning(
+                            CacheIssue::ROLLUP_UNREADABLE,
+                            &path,
+                            error.to_string(),
+                        ));
+                        continue;
+                    }
+                };
+                let document = match serde_json::from_str::<RollupDocument>(&text) {
+                    Ok(document) => document,
+                    Err(error) => {
+                        issues.push(CacheIssue::warning(
+                            CacheIssue::ROLLUP_CORRUPT,
+                            &path,
+                            error.to_string(),
+                        ));
+                        continue;
+                    }
+                };
+                // A document from another format, or another build whose quantities may have
+                // changed meaning, is not evidence about this one. Skipping it leaves the profile
+                // unobserved, which forces the total incomplete rather than quietly dropping it
+                // from the sum -- and the skip is named, so the reader can say why.
+                if document.schema != ROLLUP_SCHEMA || document.binary != env!("SDSYNC_VERSION") {
+                    issues.push(CacheIssue::info(
+                        CacheIssue::ROLLUP_FOREIGN,
+                        &path,
+                        format!(
+                            "written by schema {:?} / build {:?}; waiting for this build's next status pass",
+                            document.schema, document.binary
+                        ),
+                    ));
+                    continue;
+                }
+                documents.insert(document.profile.clone(), document);
             }
-            let Ok(text) = fs::read_to_string(&path) else {
-                continue;
-            };
-            let Ok(document) = serde_json::from_str::<RollupDocument>(&text) else {
-                continue;
-            };
-            // A document from another format, or another build whose quantities may have changed
-            // meaning, is not evidence about this one. Skipping it leaves the profile unobserved,
-            // which forces the total incomplete rather than quietly dropping it from the sum.
-            if document.schema != ROLLUP_SCHEMA || document.binary != env!("SDSYNC_VERSION") {
-                continue;
-            }
-            documents.insert(document.profile.clone(), document);
         }
+        // No directory yet means no profile has been observed, which the result already says.
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => issues.push(CacheIssue::warning(
+            CacheIssue::ROLLUP_DIRECTORY_UNREADABLE,
+            directory,
+            error.to_string(),
+        )),
     }
 
     let never_observed: Vec<String> = expected
@@ -1531,6 +1874,7 @@ pub fn compose_rollups(directory: &Path, expected: Option<&[String]>, now: i64) 
         total,
         total_unavailable_reason,
         profiles: documents.into_values().collect(),
+        issues,
     }
 }
 
@@ -1658,6 +2002,7 @@ mod tests {
             LocalInventory {
                 root: PathBuf::from("/volume1/photos"),
                 entries: BTreeMap::new(),
+                skipped: Vec::new(),
             },
             RemoteInventory {
                 root_exists: true,
@@ -2057,6 +2402,67 @@ mod tests {
                 .serve(&mut fresh_local, &mut fresh_remote, &comparison)
                 .supplied
                 == 0
+        );
+    }
+
+    /// N-10: a record observed inside its racy window stays withheld after a scoped pass carries it
+    /// into a newer file. The rewrite stamps the file with a later `generated_at` but keeps the
+    /// record's own observation time, and the racy rule must follow the latter.
+    #[test]
+    fn a_carried_record_stays_racy_after_a_scoped_rewrite() {
+        let scratch = Scratch::new();
+        let cache = StatusCache::open(options(&scratch.0), NOW).expect("cache opens");
+        let (mut local, mut remote) = inventories();
+        // Modified in the same second it was observed.
+        pair(&mut local, &mut remote, "kept/racy.bin", 10, NOW * 1000, 11);
+        pair(&mut local, &mut remote, "scoped/b.bin", 20, 2_000_000, 12);
+        warm(&cache, &mut local, &mut remote, 0x41);
+
+        // A scoped pass ten minutes later, over "scoped/" only, carries "kept/racy.bin".
+        let (mut scoped_local, mut scoped_remote) = inventories();
+        pair(
+            &mut scoped_local,
+            &mut scoped_remote,
+            "scoped/b.bin",
+            20,
+            2_000_000,
+            12,
+        );
+        for entry in scoped_local.entries.values_mut() {
+            entry.content_md5 = Some(digest(0x41));
+        }
+        for entry in scoped_remote.entries.values_mut() {
+            entry.content_md5 = Some(digest(0x41));
+        }
+        let comparison = comparison_of(&scoped_local);
+        StatusCache::open(options(&scratch.0), NOW + 600)
+            .expect("cache opens")
+            .store(&scoped_local, &scoped_remote, &comparison, true)
+            .expect("store");
+        assert!(
+            fs::read_to_string(cache.path())
+                .expect("readable")
+                .contains("kept/racy.bin"),
+            "the record was carried"
+        );
+
+        let (mut fresh_local, mut fresh_remote) = inventories();
+        pair(
+            &mut fresh_local,
+            &mut fresh_remote,
+            "kept/racy.bin",
+            10,
+            NOW * 1000,
+            11,
+        );
+        let comparison = comparison_of(&fresh_local);
+        let later = StatusCache::open(options(&scratch.0), NOW + 1200).expect("cache opens");
+        assert_eq!(
+            later
+                .serve(&mut fresh_local, &mut fresh_remote, &comparison)
+                .supplied,
+            0,
+            "racy evidence became servable because a later scoped pass rewrote the file"
         );
     }
 
@@ -2522,19 +2928,165 @@ mod tests {
         for name in ["", "..", "../escape", "a/b", ".hidden", "with space"] {
             let mut candidate = options(&scratch.0);
             candidate.profile = name.to_owned();
-            assert!(
-                StatusCache::open(candidate, NOW).is_none(),
+            let refusal = StatusCache::open(candidate, NOW).expect_err(&format!(
                 "profile name {name:?} was accepted as a file name"
-            );
+            ));
+            assert_eq!(refusal.code, CacheIssue::PROFILE_NAME_UNSAFE);
+            assert!(refusal.is_warning());
         }
     }
 
+    /// S-7: a configured cache that cannot be used is a named condition with its cause, never a
+    /// silent `None` the caller cannot report.
     #[test]
-    fn a_missing_directory_declines_rather_than_failing() {
+    fn a_missing_directory_is_refused_with_a_named_cause() {
         let scratch = Scratch::new();
         let mut absent = options(&scratch.0);
         absent.directory = scratch.0.join("does-not-exist");
-        assert!(StatusCache::open(absent, NOW).is_none());
+        let refusal = StatusCache::open(absent, NOW).expect_err("an absent directory was accepted");
+        assert_eq!(refusal.code, CacheIssue::DIRECTORY_UNUSABLE);
+        assert!(refusal.path.ends_with("does-not-exist"), "{refusal}");
+        assert!(!refusal.cause.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_group_writable_directory_is_refused_and_says_why() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let scratch = Scratch::new();
+        fs::set_permissions(&scratch.0, fs::Permissions::from_mode(0o775)).expect("chmod");
+        let refusal =
+            StatusCache::open(options(&scratch.0), NOW).expect_err("a shared directory was used");
+        assert_eq!(refusal.code, CacheIssue::DIRECTORY_UNUSABLE);
+        assert!(refusal.cause.contains("group or other"), "{refusal}");
+    }
+
+    /// A damaged stored file still degrades to a cold pass, and now says so.
+    #[test]
+    fn a_damaged_file_is_reported_as_corrupt_and_served_cold() {
+        let scratch = Scratch::new();
+        let cache = StatusCache::open(options(&scratch.0), NOW).expect("cache opens");
+        let (mut local, mut remote) = inventories();
+        pair(&mut local, &mut remote, "a.bin", 10, 1_000_000, 11);
+        warm(&cache, &mut local, &mut remote, 0x21);
+        let text = fs::read_to_string(cache.path()).expect("readable");
+        fs::write(
+            cache.path(),
+            text.replace(
+                &format!(
+                    "{END_SENTINEL}
+"
+                ),
+                "",
+            ),
+        )
+        .expect("truncate");
+
+        let (mut fresh_local, mut fresh_remote) = inventories();
+        pair(
+            &mut fresh_local,
+            &mut fresh_remote,
+            "a.bin",
+            10,
+            1_000_000,
+            11,
+        );
+        let comparison = comparison_of(&fresh_local);
+        let reader = StatusCache::open(options(&scratch.0), NOW + 5).expect("cache opens");
+        assert_eq!(
+            reader
+                .serve(&mut fresh_local, &mut fresh_remote, &comparison)
+                .supplied,
+            0
+        );
+        let issues = reader.issues();
+        assert_eq!(
+            issues
+                .iter()
+                .map(|issue| issue.code.as_str())
+                .collect::<Vec<_>>(),
+            [CacheIssue::FILE_CORRUPT],
+            "{issues:?}"
+        );
+        assert!(issues[0].cause.contains("truncated"), "{}", issues[0]);
+    }
+
+    /// A file written for another query is retired, reported at `info`: it is expected after an
+    /// upgrade or a repointed profile, and nothing needs fixing.
+    #[test]
+    fn a_file_from_another_query_is_reported_as_retired() {
+        let scratch = Scratch::new();
+        let cache = StatusCache::open(options(&scratch.0), NOW).expect("cache opens");
+        let (mut local, mut remote) = inventories();
+        pair(&mut local, &mut remote, "a.bin", 10, 1_000_000, 11);
+        warm(&cache, &mut local, &mut remote, 0x22);
+
+        let mut repointed = options(&scratch.0);
+        repointed.remote = "/team/elsewhere".to_owned();
+        let reader = StatusCache::open(repointed, NOW + 5).expect("cache opens");
+        let (mut fresh_local, mut fresh_remote) = inventories();
+        pair(
+            &mut fresh_local,
+            &mut fresh_remote,
+            "a.bin",
+            10,
+            1_000_000,
+            11,
+        );
+        let comparison = comparison_of(&fresh_local);
+        reader.serve(&mut fresh_local, &mut fresh_remote, &comparison);
+        let issues = reader.issues();
+        assert_eq!(issues.len(), 1, "{issues:?}");
+        assert_eq!(issues[0].code, CacheIssue::FILE_RETIRED);
+        assert!(!issues[0].is_warning());
+        assert!(issues[0].cause.contains("destination"), "{}", issues[0]);
+    }
+
+    /// A store that cannot write returns a named condition instead of a bare I/O error.
+    #[test]
+    fn a_failed_store_is_a_named_condition() {
+        let scratch = Scratch::new();
+        let cache = StatusCache::open(options(&scratch.0), NOW).expect("cache opens");
+        let (mut local, mut remote) = inventories();
+        pair(&mut local, &mut remote, "a.bin", 10, 1_000_000, 11);
+        fs::remove_dir_all(&scratch.0).expect("remove the directory under the cache");
+        for entry in local.entries.values_mut() {
+            entry.content_md5 = Some(digest(0x23));
+        }
+        for entry in remote.entries.values_mut() {
+            entry.content_md5 = Some(digest(0x23));
+        }
+        let comparison = comparison_of(&local);
+        let issue = cache
+            .store(&local, &remote, &comparison, false)
+            .expect_err("a store into a vanished directory succeeded");
+        assert_eq!(issue.code, CacheIssue::STORE_FAILED);
+        assert!(cache.issues().contains(&issue));
+        assert_eq!(
+            cache.discard(),
+            Ok(()),
+            "an absent file is already discarded"
+        );
+    }
+
+    /// The aggregate names every rollup file it could not use, instead of quietly treating the
+    /// profile as never observed.
+    #[test]
+    fn unusable_rollup_files_are_named_in_the_aggregate() {
+        let scratch = Scratch::new();
+        fs::write(scratch.0.join("broken.rollup.json"), "{not json").expect("write");
+        let aggregate = compose_rollups(&scratch.0, Some(&["broken".to_owned()]), NOW);
+        assert_eq!(aggregate.profiles_never_observed, ["broken"]);
+        assert_eq!(
+            aggregate
+                .issues
+                .iter()
+                .map(|issue| issue.code.as_str())
+                .collect::<Vec<_>>(),
+            [CacheIssue::ROLLUP_CORRUPT]
+        );
+        let absent = compose_rollups(&scratch.0.join("nowhere"), None, NOW);
+        assert!(absent.issues.is_empty(), "no directory yet is not a fault");
     }
 
     /// The rollup is a separate document describing the whole profile, so a scoped pass — whose
@@ -2550,6 +3102,7 @@ mod tests {
             digests_computed: 3,
             oldest_evidence_epoch: Some(NOW - 900),
             canary_checked: 2,
+            issues: Vec::new(),
         };
 
         cache

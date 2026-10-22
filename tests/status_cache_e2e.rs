@@ -345,6 +345,12 @@ fn a_configured_cache_that_cannot_be_opened_is_reported_rather_than_read_as_abse
         "a configured directory that could not be used is not the same answer as no directory"
     );
     assert_eq!(answer["cache"]["entries_reused"], 0);
+    // The refusal is published as a named record, not only as a line on stderr.
+    assert_eq!(
+        answer["cache"]["issues"][0]["code"], "cache-directory-unusable",
+        "the published answer must say why the cache was unusable: {answer}"
+    );
+    assert_eq!(answer["cache"]["issues"][0]["severity"], "warning");
     let diagnostics = String::from_utf8_lossy(&output.stderr);
     assert!(
         diagnostics.contains("status cache"),

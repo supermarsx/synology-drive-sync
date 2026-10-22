@@ -87,9 +87,150 @@ pub struct LocalEntry {
 pub struct LocalInventory {
     pub root: PathBuf,
     pub entries: BTreeMap<String, LocalEntry>,
+    /// Paths the walk saw and declined to carry, and why.
+    ///
+    /// Not an exclusion: nobody asked for these to be left out, so they are reported. And not an
+    /// absence either. A skipped path exists locally, so the planner treats it and everything
+    /// beneath it as protected and never schedules a mirror deletion there.
+    pub skipped: Vec<SkippedEntry>,
 }
 
+/// One path a run did not carry although nothing excluded it.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SkippedEntry {
+    /// Source-relative path, in the local spelling where one exists and the remote one otherwise.
+    pub relative: String,
+    pub reason: SkipReason,
+}
+
+/// Why a path was skipped instead of failing the whole run.
+///
+/// Each of these used to be a whole-run refusal, so one `desktop.ini` or one case-only rename
+/// anywhere in a tree meant nothing synced at all, on every run, until someone found and fixed it
+/// by hand. A skip carries only the affected path and leaves both sides of it untouched.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum SkipReason {
+    /// A Windows SYSTEM or TEMPORARY entry that the default exclusions did not cover.
+    WindowsAttributes,
+    /// A symbolic link, junction or volume mount point -- an entry that redirects to another path --
+    /// or a reparse point with no data behind it at all (an app execution alias, an `AF_UNIX`
+    /// socket).
+    /// Reparse points that hold their own data (deduplicated files, hydrated or pinned OneDrive
+    /// files) are not this; they are carried as ordinary files.
+    LinkOrReparsePoint,
+    /// A cloud or HSM placeholder whose content is not on this disk (`RECALL_ON_DATA_ACCESS`,
+    /// `RECALL_ON_OPEN` or `OFFLINE`). Reading it would start a download, so it is not read.
+    DehydratedPlaceholder,
+    /// Two local names differ only by case or Unicode normalisation.
+    LocalCaseCollision { other: String },
+    /// The destination already holds a second spelling of this path.
+    RemoteCaseCollision { other: String },
+    /// A case-only rename. Carrying it means removing the old remote spelling, which only a
+    /// mirror run (`--delete`) may do.
+    CaseRenameNeedsDelete { remote: String },
+    /// Withheld after the walk because it could not be read consistently, with the error that said
+    /// so. See [`LocalInventory::withhold`].
+    Deferred { detail: String },
+}
+
+impl SkipReason {
+    /// Stable machine tag.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::WindowsAttributes => "windows-attributes",
+            Self::LinkOrReparsePoint => "link-or-reparse-point",
+            Self::DehydratedPlaceholder => "dehydrated-placeholder",
+            Self::LocalCaseCollision { .. } => "local-case-collision",
+            Self::RemoteCaseCollision { .. } => "remote-case-collision",
+            Self::CaseRenameNeedsDelete { .. } => "case-rename-needs-delete",
+            Self::Deferred { .. } => "deferred",
+        }
+    }
+
+    /// One human sentence, naming the other spelling where there is one.
+    pub fn detail(&self) -> String {
+        match self {
+            Self::WindowsAttributes => {
+                "Windows SYSTEM and TEMPORARY entries are not synchronized by Synology Drive"
+                    .to_owned()
+            }
+            Self::LinkOrReparsePoint => {
+                "symbolic links, junctions, mount points and data-less reparse points (app \
+                 execution aliases, sockets) are not followed"
+                    .to_owned()
+            }
+            Self::DehydratedPlaceholder => {
+                "an online-only placeholder whose content is not on this disk; reading it would                  download it, so it is skipped until it is made available offline"
+                    .to_owned()
+            }
+            Self::LocalCaseCollision { other } => format!(
+                "the source also holds {other:?}; names that differ only by case or Unicode \
+                 normalisation cannot coexist on Synology Drive clients, so neither is synchronized"
+            ),
+            Self::RemoteCaseCollision { other } => format!(
+                "the destination also holds {other:?}; names that differ only by case or Unicode \
+                 normalisation cannot coexist on Synology Drive clients, so neither is changed"
+            ),
+            Self::CaseRenameNeedsDelete { remote } => format!(
+                "a case-only rename of {remote:?}; run with --delete to replace the old spelling, \
+                 or rename it in File Station"
+            ),
+            Self::Deferred { detail } => format!("left for the next run: {detail}"),
+        }
+    }
+}
+
+/// OS metadata files no client means to synchronize, excluded unless a rule re-includes them.
+///
+/// Synology Drive's own client skips these. Without the defaults, Windows' `desktop.ini` --
+/// Hidden+System in every Documents, Pictures, Music and Desktop folder -- failed every scan of a
+/// standard user folder, and macOS's `Icon\r` (a control character in a name) did the same for any
+/// folder with a custom icon. Written as gitignore patterns so a later `!desktop.ini` in
+/// `.sdsyncignore` or `--exclude` still wins, and spelled case-insensitively where Windows itself
+/// varies the case. `Icon[\r]` is a character class because a trailing `\r` would be trimmed as
+/// whitespace; the class keeps it and still never matches a plain `Icon`.
+pub const DEFAULT_EXCLUDES: &[&str] = &[
+    "[Dd][Ee][Ss][Kk][Tt][Oo][Pp].[Ii][Nn][Ii]",
+    "[Tt][Hh][Uu][Mm][Bb][Ss].[Dd][Bb]",
+    "[Ee][Hh][Tt][Hh][Uu][Mm][Bb][Ss].[Dd][Bb]",
+    ".DS_Store",
+    "Icon[\r]",
+    "~$*",
+];
+
 impl LocalInventory {
+    /// Take a path out of this run without letting it read as absent.
+    ///
+    /// For a file the run cannot carry after all -- it changed while being hashed, or could not be
+    /// read -- discovered after the walk. Removing the entry alone would be wrong in the dangerous
+    /// direction: the planner would see a remote file with no local counterpart and, under
+    /// `--delete`, delete it. Recorded as skipped instead, the planner shields the path and every
+    /// remote spelling of it (case or Unicode normalisation variants included), keeps its remote
+    /// ancestors, and reports it. The remote inventory must be left as it is: shielding needs the
+    /// remote entry present to protect its parents.
+    pub fn withhold(&mut self, relative: &str, reason: SkipReason) {
+        let prefix = format!("{relative}/");
+        let beneath: Vec<String> = self
+            .entries
+            .range::<str, _>((
+                std::ops::Bound::Included(prefix.as_str()),
+                std::ops::Bound::Unbounded,
+            ))
+            .take_while(|(candidate, _)| candidate.starts_with(&prefix))
+            .map(|(candidate, _)| candidate.clone())
+            .collect();
+        for candidate in beneath {
+            self.entries.remove(&candidate);
+        }
+        self.entries.remove(relative);
+        self.skipped.push(SkippedEntry {
+            relative: relative.to_owned(),
+            reason,
+        });
+        self.skipped
+            .sort_by(|left, right| left.relative.cmp(&right.relative));
+    }
+
     pub fn files(&self) -> usize {
         self.entries
             .values()
@@ -126,7 +267,7 @@ impl IgnoreRules {
                 path: source.to_owned(),
                 source: source_error,
             })?;
-        if is_link_or_reparse(&source_metadata) {
+        if is_link_or_reparse(source, &source_metadata) {
             return Err(Error::UnsupportedLocalEntry {
                 path: source.to_owned(),
                 reason: "the source root itself is a symbolic link, junction, or reparse point"
@@ -139,10 +280,17 @@ impl IgnoreRules {
         })?;
         reject_filesystem_root(&source_root)?;
         let mut builder = GitignoreBuilder::new(&source_root);
+        // First, so that every operator rule -- the ignore file's and the command line's -- is
+        // later and can negate one of them.
+        for pattern in DEFAULT_EXCLUDES {
+            builder.add_line(None, pattern).map_err(|error| {
+                Error::Message(format!("invalid built-in exclude {pattern:?}: {error}"))
+            })?;
+        }
         let default_file = source_root.join(DEFAULT_IGNORE_FILE);
         match fs::symlink_metadata(&default_file) {
             Ok(metadata) => {
-                if is_link_or_reparse(&metadata) || !metadata.is_file() {
+                if is_link_or_reparse(&default_file, &metadata) || !metadata.is_file() {
                     return Err(Error::UnsupportedLocalEntry {
                         path: default_file,
                         reason: ".sdsyncignore must be a regular file, not a link, reparse point, or directory"
@@ -254,6 +402,7 @@ struct ScanContext<'a> {
 struct ScanOutput {
     entries: BTreeMap<String, LocalEntry>,
     excluded: BTreeSet<String>,
+    skipped: Vec<SkippedEntry>,
     complete: bool,
 }
 
@@ -262,6 +411,7 @@ impl Default for ScanOutput {
         Self {
             entries: BTreeMap::new(),
             excluded: BTreeSet::new(),
+            skipped: Vec::new(),
             complete: true,
         }
     }
@@ -276,12 +426,29 @@ impl ScanOutput {
     /// required to render an incomplete total as a floor: a 20,000-entry tree at the shipped
     /// 20,000-entry budget was published as "20,000+" when it was in fact all of it.
     fn insert(&mut self, relative: String, entry: LocalEntry, budget: usize) -> bool {
-        if self.entries.len() >= budget {
+        if self.recorded() >= budget {
             self.complete = false;
             return false;
         }
         self.entries.insert(relative, entry);
         true
+    }
+
+    /// Record a path the walk declines to carry, on the same budget as an entry.
+    ///
+    /// Charged against the budget because a skip is held in memory exactly like an entry, and a
+    /// tree that is nothing but cloud placeholders would otherwise be an unbounded list.
+    fn skip(&mut self, relative: String, reason: SkipReason, budget: usize) -> bool {
+        if self.recorded() >= budget {
+            self.complete = false;
+            return false;
+        }
+        self.skipped.push(SkippedEntry { relative, reason });
+        true
+    }
+
+    fn recorded(&self) -> usize {
+        self.entries.len().saturating_add(self.skipped.len())
     }
 }
 
@@ -327,7 +494,7 @@ pub fn scan_scoped(
         path: source.to_owned(),
         source: source_error,
     })?;
-    if is_link_or_reparse(&source_metadata) {
+    if is_link_or_reparse(source, &source_metadata) {
         return Err(Error::UnsupportedLocalEntry {
             path: source.to_owned(),
             reason: "the source root itself is a symbolic link or junction".to_owned(),
@@ -357,18 +524,15 @@ pub fn scan_scoped(
     };
     let mut output = ScanOutput::default();
     scan_dir(&root, "", &context, &mut output)?;
-    if let Some((first, second)) = portable_case_collision(output.entries.keys()) {
-        return Err(Error::UnsupportedLocalEntry {
-            path: root.join(&second),
-            reason: format!(
-                "{first:?} and {second:?} differ only by case and cannot both sync to Windows Drive clients"
-            ),
-        });
-    }
+    skip_portable_case_collisions(&mut output);
+    output
+        .skipped
+        .sort_by(|left, right| left.relative.cmp(&right.relative));
     Ok(ScopedScan {
         inventory: LocalInventory {
             root,
             entries: output.entries,
+            skipped: output.skipped,
         },
         excluded: output.excluded,
         complete: output.complete,
@@ -417,17 +581,10 @@ pub fn entry_at(root: &Path, relative: &str) -> Result<Option<LocalEntry>> {
             reason,
         });
     }
-    if is_link_or_reparse(&metadata) {
-        return Err(Error::UnsupportedLocalEntry {
-            path: full_path,
-            reason: "symbolic links, junctions, and reparse points are not followed".to_owned(),
-        });
-    }
-    if let Some(reason) = unsupported_windows_attributes(&metadata) {
-        return Err(Error::UnsupportedLocalEntry {
-            path: full_path,
-            reason: reason.to_owned(),
-        });
+    // The walk skips these rather than refusing them, so there is nothing here to record either.
+    // The caller's deletion stays kept: the path exists, it is only not carried.
+    if is_link_or_reparse(&full_path, &metadata) || has_unsupported_windows_attributes(&metadata) {
+        return Ok(None);
     }
     if metadata.is_dir() {
         return Ok(Some(LocalEntry {
@@ -545,6 +702,41 @@ pub fn populate_content_md5_selective(
     Ok(())
 }
 
+/// [`populate_content_md5_selective`], returning the files that could not be hashed instead of
+/// failing on the first one.
+///
+/// A file that changed, vanished or would not open while being hashed is a fact about that file,
+/// not about the run: one open mailbox or growing log used to stop every other file from syncing.
+/// Each failure is returned with its error and the entry is left without a digest; the caller must
+/// take it out of the run with [`LocalInventory::withhold`], never by deleting the entry, which
+/// would make its remote copy look like a mirror-deletion candidate. Cancellation still ends the
+/// whole pass and returns no partial result.
+pub fn populate_content_md5_selective_deferring(
+    inventory: &mut LocalInventory,
+    comparison: &BTreeSet<String>,
+    cancellation: &CancellationToken,
+) -> Result<Vec<(String, Error)>> {
+    let mut failed = Vec::new();
+    for (relative, entry) in inventory.entries.iter_mut() {
+        cancellation.check()?;
+        cancellation.tick();
+        if entry.kind != EntryKind::File || entry.content_md5.is_some() {
+            continue;
+        }
+        let digest = if comparison.contains(relative) {
+            hash_file_md5_snapshot(entry, cancellation)
+        } else {
+            hash_file_snapshot(entry, cancellation)
+        };
+        match digest {
+            Ok(digest) => entry.content_md5 = Some(digest),
+            Err(Error::Cancelled) => return Err(Error::Cancelled),
+            Err(error) => failed.push((relative.clone(), error)),
+        }
+    }
+    Ok(failed)
+}
+
 /// Recompute an entry's fingerprint at full strength.
 ///
 /// Used to promote a file that was hashed for comparison only and then turned out to differ, so
@@ -652,7 +844,7 @@ fn verify_entry_snapshot(entry: &LocalEntry) -> Result<()> {
         path: entry.full_path.clone(),
         source,
     })?;
-    if is_link_or_reparse(&metadata) {
+    if is_link_or_reparse(&entry.full_path, &metadata) {
         return Err(Error::SourceChanged(entry.full_path.clone()));
     }
     verify_metadata_snapshot(entry, &metadata)
@@ -802,17 +994,22 @@ fn scan_dir(
             path: child.path(),
             source,
         })?;
-        if is_link_or_reparse(&metadata) {
-            return Err(Error::UnsupportedLocalEntry {
-                path: child.path(),
-                reason: "symbolic links, junctions, and reparse points are not followed".to_owned(),
-            });
-        }
-        if let Some(reason) = unsupported_windows_attributes(&metadata) {
-            return Err(Error::UnsupportedLocalEntry {
-                path: child.path(),
-                reason: reason.to_owned(),
-            });
+        // Skipped, not refused, and never descended into. These used to fail the whole scan, and
+        // ordinary trees are full of them: every Files-On-Demand OneDrive file is a reparse point,
+        // and Windows marks assorted shell files SYSTEM. One of them meant nothing synced. The skip
+        // is recorded, so it is reported and the planner protects the path from mirror deletion.
+        let skip = if let Some(reason) = link_skip_reason(&child.path(), &metadata) {
+            Some(reason)
+        } else if has_unsupported_windows_attributes(&metadata) {
+            Some(SkipReason::WindowsAttributes)
+        } else {
+            None
+        };
+        if let Some(reason) = skip {
+            if !output.skip(relative, reason, context.budget) {
+                return Ok(());
+            }
+            continue;
         }
 
         if metadata.is_dir() {
@@ -949,54 +1146,196 @@ fn is_administrative_share(share: &str) -> bool {
     drive_share || name.eq_ignore_ascii_case("admin") || name.eq_ignore_ascii_case("ipc")
 }
 
-fn portable_case_collision<'a>(
-    paths: impl IntoIterator<Item = &'a String>,
-) -> Option<(String, String)> {
-    let mut seen = BTreeMap::new();
-    for path in paths {
-        let folded = path.to_lowercase();
-        if let Some(first) = seen.insert(folded, path.clone())
-            && first != *path
-        {
-            return Some((first, path.clone()));
+/// Take every pair of local names that differ only by case or Unicode normalisation out of the
+/// inventory, with everything beneath them, and record each spelling as skipped.
+///
+/// A case-sensitive source can hold `Report.pdf` beside `report.pdf`, and a Linux one can hold an
+/// NFC and an NFD spelling of `café`. No Synology Drive client can hold both, so neither may be
+/// carried -- but that used to fail the whole scan, so one such pair anywhere stopped every file
+/// from syncing. Both spellings are dropped here and nothing else is touched: the skip records make
+/// the planner treat both, and every remote spelling of them, as protected.
+fn skip_portable_case_collisions(output: &mut ScanOutput) {
+    let mut by_fold: BTreeMap<String, Vec<&String>> = BTreeMap::new();
+    for relative in output.entries.keys() {
+        by_fold
+            .entry(crate::path::portable_fold(relative))
+            .or_default()
+            .push(relative);
+    }
+    let mut colliding: Vec<(String, String)> = Vec::new();
+    let mut dropped_folds: BTreeSet<String> = BTreeSet::new();
+    for (fold, spellings) in &by_fold {
+        if spellings.len() < 2 {
+            continue;
+        }
+        // Beneath a pair already dropped: its subtree goes with it, and one report is enough.
+        if fold_has_ancestor_in(fold, &dropped_folds) {
+            continue;
+        }
+        dropped_folds.insert(fold.clone());
+        for (index, spelling) in spellings.iter().enumerate() {
+            let other = spellings[(index + 1) % spellings.len()];
+            colliding.push(((*spelling).clone(), other.clone()));
         }
     }
-    None
-}
-
-#[cfg(windows)]
-fn is_link_or_reparse(metadata: &fs::Metadata) -> bool {
-    use std::os::windows::fs::MetadataExt;
-
-    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
-    metadata.file_type().is_symlink()
-        || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
-}
-
-#[cfg(windows)]
-fn unsupported_windows_attributes(metadata: &fs::Metadata) -> Option<&'static str> {
-    use std::os::windows::fs::MetadataExt;
-
-    const FILE_ATTRIBUTE_SYSTEM: u32 = 0x0004;
-    const FILE_ATTRIBUTE_TEMPORARY: u32 = 0x0100;
-    const FILE_ATTRIBUTE_OFFLINE: u32 = 0x1000;
-    let attributes = metadata.file_attributes();
-    if attributes & (FILE_ATTRIBUTE_SYSTEM | FILE_ATTRIBUTE_TEMPORARY | FILE_ATTRIBUTE_OFFLINE) != 0
-    {
-        Some("Windows OFFLINE, SYSTEM, and TEMPORARY entries are unsupported by Synology Drive")
-    } else {
-        None
+    drop(by_fold);
+    for (relative, other) in colliding {
+        let prefix = format!("{relative}/");
+        let beneath: Vec<String> = output
+            .entries
+            .range::<str, _>((
+                std::ops::Bound::Included(prefix.as_str()),
+                std::ops::Bound::Unbounded,
+            ))
+            .take_while(|(candidate, _)| candidate.starts_with(&prefix))
+            .map(|(candidate, _)| candidate.clone())
+            .collect();
+        for candidate in beneath {
+            output.entries.remove(&candidate);
+        }
+        output.entries.remove(&relative);
+        output.skipped.push(SkippedEntry {
+            relative,
+            reason: SkipReason::LocalCaseCollision { other },
+        });
     }
 }
 
-#[cfg(not(windows))]
-fn unsupported_windows_attributes(_metadata: &fs::Metadata) -> Option<&'static str> {
-    None
+/// True when a strict ancestor of the folded path `fold` is in `folds`.
+pub(crate) fn fold_has_ancestor_in(fold: &str, folds: &BTreeSet<String>) -> bool {
+    if folds.is_empty() {
+        return false;
+    }
+    fold.match_indices('/')
+        .any(|(index, _)| folds.contains(&fold[..index]))
+}
+
+/// Whether an entry holds its own data here, points somewhere else, or holds none locally yet.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum LinkClass {
+    /// An ordinary file or directory -- including a Windows reparse point whose data is local:
+    /// a Data Deduplication file, a hydrated or pinned OneDrive file, a WOF-compressed file.
+    Ordinary,
+    /// A symbolic link, junction or volume mount point. Never followed.
+    Link,
+    /// A cloud or HSM placeholder whose content is not on this disk. Reading it would start a
+    /// download or a recall, so it is never read.
+    DehydratedPlaceholder,
+}
+
+const FILE_ATTRIBUTE_OFFLINE: u32 = 0x0000_1000;
+const FILE_ATTRIBUTE_RECALL_ON_OPEN: u32 = 0x0004_0000;
+const FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS: u32 = 0x0040_0000;
+
+/// Classify a Windows entry from what `symlink_metadata` reports.
+///
+/// `name_surrogate` is the standard library's `FileType::is_symlink`, which on Windows is true
+/// exactly for reparse points whose tag is a *name surrogate*: symbolic links, junctions and volume
+/// mount points, the reparse kinds that redirect to another path. Every other reparse tag --
+/// `IO_REPARSE_TAG_DEDUP`, the `IO_REPARSE_TAG_CLOUD_*` family, WOF -- stores this file's own data
+/// behind a filter driver and reads like any file.
+///
+/// Skipping every reparse point used to drop all of those silently: a deduplicated volume or a
+/// OneDrive folder reported a complete, successful run with those files never synced. Only the
+/// recall attributes say whether reading would leave the disk, so they decide; the tag never could
+/// on its own, because a cloud file carries the same tag hydrated or not.
+fn classify_link(name_surrogate: bool, attributes: u32) -> LinkClass {
+    if name_surrogate {
+        return LinkClass::Link;
+    }
+    if attributes
+        & (FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS
+            | FILE_ATTRIBUTE_RECALL_ON_OPEN
+            | FILE_ATTRIBUTE_OFFLINE)
+        != 0
+    {
+        return LinkClass::DehydratedPlaceholder;
+    }
+    // Whether or not FILE_ATTRIBUTE_REPARSE_POINT is set: a reparse point that is neither a name
+    // surrogate nor awaiting recall holds its data here.
+    LinkClass::Ordinary
+}
+
+/// Windows' answer to opening a reparse point no filter driver serves: `ERROR_CANT_ACCESS_FILE`
+/// (1920) and `ERROR_CANT_RESOLVE_FILENAME` (1921).
+#[cfg(windows)]
+const UNOPENABLE_REPARSE_ERRORS: [i32; 2] = [1920, 1921];
+
+/// Whether an open that failed says the entry is a reparse point with no data behind it.
+#[cfg(windows)]
+fn is_unopenable_reparse_error(error: &std::io::Error) -> bool {
+    error
+        .raw_os_error()
+        .is_some_and(|code| UNOPENABLE_REPARSE_ERRORS.contains(&code))
+}
+
+/// [`classify_link`], plus one probe the attributes cannot replace.
+///
+/// Some non-surrogate reparse tags carry no data at all: an app execution alias
+/// (`IO_REPARSE_TAG_APPEXECLINK`, the `python.exe` in `WindowsApps`) or an `AF_UNIX` socket
+/// (`IO_REPARSE_TAG_AF_UNIX`). They are not name surrogates and not awaiting recall, so they read as
+/// ordinary -- and then every open fails with 1920, which turned each run that met one into a
+/// partial one. The tag would say so directly, but this crate forbids the `unsafe` needed to read
+/// it. Opening the file says it just as well, and costs one open per non-surrogate reparse *file*,
+/// which outside a deduplicated or OneDrive tree is none at all. Directories are not probed: a
+/// directory cannot be opened as a file, and its children are classified one by one anyway.
+/// (`IO_REPARSE_TAG_LX_SYMLINK` is a name surrogate, so it is already a link without the probe.)
+///
+/// Any other open error is not decided here: the entry stays ordinary and the hash that reads it
+/// reports the error against the path, as for any file.
+#[cfg(windows)]
+fn link_class(path: &Path, metadata: &fs::Metadata) -> LinkClass {
+    use std::os::windows::fs::MetadataExt;
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
+    let class = classify_link(
+        metadata.file_type().is_symlink(),
+        metadata.file_attributes(),
+    );
+    if class == LinkClass::Ordinary
+        && metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+        && !metadata.is_dir()
+        && fs::File::open(path)
+            .err()
+            .is_some_and(|error| is_unopenable_reparse_error(&error))
+    {
+        return LinkClass::Link;
+    }
+    class
 }
 
 #[cfg(not(windows))]
-fn is_link_or_reparse(metadata: &fs::Metadata) -> bool {
-    metadata.file_type().is_symlink()
+fn link_class(_path: &Path, metadata: &fs::Metadata) -> LinkClass {
+    classify_link(metadata.file_type().is_symlink(), 0)
+}
+
+/// True for anything the tool will not read as ordinary data: a link, or a placeholder whose data
+/// is elsewhere.
+fn is_link_or_reparse(path: &Path, metadata: &fs::Metadata) -> bool {
+    link_class(path, metadata) != LinkClass::Ordinary
+}
+
+/// The skip reason for an entry that is not ordinary data.
+fn link_skip_reason(path: &Path, metadata: &fs::Metadata) -> Option<SkipReason> {
+    match link_class(path, metadata) {
+        LinkClass::Ordinary => None,
+        LinkClass::Link => Some(SkipReason::LinkOrReparsePoint),
+        LinkClass::DehydratedPlaceholder => Some(SkipReason::DehydratedPlaceholder),
+    }
+}
+
+#[cfg(windows)]
+fn has_unsupported_windows_attributes(metadata: &fs::Metadata) -> bool {
+    use std::os::windows::fs::MetadataExt;
+
+    // OFFLINE is classified with the other recall attributes by `classify_link`, which runs first.
+    const FILE_ATTRIBUTE_SYSTEM: u32 = 0x0004;
+    const FILE_ATTRIBUTE_TEMPORARY: u32 = 0x0100;
+    metadata.file_attributes() & (FILE_ATTRIBUTE_SYSTEM | FILE_ATTRIBUTE_TEMPORARY) != 0
+}
+
+#[cfg(not(windows))]
+fn has_unsupported_windows_attributes(_metadata: &fs::Metadata) -> bool {
+    false
 }
 
 #[cfg(test)]
@@ -1342,52 +1681,77 @@ mod tests {
         fs::remove_dir_all(parent).unwrap();
     }
 
+    /// A link inside the tree is skipped and reported, never followed and never a whole-scan
+    /// failure. It used to be the latter, which on Windows meant any OneDrive Files-On-Demand
+    /// placeholder (a reparse point) stopped every file beside it from syncing.
     #[test]
-    fn scan_rejects_a_link_within_the_source_tree() {
+    fn scan_skips_and_reports_a_link_within_the_source_tree() {
         let root = temp_dir("link-child");
         let outside = temp_dir("link-child-target");
         fs::write(outside.join("payload.txt"), b"payload").unwrap();
+        fs::write(root.join("kept.txt"), b"kept").unwrap();
         let link = root.join("linked");
         if !try_make_link(&link, &outside) {
             eprintln!(
-                "skipping scan_rejects_a_link_within_the_source_tree: could not create a link"
+                "skipping scan_skips_and_reports_a_link_within_the_source_tree: could not create a link"
             );
             fs::remove_dir_all(root).unwrap();
             fs::remove_dir_all(outside).unwrap();
             return;
         }
-        let expected_link_path = fs::canonicalize(&root).unwrap().join("linked");
 
         let rules = IgnoreRules::build(&root, &[]).unwrap();
-        assert!(matches!(
-            scan(&root, &rules, &CancellationToken::default()),
-            Err(Error::UnsupportedLocalEntry { path, reason })
-                if path == expected_link_path && reason.contains("not followed")
-        ));
+        let inventory = scan(&root, &rules, &CancellationToken::default()).unwrap();
+        assert_eq!(
+            inventory.entries.keys().collect::<Vec<_>>(),
+            ["kept.txt"],
+            "the link is not followed and its sibling is still carried"
+        );
+        assert_eq!(
+            inventory.skipped,
+            [SkippedEntry {
+                relative: "linked".to_owned(),
+                reason: SkipReason::LinkOrReparsePoint,
+            }]
+        );
+        assert_eq!(
+            entry_at(&inventory.root, "linked")
+                .unwrap()
+                .map(|e| e.relative),
+            None
+        );
 
         fs::remove_dir_all(&root).unwrap();
         fs::remove_dir_all(&outside).unwrap();
     }
 
     #[test]
-    fn scan_rejects_case_colliding_entries_on_case_sensitive_filesystems() {
+    fn scan_skips_case_colliding_entries_on_case_sensitive_filesystems() {
         let root = temp_dir("case-collision-scan");
         fs::write(root.join("Config.txt"), b"a").unwrap();
         fs::write(root.join("config.txt"), b"b").unwrap();
-        if fs::read_dir(&root).unwrap().count() < 2 {
+        fs::write(root.join("other.txt"), b"c").unwrap();
+        if fs::read_dir(&root).unwrap().count() < 3 {
             // The filesystem folded the two names together (the default on Windows and
             // macOS), so there is nothing left to collide. Skip on this platform.
             fs::remove_dir_all(root).unwrap();
             return;
         }
-        let expected_path = fs::canonicalize(&root).unwrap().join("config.txt");
 
         let rules = IgnoreRules::build(&root, &[]).unwrap();
-        assert!(matches!(
-            scan(&root, &rules, &CancellationToken::default()),
-            Err(Error::UnsupportedLocalEntry { path, reason })
-                if path == expected_path && reason.contains("differ only by case")
-        ));
+        let inventory = scan(&root, &rules, &CancellationToken::default()).unwrap();
+        assert_eq!(inventory.entries.keys().collect::<Vec<_>>(), ["other.txt"]);
+        assert_eq!(
+            inventory
+                .skipped
+                .iter()
+                .map(|skip| (skip.relative.as_str(), skip.reason.as_str()))
+                .collect::<Vec<_>>(),
+            [
+                ("Config.txt", "local-case-collision"),
+                ("config.txt", "local-case-collision"),
+            ]
+        );
 
         fs::remove_dir_all(root).unwrap();
     }
@@ -1400,12 +1764,276 @@ mod tests {
         assert!(drive_path_issue("normal/fichier.txt").is_none());
     }
 
+    fn output_of(paths: &[(&str, EntryKind)]) -> ScanOutput {
+        let mut output = ScanOutput::default();
+        for (relative, kind) in paths {
+            output.entries.insert(
+                (*relative).to_owned(),
+                LocalEntry {
+                    relative: (*relative).to_owned(),
+                    full_path: PathBuf::from(relative),
+                    kind: *kind,
+                    size: 0,
+                    mtime_ms: 0,
+                    identity: FileIdentity::default(),
+                    content_md5: None,
+                },
+            );
+        }
+        output
+    }
+
+    /// A colliding pair is dropped with everything beneath it and reported once per spelling, and
+    /// nothing else in the tree is touched. Synthetic, so it runs on case-insensitive hosts too.
     #[test]
-    fn detects_portability_case_collisions() {
-        let paths = ["Folder/A.txt".to_owned(), "folder/a.TXT".to_owned()];
-        assert!(portable_case_collision(paths.iter()).is_some());
-        let distinct = ["Folder/A.txt".to_owned(), "Folder/B.txt".to_owned()];
-        assert!(portable_case_collision(distinct.iter()).is_none());
+    fn a_portable_case_collision_drops_only_the_pair_and_its_subtrees() {
+        let mut output = output_of(&[
+            ("Folder", EntryKind::Directory),
+            ("Folder/A.txt", EntryKind::File),
+            ("folder", EntryKind::Directory),
+            ("folder/a.TXT", EntryKind::File),
+            ("folder-two", EntryKind::Directory),
+            ("folder-two/b.txt", EntryKind::File),
+            ("keep.txt", EntryKind::File),
+        ]);
+        skip_portable_case_collisions(&mut output);
+        assert_eq!(
+            output.entries.keys().collect::<Vec<_>>(),
+            ["folder-two", "folder-two/b.txt", "keep.txt"]
+        );
+        let mut skipped = output.skipped.clone();
+        skipped.sort_by(|left, right| left.relative.cmp(&right.relative));
+        assert_eq!(
+            skipped,
+            [
+                SkippedEntry {
+                    relative: "Folder".to_owned(),
+                    reason: SkipReason::LocalCaseCollision {
+                        other: "folder".to_owned()
+                    },
+                },
+                SkippedEntry {
+                    relative: "folder".to_owned(),
+                    reason: SkipReason::LocalCaseCollision {
+                        other: "Folder".to_owned()
+                    },
+                },
+            ]
+        );
+        assert!(skipped[0].reason.detail().contains("\"folder\""));
+
+        let mut distinct = output_of(&[
+            ("Folder/A.txt", EntryKind::File),
+            ("Folder/B.txt", EntryKind::File),
+        ]);
+        skip_portable_case_collisions(&mut distinct);
+        assert_eq!(distinct.entries.len(), 2);
+        assert!(distinct.skipped.is_empty());
+    }
+
+    /// An NFC and an NFD spelling of one name are the same name to every Drive client, exactly as a
+    /// case variant is.
+    #[test]
+    fn unicode_normalisation_variants_collide_like_case_variants() {
+        let composed = "caf\u{e9}.txt";
+        let decomposed = "cafe\u{301}.txt";
+        let mut output = output_of(&[
+            (composed, EntryKind::File),
+            (decomposed, EntryKind::File),
+            ("plain.txt", EntryKind::File),
+        ]);
+        skip_portable_case_collisions(&mut output);
+        assert_eq!(output.entries.keys().collect::<Vec<_>>(), ["plain.txt"]);
+        assert_eq!(output.skipped.len(), 2);
+    }
+
+    /// Built-in exclusions cover the OS metadata files that otherwise abort or pollute a run, in the
+    /// case variants Windows produces, and stay overridable by an operator negation.
+    #[test]
+    fn default_excludes_cover_os_metadata_files_and_can_be_negated() {
+        let root = temp_dir("default-excludes");
+        let rules = IgnoreRules::build(&root, &[]).unwrap();
+        for name in [
+            "desktop.ini",
+            "Desktop.ini",
+            "sub/DESKTOP.INI",
+            "Thumbs.db",
+            "thumbs.db",
+            "ehthumbs.db",
+            ".DS_Store",
+            "deep/dir/.DS_Store",
+            "Icon\r",
+            "~$report.docx",
+        ] {
+            assert!(rules.is_ignored(name, false), "{name:?} should be excluded");
+        }
+        for name in [
+            "Icon",
+            "Iconr",
+            "desktop.ini.bak",
+            "my thumbs.db",
+            "report.docx",
+        ] {
+            assert!(!rules.is_ignored(name, false), "{name:?} must stay payload");
+        }
+
+        let negated = IgnoreRules::build(&root, &["!desktop.ini".to_owned()]).unwrap();
+        assert!(!negated.is_ignored("desktop.ini", false));
+        assert!(negated.is_ignored("Thumbs.db", false));
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// `Icon\r` is a real macOS file name, and the control character in it used to fail the scan
+    /// before any rule could apply. Excluded by default, it no longer reaches validation. Unix only:
+    /// Windows refuses to create the name at all.
+    #[cfg(unix)]
+    #[test]
+    fn a_macos_custom_icon_file_does_not_fail_the_scan() {
+        let root = temp_dir("icon-cr");
+        fs::write(root.join("Icon\r"), b"").unwrap();
+        fs::write(root.join("photo.jpg"), b"jpg").unwrap();
+        let rules = IgnoreRules::build(&root, &[]).unwrap();
+        let inventory = scan(&root, &rules, &CancellationToken::default()).unwrap();
+        assert_eq!(inventory.entries.keys().collect::<Vec<_>>(), ["photo.jpg"]);
+        assert!(inventory.skipped.is_empty());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// The deferring hash pass returns the one file that vanished and still hashes the rest.
+    #[test]
+    fn deferring_hashing_returns_failed_files_and_hashes_the_rest() {
+        let root = temp_dir("deferring-hash");
+        fs::write(root.join("gone.txt"), b"soon gone").unwrap();
+        fs::write(root.join("kept.txt"), b"kept").unwrap();
+        let rules = IgnoreRules::build(&root, &[]).unwrap();
+        let mut inventory = scan(&root, &rules, &CancellationToken::default()).unwrap();
+        fs::remove_file(root.join("gone.txt")).unwrap();
+
+        let failed = populate_content_md5_selective_deferring(
+            &mut inventory,
+            &BTreeSet::new(),
+            &CancellationToken::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            failed
+                .iter()
+                .map(|(relative, _)| relative.as_str())
+                .collect::<Vec<_>>(),
+            ["gone.txt"]
+        );
+        assert!(inventory.entries["kept.txt"].content_md5.is_some());
+        assert!(inventory.entries["gone.txt"].content_md5.is_none());
+
+        inventory.withhold(
+            "gone.txt",
+            SkipReason::Deferred {
+                detail: failed[0].1.to_string(),
+            },
+        );
+        assert!(!inventory.entries.contains_key("gone.txt"));
+        assert_eq!(inventory.skipped[0].reason.as_str(), "deferred");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// review-core S3: only name surrogates are links, only recall attributes make a placeholder,
+    /// and every other reparse point -- dedup, hydrated or pinned cloud files -- is ordinary data.
+    #[test]
+    fn reparse_points_are_classified_by_what_reading_them_would_do() {
+        const REPARSE: u32 = 0x0000_0400;
+        const ARCHIVE: u32 = 0x0000_0020;
+        const PINNED: u32 = 0x0008_0000;
+        const UNPINNED: u32 = 0x0010_0000;
+        // Symbolic link, junction, mount point: name surrogates, whatever else is set.
+        assert_eq!(classify_link(true, REPARSE), LinkClass::Link);
+        assert_eq!(
+            classify_link(true, REPARSE | FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS),
+            LinkClass::Link
+        );
+        // Data Deduplication: a non-surrogate reparse point with its data on the volume.
+        assert_eq!(classify_link(false, REPARSE | ARCHIVE), LinkClass::Ordinary);
+        // OneDrive, hydrated or pinned ("always keep on this device").
+        assert_eq!(classify_link(false, REPARSE | PINNED), LinkClass::Ordinary);
+        assert_eq!(classify_link(false, REPARSE | ARCHIVE), LinkClass::Ordinary);
+        // OneDrive online-only, and an HSM-offline file: reading would recall them.
+        assert_eq!(
+            classify_link(
+                false,
+                REPARSE | UNPINNED | FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS
+            ),
+            LinkClass::DehydratedPlaceholder
+        );
+        assert_eq!(
+            classify_link(false, REPARSE | FILE_ATTRIBUTE_RECALL_ON_OPEN),
+            LinkClass::DehydratedPlaceholder
+        );
+        assert_eq!(
+            classify_link(false, FILE_ATTRIBUTE_OFFLINE),
+            LinkClass::DehydratedPlaceholder
+        );
+        // Plain files and directories.
+        assert_eq!(classify_link(false, 0), LinkClass::Ordinary);
+        assert_eq!(classify_link(false, ARCHIVE), LinkClass::Ordinary);
+        assert_eq!(
+            SkipReason::DehydratedPlaceholder.as_str(),
+            "dehydrated-placeholder"
+        );
+    }
+
+    /// The open-probe's decision: only 1920/1921 make a non-surrogate reparse point a link.
+    #[cfg(windows)]
+    #[test]
+    fn only_the_unopenable_reparse_errors_reclassify_an_entry() {
+        assert!(is_unopenable_reparse_error(
+            &std::io::Error::from_raw_os_error(1920)
+        ));
+        assert!(is_unopenable_reparse_error(
+            &std::io::Error::from_raw_os_error(1921)
+        ));
+        assert!(!is_unopenable_reparse_error(
+            &std::io::Error::from_raw_os_error(5)
+        ));
+        assert!(!is_unopenable_reparse_error(
+            &std::io::Error::from_raw_os_error(32)
+        ));
+        assert!(!is_unopenable_reparse_error(&std::io::Error::other(
+            "no code"
+        )));
+    }
+
+    /// A real app execution alias, where this machine has one: skipped as a link, never opened
+    /// for hashing, and never a whole-run or partial-run failure.
+    #[cfg(windows)]
+    #[test]
+    fn an_app_execution_alias_is_classified_as_a_link() {
+        let Some(directory) = std::env::var_os("LOCALAPPDATA")
+            .map(|base| PathBuf::from(base).join("Microsoft").join("WindowsApps"))
+        else {
+            eprintln!("skipping: LOCALAPPDATA is not set");
+            return;
+        };
+        let Ok(entries) = fs::read_dir(&directory) else {
+            eprintln!("skipping: no WindowsApps directory");
+            return;
+        };
+        let alias = entries.filter_map(std::result::Result::ok).find(|entry| {
+            entry.path().extension().is_some_and(|ext| ext == "exe")
+                && fs::File::open(entry.path())
+                    .err()
+                    .is_some_and(|error| is_unopenable_reparse_error(&error))
+        });
+        let Some(alias) = alias else {
+            eprintln!("skipping: no app execution alias on this machine");
+            return;
+        };
+        let metadata = fs::symlink_metadata(alias.path()).unwrap();
+        assert_eq!(link_class(&alias.path(), &metadata), LinkClass::Link);
+        assert_eq!(
+            link_skip_reason(&alias.path(), &metadata),
+            Some(SkipReason::LinkOrReparsePoint)
+        );
+        eprintln!("checked app execution alias {}", alias.path().display());
     }
 
     #[test]
@@ -1662,11 +2290,13 @@ mod tests {
         }
     }
 
-    /// The same name, not excluded, still fails the scan. The reorder must not weaken the refusal.
+    /// A refused name that nothing excludes still fails the scan. The reorder must not weaken the
+    /// refusal. (`~$report.docx`, the Office lock file, is a built-in exclusion now, so the name
+    /// here is an ordinary `~` name.)
     #[test]
     fn an_unexcluded_name_the_tool_refuses_still_fails_the_scan() {
         let root = temp_dir("unexcluded-refused-name");
-        if fs::write(root.join("~$report.docx"), b"payload").is_err() {
+        if fs::write(root.join("~scratch.txt"), b"payload").is_err() {
             fs::remove_dir_all(&root).unwrap();
             return;
         }
@@ -1793,32 +2423,93 @@ mod tests {
     }
 
     #[cfg(windows)]
+    fn set_attributes(target: &Path, flags: &[&str]) -> bool {
+        let status = std::process::Command::new("attrib")
+            .args(flags)
+            .arg(target)
+            .status();
+        matches!(status, Ok(status) if status.success())
+    }
+
+    /// A SYSTEM file is skipped and reported, its siblings still sync, and a later read of the same
+    /// path agrees with the walk.
+    #[cfg(windows)]
     #[test]
-    fn scan_rejects_windows_system_attribute_files() {
+    fn scan_skips_and_reports_windows_system_attribute_files() {
         let root = temp_dir("windows-system-attribute");
         let target = root.join("system.dat");
         fs::write(&target, b"payload").unwrap();
-
-        let status = std::process::Command::new("attrib")
-            .arg("+S")
-            .arg(&target)
-            .status();
-        if !matches!(status, Ok(status) if status.success()) {
+        fs::write(root.join("report.docx"), b"doc").unwrap();
+        if !set_attributes(&target, &["+S"]) {
             eprintln!(
-                "skipping scan_rejects_windows_system_attribute_files: could not set the SYSTEM attribute"
+                "skipping scan_skips_and_reports_windows_system_attribute_files: could not set the SYSTEM attribute"
             );
             fs::remove_dir_all(root).unwrap();
             return;
         }
 
-        let expected_path = fs::canonicalize(&target).unwrap();
         let rules = IgnoreRules::build(&root, &[]).unwrap();
-        assert!(matches!(
-            scan(&root, &rules, &CancellationToken::default()),
-            Err(Error::UnsupportedLocalEntry { path, reason })
-                if path == expected_path && reason.contains("SYSTEM")
-        ));
+        let inventory = scan(&root, &rules, &CancellationToken::default()).unwrap();
+        assert_eq!(
+            inventory.entries.keys().collect::<Vec<_>>(),
+            ["report.docx"]
+        );
+        assert_eq!(
+            inventory.skipped,
+            [SkippedEntry {
+                relative: "system.dat".to_owned(),
+                reason: SkipReason::WindowsAttributes,
+            }]
+        );
+        assert!(entry_at(&inventory.root, "system.dat").unwrap().is_none());
 
+        let _ = set_attributes(&target, &["-S"]);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// N-1, the shape every Windows profile has: `desktop.ini` is Hidden+System in Documents,
+    /// Pictures, Music and Desktop. It used to abort every scan of those folders. Excluded by
+    /// default it is neither carried nor reported; re-included by the operator, it is skipped and
+    /// reported rather than refused.
+    #[cfg(windows)]
+    #[test]
+    fn a_hidden_system_desktop_ini_neither_fails_nor_clutters_the_scan() {
+        let root = temp_dir("desktop-ini");
+        let documents = root.join("Documents");
+        fs::create_dir(&documents).unwrap();
+        let ini = documents.join("desktop.ini");
+        fs::write(&ini, b"[.ShellClassInfo]").unwrap();
+        fs::write(documents.join("report.docx"), b"doc").unwrap();
+        if !set_attributes(&ini, &["+H", "+S"]) {
+            eprintln!("skipping: could not set the HIDDEN and SYSTEM attributes");
+            fs::remove_dir_all(root).unwrap();
+            return;
+        }
+
+        let rules = IgnoreRules::build(&root, &[]).unwrap();
+        let inventory = scan(&root, &rules, &CancellationToken::default()).unwrap();
+        assert_eq!(
+            inventory.entries.keys().collect::<Vec<_>>(),
+            ["Documents", "Documents/report.docx"]
+        );
+        assert!(inventory.skipped.is_empty());
+
+        let reincluded = IgnoreRules::build(&root, &["!desktop.ini".to_owned()]).unwrap();
+        let inventory = scan(&root, &reincluded, &CancellationToken::default()).unwrap();
+        assert_eq!(
+            inventory.entries.keys().collect::<Vec<_>>(),
+            ["Documents", "Documents/report.docx"]
+        );
+        assert_eq!(
+            inventory
+                .skipped
+                .iter()
+                .map(|skip| (skip.relative.as_str(), skip.reason.as_str()))
+                .collect::<Vec<_>>(),
+            [("Documents/desktop.ini", "windows-attributes")]
+        );
+
+        let _ = set_attributes(&ini, &["-H", "-S"]);
         fs::remove_dir_all(root).unwrap();
     }
 

@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::path::Path;
 
 use crate::{Error, Result};
@@ -156,6 +157,32 @@ pub fn is_dsm_managed(relative: &str) -> bool {
 
 pub fn path_for_match(relative: &str) -> &Path {
     Path::new(relative)
+}
+
+/// `text` in Unicode Normalization Form C, borrowed when it already is.
+///
+/// macOS writes names decomposed (NFD) and almost everything else writes them composed (NFC), so
+/// the same visible name reaches the planner as two different byte strings depending on which
+/// client created it. Comparison has to see through that; I/O never does, because each side's
+/// filesystem only answers to the bytes it holds.
+pub(crate) fn nfc(text: &str) -> Cow<'_, str> {
+    if text.is_ascii() {
+        return Cow::Borrowed(text);
+    }
+    icu_normalizer::ComposingNormalizerBorrowed::new_nfc().normalize(text)
+}
+
+/// The key two spellings share when a Synology Drive client cannot hold both of them side by side:
+/// case folded, after Unicode normalisation.
+///
+/// `/` is ASCII and survives both steps unchanged, and neither step moves text across it, so the
+/// fold of a path's prefix is the same prefix of the path's fold. Callers rely on that to fold a
+/// path once and then slice its ancestors out of the result.
+pub(crate) fn portable_fold(text: &str) -> String {
+    if text.is_ascii() {
+        return text.to_ascii_lowercase();
+    }
+    nfc(text).to_lowercase()
 }
 
 pub(crate) fn drive_path_issue(path: &str) -> Option<String> {
