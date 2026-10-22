@@ -158,7 +158,7 @@ routines, state, and logs.
 | `doctor target [REMOTE]` | None | Run the default Standard check: authenticate, then sample at most five visible share roots when no destination is selected or five direct children when one is selected, and log out |
 | `doctor --level extensive target [REMOTE]` | None | Require the fullest target API/capability evidence; still read-only |
 | `doctor --level extensive target [REMOTE] --write-test` | Disposable probe and cleanup only | Exercise live create, upload, copy, MD5/CRC32/SHA-256 verification, and cleanup |
-| `plan` | None | Review the exact pending work; `--exit-code` returns `10` when changes exist |
+| `plan` | None | Review the exact pending work; `--exit-code` returns `10` when changes exist; it exits `3` whenever a path had to be deferred (for example a file changing while it was fingerprinted) |
 | `sync` | Creates and updates | Safe default; remote-only entries remain |
 | `sync` with effective deletion enabled | Creates, updates, and guarded removals | Deliberate one-way mirror after separate recovery testing |
 
@@ -176,8 +176,8 @@ Comparison is independent of the operation:
 
 | Mode | A same-path file matches when | Trade-off |
 | --- | --- | --- |
-| `content` | Size, MD5, IEEE CRC32, SHA-256, and one-second mtime match | Safest and default; streams selected remote bytes and verifies uploads |
-| `metadata` | Size and one-second mtime match | Faster, but can miss equal-size/equal-time content changes |
+| `content` | Size, MD5, IEEE CRC32, SHA-256, and whole-second mtime match (floor or rounded) | Safest and default; streams selected remote bytes and verifies uploads |
+| `metadata` | Size and whole-second mtime match (floor or rounded) | Faster, but can miss equal-size changes within the same second |
 | `size-only` | Size matches | Fastest and weakest; no content verification |
 
 Use `--no-delete` to defeat deletion selected by a profile or environment for one invocation. A
@@ -366,9 +366,12 @@ prevent overlap, and allow enough time for the complete scan-transfer-verify wor
   ordinary Windows UNC share roots such as `\\nas\media`. Filesystem roots (`/`, `C:\`), mapped-drive
   roots such as `Z:\`, and Windows administrative shares such as `C$`, `ADMIN$`, and `IPC$` are
   rejected. The operating system remains responsible for mounting and source-share authentication.
-- Symlinks, junctions/reparse points, special or unreadable entries, unsafe names, and case
-  collisions fail closed. Keep the source quiescent and run as an unprivileged identity that owns
-  or exclusively controls it.
+- Symlinks, junctions, SYSTEM/TEMPORARY entries, dehydrated cloud placeholders, and names that
+  collide by case or Unicode normalisation are skipped and reported by name, never uploaded and never
+  deleted from the NAS; OS metadata files (`desktop.ini`, `Thumbs.db`, `.DS_Store`, `~$*`) are
+  excluded by default. Special or unreadable entries and unsafe names still fail closed. A file that
+  changes or is locked mid-run is deferred, and the run exits `3` (partial) so it is retried. Keep the
+  source quiescent and run as an unprivileged identity that owns or exclusively controls it.
 - There is no two-way reconciliation, Drive conflict protocol, block-level delta, resumable upload,
   transactional multi-profile rollback, or crash-atomic overwrite/type replacement.
 - File content, hierarchy, names, and file mtime are in scope. ACLs, ownership, modes, xattrs, hard

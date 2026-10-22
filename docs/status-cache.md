@@ -63,8 +63,35 @@ Any of these makes it as if the entry were not there:
   `digests_reused`.
 - The package was upgraded, the profile was repointed at another source or destination, or the
   comparison mode changed. Each retires the whole file.
-- The file is unreadable, truncated, out of order, missing its end marker, or not a private file
-  owned by the package. Each abandons the whole file, silently, and runs uncached.
+- The file is unreadable, truncated, out of order, missing its end marker, holds a record with a
+  malformed digest, or is not a private file owned by the package. Each abandons the whole file and
+  runs uncached, and each is **named**: see [Degraded states are named](#degraded-states-are-named).
+
+## Degraded states are named
+
+A cache that cannot be opened, read or written never gives up quietly. Every condition met while
+serving or writing is a `cache.issues` entry in the `status` result (always present, empty when
+healthy), and the human output prints one line per issue. Each carries a stable `code`, a `severity`
+(`warning` for a fault someone may need to fix, `info` for an expected retirement), the `path`
+concerned, and a `cause` that includes the operating system's error where there was one. Warning-severity
+issues are also logged as warnings.
+
+| Code | Meaning |
+| --- | --- |
+| `cache-profile-name-unsafe`, `cache-directory-unusable` | The cache directory or the profile's file name is refused (missing, group- or world-writable, not owned by the package); the pass runs uncached and `state` is `unusable`. |
+| `cache-file-unsafe`, `cache-file-unreadable`, `cache-file-corrupt` | The profile's file is not private, cannot be read, or is damaged (the cause names the bad header field, record, or "truncated"). It is served cold. |
+| `cache-file-retired` | Written by another build, query, or comparison mode. Expected after an upgrade or a repoint. |
+| `cache-records-rejected` | Records were refused during a rewrite. |
+| `cache-store-failed`, `cache-rollup-store-failed`, `cache-cleanup-failed`, `cache-eviction-failed`, `cache-discard-failed` | The pass computed its answer but could not write, clean up, evict, or discard cache files. |
+| `cache-canary-mismatch` | The canary disagreed with live evidence; the whole cache was discarded. |
+| `cache-clock-unreadable` | The system clock could not be read, so no entry's age can be judged. |
+| `rollup-directory-unreadable`, `rollup-unreadable`, `rollup-corrupt`, `rollup-foreign` | A status rollup the aggregate could not use. `rollup-foreign` (info) was written by another build and refreshes on the next status pass. |
+
+On the DSM package the dashboard reads the rollup issues from the snapshot's
+`outcomes.status_cache_health` and shows "Status figures could not be read: <cause>" beside the
+observed age. The rollup row also carries the profile's last-run verdict ("Last run failed" or
+"Last run partial") next to the tree comparison, because a rollup is a comparison taken when someone
+asked, never a verdict on the last run.
 
 ## The one thing it can get wrong
 

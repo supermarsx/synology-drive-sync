@@ -21,7 +21,8 @@ safe server-copy candidates, and deletion guards, then streams those files once 
 IEEE CRC32, and SHA-256 together.
 
 Never replace an unavailable digest with a zero, empty string, or assumed mismatch. The planner and
-executor fail closed when the safety decision depends on missing remote metadata.
+executor fail closed when the safety decision depends on missing remote metadata: the affected path
+is deferred (neither uploaded nor deleted) and named in the outcome, never decided on a guess.
 
 ## Build a plan
 

@@ -7,8 +7,8 @@ files, and preserves remote-only entries by default. Mirror behavior is opt-in.
 
 | Mode | Same-path file is unchanged when | Trade-off |
 | --- | --- | --- |
-| `content` | size, MD5, IEEE CRC32, SHA-256, and one-second mtime all match | Safest and default; streams selected remote files to compute the complete fingerprint. |
-| `metadata` | size and one-second mtime match | Avoids remote content hashes but cannot detect equal-size/equal-time byte changes. |
+| `content` | size, MD5, IEEE CRC32, SHA-256, and whole-second mtime all match (the remote second equals the floor or the rounded local time) | Safest and default; streams selected remote files to compute the complete fingerprint. |
+| `metadata` | size and whole-second mtime match (floor or rounded) | Avoids remote content hashes but cannot detect equal-size changes within the same second. |
 | `size-only` | size matches | Fastest and weakest; use only when that correspondence is explicitly acceptable. |
 
 Content mode requires the File Station account to have download permission for every selected
@@ -33,11 +33,16 @@ synology-drive-sync plan --profile production \
   --exclude '!*.pdf'
 ```
 
+Built-in default excludes come first, ahead of every rule above: `desktop.ini`, `Thumbs.db` and
+`ehthumbs.db` (any case), `.DS_Store`, a macOS `Icon\r` file, and Office lock files (`~$*`). They are
+never uploaded, and any copy already on the NAS is protected from `--delete`. Because they are ordinary
+rules evaluated first, a rule of your own such as `!desktop.ini` re-includes one.
+
 Command-line rules append to profile rules. Excluded local entries are outside the desired sync set;
 review mirror plans carefully because a formerly included remote path can become remote-only.
 
 Exclusion is decided **before** a name is checked for portability, so a rule can exclude a name the
-tool would otherwise refuse to carry — an Office lock file such as `~$report.docx`, a Windows device
+tool would otherwise refuse to carry — a name such as `~scratch.txt`, a Windows device
 stem such as `aux.h`, a trailing dot, a component over the length limit, or even a name that is not
 valid UTF-8. Without a matching rule those names still fail the whole run, which is the right answer
 for a name that cannot be mapped to a remote path; with one, they are simply skipped.

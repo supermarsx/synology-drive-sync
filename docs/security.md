@@ -16,7 +16,10 @@ vulnerabilities through the private channel named there rather than a public iss
 - Verify release checksums and provenance before deploying into a sensitive environment.
 
 The application uses memory erasure for owned secret buffers where the Rust types permit it, but no
-application can guarantee a secret existed in only one allocation. HTTP/TLS serialization,
+application can guarantee a secret existed in only one allocation. A sync run holds the DSM password
+in zeroizing memory until it ends so an expired session can be re-established without a prompt (a
+`--password-file` is re-read instead and nothing is retained); see
+[session expiry](configuration/credentials.md#session-expiry-and-how-long-the-password-is-held). HTTP/TLS serialization,
 environment storage, allocators, operating-system buffers, and crash dumps may retain intermediary
 copies.
 

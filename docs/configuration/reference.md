@@ -40,7 +40,7 @@ for the complete resolution order and scheduler guidance.
 | --- | --- | --- | --- |
 | `compare` | `--compare`, `SDSYNC_COMPARE` | `content`; enum | `content`, `metadata`, or `size-only`. Content is the safest default. |
 | `jobs` | `--jobs`, `SDSYNC_JOBS` | integer; `2` | Concurrent uploads, from `1` through `16`. The configured rate limit is shared rather than multiplied by this value. |
-| `excludes` | repeated `--exclude`; no core environment variable | array of strings; `[]` | Gitignore-style rules evaluated in order. CLI rules append. A leading `!` negates an earlier match. The root `.sdsyncignore` also participates. |
+| `excludes` | repeated `--exclude`; no core environment variable | array of strings; `[]` | Gitignore-style rules evaluated in order. CLI rules append. A leading `!` negates an earlier match. The root `.sdsyncignore` also participates. Built-in defaults (`desktop.ini`, `Thumbs.db`, `ehthumbs.db`, `.DS_Store`, `Icon\r`, `~$*`) are applied first and can be negated. |
 
 ## Deletion safety
 

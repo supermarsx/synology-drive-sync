@@ -33,7 +33,9 @@ in [Diagnostics and multi-profile batches](diagnostics-and-batch.md).
 
 `--quiet` disables the standard-error log sink and progress, but it does not silently disable a
 configured file or remote sink. `--log-level off` disables structured event emission to every
-sink. Command results on stdout and final error reporting are separate from structured logging.
+sink. Command results on stdout and final error reporting are separate from structured logging. (The
+DSM package's per-category thresholds are a different mechanism and do not hide `error` records; see
+[DSM security](dsm/security.md).)
 
 ## Configuration and precedence
 
@@ -137,13 +139,15 @@ upload.started                 upload.attempt_started          upload.progress
 upload.completed               upload.failed
 directory.created              entry.deleted
 retry.scheduled                cancellation.requested
+run.partial                    entry.skipped                   entry.deferred
+result_record.failed
 ```
 
 Every JSON log record has the same seven base fields. `operation_id` and `attempt` are `null` when
 not applicable, and unused numeric metrics are zero. This stable shape is preferable to parsing
 human messages.
 
-Four optional members carry structured detail, and are **omitted entirely** from records that do
+Seven optional members carry structured detail, and are **omitted entirely** from records that do
 not have them, so every record listed before this release renders byte for byte as it always did:
 
 | Member | Present on | Contents |
@@ -152,6 +156,29 @@ not have them, so every record listed before this release renders byte for byte 
 | `connection` | `connection.established` | Scheme, host, port, base path, redirect policy, certificate policy. |
 | `session` | `session.established` | SID length, whether a token was issued, the requested login format, and whether the server set a cookie. |
 | `call` | `api_call.*`, `retry.scheduled` | One HTTP round trip: see below. |
+| `reason` | `run.failed`, `run.partial`, `upload.failed`, `entry.skipped`, `entry.deferred`, `result_record.failed` | The class of the failure, skip or deferral: one token from the closed list below. Never error text. |
+| `profile` | records attributable to one profile | The profile name (`[A-Za-z0-9_-]`). |
+| `path` | `upload.failed`, `entry.skipped`, `entry.deferred`, `result_record.failed` | Relative path of the entry concerned, sanitised like every other runtime text (any byte outside `A-Z a-z 0-9 . - _ / : ,` reads as `_`, non-ASCII included) and cut at 128 bytes with a trailing `~`. Never on authentication or connection records. |
+
+`run.partial` replaces `run.completed` for a run that finished without error but left entries for
+the next run (changed during the run, a kept deletion, a refused server-side copy); the entries
+themselves are `entry.deferred` or `entry.skipped` records. The `reason` vocabulary is closed and
+pinned to the core by a test (`$defs/eventReason` in `observability.schema.json`):
+
+```text
+authentication            network                   http_status               timeout
+remote_response_invalid   dsm_api_error             dsm_api_unsupported       share_not_writable
+remote_path_refused       type_conflict             protected_conflict        empty_source_guard
+delete_limit              source_invalid            local_entry_unsupported   local_io
+source_changed            resync_ticket_stale       content_verification_failed
+remote_changed            server_copy_unavailable   server_copy_failed        reconciliation_pending
+credential_unavailable    config_invalid            https_required            scope_not_found
+cancelled                 unclassified
+changed_during_run        delete_bound              server_copy_fallback      excluded
+upload_failed
+```
+
+The DSM package surfaces these on the dashboard as the reason a run failed or is partial.
 
 ## Request-level diagnostics
 
@@ -262,7 +289,7 @@ plan renders the reason and its explanation after the action line:
 | --- | --- | --- |
 | `missing-remote` | No remote entry exists at the mapped path | every compare mode |
 | `size-differs` | Local and remote sizes differ | every compare mode |
-| `mtime-differs` | Sizes agree and the second-resolution modification times differ | `metadata`, `content` |
+| `mtime-differs` | Sizes agree and the modification times differ at File Station's whole-second resolution: the remote second is neither the floor nor the rounded value of the local time | `metadata`, `content` |
 | `content-differs` | Sizes agree and the content digests did not compare equal | `content` |
 | `type-replaced` | A remote entry of the other kind occupies the path and is replaced | every compare mode |
 
@@ -275,7 +302,10 @@ the modification times differ, it reports the difference it did observe, `mtime-
 `sync --output json` uses `sdsync.sync.v1`, retains the complete `plan`, and adds `result`. A changed
 sync result contains `changed`, `uploaded`, `server_copied`, `upload_bytes`,
 `directories_created`, `deleted`, `deletes_skipped`, `kept_deletes_uploaded`, `changed_during_run`,
-`failed`, and `elapsed_ms`; an already-synchronized run uses `"result":{"changed":false}`.
+`failed`, `outcome`, `deferred`, `mtime_not_kept`, `skipped`, `incomplete_listings`,
+`incomplete_listing_folders`, `recovered`, and `elapsed_ms`; an already-synchronized run uses
+`"result":{"changed":false}`. [Partial runs, deferrals and skips](#partial-runs-deferrals-and-skips)
+defines the verdict fields.
 
 `deletes_skipped` counts planned mirror deletions the run kept rather than performed: the local path
 exists again, or a kept deletion beneath a directory left it non-empty. `kept_deletes_uploaded` counts
@@ -288,6 +318,102 @@ the document is emitted either way, because a run that uploaded nine hundred fil
 reconcile has nine hundred uploads worth reporting. `server_copy_fallback_bytes` is the amount that may still be uploaded
 only when a planned server copy cannot be started; it is deliberately separate from
 `upload_bytes`.
+
+### Result records
+
+The global `--result-record FILE` option writes one NDJSON line per job, atomically, with mode `0600`
+on Unix, for `sync` and `plan` in single-profile and batch runs. It is independent of `--output`, so
+a wrapper can keep human output and still read the verdict:
+
+```json
+{"schema":"sdsync.result-record.v1","profile":"photos","status":"partial","result":{"outcome":"partial","deferred":[]}}
+```
+
+`status` is `complete`, `partial`, `failed` or `planned` for a single run; a batch uses its existing
+job statuses. `result` is the execution result object described below, a small plan verdict, or
+`null`. A failure to write the record is a warning on standard error and a warning event in `sync.log`
+naming the file and the cause; the exit code is unchanged. The line shape is defined by the
+`$defs/resultRecord` in `observability.schema.json` (its `result` verdict is `$defs/planVerdict`
+for a plan). The failure is logged as a `warn` `result_record.failed` event with reason `local_io`, the
+record's file name as `path`, and the profile. The DSM runner uses it to record deferred and skipped counts for every run.
+
+### Partial runs, deferrals and skips
+
+A check that used to fail the whole run now sets aside only the path it concerns, on both sides. A
+set-aside path is never uploaded and never deleted, nothing is deleted on its account (its ancestors
+and every other spelling of its name are protected too), and the rest of the run proceeds. Two
+vocabularies result, and both are always named, never silent.
+
+`result.outcome` is the run's verdict in one word: `complete`, `partial` or `failed`. The process
+exits `3` and the outcome is `partial` only when `result.deferred` holds at least one **transient**
+reason; the log then carries `run.partial` in place of `run.completed`. `plan` follows the same
+rule: it exits `3` and names a file it could not fingerprint in `plan.skipped` (tag `deferred`) and in
+an `entry.deferred` record. Failure (`1`) and cancellation (`130`) keep their own codes. Lasting items
+are reported, logged and warned about, but exit `0` with `outcome: "complete"`.
+
+`result.deferred[]` is `{path, reason, detail}` per path left for a later run (a deletion withheld because of a deferred partner carries that partner's reason). `plan` exits `0` when every deferral is lasting. The SDK `DeferredReason` has the same eleven tokens:
+
+| `reason` | Meaning and what to do | Lasting |
+| --- | --- | --- |
+| `source-changed` | The local file changed while it was hashed or sent. It is never sent torn: the transfer is aborted and the destination left as it was. Re-run once the writer is done. | no |
+| `source-vanished` | Deleted locally during the run. Re-run; the deletion is then planned normally. | no |
+| `source-unreadable` | Locked or not permitted. Release the lock or fix the permission. | no |
+| `remote-digest-unavailable` | The NAS could not compute the checksum of this one file. Only per-file DSM or HTTP outcomes defer; transport, session, permission and busy errors still fail the run once, with that cause. | no |
+| `remote-changed` | The NAS entry changed after planning, or an upload destination had appeared. Left as found, never overwritten. | no |
+| `server-copy-failed` | The NAS-side copy finished with an error; the file is uploaded next run. | no |
+| `delete-failed` | The NAS refused the deletion; it is retried next run. | no |
+| `unrepresentable-name` | A NAS name this host's filesystem cannot hold (a trailing dot or space, a reserved device name, characters NTFS refuses). Never deleted on that account. | yes |
+| `unsupported-local-entry` | Not a regular file or directory the sync carries, including a Windows file whose open fails with error 1920 or 1921. | yes |
+| `remote-unreadable` | The NAS does not let this account read the file (for example DSM code 105), so it is never compared or deleted until its permissions change. Exit `0` with a warning. | yes |
+| `listing-incomplete` | The NAS folder listed fewer entries than it counted on two stable reads, typically Advanced Permission hiding items. Deletions among its direct children, the folder itself and its ancestors are withheld; other folders are unaffected. | yes |
+
+`result.skipped` is a count and `plan.skipped[]` is `{path, reason, detail}` for paths the plan
+declines to carry for a lasting reason. The scan no longer aborts on them:
+
+| `reason` | Meaning |
+| --- | --- |
+| `windows-attributes` | A Windows SYSTEM or TEMPORARY entry the default exclusions did not cover. |
+| `link-or-reparse-point` | A symlink, junction or volume mount point. Reparse points that hold their own data (deduplicated files, hydrated or pinned cloud files) are ordinary files and are carried. |
+| `dehydrated-placeholder` | A cloud or HSM placeholder (`RECALL_ON_DATA_ACCESS`, `RECALL_ON_OPEN` or `OFFLINE`). Reading it would start a download, so it is not read; hydrate it to sync it. |
+| `local-case-collision` | Two local names differ only by case or Unicode normalisation; both are named and neither is sent. |
+| `remote-case-collision` | The destination already holds two such spellings; both are named and nothing is deleted. |
+| `case-rename-needs-delete` | A case-only rename, which removes the old remote spelling and so needs `--delete`. Under `--delete` a rename converges: the new spelling is uploaded and the old one removed. |
+| `deferred` | A deferral named in the plan; `detail` reads `<reason>: <cause>`. Unlike the other tags it is transient and, in a `plan`, makes the exit code `3`. A deletion withheld on a deferred path's account carries that path's reason. |
+
+A skipped path's remote copies are protected, not deleted. Skips appear as `SKIPPED` lines in human
+plan output and as one `entry.skipped` warning each.
+
+The remaining fields say what the run recovered from, so nothing is silent:
+
+- `mtime_not_kept` counts destinations whose modification time the NAS did not keep (see
+  [how modification times are compared](diagnostics-and-batch.md#how-modification-times-are-compared)).
+  Their content was verified; a `metadata` comparison reports them changed next run. A warning only.
+- `incomplete_listing_folders` names each folder behind `incomplete_listings` (`.` is the destination
+  root); each is also logged as an `entry.skipped` warning with reason `remote_response_invalid`.
+- `recovered` counts `retries`, `reauthentications`, `reauthentication_failures`,
+  `keepalive_failures`, `server_tasks_not_stopped` and `server_copy_fallbacks`. Human output prints a
+  `Recovered:` line when any is non-zero.
+
+The `reason` on `entry.deferred` and `entry.skipped` is the closed event vocabulary, not the result
+token. Deferrals map as follows: `source-changed` and `source-vanished` to `changed_during_run`,
+`source-unreadable` to `local_io`, `unsupported-local-entry` and `unrepresentable-name` to
+`local_entry_unsupported`, `remote-digest-unavailable` and `delete-failed` to `dsm_api_error`,
+`remote-changed` to `remote_changed`, `listing-incomplete` to `remote_response_invalid`, and
+`server-copy-failed` to `server_copy_failed`. Skips map to `local_entry_unsupported` (attributes,
+links, placeholders), `changed_during_run` (`deferred`) or `protected_conflict` (collisions and the
+case rename). The NDJSON plan stream carries no `skipped` records; read them from the JSON plan or
+the log.
+
+When a remote checksum fails with the same cause for three files in a row (or three before any
+succeeds; DSM `408` and `105` do not count), the run fails once instead of deferring every file: "N
+remote checksums failed with the same cause, so the NAS rather than these files is the likely
+problem: <cause>; files: a, b, c", with the cause's own event reason. A fatal digest error names the
+remote file as a `(file "<remote path>")` suffix.
+
+Post-run reconciliation excuses, as `changed_during_run`, a local file modified after the run began,
+a local file deleted during a `--delete` run (when the run did not schedule that deletion and either
+wrote at or beneath the path or found the remote entry older than the run), anything related to a
+deferred path, and an mtime-only difference on a file this run wrote.
 
 NDJSON uses a streaming contract rather than splitting the JSON object mechanically. Records are
 ordered as follows:
@@ -302,7 +428,7 @@ ordered as follows:
 {"schema":"sdsync.plan-action.v1","action":"create-directory","relative":"releases","remote_path":"/team/export/releases","reason":"missing-remote"}
 {"schema":"sdsync.plan-action.v1","action":"copy-remote-content","from_relative":"old/report.bin","from_remote_path":"/team/export/old/report.bin","to_relative":"new/report.bin","to_remote_path":"/team/export/new/report.bin","expected_size":4096,"expected_mtime_seconds":1785769200,"content_md5":"d41d8cd98f00b204e9800998ecf8427e","source_snapshot_guard":{"entry_kind":"file","size":4096,"mtime_seconds":1785769200,"content_md5":"d41d8cd98f00b204e9800998ecf8427e","require_mtime":true},"verified_upload_fallback":"only-before-copy-task-start"}
 {"schema":"sdsync.plan-action.v1","action":"upload","relative":"release.bin","remote_path":"/team/export/release.bin","bytes":5242880,"mtime_ms":1785769200000,"reason":"content-differs"}
-{"schema":"sdsync.output.v1","kind":"completion","result":{"changed":true,"uploaded":1,"server_copied":1,"upload_bytes":5242880,"directories_created":1,"deleted":0,"deletes_skipped":0,"kept_deletes_uploaded":0,"changed_during_run":0,"failed":false,"elapsed_ms":8421}}
+{"schema":"sdsync.output.v1","kind":"completion","result":{"changed":true,"uploaded":1,"server_copied":1,"upload_bytes":5242880,"directories_created":1,"deleted":0,"deletes_skipped":0,"kept_deletes_uploaded":0,"changed_during_run":0,"failed":false,"outcome":"complete","deferred":[],"mtime_not_kept":0,"skipped":0,"incomplete_listings":0,"incomplete_listing_folders":[],"recovered":{"retries":0,"reauthentications":0,"reauthentication_failures":0,"keepalive_failures":0,"server_tasks_not_stopped":0,"server_copy_fallbacks":0},"elapsed_ms":8421}}
 ```
 
 A plan-only NDJSON stream ends after its last action. An unchanged sync emits the summary followed
@@ -400,7 +526,8 @@ Batch output is emitted before a nonzero result is returned for a preflight or e
 An initial aggregate-cap breach and a fresh-plan cap breach both return operational exit `1`. The
 initial breach authorizes no selected mutation; a fresh breach authorizes no mutation for the
 blocked job but does not roll back earlier successes. If a mutating job otherwise fails, earlier
-successful jobs remain committed and later jobs are `not-run`. Preserve both stdout and stderr,
+successful jobs remain committed; a sync batch still runs the remaining targets unless it was
+cancelled or the aggregate deletion cap refused a reservation, and those later jobs are `not-run`. Preserve both stdout and stderr,
 and treat nested paths and error strings as path-sensitive operational data. Use an explicit common
 `--output json` or `--output ndjson` when selected profiles otherwise resolve different output
 defaults.
@@ -564,8 +691,12 @@ formatting:
 - event codes are a closed enum;
 - event metadata is numeric only;
 - progress uses numeric operation IDs and counters;
-- no generic `sdsync.log.v1` or progress record accepts paths, usernames, URLs, headers, bearer
+- no generic `sdsync.log.v1` or progress record accepts usernames, URLs, headers, bearer
   tokens, passwords, OTP codes, TOTP seeds, free-form messages, or arbitrary key/value fields;
+- the one path a log record can carry is the opt-in `path` member of a failure, skip or deferral
+  record: the entry's path relative to the profile source, sanitised and bounded as described
+  under [Logs](#logs). It names a file the operator synchronises, never a credential, and is never
+  set on authentication or connection records;
 - remote transport errors are reduced to fixed categories and never include response bodies;
 - endpoint validation errors and token errors do not echo the offending value;
 - redirects are disabled so a bearer header cannot be forwarded by the client.

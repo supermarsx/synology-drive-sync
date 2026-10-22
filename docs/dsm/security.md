@@ -360,7 +360,9 @@ malformed rotated history remain fail closed. Exact record verification and file
 complete before the outbox record can be retired.
 
 Category thresholds suppress optional Activity/controller/scheduler and structured pre-relay API
-records below the configured level before persistence. Each pre-relay API record uses the exact
+records below the configured level before persistence. No threshold, `off` included, hides an
+`error`-level record: a failure stays visible in Activity and Logs whatever a category is set to, and
+an unlevelled line (raw stderr a child process left in `controller.log`) is read as an error. Each pre-relay API record uses the exact
 stage-derived `bridge`, `authentication`, or `security` category; a corrupt or unsafe policy fails
 closed without writing the record or its coalescing state. Log reads scan bounded rotated history and
 return up to the requested number of matching records, so newer trace/debug noise cannot hide an

@@ -103,6 +103,78 @@ The snapshot reports:
 Plan and Run remain asynchronous in the dashboard. “Queued” is not completion. Follow the run state,
 Activity, and logs.
 
+### Run outcomes, reasons, and where a failure is recorded
+
+The state above is the legacy view. The snapshot also carries an `outcomes` block
+(`sdsync.dsm-outcomes.v1`) that interprets the package's state files into a verdict and a cause. The
+bridge computes it after either read rung answers, so both carry it, and it never fails the snapshot:
+a missing, unsafe, or unrecognised state file degrades that one entry and adds a named record to
+`outcomes.errors` instead.
+
+| Outcome | Meaning |
+| --- | --- |
+| `succeeded` | Finished, exit 0. Counts of skipped or deferred entries turn it into a warning, never plain success. |
+| `partial` | The core exited `3`: finished, but named paths were deferred and sync on the next run. Not a failure: no failure alert, no retry consumed, and a dependent routine may run after it. |
+| `failed` | Ended non-zero, or was refused in preflight. `reason` says why when known. |
+| `busy` | Refused because another run, Doctor, or management action held the run lock (exit `75`). A deferral that is retried; not a failure and not counted by the failure alert. |
+| `cancelled` | Stopped by the user or a package stop (`130`/`143`). No alert. |
+| `not_run` | No record, or the last aggregate run did not reach this profile; its previous completion is kept. |
+| `stale` | `run.state` says `running` but the runner is gone (see below). Treated as failed. |
+| `unknown` | A record exists but its value is not one this reader knows. Shown as “Status unknown”, never as success. |
+
+The snapshot carries one outcome for the last run (`outcomes.run`, with the last whole-estate run kept
+in `run.aggregate` so a later single-profile run cannot hide an aggregate failure) and one per
+profile (`outcomes.profiles[]`, with `consecutive_failures` and `last_success_epoch`). Reasons are
+short tokens, never paths or secrets; the dashboard turns each into a cause and a next step, and shows
+any token it does not recognise as `unknown (<token>)` rather than hiding it. `outcomes.alerts` carries
+the consecutive-failure count and threshold, so the failure is durable in every poll rather than only
+in a notification.
+
+**A refusal before the core starts is recorded where a reader looks.** A scheduled run that is refused
+in preflight (invalid configuration, a profile log path that is not the package-managed one, the
+security policy, an unsafe package file, a missing password, an unadmitted wrapper) used to exit with
+no trace. Every exit of the runner now names a reason and writes four records: `run.state`
+(`failed`, with `reason` and a one-line `detail`), the profile's own state, the failure counter (for
+sync), and an error-level Activity `run.failed` with the cause. If a run is already in flight, its
+`running` record is preserved rather than overwritten. A refusal because the run lock is held writes
+only an Activity `run.deferred` and never touches `run.state`.
+
+**Captured core stderr for scheduled runs.** A scheduled run captures the core's standard error. The
+last `error:` line (or else the last non-empty line) is sanitised to printable ASCII, cut at 160
+characters, and becomes both the run's `detail` and the Activity message. The last 16 KiB are kept
+in `var/log/run-stderr.log` (mode `0600`, with a header naming epoch, scope, operation, and exit;
+rotated per run to `.1` through `.3`). It can contain local and remote paths, as a manual job result
+already can; collect it as evidence like the other package logs. A manual run keeps its output in
+the job result instead.
+
+**Per-profile outcomes in an aggregate.** An aggregate run no longer stops at the first profile that
+fails preflight. Each refused profile gets its own failed state and Activity record, and the profiles
+that were admitted run with the same deletion budget (a subset can only delete less). The run still
+ends failed, with reason `profiles_skipped`, and still alerts. A scheduled aggregate reads the core's
+per-job records, so each profile is recorded `succeeded`, `failed`, or `not_run` on its own evidence;
+a manual aggregate falls back to the exit code, and the profile outcomes it cannot read are recorded
+`unknown` and counted as failed for the dependency gate. The core continues past a failed target; it
+stops only on cancellation or when the aggregate deletion cap refuses a reservation.
+
+**A run that died.** If `run.state` says `running` but `run.lock` has no live owner (pid, start time,
+and boot identity all checked, and the record re-read), the runner is gone: killed, out of memory, or
+power loss. The controller rewrites the state as `failed` with reason `runner_died`, writes an
+Activity `run.failed` and the failure alert, and logs `run_runner_died`; the dashboard shows “A run
+died without finishing” with a stale outcome. The bridge applies the same rule at read time, so the
+verdict does not wait for the controller (or survives a stopped one). An owner file that fails its
+ownership or mode check is *not* declared stale, because death cannot be proven.
+
+**Lasting skips and deferrals** exit `0`. The run is `succeeded` with a warning
+(`skipped_entries` or `deferred_entries`); the dashboard renders it as a warning, for example “Synced,
+3 entries skipped and will not sync until fixed”, and the entries are named by `entry.skipped` and
+`entry.deferred` records in the sync log. See
+[partial runs, deferrals and skips](../observability.md#partial-runs-deferrals-and-skips).
+
+**Degraded echoes.** When a run's own result is sound but some records of it could not be written
+(Activity line, alert counter, DSM log), the run carries `degraded` naming the sinks, and the
+dashboard says so. An alert that could not be processed is itself recorded: the dashboard shows
+“Failure alerts unavailable” and Activity gets `notification.unavailable`.
+
 ## What may run beside what
 
 Every dashboard request that does real work becomes a queued job, and the controller classifies each
@@ -137,9 +209,12 @@ codes are:
 | --- | --- |
 | `run.started` | Package Plan/Sync action started |
 | `run.succeeded` | Package action completed successfully |
-| `run.failed` | Package action completed with a nonzero result |
-| `routine.deferred` | Routine was outside its window or dependency evidence was not satisfied |
+| `run.failed` | Package action completed with a nonzero result, was refused in preflight, or its runner died; the message carries the cause |
+| `run.deferred` | A run was refused only because another operation held the run lock, or a routine wrapper was never admitted; retried, not a failure |
+| `routine.deferred` | Routine was outside its window or dependency evidence was not satisfied; recorded once per episode, not on every controller turn |
 | `routine.retry_scheduled` | A whole-action retry was scheduled |
+| `routine.retries_exhausted` | A routine used all its retry attempts; the message carries the attempt count and last reason |
+| `routine.watch_abandoned` | The controller stopped retrying a native watcher |
 | `doctor.succeeded` | Doctor completed successfully |
 | `doctor.failed` | Doctor completed with a nonzero result |
 | `doctor.inventory` | The DSM package retained one bounded private Doctor discovery record |
@@ -172,7 +247,10 @@ or unreadable state, and traverse from the oldest rotation through the active fi
 the newest requested suffix that fits its byte budget. Doctor discovery is available only through
 the local `doctor` Logs source and matching Activity events and is excluded from the core remote-log
 sink. Structured API failure lines obey their exact bridge/authentication/security category
-threshold. API output replaces private package paths with neutral labels and masks secret-file
+threshold, but an `error`-level record is never hidden by one: it is read in Activity and Logs
+whatever the category is set to, `off` included, and a line with no level (raw standard error a
+child process left in `controller.log`) is read as an error. The Activity read reports where its
+history starts (`history`), so a failure rotated away is not mistaken for none. API output replaces private package paths with neutral labels and masks secret-file
 paths; secret values are never an allowed log field. Selecting one of the six sources reads only
 that source; `all` remains globally bounded below the API bridge's 1 MiB response-capture limit.
 

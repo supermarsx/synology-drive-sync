@@ -60,11 +60,16 @@ The card has two sizes, both chosen by DSM rather than by the package:
 Each profile row reports the best evidence the package status snapshot actually carries. Where a
 routine exists for the profile, the row reports that routine's own last execution state
 (`Succeeded`, `Failed`, `Running`, `Deferred`, `Scheduled`, or `Not yet run`) and the age of its last
-success. Where no routine exists, the snapshot has no per-profile run record at all, so the row falls
-back to the cached Doctor result and says so explicitly (`Doctor passed`, `Doctor failed`, or
-`No routine`). The headline reports the worst state present rather than an average: an untrusted
-controller identity outranks a failing profile, which outranks a stopped service, which outranks a
-profile that has never run.
+success. A row is led by the profile's own recorded outcome (`outcomes.profiles[]`), so a profile
+whose last run failed no longer reads `Doctor passed`. Only where the profile has no recorded run does
+the row fall back to the cached Doctor result and say so explicitly (`Not run` with `Doctor passed; no
+sync recorded`, `Doctor failed`, or `No routine`). The headline reports the worst state present rather than an average: an untrusted
+controller identity outranks everything; a failed, died or unknown last run (or unreadable failure
+alerts) outranks a failing profile, which outranks a stopped service, which outranks profiles needing
+attention, partial runs and unwritten records, which outrank a profile that has never run. A
+snapshot with no `outcomes` block is never called healthy. After a failed read every row is marked
+`(stale)` with an unknown level (failures stay red) and the headline says “Status is stale”, so a
+retained snapshot never shows green under a dead bridge.
 
 The widget is read-only. It calls only the `snapshot` read of the same authenticated CGI bridge the
 AppWindow uses, and it can neither queue an operation nor reach a secret. Its refresh discipline is
@@ -186,11 +191,21 @@ Overview is an operational summary, not a substitute for Doctor or a reviewed Pl
 | Service | `running`, `stopped`, or `untrusted` controller evidence from the package snapshot |
 | Profiles | Configured profile count and how many have protected password material |
 | Next routine | Earliest reported `next_run_epoch` among enabled per-profile routines |
-| Last result | `never`, `running`, `succeeded`, or `failed`, plus its completion time when known |
+| Last result | The run outcome (`succeeded`, `partial`, `failed`, `busy`, `cancelled`, `stale`, `unknown`) with its reason in words and the runner's one-line cause, plus its completion time when known |
 | Active scope | Named profile or `all` while an operation is running |
 | Realtime | Count of enabled realtime routines and whether polling fallback is visible |
 | Profiles | Profile name, logical destination, default marker, and password-presence status |
 | Last operation | Operation (`plan` or `sync`), state, scope, start, and finish evidence |
+
+An **attention list** above these cards (on Overview and Activity) names every run outcome that needs
+a look: a failed or died run with its cause, consecutive failures against the alert threshold,
+unreadable failure alerts, partial runs and skipped or deferred entries, records that could not be
+written, and unreadable status figures. It persists in every poll until a success clears it, so it
+does not depend on having seen a notification, and a failure that happened while the page was closed
+is announced once, by a toast, when it loads. Each profile shows a “Last run:” line, the
+tree-comparison table notes “Last run failed: …” beside a profile whose last run failed (a comparison
+is taken when someone asks, not a verdict on the last run), and while the bridge is unreachable the
+page is dimmed rather than left looking current.
 
 **Plan all profiles** and **Run all profiles** enqueue an action with scope `all`. The dashboard does
 not enable deletion from these quick actions. Use the reviewed deletion flow documented under

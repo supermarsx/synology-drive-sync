@@ -35,7 +35,16 @@ the mounted source. See [Local, mapped-drive, and SMB sources](local-and-smb-sou
 per-platform paths, the share-root limitation, and expected SMB performance.
 
 Without `--hash`, the scanner validates names, types, metadata, case portability, link/reparse
-boundaries, and readability needed to enumerate the tree. With `--hash`, it additionally reads every
+boundaries, and readability needed to enumerate the tree. Links, reparse points that redirect,
+SYSTEM and TEMPORARY entries, dehydrated cloud placeholders and case or Unicode-normalisation
+collisions are skipped rather than failing the scan, and OS metadata files (`desktop.ini`,
+`Thumbs.db`, `ehthumbs.db`, `.DS_Store`, `Icon\r`, `~$*`) are excluded by default; `sync`, `plan` and
+`doctor source` name every skipped path (see [local and SMB sources](local-and-smb-sources.md)). The
+`doctor source` JSON carries `source.skipped: [{path, reason, detail}]` using the `plan.skipped` tags;
+human output says "Source is readable, with entries a sync will skip" and lists `SKIPPED <path>:
+<detail> (<tag>)` lines. With `--hash`, a file that is changing, locked or data-less is withheld and
+named rather than failing the whole diagnosis. A source root that is itself a link or reparse point is still
+refused. With `--hash`, it additionally reads every
 payload file, records MD5, IEEE CRC32, and SHA-256, and verifies that each file still matches the size and mtime
 snapshot taken by the scan. Cancellation or any scanner/read/snapshot failure returns no successful
 partial report. The diagnostic never writes to the source.
@@ -361,14 +370,30 @@ a pass/fail gate, because it is the one property of a destination the tool canno
 itself: the upload writes `mtime` in milliseconds and every comparison reads whole seconds back from
 File Station. `mtime_preserved` is `true`, `false`, or `null` when DSM reported no modified time at
 all. A `false` means every `metadata` or `content` run will report unchanged files as differing, so
-each run re-uploads the whole tree and post-run reconciliation cannot converge; a `sync` against such
-a destination warns once per run. It must never use or
+each run re-uploads the whole tree; a `sync` against such a destination warns once per run and counts
+the affected files in `mtime_not_kept` (their content is still verified, and post-run reconciliation
+excuses an mtime-only difference on a file the run wrote). It must never use or
 replace an existing user path. A process crash, lost connection, DSM failure, or failed cleanup can
 leave a disposable artifact; inspect and remove the exact reported probe path manually before
 retrying. The nested `write_test` report distinguishes request, preflight, execution, verification,
 cleanup, and any leftover path. The write test is not appropriate as a routine production health
 check. For compatibility, omitting `--level` with `--write-test` auto-promotes to Extensive, but new
 automation should make both opt-ins explicit.
+
+## How modification times are compared
+
+File Station stores and returns whole seconds, while the local time carries milliseconds, and DSM
+may store either the floor or the rounded second of what an upload sent. A remote second therefore
+agrees with a local time that has a sub-second part when it equals the floor **or** the rounded
+(half-up) value, and with a whole-second local time (FAT, SMB, or a time read back from File Station)
+only when it matches exactly. Anything coarser counts as changed, so a genuine edit is not hidden by a
+tolerance and a rounded upload does not read as a perpetual difference.
+
+The residual is inherent to the destination's resolution: an edit that keeps the size and lands in
+the same second (or the same rounding bucket) is not detectable in `--compare metadata`. `--compare
+content` compares digests and catches it. Candidates for a server-side copy and every guard that
+authorises a copy or a deletion keep an exact compare; a destination whose time was not kept still
+needs a full content read-back before a source is deleted.
 
 ## Selecting complete profile jobs
 
@@ -482,12 +507,18 @@ its phase was not completed or was not applicable. The `all_targets_preflighted_
 boolean is observed evidence derived from the job records, not a declaration of intended policy: it
 is false when preflight failed or was interrupted. Each plan still retains its own deletion count.
 
-If execution of a mutating job fails, already completed earlier jobs are not rolled back and later
-jobs are not run. The command returns nonzero after writing the aggregate result. The aggregate is
+If execution of a mutating job fails, already completed earlier jobs are not rolled back. A sync
+batch carries on with the remaining targets after a failure; it stops, leaving the rest `not-run`,
+only on cancellation or when the aggregate `--max-total-delete` cap refuses a reservation. The
+command returns nonzero after writing the aggregate result. The aggregate is
 `partial` when a job itself is potentially partial or when an earlier job succeeded before another
 failed; otherwise a no-success failure is `failed`. Preserve stdout and stderr together with the
 profile order, repair the failed job, obtain a fresh plan for every affected target, and do not
 infer that `not-run` means already synchronized.
+
+A job that finished but deferred transient paths is `success` with `result.outcome: "partial"`; the
+job status `partial` above means something different (failed after mutating). When every job ran,
+none failed, and at least one is partial in that sense, the batch exits `3`.
 
 For machine parsing, pass `--output json` or `--output ndjson` explicitly rather than relying on
 different per-profile defaults. Command results remain on stdout; diagnostic logs and progress

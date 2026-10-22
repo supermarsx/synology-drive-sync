@@ -126,6 +126,20 @@ the [release instructions](../releases.md#synology-dsm-packages), then install i
 **Package Center > Manual Install**. GitHub Releases are the update channel for this package; the
 26.11 asset remains immutable.
 
+### The same mismatch inside scheduled runs
+
+A related field failure hit scheduled routines rather than startup: DSM handed the runner the
+physical `SYNOPKG_PKGDEST`, `SYNOPKG_PKGHOME` and `SYNOPKG_PKGVAR` (`/volumeN/@appstore/...`) while the
+manager had written the profile's log path under the `/var/packages/synology-drive-sync/...` alias. The
+runner's log-file preflight compared the two as strings and refused every profile (exit `66`), and the
+supervisor refused its own binary because `argv[0]` spelled a different path. Nothing in Activity said
+so. The package now pins `package_root`, `package_home` and `package_var` to the alias whenever the
+alias and the physical path resolve to the same device and inode, in the runner, the controller, and
+the lifecycle scripts, so every process derives byte-identical paths. The bridge's supervisor check
+likewise accepts a path that is the same file as the package binary, while still executing the alias.
+A supervisor refusal is no longer silent: it prints one `sdsync-dsm-api: supervised core refused:
+<code>` line and exits `78`, recorded as reason `supervisor_refused`.
+
 ## `api.cgi?action=csrf` reports semantic status 503
 
 Package-generated GET failures use HTTP transport 200 because Webman can discard or replace non-2xx
@@ -628,10 +642,45 @@ before this field existed, and that reads as `ok`.
 `backend` itself is only as current as the last poll that actually completed; a stalled or failing
 poll leaves it holding whatever it last reported rather than updating to reflect the present.
 
+## A run failed, died, or was refused
+
+Start with the dashboard's attention list or the snapshot's `outcomes.run` (`reason` and `detail`);
+the same cause is in Activity `run.failed`. A scheduled run's core stderr tail is in
+`var/log/run-stderr.log`.
+
+| Reason | Meaning | What to do |
+| --- | --- | --- |
+| `preflight_config_invalid` | `config validate` failed for the profile set | Correct the highlighted setting on Profiles. |
+| `preflight_log_file_path` | The profile's log file is not the package-managed path (exit `66`) | Reset the profile's log-file setting, or repair the package. If it began after an upgrade, see the path-alias section above. |
+| `preflight_policy` | The security policy refused the profile (plain HTTP, unverified TLS, destructive options) | Review Security. |
+| `preflight_unsafe_state` | A package file failed its ownership or mode check (exit `73`/`77`) | Repair or reinstall; do not chmod by hand. |
+| `no_password:<profile>` | That profile's password file is missing | Enter the password on Profiles. |
+| `supervisor_refused` | The package supervisor refused before the core ran (exit `78`) | Read the stderr line in `api.log`/`controller.log`; reinstall if the binary identity mismatch persists. |
+| `runner_died` | The runner was killed or lost before it finished (out of memory, power loss) | Review Logs, then run again. Nothing is rolled back. |
+| `core_failed` / a core reason (`authentication`, `network`, `timeout`, `share_not_writable`, ...) | The core ran and failed; the reason is the class of the core's error | Follow the dashboard's next step; the one-line `detail` is the core's last error line. |
+| `profiles_skipped` | An aggregate ran without the profiles that failed preflight | Fix those profiles; each has its own failed record. |
+| `batch_target_failed:<profile>` / `not_reached` | An aggregate stopped at, or never reached, this profile | Fix the named profile, then run again. |
+| `deferred_paths` | The core exited `3`: finished, with some paths deferred to the next run. Recorded as `succeeded` with outcome `partial`, an Activity warning counting the waiting paths, no alert and no failure count | Nothing; the next run picks them up. Read `entry.deferred` in the sync log if it repeats. |
+| `lock_busy` | Another run, Doctor, or management action held the run lock | Nothing: this is a deferral, retried, and is not counted as a failure. |
+
+**Failure alerts unavailable** means the alert state file is unsafe or corrupt, so the failure counter
+and its notifications are disabled too; the consecutive-failure count is shown as unavailable rather
+than zero. Repair the file through the manager or a verified reinstall. **Some records of this run
+could not be written** (the `degraded` marker) means the run's result is sound but an echo, such as
+the Activity line, the alert counter, or the DSM log, was not written; check `controller.log` for
+`activity_append_failed`, `alert_unavailable`, or `dsm_log_emit_failed`.
+
+A **partial** run (exit `3`) is not a failure: some paths were deferred and sync next time. A run with
+**skipped or deferred entries and a warning** exited `0`; the entries are named by `entry.skipped` and
+`entry.deferred` records in the sync log, and the reasons are listed under
+[partial runs, deferrals and skips](../observability.md#partial-runs-deferrals-and-skips).
+
 ## Routine is deferred
 
 Check active weekday/time window, NAS clock/time zone, dependency latest-success states, and deletion
-approval. If a profile's deletion cap is greater than its routine approval ceiling, the controller
+approval. A deferral is written once when the routine enters it (Activity and `controller.log`), not
+on every controller turn, and a busy run lock (exit `75`) defers the routine for 30 seconds without
+consuming a retry. If a profile's deletion cap is greater than its routine approval ceiling, the controller
 defers instead of weakening the bound. Cyclic, missing, duplicate, or self dependencies are rejected
 at configuration time.
 

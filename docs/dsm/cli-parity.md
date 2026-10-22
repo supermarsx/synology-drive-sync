@@ -222,12 +222,15 @@ code rather than served.
 | `66` | Required profile, configuration, or protected credential is absent |
 | `69` | Installed executable or required runtime facility is unavailable |
 | `73` | Unsafe package path, state, lock, log, queue, or untrusted PID |
-| `75` | Another management or Plan/Run operation is active |
+| `75` | Another management or Plan/Run operation is active; a deferral, retried, not a failure |
 | `77` | Command was not run as the DSM package identity |
+| `78` | The package supervisor refused to start the core (binary identity mismatch); the core never ran, and one `supervised core refused: <code>` line is printed |
 | `130` / `143` | Interrupted management or terminated Plan/Run operation |
 
-Core planning, transport, authentication, and File Station failures propagate their own nonzero
-status. Treat `75` as a bounded retry only after confirming the recorded operation is expected.
+The core's own `3` (partial: finished with transient paths deferred to the next run) is propagated
+as is and is recorded as a `partial` outcome, not a failure; `plan` can also exit `3`. Lasting skips
+and deferrals exit `0` with a warning. Core planning, transport, authentication, and File Station
+failures propagate their own nonzero status. Treat `75` as a bounded retry only after confirming the recorded operation is expected.
 Investigate every other nonzero result and obtain a fresh Plan before retrying a mutation.
 
 ## Package Center parity

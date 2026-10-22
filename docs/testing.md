@@ -14,7 +14,7 @@ The CLI uses the workspace release profile. Build the C ABI with the dedicated u
 
 ## Test layers
 
-The deterministic suite has three complementary layers:
+The deterministic suite has these complementary layers:
 
 - **Unit tests** exercise configuration and credential-source precedence, path and deletion safety,
   hashing and planning, progress and observability failures, retry/cancellation behavior,
@@ -26,7 +26,17 @@ The deterministic suite has three complementary layers:
   models reverse-proxy prefixes and discovery fallback, authentication/TOTP and independent
   sessions, inventory and permissions, disposable write-probe cleanup, all-target batch preflight,
   additive and destructive parity, guarded type-conflict replacement, verified server-side rename
-  copies, retry reconciliation, and final rescan/replan checks.
+  copies, retry reconciliation, and final rescan/replan checks. They also cover the failure
+  vocabulary: a file that changes while it is hashed (exit `3`, `outcome: "partial"`, the deferral
+  carried to the next run), a source that vanishes after upload, DSM session expiry with exactly one
+  re-login, paginated and Advanced-Permission-hidden listings, a server-side copy that finishes with an
+  error, and the guarantee that a case-renamed or Unicode-paired name is never deleted when its upload
+  is deferred. `tests/scan_skip_protection.rs` walks and plans a real tree holding a link, SYSTEM files
+  and OS metadata files and asserts that only the genuinely remote-only file is deleted.
+- **Dashboard surface tests** (`packaging/synology/ui-src/test/outcomes-surface.test.mjs` and the
+  widget and AppWindow contract tests) feed every outcome, every reason code, unknown tokens and
+  hostile input through the pure `outcomes.mjs` model and assert that nothing renders as plain success
+  when a run failed, died, was partial, or the bridge stopped answering.
 
 These layers use local filesystem fixtures and mock HTTP servers. They do not log in to a live NAS,
 mutate the host credential vault, or prove compatibility with a particular DSM, File Station, TLS,

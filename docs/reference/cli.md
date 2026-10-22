@@ -55,15 +55,29 @@ Legacy `--dry-run` is equivalent to planning. New scripts should use `plan`.
 | --- | --- |
 | `0` | Success; for `plan --exit-code`, no changes are pending. |
 | `10` | `plan --exit-code` found pending changes. |
+| `3` | Partial: the run finished, but at least one path was **deferred** for a transient reason and is left for the next run. Applies to `sync`, `resync`, `plan` and batches. |
 | `2` | Command-line usage or configuration error. |
 | `1` | Operational failure: filesystem, network, DSM, vault, deletion guard, or required-log delivery. |
 | `130` | Cooperative Ctrl+C/SIGINT or SIGTERM cancellation, and the immediate exit a repeated signal forces. |
+
+Exit `3` takes precedence over `0` and `10` only: failure (`1`), usage error (`2`) and cancellation
+(`130`) keep their own codes. It is the exit for transient deferrals alone (a file that changed or
+was locked while it was read, a destination that moved after planning, a refused server-side copy
+or deletion). Lasting skips (links, reparse points, case collisions, names the destination cannot
+hold, incomplete NAS listings) and the lasting deferrals exit `0` with `outcome: "complete"`
+and a warning, because a run that could never be anything but partial would re-run forever under a
+scheduler. Both are always named in the result and the log; see
+[partial runs, deferrals and skips](../observability.md#partial-runs-deferrals-and-skips) for the
+reasons and what each means. A scheduler should treat `3` as "retry later", not as an alert.
 
 Treat every other nonzero value as failure and consume JSON/NDJSON output rather than parsing human
 diagnostic prose. An aggregate deletion-cap breach is an operational safety failure (`1`), not a
 usage error.
 
 ## Global output controls
+
+`--result-record FILE` writes one machine-readable line per job for `sync` and `plan`, single-profile
+and batch, independent of `--output`; see [result records](../observability.md#result-records).
 
 Global configuration and output options may appear before or after a subcommand. Result output on
 stdout is selected independently from diagnostics/progress on stderr:

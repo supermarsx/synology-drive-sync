@@ -95,9 +95,17 @@ polled, and the routine's `backend_reason` (below) names which condition applies
 This is not a kernel event stream and very short-lived changes between identical fingerprints may not
 be observable; final sync planning still performs the engine's normal complete source/target work. A
 healthy native event that is still inside its debounce suppresses fingerprint fallback for that turn,
-so polling cannot dispatch the same change before the quiet period ends. After consuming a native
-event, the controller refreshes the fingerprint baseline so fallback polling cannot dispatch that
-same change a second time.
+so polling cannot dispatch the same change before the quiet period ends.
+
+The fingerprint baseline moves only after a sync of the change **succeeds** (exit 0). A reading that
+becomes due is held as pending; a deferred dependency, a busy refusal, a failure, or an exhausted
+retry ladder leaves the old baseline and the pending reading in place, so the change is due again on
+the next poll rather than being forgotten. After a successful native dispatch the controller
+re-baselines in the background, so fallback polling cannot dispatch that same change a second time;
+if that fails the baseline is left alone and the backstop poll re-dispatches. The poll walk itself is
+a single background job (one at a time): the controller turn collects its result on a later turn
+instead of blocking on a slow tree. A not-before time written by a busy refusal, a dependency
+re-check, or exhaustion is honoured by realtime routines too.
 
 The snapshot reports the effective backend as `inotify`, `polling`, `interval`, `daily`, or `none`,
 and, for a realtime routine, a `backend_reason` naming why: `ok`, `source_missing`,
@@ -126,6 +134,20 @@ a later finite run rather than consuming an additional retry early.
 Routine files created before the exponential toggle are interpreted as enabled, preserving their
 former doubling behavior. A legacy base above five minutes is read and executed as 300 seconds; the
 next save writes the supported bounded value.
+
+When a routine exhausts its retry attempts, Activity records `routine.retries_exhausted` (error)
+with the attempt count and the last reason, a sync routine raises a DSM system-log `sync_failed` and,
+when failure alerts are enabled, a desktop one, and a realtime routine then cools down for 900
+seconds before it may try again. Exit `3` (partial) consumes no retry and no failure count: the
+deferred paths are picked up by the next run.
+
+Deferrals are recorded once per episode, not every controller turn. A routine outside its daily
+window, or waiting on a dependency, writes one Activity line and one log line when it enters that
+state, and an earlier succeeded or failed outcome is not overwritten by the deferral. The dependency
+is still re-checked every turn, so the routine runs as soon as it is satisfied. A run refused because
+the run lock was busy (exit `75`) is also a deferral: the routine is retried 30 seconds later and no
+retry is consumed. A routine whose configuration is skipped as invalid is reported once per field per
+controller lifetime, in `controller.log` and Activity, instead of silently.
 
 Retries do not make a multi-profile or deletion operation transactional. Earlier successful target
 changes remain when a later action fails. Investigate authentication, routing, source, or safety
@@ -204,6 +226,9 @@ sudo -u "$PACKAGE_USER" -- "$MANAGER" disable
 ```
 
 It runs all profiles sequentially after one interval, uses delay-after-completion, and has separate
-scheduled deletion approval. It can coexist in configuration with per-profile routines, but both
+scheduled deletion approval. Its next deadline is kept in `var/state/schedule.state`, so a restart or
+reboot no longer postpones a run by a whole interval: on start the next run is the earlier of the saved
+deadline and one interval from now, and a deadline that passed while the controller was stopped runs
+one minute after it starts. It can coexist in configuration with per-profile routines, but both
 share the same run lock. Prefer per-profile routines for new dashboard-managed deployments because
 their mode-specific timing, dependency, fallback, and state are individually visible.

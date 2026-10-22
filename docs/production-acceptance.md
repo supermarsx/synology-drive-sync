@@ -189,7 +189,7 @@ This optimization requires a unique byte-identical remote candidate, different s
 
 ## 6. Verify bytes and Drive indexing externally
 
-The default `content` comparison requires matching size, MD5, IEEE CRC32, SHA-256, and second-resolution file mtime. Each upload is verified against the destination's own length and File Station's server-side MD5, computed from a fingerprint of the bytes that went onto the wire; the bytes are not transferred back. The paths that read a remote file back in full are the ones whose evidence has to stand on its own: a server-side copy's destination, and the guard that authorises a mirror deletion. MD5 is retained for File Station and output compatibility but is never sufficient by itself. Explicit `metadata` and `size-only` performance modes provide weaker change detection and do not establish content equality.
+The default `content` comparison requires matching size, MD5, IEEE CRC32, SHA-256, and a file mtime that agrees at File Station's whole-second resolution (the remote second equals the floor or the rounded value of the local time). Each upload is verified against the destination's own length and File Station's server-side MD5, computed from a fingerprint of the bytes that went onto the wire; the bytes are not transferred back. The paths that read a remote file back in full are the ones whose evidence has to stand on its own: a server-side copy's destination, and the guard that authorises a mirror deletion. MD5 is retained for File Station and output compatibility but is never sufficient by itself. Explicit `metadata` and `size-only` performance modes provide weaker change detection and do not establish content equality.
 
 For production acceptance, independently download the completed destination through File Station, or wait for a separate Synology Drive client to finish downloading it, and compare every file against the recorded SHA-256 manifest. On Unix, place it at `./acceptance-download` and run:
 
@@ -306,8 +306,12 @@ payload creation, then run and confirm the whole descendant hierarchy appears. S
 that a nonexistent top-level shared-folder path fails closed rather than creating a DSM share, and
 that a trailing slash, dot segment, Drive-incompatible name such as `~temporary`, or case-varied
 DSM-managed component such as `@EADIR`/`@APPDATA` is rejected before any target request can mutate
-data. Include a case-only local/remote directory conflict and a path whose selected prefix plus
-relative name exceeds the Drive portability limit; both must fail during planning.
+data. Include a path whose selected prefix plus relative name exceeds the Drive portability limit,
+which must fail during planning. Include a case-only rename (it must converge under `--delete`, or be
+skipped as `case-rename-needs-delete` without it) and a true case collision of two local or two
+remote names (both must be skipped, named in `plan.skipped`, and never deleted). Include a symlink or
+junction and, on Windows, a `desktop.ini` and a SYSTEM-attribute file: each must be excluded or
+skipped and reported, and its NAS counterpart must survive a `--delete` run.
 
 Add a second profile with a different target URL or destination and distinct protected credentials.
 Require these commands to preflight every target and run in deterministic profile-name order:

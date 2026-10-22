@@ -6,7 +6,11 @@ Each profile can own three protected values:
 - optional DSM TOTP seed; and
 - optional remote logging bearer token.
 
-They are separate package-owned files, not TOML fields. A profile snapshot returns only
+They are separate package-owned files, not TOML fields. The generated profile hands the core the
+password as a `password-file` path, so the core re-reads the file when DSM expires a session mid-run
+and retains no copy of the password for the run (a password from standard input or the environment is
+instead held in zeroizing memory for the run; see
+[session expiry](../configuration/credentials.md#session-expiry-and-how-long-the-password-is-held)). A profile snapshot returns only
 `has_password`, `has_totp`, and `has_remote_log_token` booleans. It never returns a stored value,
 masked prefix, length, hash, or reusable derivative.
 

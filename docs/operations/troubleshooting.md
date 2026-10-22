@@ -56,7 +56,7 @@ DSM can return HTTP 200 with a JSON API failure, so both transport status and re
 | HTTP 504 or DSM `1801` | Proxy/File Station/application timeout | Long-upload timeout, rate cap, and largest file. |
 | DSM `150` | Requests appear from different client IPs | Proxy source-IP/session consistency. |
 | DSM `1800` | Multipart content length absent/inconsistent | Proxy buffering/body transformations and client version. |
-| DSM `106`, `107`, or `119` immediately after login | File Station rejected, expired, or lost the DSM session before evaluating the path | Run `doctor` and read the **DSM session channel ablation** section: it presents the same request through one session channel at a time and says whether the fault is which channel this client uses or the path itself. Then compare the same account through a direct LAN or tested custom-domain route. |
+| DSM `106`, `107`, or `119` immediately after login (a session that expires *mid-run* is re-established once per occurrence, up to four times per run, and counted in `recovered.reauthentications`; a failed re-login reports its own cause) | File Station rejected, expired, or lost the DSM session before evaluating the path | Run `doctor` and read the **DSM session channel ablation** section: it presents the same request through one session channel at a time and says whether the fault is which channel this client uses or the path itself. Then compare the same account through a direct LAN or tested custom-domain route. |
 | Login succeeds but inventory returns DSM `105` | Account or package permission mismatch | File Station application permission and the exact destination ACL. |
 | Destination missing | Root or ancestor is not writable/does not exist | Create/enable the share or user home in DSM; the client only creates below it. |
 
@@ -110,8 +110,25 @@ comparison above, which is the one mechanism that can confirm it outright.
 
 - Run `doctor source --hash` as the scheduler identity, not only interactively.
 - A share root itself is rejected; choose a subdirectory.
-- Links, Windows reparse points, cloud placeholders, offline/HSM files, unreadable entries, invalid
-  portable names, and files changing during scan/hash fail closed.
+- Links, junctions, Windows SYSTEM/TEMPORARY entries, dehydrated cloud or offline/HSM placeholders,
+  and names that collide by case or Unicode normalisation are **skipped and reported** (`plan.skipped`,
+  `SKIPPED` lines, `entry.skipped` warnings), never uploaded and never deleted from the NAS; the run
+  exits `0` with a warning. OS metadata files (`desktop.ini`, `Thumbs.db`, `ehthumbs.db`, `.DS_Store`,
+  `Icon\r`, `~$*`) are excluded by default. Deduplicated and hydrated cloud files are ordinary data
+  and are synced.
+- A file that changes or is locked while it is hashed or sent is **deferred**: it is not uploaded,
+  nothing is deleted on its account, and the run exits `3` so a scheduler retries it. The reasons
+  and what to do about each are in
+  [partial runs, deferrals and skips](../observability.md#partial-runs-deferrals-and-skips).
+- A source root that is a link or reparse point, special files (FIFO, socket, device), unreadable
+  entries and refused portable names (`~foo`, `aux.h`, a trailing dot) still fail the run unless
+  excluded.
+- Case-only renames and NFC/NFD spellings converge; only a true collision (two names that fold to
+  one) is skipped, with both spellings named. Rename one to continue.
+- `metadata` comparison treats a remote second equal to the floor or the rounded value of the local
+  time as unchanged, so an edit of the same size within the same second is not detected; use
+  `--compare content` where that matters.
+- Exit code `3` means "partial, retry later"; it is not a failure. Alert on `1`, `2` and `130`.
 - A mapped drive letter may be absent in a service logon. Use a proven UNC path or mount lifecycle.
 
 See [local, mapped-drive, and SMB sources](../local-and-smb-sources.md).

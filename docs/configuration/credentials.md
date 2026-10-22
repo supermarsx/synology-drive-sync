@@ -89,6 +89,30 @@ Generated codes depend on accurate system time. Keep the runner synchronized wit
 source and include clock behavior in the live acceptance test. Never store one current OTP for a
 scheduled job; use a protected reusable seed only when the account policy permits it.
 
+## Session expiry and how long the password is held
+
+DSM can expire or drop a session under a long run (codes `106`, `107` and `119`, and `105` only when
+a follow-up `list_share` liveness probe also fails). The CLI re-authenticates once, transparently,
+and resends the request that met the expiry. Re-authentication is serialised, capped at four per run,
+and counted in the result's `recovered` object; a failed re-login surfaces its own cause (a one-time
+code required, a changed password, a locked account) rather than a generic session error. A keepalive
+touches the session every five minutes during long plan hashing and promotion, and once before the
+first mutation.
+
+**The password is therefore held for the whole run.** Before this, a run read the password, logged
+in, and let the value go; an overnight mirror whose session expired failed after hours of work and
+the next run repeated them. To re-login without a prompt nobody is watching, the process now keeps the
+password in zeroizing memory until the run ends, unless it came from a `--password-file`: that file
+is read again on each re-login and nothing is retained. A one-time code is generated again from the
+TOTP seed file or the vault exactly as at first login; a password supplied through `--password-stdin`
+or `SDSYNC_PASSWORD` cannot be re-read, which is why it is held. The re-login closure never logs or
+prints the secret. The SDK does not install a re-authenticator (its secret provider is borrowed for
+the call); it gets the keepalive and the pre-mutation touch only.
+
+This widens the window in which the password exists in the process. Prefer `--password-file` or the OS
+vault on a host where that matters, and treat a core dump of a running sync as containing the
+password.
+
 Application-owned secret buffers are erased on drop where their Rust types permit, but serialization,
 TLS, HTTP, allocator, and operating-system buffers may retain intermediary copies. Avoid crash dumps
 and hostile same-user processes on credential-bearing hosts.
