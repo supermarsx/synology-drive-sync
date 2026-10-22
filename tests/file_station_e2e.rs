@@ -194,6 +194,7 @@ fn source_doctor_hashes_the_real_local_tree_without_network_output() {
                 "bytes": 14,
                 "content_hashed": true,
                 "hashed_files": 2,
+                "skipped": [],
                 "elapsed_ms": null
             }
         })
@@ -2195,14 +2196,19 @@ fn additive_plan_then_sync_preserves_folder_parity_and_verifies_every_upload() {
             "SYNO.FileStation.List.getinfo",
             "SYNO.FileStation.List.getinfo",
             "SYNO.FileStation.List.list",
+            // The session is touched once before the first mutation, so an idle timeout that
+            // expired during hashing is answered by a login rather than by a failed upload.
+            "SYNO.FileStation.List.list_share",
             "SYNO.FileStation.CreateFolder.create",
             "SYNO.FileStation.CreateFolder.create",
-            // Upload, then its size, then its digest computed on the NAS. Three round trips where
-            // there were two, and none of them carries the file.
+            // The destination's precondition, then the upload, then its size, then its digest
+            // computed on the NAS. None of them carries the file back.
+            "SYNO.FileStation.List.getinfo",
             "SYNO.FileStation.Upload.upload",
             "SYNO.FileStation.List.getinfo",
             "SYNO.FileStation.MD5.start",
             "SYNO.FileStation.MD5.status",
+            "SYNO.FileStation.List.getinfo",
             "SYNO.FileStation.Upload.upload",
             "SYNO.FileStation.List.getinfo",
             "SYNO.FileStation.MD5.start",
@@ -2917,8 +2923,12 @@ fn unique_cross_parent_rename_uses_verified_server_copy_without_uploading_bytes(
     );
 }
 
+/// A remote-only entry replaced after planning is kept, named, and reported as a partial run.
+///
+/// It used to fail the run, which preserved this entry and also abandoned every other deletion and
+/// upload after it. Preserving the one entry is the whole of what safety asks.
 #[test]
-fn destructive_sync_fails_closed_when_remote_snapshot_changes_after_planning() {
+fn destructive_sync_preserves_and_names_a_remote_entry_changed_after_planning() {
     let fixture = TestDir::new("delete-guard");
     let source = fixture.child("source");
     fs::create_dir(&source).expect("create delete-guard source");
@@ -2974,25 +2984,19 @@ fn destructive_sync_fails_closed_when_remote_snapshot_changes_after_planning() {
     let mut sync_arguments = vec!["--quiet", "--output", "json", "sync"];
     sync_arguments.extend(common.iter().copied());
     let sync = run(&sync_arguments);
-    assert_eq!(sync.status.code(), Some(1));
-    // A failed run still reports what it did. Here that is nothing at all, which is exactly the
-    // claim an operator needs: the deletion was refused and no mutation was performed. Before the
-    // report survived a failure, stdout was empty and the only account of a run was its error line.
-    let failed = stdout_json(&sync);
-    assert_eq!(failed["schema"], "sdsync.sync.v1");
-    assert_eq!(failed["result"]["failed"], true);
-    assert_eq!(failed["result"]["deleted"], 0);
-    assert_eq!(failed["result"]["uploaded"], 0);
-    assert_eq!(failed["result"]["changed"], false);
-    assert_eq!(failed["plan"]["summary"]["deletions"], 1);
+    assert_eq!(sync.status.code(), Some(3), "a partial run exits 3");
+    let partial = stdout_json(&sync);
+    assert_eq!(partial["schema"], "sdsync.sync.v1");
+    assert_eq!(partial["result"]["failed"], false);
+    assert_eq!(partial["result"]["outcome"], "partial");
+    assert_eq!(partial["result"]["deleted"], 0);
+    assert_eq!(partial["result"]["uploaded"], 0);
+    assert_eq!(partial["result"]["changed"], false);
+    assert_eq!(partial["plan"]["summary"]["deletions"], 1);
+    assert_eq!(partial["result"]["deferred"][0]["path"], "stale.txt");
+    assert_eq!(partial["result"]["deferred"][0]["reason"], "remote-changed");
     let stderr = String::from_utf8(sync.stderr).expect("stderr is UTF-8");
-    assert!(
-        stderr.contains("changed since planning; it was preserved"),
-        "unexpected stderr: {stderr:?}"
-    );
-    assert!(stderr.contains("/team/delete/stale.txt"));
     assert!(!stderr.contains("correct horse battery staple"));
-    assert_eq!(stderr.lines().count(), 1);
     assert_eq!(
         server.file_contents("/team/delete/stale.txt"),
         Some(b"changed-concurrently".to_vec()),
@@ -3005,7 +3009,7 @@ fn destructive_sync_fails_closed_when_remote_snapshot_changes_after_planning() {
         sync_requests
             .iter()
             .all(|request| request.operation() != "SYNO.FileStation.Delete.delete"),
-        "snapshot drift must abort before the delete request"
+        "snapshot drift must keep the entry: no delete request"
     );
     assert!(
         sync_requests
@@ -4440,4 +4444,840 @@ fn a_mirror_deletion_still_downloads_its_guard_but_only_for_the_candidates() {
         server.file_contents("/team/sync/kept.txt"),
         Some(b"kept".to_vec())
     );
+}
+
+/// Arguments shared by the per-path deferral tests: one destination, quiet JSON, one job.
+fn deferral_sync_arguments<'a>(
+    source: &'a str,
+    destination: &'a str,
+    url: &'a str,
+    password: &'a str,
+    extra: &[&'a str],
+) -> Vec<&'a str> {
+    let mut arguments = vec![
+        "--quiet",
+        "--output",
+        "json",
+        "sync",
+        source,
+        destination,
+        "--url",
+        url,
+        "--username",
+        "e2e-user",
+        "--password-file",
+        password,
+        "--no-vault",
+        "--allow-http",
+        "--jobs",
+        "1",
+    ];
+    arguments.extend_from_slice(extra);
+    arguments
+}
+
+/// The one deferral a partial run reported.
+fn only_deferred(document: &Value) -> &Value {
+    let deferred = document["result"]["deferred"]
+        .as_array()
+        .expect("the result names its deferrals");
+    assert_eq!(deferred.len(), 1, "{deferred:?}");
+    &deferred[0]
+}
+
+/// N-3: a file that changes while the run is hashing it is deferred by name, the rest of the run
+/// proceeds, the run ends partial (exit 3), and the next run carries it.
+///
+/// Before, one busy file (an open mailbox, a log being appended to) failed every run before a
+/// single transfer, so nothing synced at all.
+#[test]
+fn a_file_that_changes_while_it_is_hashed_is_deferred_and_carried_next_run() {
+    let fixture = TestDir::new("deferral-hash");
+    let source = fixture.child("source");
+    fs::create_dir_all(&source).expect("create source directory");
+    fs::write(source.join("steady.txt"), b"steady").expect("write steady file");
+    let busy = source.join("busy.log");
+    fs::write(&busy, b"first line\n").expect("write busy file");
+    let password = fixture.write("password", PASSWORD);
+    let server = MockFileStation::start();
+    server.add_directory("/team/busy");
+    // The remote walk happens after the local scan and before hashing, which is exactly when a log
+    // being appended to changes under a real run.
+    let appended = busy.clone();
+    server.on_next_request("SYNO.FileStation.List.list", move || {
+        fs::write(&appended, b"first line\nsecond line\n").expect("append to busy file");
+    });
+
+    let source_text = source.to_str().expect("UTF-8 source path");
+    let password_text = password.to_str().expect("UTF-8 password path");
+    let arguments = deferral_sync_arguments(
+        source_text,
+        "/team/busy",
+        server.base_url(),
+        password_text,
+        &[],
+    );
+    let first = run(&arguments);
+    assert_eq!(
+        first.status.code(),
+        Some(3),
+        "stderr: {}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    let document = stdout_json(&first);
+    assert_eq!(document["result"]["outcome"], "partial");
+    assert_eq!(document["result"]["failed"], false);
+    assert_eq!(document["result"]["uploaded"], 1);
+    let deferred = only_deferred(&document);
+    assert_eq!(deferred["path"], "busy.log");
+    assert_eq!(deferred["reason"], "source-changed");
+    assert_eq!(
+        server.file_contents("/team/busy/steady.txt"),
+        Some(b"steady".to_vec())
+    );
+    assert_eq!(
+        server.file_contents("/team/busy/busy.log"),
+        None,
+        "nothing torn or stale is written for the deferred file"
+    );
+
+    let second = run(&arguments);
+    assert_success(&second);
+    let document = stdout_json(&second);
+    assert_eq!(document["result"]["outcome"], "complete");
+    assert_eq!(
+        server.file_contents("/team/busy/busy.log"),
+        Some(b"first line\nsecond line\n".to_vec()),
+        "the next run picks the deferred file up"
+    );
+}
+
+/// N-4: a file the run uploaded and the user then deleted locally is a change made while the run
+/// worked, not a reconciliation failure.
+#[test]
+fn a_file_deleted_locally_after_its_upload_does_not_fail_a_mirror_run() {
+    let fixture = TestDir::new("deferral-vanished");
+    let source = fixture.child("source");
+    fs::create_dir_all(&source).expect("create source directory");
+    fs::write(source.join("keep.txt"), b"keep").expect("write kept file");
+    let temporary = source.join("build.tmp");
+    fs::write(&temporary, b"intermediate").expect("write temporary file");
+    let password = fixture.write("password", PASSWORD);
+    let server = MockFileStation::start();
+    server.add_directory("/team/vanish");
+    // The upload's own verification is the first digest task in a metadata run: the file landed,
+    // and then the build removed it.
+    let removed = temporary.clone();
+    server.on_next_request("SYNO.FileStation.MD5.start", move || {
+        fs::remove_file(&removed).expect("remove temporary file");
+    });
+
+    let source_text = source.to_str().expect("UTF-8 source path");
+    let password_text = password.to_str().expect("UTF-8 password path");
+    let sync = run(&deferral_sync_arguments(
+        source_text,
+        "/team/vanish",
+        server.base_url(),
+        password_text,
+        &["--compare", "metadata", "--delete"],
+    ));
+    assert_success(&sync);
+    let document = stdout_json(&sync);
+    assert_eq!(document["result"]["uploaded"], 2);
+    assert_eq!(document["result"]["changed_during_run"], 1);
+    assert_eq!(document["result"]["outcome"], "complete");
+}
+
+/// The mock pages `List.list` as DSM does, and a directory larger than one page is read whole: a
+/// mirror run sees, and deletes, the remote extras on the second page too.
+#[test]
+fn a_directory_larger_than_one_listing_page_is_read_whole() {
+    let fixture = TestDir::new("pagination");
+    let source = fixture.child("source");
+    fs::create_dir_all(&source).expect("create source directory");
+    let keep = source.join("keep.txt");
+    fs::write(&keep, b"keep").expect("write kept file");
+    let keep_mtime = modified_seconds(&keep);
+    let password = fixture.write("password", PASSWORD);
+    let server = MockFileStation::start();
+    server.add_directory("/team/paged");
+    server.add_file("/team/paged/keep.txt", b"keep", keep_mtime);
+    for index in 0..505 {
+        server.add_file(&format!("/team/paged/x{index:03}.txt"), b"x", 1_700_000_000);
+    }
+
+    let source_text = source.to_str().expect("UTF-8 source path");
+    let password_text = password.to_str().expect("UTF-8 password path");
+    let sync = run(&deferral_sync_arguments(
+        source_text,
+        "/team/paged",
+        server.base_url(),
+        password_text,
+        &["--compare", "metadata", "--delete", "--max-delete", "1000"],
+    ));
+    assert_success(&sync);
+    let document = stdout_json(&sync);
+    assert_eq!(document["result"]["deleted"], 505);
+    assert_eq!(server.file_paths(), ["/team/paged/keep.txt"]);
+    assert!(
+        server.requests().iter().any(|request| {
+            request.operation() == "SYNO.FileStation.List.list"
+                && request.fields.get("offset").map(String::as_str) == Some("500")
+        }),
+        "the second page must have been requested"
+    );
+}
+
+/// N6: DSM counting entries it does not return (Access-Based Enumeration) leaves the run going,
+/// with every deletion in that folder withheld and named. The short listing is never read as
+/// "these remote files are absent".
+#[test]
+fn a_folder_whose_listing_hides_entries_withholds_its_deletions_only() {
+    let fixture = TestDir::new("hidden-entries");
+    let source = fixture.child("source");
+    fs::create_dir_all(source.join("open")).expect("create source directories");
+    let keep = source.join("keep.txt");
+    fs::write(&keep, b"keep").expect("write kept file");
+    let keep_mtime = modified_seconds(&keep);
+    let password = fixture.write("password", PASSWORD);
+    let server = MockFileStation::start();
+    server.add_directory("/team/abe");
+    server.add_directory("/team/abe/open");
+    server.add_file("/team/abe/keep.txt", b"keep", keep_mtime);
+    server.add_file("/team/abe/old.txt", b"old", 1_700_000_000);
+    server.add_file("/team/abe/open/stale.txt", b"stale", 1_700_000_000);
+    server.hide_list_entries("/team/abe", 2);
+
+    let source_text = source.to_str().expect("UTF-8 source path");
+    let password_text = password.to_str().expect("UTF-8 password path");
+    let sync = run(&deferral_sync_arguments(
+        source_text,
+        "/team/abe",
+        server.base_url(),
+        password_text,
+        &["--compare", "metadata", "--delete"],
+    ));
+    // A listing short in the same way on every read is lasting (ABE keeps hiding what the account
+    // cannot read), so it is reported and warned about, and the run is not partial forever.
+    assert_success(&sync);
+    let document = stdout_json(&sync);
+    assert_eq!(document["result"]["outcome"], "complete");
+    let deferred = only_deferred(&document);
+    assert_eq!(deferred["path"], "old.txt");
+    assert_eq!(deferred["reason"], "listing-incomplete");
+    assert_eq!(document["result"]["incomplete_listings"], 1);
+    assert_eq!(
+        document["result"]["incomplete_listing_folders"],
+        serde_json::json!(["."])
+    );
+    assert_eq!(
+        server.file_contents("/team/abe/old.txt"),
+        Some(b"old".to_vec()),
+        "nothing in a short listing is deleted"
+    );
+    assert_eq!(
+        server.file_contents("/team/abe/open/stale.txt"),
+        None,
+        "a folder that listed whole is mirrored as usual"
+    );
+}
+
+/// A session DSM expires mid-run is replaced by one login and the run completes.
+#[test]
+fn a_session_that_expires_mid_run_is_renewed_and_the_run_completes() {
+    let fixture = TestDir::new("session-expiry");
+    let source = fixture.child("source");
+    fs::create_dir_all(&source).expect("create source directory");
+    fs::write(source.join("one.txt"), b"one").expect("write first file");
+    fs::write(source.join("two.txt"), b"two").expect("write second file");
+    let password = fixture.write("password", PASSWORD);
+    let server = MockFileStation::start();
+    server.add_directory("/team/expiry");
+    server.expire_session_after(6);
+
+    let source_text = source.to_str().expect("UTF-8 source path");
+    let password_text = password.to_str().expect("UTF-8 password path");
+    let sync = run(&deferral_sync_arguments(
+        source_text,
+        "/team/expiry",
+        server.base_url(),
+        password_text,
+        &["--compare", "metadata"],
+    ));
+    assert_success(&sync);
+    let document = stdout_json(&sync);
+    assert_eq!(document["result"]["uploaded"], 2);
+    assert_eq!(server.logins_seen(), 2, "exactly one re-authentication");
+    assert_eq!(
+        document["result"]["recovered"]["reauthentications"], 1,
+        "a re-login is reported, not absorbed"
+    );
+    let output = [sync.stdout, sync.stderr].concat();
+    assert!(!String::from_utf8_lossy(&output).contains("correct horse battery staple"));
+}
+
+/// A server copy DSM stamps with the time of the copy is verified by its bytes and reported as a
+/// warning; it no longer fails the run.
+#[test]
+fn a_server_copy_stamped_with_the_copy_time_is_a_warning_not_a_failure() {
+    let fixture = TestDir::new("copy-mtime");
+    let source = fixture.child("source");
+    fs::create_dir_all(source.join("new")).expect("create renamed source directory");
+    let local_file = source.join("new/item.bin");
+    fs::write(&local_file, b"copy-me-on-nas").expect("write server-copy source file");
+    let mtime = modified_seconds(&local_file);
+    let password = fixture.write("password", PASSWORD);
+    let server = MockFileStation::start();
+    server.add_directory("/team/copy");
+    server.add_directory("/team/copy/old");
+    server.add_file("/team/copy/old/item.bin", b"copy-me-on-nas", mtime);
+    server.stamp_copies_with(mtime + 3_600);
+
+    let source_text = source.to_str().expect("UTF-8 source path");
+    let password_text = password.to_str().expect("UTF-8 password path");
+    let sync = run(&deferral_sync_arguments(
+        source_text,
+        "/team/copy",
+        server.base_url(),
+        password_text,
+        &[],
+    ));
+    assert_success(&sync);
+    let document = stdout_json(&sync);
+    assert_eq!(document["result"]["server_copied"], 1);
+    assert_eq!(document["result"]["mtime_not_kept"], 1);
+    assert_eq!(
+        server.file_contents("/team/copy/new/item.bin"),
+        Some(b"copy-me-on-nas".to_vec())
+    );
+}
+
+/// S2-B11: a copy task DSM finishes with an error is deferred by name, not reported as content
+/// corruption, and the next run completes it.
+#[test]
+fn a_server_copy_that_finishes_with_an_error_is_deferred_and_completed_next_run() {
+    let fixture = TestDir::new("copy-error");
+    let source = fixture.child("source");
+    fs::create_dir_all(source.join("new")).expect("create renamed source directory");
+    let local_file = source.join("new/item.bin");
+    fs::write(&local_file, b"copy-me-on-nas").expect("write server-copy source file");
+    let mtime = modified_seconds(&local_file);
+    let password = fixture.write("password", PASSWORD);
+    let server = MockFileStation::start();
+    server.add_directory("/team/copy");
+    server.add_directory("/team/copy/old");
+    server.add_file("/team/copy/old/item.bin", b"copy-me-on-nas", mtime);
+    server.fail_next_copy_task();
+
+    let source_text = source.to_str().expect("UTF-8 source path");
+    let password_text = password.to_str().expect("UTF-8 password path");
+    let arguments = deferral_sync_arguments(
+        source_text,
+        "/team/copy",
+        server.base_url(),
+        password_text,
+        &[],
+    );
+    let first = run(&arguments);
+    assert_eq!(
+        first.status.code(),
+        Some(3),
+        "stderr: {}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    let document = stdout_json(&first);
+    let deferred = only_deferred(&document);
+    assert_eq!(deferred["path"], "new/item.bin");
+    assert_eq!(deferred["reason"], "server-copy-failed");
+
+    let second = run(&arguments);
+    assert_success(&second);
+    assert_eq!(
+        server.file_contents("/team/copy/new/item.bin"),
+        Some(b"copy-me-on-nas".to_vec())
+    );
+}
+
+/// A DSM that rounds the uploaded milliseconds rather than flooring them must not stop a mirror
+/// run before its deletions: the uploads' bytes are proven, and the time is a warning.
+#[test]
+fn a_destination_that_rounds_upload_times_does_not_block_mirror_deletion() {
+    let fixture = TestDir::new("rounded-mtime");
+    let source = fixture.child("source");
+    fs::create_dir_all(&source).expect("create source directory");
+    fs::write(source.join("new.txt"), b"uploaded payload").expect("write uploaded source file");
+    // Seven tenths past a whole second, so rounding and flooring disagree by one.
+    fs::File::options()
+        .write(true)
+        .open(source.join("new.txt"))
+        .expect("open uploaded source file")
+        .set_modified(UNIX_EPOCH + std::time::Duration::from_millis(1_700_000_000_700))
+        .expect("set a sub-second modification time");
+    let password = fixture.write("password", PASSWORD);
+    let server = MockFileStation::start();
+    server.add_directory("/team/rounded");
+    server.add_file("/team/rounded/gone.txt", b"gone", 1_700_000_000);
+    server.round_upload_mtime();
+
+    let source_text = source.to_str().expect("UTF-8 source path");
+    let password_text = password.to_str().expect("UTF-8 password path");
+    let arguments = deferral_sync_arguments(
+        source_text,
+        "/team/rounded",
+        server.base_url(),
+        password_text,
+        &["--compare", "metadata", "--delete"],
+    );
+    let sync = run(&arguments);
+    assert_success(&sync);
+    let document = stdout_json(&sync);
+    assert_eq!(document["result"]["uploaded"], 1);
+    assert_eq!(document["result"]["deleted"], 1);
+    assert_eq!(server.file_contents("/team/rounded/gone.txt"), None);
+    assert_eq!(
+        server.file_mtime("/team/rounded/new.txt"),
+        Some(1_700_000_001),
+        "the mock rounded, as the scenario requires"
+    );
+
+    // And the next run converges instead of re-uploading the file forever.
+    let again = run(&arguments);
+    assert_success(&again);
+    assert_eq!(stdout_json(&again)["result"]["changed"], false);
+    assert!(
+        server
+            .requests()
+            .iter()
+            .filter(|request| request.operation() == "SYNO.FileStation.Upload.upload")
+            .count()
+            == 1,
+        "a rounded modification time must compare as unchanged"
+    );
+}
+
+/// A file whose local name is the NFD spelling of an NFC remote name, changing while it is hashed
+/// under `--delete`, is deferred and its remote copy is kept.
+///
+/// The planner pairs the two spellings, so the local key and the remote key differ. Taking the
+/// failed file out of the run by removing its local entry alone would leave the NFC remote copy
+/// looking remote-only, and a mirror run would delete it. Withholding shields every spelling.
+#[test]
+fn a_changing_nfd_file_paired_with_an_nfc_remote_name_is_never_deleted() {
+    let fixture = TestDir::new("deferral-nfc");
+    let source = fixture.child("source");
+    fs::create_dir_all(&source).expect("create source directory");
+    let nfd = source.join("cafe\u{0301}.txt");
+    fs::write(&nfd, b"first").expect("write NFD file");
+    let password = fixture.write("password", PASSWORD);
+    let server = MockFileStation::start();
+    server.add_directory("/team/nfc");
+    server.add_file("/team/nfc/caf\u{00e9}.txt", b"older", 1_700_000_000);
+    let changed = nfd.clone();
+    server.on_next_request("SYNO.FileStation.List.list", move || {
+        fs::write(&changed, b"first and then more").expect("rewrite NFD file");
+    });
+
+    let source_text = source.to_str().expect("UTF-8 source path");
+    let password_text = password.to_str().expect("UTF-8 password path");
+    let sync = run(&deferral_sync_arguments(
+        source_text,
+        "/team/nfc",
+        server.base_url(),
+        password_text,
+        &["--delete", "--allow-empty-source"],
+    ));
+    assert_eq!(
+        sync.status.code(),
+        Some(3),
+        "stderr: {}",
+        String::from_utf8_lossy(&sync.stderr)
+    );
+    let document = stdout_json(&sync);
+    assert_eq!(document["result"]["deleted"], 0);
+    assert_eq!(only_deferred(&document)["reason"], "source-changed");
+    assert!(
+        server
+            .requests()
+            .iter()
+            .all(|request| request.operation() != "SYNO.FileStation.Delete.delete"),
+        "no remote spelling of a deferred file may be deleted"
+    );
+    assert_eq!(
+        server.file_contents("/team/nfc/caf\u{00e9}.txt"),
+        Some(b"older".to_vec())
+    );
+}
+
+/// A deferral that only reached stdout would be invisible for a scheduled run. Each one is logged
+/// as `entry.deferred` with its path, reason and profile, and the run ends `run.partial`.
+#[test]
+fn a_deferred_path_is_logged_with_its_path_reason_and_profile() {
+    let fixture = TestDir::new("deferral-log");
+    let source = fixture.child("source");
+    fs::create_dir_all(&source).expect("create source directory");
+    fs::write(source.join("steady.txt"), b"steady").expect("write steady file");
+    let busy = source.join("busy.log");
+    fs::write(&busy, b"first line\n").expect("write busy file");
+    let password = fixture.write("password", PASSWORD);
+    let log_file = fixture.child("sync.log");
+    let server = MockFileStation::start();
+    server.add_directory("/team/logged");
+    let appended = busy.clone();
+    server.on_next_request("SYNO.FileStation.List.list", move || {
+        fs::write(&appended, b"first line\nsecond line\n").expect("append to busy file");
+    });
+
+    let source_text = source.to_str().expect("UTF-8 source path");
+    let password_text = password.to_str().expect("UTF-8 password path");
+    let log_text = log_file.to_str().expect("UTF-8 log path");
+    let sync = run(&[
+        "--output",
+        "json",
+        "--log-format",
+        "json",
+        "--log-level",
+        "info",
+        "--log-file",
+        log_text,
+        "--progress",
+        "never",
+        "sync",
+        source_text,
+        "/team/logged",
+        "--url",
+        server.base_url(),
+        "--username",
+        "e2e-user",
+        "--password-file",
+        password_text,
+        "--no-vault",
+        "--allow-http",
+        "--jobs",
+        "1",
+    ]);
+    assert_eq!(
+        sync.status.code(),
+        Some(3),
+        "stderr: {}",
+        String::from_utf8_lossy(&sync.stderr)
+    );
+    let records = fs::read_to_string(&log_file)
+        .expect("the run wrote its log")
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).expect("one JSON record per line"))
+        .collect::<Vec<_>>();
+    let deferred = records
+        .iter()
+        .find(|record| record["event"] == "entry.deferred")
+        .expect("the deferral is logged");
+    assert_eq!(deferred["path"], "busy.log");
+    assert_eq!(deferred["reason"], "changed_during_run");
+    assert!(
+        deferred["profile"]
+            .as_str()
+            .is_some_and(|profile| !profile.is_empty()),
+        "{deferred}"
+    );
+    let verdict = records
+        .iter()
+        .find(|record| record["event"] == "run.partial")
+        .expect("a partial run is logged as partial");
+    assert_eq!(verdict["profile"], deferred["profile"]);
+    assert!(
+        records
+            .iter()
+            .all(|record| record["event"] != "run.completed"),
+        "a partial run must not also log run.completed"
+    );
+    assert!(
+        !fs::read_to_string(&log_file)
+            .unwrap()
+            .contains("correct horse battery staple")
+    );
+}
+
+/// S1-1: a case-only rename under `--delete --compare metadata` whose new spelling changes before
+/// it can be fingerprinted keeps the old remote spelling. Before, the upload was deferred and the
+/// old spelling deleted anyway, so the NAS (and every Drive client after it) held neither.
+#[test]
+fn a_case_rename_whose_upload_is_deferred_never_deletes_the_old_spelling() {
+    let fixture = TestDir::new("case-rename-deferred");
+    let source = fixture.child("source");
+    fs::create_dir_all(&source).expect("create source directory");
+    let renamed = source.join("report.pdf");
+    fs::write(&renamed, b"report body").expect("write renamed file");
+    let password = fixture.write("password", PASSWORD);
+    let server = MockFileStation::start();
+    server.add_directory("/team/rename");
+    server.add_file("/team/rename/Report.pdf", b"report body", 1_700_000_000);
+    // Metadata mode reads an upload for the first time when it is fingerprinted, after the remote
+    // walk: a write between the two defers it there.
+    let changed = renamed.clone();
+    server.on_next_request("SYNO.FileStation.List.list", move || {
+        fs::write(&changed, b"report body, edited").expect("edit renamed file");
+    });
+
+    let source_text = source.to_str().expect("UTF-8 source path");
+    let password_text = password.to_str().expect("UTF-8 password path");
+    let sync = run(&deferral_sync_arguments(
+        source_text,
+        "/team/rename",
+        server.base_url(),
+        password_text,
+        &["--compare", "metadata", "--delete"],
+    ));
+    let document = stdout_json(&sync);
+    assert_eq!(
+        sync.status.code(),
+        Some(3),
+        "stderr: {}\n{document}",
+        String::from_utf8_lossy(&sync.stderr)
+    );
+    assert_eq!(document["result"]["deleted"], 0);
+    assert!(
+        server
+            .requests()
+            .iter()
+            .all(|request| request.operation() != "SYNO.FileStation.Delete.delete"),
+        "the old spelling must not be deleted while the new one is not on the NAS"
+    );
+    assert_eq!(
+        server.file_contents("/team/rename/Report.pdf"),
+        Some(b"report body".to_vec())
+    );
+    let deferred = document["result"]["deferred"].as_array().unwrap();
+    assert!(
+        deferred.iter().any(|record| record["path"] == "Report.pdf"),
+        "the withheld deletion is named: {deferred:?}"
+    );
+}
+
+/// S2-1: `plan` names a file that changed before it could be fingerprinted, exits 3 and logs it.
+/// Before, the file vanished from the plan, the exit was 0 and the log said `run.completed`.
+#[test]
+fn plan_names_a_file_deferred_at_fingerprinting_and_exits_partial() {
+    let fixture = TestDir::new("plan-deferral");
+    let source = fixture.child("source");
+    fs::create_dir_all(&source).expect("create source directory");
+    fs::write(source.join("steady.txt"), b"steady").expect("write steady file");
+    let busy = source.join("busy.log");
+    fs::write(&busy, b"first line\n").expect("write busy file");
+    let password = fixture.write("password", PASSWORD);
+    let log_file = fixture.child("plan.log");
+    let server = MockFileStation::start();
+    server.add_directory("/team/planned");
+    let appended = busy.clone();
+    server.on_next_request("SYNO.FileStation.List.list", move || {
+        fs::write(&appended, b"first line\nsecond line\n").expect("append to busy file");
+    });
+
+    let source_text = source.to_str().expect("UTF-8 source path");
+    let password_text = password.to_str().expect("UTF-8 password path");
+    let log_text = log_file.to_str().expect("UTF-8 log path");
+    let plan = run(&[
+        "--quiet",
+        "--output",
+        "json",
+        "--log-format",
+        "json",
+        "--log-level",
+        "info",
+        "--log-file",
+        log_text,
+        "plan",
+        source_text,
+        "/team/planned",
+        "--url",
+        server.base_url(),
+        "--username",
+        "e2e-user",
+        "--password-file",
+        password_text,
+        "--no-vault",
+        "--allow-http",
+        "--compare",
+        "metadata",
+    ]);
+    assert_eq!(plan.status.code(), Some(3));
+    let document = stdout_json(&plan);
+    assert_eq!(document["schema"], "sdsync.plan.v1");
+    let skipped = document["plan"]["skipped"].as_array().unwrap();
+    assert!(
+        skipped
+            .iter()
+            .any(|entry| entry["path"] == "busy.log" && entry["reason"] == "deferred"),
+        "{skipped:?}"
+    );
+    assert_eq!(document["plan"]["summary"]["uploads"], 1);
+    let log = fs::read_to_string(&log_file).expect("the plan wrote its log");
+    let records = log
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).expect("JSON record"))
+        .collect::<Vec<_>>();
+    assert!(
+        records
+            .iter()
+            .any(|record| record["event"] == "entry.deferred" && record["path"] == "busy.log")
+    );
+    assert!(
+        records
+            .iter()
+            .any(|record| record["event"] == "run.partial")
+    );
+    assert!(
+        records
+            .iter()
+            .all(|record| record["event"] != "run.completed")
+    );
+}
+
+/// One remote file the account may not read (DSM 105 on its checksum, while the session answers
+/// everything else) is a lasting, named deferral: the run completes, exit 0, and the file is
+/// neither compared nor deleted. Before, it failed every content run with exit 1 and no file name.
+#[test]
+fn one_remote_file_the_account_cannot_read_is_named_and_the_run_completes() {
+    let fixture = TestDir::new("remote-unreadable");
+    let source = fixture.child("source");
+    fs::create_dir_all(&source).expect("create source directory");
+    let password = fixture.write("password", PASSWORD);
+    let server = MockFileStation::start();
+    server.add_directory("/team/acl");
+    for name in ["a.txt", "b.txt"] {
+        let path = source.join(name);
+        fs::write(&path, b"same").expect("write source file");
+        server.add_file(
+            &format!("/team/acl/{name}"),
+            b"same",
+            modified_seconds(&path),
+        );
+    }
+    server.fail_next_api_operation("SYNO.FileStation.MD5.start", 105);
+
+    let source_text = source.to_str().expect("UTF-8 source path");
+    let password_text = password.to_str().expect("UTF-8 password path");
+    let sync = run(&deferral_sync_arguments(
+        source_text,
+        "/team/acl",
+        server.base_url(),
+        password_text,
+        &["--delete"],
+    ));
+    assert_success(&sync);
+    let document = stdout_json(&sync);
+    assert_eq!(document["result"]["outcome"], "complete");
+    let deferred = only_deferred(&document);
+    assert_eq!(deferred["reason"], "remote-unreadable");
+    assert!(
+        ["a.txt", "b.txt"].contains(&deferred["path"].as_str().unwrap()),
+        "{deferred}"
+    );
+    assert!(
+        server
+            .requests()
+            .iter()
+            .all(|request| request.operation() != "SYNO.FileStation.Delete.delete")
+    );
+}
+
+/// `--result-record` writes one `sdsync.result-record.v1` line per job, whatever `--output` is, so
+/// a supervisor can read the counts of a run whose stdout is meant for a person.
+#[test]
+fn a_result_record_carries_the_counts_whatever_the_output_format() {
+    let fixture = TestDir::new("result-record");
+    let source = fixture.child("source");
+    fs::create_dir_all(&source).expect("create source directory");
+    fs::write(source.join("one.txt"), b"one").expect("write source file");
+    let password = fixture.write("password", PASSWORD);
+    let record = fixture.child("result.ndjson");
+    let server = MockFileStation::start();
+    server.add_directory("/team/record");
+
+    let source_text = source.to_str().expect("UTF-8 source path");
+    let password_text = password.to_str().expect("UTF-8 password path");
+    let record_text = record.to_str().expect("UTF-8 record path");
+    let sync = run(&[
+        "--quiet",
+        "--result-record",
+        record_text,
+        "sync",
+        source_text,
+        "/team/record",
+        "--url",
+        server.base_url(),
+        "--username",
+        "e2e-user",
+        "--password-file",
+        password_text,
+        "--no-vault",
+        "--allow-http",
+    ]);
+    assert_success(&sync);
+    let text = fs::read_to_string(&record).expect("the record was written");
+    let lines = text.lines().collect::<Vec<_>>();
+    assert_eq!(lines.len(), 1, "{text}");
+    let line: Value = serde_json::from_str(lines[0]).expect("one JSON line");
+    assert_eq!(line["schema"], "sdsync.result-record.v1");
+    assert!(
+        line["profile"]
+            .as_str()
+            .is_some_and(|profile| !profile.is_empty())
+    );
+    assert_eq!(line["status"], "complete");
+    assert_eq!(line["result"]["outcome"], "complete");
+    assert_eq!(line["result"]["uploaded"], 1);
+    assert_eq!(line["result"]["deferred"], json!([]));
+    assert!(line["result"]["recovered"]["reauthentication_failures"].is_number());
+    assert!(line.get("plan").is_none());
+}
+
+/// A result record that cannot be written is not silent: the run keeps its own verdict, warns on
+/// stderr, and logs `result_record.failed` naming the file, so `counts=unavailable` has a cause.
+#[test]
+fn a_result_record_that_cannot_be_written_is_logged() {
+    let fixture = TestDir::new("result-record-unwritable");
+    let source = fixture.child("source");
+    fs::create_dir_all(&source).expect("create source directory");
+    fs::write(source.join("one.txt"), b"one").expect("write source file");
+    let password = fixture.write("password", PASSWORD);
+    let log_file = fixture.child("sync.log");
+    let record = fixture.child("missing-directory").join("result.ndjson");
+    let server = MockFileStation::start();
+    server.add_directory("/team/unwritable");
+
+    let sync = run(&[
+        "--output",
+        "json",
+        "--progress",
+        "never",
+        "--log-format",
+        "json",
+        "--log-level",
+        "info",
+        "--log-file",
+        log_file.to_str().expect("UTF-8 log path"),
+        "--result-record",
+        record.to_str().expect("UTF-8 record path"),
+        "sync",
+        source.to_str().expect("UTF-8 source path"),
+        "/team/unwritable",
+        "--url",
+        server.base_url(),
+        "--username",
+        "e2e-user",
+        "--password-file",
+        password.to_str().expect("UTF-8 password path"),
+        "--no-vault",
+        "--allow-http",
+    ]);
+    assert_eq!(sync.status.code(), Some(0), "the run's own verdict stands");
+    assert!(String::from_utf8_lossy(&sync.stderr).contains("could not be written"));
+    let logged = fs::read_to_string(&log_file)
+        .expect("log written")
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).expect("JSON record"))
+        .find(|record| record["event"] == "result_record.failed")
+        .expect("the failure is in the log");
+    assert_eq!(logged["level"], "warn");
+    assert_eq!(logged["reason"], "local_io");
+    assert!(logged["path"].as_str().unwrap().contains("result.ndjson"));
 }

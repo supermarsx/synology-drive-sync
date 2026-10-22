@@ -148,6 +148,23 @@ pub enum Error {
     )]
     ServerCopyNotStarted,
 
+    /// Remote checksums kept failing with one cause, so the cause is the NAS or the link to it
+    /// rather than the files. Raised once, naming the files, instead of deferring every file with a
+    /// timeout each.
+    #[error(
+        "{} remote checksums failed with the same cause, so the NAS rather than these files is the likely problem: {cause}; files: {}",
+        paths.len(),
+        paths.join(", ")
+    )]
+    RemoteDigestsFailing {
+        cause: Box<Error>,
+        paths: Vec<String>,
+    },
+
+    /// DSM finished a server-side copy task and reported that it failed.
+    #[error("server-side copy to {destination:?} finished with an error: {detail}")]
+    ServerCopyFailed { destination: String, detail: String },
+
     #[error("{operation} did not finish within the configured request timeout")]
     OperationTimedOut { operation: &'static str },
 

@@ -82,6 +82,40 @@ struct ServerState {
     invalidate_on_duplicate_login: bool,
     /// How many logins this server has answered.
     logins_seen: u32,
+    /// Incremented each time the session expires. Zero keeps the historical session identifier,
+    /// so every existing test sees exactly the identifier it always did; later generations make
+    /// each re-login issue a new one, the way DSM does.
+    session_generation: u32,
+    /// Authenticated requests left before the session expires, when expiry is armed.
+    session_expires_after: Option<u32>,
+    /// Entries per folder that `List.list` counts in `total` but does not return, the way
+    /// Access-Based Enumeration hides what the account may not read.
+    hidden_list_entries: BTreeMap<String, usize>,
+    /// When set, `CopyMove` stamps the copy with this time instead of keeping the source's.
+    copy_stamps_mtime: Option<i64>,
+    /// Copy tasks that finish with an error member instead of a result.
+    failing_copy_tasks: BTreeSet<String>,
+    /// Whether the next `CopyMove.start` creates a task that finishes with an error.
+    fail_next_copy: bool,
+    /// Whether `Upload` rounds the millisecond `mtime` to the nearest second rather than flooring.
+    round_upload_mtime: bool,
+    /// Actions to run once, when the first request for an operation arrives and before it is
+    /// answered: the way a test changes the local tree at a known point in a run.
+    request_hooks: Vec<RequestHook>,
+}
+
+struct RequestHook {
+    operation: String,
+    action: Box<dyn FnOnce() + Send>,
+}
+
+impl std::fmt::Debug for RequestHook {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RequestHook")
+            .field("operation", &self.operation)
+            .finish_non_exhaustive()
+    }
 }
 
 #[derive(Debug)]
@@ -154,6 +188,14 @@ impl MockFileStation {
             next_hostname: None,
             invalidate_on_duplicate_login: false,
             logins_seen: 0,
+            session_generation: 0,
+            session_expires_after: None,
+            hidden_list_entries: BTreeMap::new(),
+            copy_stamps_mtime: None,
+            failing_copy_tasks: BTreeSet::new(),
+            fail_next_copy: false,
+            round_upload_mtime: false,
+            request_hooks: Vec::new(),
         }));
         let shutdown = Arc::new(AtomicBool::new(false));
         let worker_state = Arc::clone(&state);
@@ -272,6 +314,76 @@ impl MockFileStation {
     /// How many logins this server has answered.
     pub fn logins_seen(&self) -> u32 {
         self.state.lock().expect("mock state lock").logins_seen
+    }
+
+    /// Expire the session after `requests` more authenticated requests, the way DSM's idle timer
+    /// does: every later request carrying it is answered `119`, and the next login issues a new
+    /// session identifier.
+    #[allow(dead_code)]
+    pub fn expire_session_after(&self, requests: u32) {
+        self.state
+            .lock()
+            .expect("mock state lock")
+            .session_expires_after = Some(requests);
+    }
+
+    /// Count `hidden` entries in `folder`'s `total` without returning them, as Access-Based
+    /// Enumeration does for entries the account may not read.
+    #[allow(dead_code)]
+    pub fn hide_list_entries(&self, folder: &str, hidden: usize) {
+        self.state
+            .lock()
+            .expect("mock state lock")
+            .hidden_list_entries
+            .insert(folder.to_owned(), hidden);
+    }
+
+    /// Make `CopyMove` stamp every copy with `mtime_seconds` rather than keep the source's time.
+    #[allow(dead_code)]
+    pub fn stamp_copies_with(&self, mtime_seconds: i64) {
+        self.state
+            .lock()
+            .expect("mock state lock")
+            .copy_stamps_mtime = Some(mtime_seconds);
+    }
+
+    /// Make the next `CopyMove` task finish with an error member, having copied nothing.
+    #[allow(dead_code)]
+    pub fn fail_next_copy_task(&self) {
+        self.state.lock().expect("mock state lock").fail_next_copy = true;
+    }
+
+    /// Make `Upload` round the millisecond `mtime` to the nearest second, as a DSM might.
+    #[allow(dead_code)]
+    pub fn round_upload_mtime(&self) {
+        self.state
+            .lock()
+            .expect("mock state lock")
+            .round_upload_mtime = true;
+    }
+
+    /// Run `action` once, when the next `operation` request arrives and before it is answered.
+    #[allow(dead_code)]
+    pub fn on_next_request(&self, operation: &str, action: impl FnOnce() + Send + 'static) {
+        self.state
+            .lock()
+            .expect("mock state lock")
+            .request_hooks
+            .push(RequestHook {
+                operation: operation.to_owned(),
+                action: Box::new(action),
+            });
+    }
+
+    /// The modification time the mock holds for a file.
+    #[allow(dead_code)]
+    pub fn file_mtime(&self, path: &str) -> Option<i64> {
+        self.state
+            .lock()
+            .expect("mock state lock")
+            .files
+            .get(path)
+            .map(|file| file.mtime_seconds)
     }
 
     /// Advertise an API entry the documented map cannot describe, in the `query=all` response
@@ -486,6 +598,14 @@ fn handle_connection(mut stream: TcpStream, state: &Arc<Mutex<ServerState>>) {
 
     let response = {
         let mut state = state.lock().expect("mock state lock");
+        let operation = format!("{api}.{method}");
+        if let Some(index) = state
+            .request_hooks
+            .iter()
+            .position(|hook| hook.operation == operation)
+        {
+            (state.request_hooks.remove(index).action)();
+        }
         let captured_path = captured.request_path.clone();
         state.requests.push(captured);
         let routed = route_request(
@@ -563,10 +683,11 @@ fn route_request(
         // A `SynoToken` is issued only to a login that asked for one, the way DSM does it. The
         // ablation's tokenless variant depends on this: a mock that handed out a token regardless
         // would let a client that had stopped omitting `enable_syno_token` pass unnoticed.
+        let sid = current_session_id(state);
         let data = if fields.get("enable_syno_token").map(String::as_str) == Some("yes") {
-            json!({"sid": SESSION_ID, "synotoken": SYNO_TOKEN})
+            json!({"sid": sid, "synotoken": SYNO_TOKEN})
         } else {
-            json!({"sid": SESSION_ID})
+            json!({"sid": sid})
         };
         state.rotation_pending = state.rotate_session_on.is_some();
         state.cookie_uses_remaining = 1;
@@ -589,6 +710,14 @@ fn route_request(
     }
     if !valid_session(state, fields, headers) {
         return api_error(119);
+    }
+    if let Some(remaining) = state.session_expires_after {
+        if remaining == 0 {
+            state.session_expires_after = None;
+            state.session_generation += 1;
+            return api_error(119);
+        }
+        state.session_expires_after = Some(remaining - 1);
     }
     match (api, method) {
         ("SYNO.FileStation.List", "list_share") => {
@@ -640,8 +769,26 @@ fn route_request(
             if !state.directories.contains(&folder) {
                 return api_error(408);
             }
+            // Paged the way DSM pages: `offset` and `limit` select from a stable order, and
+            // `total` counts the whole directory, including entries DSM withholds from the page.
             let files = direct_children(state, &folder);
-            let response = success(json!({"total": files.len(), "files": files}));
+            let hidden = state.hidden_list_entries.get(&folder).copied().unwrap_or(0);
+            let total = files.len() + hidden;
+            let offset = fields
+                .get("offset")
+                .and_then(|value| value.parse::<usize>().ok())
+                .unwrap_or(0);
+            let limit = fields
+                .get("limit")
+                .and_then(|value| value.parse::<usize>().ok())
+                .filter(|limit| *limit > 0)
+                .unwrap_or(usize::MAX);
+            let page = files
+                .into_iter()
+                .skip(offset)
+                .take(limit)
+                .collect::<Vec<_>>();
+            let response = success(json!({"total": total, "files": page}));
             if let Some(mutation) = state.mutation_after_listing.take()
                 && state.files.contains_key(&mutation.path)
             {
@@ -709,11 +856,15 @@ fn route_request(
             {
                 return api_error(414);
             }
-            let mtime_seconds = fields
+            let mtime_ms = fields
                 .get("mtime")
                 .and_then(|value| value.parse::<i64>().ok())
-                .unwrap_or(0)
-                .div_euclid(1000);
+                .unwrap_or(0);
+            let mtime_seconds = if state.round_upload_mtime {
+                (mtime_ms + 500).div_euclid(1000)
+            } else {
+                mtime_ms.div_euclid(1000)
+            };
             state.files.insert(
                 path,
                 FileNode {
@@ -789,10 +940,18 @@ fn route_request(
             if state.files.contains_key(&destination) || state.directories.contains(&destination) {
                 return api_error(414);
             }
-            state.files.insert(destination, source_file);
             let task = format!("copy-task-{}", state.next_task);
             state.next_task += 1;
             state.copy_tasks.insert(task.clone());
+            if std::mem::take(&mut state.fail_next_copy) {
+                state.failing_copy_tasks.insert(task.clone());
+                return success(json!({"taskid": task}));
+            }
+            let mut copy = source_file;
+            if let Some(mtime_seconds) = state.copy_stamps_mtime {
+                copy.mtime_seconds = mtime_seconds;
+            }
+            state.files.insert(destination, copy);
             success(json!({"taskid": task}))
         }
         ("SYNO.FileStation.CopyMove", "status") => {
@@ -801,6 +960,12 @@ fn route_request(
             };
             if !state.copy_tasks.contains(&task) {
                 return api_error(408);
+            }
+            if state.failing_copy_tasks.contains(&task) {
+                return success(json!({
+                    "finished": true,
+                    "error": {"code": 1000, "errors": [{"code": 1000, "path": "copy"}]}
+                }));
             }
             success(json!({"finished": true}))
         }
@@ -894,12 +1059,21 @@ fn valid_session(
         }
         state.cookie_uses_remaining -= 1;
     }
-    let valid_fields = fields.get("_sid").map(String::as_str) == Some(SESSION_ID)
+    let sid = current_session_id(state);
+    let valid_fields = fields.get("_sid") == Some(&sid)
         && fields.get("SynoToken").map(String::as_str) == Some(SYNO_TOKEN);
     let valid_headers = !state.require_header_session_transport
-        || (headers.get("cookie").map(String::as_str) == Some("id=e2e-session-secret")
+        || (headers.get("cookie") == Some(&format!("id={sid}"))
             && headers.get("x-syno-token").map(String::as_str) == Some(SYNO_TOKEN));
     valid_fields && valid_headers
+}
+
+/// The session identifier the mock currently honours and issues.
+fn current_session_id(state: &ServerState) -> String {
+    match state.session_generation {
+        0 => SESSION_ID.to_owned(),
+        generation => format!("{SESSION_ID}-{generation}"),
+    }
 }
 
 fn discovery() -> Value {

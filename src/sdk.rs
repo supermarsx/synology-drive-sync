@@ -170,6 +170,8 @@ impl SdkError {
             | Error::InvalidContentHash
             | Error::ContentVerificationFailed(_)
             | Error::ServerCopyNotStarted
+            | Error::ServerCopyFailed { .. }
+            | Error::RemoteDigestsFailing { .. }
             | Error::OperationTimedOut { .. }
             | Error::Vault { .. } => ErrorCode::Remote,
         };
@@ -543,9 +545,50 @@ pub struct PlanSummary {
     unchanged_files: usize,
     protected_entries: usize,
     upload_bytes: u64,
+    skipped: Vec<SkippedPath>,
+}
+
+/// A path the plan neither carries nor deletes, and why.
+///
+/// Each of these used to fail the whole run. Now only the path is left alone, and an embedding
+/// application must be able to show it: a link, a SYSTEM-attribute file or a case collision is a
+/// file that is not on the NAS.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct SkippedPath {
+    relative: String,
+    reason: &'static str,
+    detail: String,
+}
+
+impl SkippedPath {
+    pub fn relative(&self) -> &str {
+        &self.relative
+    }
+
+    /// Stable tag: `windows-attributes`, `link-or-reparse-point`, `dehydrated-placeholder`,
+    /// `local-case-collision`,
+    /// `remote-case-collision`, `case-rename-needs-delete` or `deferred`.
+    pub fn reason(&self) -> &'static str {
+        self.reason
+    }
+
+    pub fn detail(&self) -> &str {
+        &self.detail
+    }
+
+    /// True for a skip that recurs on every run until someone acts on it, as opposed to a
+    /// `deferred` path the next run picks up.
+    pub fn is_lasting(&self) -> bool {
+        self.reason != "deferred"
+    }
 }
 
 impl PlanSummary {
+    /// Paths this plan leaves out, lasting and deferred alike, sorted by path.
+    pub fn skipped(&self) -> &[SkippedPath] {
+        &self.skipped
+    }
+
     pub fn changes(&self) -> &[PlannedChange] {
         &self.changes
     }
@@ -662,6 +705,110 @@ pub enum MutationEvent {
         relative: String,
         bytes: u64,
     },
+    /// A path this run planned for and left for the next run. Not a mutation: reported so an
+    /// embedding caller can name what did not converge, and why.
+    PathDeferred {
+        relative: String,
+        reason: DeferredReason,
+    },
+}
+
+/// Why a path was left for the next run.
+///
+/// Declared here rather than re-exported, for the reason [`MutationEvent`] is. Each of these used
+/// to fail the whole run; now only the path is skipped, by name, and the run ends
+/// [partial](SyncOutcome::partial).
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[non_exhaustive]
+#[serde(rename_all = "kebab-case")]
+pub enum DeferredReason {
+    /// The local file changed while the run was reading or sending it.
+    SourceChanged,
+    /// The local file disappeared while the run was working.
+    SourceVanished,
+    /// The local file could not be opened or read.
+    SourceUnreadable,
+    /// The local entry is not a regular file or directory the sync carries.
+    UnsupportedLocalEntry,
+    /// File Station could not compute the remote file's checksum.
+    RemoteDigestUnavailable,
+    /// The account may not read this remote file; lasting until its permissions change.
+    RemoteUnreadable,
+    /// The remote entry changed after planning and was left as found.
+    RemoteChanged,
+    /// The remote name cannot exist on this host's filesystem.
+    UnrepresentableName,
+    /// The listing of the containing remote folder was incomplete, so no deletion was made there.
+    ListingIncomplete,
+    /// The NAS-side copy finished with an error.
+    ServerCopyFailed,
+    /// The NAS refused the deletion.
+    DeleteFailed,
+}
+
+impl From<sync::DeferReason> for DeferredReason {
+    fn from(reason: sync::DeferReason) -> Self {
+        match reason {
+            sync::DeferReason::SourceChanged => Self::SourceChanged,
+            sync::DeferReason::SourceVanished => Self::SourceVanished,
+            sync::DeferReason::SourceUnreadable => Self::SourceUnreadable,
+            sync::DeferReason::UnsupportedLocalEntry => Self::UnsupportedLocalEntry,
+            sync::DeferReason::RemoteDigestUnavailable => Self::RemoteDigestUnavailable,
+            sync::DeferReason::RemoteUnreadable => Self::RemoteUnreadable,
+            sync::DeferReason::RemoteChanged => Self::RemoteChanged,
+            sync::DeferReason::UnrepresentableName => Self::UnrepresentableName,
+            sync::DeferReason::ListingIncomplete => Self::ListingIncomplete,
+            sync::DeferReason::ServerCopyFailed => Self::ServerCopyFailed,
+            sync::DeferReason::DeleteFailed => Self::DeleteFailed,
+        }
+    }
+}
+
+/// One path a run left for the next run.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct DeferredPath {
+    relative: String,
+    reason: DeferredReason,
+    detail: String,
+}
+
+impl DeferredPath {
+    /// Source-relative, `/`-separated.
+    pub fn relative(&self) -> &str {
+        &self.relative
+    }
+
+    pub fn reason(&self) -> DeferredReason {
+        self.reason
+    }
+
+    /// The underlying observation, for an operator. Never a credential.
+    pub fn detail(&self) -> &str {
+        &self.detail
+    }
+}
+
+fn sdk_deferred(records: &[sync::DeferredPath]) -> Vec<DeferredPath> {
+    records
+        .iter()
+        .map(|record| DeferredPath {
+            relative: record.relative.clone(),
+            reason: record.reason.into(),
+            detail: record.detail.clone(),
+        })
+        .collect()
+}
+
+/// Append `extra` to `records`, keeping the first record for any path named twice.
+fn merge_deferred(records: &mut Vec<sync::DeferredPath>, extra: Vec<sync::DeferredPath>) {
+    for record in extra {
+        if !records
+            .iter()
+            .any(|existing| existing.relative == record.relative)
+        {
+            records.push(record);
+        }
+    }
 }
 
 /// Structured, secret-free SDK event.
@@ -721,6 +868,9 @@ pub struct SyncOutcome {
     applied: bool,
     reconciled: bool,
     execution: Option<ExecutionSummary>,
+    deferred: Vec<DeferredPath>,
+    #[serde(skip)]
+    recovered: crate::api::TransportCounters,
 }
 
 impl SyncOutcome {
@@ -738,6 +888,34 @@ impl SyncOutcome {
 
     pub fn execution(&self) -> Option<ExecutionSummary> {
         self.execution
+    }
+
+    /// Paths this run left for the next run, each with its reason.
+    pub fn deferred(&self) -> &[DeferredPath] {
+        &self.deferred
+    }
+
+    /// True when the run completed everything except the paths in [`Self::deferred`].
+    ///
+    /// Distinct from success and from failure: every other path converged, nothing was deleted on
+    /// the evidence that failed, and the next run picks the deferred paths up.
+    pub fn partial(&self) -> bool {
+        // The command line's rule: a path that will be left out of every run (a name this host
+        // cannot hold, an entry the sync never carries) is reported, but is not "partial".
+        self.deferred.iter().any(|record| {
+            !matches!(
+                record.reason,
+                DeferredReason::UnrepresentableName
+                    | DeferredReason::UnsupportedLocalEntry
+                    | DeferredReason::ListingIncomplete
+                    | DeferredReason::RemoteUnreadable
+            )
+        })
+    }
+
+    /// Retries, re-logins and abandoned server tasks the run recovered from, or could not.
+    pub fn recovered(&self) -> crate::api::TransportCounters {
+        self.recovered
     }
 }
 
@@ -763,6 +941,9 @@ impl Engine {
         O: FnMut(&SdkEvent) -> EventControl,
     {
         check_cancellation(cancellation)?;
+        // Read before the first scan, so "was this written while the run was working" has an
+        // answer that predates every observation the run made.
+        let started_at = std::time::SystemTime::now();
         let root = RemoteRoot::parse(&request.remote).map_err(SdkError::from_core)?;
 
         emit(
@@ -845,9 +1026,17 @@ impl Engine {
                     phase: Phase::RemoteScan,
                 },
             )?;
-            let mut remote = client
-                .remote_inventory(&root, &rules, cancellation)
+            let scanned = client
+                .remote_inventory_scoped(
+                    &root,
+                    &plan::Scope::root(),
+                    &rules,
+                    usize::MAX,
+                    cancellation,
+                )
                 .map_err(SdkError::from_core)?;
+            let incomplete_directories = scanned.incomplete_directories;
+            let mut remote = scanned.inventory;
             emit(
                 cancellation,
                 &mut on_event,
@@ -856,7 +1045,18 @@ impl Engine {
                 },
             )?;
 
-            if request.comparison == Comparison::Content {
+            let options = PlanOptions {
+                delete: request.deletion.enabled,
+                allow_empty_source: request.deletion.allow_empty_source,
+                max_delete: request.deletion.max_delete,
+                compare: request.comparison.into(),
+                server_copy,
+                // The SDK always plans the whole tree; scoping is a command-line concern.
+                scope: plan::Scope::root(),
+            };
+            // The same digest pass, with the same per-path deferral, as the command line.
+            let content = request.comparison == Comparison::Content;
+            if content {
                 emit(
                     cancellation,
                     &mut on_event,
@@ -864,27 +1064,19 @@ impl Engine {
                         phase: Phase::ContentHashing,
                     },
                 )?;
-                client
-                    .require_content_fingerprint_api()
-                    .map_err(SdkError::from_core)?;
-                let comparison = plan::select_comparison_remote_digests(&local, &remote, &rules);
-                let strong = plan::select_strong_remote_digests(
-                    &local,
-                    &remote,
-                    &rules,
-                    server_copy,
-                    request.deletion.enabled,
-                );
-                local::populate_content_md5_selective(&mut local, &comparison, cancellation)
-                    .map_err(SdkError::from_core)?;
-                client
-                    .populate_remote_content_digests(
-                        &mut remote,
-                        &comparison,
-                        &strong,
-                        cancellation,
-                    )
-                    .map_err(SdkError::from_core)?;
+            }
+            let mut deferred = sync::populate_plan_digests(
+                &client,
+                &mut local,
+                &mut remote,
+                &rules,
+                options.compare,
+                server_copy,
+                options.delete,
+                cancellation,
+            )
+            .map_err(SdkError::from_core)?;
+            if content {
                 emit(
                     cancellation,
                     &mut on_event,
@@ -901,26 +1093,20 @@ impl Engine {
                     phase: Phase::Planning,
                 },
             )?;
-            let mut plan = plan::build_plan(
-                &root,
-                &local,
-                &remote,
-                &rules,
-                &PlanOptions {
-                    delete: request.deletion.enabled,
-                    allow_empty_source: request.deletion.allow_empty_source,
-                    max_delete: request.deletion.max_delete,
-                    compare: request.comparison.into(),
-                    server_copy,
-                    // The SDK always plans the whole tree; scoping is a command-line concern.
-                    scope: plan::Scope::root(),
-                },
-            )
-            .map_err(SdkError::from_core)?;
+            let mut plan = plan::build_plan(&root, &local, &remote, &rules, &options)
+                .map_err(SdkError::from_core)?;
+            merge_deferred(
+                &mut deferred,
+                sync::withhold_deletions_in_incomplete_listings(&mut plan, &incomplete_directories),
+            );
             // This plan is executed, so its uploads need the strong digest the upload path
             // verifies against. See `plan::promote_upload_fingerprints`.
-            plan::promote_upload_fingerprints(&mut plan, cancellation)
-                .map_err(SdkError::from_core)?;
+            merge_deferred(
+                &mut deferred,
+                sync::promote_upload_fingerprints_deferring(&client, &mut plan, cancellation)
+                    .map_err(SdkError::from_core)?,
+            );
+            sync::record_deferrals_in_plan(&mut plan, &deferred);
             let plan = plan;
             let summary = summarize_plan(&plan);
             emit(
@@ -946,6 +1132,8 @@ impl Engine {
                     applied: false,
                     reconciled: false,
                     execution: None,
+                    deferred: sdk_deferred(&deferred),
+                    recovered: client.transport_counters(),
                 });
             }
             check_cancellation(cancellation)?;
@@ -960,6 +1148,9 @@ impl Engine {
             let report = if plan.is_empty() {
                 crate::sync::ExecutionReport::default()
             } else {
+                // Long local phases are over; touch the session before the first upload so an
+                // idle timeout that expired during hashing is renewed rather than failing it.
+                client.touch_session();
                 let observer_factory: UploadObserverFactory = Arc::new(|_| None);
                 sync::execute_observed(
                     &client,
@@ -982,6 +1173,7 @@ impl Engine {
                 )
                 .map_err(SdkError::from_core)?
             };
+            merge_deferred(&mut deferred, report.deferred.clone());
             emit(
                 cancellation,
                 &mut on_event,
@@ -997,16 +1189,20 @@ impl Engine {
                     phase: Phase::Reconciliation,
                 },
             )?;
-            let reconciliation =
-                reconciliation_plan(&client, request, &root, &rules, server_copy, cancellation)?;
-            if !reconciliation.is_empty() {
-                return Err(SdkError::new(
-                    ErrorCode::Reconciliation,
-                    format!(
-                        "final reconciliation found {} pending in-scope operations",
-                        operation_count(&reconciliation)
-                    ),
-                ));
+            if !plan.is_empty() {
+                let (reconciliation, reconciliation_deferred) =
+                    reconciliation_plan(&client, request, &root, &rules, &options, cancellation)?;
+                merge_deferred(&mut deferred, reconciliation_deferred);
+                // The command line's rules exactly, so an embedding application cannot fail a run
+                // the CLI reports as a success, or the reverse.
+                sync::ensure_reconciled(
+                    &plan.source_root,
+                    &plan,
+                    &reconciliation,
+                    started_at,
+                    &sync::DeferralIndex::from_records(&deferred),
+                )
+                .map_err(SdkError::from_core)?;
             }
             emit(
                 cancellation,
@@ -1027,6 +1223,8 @@ impl Engine {
                     uploaded: report.uploaded,
                     uploaded_bytes: report.uploaded_bytes,
                 }),
+                deferred: sdk_deferred(&deferred),
+                recovered: client.transport_counters(),
             })
         }));
         let operation = match operation {
@@ -1173,58 +1371,51 @@ fn check_cancellation(cancellation: &CancellationToken) -> SdkResult<()> {
     cancellation.check().map_err(SdkError::from_core)
 }
 
+/// Rebuild the plan after execution, through the same digest pass and the same deletion
+/// withholding as the run, under the shared reconciliation options.
 fn reconciliation_plan(
     client: &ApiClient,
     request: &SyncRequest,
     root: &RemoteRoot,
     rules: &IgnoreRules,
-    server_copy: bool,
+    run_options: &PlanOptions,
     cancellation: &CancellationToken,
-) -> SdkResult<SyncPlan> {
+) -> SdkResult<(SyncPlan, Vec<sync::DeferredPath>)> {
     check_cancellation(cancellation)?;
     let mut local =
         local::scan(&request.source, rules, cancellation).map_err(SdkError::from_core)?;
     check_cancellation(cancellation)?;
-    let mut remote = client
-        .remote_inventory(root, rules, cancellation)
+    let scanned = client
+        .remote_inventory_scoped(root, &plan::Scope::root(), rules, usize::MAX, cancellation)
         .map_err(SdkError::from_core)?;
+    let mut remote = scanned.inventory;
     check_cancellation(cancellation)?;
-    if request.comparison == Comparison::Content {
-        client
-            .require_content_fingerprint_api()
-            .map_err(SdkError::from_core)?;
-        let comparison = plan::select_comparison_remote_digests(&local, &remote, rules);
-        let strong = plan::select_strong_remote_digests(
-            &local,
-            &remote,
-            rules,
-            server_copy,
-            request.deletion.enabled,
-        );
-        local::populate_content_md5_selective(&mut local, &comparison, cancellation)
-            .map_err(SdkError::from_core)?;
-        client
-            .populate_remote_content_digests(&mut remote, &comparison, &strong, cancellation)
-            .map_err(SdkError::from_core)?;
-    }
     // No promotion: a reconciliation plan is inspected for emptiness, never executed, so nothing
     // consumes an upload's digest here.
-    plan::build_plan(
+    let mut deferred = sync::populate_plan_digests(
+        client,
+        &mut local,
+        &mut remote,
+        rules,
+        run_options.compare,
+        run_options.server_copy,
+        run_options.delete,
+        cancellation,
+    )
+    .map_err(SdkError::from_core)?;
+    let mut plan = plan::build_plan(
         root,
         &local,
         &remote,
         rules,
-        &PlanOptions {
-            delete: request.deletion.enabled,
-            allow_empty_source: request.deletion.allow_empty_source,
-            max_delete: request.deletion.max_delete,
-            compare: request.comparison.into(),
-            server_copy,
-            // The SDK always plans the whole tree; scoping is a command-line concern.
-            scope: plan::Scope::root(),
-        },
+        &sync::reconciliation_options(run_options, run_options.compare),
     )
-    .map_err(SdkError::from_core)
+    .map_err(SdkError::from_core)?;
+    deferred.extend(sync::withhold_deletions_in_incomplete_listings(
+        &mut plan,
+        &scanned.incomplete_directories,
+    ));
+    Ok((plan, deferred))
 }
 
 fn summarize_plan(plan: &SyncPlan) -> PlanSummary {
@@ -1273,6 +1464,15 @@ fn summarize_plan(plan: &SyncPlan) -> PlanSummary {
         unchanged_files: plan.unchanged_files,
         protected_entries: plan.protected_entries,
         upload_bytes: plan.upload_bytes,
+        skipped: plan
+            .skipped
+            .iter()
+            .map(|entry| SkippedPath {
+                relative: entry.relative.clone(),
+                reason: entry.reason.as_str(),
+                detail: entry.reason.detail(),
+            })
+            .collect(),
     }
 }
 
@@ -1323,6 +1523,10 @@ fn mutation_event(event: ExecutionEvent) -> MutationEvent {
         ExecutionEvent::KeptDeleteUploaded { relative, bytes } => {
             MutationEvent::KeptDeleteUploaded { relative, bytes }
         }
+        ExecutionEvent::PathDeferred { relative, reason } => MutationEvent::PathDeferred {
+            relative,
+            reason: reason.into(),
+        },
     }
 }
 

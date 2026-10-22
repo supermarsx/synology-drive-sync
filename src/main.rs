@@ -24,8 +24,8 @@ use synology_drive_sync::cancel::CancellationToken;
 use synology_drive_sync::local::{self, IgnoreRules, LocalEntry};
 use synology_drive_sync::observability::{
     BUILD, BearerTokenSource, BoundedText, DecodeFault, EventCode, EventLogger, EventMetrics,
-    FileLogConfig, LogEvent, LogFormat as EventLogFormat, LogLevel as EventLogLevel, LoggerConfig,
-    RemoteDelivery, RemoteLogConfig, RequestOutcome, SessionTransport,
+    EventReason, FileLogConfig, LogEvent, LogFormat as EventLogFormat, LogLevel as EventLogLevel,
+    LoggerConfig, RemoteDelivery, RemoteLogConfig, RequestOutcome, SessionTransport,
 };
 use synology_drive_sync::path::RemoteRoot;
 use synology_drive_sync::plan::{self, CompareMode, PlanOptions, RemoteSnapshot, SyncPlan};
@@ -39,7 +39,7 @@ use synology_drive_sync::source_diagnostics::{
 };
 use synology_drive_sync::status_cache;
 use synology_drive_sync::sync::{
-    self, ExecuteOptions, ExecutionEvent, ExecutionReport, UploadObserverFactory,
+    self, DeferredPath, ExecuteOptions, ExecutionEvent, ExecutionReport, UploadObserverFactory,
 };
 use synology_drive_sync::transport_diagnostics::{
     CookieLedger, IntermediarySummary, ProbeObservation, ReachabilityBudget, ReachabilityReport,
@@ -69,6 +69,16 @@ const PROGRESS_RENDER_INTERVAL: Duration = Duration::from_millis(100);
 /// The documented exit code for cooperative Ctrl+C/SIGINT/SIGTERM cancellation, used both by the
 /// ordinary error mapping and by the second-signal force exit.
 const CANCELLED_EXIT_CODE: u8 = 130;
+/// A sync that completed everything except the paths it names in its result as deferred.
+///
+/// Neither success nor failure, and distinct from both on purpose: every other path converged and
+/// nothing was deleted on the evidence that failed, but the destination does not yet hold
+/// everything, and the next run picks the deferred paths up. Exit 0 would hide a file that has not
+/// synced for a week behind a run that reports success every hour; exit 1 would report a backup
+/// that worked as one that did not, and train the operator to ignore it.
+const PARTIAL_EXIT_CODE: u8 = 3;
+/// Where `--result-record` asked for each finished job's result, if it did.
+static RESULT_RECORD: OnceLock<PathBuf> = OnceLock::new();
 
 struct NamedProfile<'a> {
     name: String,
@@ -125,6 +135,10 @@ fn dispatch(arguments: &cli::Cli) -> Result<ExitCode> {
         _ => {}
     }
 
+    if let Some(path) = &arguments.global.output.result_record {
+        // Set once, before any job runs; nothing else writes it.
+        let _ = RESULT_RECORD.set(path.clone());
+    }
     let loaded = load_optional_config(&arguments.global)?;
     match arguments.invocation() {
         cli::Invocation::Sync {
@@ -172,8 +186,10 @@ fn dispatch(arguments: &cli::Cli) -> Result<ExitCode> {
                         .unwrap_or(config::DEFAULT_MAX_TOTAL_DELETE),
                 )
             } else {
+                let job = resolved.remove(0);
                 run_sync(
-                    resolved.remove(0).settings,
+                    &job.name,
+                    job.settings,
                     sync.dry_run,
                     false,
                     arguments.global.output.progress_record.as_deref(),
@@ -215,8 +231,10 @@ fn dispatch(arguments: &cli::Cli) -> Result<ExitCode> {
                         .unwrap_or(config::DEFAULT_MAX_TOTAL_DELETE),
                 )
             } else {
+                let job = resolved.remove(0);
                 run_sync(
-                    resolved.remove(0).settings,
+                    &job.name,
+                    job.settings,
                     true,
                     plan.exit_code,
                     arguments.global.output.progress_record.as_deref(),
@@ -274,6 +292,7 @@ fn dispatch(arguments: &cli::Cli) -> Result<ExitCode> {
                     .map_err(config_error)?;
             run_resync(
                 resync,
+                &selected[0].name,
                 settings,
                 arguments.global.output.progress_record.as_deref(),
             )
@@ -422,19 +441,36 @@ fn diagnose_source_job(
         Ok(report)
     })();
     let final_log = match &operation {
-        Ok(report) => log_event(
-            logger.as_ref(),
-            LogEvent::new(EventLogLevel::Info, EventCode::RunCompleted).metrics(EventMetrics {
-                operations: report.entries as u64,
-                files: report.files as u64,
-                bytes: report.bytes,
-                elapsed_ms: duration_millis(started.elapsed()),
-                ..EventMetrics::default()
+        Ok(report) => report
+            .inventory
+            .skipped
+            .iter()
+            .try_for_each(|entry| {
+                log_event(
+                    logger.as_ref(),
+                    LogEvent::new(EventLogLevel::Warn, EventCode::EntrySkipped)
+                        .reason(skip_event_reason(&entry.reason))
+                        .path(&entry.relative),
+                )
+            })
+            .and_then(|()| {
+                log_event(
+                    logger.as_ref(),
+                    LogEvent::new(EventLogLevel::Info, EventCode::RunCompleted).metrics(
+                        EventMetrics {
+                            operations: report.entries as u64,
+                            files: report.files as u64,
+                            bytes: report.bytes,
+                            elapsed_ms: duration_millis(started.elapsed()),
+                            ..EventMetrics::default()
+                        },
+                    ),
+                )
             }),
-        ),
-        Err(_) => log_event(
+        Err(error) => log_event(
             logger.as_ref(),
-            LogEvent::new(EventLogLevel::Error, EventCode::RunFailed),
+            LogEvent::new(EventLogLevel::Error, EventCode::RunFailed)
+                .reason(EventReason::of(error)),
         ),
     };
     if operation.is_ok()
@@ -459,6 +495,13 @@ fn source_diagnostic_value(result: &TimedSourceDiagnostic) -> Value {
         "bytes": result.report.bytes,
         "content_hashed": result.hash_content,
         "hashed_files": result.report.hashed_files,
+        // Every entry a sync of this source would leave out, and why, so it can be diagnosed
+        // before a sync runs: the same tags as a plan's `skipped`.
+        "skipped": result.report.inventory.skipped.iter().map(|entry| json!({
+            "path": entry.relative,
+            "reason": entry.reason.as_str(),
+            "detail": entry.reason.detail(),
+        })).collect::<Vec<_>>(),
         "elapsed_ms": duration_millis(result.elapsed),
     })
 }
@@ -479,9 +522,15 @@ fn source_doctor_output(
         "source": source_diagnostic_value(result),
     });
     match format {
-        cli::OutputFormat::Human => RenderedOutput::Human(
-            format!(
-                "Source is healthy: {} files, {} directories, {} across {} entries; {} files hashed in {} ms ({}).",
+        cli::OutputFormat::Human => {
+            let skipped = &result.report.inventory.skipped;
+            let mut text = format!(
+                "{}: {} files, {} directories, {} across {} entries; {} files hashed in {} ms ({}).\n",
+                if skipped.is_empty() {
+                    "Source is healthy"
+                } else {
+                    "Source is readable, with entries a sync will skip"
+                },
                 result.report.files,
                 result.report.directories,
                 format_bytes(result.report.bytes),
@@ -489,8 +538,17 @@ fn source_doctor_output(
                 result.report.hashed_files,
                 duration_millis(result.elapsed),
                 result.report.canonical_root.display(),
-            ) + "\n",
-        ),
+            );
+            for entry in skipped {
+                text.push_str(&format!(
+                    "  SKIPPED {}: {} ({})\n",
+                    entry.relative,
+                    entry.reason.detail(),
+                    entry.reason.as_str()
+                ));
+            }
+            RenderedOutput::Human(text)
+        }
         cli::OutputFormat::Json => RenderedOutput::Json(value),
         cli::OutputFormat::Ndjson => RenderedOutput::Ndjson(vec![value]),
     }
@@ -750,12 +808,12 @@ fn run_sync_batch(
         }
         // A run that failed after its plan existed reports the plan *and* the failure, so the
         // failure has to be lifted out here rather than inferred from the `Result`.
-        match run_sync_job(&job.settings, true, &cancellation, |_| Ok(())).and_then(|result| {
-            match result.failure {
+        match run_sync_job(&job.name, &job.settings, true, &cancellation, |_| Ok(())).and_then(
+            |result| match result.failure {
                 Some(failure) => Err(failure),
                 None => Ok(result),
-            }
-        }) {
+            },
+        ) {
             Ok(result) => outcomes.push(SyncBatchOutcome {
                 name: job.name.clone(),
                 status: SyncBatchStatus::Preflighted,
@@ -856,6 +914,12 @@ fn run_sync_batch(
 
     // Execute deterministically and serially. Each job is replanned immediately before it can
     // mutate; the guard reserves its full fresh deletion count against the aggregate cap.
+    //
+    // One target's failure does not stop the others. Each is independent, each is reported under
+    // its own status, and the aggregate deletion cap is enforced per reservation, so a later target
+    // cannot exceed it. Stopping used to report every later target `not-run` on a schedule where
+    // one unreachable profile then starved all the rest. What does stop the batch is cancellation,
+    // and the aggregate deletion cap itself refusing a reservation.
     let mut reserved_deletions = 0_usize;
     let mut stopped = false;
     for (job, outcome) in jobs.iter().zip(&mut outcomes) {
@@ -868,14 +932,16 @@ fn run_sync_batch(
         }
         let mut fresh_plan = None;
         let mut mutation_authorized = false;
-        let execution = run_sync_job(&job.settings, false, &cancellation, |plan| {
+        let mut budget_refused = false;
+        let execution = run_sync_job(&job.name, &job.settings, false, &cancellation, |plan| {
             fresh_plan = Some(plan.clone());
             reserve_batch_deletions(
                 &mut reserved_deletions,
                 plan.delete_count(),
                 max_total_delete,
                 &job.name,
-            )?;
+            )
+            .inspect_err(|_| budget_refused = true)?;
             mutation_authorized = !plan.is_empty();
             Ok(())
         });
@@ -898,7 +964,7 @@ fn run_sync_batch(
                 outcome.report = result.completion;
                 outcome.elapsed = Some(result.elapsed);
                 outcome.error = Some(failure.to_string());
-                stopped = true;
+                stopped = budget_refused || cancelled;
             }
             Ok(result) => {
                 outcome.status = SyncBatchStatus::Success;
@@ -920,7 +986,7 @@ fn run_sync_batch(
                 outcome.report = None;
                 outcome.elapsed = None;
                 outcome.error = Some(error.to_string());
-                stopped = true;
+                stopped = budget_refused || cancelled;
             }
         }
     }
@@ -948,9 +1014,24 @@ fn sync_batch_completion(outcomes: &[SyncBatchOutcome], cancelled: bool) -> Resu
         )
     }) {
         Err(Error::Message(
-            "batch sync stopped after a target failed; completed targets were retained and later targets were not run"
-                .to_owned(),
+            if outcomes
+                .iter()
+                .any(|outcome| outcome.status == SyncBatchStatus::NotRun)
+            {
+                "batch sync stopped after a target failed; completed targets were retained and later targets were not run"
+            } else {
+                "one or more batch targets failed; every other target ran and its result was retained"
+            }
+            .to_owned(),
         ))
+    } else if outcomes.iter().any(|outcome| {
+        outcome
+            .report
+            .as_ref()
+            .is_some_and(SyncCompletion::is_partial)
+    }) {
+        // Every target ran; at least one left named paths for its next run.
+        Ok(ExitCode::from(PARTIAL_EXIT_CODE))
     } else {
         Ok(ExitCode::SUCCESS)
     }
@@ -1112,6 +1193,38 @@ fn write_sync_batch_output(
     execution_reserved_deletions: Option<usize>,
     batch_error: Option<&str>,
 ) -> Result<()> {
+    write_result_record(
+        &outcomes
+            .iter()
+            .map(|outcome| {
+                result_record_line(
+                    &outcome.name,
+                    outcome.status.as_str(),
+                    match (
+                        &outcome.report,
+                        &outcome.execution_plan,
+                        &outcome.preflight_plan,
+                    ) {
+                        (Some(_), _, _) | (None, Some(_), _) => result_record_result(
+                            outcome.execution_plan.as_ref(),
+                            outcome.report.as_ref(),
+                            outcome.elapsed.unwrap_or_default(),
+                            false,
+                        ),
+                        (None, None, Some(plan)) if plan_only => result_record_result(
+                            Some(plan),
+                            None,
+                            outcome.elapsed.unwrap_or_default(),
+                            true,
+                        ),
+                        _ => Value::Null,
+                    },
+                )
+            })
+            .collect::<Vec<_>>(),
+        output,
+        None,
+    );
     let stdout = io::stdout();
     let mut stdout = stdout.lock();
     write_sync_batch_output_to(
@@ -1246,6 +1359,7 @@ fn write_sync_batch_output_to<W: Write>(writer: &mut W, render: SyncBatchRender<
                         )
                         .map_err(output_error)?;
                     }
+                    write_deferred_human_to(writer, completion)?;
                 }
                 if let Some(error) = &outcome.error {
                     writeln!(writer, "Error: {error}").map_err(output_error)?;
@@ -1322,6 +1436,7 @@ fn attach_progress_record(
 }
 
 fn run_sync(
+    profile: &str,
     settings: config::ResolvedSync,
     plan_only: bool,
     changes_exit_code: bool,
@@ -1332,7 +1447,44 @@ fn run_sync(
         record,
         if plan_only { "plan" } else { "run" },
     );
-    let result = run_sync_job(&settings, plan_only, &cancellation, |_| Ok(()))?;
+    let result = match run_sync_job(profile, &settings, plan_only, &cancellation, |_| Ok(())) {
+        Ok(result) => result,
+        Err(error) => {
+            // Failed before it had a plan: the record still says so, with no result.
+            write_result_record(
+                &[result_record_line(profile, "failed", Value::Null)],
+                &settings.output,
+                Some(profile),
+            );
+            return Err(error);
+        }
+    };
+    write_result_record(
+        &[result_record_line(
+            profile,
+            if result.failure.is_some() {
+                "failed"
+            } else if plan_only {
+                "planned"
+            } else if result
+                .completion
+                .as_ref()
+                .is_some_and(SyncCompletion::is_partial)
+            {
+                "partial"
+            } else {
+                "complete"
+            },
+            result_record_result(
+                Some(&result.plan),
+                result.completion.as_ref(),
+                result.elapsed,
+                plan_only,
+            ),
+        )],
+        &settings.output,
+        Some(profile),
+    );
     // Printed before the verdict is returned, so a run that failed after uploading nine hundred
     // files still reports the nine hundred. Every count in it is work that succeeded and was
     // verified individually; the failure that follows does not unmake any of it.
@@ -1347,11 +1499,29 @@ fn run_sync(
     if let Some(failure) = result.failure {
         return Err(failure);
     }
-    changes_completion(
-        !result.plan.is_empty(),
-        cancellation.is_cancelled(),
-        changes_exit_code,
+    partial_completion(
+        Some(&result.plan),
+        result.completion.as_ref(),
+        changes_completion(
+            !result.plan.is_empty(),
+            cancellation.is_cancelled(),
+            changes_exit_code,
+        ),
     )
+}
+
+/// [`PARTIAL_EXIT_CODE`] in place of an otherwise successful exit, when the run deferred a path.
+///
+/// Failure and cancellation keep their own codes: they say more than "partial" does.
+fn partial_completion(
+    plan: Option<&SyncPlan>,
+    completion: Option<&SyncCompletion>,
+    result: Result<ExitCode>,
+) -> Result<ExitCode> {
+    match result {
+        Ok(_) if run_is_partial(plan, completion) => Ok(ExitCode::from(PARTIAL_EXIT_CODE)),
+        other => other,
+    }
 }
 
 fn changes_completion(changes: bool, cancelled: bool, changes_exit_code: bool) -> Result<ExitCode> {
@@ -1369,13 +1539,64 @@ fn changes_completion(changes: bool, cancelled: bool, changes_exit_code: bool) -
 /// One value rather than three parameters, because every renderer needs all of it: a report whose
 /// counts are real but whose run then failed reads very differently from the same counts on a run
 /// that succeeded, and the reconciliation verdict is part of the answer rather than a footnote.
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Debug, Default)]
 struct SyncCompletion {
     report: ExecutionReport,
-    /// Entries the rebuilt plan still held, all of them local files modified after the run began.
+    /// Entries the rebuilt plan still held, all of them explained by the local tree changing while
+    /// the run worked: files written after it began, or deleted while it was working.
     changed_during_run: usize,
     /// True when the run failed after performing some of this work.
     failed: bool,
+    /// Every path the run left for the next run, from planning, execution and reconciliation, each
+    /// once and by name. Non-empty makes the run partial.
+    deferred: Vec<DeferredPath>,
+    /// Destinations this run wrote whose modification time DSM did not keep within tolerance.
+    /// Their bytes were verified; a warning, not a deferral.
+    mtime_not_kept: usize,
+    /// Paths the plan declined to carry for a lasting reason (a link, a SYSTEM-attribute file, a
+    /// case or normalisation collision), named in the plan's `skipped`. Reported and logged, never
+    /// silent, but they do not make the run partial; see [`Self::is_partial`].
+    skipped: usize,
+    /// Retries, re-logins and abandoned server tasks the client recovered from, or could not.
+    transport: api::TransportCounters,
+    /// Remote folders (root-relative, `.` for the root) whose listing returned a different number
+    /// of entries than DSM counted. Deletions inside them were withheld.
+    incomplete_listings: Vec<String>,
+}
+
+impl SyncCompletion {
+    /// A completion that holds nothing but the paths planning deferred.
+    fn deferred_only(deferred: Vec<DeferredPath>, skipped: usize) -> Self {
+        Self {
+            deferred,
+            skipped,
+            ..Self::default()
+        }
+    }
+
+    /// Partial means something the next run is expected to pick up was left behind.
+    ///
+    /// Lasting skips and lasting deferrals (a link, a SYSTEM file, a name this host cannot hold)
+    /// are reported by name and counted, and logged as `entry.skipped`/`entry.deferred` warnings,
+    /// but leave the run complete: they recur on every run until someone acts on them.
+    fn is_partial(&self) -> bool {
+        self.deferred
+            .iter()
+            .any(|record| !record.reason.is_lasting())
+    }
+
+    /// Record `extra`, keeping the first reason for a path already recorded.
+    fn add_deferred(&mut self, extra: impl IntoIterator<Item = DeferredPath>) {
+        for record in extra {
+            if !self
+                .deferred
+                .iter()
+                .any(|existing| existing.relative == record.relative)
+            {
+                self.deferred.push(record);
+            }
+        }
+    }
 }
 
 struct TimedSyncResult {
@@ -1399,6 +1620,7 @@ struct SyncRun {
 }
 
 fn run_sync_job(
+    profile: &str,
     settings: &config::ResolvedSync,
     plan_only: bool,
     cancellation: &CancellationToken,
@@ -1408,12 +1630,13 @@ fn run_sync_job(
     let logger = build_logger(&settings.output)?;
     let start_log = log_event(
         logger.as_ref(),
-        LogEvent::new(EventLogLevel::Info, EventCode::RunStarted),
+        LogEvent::new(EventLogLevel::Info, EventCode::RunStarted).profile(profile),
     );
     let started = Instant::now();
 
     let mut run = match start_log {
         Ok(()) => prepare_and_run_sync(
+            profile,
             settings,
             plan_only,
             logger.clone(),
@@ -1426,7 +1649,15 @@ fn run_sync_job(
             result: Err(error),
         },
     };
-    let final_log = match (&run.result, &run.plan) {
+    // Every path the run did not carry is logged by name before the verdict, failed run or not, so
+    // the log alone can say what was left and why.
+    let entries_log = log_run_entries(
+        logger.as_ref(),
+        profile,
+        run.plan.as_ref(),
+        run.completion.as_ref(),
+    );
+    let final_log = entries_log.and_then(|()| match (&run.result, &run.plan) {
         (Ok(()), Some(plan)) => {
             let metrics = EventMetrics {
                 operations: operation_count(plan),
@@ -1435,16 +1666,29 @@ fn run_sync_job(
                 elapsed_ms: duration_millis(started.elapsed()),
                 ..EventMetrics::default()
             };
-            log_event(
-                logger.as_ref(),
-                LogEvent::new(EventLogLevel::Info, EventCode::RunCompleted).metrics(metrics),
-            )
+            // A run that left named paths for the next one is not a completed run.
+            let partial = run_is_partial(Some(plan), run.completion.as_ref());
+            let event = if partial {
+                LogEvent::new(EventLogLevel::Warn, EventCode::RunPartial)
+                    .reason(EventReason::ChangedDuringRun)
+            } else {
+                LogEvent::new(EventLogLevel::Info, EventCode::RunCompleted)
+            };
+            log_event(logger.as_ref(), event.profile(profile).metrics(metrics))
         }
-        _ => log_event(
+        (Err(error), _) => log_event(
             logger.as_ref(),
-            LogEvent::new(EventLogLevel::Error, EventCode::RunFailed),
+            LogEvent::new(EventLogLevel::Error, EventCode::RunFailed)
+                .reason(EventReason::of(error))
+                .profile(profile),
         ),
-    };
+        (Ok(()), None) => log_event(
+            logger.as_ref(),
+            LogEvent::new(EventLogLevel::Error, EventCode::RunFailed)
+                .reason(EventReason::Unclassified)
+                .profile(profile),
+        ),
+    });
     if run.result.is_ok()
         && let Err(error) = final_log
     {
@@ -1502,6 +1746,7 @@ fn resync_target(settings: &config::ResolvedSync) -> plan::ResyncTarget<'_> {
 /// the caller looked cannot be overwritten on the strength of a stale confirmation.
 fn run_resync(
     arguments: &cli::ResyncArgs,
+    profile: &str,
     mut settings: config::ResolvedSync,
     record: Option<&Path>,
 ) -> Result<ExitCode> {
@@ -1522,7 +1767,7 @@ fn run_resync(
     // caused the refusal, rather than making the caller run the planning step again themselves.
     let planned: RefCell<Option<SyncPlan>> = RefCell::new(None);
     let expected = arguments.confirm.as_deref();
-    let outcome = run_sync_job(&settings, plan_only, &cancellation, |plan| {
+    let outcome = run_sync_job(profile, &settings, plan_only, &cancellation, |plan| {
         planned.replace(Some(plan.clone()));
         let Some(expected) = expected else {
             return Ok(());
@@ -1557,7 +1802,11 @@ fn run_resync(
             // Ctrl-C during the logout round trip or the logger flush exited 0 and a supervisor
             // could not tell a completed forced overwrite from an abandoned one. It is also the
             // most destructive command there is, which is the worst place to be silent about it.
-            changes_completion(false, cancellation.is_cancelled(), false)
+            partial_completion(
+                Some(&result.plan),
+                result.completion.as_ref(),
+                changes_completion(false, cancellation.is_cancelled(), false),
+            )
         }
         Err(Error::ResyncTicketStale { presented, current }) => {
             // A live destination changes; being told only "no" would leave the caller looping
@@ -1647,6 +1896,7 @@ fn write_resync_output_to<W: Write>(
                     )
                     .map_err(output_error)?;
                 }
+                write_deferred_human_to(writer, completion)?;
             }
             if let Some(ticket) = ticket {
                 writeln!(
@@ -1724,20 +1974,23 @@ fn run_status(
     let rules = IgnoreRules::build(&settings.source, &settings.behavior.excludes)?;
     let compare = compare_mode(settings.behavior.compare);
     let query_states = status_state_filter(&arguments.states, arguments.all);
-    let cache = open_status_cache(arguments, profile, &settings, compare);
     // A directory that was asked for and could not be used is a different answer from one that was
     // never asked for, and `state: "off"` says the second. Left unreported, a scheduled run against
     // a directory that does not exist yet recomputes every digest on every run, forever, and exits
-    // 0 claiming no cache was configured.
-    let cache_unusable =
-        cache.is_none() && arguments.status_cache.is_some() && compare == CompareMode::Content;
-    if cache_unusable {
-        warn_cache(
-            &settings.output,
-            "the configured directory could not be used; every digest will be recomputed. \
-             It must exist, be a directory, and grant access to its owner only.",
-        );
-    }
+    // 0 claiming no cache was configured. The refusal is named, logged and published, never dropped.
+    let (cache, open_issue) = match open_status_cache(arguments, profile, &settings, compare) {
+        Ok(cache) => (cache, None),
+        Err(issue) => {
+            warn_cache(
+                &settings.output,
+                &format!(
+                    "{issue}; every digest will be recomputed. The directory must exist, be a \
+                     directory, and grant access to its owner only."
+                ),
+            );
+            (None, Some(issue))
+        }
+    };
 
     cancellation.check()?;
     cancellation.phase("scan_local");
@@ -1777,7 +2030,7 @@ fn run_status(
         &mut vault,
         settings.authentication.totp_secret_file.as_deref(),
     )?;
-    drop(password);
+    client = client.with_reauthenticator(reauthenticator(&settings, password));
 
     let operation = (|| {
         cancellation.check()?;
@@ -1815,11 +2068,12 @@ fn run_status(
             )?;
             comparison = selected;
             cache_report = report;
-            if cache_unusable {
+            if let Some(issue) = open_issue.clone() {
                 // `Unusable` is exactly this situation: a cache was asked for, none of it could be
                 // used, and the whole answer was therefore recomputed live. The alternative, `off`,
                 // documents itself as "no cache directory was configured".
                 cache_report.state = status_cache::CacheState::Unusable;
+                cache_report.issues.push(issue);
             }
         }
         cancellation.check()?;
@@ -1869,6 +2123,7 @@ fn run_status(
         {
             cancellation.phase("store_results");
             let scoped_query = !scope.is_root();
+            // Both failures are also recorded in `cache.issues()`, which is published below.
             if let Err(error) = cache.store(&local, &remote, &comparison, scoped_query) {
                 warn_cache(
                     &settings.output,
@@ -1878,6 +2133,9 @@ fn run_status(
             if let Err(error) = cache.store_rollup(&page.stats, &cache_report, scoped_query) {
                 warn_cache(&settings.output, &format!("rollup was not stored: {error}"));
             }
+        }
+        if let Some(cache) = cache.as_ref() {
+            publish_cache_issues(&mut cache_report, cache, &settings.output);
         }
         Ok((page, cache_report))
     })();
@@ -1997,10 +2255,10 @@ fn write_status_rollup_human_to<W: Write>(
 
 /// Bind this query to a digest cache, or decline to use one.
 ///
-/// Declines silently in every unusable case -- no directory configured, an unsafe directory, a
-/// comparison mode that computes no digests, a clock that cannot be read. A cache is an
-/// accelerator, so failing to obtain one is never an error a caller should see: the query simply
-/// costs what it always cost.
+/// `Ok(None)` when no cache applies: no directory configured, or a comparison mode that computes no
+/// digests. A configured cache that cannot be used -- an unsafe or missing directory, an unusable
+/// profile name, a clock that cannot be read -- is an `Err` naming why. It never fails the query,
+/// which simply costs what it always cost, but the caller logs and publishes it.
 ///
 /// Only [`CompareMode::Content`] is eligible. The other modes decide from size and modification
 /// time alone, so there is nothing to accelerate and nothing to get wrong.
@@ -2009,18 +2267,24 @@ fn open_status_cache(
     profile: &str,
     settings: &config::ResolvedSync,
     compare: CompareMode,
-) -> Option<status_cache::StatusCache> {
+) -> std::result::Result<Option<status_cache::StatusCache>, status_cache::CacheIssue> {
     if compare != CompareMode::Content {
-        return None;
+        return Ok(None);
     }
-    let directory = arguments.status_cache.clone()?;
-    let now = i64::try_from(
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .ok()?
-            .as_secs(),
-    )
-    .ok()?;
+    let Some(directory) = arguments.status_cache.clone() else {
+        return Ok(None);
+    };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|error| error.to_string())
+        .and_then(|elapsed| i64::try_from(elapsed.as_secs()).map_err(|error| error.to_string()))
+        .map_err(|cause| {
+            status_cache::CacheIssue::warning(
+                status_cache::CacheIssue::CLOCK_UNREADABLE,
+                &directory,
+                format!("the system clock cannot date stored evidence: {cause}"),
+            )
+        })?;
     status_cache::StatusCache::open(
         status_cache::CacheOptions {
             directory,
@@ -2042,6 +2306,25 @@ fn open_status_cache(
         },
         now,
     )
+    .map(Some)
+}
+
+/// Move every condition the cache met during this pass into the published report, warning about
+/// each one. Deduplicated against what the report already carries.
+fn publish_cache_issues(
+    report: &mut status_cache::CacheReport,
+    cache: &status_cache::StatusCache,
+    output: &config::ResolvedOutput,
+) {
+    for issue in cache.issues() {
+        if report.issues.contains(&issue) {
+            continue;
+        }
+        if issue.is_warning() {
+            warn_cache(output, &issue.to_string());
+        }
+        report.issues.push(issue);
+    }
 }
 
 /// Fill both inventories' content digests, reusing stored evidence where it is still valid.
@@ -2103,7 +2386,15 @@ fn populate_status_digests(
                 "stored digests disagreed with live evidence at {disagreeing:?}; the cache was discarded and this answer recomputed in full"
             ),
         );
-        cache.discard();
+        let mut issues = vec![status_cache::CacheIssue::canary_mismatch(
+            cache.path(),
+            &disagreeing,
+        )];
+        // A failed removal is recorded in `cache.issues()` as well; it is published with the rest.
+        if let Err(issue) = cache.discard() {
+            warn_cache(output, &issue.to_string());
+            issues.push(issue);
+        }
         for entry in local.entries.values_mut() {
             entry.content_md5 = None;
         }
@@ -2117,6 +2408,7 @@ fn populate_status_digests(
             digests_computed: comparison.len(),
             oldest_evidence_epoch: None,
             canary_checked: served.probes.len(),
+            issues,
         };
         return Ok((comparison, report));
     }
@@ -2135,6 +2427,7 @@ fn populate_status_digests(
         digests_computed: comparison.len().saturating_sub(reused),
         oldest_evidence_epoch: served.oldest_evidence_epoch,
         canary_checked: served.probes.len(),
+        issues: Vec::new(),
     };
     Ok((comparison, report))
 }
@@ -2204,6 +2497,7 @@ fn status_state_filter(states: &[cli::StateArg], all: bool) -> plan::StateFilter
 /// reconciliation failure after nine hundred successful uploads still has nine hundred uploads to
 /// report.
 fn prepare_and_run_sync(
+    profile: &str,
     settings: &config::ResolvedSync,
     plan_only: bool,
     logger: Option<Arc<EventLogger>>,
@@ -2213,6 +2507,7 @@ fn prepare_and_run_sync(
     let mut plan = None;
     let mut completion = None;
     let result = prepare_and_run_sync_reporting(
+        profile,
         settings,
         plan_only,
         logger,
@@ -2230,6 +2525,7 @@ fn prepare_and_run_sync(
 
 #[allow(clippy::too_many_arguments)]
 fn prepare_and_run_sync_reporting(
+    profile: &str,
     settings: &config::ResolvedSync,
     plan_only: bool,
     logger: Option<Arc<EventLogger>>,
@@ -2319,7 +2615,7 @@ fn prepare_and_run_sync_reporting(
         &mut vault,
         settings.authentication.totp_secret_file.as_deref(),
     )?;
-    drop(password);
+    client = client.with_reauthenticator(reauthenticator(settings, password));
 
     let operation = (|| {
         cancellation.check()?;
@@ -2334,9 +2630,22 @@ fn prepare_and_run_sync_reporting(
             LogEvent::new(EventLogLevel::Info, EventCode::RemoteScanStarted),
         )?;
         cancellation.phase("list_remote");
-        let mut remote = client
-            .remote_inventory_scoped(&root, &scope, &rules, usize::MAX, cancellation)?
-            .inventory;
+        let scanned =
+            client.remote_inventory_scoped(&root, &scope, &rules, usize::MAX, cancellation)?;
+        let incomplete_directories = scanned.incomplete_directories;
+        let mut remote = scanned.inventory;
+        if !settings.output.quiet {
+            for directory in &incomplete_directories {
+                eprintln!(
+                    "warning: the NAS listed a different number of entries than it counted in {:?};                      nothing there is deleted by this run",
+                    if directory.is_empty() {
+                        "."
+                    } else {
+                        directory.as_str()
+                    }
+                );
+            }
+        }
         cancellation.check()?;
         log_event(
             logger.as_ref(),
@@ -2353,35 +2662,38 @@ fn prepare_and_run_sync_reporting(
         require_scope_present(&scope, &local, &remote)?;
 
         cancellation.phase("compare");
-        populate_content_for_plan(
+        let run_options = run_plan_options(settings, server_copy, &scope);
+        // A file that cannot be hashed, or whose remote digest File Station cannot produce, is left
+        // out of both inventories and named, rather than failing the run. See
+        // `sync::populate_plan_digests`.
+        let mut deferred = sync::populate_plan_digests(
             &client,
             &mut local,
             &mut remote,
             &rules,
-            settings,
+            run_options.compare,
             server_copy,
+            run_options.delete,
             cancellation,
         )?;
 
         cancellation.phase("build_plan");
-        let mut plan = plan::build_plan(
-            &root,
-            &local,
-            &remote,
-            &rules,
-            &PlanOptions {
-                delete: settings.safety.delete,
-                allow_empty_source: settings.safety.allow_empty_source,
-                max_delete: settings.safety.max_delete,
-                compare: effective_compare_mode(settings),
-                server_copy,
-                scope: scope.clone(),
-            },
-        )?;
+        let mut plan = plan::build_plan(&root, &local, &remote, &rules, &run_options)?;
+        deferred.extend(sync::withhold_deletions_in_incomplete_listings(
+            &mut plan,
+            &incomplete_directories,
+        ));
         // A comparison-set file that turned out to differ is now an upload, and uploads are
         // verified against a strong digest. Raise them here, before the plan is reported or
         // executed, so every consumer of it sees fingerprints of the strength it expects.
-        plan::promote_upload_fingerprints(&mut plan, cancellation)?;
+        deferred.extend(sync::promote_upload_fingerprints_deferring(
+            &client,
+            &mut plan,
+            cancellation,
+        )?);
+        // Every path left out is in the plan itself, so a `plan` that only reports what it would do
+        // still names what it would not, and why.
+        sync::record_deferrals_in_plan(&mut plan, &deferred);
         let plan = plan;
         cancellation.check()?;
         log_event(
@@ -2401,10 +2713,19 @@ fn prepare_and_run_sync_reporting(
         let plan = plan_out.as_ref().expect("the plan was just stored");
 
         if plan_only {
+            warn_deferred(&settings.output, &deferred);
             return Ok(());
         }
 
         if plan.is_empty() {
+            // Nothing to execute, but a path planning had to leave out is still a path that did
+            // not converge, and the result must say so by name.
+            let skipped = lasting_skips(plan);
+            if !deferred.is_empty() || skipped > 0 || !incomplete_directories.is_empty() {
+                let mut completion = SyncCompletion::deferred_only(deferred, skipped);
+                completion.incomplete_listings = listing_names(&incomplete_directories);
+                *completion_out = Some(completion);
+            }
             // Nothing was executed, so there is no convergence to verify. Reconciliation exists to
             // prove that the operations a run performed achieved the intended state; an empty plan
             // performed none. Rebuilding it here re-derives the identical answer from the identical
@@ -2423,9 +2744,13 @@ fn prepare_and_run_sync_reporting(
         }
 
         cancellation.check()?;
+        // Hashing may have kept DSM waiting for hours. Renew the session before the first
+        // mutation, so an idle timeout is answered by a login rather than by a failed upload.
+        client.touch_session();
         cancellation.phase("upload");
         let progress =
-            ProgressWiring::new(plan, &settings.output, logger.clone(), cancellation.clone());
+            ProgressWiring::new(plan, &settings.output, logger.clone(), cancellation.clone())
+                .with_profile(profile);
         let execution_log_failure = Arc::new(Mutex::new(None));
         let execution_log_failure_for_report = Arc::clone(&execution_log_failure);
         let execution_logger = logger.clone();
@@ -2455,6 +2780,8 @@ fn prepare_and_run_sync_reporting(
                     // `EntryDeleted` would be a lie and there is no code for a refusal, so this
                     // reaches the operator through the report's own count and the `-v` line below.
                     ExecutionEvent::RemoteExtraDeleteSkipped { .. } => None,
+                    // Named in the result's `deferred` list and on the `-v` line below.
+                    ExecutionEvent::PathDeferred { .. } => None,
                 };
                 if let Some(code) = code
                     && let Some(logger) = &execution_logger
@@ -2478,11 +2805,14 @@ fn prepare_and_run_sync_reporting(
         // needs to know that nothing it uploads will ever compare as unchanged.
         warn_unhonoured_mtime(&settings.output, &client);
         // Recorded before any `?` below, so the counts survive every failure from here on.
-        *completion_out = Some(SyncCompletion {
-            report: completed,
-            changed_during_run: 0,
-            failed: false,
-        });
+        let mut completion = SyncCompletion::deferred_only(deferred, lasting_skips(plan));
+        completion.incomplete_listings = listing_names(&incomplete_directories);
+        completion.add_deferred(std::mem::take(&mut completed.deferred));
+        completion.mtime_not_kept = completed
+            .mtime_not_kept
+            .saturating_add(client.remote_mtime_unhonoured_count());
+        completion.report = completed;
+        *completion_out = Some(completion);
         let execution_log_result = take_recorded_failure(&execution_log_failure)?;
         if let Some(error) = execution_log_result {
             return Err(Error::Message(format!(
@@ -2499,61 +2829,351 @@ fn prepare_and_run_sync_reporting(
         execution?;
         cancellation.check()?;
         cancellation.phase("reconcile");
-        let reconciliation =
-            build_reconciliation_plan(&client, settings, &root, &rules, server_copy, cancellation)?;
-        let verdict = ensure_reconciled(&plan.source_root, &reconciliation, started_at)?;
-        if let Some(completion) = completion_out.as_mut() {
-            completion.changed_during_run = verdict.changed_during_run;
-        }
+        let (reconciliation, reconciliation_deferred) = build_reconciliation_plan(
+            &client,
+            settings,
+            &root,
+            &rules,
+            &run_options,
+            cancellation,
+        )?;
+        let completion = completion_out
+            .as_mut()
+            .expect("the completion was recorded before reconciliation");
+        // A file that could not be re-read for reconciliation is not proven converged. It is named
+        // like any other deferral rather than failing a run whose work was verified piece by piece.
+        completion.add_deferred(reconciliation_deferred);
+        let verdict = sync::ensure_reconciled(
+            &plan.source_root,
+            plan,
+            &reconciliation,
+            started_at,
+            &sync::DeferralIndex::from_records(&completion.deferred),
+        )?;
+        completion.changed_during_run = verdict.changed_during_run;
         cancellation.check()?;
         Ok(())
     })();
 
+    // Whatever the verdict, the result says what the client recovered from along the way.
+    if let Some(completion) = completion_out.as_mut() {
+        completion.transport = client.transport_counters();
+    }
     finish_authenticated_operation(&mut client, operation)
 }
 
-/// Fetch exactly the content digests the active compare mode needs, and no more.
+/// One `entry.deferred` per path the run left for the next run, and one `entry.skipped` per path
+/// the plan declined to carry, each with its path and reason.
 ///
-/// Content mode needs local digests plus the remote digests that comparison, optional server-copy
-/// reuse, and deletion guards require. Force mode compares nothing, so it needs no local hashing
-/// and no comparison digests -- but a forced *mirror* still needs the same deletion guards content
-/// mode would use. A guard must not weaken because a flag about uploading was passed.
-fn populate_content_for_plan(
-    client: &ApiClient,
-    local: &mut local::LocalInventory,
-    remote: &mut api::RemoteInventory,
-    rules: &IgnoreRules,
-    settings: &config::ResolvedSync,
-    server_copy: bool,
-    cancellation: &CancellationToken,
+/// Skips recorded as `deferred` are already named, with their precise reason, among the run's
+/// deferrals, so they are not logged twice.
+fn log_run_entries(
+    logger: Option<&Arc<EventLogger>>,
+    profile: &str,
+    plan: Option<&SyncPlan>,
+    completion: Option<&SyncCompletion>,
 ) -> Result<()> {
-    match effective_compare_mode(settings) {
-        CompareMode::Content => {
-            client.require_content_fingerprint_api()?;
-            let comparison = plan::select_comparison_remote_digests(local, remote, rules);
-            let strong = plan::select_strong_remote_digests(
-                local,
-                remote,
-                rules,
-                server_copy,
-                settings.safety.delete,
-            );
-            // Local strength mirrors remote strength, entry for entry: MD5 where the remote side
-            // will only carry MD5, full strength everywhere else. Uploads promoted out of the
-            // comparison set are raised by `plan::promote_upload_fingerprints` before execution.
-            local::populate_content_md5_selective(local, &comparison, cancellation)?;
-            client.populate_remote_content_digests(remote, &comparison, &strong, cancellation)?;
+    for record in completion.map_or(&[][..], |completion| &completion.deferred) {
+        log_event(
+            logger,
+            LogEvent::new(EventLogLevel::Info, EventCode::EntryDeferred)
+                .reason(defer_event_reason(record.reason))
+                .profile(profile)
+                .path(&record.relative),
+        )?;
+    }
+    // A folder DSM listed short is named once, as the folder, in addition to each deletion inside
+    // it that was withheld.
+    for folder in completion.map_or(&[][..], |completion| &completion.incomplete_listings) {
+        log_event(
+            logger,
+            LogEvent::new(EventLogLevel::Warn, EventCode::EntrySkipped)
+                .reason(EventReason::RemoteResponseInvalid)
+                .profile(profile)
+                .path(folder),
+        )?;
+    }
+    for entry in plan.map_or(&[][..], |plan| &plan.skipped) {
+        if let local::SkipReason::Deferred { .. } = entry.reason {
+            // A run that executed names these, with their precise reason, from its completion.
+            // A `plan` has no completion, so they are logged from here instead.
+            if completion.is_none() {
+                log_event(
+                    logger,
+                    LogEvent::new(EventLogLevel::Info, EventCode::EntryDeferred)
+                        .reason(EventReason::ChangedDuringRun)
+                        .profile(profile)
+                        .path(&entry.relative),
+                )?;
+            }
+            continue;
         }
-        CompareMode::Force if settings.safety.delete => {
-            client.require_content_fingerprint_api()?;
-            // Forced runs compare nothing, so every digest here guards a deletion and must be
-            // strong. Unchanged by the comparison split.
-            let selected = plan::select_deletion_guard_hashes(local, remote, rules);
-            client.populate_remote_content_fingerprints(remote, &selected, cancellation)?;
-        }
-        CompareMode::Force | CompareMode::Metadata | CompareMode::SizeOnly => {}
+        log_event(
+            logger,
+            LogEvent::new(EventLogLevel::Warn, EventCode::EntrySkipped)
+                .reason(skip_event_reason(&entry.reason))
+                .profile(profile)
+                .path(&entry.relative),
+        )?;
     }
     Ok(())
+}
+
+/// The closed event vocabulary's name for a deferral.
+fn defer_event_reason(reason: sync::DeferReason) -> EventReason {
+    match reason {
+        sync::DeferReason::SourceChanged | sync::DeferReason::SourceVanished => {
+            EventReason::ChangedDuringRun
+        }
+        sync::DeferReason::SourceUnreadable => EventReason::LocalIo,
+        sync::DeferReason::UnsupportedLocalEntry | sync::DeferReason::UnrepresentableName => {
+            EventReason::LocalEntryUnsupported
+        }
+        sync::DeferReason::RemoteDigestUnavailable
+        | sync::DeferReason::RemoteUnreadable
+        | sync::DeferReason::DeleteFailed => EventReason::DsmApiError,
+        sync::DeferReason::RemoteChanged => EventReason::RemoteChanged,
+        sync::DeferReason::ListingIncomplete => EventReason::RemoteResponseInvalid,
+        sync::DeferReason::ServerCopyFailed => EventReason::ServerCopyFailed,
+    }
+}
+
+/// The closed event vocabulary's name for a plan skip.
+fn skip_event_reason(reason: &local::SkipReason) -> EventReason {
+    match reason {
+        local::SkipReason::WindowsAttributes
+        | local::SkipReason::LinkOrReparsePoint
+        | local::SkipReason::DehydratedPlaceholder => EventReason::LocalEntryUnsupported,
+        local::SkipReason::Deferred { .. } => EventReason::ChangedDuringRun,
+        _ => EventReason::ProtectedConflict,
+    }
+}
+
+/// The plan options a sync run plans with./// Plan skips other than `deferred` ones, which are counted among the deferrals instead.
+fn lasting_skips(plan: &SyncPlan) -> usize {
+    plan.skipped
+        .iter()
+        .filter(|entry| entry.reason.as_str() != "deferred")
+        .count()
+}
+
+/// Folder names for the result and the log: root-relative, with `.` for the destination root.
+fn listing_names(folders: &[String]) -> Vec<String> {
+    folders
+        .iter()
+        .map(|folder| {
+            if folder.is_empty() {
+                ".".to_owned()
+            } else {
+                folder.clone()
+            }
+        })
+        .collect()
+}
+
+/// One `sdsync.result-record.v1` line.
+fn result_record_line(profile: &str, status: &str, result: Value) -> Value {
+    json!({
+        "schema": "sdsync.result-record.v1",
+        "profile": profile,
+        "status": status,
+        "result": result,
+    })
+}
+
+/// The `result` member of a record: the printed execution result for a run that executed, a
+/// small verdict for a plan, and `null` for a job that never produced either.
+fn result_record_result(
+    plan: Option<&SyncPlan>,
+    completion: Option<&SyncCompletion>,
+    elapsed: Duration,
+    plan_only: bool,
+) -> Value {
+    match (completion, plan) {
+        (Some(completion), _) => execution_value(completion, elapsed),
+        (None, Some(plan)) => {
+            let deferred = plan
+                .skipped
+                .iter()
+                .filter(|entry| matches!(entry.reason, local::SkipReason::Deferred { .. }))
+                .map(|entry| {
+                    let detail = entry.reason.detail();
+                    let reason = sync::DeferReason::ALL
+                        .iter()
+                        .find(|reason| {
+                            matches!(&entry.reason, local::SkipReason::Deferred { detail }
+                                if detail.strip_prefix(reason.as_str()).is_some_and(|rest| rest.starts_with(':')))
+                        })
+                        .map_or("deferred", |reason| reason.as_str());
+                    json!({"path": entry.relative, "reason": reason, "detail": detail})
+                })
+                .collect::<Vec<_>>();
+            json!({
+                "outcome": if run_is_partial(Some(plan), None) { "partial" } else { "complete" },
+                "changed": !plan.is_empty(),
+                "planned_only": plan_only,
+                "deferred": deferred,
+                "skipped": lasting_skips(plan),
+                "elapsed_ms": duration_millis(elapsed),
+            })
+        }
+        (None, None) => Value::Null,
+    }
+}
+
+/// Write the `--result-record` file, if one was asked for: atomically, private, one line per job.
+///
+/// A record that cannot be written is reported on standard error and does not change the run's
+/// verdict: the job's own output and exit code already carry the result.
+fn write_result_record(lines: &[Value], output: &config::ResolvedOutput, profile: Option<&str>) {
+    let Some(path) = RESULT_RECORD.get() else {
+        return;
+    };
+    let Err(error) = write_private_ndjson(path, lines) else {
+        return;
+    };
+    eprintln!(
+        "warning: the result record {} could not be written: {error}",
+        path.display()
+    );
+    // Also in the log, where whoever finds `counts=unavailable` will look. The run's own logger is
+    // already closed, so this opens the configured sinks for one event.
+    let mut event = LogEvent::new(EventLogLevel::Warn, EventCode::ResultRecordFailed)
+        .reason(EventReason::LocalIo)
+        // The file name, not the whole path: log paths are bounded and keep their beginning, which
+        // for an absolute path is the part that does not identify the file. Stderr has it whole.
+        .path(
+            &path
+                .file_name()
+                .map_or_else(|| path.to_string_lossy(), |name| name.to_string_lossy()),
+        );
+    if let Some(profile) = profile {
+        event = event.profile(profile);
+    }
+    let logged = build_logger(output).and_then(|logger| {
+        let emitted = log_event(logger.as_ref(), event);
+        finish_logger(logger.as_ref(), emitted, output.quiet)
+    });
+    if let Err(log_error) = logged {
+        eprintln!("warning: the result record failure could not be logged either: {log_error}");
+    }
+}
+
+fn write_private_ndjson(path: &Path, lines: &[Value]) -> io::Result<()> {
+    let mut body = Vec::new();
+    for line in lines {
+        serde_json::to_writer(&mut body, line).map_err(io::Error::other)?;
+        body.push(b'\n');
+    }
+    let file_name = path
+        .file_name()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "no file name"))?;
+    let mut temporary_name = std::ffi::OsString::from(".");
+    temporary_name.push(file_name);
+    temporary_name.push(format!(".{}.tmp", std::process::id()));
+    let temporary = path.with_file_name(temporary_name);
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let written = options.open(&temporary).and_then(|mut file| {
+        file.write_all(&body)?;
+        file.sync_all()
+    });
+    if let Err(error) = written.and_then(|()| std::fs::rename(&temporary, path)) {
+        let _ = std::fs::remove_file(&temporary);
+        return Err(error);
+    }
+    Ok(())
+}
+
+/// Whether the run left anything the next run is expected to pick up.
+///
+/// A run that executed answers from its completion. A `plan` has none, and answers from the
+/// deferrals its plan names.
+fn run_is_partial(plan: Option<&SyncPlan>, completion: Option<&SyncCompletion>) -> bool {
+    match completion {
+        Some(completion) => completion.is_partial(),
+        None => plan.is_some_and(|plan| plan.skipped.iter().any(sync::skip_is_transient_deferral)),
+    }
+}
+
+/// The plan options a sync run plans with.
+fn run_plan_options(
+    settings: &config::ResolvedSync,
+    server_copy: bool,
+    scope: &plan::Scope,
+) -> PlanOptions {
+    PlanOptions {
+        delete: settings.safety.delete,
+        allow_empty_source: settings.safety.allow_empty_source,
+        max_delete: settings.safety.max_delete,
+        compare: effective_compare_mode(settings),
+        server_copy,
+        scope: scope.clone(),
+    }
+}
+
+/// How this run re-establishes a session DSM expires under it.
+///
+/// A password file is read again each time. Any other source (standard input, the environment,
+/// the vault, an interactive prompt) is held for the run in zeroizing memory instead, because
+/// asking again mid-run is either impossible (standard input is spent) or a prompt nobody is
+/// watching for. That is a deliberate trade: before this an overnight mirror whose session DSM
+/// expired failed after hours of work, and the next run repeated the hours and failed the same
+/// way. The closure never prints, logs or returns the password; a one-time code is generated
+/// again from the TOTP seed file or the vault exactly as the first login did.
+fn reauthenticator(
+    settings: &config::ResolvedSync,
+    password: Zeroizing<String>,
+) -> api::Reauthenticator {
+    let url = settings.connection.url.clone();
+    let username = settings.connection.username.clone();
+    let use_vault = !settings.authentication.no_vault;
+    let allow_http = settings.network.allow_http;
+    let password_file = settings.authentication.password_file.clone();
+    let totp_secret_file = settings.authentication.totp_secret_file.clone();
+    let retained = password_file.is_none().then_some(password);
+    Arc::new(move |client: &mut ApiClient| {
+        let mut vault = credentials::VaultSession::new(use_vault, &url, &username, allow_http);
+        let password = match (&password_file, &retained) {
+            (Some(path), _) => credentials::read_password_with_file(false, Some(path), &mut vault)?,
+            (None, Some(retained)) => retained.clone(),
+            (None, None) => {
+                return Err(Error::Message(
+                    "no credential is available to re-authenticate".to_owned(),
+                ));
+            }
+        };
+        credentials::authenticate_with_sources(
+            client,
+            &username,
+            &password,
+            &mut vault,
+            totp_secret_file.as_deref(),
+        )
+    })
+}
+
+/// Name each path a plan-only run left out, on standard error.
+///
+/// A real run names them in its result. A plan has no result section, and a plan that silently
+/// omits a file which was changing while it was hashed would read as "nothing to do" for it.
+fn warn_deferred(output: &config::ResolvedOutput, deferred: &[DeferredPath]) {
+    if output.quiet {
+        return;
+    }
+    for record in deferred {
+        eprintln!(
+            "warning: {} {} ({})",
+            record.relative,
+            record.reason.describe(),
+            record.reason
+        );
+    }
 }
 
 fn build_reconciliation_plan(
@@ -2561,183 +3181,61 @@ fn build_reconciliation_plan(
     settings: &config::ResolvedSync,
     root: &RemoteRoot,
     rules: &IgnoreRules,
-    server_copy: bool,
+    run_options: &PlanOptions,
     cancellation: &CancellationToken,
-) -> Result<SyncPlan> {
+) -> Result<(SyncPlan, Vec<DeferredPath>)> {
     cancellation.check()?;
     // Reconciliation re-asks the question the run just answered, so it must cover exactly the
     // same scope. A whole-tree reconciliation after a scoped run would report every out-of-scope
     // difference the run deliberately left alone.
-    let scope = resolved_scope(settings)?;
     let compare = reconciliation_compare_mode(settings);
     let mut local = local::scan_scoped(
         &settings.source,
         rules,
-        &scope,
+        &run_options.scope,
         false,
         usize::MAX,
         cancellation,
     )?
     .inventory;
     cancellation.check()?;
-    let mut remote = client
-        .remote_inventory_scoped(root, &scope, rules, usize::MAX, cancellation)?
-        .inventory;
+    let scanned = client.remote_inventory_scoped(
+        root,
+        &run_options.scope,
+        rules,
+        usize::MAX,
+        cancellation,
+    )?;
+    let mut remote = scanned.inventory;
     cancellation.check()?;
-    if compare == CompareMode::Content {
-        client.require_content_fingerprint_api()?;
-        let comparison = plan::select_comparison_remote_digests(&local, &remote, rules);
-        let strong = plan::select_strong_remote_digests(
-            &local,
-            &remote,
-            rules,
-            server_copy,
-            settings.safety.delete,
-        );
-        local::populate_content_md5_selective(&mut local, &comparison, cancellation)?;
-        client.populate_remote_content_digests(&mut remote, &comparison, &strong, cancellation)?;
-    }
-    // Deliberately no promotion here. A reconciliation plan is only ever inspected for emptiness
-    // by `ensure_reconciled` and is never executed, so nothing consumes an upload's digest and
-    // raising it would read every changed file again to answer a question nobody asks.
-    let plan = plan::build_plan(
+    // The run's own digest pass and per-path deferral. Deliberately no promotion: a
+    // reconciliation plan is only ever inspected by `ensure_reconciled` and is never executed, so
+    // nothing consumes an upload's digest and raising it would read every changed file again to
+    // answer a question nobody asks.
+    let mut deferred = sync::populate_plan_digests(
+        client,
+        &mut local,
+        &mut remote,
+        rules,
+        compare,
+        run_options.server_copy,
+        run_options.delete,
+        cancellation,
+    )?;
+    let mut plan = plan::build_plan(
         root,
         &local,
         &remote,
         rules,
-        &reconciliation_options(settings, compare, server_copy, &scope),
+        &sync::reconciliation_options(run_options, compare),
     )?;
+    deferred.extend(sync::withhold_deletions_in_incomplete_listings(
+        &mut plan,
+        &scanned.incomplete_directories,
+    ));
     cancellation.check()?;
-    Ok(plan)
+    Ok((plan, deferred))
 }
-
-/// Plan options for the reconciliation pass, which observes and never acts.
-///
-/// The safety fuses are deliberately disarmed here, and only here. They exist to refuse a
-/// *mutation*: `max_delete` caps how much one run may delete and `allow_empty_source` stops a
-/// transiently empty source from mirroring a destination away. This plan is built after execution
-/// and is only ever asked whether it is empty, so neither fuse can protect anything — but both can
-/// still raise. When they did, remote-only entries a third party added *during* the run made
-/// `build_plan` return `DeleteLimit`, and the operator saw a delete-limit refusal for a run that had
-/// already completed, with `ensure_reconciled` never reporting the real state. Refusing to answer a
-/// question about convergence is not a safety property.
-///
-/// Everything that decides *what* the plan compares — the compare mode, server-copy availability,
-/// the scope, and whether deletions are part of the comparison at all — is passed through
-/// unchanged, because reconciliation has to ask the same question the run just answered.
-fn reconciliation_options(
-    settings: &config::ResolvedSync,
-    compare: CompareMode,
-    server_copy: bool,
-    scope: &plan::Scope,
-) -> PlanOptions {
-    PlanOptions {
-        delete: settings.safety.delete,
-        allow_empty_source: true,
-        max_delete: usize::MAX,
-        compare,
-        server_copy,
-        scope: scope.clone(),
-    }
-}
-
-/// What a post-execution reconciliation pass established.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct Reconciliation {
-    /// Entries the rebuilt plan holds that are local files modified after the run began.
-    ///
-    /// Converged as of the instant the run started, which is the only instant a run can be asked
-    /// about. Zero on the ordinary path.
-    changed_during_run: usize,
-}
-
-/// Decide whether the destination converged, distinguishing "the run did not do what it planned"
-/// from "the tree changed while the run was working".
-///
-/// Requiring the rebuilt plan to be **empty** made this the most reachable failure in the engine.
-/// The rebuild is a second full local scan taken minutes to hours after the first, so any file
-/// written locally in between appears in it: a build dropping a `.pdb`, an application appending to
-/// a log, a browser finishing a download. Every planned operation had succeeded and been verified
-/// individually, and the run still exited non-zero with `ReconciliationPending` — reporting a failed
-/// backup for a backup that worked, and (before the report survived a failure) printing no account
-/// of the nine hundred files it had uploaded.
-///
-/// The question a run can answer is "is the destination what the source was when I started". So an
-/// entry is *converged as of `started_at`* when it is an upload of a local file whose modification
-/// time is after `started_at`: this run was never going to carry those bytes, because they did not
-/// exist when it read the tree. Those are counted and reported under their own name, and the run
-/// succeeds.
-///
-/// Everything else is still a failure, and deliberately:
-///
-/// - a **delete** or a **copy** cannot be dated from the local side at all. A remote-only entry in
-///   the rebuilt plan means either that a delete this run performed did not take, or that a third
-///   party added something remotely — and the first of those is exactly what reconciliation exists
-///   to catch.
-/// - an **upload** of a file *older* than `started_at` means the run planned to carry those bytes,
-///   reported that it had, and the destination still disagrees.
-/// - a **create** is dated by stat'ing the directory, because the inventory records no modification
-///   time for directories. A directory the run should have created and did not is a real failure; a
-///   directory that appeared during the run is not.
-fn ensure_reconciled(
-    source_root: &Path,
-    plan: &SyncPlan,
-    started_at: std::time::SystemTime,
-) -> Result<Reconciliation> {
-    if plan.is_empty() {
-        return Ok(Reconciliation {
-            changed_during_run: 0,
-        });
-    }
-    if !plan.pre_deletes.is_empty() || !plan.post_deletes.is_empty() || !plan.copies.is_empty() {
-        return Err(reconciliation_pending(plan));
-    }
-    let mut changed_during_run = 0;
-    for action in &plan.uploads {
-        if !modified_after(action.local.mtime_ms, started_at) {
-            return Err(reconciliation_pending(plan));
-        }
-        changed_during_run += 1;
-    }
-    for action in &plan.creates {
-        // The root itself is never dateable this way, and a missing destination root is a failure
-        // regardless of when anything was touched.
-        if action.relative.is_empty() {
-            return Err(reconciliation_pending(plan));
-        }
-        let metadata = std::fs::symlink_metadata(source_root.join(&action.relative))
-            .map_err(|_| reconciliation_pending(plan))?;
-        let modified = metadata
-            .modified()
-            .map_err(|_| reconciliation_pending(plan))?;
-        if modified <= started_at {
-            return Err(reconciliation_pending(plan));
-        }
-        changed_during_run += 1;
-    }
-    Ok(Reconciliation { changed_during_run })
-}
-
-fn reconciliation_pending(plan: &SyncPlan) -> Error {
-    Error::ReconciliationPending {
-        operations: usize::try_from(operation_count(plan)).unwrap_or(usize::MAX),
-    }
-}
-
-/// Whether a recorded millisecond modification time is strictly after `started_at`.
-///
-/// Compared in milliseconds against the same epoch the scan records, so the comparison cannot
-/// disagree with the value the inventory holds. A time the clock cannot express relative to the
-/// epoch is treated as *not* after the start, which fails the run: the safe direction for a
-/// judgement about whether work was left undone.
-fn modified_after(mtime_ms: i64, started_at: std::time::SystemTime) -> bool {
-    started_at
-        .duration_since(std::time::UNIX_EPOCH)
-        .ok()
-        .and_then(|elapsed| i64::try_from(elapsed.as_millis()).ok())
-        .is_some_and(|started_ms| mtime_ms > started_ms)
-}
-
 fn run_doctor(settings: config::ResolvedDoctor, record: Option<&Path>) -> Result<ExitCode> {
     let cancellation = attach_progress_record(
         install_cancellation_handler()?,
@@ -2789,9 +3287,15 @@ fn run_doctor_job(
                 ..EventMetrics::default()
             }),
         ),
-        Ok(_) | Err(_) => log_event(
+        Ok(_) => log_event(
             logger.as_ref(),
-            LogEvent::new(EventLogLevel::Error, EventCode::RunFailed),
+            LogEvent::new(EventLogLevel::Error, EventCode::RunFailed)
+                .reason(EventReason::Unclassified),
+        ),
+        Err(error) => log_event(
+            logger.as_ref(),
+            LogEvent::new(EventLogLevel::Error, EventCode::RunFailed)
+                .reason(EventReason::of(error)),
         ),
     };
     if let Err(error) = final_log {
@@ -5979,9 +6483,18 @@ struct ProgressWiring {
     last_render: Arc<Mutex<Instant>>,
     logger: Option<Arc<EventLogger>>,
     cancellation: CancellationToken,
+    /// The profile every event from this run is attributed to, when it has one.
+    profile: Option<Arc<str>>,
 }
 
 impl ProgressWiring {
+    /// Attribute this run's transfer events to `profile`. Every profile writes to one log, so a
+    /// record without it could not be traced to the run that wrote it.
+    fn with_profile(mut self, profile: &str) -> Self {
+        self.profile = Some(Arc::from(profile));
+        self
+    }
+
     fn new(
         plan: &SyncPlan,
         output: &config::ResolvedOutput,
@@ -6020,6 +6533,7 @@ impl ProgressWiring {
             )),
             logger,
             cancellation,
+            profile: None,
         }
     }
 
@@ -6034,16 +6548,22 @@ impl ProgressWiring {
             ExecutionEvent::TypeConflictDeleted { .. }
             | ExecutionEvent::RemoteExtraDeleted { .. } => (OperationKind::DeleteEntry, 0),
             ExecutionEvent::DirectoryCreated { .. } => (OperationKind::CreateDirectory, 0),
-            ExecutionEvent::RemoteContentCopied { bytes, .. }
-            | ExecutionEvent::CopyFallbackUploaded { bytes, .. } => (OperationKind::Upload, *bytes),
+            ExecutionEvent::RemoteContentCopied { bytes, .. } => (OperationKind::Upload, *bytes),
             // `observer_factory` already opened and closed a tracker operation for these
             // transfers, so counting them here would double them. The kept-delete upload is not in
             // the plan's totals at all — the tracker clamps every counter to the declared total, so
             // it reads as work that made no further progress rather than as an overrun.
-            ExecutionEvent::Uploaded { .. } | ExecutionEvent::KeptDeleteUploaded { .. } => return,
+            //
+            // The copy fallback is one of these too: it is transferred under an observer from the
+            // same factory, so it was counted as it streamed, and crediting it here as well
+            // doubled its bytes and reached 100% early.
+            ExecutionEvent::Uploaded { .. }
+            | ExecutionEvent::KeptDeleteUploaded { .. }
+            | ExecutionEvent::CopyFallbackUploaded { .. } => return,
             // No operation was performed, so crediting one would overstate the run's progress
-            // against a plan that counted this entry as a deletion.
-            ExecutionEvent::RemoteExtraDeleteSkipped { .. } => return,
+            // against a plan that counted this entry as a deletion or a transfer.
+            ExecutionEvent::RemoteExtraDeleteSkipped { .. }
+            | ExecutionEvent::PathDeferred { .. } => return,
         };
         // The event arrives only after the mutation succeeded, so the operation opens and
         // closes together; `finish_success` credits the whole declared byte count.
@@ -6077,8 +6597,11 @@ impl ProgressWiring {
         let last_render = Arc::clone(&self.last_render);
         let logger = self.logger.clone();
         let cancellation = self.cancellation.clone();
+        let profile = self.profile.clone();
         Arc::new(move |entry: &LocalEntry| {
             let operation = tracker.start(OperationKind::Upload, entry.size);
+            let relative = entry.relative.clone();
+            let profile = profile.clone();
             if let Some(logger) = &logger
                 && let Err(error) = logger.emit(
                     LogEvent::new(EventLogLevel::Debug, EventCode::UploadStarted)
@@ -6094,6 +6617,7 @@ impl ProgressWiring {
             let logger = logger.clone();
             let cancellation = cancellation.clone();
             let observer: UploadObserver = Arc::new(move |event| {
+                let event_kind = event;
                 let (update, force_render, log_code, attempt) = match event {
                     UploadTransferEvent::AttemptStarted { attempt } => (
                         operation.begin_attempt(),
@@ -6139,6 +6663,18 @@ impl ProgressWiring {
                     let mut event = LogEvent::new(EventLogLevel::Debug, code)
                         .operation(update.operation_id)
                         .metrics(progress_metrics(&snapshot));
+                    // A failed transfer names its file. Whether the run then defers it or stops is
+                    // logged separately, as `entry.deferred` or `run.failed` with its reason.
+                    if matches!(event_kind, UploadTransferEvent::Failed) {
+                        event = LogEvent::new(EventLogLevel::Warn, code)
+                            .operation(update.operation_id)
+                            .metrics(progress_metrics(&snapshot))
+                            .reason(EventReason::UploadFailed)
+                            .path(&relative);
+                        if let Some(profile) = &profile {
+                            event = event.profile(profile);
+                        }
+                    }
                     if let Some(attempt) = attempt {
                         event = event.attempt(attempt);
                     }
@@ -6994,6 +7530,73 @@ fn write_completion_human_to<W: Write>(
         )
         .map_err(output_error)?;
     }
+    write_deferred_human_to(writer, completion)
+}
+
+/// The paths a run left for the next run, each by name, and the mtime warning.
+fn write_deferred_human_to<W: Write>(writer: &mut W, completion: &SyncCompletion) -> Result<()> {
+    if completion.skipped > 0 {
+        writeln!(
+            writer,
+            "Warning: {} path(s) were skipped and are not on the NAS; see SKIPPED above.",
+            completion.skipped,
+        )
+        .map_err(output_error)?;
+    }
+    if !completion.deferred.is_empty() {
+        writeln!(
+            writer,
+            "{}: {} path(s) were not carried by this run; everything else converged.",
+            if completion.is_partial() {
+                "Partial"
+            } else {
+                "Warning"
+            },
+            completion.deferred.len(),
+        )
+        .map_err(output_error)?;
+        for record in &completion.deferred {
+            writeln!(
+                writer,
+                "  {}: {} ({})",
+                record.relative,
+                record.reason.describe(),
+                record.reason
+            )
+            .map_err(output_error)?;
+        }
+    }
+    if completion.mtime_not_kept > 0 {
+        writeln!(
+            writer,
+            "Warning: the NAS did not keep the modification time of {} file(s) this run wrote; their content was verified.",
+            completion.mtime_not_kept,
+        )
+        .map_err(output_error)?;
+    }
+    if !completion.incomplete_listings.is_empty() {
+        writeln!(
+            writer,
+            "Warning: {} NAS folder(s) listed fewer or more entries than they counted; no deletion was made in them: {}.",
+            completion.incomplete_listings.len(),
+            completion.incomplete_listings.join(", "),
+        )
+        .map_err(output_error)?;
+    }
+    let transport = completion.transport;
+    if transport != api::TransportCounters::default() || completion.report.copy_fallbacks > 0 {
+        writeln!(
+            writer,
+            "Recovered: {} retried request(s), {} re-login(s) ({} failed), {} failed keepalive(s), {} server task(s) not confirmed stopped, {} server copy fallback upload(s).",
+            transport.retries,
+            transport.reauthentications,
+            transport.reauthentication_failures,
+            transport.keepalive_failures,
+            transport.server_tasks_not_stopped,
+            completion.report.copy_fallbacks,
+        )
+        .map_err(output_error)?;
+    }
     Ok(())
 }
 
@@ -7092,6 +7695,18 @@ fn write_plan_human_to<W: Write>(
     )
     .map_err(output_error)?;
     write_plan_scope_notice(writer, plan, scope)?;
+    // Always shown, not only in detail: a skipped path is one this run will not carry, and the
+    // operator has to be told which and why even when the actions are summarised.
+    for entry in &plan.skipped {
+        writeln!(
+            writer,
+            "  SKIPPED {}: {} ({})",
+            entry.relative,
+            entry.reason.detail(),
+            entry.reason.as_str()
+        )
+        .map_err(output_error)?;
+    }
     if !detailed {
         return Ok(());
     }
@@ -7268,7 +7883,13 @@ fn plan_value(plan: &SyncPlan) -> Value {
                     "content_md5": guard.content_md5.to_string(),
                 })),
             })).collect::<Vec<_>>(),
-        }
+        },
+        // Paths this plan neither carries nor deletes, and why: each one used to fail the run.
+        "skipped": plan.skipped.iter().map(|entry| json!({
+            "path": entry.relative,
+            "reason": entry.reason.as_str(),
+            "detail": entry.reason.detail(),
+        })).collect::<Vec<_>>(),
     })
 }
 
@@ -7395,6 +8016,9 @@ fn status_cache_value(cache: &status_cache::CacheReport) -> Value {
         "entries_verified_live": cache.digests_computed,
         "entries_canary_checked": cache.canary_checked,
         "oldest_evidence_epoch": cache.oldest_evidence_epoch,
+        // Every condition the cache met instead of working normally: why it was refused, why stored
+        // evidence was not used, or what could not be written. Always present, empty when none.
+        "issues": cache.issues,
     })
 }
 
@@ -7630,12 +8254,20 @@ fn write_status_human_to<W: Write>(
         )
         .map_err(output_error)?;
     }
-    if cache.state == status_cache::CacheState::Unusable {
+    if cache.state == status_cache::CacheState::Unusable
+        && cache
+            .issues
+            .iter()
+            .any(|issue| issue.code == status_cache::CacheIssue::CANARY_MISMATCH)
+    {
         writeln!(
             writer,
             "Stored digests disagreed with live evidence, so the cache was discarded and this answer was recomputed in full."
         )
         .map_err(output_error)?;
+    }
+    for issue in &cache.issues {
+        writeln!(writer, "Status cache {}: {issue}", issue.severity).map_err(output_error)?;
     }
     Ok(())
 }
@@ -7701,6 +8333,41 @@ fn execution_value(completion: &SyncCompletion, elapsed: Duration) -> Value {
         // precisely because they were previously destroyed by the failure: a run that uploaded nine
         // hundred files and then could not reconcile reported nothing at all about the nine hundred.
         "failed": completion.failed,
+        // The run's verdict in one word, so a reader does not have to derive it from three fields.
+        "outcome": if completion.failed {
+            "failed"
+        } else if completion.is_partial() {
+            "partial"
+        } else {
+            "complete"
+        },
+        // Each path left for the next run, by name and reason. Non-empty makes the run partial.
+        "deferred": completion
+            .deferred
+            .iter()
+            .map(|record| json!({
+                "path": record.relative,
+                "reason": record.reason.as_str(),
+                "detail": record.detail,
+            }))
+            .collect::<Vec<_>>(),
+        // Destinations whose modification time DSM did not keep within tolerance. Verified by
+        // content; a warning that metadata comparison will see them as changed.
+        "mtime_not_kept": completion.mtime_not_kept,
+        // Paths the plan declined to carry for a lasting reason, named in `plan.skipped`.
+        "skipped": completion.skipped,
+        // Folders DSM listed short; deletions inside them were withheld and named in `deferred`.
+        "incomplete_listings": completion.incomplete_listings.len(),
+        "incomplete_listing_folders": completion.incomplete_listings,
+        // Everything recovered from on the run's behalf, so none of it is silent.
+        "recovered": {
+            "retries": completion.transport.retries,
+            "reauthentications": completion.transport.reauthentications,
+            "reauthentication_failures": completion.transport.reauthentication_failures,
+            "keepalive_failures": completion.transport.keepalive_failures,
+            "server_tasks_not_stopped": completion.transport.server_tasks_not_stopped,
+            "server_copy_fallbacks": completion.report.copy_fallbacks,
+        },
         "elapsed_ms": duration_millis(elapsed),
     })
 }
@@ -9048,6 +9715,7 @@ mod tests {
             unchanged_files: 2,
             protected_entries: 1,
             upload_bytes: 0,
+            skipped: Vec::new(),
         }
     }
 
@@ -9263,6 +9931,7 @@ mod tests {
                 local: uploaded,
                 remote_path: "/share/root/uploaded.bin".to_owned(),
                 reason: plan::ChangeReason::ContentDiffers,
+                expected_remote: None,
             }],
             post_deletes: vec![plan::DeleteAction {
                 relative: "old/guarded.bin".to_owned(),
@@ -9281,6 +9950,7 @@ mod tests {
             unchanged_files: 3,
             protected_entries: 2,
             upload_bytes: 11,
+            skipped: Vec::new(),
         }
     }
 
@@ -9615,6 +10285,7 @@ mod tests {
                 inventory: local::LocalInventory {
                     root,
                     entries: BTreeMap::new(),
+                    skipped: Vec::new(),
                 },
             },
             hash_content: true,
@@ -10067,13 +10738,20 @@ mod tests {
             BTreeSet::from([
                 "changed",
                 "changed_during_run",
+                "deferred",
                 "deleted",
                 "deletes_skipped",
                 "directories_created",
                 "elapsed_ms",
                 "failed",
+                "incomplete_listing_folders",
+                "incomplete_listings",
                 "kept_deletes_uploaded",
+                "mtime_not_kept",
+                "outcome",
+                "recovered",
                 "server_copied",
+                "skipped",
                 "upload_bytes",
                 "uploaded",
             ])
@@ -10588,8 +11266,8 @@ mod tests {
         ));
         let now = std::time::SystemTime::now();
         assert_eq!(
-            ensure_reconciled(&absent, &empty_plan(), now).unwrap(),
-            Reconciliation {
+            reconcile(&absent, &empty_plan(), &empty_plan(), now).unwrap(),
+            sync::Reconciliation {
                 changed_during_run: 0
             }
         );
@@ -10602,9 +11280,25 @@ mod tests {
         // The directory does not exist locally, so nothing dates it to after the run began and the
         // only honest answer is that convergence was not established.
         assert!(matches!(
-            ensure_reconciled(&absent, &pending, now),
+            reconcile(&absent, &empty_plan(), &pending, now),
             Err(Error::ReconciliationPending { operations: 1 })
         ));
+    }
+
+    /// The shared verdict with nothing deferred, as most of these tests want it.
+    fn reconcile(
+        source_root: &Path,
+        executed: &SyncPlan,
+        rebuilt: &SyncPlan,
+        started_at: std::time::SystemTime,
+    ) -> Result<sync::Reconciliation> {
+        sync::ensure_reconciled(
+            source_root,
+            executed,
+            rebuilt,
+            started_at,
+            &sync::DeferralIndex::default(),
+        )
     }
 
     /// A file written locally *during* the run is convergence as of the instant the run began, and
@@ -10632,14 +11326,15 @@ mod tests {
             ),
             remote_path: "/share/root/late.log".to_owned(),
             reason: plan::ChangeReason::MissingRemote,
+            expected_remote: None,
         });
 
-        let verdict = ensure_reconciled(Path::new("."), &plan, started_at)
+        let verdict = reconcile(Path::new("."), &empty_plan(), &plan, started_at)
             .expect("a file written during the run must not fail the run");
 
         assert_eq!(
             verdict,
-            Reconciliation {
+            sync::Reconciliation {
                 changed_during_run: 1
             }
         );
@@ -10655,18 +11350,19 @@ mod tests {
             local: local_entry_modified_at("early.bin", 1_700_000_000_000),
             remote_path: "/share/root/early.bin".to_owned(),
             reason: plan::ChangeReason::MissingRemote,
+            expected_remote: None,
         });
 
         assert!(matches!(
-            ensure_reconciled(Path::new("."), &plan, started_at),
+            reconcile(Path::new("."), &empty_plan(), &plan, started_at),
             Err(Error::ReconciliationPending { operations: 1 })
         ));
     }
 
-    /// A remote-only entry cannot be dated from the local side at all, so a delete left in the
-    /// rebuilt plan stays a failure however recently anything was touched.
+    /// A deletion this run scheduled, still pending afterwards, means the delete did not take.
+    /// That stays a failure however recently anything was touched.
     #[test]
-    fn a_remaining_deletion_is_never_excused_as_a_change_during_the_run() {
+    fn a_remaining_deletion_the_run_scheduled_is_never_excused() {
         let mut plan = empty_plan();
         plan.post_deletes.push(plan::DeleteAction {
             relative: "extra".to_owned(),
@@ -10684,11 +11380,83 @@ mod tests {
         });
 
         assert!(matches!(
-            ensure_reconciled(
+            reconcile(
                 Path::new("."),
+                &plan,
                 &plan,
                 std::time::SystemTime::now() - Duration::from_secs(600)
             ),
+            Err(Error::ReconciliationPending { operations: 1 })
+        ));
+    }
+
+    /// N-4: a file the run uploaded and the user then deleted locally is remote-only afterwards.
+    /// The run's own plan proves it existed when the tree was read, so it is a change made while
+    /// the run worked, not a failure.
+    #[test]
+    fn a_file_deleted_locally_after_its_upload_is_a_change_during_the_run() {
+        let started_at = std::time::SystemTime::now();
+        let mut executed = empty_plan();
+        executed.uploads.push(plan::UploadAction {
+            local: local_entry_modified_at("build/output.tmp", 1_700_000_000_000),
+            remote_path: "/share/root/build/output.tmp".to_owned(),
+            reason: plan::ChangeReason::MissingRemote,
+            expected_remote: None,
+        });
+        let mut rebuilt = empty_plan();
+        rebuilt.post_deletes.push(plan::DeleteAction {
+            relative: "build/output.tmp".to_owned(),
+            remote_path: "/share/root/build/output.tmp".to_owned(),
+            kind: local::EntryKind::File,
+            type_conflict: false,
+            snapshot: plan::RemoteSnapshot {
+                kind: local::EntryKind::File,
+                size: 1,
+                mtime_seconds: 1_700_000_000,
+                content_md5: None,
+                require_mtime: true,
+            },
+            destination_guard: None,
+        });
+
+        assert_eq!(
+            reconcile(Path::new("."), &executed, &rebuilt, started_at).unwrap(),
+            sync::Reconciliation {
+                changed_during_run: 1
+            }
+        );
+    }
+
+    /// A path the run deferred by name is already reported, so finding it unconverged afterwards
+    /// is not a second failure.
+    #[test]
+    fn a_deferred_path_is_excused_by_reconciliation() {
+        let started_at = std::time::SystemTime::now();
+        let mut rebuilt = empty_plan();
+        rebuilt.uploads.push(plan::UploadAction {
+            local: local_entry_modified_at("mail/outlook.pst", 1_700_000_000_000),
+            remote_path: "/share/root/mail/outlook.pst".to_owned(),
+            reason: plan::ChangeReason::SizeDiffers,
+            expected_remote: None,
+        });
+        let mut deferred = sync::DeferralIndex::default();
+        deferred.insert("mail/outlook.pst", sync::DeferReason::SourceChanged);
+
+        assert_eq!(
+            sync::ensure_reconciled(
+                Path::new("."),
+                &empty_plan(),
+                &rebuilt,
+                started_at,
+                &deferred
+            )
+            .unwrap(),
+            sync::Reconciliation {
+                changed_during_run: 0
+            }
+        );
+        assert!(matches!(
+            reconcile(Path::new("."), &empty_plan(), &rebuilt, started_at),
             Err(Error::ReconciliationPending { operations: 1 })
         ));
     }
@@ -10741,7 +11509,12 @@ mod tests {
         );
 
         assert!(matches!(
-            ensure_reconciled(Path::new("."), &plan, std::time::SystemTime::now()),
+            reconcile(
+                Path::new("."),
+                &empty_plan(),
+                &plan,
+                std::time::SystemTime::now()
+            ),
             Err(Error::ReconciliationPending { operations: 5 })
         ));
         assert_eq!(
@@ -10889,9 +11662,17 @@ mod tests {
                 uploaded_bytes: 5,
                 deletes_skipped: 0,
                 kept_deletes_uploaded: 0,
+                deferred: Vec::new(),
+                mtime_not_kept: 0,
+                copy_fallbacks: 0,
             },
             changed_during_run: 0,
             failed: false,
+            deferred: Vec::new(),
+            mtime_not_kept: 0,
+            skipped: 0,
+            transport: api::TransportCounters::default(),
+            incomplete_listings: Vec::new(),
         });
         outcome.elapsed = Some(Duration::from_millis(17));
         outcome.error = Some("retained diagnostic".to_owned());
@@ -11138,15 +11919,23 @@ mod tests {
         assert_eq!(after_upload.completed_files, 1);
         assert_eq!(after_upload.logical_bytes, 7);
 
-        // The copy fallback has no observer, so its event carries the bytes instead.
+        // N3: the copy fallback streams under an observer from the same factory, so its event
+        // must not count it a second time either. Before, it did, and progress reached 100% early.
         wiring.record_execution_event(&ExecutionEvent::CopyFallbackUploaded {
             relative: "copied.bin".to_owned(),
             bytes: 11,
         });
         let after_fallback = wiring.tracker.snapshot();
-        assert_eq!(after_fallback.completed_operations, 5);
-        assert_eq!(after_fallback.completed_files, 2);
-        assert_eq!(after_fallback.logical_bytes, 18);
+        assert_eq!(after_fallback.completed_operations, 4);
+        assert_eq!(after_fallback.completed_files, 1);
+        assert_eq!(after_fallback.logical_bytes, 7);
+
+        // A deferral is no operation at all.
+        wiring.record_execution_event(&ExecutionEvent::PathDeferred {
+            relative: "busy.pst".to_owned(),
+            reason: sync::DeferReason::SourceChanged,
+        });
+        assert_eq!(wiring.tracker.snapshot().completed_operations, 4);
         wiring.finish().unwrap();
     }
 
@@ -11400,9 +12189,17 @@ mod tests {
                 uploaded_bytes: 5,
                 deletes_skipped: 0,
                 kept_deletes_uploaded: 0,
+                deferred: Vec::new(),
+                mtime_not_kept: 0,
+                copy_fallbacks: 0,
             },
             changed_during_run: 0,
             failed: false,
+            deferred: Vec::new(),
+            mtime_not_kept: 0,
+            skipped: 0,
+            transport: api::TransportCounters::default(),
+            incomplete_listings: Vec::new(),
         };
         let mut human_output = resolved_output(cli::OutputFormat::Human);
         human_output.verbosity = 1;
@@ -11424,10 +12221,15 @@ mod tests {
                 report: ExecutionReport {
                     deletes_skipped: 2,
                     kept_deletes_uploaded: 1,
-                    ..completion.report
+                    ..completion.report.clone()
                 },
                 changed_during_run: 3,
                 failed: true,
+                deferred: Vec::new(),
+                mtime_not_kept: 0,
+                skipped: 0,
+                transport: api::TransportCounters::default(),
+                incomplete_listings: Vec::new(),
             }),
             Duration::from_millis(17),
             &human_output,
@@ -11536,9 +12338,17 @@ mod tests {
                 uploaded_bytes: 5,
                 deletes_skipped: 0,
                 kept_deletes_uploaded: 0,
+                deferred: Vec::new(),
+                mtime_not_kept: 0,
+                copy_fallbacks: 0,
             },
             changed_during_run: 0,
             failed: false,
+            deferred: Vec::new(),
+            mtime_not_kept: 0,
+            skipped: 0,
+            transport: api::TransportCounters::default(),
+            incomplete_listings: Vec::new(),
         });
         completed.elapsed = Some(Duration::from_millis(19));
         completed.error = Some("retained warning".to_owned());
@@ -11861,6 +12671,94 @@ mod tests {
         assert!(source_batch_completion(&success, false).is_ok());
     }
 
+    /// `doctor source` names every entry a sync would skip, with its tag, in both renderings, so a
+    /// user can diagnose a tree before syncing it.
+    #[test]
+    fn source_doctor_lists_skipped_entries() {
+        let mut inventory = local::LocalInventory {
+            root: PathBuf::from("/srv/source"),
+            entries: BTreeMap::new(),
+            skipped: Vec::new(),
+        };
+        inventory.skipped.push(local::SkippedEntry {
+            relative: "WindowsApps/python.exe".to_owned(),
+            reason: local::SkipReason::LinkOrReparsePoint,
+        });
+        inventory.skipped.push(local::SkippedEntry {
+            relative: "mail/outlook.pst".to_owned(),
+            reason: local::SkipReason::Deferred {
+                detail: "source-unreadable: locked".to_owned(),
+            },
+        });
+        let result = TimedSourceDiagnostic {
+            report: SourceDiagnosticReport {
+                canonical_root: PathBuf::from("/srv/source"),
+                entries: 0,
+                files: 0,
+                directories: 0,
+                bytes: 0,
+                hashed_files: 0,
+                inventory,
+            },
+            hash_content: true,
+            elapsed: Duration::ZERO,
+        };
+
+        let value = source_diagnostic_value(&result);
+        assert_eq!(value["skipped"][0]["path"], "WindowsApps/python.exe");
+        assert_eq!(value["skipped"][0]["reason"], "link-or-reparse-point");
+        assert_eq!(value["skipped"][1]["reason"], "deferred");
+        let RenderedOutput::Human(text) = source_doctor_output(&result, cli::OutputFormat::Human)
+        else {
+            panic!("human output requested");
+        };
+        assert!(text.starts_with("Source is readable, with entries a sync will skip"));
+        assert!(text.contains("  SKIPPED WindowsApps/python.exe:"));
+        assert!(text.contains("  SKIPPED mail/outlook.pst: left for the next run: source-unreadable: locked (deferred)"));
+    }
+
+    /// Exit 3 is for paths the next run picks up. Lasting skips and lasting deferrals are reported
+    /// and logged, but a run made of them alone exits 0: otherwise it would be partial forever.
+    #[test]
+    fn only_transient_deferrals_make_a_run_partial() {
+        let deferred = |reason| DeferredPath {
+            relative: "a".to_owned(),
+            reason,
+            detail: String::new(),
+        };
+        let exit = |completion: SyncCompletion| {
+            partial_completion(None, Some(&completion), Ok(ExitCode::SUCCESS)).unwrap()
+        };
+        let partial = ExitCode::from(PARTIAL_EXIT_CODE);
+
+        assert_eq!(
+            exit(SyncCompletion::deferred_only(Vec::new(), 4)),
+            ExitCode::SUCCESS
+        );
+        assert_eq!(
+            exit(SyncCompletion::deferred_only(
+                vec![deferred(sync::DeferReason::UnrepresentableName)],
+                0
+            )),
+            ExitCode::SUCCESS
+        );
+        assert_eq!(
+            exit(SyncCompletion::deferred_only(
+                vec![
+                    deferred(sync::DeferReason::UnsupportedLocalEntry),
+                    deferred(sync::DeferReason::SourceChanged),
+                ],
+                2
+            )),
+            partial
+        );
+
+        let lasting = SyncCompletion::deferred_only(Vec::new(), 4);
+        let value = execution_value(&lasting, Duration::ZERO);
+        assert_eq!(value["outcome"], "complete");
+        assert_eq!(value["skipped"], 4);
+    }
+
     #[test]
     fn completion_helpers_map_changes_partial_failures_and_cancellation() {
         assert!(matches!(
@@ -11972,11 +12870,9 @@ mod tests {
         settings.safety.max_delete = 1;
         settings.safety.allow_empty_source = false;
 
-        let options = reconciliation_options(
-            &settings,
+        let options = sync::reconciliation_options(
+            &run_plan_options(&settings, true, &plan::Scope::parse("docs").unwrap()),
             CompareMode::Metadata,
-            true,
-            &plan::Scope::parse("docs").unwrap(),
         );
 
         assert_eq!(options.max_delete, usize::MAX);
@@ -11990,11 +12886,9 @@ mod tests {
 
         // A run that was not deleting does not start now.
         settings.safety.delete = false;
-        let options = reconciliation_options(
-            &settings,
+        let options = sync::reconciliation_options(
+            &run_plan_options(&settings, false, &plan::Scope::root()),
             CompareMode::Metadata,
-            false,
-            &plan::Scope::root(),
         );
         assert!(!options.delete);
     }
@@ -13144,6 +14038,7 @@ mod status_command_tests {
                     },
                     remote_path: "/team/export/a.txt".to_owned(),
                     reason: plan::ChangeReason::Forced,
+                    expected_remote: None,
                 },
                 plan::UploadAction {
                     local: local::LocalEntry {
@@ -13157,12 +14052,14 @@ mod status_command_tests {
                     },
                     remote_path: "/team/export/b.txt".to_owned(),
                     reason: plan::ChangeReason::Forced,
+                    expected_remote: None,
                 },
             ],
             post_deletes: Vec::new(),
             unchanged_files: 0,
             protected_entries: 0,
             upload_bytes: 1_024,
+            skipped: Vec::new(),
         }
     }
 
@@ -13245,6 +14142,7 @@ mod resync_output_tests {
             },
             remote_path: format!("/team/export/{relative}"),
             reason: plan::ChangeReason::Forced,
+            expected_remote: None,
         }
     }
 
@@ -13261,6 +14159,7 @@ mod resync_output_tests {
             unchanged_files: 0,
             protected_entries: 0,
             upload_bytes: 1_024,
+            skipped: Vec::new(),
         }
     }
 
@@ -13358,9 +14257,17 @@ mod resync_output_tests {
                 uploaded_bytes: 1_024,
                 deletes_skipped: 0,
                 kept_deletes_uploaded: 0,
+                deferred: Vec::new(),
+                mtime_not_kept: 0,
+                copy_fallbacks: 0,
             },
             changed_during_run: 0,
             failed: false,
+            deferred: Vec::new(),
+            mtime_not_kept: 0,
+            skipped: 0,
+            transport: api::TransportCounters::default(),
+            incomplete_listings: Vec::new(),
         };
         let text = human(render(
             cli::OutputFormat::Human,

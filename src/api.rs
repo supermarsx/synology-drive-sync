@@ -5,7 +5,7 @@ use std::io::{Read, Write};
 use std::num::NonZeroU64;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, OnceLock, PoisonError};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError, RwLock};
 use std::thread;
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
@@ -185,7 +185,20 @@ pub struct ApiClient {
     download_http: AsyncHttpClient,
     base: Url,
     apis: HashMap<String, ApiSpec>,
-    session: Option<Session>,
+    /// The authenticated session, shared by this client and the clones taken after login.
+    ///
+    /// Shared so that a session refreshed by one upload worker is the session every worker sends
+    /// next. A login *replaces* the slot rather than writing through it, so a clone that logs in on
+    /// its own (the Doctor's second, tokenless session) still holds a session of its own and never
+    /// disturbs the one it was cloned from. Only [`Self::refresh_session`] writes through.
+    session: Arc<RwLock<Option<Session>>>,
+    /// How to establish a replacement session when DSM reports the current one expired.
+    ///
+    /// Installed by a caller that can obtain the credentials again; absent everywhere else, which
+    /// leaves the session codes exactly as fatal as they always were.
+    reauthenticator: Option<Reauthenticator>,
+    /// Serialises re-authentication and counts it, shared by every clone.
+    reauthentication: Arc<Mutex<u32>>,
     retries: u32,
     control_timeout: Duration,
     /// Optional absolute budget shared by every control request made through
@@ -210,7 +223,96 @@ pub struct ApiClient {
     /// Shared deliberately: each upload worker holds a by-value clone of this client, so a
     /// per-client flag would report the fact only for whichever worker happened to notice it.
     /// The consequence is a property of the run, not of one transfer, and belongs to the run.
-    remote_mtime_unhonoured: Arc<AtomicBool>,
+    ///
+    /// Counted rather than latched so the run can say how many of its uploads it concerns.
+    remote_mtime_unhonoured: Arc<AtomicUsize>,
+    /// Server-side MD5 tasks in flight across this client and every clone of it.
+    ///
+    /// The comparison batch always kept [`REMOTE_MD5_CONCURRENCY`] tasks, but upload verification
+    /// runs one per upload worker, and `--jobs` allows sixteen. Shared, so the NAS sees the same
+    /// bound whichever path asks.
+    md5_tasks: Arc<TaskGate>,
+    /// What this client recovered from on the caller's behalf, shared by every clone, so a run can
+    /// report every retry, re-login and abandoned server task rather than absorb them silently.
+    counters: Arc<ClientCounters>,
+}
+
+#[derive(Debug, Default)]
+struct ClientCounters {
+    retries: AtomicUsize,
+    reauthentications: AtomicUsize,
+    reauthentication_failures: AtomicUsize,
+    keepalive_failures: AtomicUsize,
+    tasks_not_stopped: AtomicUsize,
+}
+
+/// What a client recovered from, or could not, during a run. Every one of these used to happen
+/// without a trace in the result: each is also visible request by request through the
+/// [`RequestObserver`].
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct TransportCounters {
+    /// Requests sent again after a transient failure.
+    pub retries: usize,
+    /// Sessions DSM expired that were replaced by a new login.
+    pub reauthentications: usize,
+    /// Attempts to replace an expired session that failed; the request then failed with DSM's
+    /// session error.
+    pub reauthentication_failures: usize,
+    /// Keepalive touches that failed. The next real request recovers or reports its own error.
+    pub keepalive_failures: usize,
+    /// Server-side MD5 or copy tasks this client abandoned and could not confirm stopped. Each one
+    /// finishes on the NAS on its own; nothing is written by an MD5 task, and an abandoned copy's
+    /// destination is checked by the next run's plan.
+    pub server_tasks_not_stopped: usize,
+}
+
+/// A counting gate: at most `capacity` holders at once, and a wait that cancellation ends.
+#[derive(Debug)]
+struct TaskGate {
+    in_use: Mutex<usize>,
+    released: std::sync::Condvar,
+    capacity: usize,
+}
+
+impl TaskGate {
+    fn new(capacity: usize) -> Self {
+        Self {
+            in_use: Mutex::new(0),
+            released: std::sync::Condvar::new(),
+            capacity: capacity.max(1),
+        }
+    }
+
+    fn acquire(&self, cancellation: &CancellationToken) -> Result<TaskSlot<'_>> {
+        let mut in_use = self.in_use.lock().unwrap_or_else(PoisonError::into_inner);
+        while *in_use >= self.capacity {
+            cancellation.check()?;
+            in_use = self
+                .released
+                .wait_timeout(in_use, RATE_LIMIT_POLL_INTERVAL)
+                .unwrap_or_else(PoisonError::into_inner)
+                .0;
+        }
+        *in_use += 1;
+        Ok(TaskSlot { gate: self })
+    }
+}
+
+/// One held place in a [`TaskGate`], given back on drop.
+struct TaskSlot<'gate> {
+    gate: &'gate TaskGate,
+}
+
+impl Drop for TaskSlot<'_> {
+    fn drop(&mut self) {
+        let mut in_use = self
+            .gate
+            .in_use
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        *in_use = in_use.saturating_sub(1);
+        self.gate.released.notify_one();
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -257,6 +359,16 @@ pub struct ScopedRemoteInventory {
     pub inventory: RemoteInventory,
     /// False when the entry budget stopped the walk, making the inventory a subset of the scope.
     pub complete: bool,
+    /// Root-relative directories (`""` for the root) whose listing returned fewer or more entries
+    /// than DSM's `total` claimed, consistently across two passes.
+    ///
+    /// Accepted rather than failed, because a stable disagreement is what DSM produces for entries
+    /// it counts and then filters out of the listing — Access-Based Enumeration hiding unreadable
+    /// items, or DSM-managed names it does not return — and failing every run on such a directory
+    /// is not a safety property. But the listing is known not to be the whole directory, so
+    /// nothing in these directories may be deleted on the strength of its absence from it: a
+    /// caller that mutates must withhold every deletion inside them.
+    pub incomplete_directories: Vec<String>,
 }
 
 /// One bounded, display-safe entry returned by a target diagnostic.
@@ -788,6 +900,23 @@ pub enum ApiObservation {
 /// shared by every clone of the client it was installed on.
 pub type RequestObserver = Arc<dyn Fn(ApiObservation) + Send + Sync>;
 
+/// Establishes a fresh session on the client it is handed, from wherever the caller keeps its
+/// credentials.
+///
+/// The client handed in is a scratch clone; on success its session replaces the shared one. The
+/// closure is the only place a credential is touched, so this module never holds a password: a
+/// caller that can re-read its secret (a password file, the OS vault) re-reads it on each call.
+pub type Reauthenticator = Arc<dyn Fn(&mut ApiClient) -> Result<()> + Send + Sync>;
+
+/// Upper bound on re-authentications per run, shared by every clone of a client.
+///
+/// A session that dies once overnight needs one. A DSM that refuses every session it issues would
+/// otherwise log in again for every request it rejects.
+const MAX_REAUTHENTICATIONS: u32 = 4;
+
+/// How often a long local phase touches the session, so DSM's idle timer never expires it.
+pub const SESSION_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(5 * 60);
+
 /// Everything one request attempt needs to describe itself.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct AttemptContext {
@@ -936,7 +1065,9 @@ impl ApiClient {
             download_http,
             base,
             apis: HashMap::new(),
-            session: None,
+            session: Arc::new(RwLock::new(None)),
+            reauthenticator: None,
+            reauthentication: Arc::new(Mutex::new(0)),
             retries: options.retries,
             control_timeout: control_request_timeout(options.request_timeout),
             control_deadline,
@@ -945,7 +1076,9 @@ impl ApiClient {
             upload_rate_limit: None,
             cancellation: CancellationToken::default(),
             observer,
-            remote_mtime_unhonoured: Arc::new(AtomicBool::new(false)),
+            remote_mtime_unhonoured: Arc::new(AtomicUsize::new(0)),
+            md5_tasks: Arc::new(TaskGate::new(REMOTE_MD5_CONCURRENCY)),
+            counters: Arc::new(ClientCounters::default()),
         };
         // Announced before discovery so the endpoint is named ahead of the first request it
         // explains, which is the order a reader needs.
@@ -980,6 +1113,151 @@ impl ApiClient {
         self
     }
 
+    /// Install the way this client re-establishes an expired session.
+    ///
+    /// Without one, DSM's session codes are fatal exactly as before; see [`retryable`]. With one, a
+    /// request DSM refused for its session (106 timed out, 107 interrupted by a duplicate login,
+    /// 119 invalid, and 105 when a liveness probe confirms the session is what failed) is sent
+    /// again once, after a single re-authentication shared by every clone of this client. Those
+    /// codes mean DSM rejected the request before acting on it, which is what makes the second
+    /// send safe.
+    #[must_use]
+    pub fn with_reauthenticator(mut self, reauthenticator: Reauthenticator) -> Self {
+        self.reauthenticator = Some(reauthenticator);
+        self
+    }
+
+    /// Run `attempt`, and once more after re-authenticating if DSM refused it for its session.
+    fn with_session_recovery<T>(&self, mut attempt: impl FnMut() -> Result<T>) -> Result<T> {
+        let sent = self.current_session().map(|session| session.sid);
+        match attempt() {
+            Err(error) => match self.recover_session(sent.as_ref().map(|sid| sid.as_str()), &error)
+            {
+                Recovery::Resend => attempt(),
+                Recovery::NotApplicable => Err(error),
+                // The re-login's own failure is the cause an operator acts on (a one-time code is
+                // required, the password changed, the account is locked), so it replaces DSM's
+                // session code rather than being dropped behind it.
+                Recovery::LoginFailed(login_error) => Err(login_error),
+            },
+            result => result,
+        }
+    }
+
+    /// Replace a session DSM reported dead, and say whether the request should be sent again.
+    ///
+    /// Serialised, so concurrent workers that all hit the expiry produce one login: the first
+    /// replaces the session, and the rest see that the session they sent with is no longer the
+    /// current one and simply resend.
+    fn recover_session(&self, sent_sid: Option<&str>, error: &Error) -> Recovery {
+        let Some(reauthenticate) = &self.reauthenticator else {
+            return Recovery::NotApplicable;
+        };
+        let code = error.api_code();
+        if !matches!(code, Some(105 | 106 | 107 | 119)) {
+            return Recovery::NotApplicable;
+        }
+        let mut count = self
+            .reauthentication
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let current = self.current_session().map(|session| session.sid);
+        if current.as_ref().map(|sid| sid.as_str()) != sent_sid {
+            return Recovery::Resend;
+        }
+        // 105 is also File Station's answer for a path the account may not read. Only a session
+        // that fails a request every account may make is treated as expired.
+        if code == Some(105) && self.confirm_file_station_session().is_ok() {
+            return Recovery::NotApplicable;
+        }
+        if *count >= MAX_REAUTHENTICATIONS {
+            return Recovery::NotApplicable;
+        }
+        *count += 1;
+        let mut fresh = self.clone();
+        fresh.reauthenticator = None;
+        let session = reauthenticate(&mut fresh).and_then(|()| {
+            fresh.current_session().ok_or_else(|| {
+                Error::Message("re-authentication completed without a session".to_owned())
+            })
+        });
+        match session {
+            Ok(session) => {
+                *self.session.write().unwrap_or_else(PoisonError::into_inner) = Some(session);
+                self.counters
+                    .reauthentications
+                    .fetch_add(1, Ordering::AcqRel);
+                Recovery::Resend
+            }
+            Err(login_error) => {
+                self.counters
+                    .reauthentication_failures
+                    .fetch_add(1, Ordering::AcqRel);
+                Recovery::LoginFailed(login_error)
+            }
+        }
+    }
+
+    /// Everything this client and its clones recovered from so far. See [`TransportCounters`].
+    pub fn transport_counters(&self) -> TransportCounters {
+        TransportCounters {
+            retries: self.counters.retries.load(Ordering::Acquire),
+            reauthentications: self.counters.reauthentications.load(Ordering::Acquire),
+            reauthentication_failures: self
+                .counters
+                .reauthentication_failures
+                .load(Ordering::Acquire),
+            keepalive_failures: self.counters.keepalive_failures.load(Ordering::Acquire),
+            server_tasks_not_stopped: self.counters.tasks_not_stopped.load(Ordering::Acquire),
+        }
+    }
+
+    fn count_retry(&self) {
+        self.counters.retries.fetch_add(1, Ordering::AcqRel);
+    }
+
+    /// Touch the session with the cheapest request File Station answers, re-authenticating if DSM
+    /// says it expired.
+    ///
+    /// Best effort by design: a failed touch is not a failed run. The request that actually needs
+    /// the session goes through the same recovery and reports its own error.
+    pub fn touch_session(&self) {
+        match self.with_session_recovery(|| self.confirm_file_station_session()) {
+            Ok(()) | Err(Error::Cancelled) => {}
+            // Counted, and visible request by request through the observer.
+            Err(_) => {
+                self.counters
+                    .keepalive_failures
+                    .fetch_add(1, Ordering::AcqRel);
+            }
+        }
+    }
+
+    /// Run `work` while touching the session every `interval`.
+    ///
+    /// For the long local phases (whole-tree hashing before planning, fingerprint promotion before
+    /// execution) that send DSM nothing for hours on a large first sync. DSM's idle timer expired
+    /// the session underneath them, the first request after the phase failed, and the next run
+    /// hashed everything again and failed the same way.
+    pub fn keep_session_alive_while<T>(&self, interval: Duration, work: impl FnOnce() -> T) -> T {
+        if self.current_session().is_none() {
+            return work();
+        }
+        let (stop, stopped) = std::sync::mpsc::channel::<()>();
+        thread::scope(|scope| {
+            scope.spawn(move || {
+                while let Err(std::sync::mpsc::RecvTimeoutError::Timeout) =
+                    stopped.recv_timeout(interval)
+                {
+                    self.touch_session();
+                }
+            });
+            let result = work();
+            drop(stop);
+            result
+        })
+    }
+
     fn observe(&self, observation: ApiObservation) {
         if let Some(observer) = &self.observer {
             observer(observation);
@@ -992,7 +1270,8 @@ impl ApiClient {
     /// `with_async_session_headers` attach, derived from session state rather than by changing
     /// their signatures. The field half reads form-field **names** only; no value is inspected.
     fn session_transport(&self, fields: &[(String, String)]) -> SessionTransport {
-        let session = self.session.as_ref();
+        let session = self.current_session();
+        let session = session.as_ref();
         SessionTransport {
             cookie_header: session.is_some(),
             syno_token_header: session.is_some_and(|session| session.syno_token.is_some()),
@@ -1040,7 +1319,25 @@ impl ApiClient {
         selected_relative_paths: &BTreeSet<String>,
         cancellation: &CancellationToken,
     ) -> Result<()> {
+        self.populate_remote_content_md5_with(
+            inventory,
+            selected_relative_paths,
+            DigestFailure::FailRun,
+            cancellation,
+        )
+        .map(|_| ())
+    }
+
+    fn populate_remote_content_md5_with(
+        &self,
+        inventory: &mut RemoteInventory,
+        selected_relative_paths: &BTreeSet<String>,
+        failure: DigestFailure,
+        cancellation: &CancellationToken,
+    ) -> Result<Vec<(String, Error)>> {
         self.require_content_api()?;
+        let mut deferred = Vec::new();
+        let mut breaker = DigestBreaker::default();
         let mut selection = selected_relative_paths.iter();
         loop {
             cancellation.check()?;
@@ -1066,12 +1363,21 @@ impl ApiClient {
                 }
             }
             if batch.is_empty() {
-                return Ok(());
+                return Ok(deferred);
             }
-            let digests = self.remote_content_md5_batch(&batch, cancellation)?;
+            let digests = self.remote_content_md5_batch(&batch, failure, cancellation)?;
             for ((relative, _), digest) in batch.iter().zip(digests) {
-                if let Some(entry) = inventory.entries.get_mut(*relative) {
-                    entry.content_md5 = Some(digest);
+                match digest {
+                    Ok(digest) => {
+                        breaker.succeeded();
+                        if let Some(entry) = inventory.entries.get_mut(*relative) {
+                            entry.content_md5 = Some(digest);
+                        }
+                    }
+                    Err(error) => {
+                        breaker.failed(relative, &error)?;
+                        deferred.push(((*relative).to_owned(), error));
+                    }
                 }
             }
         }
@@ -1081,8 +1387,13 @@ impl ApiClient {
     ///
     /// Returns them in batch order. The concurrency is a scheduling detail and not a semantic one:
     /// each digest is produced by exactly the same [`Self::remote_content_md5`] the serial path
-    /// used, and a failure is reported as the first error observed, which is the error the serial
-    /// path would have returned for the same batch.
+    /// used.
+    ///
+    /// Under [`DigestFailure::FailRun`] the first failure is the batch's answer, and it ends the
+    /// batch *now*: the peers' in-flight tasks are stopped through a batch-scoped cancellation
+    /// rather than polled to completion, so a failure no longer waits for the slowest file in the
+    /// batch to finish a digest nobody will read. Under [`DigestFailure::DeferFile`] each file's
+    /// outcome is its own and only cancellation ends the batch.
     ///
     /// The calling thread is one of the workers. A helper that cannot be spawned therefore costs
     /// parallelism and never correctness -- with none of them spawned this drains the batch exactly
@@ -1091,65 +1402,69 @@ impl ApiClient {
     fn remote_content_md5_batch(
         &self,
         batch: &[(&str, String)],
+        failure: DigestFailure,
         cancellation: &CancellationToken,
-    ) -> Result<Vec<ContentMd5>> {
-        let workers = REMOTE_MD5_CONCURRENCY.min(batch.len());
-        if workers <= 1 {
-            return batch
-                .iter()
-                .map(|(_, remote_path)| self.remote_content_md5(remote_path, cancellation))
-                .collect();
-        }
-
+    ) -> Result<Vec<Result<ContentMd5>>> {
+        let batch_cancellation = cancellation.child();
         let cursor = AtomicUsize::new(0);
-        let abandoned = AtomicBool::new(false);
-        let collected: Mutex<Vec<Option<ContentMd5>>> = Mutex::new(vec![None; batch.len()]);
+        let collected: Mutex<Vec<Option<Result<ContentMd5>>>> =
+            Mutex::new((0..batch.len()).map(|_| None).collect());
         let first_error: Mutex<Option<Error>> = Mutex::new(None);
 
         let drain = || {
             loop {
-                // Stop claiming work once any file in this batch has failed. A worker already
-                // inside a request keeps its own bounded deadline, so this shortens the batch
-                // rather than interrupting a call -- the same exposure the serial path had.
-                if abandoned.load(Ordering::Acquire) {
+                if batch_cancellation.is_cancelled() {
                     return;
                 }
                 let index = cursor.fetch_add(1, Ordering::AcqRel);
                 let Some((_, remote_path)) = batch.get(index) else {
                     return;
                 };
-                match self.remote_content_md5(remote_path, cancellation) {
-                    Ok(digest) => {
-                        let mut slots = collected.lock().unwrap_or_else(PoisonError::into_inner);
-                        // The index came from the cursor, so it is in range and claimed by this
-                        // worker alone. The lock is held only to write one slot, never across a
-                        // request.
-                        if let Some(slot) = slots.get_mut(index) {
-                            *slot = Some(digest);
-                        }
-                    }
+                let result = self.remote_content_md5(remote_path, &batch_cancellation);
+                let fatal = match &result {
+                    Ok(_) => false,
+                    // A peer abandoned the batch; this is not the file's answer.
+                    Err(Error::Cancelled) if !cancellation.is_cancelled() => return,
+                    Err(Error::Cancelled) => true,
                     Err(error) => {
+                        failure == DigestFailure::FailRun
+                            || self.digest_failure_scope(error) == DigestScope::Run
+                    }
+                };
+                let result = result.map_err(|error| naming_remote_file(error, remote_path));
+                if fatal {
+                    if let Err(error) = result {
                         let mut reported =
                             first_error.lock().unwrap_or_else(PoisonError::into_inner);
                         if reported.is_none() {
                             *reported = Some(error);
                         }
-                        drop(reported);
-                        abandoned.store(true, Ordering::Release);
-                        return;
                     }
+                    batch_cancellation.cancel();
+                    return;
+                }
+                let mut slots = collected.lock().unwrap_or_else(PoisonError::into_inner);
+                // The index came from the cursor, so it is in range and claimed by this worker
+                // alone. The lock is held only to write one slot, never across a request.
+                if let Some(slot) = slots.get_mut(index) {
+                    *slot = Some(result);
                 }
             }
         };
 
-        thread::scope(|scope| {
-            for index in 1..workers {
-                let _ = thread::Builder::new()
-                    .name(format!("sdsync-md5-{index}"))
-                    .spawn_scoped(scope, drain);
-            }
+        let workers = REMOTE_MD5_CONCURRENCY.min(batch.len());
+        if workers <= 1 {
             drain();
-        });
+        } else {
+            thread::scope(|scope| {
+                for index in 1..workers {
+                    let _ = thread::Builder::new()
+                        .name(format!("sdsync-md5-{index}"))
+                        .spawn_scoped(scope, drain);
+                }
+                drain();
+            });
+        }
 
         if let Some(error) = first_error
             .lock()
@@ -1158,6 +1473,7 @@ impl ApiClient {
         {
             return Err(error);
         }
+        cancellation.check()?;
         collected
             .into_inner()
             .unwrap_or_else(PoisonError::into_inner)
@@ -1196,6 +1512,7 @@ impl ApiClient {
     ) -> Result<ContentMd5> {
         self.require_content_api()?;
         cancellation.check()?;
+        let _slot = self.md5_tasks.acquire(cancellation)?;
         let deadline = Instant::now()
             .checked_add(self.operation_timeout)
             .ok_or_else(|| Error::Message("operation timeout is too large".to_owned()))?;
@@ -1216,11 +1533,11 @@ impl ApiClient {
         let mut poll_interval = REMOTE_MD5_FIRST_POLL_INTERVAL;
         loop {
             if cancellation.is_cancelled() {
-                let _ = self.stop_task("SYNO.FileStation.MD5", 2, &task.taskid);
+                self.stop_task("SYNO.FileStation.MD5", 2, &task.taskid);
                 return Err(Error::Cancelled);
             }
             if Instant::now() >= deadline {
-                let _ = self.stop_task("SYNO.FileStation.MD5", 2, &task.taskid);
+                self.stop_task("SYNO.FileStation.MD5", 2, &task.taskid);
                 return Err(Error::OperationTimedOut {
                     operation: "remote MD5 calculation",
                 });
@@ -1237,14 +1554,14 @@ impl ApiClient {
             ) {
                 Ok(Some(status)) => status,
                 Ok(None) => {
-                    let _ = self.stop_task("SYNO.FileStation.MD5", 2, &task.taskid);
+                    self.stop_task("SYNO.FileStation.MD5", 2, &task.taskid);
                     return Err(Error::InvalidResponse {
                         operation: "SYNO.FileStation.MD5.status".to_owned(),
                         message: "successful response contained no task status".to_owned(),
                     });
                 }
                 Err(error) => {
-                    let _ = self.stop_task("SYNO.FileStation.MD5", 2, &task.taskid);
+                    self.stop_task("SYNO.FileStation.MD5", 2, &task.taskid);
                     return Err(error);
                 }
             };
@@ -1263,7 +1580,7 @@ impl ApiClient {
             // answers a small file at the speed of the file; doubling to the old interval keeps
             // a large one from being polled thousands of times.
             if let Err(error) = sleep_cancellable(poll_interval, cancellation) {
-                let _ = self.stop_task("SYNO.FileStation.MD5", 2, &task.taskid);
+                self.stop_task("SYNO.FileStation.MD5", 2, &task.taskid);
                 return Err(error);
             }
             poll_interval = (poll_interval * 2).min(REMOTE_MD5_MAX_POLL_INTERVAL);
@@ -1296,6 +1613,72 @@ impl ApiClient {
         self.populate_remote_content_fingerprints(inventory, strong, cancellation)?;
         let comparison_only: BTreeSet<String> = comparison.difference(strong).cloned().collect();
         self.populate_remote_content_md5(inventory, &comparison_only, cancellation)
+    }
+
+    /// [`Self::populate_remote_content_digests`] for a run that can leave one file for later.
+    ///
+    /// A digest File Station could not produce for one file (an MD5 task that errored or timed
+    /// out, a download that failed after its retries) is returned with its relative path, and
+    /// that entry keeps no digest, instead of failing the whole run. The caller must then keep the
+    /// path out of the plan entirely: without a digest it can neither be compared nor guard a
+    /// deletion. Cancellation still ends the pass.
+    pub fn populate_remote_content_digests_deferring(
+        &self,
+        inventory: &mut RemoteInventory,
+        comparison: &BTreeSet<String>,
+        strong: &BTreeSet<String>,
+        cancellation: &CancellationToken,
+    ) -> Result<Vec<(String, Error)>> {
+        let mut deferred =
+            self.populate_remote_content_fingerprints_deferring(inventory, strong, cancellation)?;
+        let comparison_only: BTreeSet<String> = comparison.difference(strong).cloned().collect();
+        deferred.extend(self.populate_remote_content_md5_with(
+            inventory,
+            &comparison_only,
+            DigestFailure::DeferFile,
+            cancellation,
+        )?);
+        Ok(deferred)
+    }
+
+    /// [`Self::populate_remote_content_fingerprints`], returning per-file failures instead of the
+    /// first one. See [`Self::populate_remote_content_digests_deferring`].
+    pub fn populate_remote_content_fingerprints_deferring(
+        &self,
+        inventory: &mut RemoteInventory,
+        selected_relative_paths: &BTreeSet<String>,
+        cancellation: &CancellationToken,
+    ) -> Result<Vec<(String, Error)>> {
+        self.require_content_fingerprint_api()?;
+        let mut deferred = Vec::new();
+        let mut breaker = DigestBreaker::default();
+        for relative in selected_relative_paths {
+            cancellation.check()?;
+            let entry = inventory.entries.get_mut(relative).ok_or_else(|| {
+                Error::Message(format!(
+                    "remote content selection referenced missing inventory path {relative:?}"
+                ))
+            })?;
+            if entry.kind != EntryKind::File {
+                return Err(Error::Message(format!(
+                    "remote content selection referenced non-file path {relative:?}"
+                )));
+            }
+            match self.remote_content_fingerprint(&entry.remote_path, entry.size, cancellation) {
+                Ok(fingerprint) => {
+                    breaker.succeeded();
+                    entry.content_md5 = Some(fingerprint);
+                }
+                Err(Error::Cancelled) => return Err(Error::Cancelled),
+                Err(error) if self.digest_failure_scope(&error) != DigestScope::Run => {
+                    let error = naming_remote_file(error, &entry.remote_path);
+                    breaker.failed(relative, &error)?;
+                    deferred.push((relative.clone(), error));
+                }
+                Err(error) => return Err(naming_remote_file(error, &entry.remote_path)),
+            }
+        }
+        Ok(deferred)
     }
 
     /// Populate collision-resistant content fingerprints for the selected files.
@@ -1341,10 +1724,22 @@ impl ApiClient {
         cancellation: &CancellationToken,
     ) -> Result<ContentMd5> {
         self.require_content_fingerprint_api()?;
+        self.with_session_recovery(|| {
+            self.remote_content_fingerprint_retrying(remote_path, expected_size, cancellation)
+        })
+    }
+
+    fn remote_content_fingerprint_retrying(
+        &self,
+        remote_path: &str,
+        expected_size: u64,
+        cancellation: &CancellationToken,
+    ) -> Result<ContentMd5> {
         for attempt in 0..=self.retries {
             cancellation.check()?;
             match self.remote_content_fingerprint_once(remote_path, expected_size, cancellation) {
                 Err(error) if attempt < self.retries && retryable(&error) => {
+                    self.count_retry();
                     retry_pause_cancellable(attempt, cancellation)?;
                 }
                 result => return result,
@@ -1442,11 +1837,11 @@ impl ApiClient {
 
         loop {
             if cancellation.is_cancelled() {
-                let _ = self.stop_task("SYNO.FileStation.CopyMove", 3, &task.taskid);
+                self.stop_task("SYNO.FileStation.CopyMove", 3, &task.taskid);
                 return Err(Error::Cancelled);
             }
             if Instant::now() >= deadline {
-                let _ = self.stop_task("SYNO.FileStation.CopyMove", 3, &task.taskid);
+                self.stop_task("SYNO.FileStation.CopyMove", 3, &task.taskid);
                 return Err(Error::OperationTimedOut {
                     operation: "server-side file copy",
                 });
@@ -1469,22 +1864,31 @@ impl ApiClient {
             ) {
                 Ok(Some(status)) => status,
                 Ok(None) => {
-                    let _ = self.stop_task("SYNO.FileStation.CopyMove", 3, &task.taskid);
+                    self.stop_task("SYNO.FileStation.CopyMove", 3, &task.taskid);
                     return Err(Error::InvalidResponse {
                         operation: "SYNO.FileStation.CopyMove.status".to_owned(),
                         message: "successful response contained no task status".to_owned(),
                     });
                 }
                 Err(error) => {
-                    let _ = self.stop_task("SYNO.FileStation.CopyMove", 3, &task.taskid);
+                    self.stop_task("SYNO.FileStation.CopyMove", 3, &task.taskid);
                     return Err(error);
                 }
             };
             if status.finished {
+                // A copy DSM finished *with an error* copied nothing usable, and the destination
+                // may hold a partial file. Named for what it is: checked further on, it was reported
+                // as a content mismatch, which sends an operator looking for corruption.
+                if let Some(error) = status.error.filter(|error| !error.is_null()) {
+                    return Err(Error::ServerCopyFailed {
+                        destination: destination_path.to_owned(),
+                        detail: bounded_diagnostic_text(&error.to_string(), 256).0,
+                    });
+                }
                 break;
             }
             if let Err(error) = sleep_cancellable(Duration::from_millis(100), cancellation) {
-                let _ = self.stop_task("SYNO.FileStation.CopyMove", 3, &task.taskid);
+                self.stop_task("SYNO.FileStation.CopyMove", 3, &task.taskid);
                 return Err(error);
             }
         }
@@ -1492,15 +1896,25 @@ impl ApiClient {
         self.verify_remote_content(destination_path, expected_size, expected, cancellation)
     }
 
-    fn stop_task(&self, api: &'static str, version: u32, taskid: &str) -> Result<()> {
-        self.call_bounded::<Value>(
-            api,
-            version,
-            "stop",
-            vec![pair("taskid", json_string(taskid)?)],
-            STOP_REQUEST_TIMEOUT,
-        )?;
-        Ok(())
+    /// Stop an abandoned server-side task, counting it when the stop cannot be confirmed.
+    ///
+    /// The caller is already returning a more important error, so the stop's own failure must not
+    /// replace it; it is counted in [`TransportCounters::server_tasks_not_stopped`] instead.
+    fn stop_task(&self, api: &'static str, version: u32, taskid: &str) {
+        let stopped = json_string(taskid).and_then(|taskid| {
+            self.call_bounded::<Value>(
+                api,
+                version,
+                "stop",
+                vec![pair("taskid", taskid)],
+                STOP_REQUEST_TIMEOUT,
+            )
+        });
+        if stopped.is_err() {
+            self.counters
+                .tasks_not_stopped
+                .fetch_add(1, Ordering::AcqRel);
+        }
     }
 
     /// Prove a remote file holds expected content, by reading it back and hashing it.
@@ -1723,7 +2137,38 @@ impl ApiClient {
     /// converge. The upload itself is not failed over it: the bytes did land, and the size and
     /// digest checks proved it.
     pub fn remote_mtime_unhonoured(&self) -> bool {
+        self.remote_mtime_unhonoured_count() > 0
+    }
+
+    /// How many uploads this run saw DSM keep a modification time outside the tolerance of the one
+    /// sent. See [`Self::remote_mtime_unhonoured`].
+    pub fn remote_mtime_unhonoured_count(&self) -> usize {
         self.remote_mtime_unhonoured.load(Ordering::Acquire)
+    }
+
+    /// What occupies `remote_path` right now, from one `getinfo`.
+    ///
+    /// The precondition an overwriting upload checks immediately before it sends: the plan was
+    /// derived from an inventory that may be hours old, and `Upload` with `overwrite=true` replaces
+    /// whatever is there now without asking. Retried like any idempotent read.
+    pub fn remote_path_state(&self, remote_path: &str) -> Result<RemotePathState> {
+        let item = match self.get_info(remote_path) {
+            Ok(item) => item,
+            Err(error) if error.api_code() == Some(408) => return Ok(RemotePathState::Absent),
+            Err(error) => return Err(error),
+        };
+        if item.isdir {
+            return Ok(RemotePathState::Directory);
+        }
+        let additional = item.additional.unwrap_or_default();
+        let size = additional.size.ok_or_else(|| Error::InvalidResponse {
+            operation: "SYNO.FileStation.List.getinfo".to_owned(),
+            message: "file information contained no byte size".to_owned(),
+        })?;
+        Ok(RemotePathState::File {
+            size,
+            mtime_seconds: additional.time.as_ref().and_then(|time| time.mtime),
+        })
     }
 
     /// The post-condition of an upload, taken from exactly one `getinfo`.
@@ -1805,9 +2250,9 @@ impl ApiClient {
     /// time answers nothing and latches nothing.
     fn note_uploaded_mtime(&self, local: &LocalEntry, reported: Option<i64>) {
         if let Some(reported) = reported
-            && reported != local.mtime_ms.div_euclid(1000)
+            && !crate::plan::mtimes_agree(local.mtime_ms, reported)
         {
-            self.remote_mtime_unhonoured.store(true, Ordering::Release);
+            self.remote_mtime_unhonoured.fetch_add(1, Ordering::AcqRel);
         }
     }
 
@@ -1841,8 +2286,9 @@ impl ApiClient {
         otp: Option<&str>,
         enable_syno_token: bool,
     ) -> Result<()> {
-        // A failed re-login must never leave an older session usable.
-        self.session = None;
+        // A failed re-login must never leave an older session usable. Replaced rather than
+        // cleared through the shared slot: clones that still hold the old session keep it.
+        self.session = Arc::new(RwLock::new(None));
         let spec = self.required_spec("SYNO.API.Auth")?;
         let auth_version = 6_u32.min(spec.max_version);
         if auth_version < 3 || auth_version < spec.min_version {
@@ -1914,12 +2360,12 @@ impl ApiClient {
             login_format: LoginFormat::Sid,
             server_set_cookie: facts.set_cookie_count > 0,
         }));
-        self.session = Some(session);
+        self.session = Arc::new(RwLock::new(Some(session)));
         Ok(())
     }
 
     pub fn logout(&mut self) -> Result<()> {
-        if self.session.is_none() {
+        if self.current_session().is_none() {
             return Ok(());
         }
         let version = 6_u32.min(self.required_spec("SYNO.API.Auth")?.max_version);
@@ -1931,7 +2377,7 @@ impl ApiClient {
         )?;
         let url = self.api_url("SYNO.API.Auth")?;
         let result = self.send_form_once::<Value>(url, fields, "SYNO.API.Auth", version, "logout");
-        self.session = None;
+        self.session = Arc::new(RwLock::new(None));
         result.map(|_| ())
     }
 
@@ -2502,7 +2948,7 @@ impl ApiClient {
             )));
         }
         let children = self.list_directory(remote_path, cancellation)?;
-        if !children.is_empty() {
+        if !children.whole || !children.items.is_empty() {
             return Err(Error::Message(format!(
                 "write-probe directory {remote_path:?} was not empty after creation"
             )));
@@ -2651,6 +3097,7 @@ impl ApiClient {
                             entries,
                         },
                         complete: true,
+                        incomplete_directories: Vec::new(),
                     });
                 }
                 Err(error) => return Err(error),
@@ -2700,10 +3147,11 @@ impl ApiClient {
         }
 
         let mut complete = true;
+        let mut incomplete_directories = Vec::new();
         'walk: while let Some(folder) = pending.pop() {
             cancellation.check()?;
-            let files = match self.list_directory(&folder, cancellation) {
-                Ok(files) => files,
+            let listing = match self.list_directory(&folder, cancellation) {
+                Ok(listing) => listing,
                 Err(error) if folder == root.as_str() && error.api_code() == Some(408) => {
                     root_exists = false;
                     break;
@@ -2712,6 +3160,10 @@ impl ApiClient {
                 Err(error) if folder == scope_path && error.api_code() == Some(408) => break,
                 Err(error) => return Err(error),
             };
+            if !listing.whole {
+                incomplete_directories.push(root.relative(&folder)?);
+            }
+            let files = listing.items;
 
             for item in files {
                 cancellation.tick();
@@ -2785,6 +3237,7 @@ impl ApiClient {
                 entries,
             },
             complete,
+            incomplete_directories,
         })
     }
 
@@ -3455,14 +3908,18 @@ impl ApiClient {
         create_parents: bool,
         cancellation: &CancellationToken,
     ) -> Result<()> {
-        let result = self.upload_observed_inner(
-            local,
-            remote_file,
-            observer.clone(),
-            overwrite,
-            create_parents,
-            cancellation,
-        );
+        // A session refusal means DSM discarded the request before writing anything, so the
+        // transfer is sent again from the start under the replacement session.
+        let result = self.with_session_recovery(|| {
+            self.upload_observed_inner(
+                local,
+                remote_file,
+                observer.clone(),
+                overwrite,
+                create_parents,
+                cancellation,
+            )
+        });
         if let Some(observer) = observer {
             let _ = observer(if result.is_ok() {
                 UploadTransferEvent::Completed
@@ -3484,6 +3941,7 @@ impl ApiClient {
     ) -> Result<()> {
         let (remote_parent, remote_name) = parent_and_name(remote_file)?;
         let observer_cancelled = Arc::new(AtomicBool::new(false));
+        let source_changed = Arc::new(AtomicBool::new(false));
         for attempt in 0..=self.retries {
             cancellation.check()?;
             if observer.as_ref().is_some_and(|observer| {
@@ -3511,6 +3969,10 @@ impl ApiClient {
                 throttle: upload_throttle(self.upload_rate_limit.as_ref(), cancellation),
                 cancellation: cancellation.clone(),
                 streamed: streamed.clone(),
+                source_guard: Some(SourceGuard {
+                    local: local.clone(),
+                    changed: Arc::clone(&source_changed),
+                }),
             };
             let part = Part::reader_with_length(reader, local.size)
                 .file_name(remote_name.to_owned())
@@ -3579,6 +4041,14 @@ impl ApiClient {
             apply_outcome(&mut record, &result, "SYNO.FileStation.Upload");
             self.observe(ApiObservation::CallCompleted(record));
             let result = prioritize_observer_cancellation(&observer_cancelled, result);
+            // Refused by the reader before the closing boundary, so DSM never received a complete
+            // body and committed nothing. Reported as the change it was, not as a transport fault
+            // to be retried.
+            let result = if source_changed.load(Ordering::Acquire) && result.is_err() {
+                Err(Error::SourceChanged(local.full_path.clone()))
+            } else {
+                result
+            };
             match result {
                 Ok(()) => {
                     verify_local_snapshot(local)?;
@@ -3591,6 +4061,7 @@ impl ApiClient {
                     return Ok(());
                 }
                 Err(error) if attempt < self.retries && retryable(&error) => {
+                    self.count_retry();
                     verify_local_snapshot(local)?;
                     if let Some(expected) = local.content_md5 {
                         let actual_local = crate::local::hash_file_snapshot(local, cancellation)?;
@@ -3730,20 +4201,39 @@ impl ApiClient {
     /// A short inventory must never be returned as a complete one. Downstream, a remote entry
     /// missing from the inventory is planned as an upload to a path that in fact exists, and the
     /// upload overwrites it; a directory whose children went missing can also be proposed for
-    /// deletion. So a walk whose pages disagree is discarded and taken again from offset 0, and a
-    /// second disagreement is an error naming both counts.
+    /// deletion. So a walk whose pages disagree is discarded and taken again from offset 0.
+    ///
+    /// Two disagreements are not all alike. A `total` that moved between pages, twice, is a
+    /// directory changing under the walk, and is an error naming the folder and both counts. An
+    /// arrival count that differs from a `total` which held still — the *same* entries on both
+    /// passes — is DSM counting entries it does not return (Access-Based Enumeration hiding what
+    /// the account cannot read, or managed names it filters). That listing is returned, marked
+    /// not whole, so the caller can withhold deletions inside it instead of failing every run on
+    /// that directory forever.
     fn list_directory(
         &self,
         folder: &str,
         cancellation: &CancellationToken,
-    ) -> Result<Vec<RemoteItem>> {
+    ) -> Result<DirectoryRead> {
         let first = self.list_directory_pass(folder, cancellation)?;
         if first.is_whole() {
-            return Ok(first.items);
+            return Ok(DirectoryRead {
+                items: first.items,
+                whole: true,
+            });
         }
         let second = self.list_directory_pass(folder, cancellation)?;
         if second.is_whole() {
-            return Ok(second.items);
+            return Ok(DirectoryRead {
+                items: second.items,
+                whole: true,
+            });
+        }
+        if first.is_stable_partial_of_same_entries(&second) {
+            return Ok(DirectoryRead {
+                items: second.items,
+                whole: false,
+            });
         }
         Err(Error::InvalidResponse {
             operation: "SYNO.FileStation.List.list".to_owned(),
@@ -3779,10 +4269,13 @@ impl ApiClient {
                 ),
             ];
             let data: ListData = self
-                .call("SYNO.FileStation.List", 2, "list", parameters, true)?
+                .call("SYNO.FileStation.List", 2, "list", parameters, true)
+                .map_err(|error| naming_listed_folder(error, folder))?
                 .ok_or_else(|| Error::InvalidResponse {
                     operation: "SYNO.FileStation.List.list".to_owned(),
-                    message: "successful response contained no directory data".to_owned(),
+                    message: format!(
+                        "successful response contained no directory data for {folder:?}"
+                    ),
                 })?;
             if offset == 0 {
                 declared = data.total;
@@ -3801,13 +4294,10 @@ impl ApiClient {
                 break;
             }
             if count == 0 {
-                return Err(Error::InvalidResponse {
-                    operation: "SYNO.FileStation.List.list".to_owned(),
-                    message: format!(
-                        "pagination stalled at offset {offset} while server reported {} entries",
-                        data.total
-                    ),
-                });
+                // An empty page before `total` is reached ends this pass short. Whether that is a
+                // directory DSM counts but does not fully return, or a broken listing, is decided by
+                // `list_directory` from whether a second pass ends at the same place.
+                break;
             }
         }
         Ok(DirectoryListing {
@@ -3874,9 +4364,11 @@ impl ApiClient {
         allow_retry: bool,
     ) -> Result<Option<T>> {
         self.validate_api(api, version)?;
-        let fields = self.authenticated_fields(api, version, method, parameters)?;
         let url = self.api_url(api)?;
-        self.send_form_with_retry(url, fields, api, version, method, allow_retry)
+        self.with_session_recovery(|| {
+            let fields = self.authenticated_fields(api, version, method, parameters.clone())?;
+            self.send_form_with_retry(url.clone(), fields, api, version, method, allow_retry)
+        })
     }
 
     fn call_bounded<T: DeserializeOwned>(
@@ -3912,9 +4404,19 @@ impl ApiClient {
         timeout: Duration,
     ) -> Result<Option<T>> {
         self.validate_api(api, version)?;
-        let fields = self.authenticated_fields(api, version, method, parameters)?;
         let url = self.api_url(api)?;
-        self.send_form_with_retry_bounded(url, fields, api, version, method, true, timeout)
+        self.with_session_recovery(|| {
+            let fields = self.authenticated_fields(api, version, method, parameters.clone())?;
+            self.send_form_with_retry_bounded(
+                url.clone(),
+                fields,
+                api,
+                version,
+                method,
+                true,
+                timeout,
+            )
+        })
     }
 
     fn authenticated_fields(
@@ -3997,6 +4499,7 @@ impl ApiClient {
                 // task-stop requests do -- and a guard there would refuse the single request
                 // those paths depend on, turning cancellation into abandoned remote state.
                 Err(error) if attempt < attempts && retryable(&error) => {
+                    self.count_retry();
                     // Report the wait that is about to happen, not merely that one will: a log
                     // showing four attempts without their backoff cannot explain where the
                     // wall-clock time went.
@@ -4146,14 +4649,21 @@ impl ApiClient {
             .ok_or_else(|| Error::MissingApi(api.to_owned()))
     }
 
-    fn required_session(&self) -> Result<&Session> {
-        self.session
-            .as_ref()
+    fn required_session(&self) -> Result<Session> {
+        self.current_session()
             .ok_or_else(|| Error::Message("not authenticated to File Station".to_owned()))
     }
 
-    fn session_headers(&self) -> Result<Option<SessionHeaders>> {
+    /// A copy of the current session. Owned, so no lock is held across a request.
+    fn current_session(&self) -> Option<Session> {
         self.session
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
+    fn session_headers(&self) -> Result<Option<SessionHeaders>> {
+        self.current_session()
             .as_ref()
             .map(Session::request_headers)
             .transpose()
@@ -4297,6 +4807,42 @@ struct ListData {
     files: Vec<RemoteItemWire>,
 }
 
+/// A directory's entries as `list_directory` settled them.
+#[derive(Debug)]
+struct DirectoryRead {
+    items: Vec<RemoteItem>,
+    /// False when the entries disagreed with DSM's `total` in a stable way; see
+    /// [`ScopedRemoteInventory::incomplete_directories`].
+    whole: bool,
+}
+
+/// Attach the folder a failed listing was for, keeping the error's kind and DSM code.
+///
+/// A walk lists thousands of directories, and "List.list failed with code 105" without the folder
+/// left the operator nothing to look at.
+fn naming_listed_folder(error: Error, folder: &str) -> Error {
+    match error {
+        Error::Api {
+            api,
+            operation,
+            code,
+            description,
+            details,
+        } => Error::Api {
+            api,
+            operation,
+            code,
+            description: format!("{description} (listing {folder:?})"),
+            details,
+        },
+        Error::InvalidResponse { operation, message } => Error::InvalidResponse {
+            operation,
+            message: format!("{message} (listing {folder:?})"),
+        },
+        other => other,
+    }
+}
+
 /// One pass over a directory's pages, with the evidence for whether it saw the whole directory.
 #[derive(Debug)]
 struct DirectoryListing {
@@ -4315,6 +4861,23 @@ impl DirectoryListing {
     /// not match what was claimed.
     fn is_whole(&self) -> bool {
         self.changed_to.is_none() && self.items.len() == self.declared
+    }
+
+    /// Whether this pass and `other` disagree with `total` in the same, stable way.
+    ///
+    /// Both passes saw one `total` throughout, and both returned exactly the same paths in the
+    /// same order. A directory changing under the walk cannot produce that twice; a server that
+    /// counts entries it then withholds produces nothing else.
+    fn is_stable_partial_of_same_entries(&self, other: &Self) -> bool {
+        self.changed_to.is_none()
+            && other.changed_to.is_none()
+            && self.declared == other.declared
+            && self.items.len() == other.items.len()
+            && self
+                .items
+                .iter()
+                .zip(&other.items)
+                .all(|(left, right)| left.path == right.path && left.isdir == right.isdir)
     }
 
     fn disagreement(&self) -> String {
@@ -4353,6 +4916,20 @@ struct Md5StatusData {
 #[derive(Debug, Deserialize)]
 struct TaskStatusData {
     finished: bool,
+    /// Present when DSM ended the task with a failure rather than a result.
+    #[serde(default)]
+    error: Option<Value>,
+}
+
+/// What occupies a remote path, as one `getinfo` reports it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RemotePathState {
+    Absent,
+    Directory,
+    File {
+        size: u64,
+        mtime_seconds: Option<i64>,
+    },
 }
 
 #[derive(Debug, Deserialize)]
@@ -5592,6 +6169,41 @@ struct ObservedReader<R> {
     /// strictly better question than that re-read did: not "does the file on disk still hash to the
     /// planned fingerprint" but "did the bytes that went onto the wire hash to it".
     streamed: Option<Arc<Mutex<StreamedBody>>>,
+    /// The source this body is read from, checked before the reader admits end of file.
+    ///
+    /// The multipart encoder reads the file part to end of file before it writes the closing
+    /// boundary, so an error returned *here* aborts the request while DSM still holds an
+    /// unterminated body, and nothing is committed. Checked only after the transfer, a source
+    /// edited mid-upload had already been written to the destination (`overwrite=true`) as a
+    /// mixture of two versions, and the run only then reported that it had changed.
+    source_guard: Option<SourceGuard>,
+}
+
+/// What [`ObservedReader`] verifies about its source before ending the body.
+struct SourceGuard {
+    local: LocalEntry,
+    /// Set when the reader refused to end the body because the source changed.
+    changed: Arc<AtomicBool>,
+}
+
+impl SourceGuard {
+    /// Whether the bytes sent so far, and the file on disk now, are still the planned source.
+    fn intact(&self, streamed: Option<&Mutex<StreamedBody>>) -> bool {
+        if let (Some(expected), Some(streamed)) = (self.local.content_md5, streamed) {
+            let streamed = streamed.lock().unwrap_or_else(PoisonError::into_inner);
+            if streamed.bytes != self.local.size
+                || !content_evidence_matches(expected, streamed.hasher.fingerprint())
+            {
+                return false;
+            }
+        }
+        verify_local_snapshot(&self.local).is_ok()
+    }
+
+    fn refuse(&self) -> std::io::Error {
+        self.changed.store(true, Ordering::Release);
+        std::io::Error::other("upload source changed while it was being sent")
+    }
 }
 
 /// What an upload body reader observed about the bytes it sent.
@@ -5613,6 +6225,223 @@ impl StreamedBody {
         self.hasher.update(chunk);
         self.bytes = self.bytes.saturating_add(chunk.len() as u64);
     }
+}
+
+/// How far a failed digest reaches.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DigestScope {
+    /// Confined to the file, and may clear on its own: defer it.
+    File,
+    /// The account may not read this one file (DSM 105 while the session answers a request every
+    /// account may make). Lasting, until someone changes its permissions.
+    Unreadable,
+    /// About every file: fail the run.
+    Run,
+}
+
+impl ApiClient {
+    /// [`digest_failure_is_per_file`], plus the one case it cannot decide alone: DSM's 105 is both
+    /// "this session is gone" and "this account may not read this path". A liveness probe tells
+    /// the two apart, so one unreadable file no longer fails every content run, and an expired
+    /// session (after re-login failed) still fails it once.
+    fn digest_failure_scope(&self, error: &Error) -> DigestScope {
+        if error.api_code() == Some(105) {
+            return if self.confirm_file_station_session().is_ok() {
+                DigestScope::Unreadable
+            } else {
+                DigestScope::Run
+            };
+        }
+        if digest_failure_is_per_file(error) {
+            DigestScope::File
+        } else {
+            DigestScope::Run
+        }
+    }
+}
+
+/// Consecutive per-file digest failures with one cause, and failures before any success, beyond
+/// which the cause is taken to be the NAS rather than the files.
+const DIGEST_BREAKER_THRESHOLD: usize = 3;
+
+/// Stops a digest pass that is deferring files for a cause they share.
+///
+/// Timeouts, unusable answers and 404s can each be about one file. Three in a row with the same
+/// cause, or three before a single success, are about the NAS or the link: deferring every file
+/// cost a timeout per file and reported thousands of paths for one problem. A missing file (408)
+/// and a file the account may not read (105, probed) are about their file however many there are,
+/// and are not counted.
+#[derive(Debug, Default)]
+struct DigestBreaker {
+    successes: usize,
+    failures: Vec<String>,
+    consecutive_class: Option<String>,
+    consecutive: Vec<String>,
+}
+
+impl DigestBreaker {
+    fn succeeded(&mut self) {
+        self.successes += 1;
+        self.consecutive_class = None;
+        self.consecutive.clear();
+    }
+
+    fn failed(&mut self, relative: &str, error: &Error) -> Result<()> {
+        if matches!(error.api_code(), Some(105 | 408)) {
+            return Ok(());
+        }
+        let class = digest_cause_class(error);
+        if self.consecutive_class.as_deref() != Some(class.as_str()) {
+            self.consecutive_class = Some(class);
+            self.consecutive.clear();
+        }
+        self.consecutive.push(relative.to_owned());
+        self.failures.push(relative.to_owned());
+        let tripped = if self.consecutive.len() >= DIGEST_BREAKER_THRESHOLD {
+            Some(&self.consecutive)
+        } else if self.successes == 0 && self.failures.len() >= DIGEST_BREAKER_THRESHOLD {
+            Some(&self.failures)
+        } else {
+            None
+        };
+        match tripped {
+            Some(paths) => Err(Error::RemoteDigestsFailing {
+                cause: Box::new(clone_digest_error(error)),
+                paths: paths.clone(),
+            }),
+            None => Ok(()),
+        }
+    }
+}
+
+/// A cause class for [`DigestBreaker`]: the error kind, with its DSM code or HTTP status.
+fn digest_cause_class(error: &Error) -> String {
+    match error {
+        Error::Api { code, .. } => format!("dsm-{code}"),
+        Error::HttpStatus { status, .. } => format!("http-{}", status.as_u16()),
+        Error::OperationTimedOut { .. } => "timeout".to_owned(),
+        Error::InvalidResponse { .. } => "invalid-response".to_owned(),
+        Error::InvalidContentHash => "invalid-digest".to_owned(),
+        Error::ContentVerificationFailed(_) => "content-verification".to_owned(),
+        _ => "other".to_owned(),
+    }
+}
+
+/// A copy of a per-file digest error, which are all plain data. (`Error` is not `Clone` because
+/// some variants carry I/O sources; none of those reaches here.)
+fn clone_digest_error(error: &Error) -> Error {
+    match error {
+        Error::Api {
+            api,
+            operation,
+            code,
+            description,
+            details,
+        } => Error::Api {
+            api: api.clone(),
+            operation: operation.clone(),
+            code: *code,
+            description: description.clone(),
+            details: details.clone(),
+        },
+        Error::HttpStatus {
+            operation,
+            status,
+            message,
+        } => Error::HttpStatus {
+            operation: operation.clone(),
+            status: *status,
+            message: message.clone(),
+        },
+        Error::OperationTimedOut { operation } => Error::OperationTimedOut { operation },
+        Error::InvalidResponse { operation, message } => Error::InvalidResponse {
+            operation: operation.clone(),
+            message: message.clone(),
+        },
+        Error::InvalidContentHash => Error::InvalidContentHash,
+        Error::ContentVerificationFailed(path) => Error::ContentVerificationFailed(path.clone()),
+        other => Error::Message(other.to_string()),
+    }
+}
+
+/// Attach the remote file a digest failure was for, keeping the error's kind and DSM code.
+fn naming_remote_file(error: Error, remote_path: &str) -> Error {
+    match error {
+        Error::Api {
+            api,
+            operation,
+            code,
+            description,
+            details,
+        } => Error::Api {
+            api,
+            operation,
+            code,
+            description: format!("{description} (file {remote_path:?})"),
+            details,
+        },
+        Error::InvalidResponse { operation, message } => Error::InvalidResponse {
+            operation,
+            message: format!("{message} (file {remote_path:?})"),
+        },
+        Error::HttpStatus {
+            operation,
+            status,
+            message,
+        } => Error::HttpStatus {
+            operation: format!("{operation} of {remote_path:?}"),
+            status,
+            message,
+        },
+        Error::Http { operation, source } => Error::Http {
+            operation: format!("{operation} of {remote_path:?}"),
+            source,
+        },
+        Error::HttpBody { operation, source } => Error::HttpBody {
+            operation: format!("{operation} of {remote_path:?}"),
+            source,
+        },
+        other => other,
+    }
+}
+
+/// Whether a failed digest is about that one file, rather than about the run.
+///
+/// Only a cause confined to the file may defer it: the file is gone (408), DSM rejected that
+/// operation (400/401) or lost its task (599), a file-specific File Station error (1000 and up), its
+/// task outran the deadline, or its answer was unusable. A transport failure, a session that could
+/// not be renewed, a permission or authentication refusal, or a missing API is about every file:
+/// deferring each one cost a timeout per file and turned one clear failure into a partial run that
+/// named thousands of paths. Those fail the run, once, with their cause.
+fn digest_failure_is_per_file(error: &Error) -> bool {
+    match error {
+        Error::Api { code, .. } => matches!(*code, 400 | 401 | 408 | 599 | 1000..),
+        Error::HttpStatus { status, .. } => matches!(status.as_u16(), 404 | 410),
+        Error::OperationTimedOut { .. }
+        | Error::InvalidResponse { .. }
+        | Error::InvalidContentHash
+        | Error::ContentVerificationFailed(_) => true,
+        _ => false,
+    }
+}
+
+/// What [`ApiClient::recover_session`] decided about a refused request.
+enum Recovery {
+    /// A replacement session is in place; send the request again.
+    Resend,
+    /// Not a session failure this client can recover from; the original error stands.
+    NotApplicable,
+    /// The re-login itself failed, with this error.
+    LoginFailed(Error),
+}
+
+/// What one file's failed digest means for the pass that asked for it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DigestFailure {
+    /// The pass fails, as every digest failure always did.
+    FailRun,
+    /// The file is reported back and the pass continues.
+    DeferFile,
 }
 
 /// A token bucket written as a pure state machine: every operation is handed the current
@@ -5903,10 +6732,22 @@ impl<R: Read> Read for ObservedReader<R> {
         if count > 0
             && let Some(streamed) = &self.streamed
         {
-            streamed
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .update(&buffer[..count]);
+            let mut streamed = streamed.lock().unwrap_or_else(PoisonError::into_inner);
+            streamed.update(&buffer[..count]);
+            // A file that grew is refused as soon as it passes its planned length, rather than
+            // after streaming bytes the declared part length cannot carry.
+            if let Some(guard) = &self.source_guard
+                && streamed.bytes > guard.local.size
+            {
+                return Err(guard.refuse());
+            }
+        }
+        if count == 0
+            && !buffer.is_empty()
+            && let Some(guard) = &self.source_guard
+            && !guard.intact(self.streamed.as_deref())
+        {
+            return Err(guard.refuse());
         }
         if count > 0
             && let Some(observer) = &self.observer
@@ -6102,18 +6943,12 @@ fn discovery_route_returned_response(error: &Error) -> bool {
 /// a large tree, and an administrator signing into DSM with the same account produces 107. Retrying
 /// them here would be pointless — the same dead session goes back out, three times, with backoff.
 ///
-/// Recovering properly means re-authenticating and retrying the failed call, and that is a larger
-/// change than it looks. Each worker holds a by-value clone of the client, so there is no shared slot
-/// a refreshed session could be written to; `Session` would have to move behind an
-/// `Arc<RwLock<..>>`, and the credentials would have to be retained in memory for the whole run
-/// rather than dropped immediately after authentication, which is a security posture the vault
-/// design chose against. That is not a change to make as a footnote to a bug batch.
-///
-/// What was actually wrong about the old behaviour is not that it failed but that it reported
-/// nothing: the run died after doing most of its work and the operator was left with "rerun to
-/// authenticate again" and no account of what had landed. That half is closed — the report of
-/// completed work now survives a failure — so the remaining cost of an expired session is a rerun
-/// that re-plans against a destination most of which is already correct.
+/// Recovery is re-authentication, not retry, and lives one layer up in
+/// [`ApiClient::with_session_recovery`]: the session sits in a slot every worker clone shares, a
+/// caller that can obtain the credentials again installs a [`Reauthenticator`], and a refused
+/// request is sent once more under the replacement session. The credential is re-read by that
+/// closure when it is needed rather than retained by this module. Long local phases also touch the
+/// session ([`ApiClient::keep_session_alive_while`]) so the idle timer rarely fires at all.
 fn retryable(error: &Error) -> bool {
     match error {
         Error::Http { source, .. } => {
@@ -6653,10 +7488,12 @@ mod tests {
                     _request_format: None,
                 },
             )]),
-            session: Some(Session {
+            session: Arc::new(RwLock::new(Some(Session {
                 sid: Zeroizing::new("download-test-session".to_owned()),
                 syno_token: Some(Zeroizing::new("download-test-token".to_owned())),
-            }),
+            }))),
+            reauthenticator: None,
+            reauthentication: Arc::new(Mutex::new(0)),
             retries,
             control_timeout: idle_timeout,
             control_deadline: None,
@@ -6665,7 +7502,9 @@ mod tests {
             upload_rate_limit: None,
             cancellation: CancellationToken::default(),
             observer: None,
-            remote_mtime_unhonoured: Arc::new(AtomicBool::new(false)),
+            remote_mtime_unhonoured: Arc::new(AtomicUsize::new(0)),
+            md5_tasks: Arc::new(TaskGate::new(REMOTE_MD5_CONCURRENCY)),
+            counters: Arc::new(ClientCounters::default()),
         }
     }
 
@@ -7099,7 +7938,7 @@ mod tests {
             .expect("bounded logout must retain its fresh cleanup deadline");
         assert!(cleanup_deadline >= earliest_cleanup_deadline);
         assert_ne!(cleanup_deadline, expired_probe_deadline);
-        assert!(client.session.is_none());
+        assert!(client.current_session().is_none());
         let requests = server.join().unwrap();
         assert_eq!(requests.len(), 3);
         assert!(String::from_utf8_lossy(&requests[2].body).contains("method=logout"));
@@ -8574,9 +9413,8 @@ mod tests {
     }
 
     #[test]
-    fn remote_inventory_rejects_stalled_or_inconsistent_directory_pages() {
+    fn remote_inventory_rejects_inconsistent_directory_pages() {
         let bad_pages = [
-            serde_json::json!({"success":true,"data":{"total":1,"files":[]}}),
             serde_json::json!({"success":true,"data":{"total":1,"files":[{"path":"/share/root","name":"root","isdir":true}]}}),
             serde_json::json!({"success":true,"data":{"total":1,"files":[{"path":"/share/root/a","name":"wrong","isdir":false,"additional":{"size":1,"time":{"mtime":1}}}]}}),
             serde_json::json!({"success":true,"data":{"total":2,"files":[
@@ -9243,6 +10081,7 @@ mod tests {
             throttle: None,
             cancellation: CancellationToken::default(),
             streamed: None,
+            source_guard: None,
         };
         let mut output = Vec::new();
         reader.read_to_end(&mut output).unwrap();
@@ -9261,6 +10100,7 @@ mod tests {
             throttle: None,
             cancellation: CancellationToken::default(),
             streamed: None,
+            source_guard: None,
         };
         let error = reader.read(&mut [0_u8; 8]).unwrap_err();
         assert_eq!(error.kind(), std::io::ErrorKind::Interrupted);
@@ -9356,7 +10196,9 @@ mod tests {
                 .expect("client builds"),
             base: Url::parse("https://files.example.test/webapi/").unwrap(),
             apis: HashMap::new(),
-            session: None,
+            session: Arc::new(RwLock::new(None)),
+            reauthenticator: None,
+            reauthentication: Arc::new(Mutex::new(0)),
             retries: 0,
             control_timeout: Duration::from_secs(1),
             control_deadline: None,
@@ -9365,7 +10207,9 @@ mod tests {
             upload_rate_limit: None,
             cancellation: CancellationToken::default(),
             observer: None,
-            remote_mtime_unhonoured: Arc::new(AtomicBool::new(false)),
+            remote_mtime_unhonoured: Arc::new(AtomicUsize::new(0)),
+            md5_tasks: Arc::new(TaskGate::new(REMOTE_MD5_CONCURRENCY)),
+            counters: Arc::new(ClientCounters::default()),
         };
         assert_eq!(client.max_upload_rate(), None);
 
@@ -9411,6 +10255,7 @@ mod tests {
             throttle: upload_throttle(bucket.as_ref(), cancellation),
             cancellation: cancellation.clone(),
             streamed: None,
+            source_guard: None,
         }
     }
 
@@ -11686,7 +12531,8 @@ mod tests {
 
         let items = client
             .list_directory(folder, &CancellationToken::default())
-            .expect("a re-listed directory is not an error");
+            .expect("a re-listed directory is not an error")
+            .items;
 
         assert_eq!(
             items
@@ -11906,6 +12752,376 @@ mod tests {
     }
 
     /// A listing that agrees with itself still costs exactly one pass.
+    /// N6: DSM counting entries it does not return (Access-Based Enumeration, filtered managed
+    /// names) is a stable disagreement. Both passes return the same entries, so the listing is
+    /// accepted, and the directory is named as incomplete so nothing in it is deleted on the
+    /// strength of its absence. Before, every run failed on such a directory, forever.
+    #[test]
+    fn a_stable_short_listing_is_accepted_and_named_incomplete() {
+        let folder = "/share/root";
+        let mut responses = upload_preamble();
+        responses.extend([
+            (StatusCode::OK, getinfo_directory("/share")),
+            (StatusCode::OK, getinfo_directory(folder)),
+            // Two hidden entries: counted, never returned.
+            (StatusCode::OK, list_page(folder, 3, &["a"])),
+            (StatusCode::OK, list_page(folder, 3, &[])),
+            (StatusCode::OK, list_page(folder, 3, &["a"])),
+            (StatusCode::OK, list_page(folder, 3, &[])),
+        ]);
+        let (client, server) = upload_client(responses, 0);
+
+        let scoped = client
+            .remote_inventory_scoped(
+                &RemoteRoot::parse(folder).unwrap(),
+                &Scope::root(),
+                &IgnoreRules::none(),
+                usize::MAX,
+                &CancellationToken::default(),
+            )
+            .expect("a stable short listing is not an error");
+
+        assert_eq!(scoped.inventory.entries.keys().collect::<Vec<_>>(), ["a"]);
+        assert_eq!(scoped.incomplete_directories, [String::new()]);
+        assert_eq!(server.join().unwrap().len(), 8);
+    }
+
+    /// A short listing whose two passes disagree about *which* entries exist is a directory
+    /// changing under the walk, and stays an error that names the folder.
+    #[test]
+    fn a_short_listing_that_changes_between_passes_is_an_error_naming_the_folder() {
+        let folder = "/share/root";
+        let mut responses = upload_preamble();
+        responses.extend([
+            (StatusCode::OK, list_page(folder, 3, &["a"])),
+            (StatusCode::OK, list_page(folder, 3, &[])),
+            (StatusCode::OK, list_page(folder, 3, &["b"])),
+            (StatusCode::OK, list_page(folder, 3, &[])),
+        ]);
+        let (client, server) = upload_client(responses, 0);
+
+        let error = client
+            .list_directory(folder, &CancellationToken::default())
+            .unwrap_err();
+        assert!(error.to_string().contains("\"/share/root\""), "{error}");
+        assert_eq!(server.join().unwrap().len(), 6);
+    }
+
+    /// S2-B9: a DSM refusal while listing names the folder it refused.
+    #[test]
+    fn a_failed_listing_names_its_folder_and_keeps_its_code() {
+        let folder = "/share/root/private";
+        let mut responses = upload_preamble();
+        responses.push((
+            StatusCode::OK,
+            r#"{"success":false,"error":{"code":407}}"#.to_owned(),
+        ));
+        let (client, server) = upload_client(responses, 0);
+
+        let error = client
+            .list_directory(folder, &CancellationToken::default())
+            .unwrap_err();
+        assert_eq!(error.api_code(), Some(407));
+        assert!(error.to_string().contains(folder), "{error}");
+        server.join().unwrap();
+    }
+
+    /// Session expiry with a re-authenticator installed: one login, and the refused request is
+    /// sent again under the new session.
+    #[test]
+    fn an_expired_session_is_replaced_once_and_the_request_resent() {
+        let folder = "/share/root";
+        let mut responses = upload_preamble();
+        responses.extend([
+            (
+                StatusCode::OK,
+                r#"{"success":false,"error":{"code":119}}"#.to_owned(),
+            ),
+            (StatusCode::OK, login_response()),
+            (StatusCode::OK, list_page(folder, 1, &["a"])),
+        ]);
+        let (client, server) = upload_client(responses, 0);
+        let logins = Arc::new(AtomicUsize::new(0));
+        let counted = Arc::clone(&logins);
+        let client = client.with_reauthenticator(Arc::new(move |fresh: &mut ApiClient| {
+            counted.fetch_add(1, Ordering::AcqRel);
+            fresh.login("mirror-user", "password", None)
+        }));
+
+        let listing = client
+            .list_directory(folder, &CancellationToken::default())
+            .expect("an expired session is renewed, not fatal");
+        assert_eq!(listing.items.len(), 1);
+        assert_eq!(logins.load(Ordering::Acquire), 1);
+        let requests = server.join().unwrap();
+        assert_eq!(requests.len(), 5);
+        assert!(String::from_utf8_lossy(&requests[3].body).contains("method=login"));
+    }
+
+    /// When the re-login itself fails, its cause is the error the run reports: "a one-time code
+    /// is required" or "the password changed" is what an operator acts on, not DSM's 119.
+    #[test]
+    fn a_failed_re_login_reports_its_own_cause() {
+        let mut responses = upload_preamble();
+        responses.push((
+            StatusCode::OK,
+            r#"{"success":false,"error":{"code":119}}"#.to_owned(),
+        ));
+        let (client, server) = upload_client(responses, 0);
+        let client = client.with_reauthenticator(Arc::new(|_: &mut ApiClient| {
+            Err(Error::Message(
+                "DSM requires a one-time code for this account".to_owned(),
+            ))
+        }));
+
+        let error = client
+            .list_directory("/share/root", &CancellationToken::default())
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("one-time code"),
+            "the re-login's cause is kept: {error}"
+        );
+        assert_eq!(client.transport_counters().reauthentication_failures, 1);
+        server.join().unwrap();
+    }
+
+    /// A digest pass that keeps failing for one cause stops, once, naming the files: three timeouts
+    /// in a row, or three failures before any success. A missing file or an unreadable one is
+    /// about that file however many there are, and success resets the run.
+    #[test]
+    fn the_digest_breaker_trips_on_a_shared_cause_and_names_the_files() {
+        let timeout = || Error::OperationTimedOut {
+            operation: "remote MD5 calculation",
+        };
+        let api = |code| Error::Api {
+            api: "SYNO.FileStation.MD5".to_owned(),
+            operation: "start".to_owned(),
+            code,
+            description: String::new(),
+            details: Vec::new(),
+        };
+
+        let mut breaker = DigestBreaker::default();
+        breaker.succeeded();
+        breaker.failed("a", &timeout()).unwrap();
+        breaker.failed("b", &timeout()).unwrap();
+        breaker.succeeded();
+        breaker.failed("c", &timeout()).unwrap();
+        breaker.failed("d", &api(408)).unwrap();
+        breaker.failed("e", &api(105)).unwrap();
+        breaker.failed("f", &timeout()).unwrap();
+        let tripped = breaker.failed("g", &timeout()).unwrap_err();
+        match &tripped {
+            Error::RemoteDigestsFailing { cause, paths } => {
+                assert!(matches!(**cause, Error::OperationTimedOut { .. }));
+                assert_eq!(paths, &["c", "f", "g"]);
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        assert_eq!(
+            crate::observability::EventReason::of(&tripped),
+            crate::observability::EventReason::of(&timeout()),
+            "the run fails with its cause's own reason"
+        );
+
+        let mut cold = DigestBreaker::default();
+        cold.failed("x", &timeout()).unwrap();
+        cold.failed("y", &api(1100)).unwrap();
+        assert!(matches!(
+            cold.failed("z", &Error::InvalidContentHash),
+            Err(Error::RemoteDigestsFailing { .. })
+        ));
+    }
+
+    /// A fatal digest failure names the file it was for.
+    #[test]
+    fn a_digest_failure_names_its_remote_file() {
+        let named = naming_remote_file(
+            Error::Api {
+                api: "SYNO.FileStation.MD5".to_owned(),
+                operation: "start".to_owned(),
+                code: 407,
+                description: String::new(),
+                details: Vec::new(),
+            },
+            "/share/root/private/report.pdf",
+        );
+        assert_eq!(named.api_code(), Some(407));
+        assert!(named.to_string().contains("/share/root/private/report.pdf"));
+    }
+
+    /// S2-3: only a cause confined to one file defers that file. A transport, session, permission
+    /// or missing-API failure is about every file and fails the run once.
+    #[test]
+    fn only_per_file_digest_failures_are_deferrable() {
+        let api = |code| Error::Api {
+            api: "SYNO.FileStation.MD5".to_owned(),
+            operation: "status".to_owned(),
+            code,
+            description: String::new(),
+            details: Vec::new(),
+        };
+        for per_file in [
+            api(408),
+            api(400),
+            api(599),
+            api(1100),
+            Error::OperationTimedOut {
+                operation: "remote MD5 calculation",
+            },
+            Error::InvalidContentHash,
+        ] {
+            assert!(digest_failure_is_per_file(&per_file), "{per_file}");
+        }
+        for run_level in [
+            api(105),
+            api(106),
+            api(119),
+            api(407),
+            api(402),
+            Error::MissingApi("SYNO.FileStation.MD5".to_owned()),
+            Error::Message("transport".to_owned()),
+            Error::Cancelled,
+        ] {
+            assert!(!digest_failure_is_per_file(&run_level), "{run_level}");
+        }
+    }
+
+    /// Without a re-authenticator the session codes stay exactly as fatal as they were.
+    #[test]
+    fn without_a_reauthenticator_an_expired_session_is_still_fatal() {
+        let mut responses = upload_preamble();
+        responses.push((
+            StatusCode::OK,
+            r#"{"success":false,"error":{"code":119}}"#.to_owned(),
+        ));
+        let (client, server) = upload_client(responses, 0);
+
+        let error = client
+            .list_directory("/share/root", &CancellationToken::default())
+            .unwrap_err();
+        assert_eq!(error.api_code(), Some(119));
+        assert_eq!(server.join().unwrap().len(), 3);
+    }
+
+    /// 105 is also a real permission refusal. When the session still answers a request every
+    /// account may make, no login is spent on it.
+    #[test]
+    fn a_permission_refusal_from_a_live_session_does_not_reauthenticate() {
+        let mut responses = upload_preamble();
+        responses.extend([
+            (
+                StatusCode::OK,
+                r#"{"success":false,"error":{"code":105}}"#.to_owned(),
+            ),
+            (
+                StatusCode::OK,
+                r#"{"success":true,"data":{"total":1,"shares":[]}}"#.to_owned(),
+            ),
+        ]);
+        let (client, server) = upload_client(responses, 0);
+        let logins = Arc::new(AtomicUsize::new(0));
+        let counted = Arc::clone(&logins);
+        let client = client.with_reauthenticator(Arc::new(move |fresh: &mut ApiClient| {
+            counted.fetch_add(1, Ordering::AcqRel);
+            fresh.login("mirror-user", "password", None)
+        }));
+
+        let error = client
+            .list_directory("/share/root/private", &CancellationToken::default())
+            .unwrap_err();
+        assert_eq!(error.api_code(), Some(105));
+        assert_eq!(logins.load(Ordering::Acquire), 0);
+        assert_eq!(server.join().unwrap().len(), 4);
+    }
+
+    /// S2-B11: a copy task DSM finished with an error is reported as a failed copy, not as a
+    /// content mismatch an operator would go looking for corruption over.
+    #[test]
+    fn a_copy_task_that_finished_with_an_error_is_named_as_such() {
+        let mut responses = vec![
+            (StatusCode::OK, write_probe_discovery(true)),
+            (StatusCode::OK, login_response()),
+        ];
+        responses.extend([
+            (
+                StatusCode::OK,
+                r#"{"success":true,"data":{"taskid":"copy-1"}}"#.to_owned(),
+            ),
+            (
+                StatusCode::OK,
+                r#"{"success":true,"data":{"finished":true,"error":{"code":1000}}}"#.to_owned(),
+            ),
+        ]);
+        let (client, server) = upload_client(responses, 0);
+
+        let error = client
+            .copy_file_verified(
+                &RemoteRoot::parse("/share/root").unwrap(),
+                "/share/root/old/file.bin",
+                "/share/root/new/file.bin",
+                3,
+                ContentMd5::from_content(b"abc"),
+                &CancellationToken::default(),
+            )
+            .unwrap_err();
+        assert!(
+            matches!(&error, Error::ServerCopyFailed { destination, .. }
+                if destination == "/share/root/new/file.bin"),
+            "{error:?}"
+        );
+        assert_eq!(server.join().unwrap().len(), 4);
+    }
+
+    /// P1: server-side MD5 tasks are bounded across every path that starts one, and a wait for a
+    /// place ends with the run.
+    #[test]
+    fn the_md5_task_gate_bounds_holders_and_releases_on_drop() {
+        let gate = TaskGate::new(1);
+        let running = CancellationToken::default();
+        let held = gate.acquire(&running).expect("a free gate admits");
+        let cancelled = CancellationToken::default();
+        cancelled.cancel();
+        assert!(matches!(gate.acquire(&cancelled), Err(Error::Cancelled)));
+        drop(held);
+        assert!(gate.acquire(&cancelled).is_ok(), "a released place is free");
+    }
+
+    /// The pre-upload precondition reads what is at the destination right now.
+    #[test]
+    fn remote_path_state_reads_absent_directories_and_files() {
+        let mut responses = upload_preamble();
+        responses.extend([
+            (
+                StatusCode::OK,
+                r#"{"success":false,"error":{"code":408}}"#.to_owned(),
+            ),
+            (StatusCode::OK, getinfo_directory("/share/root/dir")),
+            (
+                StatusCode::OK,
+                getinfo_file("/share/root/file.bin", 7, Some(1_700_000_000)),
+            ),
+        ]);
+        let (client, server) = upload_client(responses, 0);
+
+        assert_eq!(
+            client.remote_path_state("/share/root/absent").unwrap(),
+            RemotePathState::Absent
+        );
+        assert_eq!(
+            client.remote_path_state("/share/root/dir").unwrap(),
+            RemotePathState::Directory
+        );
+        assert_eq!(
+            client.remote_path_state("/share/root/file.bin").unwrap(),
+            RemotePathState::File {
+                size: 7,
+                mtime_seconds: Some(1_700_000_000)
+            }
+        );
+        server.join().unwrap();
+    }
+
     #[test]
     fn a_settled_listing_is_read_once() {
         let folder = "/share/root";
@@ -11915,7 +13131,8 @@ mod tests {
 
         let items = client
             .list_directory(folder, &CancellationToken::default())
-            .expect("a settled listing");
+            .expect("a settled listing")
+            .items;
 
         assert_eq!(items.len(), 2);
         assert_eq!(server.join().unwrap().len(), 3);
@@ -12474,42 +13691,86 @@ mod tests {
         fs::remove_file(path).unwrap();
     }
 
-    /// The planning digest is authoritative. If the bytes on disk no longer match it, the upload
-    /// must abort rather than publish content nobody planned.
+    /// A server that answers discovery and login, then records every byte of the upload
+    /// connections that follow until each closes, answering none of them.
+    fn upload_body_recording_server() -> (String, JoinHandle<Vec<Vec<u8>>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let address = listener.local_addr().unwrap();
+        let handle = std::thread::spawn(move || {
+            for (index, (status, body)) in upload_preamble().into_iter().enumerate() {
+                let mut stream = accept_scripted_connection(&listener, index);
+                read_scripted_request(&mut stream, index);
+                write_scripted_response(&mut stream, status, &body);
+            }
+            let mut bodies = Vec::new();
+            let deadline = Instant::now() + Duration::from_millis(1_500);
+            while Instant::now() < deadline {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        stream.set_nonblocking(false).unwrap();
+                        stream
+                            .set_read_timeout(Some(Duration::from_millis(500)))
+                            .unwrap();
+                        let mut received = Vec::new();
+                        let _ = stream.read_to_end(&mut received);
+                        bodies.push(received);
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(2));
+                    }
+                    Err(error) => panic!("recording server accept failed: {error}"),
+                }
+            }
+            bodies
+        });
+        (format!("http://{address}/prefix/"), handle)
+    }
+
+    /// The planning digest is authoritative. If the bytes being sent are not the planned bytes,
+    /// the upload must abort *before* DSM holds a complete body, so nothing torn is ever written.
+    ///
+    /// The reader checks the bytes it streamed against the planned fingerprint when the file ends,
+    /// and the multipart encoder asks for that end before it writes the closing boundary. So the
+    /// request is abandoned with the body unterminated, which DSM discards, and the failure is the
+    /// change it was rather than a transport fault worth retrying.
     #[test]
     fn upload_aborts_when_the_source_no_longer_matches_its_planned_digest() {
-        // Detected after a successful transfer, before the remote object is trusted.
-        let (path, mut local) = temp_upload_source("rewritten", b"abc");
-        local.content_md5 = Some(ContentMd5::from_bytes([0_u8; 16]));
-        let mut responses = upload_preamble();
-        responses.push((StatusCode::OK, r#"{"success":true}"#.to_owned()));
-        let (client, server) = upload_client(responses, 0);
-        assert!(matches!(
-            client.upload(&local, "/share/root/abc.bin"),
-            Err(Error::SourceChanged(ref changed)) if *changed == path
-        ));
-        assert_eq!(server.join().unwrap().len(), 3);
-        fs::remove_file(&path).unwrap();
+        for retries in [0, 1] {
+            let (path, mut local) = temp_upload_source("rewritten", b"abc");
+            local.content_md5 = Some(ContentMd5::from_bytes([0_u8; 16]));
+            let (url, server) = upload_body_recording_server();
+            let mut client = ApiClient::connect(&ClientOptions {
+                base_url: url,
+                allow_http: true,
+                accept_invalid_certs: false,
+                ca_certificate: None,
+                connect_timeout: Duration::from_secs(2),
+                request_timeout: Duration::from_secs(5),
+                retries,
+            })
+            .unwrap();
+            client.login("mirror-user", "password", None).unwrap();
 
-        // Detected while deciding whether a retryable failure is worth retrying.
-        let (path, mut local) = temp_upload_source("rewritten-retry", b"abc");
-        local.content_md5 = Some(ContentMd5::from_bytes([0_u8; 16]));
-        let mut responses = upload_preamble();
-        responses.push((
-            StatusCode::BAD_GATEWAY,
-            "temporary proxy failure".to_owned(),
-        ));
-        let (client, server) = upload_client(responses, 1);
-        assert!(matches!(
-            client.upload(&local, "/share/root/abc.bin"),
-            Err(Error::SourceChanged(ref changed)) if *changed == path
-        ));
-        assert_eq!(
-            server.join().unwrap().len(),
-            3,
-            "a changed source must not be retransmitted"
-        );
-        fs::remove_file(&path).unwrap();
+            assert!(matches!(
+                client.upload(&local, "/share/root/abc.bin"),
+                Err(Error::SourceChanged(ref changed)) if *changed == path
+            ));
+            let bodies = server.join().unwrap();
+            assert!(
+                bodies.len() <= 1,
+                "a changed source must not be retransmitted: {} attempts",
+                bodies.len()
+            );
+            for body in bodies {
+                assert!(
+                    !body.windows(4).any(|window| window == b"--\r\n"),
+                    "the multipart body must never be terminated: {}",
+                    String::from_utf8_lossy(&body)
+                );
+            }
+            fs::remove_file(&path).unwrap();
+        }
 
         // The upload reported success but the NAS holds something else: fail closed.
         let (path, local) = temp_upload_source("mismatched", b"abc");
@@ -12746,7 +14007,9 @@ mod tests {
                     _request_format: None,
                 },
             )]),
-            session: None,
+            session: Arc::new(RwLock::new(None)),
+            reauthenticator: None,
+            reauthentication: Arc::new(Mutex::new(0)),
             retries: 0,
             control_timeout: Duration::from_secs(1),
             control_deadline: None,
@@ -12755,7 +14018,9 @@ mod tests {
             upload_rate_limit: None,
             cancellation: CancellationToken::default(),
             observer: None,
-            remote_mtime_unhonoured: Arc::new(AtomicBool::new(false)),
+            remote_mtime_unhonoured: Arc::new(AtomicUsize::new(0)),
+            md5_tasks: Arc::new(TaskGate::new(REMOTE_MD5_CONCURRENCY)),
+            counters: Arc::new(ClientCounters::default()),
         };
 
         let md5_only = client_for("SYNO.FileStation.MD5");
@@ -12958,7 +14223,7 @@ FplE
             .unwrap_err();
         assert_eq!(
             error.to_string(),
-            "unexpected response during SYNO.FileStation.List.list: successful response contained no directory data"
+            "unexpected response during SYNO.FileStation.List.list: successful response contained no directory data for \"/share/root\""
         );
         assert_eq!(server.join().unwrap().len(), 5);
     }
@@ -13100,6 +14365,7 @@ FplE
             throttle: None,
             cancellation: cancellation.clone(),
             streamed: None,
+            source_guard: None,
         };
         assert_eq!(reader.read(&mut [0_u8; 3]).unwrap(), 3);
 

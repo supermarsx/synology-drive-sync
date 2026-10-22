@@ -772,6 +772,19 @@ pub struct OutputArgs {
     )]
     pub progress_record: Option<PathBuf>,
 
+    /// Also write each finished sync or plan job's result to FILE, as NDJSON.
+    ///
+    /// One `sdsync.result-record.v1` line per job, written atomically when the command finishes,
+    /// whatever `--output` says, so a supervisor can read the counts without parsing the output
+    /// shown to a person. Like `--progress-record`, deliberately no `env`.
+    #[arg(
+        long = "result-record",
+        global = true,
+        value_name = "FILE",
+        help_heading = "Output/Logging"
+    )]
+    pub result_record: Option<PathBuf>,
+
     /// Select command-result output independently from diagnostic logs.
     #[arg(
         long,

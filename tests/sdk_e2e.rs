@@ -9,8 +9,8 @@ use support::TestDir;
 use support::file_station_mock::MockFileStation;
 use synology_drive_sync::cancel::CancellationToken;
 use synology_drive_sync::sdk::{
-    Engine, ErrorCode, EventControl, OtpChallenge, PlanDecision, SdkEvent, Secret, SecretProvider,
-    SecretProviderError, SyncRequest,
+    DeferredReason, Engine, ErrorCode, EventControl, MutationEvent, OtpChallenge, PlanDecision,
+    SdkEvent, Secret, SecretProvider, SecretProviderError, SyncRequest,
 };
 
 struct FixedSecrets {
@@ -392,4 +392,73 @@ fn panic_when_logout_starts_logs_out_without_reinvoking_the_observer() {
             .iter()
             .any(|request| request.operation() == "SYNO.API.Auth.logout")
     );
+}
+
+/// N4/N-6: the SDK reaches the command line's verdict. A file that changes while it is hashed is
+/// deferred by name and the run is partial, not failed; before, the SDK failed any run whose
+/// reconciliation plan was not empty, and the CLI did not.
+#[test]
+fn a_file_changing_during_hashing_makes_an_sdk_run_partial_not_failed() {
+    let server = MockFileStation::start();
+    // Present, so the remote walk lists it after the local scan and before hashing.
+    server.add_directory("/team/sdk");
+    let source = TestDir::new("sdk-deferral");
+    source.write("steady.txt", b"steady");
+    source.write("busy.log", b"first line\n");
+    let busy = source.path().join("busy.log");
+    server.on_next_request("SYNO.FileStation.List.list", move || {
+        std::fs::write(&busy, b"first line\nsecond line\n").expect("append to busy file");
+    });
+    let request = request(&server, &source);
+    let mut secrets = FixedSecrets::new();
+    let cancellation = CancellationToken::default();
+    let deferred_events = Arc::new(AtomicUsize::new(0));
+    let deferred_events_for_callback = Arc::clone(&deferred_events);
+
+    let outcome = Engine
+        .run(
+            &request,
+            &mut secrets,
+            &cancellation,
+            |_| PlanDecision::Apply,
+            move |event| {
+                if matches!(
+                    event,
+                    SdkEvent::Mutation {
+                        mutation: MutationEvent::PathDeferred { .. }
+                    }
+                ) {
+                    deferred_events_for_callback.fetch_add(1, Ordering::AcqRel);
+                }
+                EventControl::Continue
+            },
+        )
+        .expect("one busy file is not a failed run");
+
+    assert!(outcome.applied());
+    assert!(outcome.reconciled());
+    assert!(outcome.partial());
+    assert_eq!(outcome.deferred().len(), 1, "{:?}", outcome.deferred());
+    assert_eq!(outcome.deferred()[0].relative(), "busy.log");
+    assert_eq!(
+        outcome.deferred()[0].reason(),
+        DeferredReason::SourceChanged
+    );
+    // The plan an embedding application is shown names it too, as `plan` does on the command line.
+    let skipped = outcome.plan().skipped();
+    assert_eq!(skipped.len(), 1);
+    assert_eq!(skipped[0].relative(), "busy.log");
+    assert_eq!(skipped[0].reason(), "deferred");
+    assert!(!skipped[0].is_lasting());
+    assert_eq!(
+        outcome.execution().expect("execution summary").uploaded(),
+        1
+    );
+    assert_eq!(
+        server.file_contents("/team/sdk/steady.txt"),
+        Some(b"steady".to_vec())
+    );
+    assert!(server.file_contents("/team/sdk/busy.log").is_none());
+    // Deferred during planning, so it is reported in the outcome rather than as an execution event.
+    assert_eq!(deferred_events.load(Ordering::Acquire), 0);
 }

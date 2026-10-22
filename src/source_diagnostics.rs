@@ -62,7 +62,24 @@ fn finish_diagnostic(
 ) -> Result<SourceDiagnosticReport> {
     cancellation.check()?;
     if options.hash_content {
-        local::populate_content_md5(&mut inventory, cancellation)?;
+        // The sync's own per-file rule: a file that changes, vanishes or cannot be read while it
+        // is hashed is named among the skipped entries, with the reason a sync would give it,
+        // instead of failing the diagnosis of everything else.
+        let failed = local::populate_content_md5_selective_deferring(
+            &mut inventory,
+            &std::collections::BTreeSet::new(),
+            cancellation,
+        )?;
+        for (relative, error) in failed {
+            let reason = crate::sync::DeferReason::for_local_error(&error)
+                .unwrap_or(crate::sync::DeferReason::SourceUnreadable);
+            inventory.withhold(
+                &relative,
+                local::SkipReason::Deferred {
+                    detail: format!("{reason}: {error}"),
+                },
+            );
+        }
     }
     cancellation.check()?;
 
@@ -322,22 +339,31 @@ mod tests {
         ));
     }
 
+    /// A file that changes while it is hashed is reported as the sync would report it, named and
+    /// tagged, and left out of the counts, rather than failing the diagnosis of everything else.
     #[test]
-    fn hash_snapshot_change_is_propagated_and_never_returns_counts() {
+    fn hash_snapshot_change_is_named_and_left_out_of_the_counts() {
         let root = TestDir::new("changed-after-scan");
         let payload = root.path().join("payload.bin");
         fs::write(&payload, b"before").unwrap();
+        fs::write(root.path().join("steady.bin"), b"steady").unwrap();
         let rules = IgnoreRules::build(root.path(), &[]).unwrap();
         let inventory = local::scan(root.path(), &rules, &CancellationToken::default()).unwrap();
         fs::write(&payload, b"after-with-a-different-size").unwrap();
 
+        let report = finish_diagnostic(
+            inventory,
+            SourceDiagnosticOptions { hash_content: true },
+            &CancellationToken::default(),
+        )
+        .unwrap();
+        assert_eq!(report.files, 1);
+        assert_eq!(report.hashed_files, 1);
+        assert_eq!(report.inventory.skipped.len(), 1);
+        assert_eq!(report.inventory.skipped[0].relative, "payload.bin");
         assert!(matches!(
-            finish_diagnostic(
-                inventory,
-                SourceDiagnosticOptions { hash_content: true },
-                &CancellationToken::default(),
-            ),
-            Err(Error::SourceChanged(_))
+            &report.inventory.skipped[0].reason,
+            local::SkipReason::Deferred { detail } if detail.starts_with("source-changed:")
         ));
     }
 
@@ -373,6 +399,7 @@ mod tests {
         let inventory = LocalInventory {
             root: fs::canonicalize(root.path()).unwrap(),
             entries,
+            skipped: Vec::new(),
         };
 
         assert!(matches!(
