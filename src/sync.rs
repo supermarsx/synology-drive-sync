@@ -816,10 +816,7 @@ impl DeferralIndex {
             if let Some(reason) = self.exact.get(candidate) {
                 return Some(*reason);
             }
-            match candidate.rfind('/') {
-                Some(slash) => candidate = &candidate[..slash],
-                None => return None,
-            }
+            candidate = &candidate[..candidate.rfind('/')?];
         }
     }
 
