@@ -41,7 +41,7 @@ following fields are accepted:
 | `request_timeout_seconds` | unsigned integer or null | `7200` | Positive complete-request timeout. |
 | `retries` | unsigned integer or null | `2` | Retries after the first request, from `0` through `5`. |
 | `max_upload_rate` | unsigned integer or null | unlimited | Shared positive upload limit in bytes per second. |
-| `exclusions` | string array | `[]` | Gitignore-style local exclusion patterns. |
+| `exclusions` | string array | `[]` | Gitignore-style exclusion patterns; they fold case and Unicode normalisation when the source filesystem does, and protect matching NAS entries from deletion. |
 | `comparison` | string or null | `content` | `content`, `metadata`, or `size-only`. |
 | `deletion` | object or null | disabled | Explicit bounded mirror-deletion policy. |
 | `jobs` | unsigned integer or null | `2` | Concurrent mutation-worker count, from `1` through `16`. |
@@ -107,13 +107,24 @@ A successful result is:
   "schema": "sdsync.ffi-result.v1",
   "ok": true,
   "outcome": {
-    "plan": { "changes": [], "creates": 0, "copies": 0, "uploads": 0, "deletes": 0, "unchanged_files": 0, "protected_entries": 0, "upload_bytes": 0 },
+    "plan": { "changes": [], "creates": 0, "copies": 0, "uploads": 0, "deletes": 0, "unchanged_files": 0, "protected_entries": 0, "upload_bytes": 0, "skipped": [] },
     "applied": false,
     "reconciled": false,
-    "execution": null
+    "execution": null,
+    "deferred": [],
+    "recovered": { "retries": 0, "reauthentications": 0, "reauthentication_failures": 0, "keepalive_failures": 0, "server_tasks_not_stopped": 0 },
+    "incomplete_listings": []
   }
 }
 ```
+
+The `outcome` object also carries `deferred` (each path left for a later run, with its kebab-case
+reason and detail), `recovered` (the retries, re-authentications and other recoveries the run absorbed,
+under the same key names as the command-line result) and `incomplete_listings` (NAS folders DSM listed
+short). When `execution` is not `null` it holds `deleted`, `created`, `copied`, `uploaded`,
+`uploaded_bytes`, `mtime_not_kept`, `copy_fallbacks`, `deletes_skipped`, `kept_deletes_uploaded` and
+`renamed`. `plan.skipped` lists the paths the plan declines to carry. The reason names and which of
+them are lasting are in [Partial runs, deferrals and skips](../observability.md#partial-runs-deferrals-and-skips).
 
 A failure uses the same envelope with `ok: false` and an `error` object:
 
@@ -127,6 +138,11 @@ A failure uses the same envelope with `ok: false` and an `error` object:
   }
 }
 ```
+
+A run that fails after it already changed the NAS adds two optional members to `error`: `completed`
+(the same counters as `execution`, for the work that did happen) and `deferred` (the paths it had
+already left for a later run). They are absent when nothing had executed. Read them before retrying,
+because the mutations they count are not rolled back.
 
 Application error codes include `invalid-request`, `credential-unavailable`, `otp-required`,
 `authentication`, `local-filesystem`, `network`, `remote`, `safety`, `cancelled`, `reconciliation`,

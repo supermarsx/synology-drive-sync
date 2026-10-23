@@ -181,6 +181,11 @@ Alongside each cache file, `<profile>.rollup.json` holds the totals from the las
 a dashboard can render the whole picture without walking anything. It is written by the pass that
 computed it — it is not a sum over the cache, and nothing ever reads it back as an input.
 
+A writer's temporary file (`.tmp.<profile>.<pid>...`, named with a leading dot) is never read as a
+rollup, so a pass killed mid-write cannot turn into a `rollup-corrupt` issue. The next store in that
+directory removes temporaries older than 15 minutes, and a removal that fails is reported as
+`cache-cleanup-failed` rather than left to sit unnoticed.
+
 `status-rollup` prints them, per profile and combined:
 
 ```bash

@@ -204,7 +204,10 @@ Export any non-secret configuration and retain required audit logs. A real unins
 removes generated configuration, password/TOTP/remote-log-token files, routines, state, queue,
 locks, and package logs under `/var/packages/synology-drive-sync/{home,var}`. It leaves the local
 source, remote target data, DSM users, shares, ACLs, snapshots, and Drive configuration untouched.
-Deleted package credentials are not recoverable.
+Deleted package credentials are not recoverable. The uninstall script names anything it could not
+remove (`could not remove <path> (status N)`) and, when package data is still present afterwards,
+lists it and fails, rather than reporting a purge that did not happen; likewise `postinst`,
+`postupgrade` and the start script name the step (and path) that failed.
 
 ## Post-install acceptance evidence
 

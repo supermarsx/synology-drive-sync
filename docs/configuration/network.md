@@ -14,6 +14,24 @@ https://gateway.example.com/nas/
 An optional path prefix is supported. For `/nas/`, the proxy must rewrite `/nas/webapi/*` to DSM's
 `/webapi/*`. A File Station browser alias alone is not proof that WebAPI routing works.
 
+## Forward proxies from the environment
+
+The client honours the standard proxy environment variables, so traffic can leave through a forward
+proxy you did not configure here. For the configured URL's scheme it reads `HTTPS_PROXY` or
+`HTTP_PROXY` (upper case first), then `ALL_PROXY`; an empty value means none; no proxy is used under
+CGI (`REQUEST_METHOD` set); and `NO_PROXY` exempts hosts by `*`, exact host, domain suffix, IP address
+or CIDR range. Credentials in the proxy URL are never printed.
+
+Because nothing else says the NAS is reached through a third party, `sync`, `plan`, `status` and
+`doctor` print a warning after connecting that names the proxy and the variable it came from, and tell
+you to set `NO_PROXY=<nas host>` to connect directly. With `--allow-http` the warning adds that the
+password crosses the proxy unencrypted. `--quiet` suppresses it. When API discovery fails, the error
+says where it failed: `File Station API discovery failed at http://host:port; ...` for a direct
+connection, or `... through the forward proxy http://proxy:port (from HTTP_PROXY); ...` when one was
+used. Whether a job run by the DSM package inherits a proxy from the Control Panel is not known from
+the code alone; [the NAS questions](../production-acceptance.md#questions-only-a-real-nas-can-answer)
+say how to check what such a job really sees.
+
 ## Routing-only diagnostic
 
 Before provisioning credentials, test TLS, proxy routing, and API discovery:
@@ -81,7 +99,7 @@ cooperative shutdown.
 
 `retries` defaults to 2 and accepts 0 through 5. Retryable transport, busy, HTTP 408/429, and
 502/503/504 failures are bounded. File Station has no resumable upload protocol. In content mode, a
-lost response first triggers an exact remote size and MD5/CRC32/SHA-256 fingerprint check; if completion cannot be proved, the
+lost response first triggers a check of the destination's exact size, modification time and server-side MD5; if completion cannot be proved, the
 retry restarts the whole file.
 
 ## Upload rate limit
@@ -96,6 +114,12 @@ jobs = 4
 Four jobs divide the one budget; they do not each receive 1 MiB/s. Raise `timeout` above the largest
 single file divided by the configured rate. A 4 GiB file at 1 MiB/s needs roughly 4096 seconds before
 protocol and retry overhead.
+
+The client enforces that relationship before sending anything. An upload whose minimum duration at
+`max-rate` (its size less one second of budget, divided by the rate) already exceeds `timeout` is refused
+with a configuration error that names the file, the seconds needed and both settings, instead of being
+sent `retries + 1` times and timing out each time. The check is a lower bound: other concurrent uploads
+sharing the budget only make a transfer longer.
 
 The reverse proxy and DSM must also permit the largest request body and a connection long enough for
 that rate. Prove both with the [production acceptance runbook](../production-acceptance.md).

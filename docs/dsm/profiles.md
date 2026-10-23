@@ -24,7 +24,7 @@ Create a distinct profile, validate it, and remove the old one when a name must 
 
 Comparison behavior:
 
-- **Content** requires size, MD5, IEEE CRC32, SHA-256, and mtime evidence and is the strongest normal correspondence mode.
+- **Content** compares size and File Station's server-side MD5 (a modification time that moved alone does not trigger an upload); deletions and server-side copies additionally require the complete MD5, IEEE CRC32 and SHA-256 fingerprint. It is the strongest normal correspondence mode.
 - **Metadata** uses size and mtime and can miss same-size/same-time content changes.
 - **Size only** is the weakest and should be reserved for a deliberately accepted workflow.
 

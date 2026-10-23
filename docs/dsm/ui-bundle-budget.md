@@ -35,22 +35,24 @@ stylesheet is now spent as a lever, and the numbers say so:
   `from`/`to`, `minmax(112px, 0.72fr)`, newline-anchored selectors, and the 260/220-char keyframe
   windows. No minifier has a knob for any of them.
 
-The bundle exceeds the 512,000-byte hint by about 62.1 KB. It was about 34.3 KB over before the run-outcome
+The bundle exceeds the 512,000-byte hint by about 91.1 KB (603,128 bytes). It was about 62.1 KB over before the
+adversarial-audit fix round described [below](#what-the-audit-fix-round-cost-and-what-that-28970-bytes-is-made-of),
+about 34.3 KB over before the run-outcome
 surfaces landed (reason copy, attention list, per-profile last run, stale rendering; about 17.3 KB, of
 which most is operator-visible prose naming each cause and next step); about 31.3 KB over before the
 realtime routine surfaced its `backend_reason` and last-poll age, the manual Refresh and snapshot
 diffing were fixed, and the Activity search box was debounced; about 28.5 KB over before the
 Activity route split into event-lens tabs; about 19.6 KB over before the in-service read failures
 were named; about 10.0 KB over before queued progress landed; and about 21.7 KB over before the
-stylesheet was condensed. Any further reduction has to come out of the JavaScript: at ~451.2 KB
-excluding the embedded stylesheet, that is where the remaining headroom is, and there is no second
+stylesheet was condensed. Any further reduction has to come out of the JavaScript: at ~479.3 KB
+excluding the embedded stylesheet (~451.2 KB before the audit fix round), that is where the remaining headroom is, and there is no second
 stylesheet-shaped win behind it.
 
-Eight features have landed over the budget since it was first written (the timestamped log view and
+Nine pieces of work have landed over the budget since it was first written (the timestamped log view and
 per-category clearing, the stored-totals summary that made the Sync section open without a walk,
 queued-job progress, the named in-service read failures with the stale-status age and cause, the
 Activity route's event-lens tabs, and then the realtime `backend_reason` surfacing alongside the
-dashboard review fixes above, and the run-outcome surfaces). Each was worth its bytes; none of them is where the headroom is.
+dashboard review fixes above, the run-outcome surfaces, and the adversarial-audit fixes). Each was worth its bytes; none of them is where the headroom is.
 
 ### What the Activity tabs cost, and what that 2,853 bytes is made of
 
@@ -125,6 +127,35 @@ nothing, so the dependency runs one way, but two of the Python harnesses execute
 with its whole import block stripped. Nothing in `App.vue` may therefore reference those constants at
 module-evaluation time — `snapshotStaleEscalationMs()` is a function rather than a `const` for
 exactly that reason.
+
+### What the audit fix round cost, and what that 28,970 bytes is made of
+
+The adversarial-audit fixes to the dashboard grew `dist/SynologyDriveSync.js` from 574,158 to 603,128 bytes, +28,970,
+and `dist/style.css` from 122,938 to 123,846, +908. The stylesheet is embedded in the bundle, so its
+908 bytes are counted inside the 28,970 and the JavaScript proper grew by about 28,062.
+
+The ceiling is a webpack `hints: "warning"` threshold, not an enforced gate (see the top of this
+page): it was already exceeded before this round, and this round moves the excess from about 62.1 KB
+to about 91.1 KB. Nothing fails because of it, and the limit in `webpack.config.js` was not raised.
+
+Unlike the tables above, these bytes were **not** measured by building with each block removed: the
+fixes landed together and share code. What follows is the growth of the *source* files (before
+comments are stripped and the bundle is minified, so it overstates the bundle and should be read
+only as proportions):
+
+| Source | Before | After | What it holds |
+| --- | ---: | ---: | --- |
+| `outcomes.mjs` | 28,787 | 46,130 | The reason vocabulary (30 further labels, each a cause and a next step, now 96 rows), the labels for the new engine deferral and skip names, `routineDeferCopy`, schema checks for the outcomes document, stale/long-running/stalled signals |
+| `App.vue` | 493,124 | 513,580 | The patch-guard boundary and error banner, per-feed failure text, the retained run-stderr view, the not-yet-applied and saved-with-warnings notices, the clock tick, minimised-window and Logs back-off |
+| `widgetModel.mjs` | 23,798 | 27,741 | Widget back-off from the second unnamed failure, the clock tick, routine wait labels, blocked-routine row |
+| `api.js` | 77,370 | 80,657 | Failure description with status, code and message, mutation warnings handed to the window |
+| new `errorCopy.mjs`, `feedModel.mjs`, `textSafety.mjs`, `uiErrors.mjs` | 0 | 15,631 | Per-code failure copy, collision-free Activity row keys and feed document checks, bidi and zero-width escaping, the plain-DOM error banner |
+
+Much of the growth is operator-visible prose again (the reason labels and the failure copy), which a
+minifier cannot touch and which is the feature: `reason-vocabulary.test.mjs` now fails on any reason
+token the package can write that has no label, so a new token cannot silently fall back to its raw
+code. The structural alternative is the same one declined above, packing prose into arrays, and it
+is declined for the same reasons. Any reduction still has to come out of the existing JavaScript.
 
 ## Constraints on transforming the stylesheet
 

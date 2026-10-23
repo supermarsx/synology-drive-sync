@@ -83,7 +83,11 @@ session:
 - it never polls faster than the AppWindow's own **Status refresh** setting, which it reads from the
   same stored preference, so raising that setting also slows the widget;
 - consecutive failures back the interval off to a five-minute floor, and one successful read clears
-  the backoff. The card keeps displaying the last snapshot it did retrieve and marks itself
+  the backoff. A failure the package did not name (the request never completed, or an HTTP 401, 429 or
+  5xx without a package code) ramps the same way from the second consecutive failure;
+- a DSM window that has been minimised (its element reports no layout box) rests at the 60-second
+  cadence and resumes at once when it is restored. This is a heuristic: if DSM hides a window another
+  way, nothing slows, which costs load but not correctness; The card keeps displaying the last snapshot it did retrieve and marks itself
   `Retrying slowly` rather than blanking.
 
 ### When the widget cannot read the package
@@ -170,7 +174,11 @@ whether the window keeps asking:
 
 The Activity and Logs feeds settle independently of each other and retain their rows the same way,
 so the feed state beside them dates what is left on screen: `activity feed unavailable, retained
-rows are 4 hours old`. `docs/dsm/troubleshooting.md` lists the codes and what each one means.
+rows are 4 hours old`. A feed that fails shows the cause (HTTP status, the package's error code and
+message) above the tabs, whichever is open, and the “no events recorded” text appears only after a
+read that succeeded: a failed or still-running first read never reads as an empty history. A document
+in an unexpected shape counts as a failed read. Status ages and the clock are kept moving between
+polls (a 30-second tick), so an old reading does not look fresh just because nothing replaced it. `docs/dsm/troubleshooting.md` lists the codes and what each one means.
 
 Every retained document lives in the window that read it. It is never keyed, never shared between
 tabs, never written to browser storage, and gone when the window closes: a tab is one DSM session,
@@ -200,7 +208,9 @@ Overview is an operational summary, not a substitute for Doctor or a reviewed Pl
 An **attention list** above these cards (on Overview and Activity) names every run outcome that needs
 a look: a failed or died run with its cause, consecutive failures against the alert threshold,
 unreadable failure alerts, partial runs and skipped or deferred entries, records that could not be
-written, and unreadable status figures. It persists in every poll until a success clears it, so it
+written, a run that has been going for more than six hours or has shown no progress for 30 minutes,
+a routine whose deletion limit can never be satisfied (*blocked*), a configuration saved but not yet
+applied by the running controller, and unreadable status figures. It persists in every poll until a success clears it, so it
 does not depend on having seen a notification, and a failure that happened while the page was closed
 is announced once, by a toast, when it loads. Each profile shows a “Last run:” line, the
 tree-comparison table notes “Last run failed: …” beside a profile whose last run failed (a comparison
@@ -224,8 +234,11 @@ and three secret-state editors. See:
 - [Secrets and protected values](secrets.md) for keep, replace, clear, non-disclosure, and ordering.
 
 The underlying save is queued, but the page polls its sanitized result and reports success only after
-the controller completes it. Configuration is applied first, followed by each requested secret
-operation in order. A lost POST acknowledgement is recovered by replaying the exact serialized
+the controller completes it. A save that completed but carries warnings (for example, the running
+controller could not be told to reload, so the previous schedule or policy is still in effect) is shown
+as saved with a persistent red *Saved, but it is not fully in effect* notice that names each warning
+and can be dismissed; it is never reported as plain success. Configuration is applied first, followed by
+each requested secret operation in order. A lost POST acknowledgement is recovered by replaying the exact serialized
 request, request ID, authentication snapshot, and CSRF token up to two times; the package returns the
 same job instead of creating a duplicate. Configuration and secret stages also have bounded result
 observation so the editor cannot stay busy indefinitely.
@@ -318,14 +331,20 @@ back to all. Pause/resume live updates and Clear view act on the whole page and 
 on every tab.
 
 Package logs supports `100`, `200`, `500`, or `1000` lines and can pause live updates without
-stopping package logging. For each source, retained rotations are read oldest to newest before the
-active file; the newest requested suffix that fits the response budget is returned. A selected
-source is read alone; the `all` response is globally bounded below the bridge capture limit.
+stopping package logging. For each source the service reads the retained rotations backwards from the
+newest line, so the newest requested suffix that fits the response budget is returned; a source whose
+read stopped at its scan budget says *newest lines only; older history was not scanned*. A selected
+source is read alone; the `all` response is globally bounded below the bridge capture limit. The
+**Core error output** source shows the core's own stderr of the last few runs. Every error line is
+shown whatever the log level, and a path in a sync-log record is shown decoded from its percent-encoded
+form.
 **Clear view** clears only the browser presentation; it does not delete package logs.
 
 Snapshot polling pauses while the document is hidden. Log polling occurs only while the Package
-logs tab is open and not paused: the event tabs poll only the Activity feed, since the package log
-read forks the NAS's shell manager and the event tabs never render its result. Opening the Package
+logs tab is open and not paused: the event tabs poll only the Activity feed, since the event tabs never
+render a log read's result. The next log read waits at least three times as long as the last one took,
+rests at the 60-second cadence in a minimised window, and ramps like the status poll after two
+consecutive failures. Opening the Package
 logs tab fetches logs immediately rather than waiting for the next poll tick. Refresh intervals are
 controlled in Settings. **Manual only** cancels the corresponding background timer while retaining
 the explicit Refresh or Activity-page reload action. Full event and retention details are in

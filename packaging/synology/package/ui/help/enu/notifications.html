@@ -41,6 +41,6 @@
   <p>This package acquires no DSM resource worker, so it registers no Control Panel notification rule and installs no Log Center pattern. Email, SMS, mobile, and CMS delivery cannot be enabled through this package.</p>
 
   <h2>Open-session signals</h2>
-  <p>Browser notification and audible-cue settings are optional, non-secret preferences for the current browser. Saving them requires the notification-change policy and records a fixed <code>session-notifications</code> audit event before local persistence. They operate only while the AppWindow session can observe a newly failed result and do not replace DSM package alerts.</p>
+  <p>Browser notification and audible-cue settings are optional, non-secret preferences for the current browser. Saving them requires the notification-change policy and records a fixed <code>session-notifications</code> audit event before local persistence. They operate only while the AppWindow session can observe a newly failed result and do not replace DSM package alerts. Every new failure notifies once however often the page is refreshed: a failed run, a run whose runner died, an outcome the package could not interpret, and a failed profile of an all-profiles run all count. The first status a window reads is its baseline, so a failure already present when the window opens is announced by the message in the window and the Overview list, not by a notification. If the browser refuses a notification, the window says so instead of dropping it.</p>
 </body>
 </html>

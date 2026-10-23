@@ -120,15 +120,37 @@ comparison above, which is the one mechanism that can confirm it outright.
   nothing is deleted on its account, and the run exits `3` so a scheduler retries it. The reasons
   and what to do about each are in
   [partial runs, deferrals and skips](../observability.md#partial-runs-deferrals-and-skips).
-- A source root that is a link or reparse point, special files (FIFO, socket, device), unreadable
-  entries and refused portable names (`~foo`, `aux.h`, a trailing dot) still fail the run unless
-  excluded.
-- Case-only renames and NFC/NFD spellings converge; only a true collision (two names that fold to
-  one) is skipped, with both spellings named. Rename one to continue.
+- Refused portable names (`~foo`, `aux.h`, a trailing dot), names over 255 bytes, paths too long once
+  the destination prefix is added, special files (FIFO, socket, device), a modification time before
+  1970, and folders this account may not list no longer fail the run. Each is named as a lasting
+  `unsupported-entry` or `local-permission-denied` warning, never uploaded and never deleted from the
+  NAS, and the run exits `0`: fix the name or permission, or exclude it, to clear the warning. Only a
+  source root that is a link or reparse point, or an `.sdsyncignore` that is not ordinary data, still
+  fails the run.
+- A NAS refusal of one path (`NAS refused SYNO.FileStation.Upload.upload of "/team/x" with code 418`)
+  is a lasting `remote-refused` warning naming the path and the code; its siblings still sync. If most
+  of the run is refused for one cause, the run fails once instead and names the cause. Quota and full-disk
+  errors (`415`, `416`), a read-only volume (`411`) and session errors stay run failures.
+- A local file where the NAS holds a folder (or the reverse), a local entry at a NAS link, and a NAS-only
+  folder kept for an excluded entry are named skips (`type-conflict`, `remote-link`,
+  `protected-descendant`), not run failures. Two failures keep the whole run: `remote-real-path-unusable`
+  (most folders look like links, which means DSM's `real_path` answers are not what the link guard
+  expects; run `doctor` and compare with the
+  [NAS questions](../production-acceptance.md#questions-only-a-real-nas-can-answer)) and a
+  refusal breaker that trips.
+- A case-only rename (`Report.pdf` to `report.pdf`) under `--delete` is one File Station rename; if it
+  cannot be made it is a lasting `case-rename-pending` warning and nothing is deleted. NFC/NFD
+  spellings converge; only a true collision (two names that fold to one) is skipped, with both
+  spellings named. Rename one to continue.
+- `--exclude` patterns fold case and Unicode normalisation on a source that does (Windows, macOS, most
+  SMB mounts), on both sides: `--exclude report.pdf` also protects a NAS-only `Report.pdf` and keeps a
+  local `Report.pdf` from uploading.
 - `metadata` comparison treats a remote second equal to the floor or the rounded value of the local
   time as unchanged, so an edit of the same size within the same second is not detected; use
   `--compare content` where that matters.
-- Exit code `3` means "partial, retry later"; it is not a failure. Alert on `1`, `2` and `130`.
+- Exit code `3` means "partial, retry later"; it is not a failure. Alert on `1`, `2` and `130`. A
+  condition only a person can clear exits `0` with a named warning, so check `deferred` and `skipped`
+  in the result, not only the exit code.
 - A mapped drive letter may be absent in a service logon. Use a proven UNC path or mount lifecycle.
 
 See [local, mapped-drive, and SMB sources](../local-and-smb-sources.md).
@@ -136,7 +158,7 @@ See [local, mapped-drive, and SMB sources](../local-and-smb-sources.md).
 ## Uploads retry from zero
 
 File Station exposes no resumable upload protocol. After a lost response, content mode checks whether
-the exact expected size and complete MD5/CRC32/SHA-256 fingerprint already arrived. If it cannot prove completion, the retry restarts the
+the exact expected size, the modification time sent and the server-side MD5 already arrived. If it cannot prove completion, the retry restarts the
 whole file. Account for this in bandwidth, proxy, and scheduler limits.
 
 ## A plan changed before execution

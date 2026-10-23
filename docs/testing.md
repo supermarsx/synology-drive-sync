@@ -30,9 +30,15 @@ The deterministic suite has these complementary layers:
   vocabulary: a file that changes while it is hashed (exit `3`, `outcome: "partial"`, the deferral
   carried to the next run), a source that vanishes after upload, DSM session expiry with exactly one
   re-login, paginated and Advanced-Permission-hidden listings, a server-side copy that finishes with an
-  error, and the guarantee that a case-renamed or Unicode-paired name is never deleted when its upload
-  is deferred. `tests/scan_skip_protection.rs` walks and plans a real tree holding a link, SYSTEM files
-  and OS metadata files and asserts that only the genuinely remote-only file is deleted.
+  error, and the guarantee that a case-only rename is one File Station rename that deletes nothing (a
+  refused or blocked rename becomes a named `case-rename-pending` warning, never a delete) and that a
+  Unicode-paired name is never deleted when its upload is deferred. `tests/scan_skip_protection.rs`
+  walks and plans a real tree holding a link, SYSTEM files and OS metadata files and asserts that only
+  the genuinely remote-only file is deleted. `tests/engine_adversarial.rs` and
+  `tests/file_station_remote.rs` drive the real binary against the mock with the failures a
+  production NAS produces per path (a name DSM refuses, a remote symbolic link, a name the walk cannot
+  address, a share-wide refusal, an exclude that must protect every spelling) and assert that the run
+  names the path, deletes nothing on its account and lets its siblings finish.
 - **Dashboard surface tests** (`packaging/synology/ui-src/test/outcomes-surface.test.mjs` and the
   widget and AppWindow contract tests) feed every outcome, every reason code, unknown tokens and
   hostile input through the pure `outcomes.mjs` model and assert that nothing renders as plain success
@@ -41,7 +47,9 @@ The deterministic suite has these complementary layers:
 These layers use local filesystem fixtures and mock HTTP servers. They do not log in to a live NAS,
 mutate the host credential vault, or prove compatibility with a particular DSM, File Station, TLS,
 or reverse-proxy release. A disposable target on the intended NAS must still pass the steps in
-[Production acceptance](production-acceptance.md).
+[Production acceptance](production-acceptance.md), and the
+[questions only a real NAS can answer](production-acceptance.md#questions-only-a-real-nas-can-answer)
+list the behaviours the mock can only assume.
 
 ## Reproducible source coverage
 

@@ -157,8 +157,8 @@ not have them, so every record listed before this release renders byte for byte 
 | `session` | `session.established` | SID length, whether a token was issued, the requested login format, and whether the server set a cookie. |
 | `call` | `api_call.*`, `retry.scheduled` | One HTTP round trip: see below. |
 | `reason` | `run.failed`, `run.partial`, `upload.failed`, `entry.skipped`, `entry.deferred`, `result_record.failed` | The class of the failure, skip or deferral: one token from the closed list below. Never error text. |
-| `profile` | records attributable to one profile | The profile name (`[A-Za-z0-9_-]`). |
-| `path` | `upload.failed`, `entry.skipped`, `entry.deferred`, `result_record.failed` | Relative path of the entry concerned, sanitised like every other runtime text (any byte outside `A-Z a-z 0-9 . - _ / : ,` reads as `_`, non-ASCII included) and cut at 128 bytes with a trailing `~`. Never on authentication or connection records. |
+| `profile` | records attributable to one profile | The profile name (`[A-Za-z0-9_-]`). Every record of a profile's sync or plan job carries it, including the transport's `api_call.*` and `retry.scheduled`. |
+| `path` | `upload.failed`, `entry.skipped`, `entry.deferred`, `result_record.failed`, and `run.failed` when the failure concerns one entry | Relative path of the entry concerned, percent-encoded so it stays one safe token and decodes exactly: every byte outside `A-Z a-z 0-9 . - _ / : ,` (non-ASCII, space and `%` included) is written `%XX`. Cut at 255 characters with a trailing `~`, which never splits an escape. Never on authentication or connection records. |
 
 `run.partial` replaces `run.completed` for a run that finished without error but left entries for
 the next run (changed during the run, a kept deletion, a refused server-side copy); the entries
@@ -216,7 +216,7 @@ carrying in a way the server does not expect.
 ### What these records deliberately cannot contain
 
 The record types are closed. Every member is an enum, an integer, a boolean, a compile-time string,
-or a bounded token that has passed a sanitizer retaining only `A-Z a-z 0-9 . - _ / :`. There is no
+or a bounded token that has passed a sanitizer retaining only `A-Z a-z 0-9 . - _ / :` (a path keeps its other bytes as `%XX` escapes). There is no
 member capable of holding a password, an OTP code, a SID, a SynoToken, a cookie, a header value, a
 request-field value, or a response body — not because a filter removes them, but because no type in
 the record can represent them.
@@ -273,7 +273,7 @@ For example, a single-profile `plan --output json` returns the full plan in one
 `sdsync.plan.v1` object:
 
 ```json
-{"schema":"sdsync.plan.v1","plan":{"summary":{"uploads":1,"upload_bytes":5242880,"server_copy_fallback_bytes":0,"server_copies":0,"directories":1,"deletions":0,"unchanged_files":41,"protected_entries":0,"changes":true},"actions":{"pre_deletes":[],"creates":[{"relative":"releases","remote_path":"/team/export/releases","reason":"missing-remote"}],"copies":[],"uploads":[{"relative":"release.bin","remote_path":"/team/export/release.bin","bytes":5242880,"mtime_ms":1785769200000,"reason":"content-differs"}],"post_deletes":[]}}}
+{"schema":"sdsync.plan.v1","plan":{"summary":{"uploads":1,"upload_bytes":5242880,"server_copy_fallback_bytes":0,"server_copies":0,"directories":1,"deletions":0,"renames":0,"unchanged_files":41,"protected_entries":0,"changes":true},"actions":{"pre_deletes":[],"creates":[{"relative":"releases","remote_path":"/team/export/releases","reason":"missing-remote"}],"copies":[],"uploads":[{"relative":"release.bin","remote_path":"/team/export/release.bin","bytes":5242880,"mtime_ms":1785769200000,"reason":"content-differs"}],"post_deletes":[],"renames":[]}}}
 ```
 
 ### Change reasons
@@ -282,30 +282,35 @@ Every `upload` and `create-directory` action carries the comparison that schedul
 plan renders the reason and its explanation after the action line:
 
 ```text
-  UPLOAD release.bin -> /team/export/release.bin (content-differs: size equal, complete MD5/CRC32/SHA-256 fingerprint did not match)
+  UPLOAD release.bin -> /team/export/release.bin (content-differs: size equal, MD5 content digests differ)
 ```
 
 | `reason` | Meaning | Emitted by |
 | --- | --- | --- |
 | `missing-remote` | No remote entry exists at the mapped path | every compare mode |
 | `size-differs` | Local and remote sizes differ | every compare mode |
-| `mtime-differs` | Sizes agree and the modification times differ at File Station's whole-second resolution: the remote second is neither the floor nor the rounded value of the local time | `metadata`, `content` |
+| `mtime-differs` | Sizes agree and the modification times differ at File Station's whole-second resolution: the remote second is neither the floor nor the rounded value of the local time | `metadata`; `content` only for an empty file or when no usable fingerprint pair exists |
 | `content-differs` | Sizes agree and the content digests did not compare equal | `content` |
 | `type-replaced` | A remote entry of the other kind occupies the path and is replaced | every compare mode |
 
 The reason never claims a comparison the selected mode did not make. `--compare size-only`
 therefore reports only `missing-remote`, `size-differs`, and `type-replaced`, and only
-`--compare content` can report `content-differs`. Equality requires the complete MD5, IEEE CRC32,
-and SHA-256 fingerprint. When content mode has no usable fingerprint pair but
+`--compare content` can report `content-differs`. Equality requires matching size and MD5: the
+comparison uses File Station's server-side MD5, and a pair whose strong digests are both known and
+disagree is a difference even when the MD5s match. The complete MD5, IEEE CRC32 and SHA-256
+fingerprint is required only where a digest authorises a mutation, namely a deletion guard and the
+source of a server-side copy. When content mode has no usable digest pair but
 the modification times differ, it reports the difference it did observe, `mtime-differs`.
 
 `sync --output json` uses `sdsync.sync.v1`, retains the complete `plan`, and adds `result`. A changed
 sync result contains `changed`, `uploaded`, `server_copied`, `upload_bytes`,
-`directories_created`, `deleted`, `deletes_skipped`, `kept_deletes_uploaded`, `changed_during_run`,
+`directories_created`, `deleted`, `renamed`, `deletes_skipped`, `kept_deletes_uploaded`, `changed_during_run`,
 `failed`, `outcome`, `deferred`, `mtime_not_kept`, `skipped`, `incomplete_listings`,
 `incomplete_listing_folders`, `recovered`, and `elapsed_ms`; an already-synchronized run uses
 `"result":{"changed":false}`. [Partial runs, deferrals and skips](#partial-runs-deferrals-and-skips)
-defines the verdict fields.
+defines the verdict fields. In human output a case-only rename is a `RENAME <from> -> <to>` line of the
+plan, and a sync that made any closes with `N case-only rename(s) were made on the NAS with File Station
+Rename.`
 
 `deletes_skipped` counts planned mirror deletions the run kept rather than performed: the local path
 exists again, or a kept deletion beneath a directory left it non-empty. `kept_deletes_uploaded` counts
@@ -351,21 +356,35 @@ rule: it exits `3` and names a file it could not fingerprint in `plan.skipped` (
 an `entry.deferred` record. Failure (`1`) and cancellation (`130`) keep their own codes. Lasting items
 are reported, logged and warned about, but exit `0` with `outcome: "complete"`.
 
-`result.deferred[]` is `{path, reason, detail}` per path left for a later run (a deletion withheld because of a deferred partner carries that partner's reason). `plan` exits `0` when every deferral is lasting. The SDK `DeferredReason` has the same eleven tokens:
+`result.deferred[]` is `{path, reason, detail}` per path left for a later run (a deletion withheld because of a deferred partner carries that partner's reason). `plan` exits `0` when every deferral is lasting. The SDK `DeferredReason` has the same seventeen tokens and `is_lasting()`, which asks the engine rather than keeping its own list.
+
+**Lasting means exit `0`.** A condition only a person can clear (a name the NAS or Synology Drive refuses,
+a permission, a file type, a spelling to rename) is *lasting*: the run completes, `outcome` is
+`complete`, and the path is named with its reason in `deferred` or `skipped`, logged as a warning, and
+shown by the DSM dashboard as amber "synced with warnings" rather than green. Making such a run
+`partial` would only make it re-run forever under a realtime trigger and bury the warning. A condition
+that clears by itself (a file still changing, a lock, a checksum the NAS could not compute) is
+*transient*: the run is `partial` and exits `3`.
 
 | `reason` | Meaning and what to do | Lasting |
 | --- | --- | --- |
 | `source-changed` | The local file changed while it was hashed or sent. It is never sent torn: the transfer is aborted and the destination left as it was. Re-run once the writer is done. | no |
 | `source-vanished` | Deleted locally during the run. Re-run; the deletion is then planned normally. | no |
-| `source-unreadable` | Locked or not permitted. Release the lock or fix the permission. | no |
+| `source-unreadable` | Locked or otherwise briefly unreadable (a sharing violation, a transient I/O error). Release the lock and re-run. A permission refusal is `local-permission-denied` instead. | no |
 | `remote-digest-unavailable` | The NAS could not compute the checksum of this one file. Only per-file DSM or HTTP outcomes defer; transport, session, permission and busy errors still fail the run once, with that cause. | no |
 | `remote-changed` | The NAS entry changed after planning, or an upload destination had appeared. Left as found, never overwritten. | no |
 | `server-copy-failed` | The NAS-side copy finished with an error; the file is uploaded next run. | no |
-| `delete-failed` | The NAS refused the deletion; it is retried next run. | no |
+| `delete-failed` | The NAS failed the deletion for a reason other than permission (for example code 900); it is retried next run. | no |
 | `unrepresentable-name` | A NAS name this host's filesystem cannot hold (a trailing dot or space, a reserved device name, characters NTFS refuses). Never deleted on that account. | yes |
 | `unsupported-local-entry` | Not a regular file or directory the sync carries, including a Windows file whose open fails with error 1920 or 1921. | yes |
 | `remote-unreadable` | The NAS does not let this account read the file (for example DSM code 105), so it is never compared or deleted until its permissions change. Exit `0` with a warning. | yes |
 | `listing-incomplete` | The NAS folder listed fewer entries than it counted on two stable reads, typically Advanced Permission hiding items. Deletions among its direct children, the folder itself and its ancestors are withheld; other folders are unaffected. | yes |
+| `remote-refused` | DSM refused this one path: its name (code 418, 414, 1100, 1101), its size for the destination filesystem (1804), or this account's permissions (105 once the session is proven alive, 407). The detail reads `NAS refused <api.method> of "<path>" with code N: ...`. A refused folder also withholds its own subtree; its siblings carry on. Rename it or change the permission. If three or more refusals share one cause and are more than half of the folders and files attempted, the run **fails** instead, naming the cause and the paths. | yes |
+| `remote-skipped` | A NAS entry the walk will not carry: a name this tool cannot address (a control character, a backslash), a link out of the destination, or a folder already walked. Never deleted, overwritten or descended, and its folder and ancestors are kept. Rename or remove it on the NAS. | yes |
+| `unsupported-entry` | A local name, path or entry kind Synology Drive cannot hold: a refused name (leading `~`, a control character, one of `* : ? " < >` or a pipe, a trailing dot or space, a reserved device name), a path over 247 characters once the destination prefix is prepended, a name over 255 bytes, a non-UTF-8 name, a FIFO, socket or device, or a modification time before 1970. In a `plan` it appears in `plan.skipped` with the tag `deferred` and a detail starting `unsupported-entry:`. Never uploaded, and the NAS copy is never deleted. Rename or exclude it. | yes |
+| `local-permission-denied` | This account may not read the local file or list the folder (permission denied). A folder that cannot be listed is withheld whole: nothing beneath it is deleted on the NAS. Change the permission. | yes |
+| `delete-not-permitted` | DSM refused to delete the entry for permission (105 once the session is proven alive, or 407). The entry stays until the folder's rights change. Any other refused deletion (for example code 900) is `delete-failed`. | yes |
+| `case-rename-pending` | A case-only rename on the NAS was not made or did not finish: File Station refused it, the DSM has no `Rename` v2, the old spelling holds entries a rename must not move (excluded, DSM-managed, mounted or set-aside ones, or anything deferred in this run), or the NAS still holds the old spelling beside the new one. Nothing is deleted on its account and the content keeps syncing under the NAS spelling. A leftover second spelling is never touched and is always reported. Rename or remove it in File Station. | yes |
 
 `result.skipped` is a count and `plan.skipped[]` is `{path, reason, detail}` for paths the plan
 declines to carry for a lasting reason. The scan no longer aborts on them:
@@ -377,7 +396,10 @@ declines to carry for a lasting reason. The scan no longer aborts on them:
 | `dehydrated-placeholder` | A cloud or HSM placeholder (`RECALL_ON_DATA_ACCESS`, `RECALL_ON_OPEN` or `OFFLINE`). Reading it would start a download, so it is not read; hydrate it to sync it. |
 | `local-case-collision` | Two local names differ only by case or Unicode normalisation; both are named and neither is sent. |
 | `remote-case-collision` | The destination already holds two such spellings; both are named and nothing is deleted. |
-| `case-rename-needs-delete` | A case-only rename, which removes the old remote spelling and so needs `--delete`. Under `--delete` a rename converges: the new spelling is uploaded and the old one removed. |
+| `case-rename-needs-delete` | A case-only rename, which needs `--delete`. Under `--delete` it is one File Station `Rename` (listed in `plan.actions.renames`, counted in `summary.renames` and `result.renamed`, executed last and deepest first); it uploads and deletes nothing. Without `--delete` the old spelling is kept. See `case-rename-pending` when a rename cannot be made. |
+| `type-conflict` | A local file where the NAS holds a folder (or the reverse), or a local entry at a NAS mount point, that this run may not replace: no `--delete`, or the NAS folder holds an excluded, DSM-managed or mounted entry. Both sides are left as they are. Not a run failure. |
+| `remote-link` | A local entry where the NAS holds a link to somewhere else (`mount_point_type` `link`, or a real path that is not the folder's own). Nothing is written, deleted or descended at or beneath it, so local content there is not backed up until the link is replaced by a folder. |
+| `protected-descendant` | A NAS-only folder a mirror would delete, kept because it holds an excluded or DSM-managed entry, named once at the topmost such folder. Remove that entry in File Station to let the folder go. |
 | `deferred` | A deferral named in the plan; `detail` reads `<reason>: <cause>`. Unlike the other tags it is transient and, in a `plan`, makes the exit code `3`. A deletion withheld on a deferred path's account carries that path's reason. |
 
 A skipped path's remote copies are protected, not deleted. Skips appear as `SKIPPED` lines in human
@@ -396,13 +418,27 @@ The remaining fields say what the run recovered from, so nothing is silent:
 
 The `reason` on `entry.deferred` and `entry.skipped` is the closed event vocabulary, not the result
 token. Deferrals map as follows: `source-changed` and `source-vanished` to `changed_during_run`,
-`source-unreadable` to `local_io`, `unsupported-local-entry` and `unrepresentable-name` to
-`local_entry_unsupported`, `remote-digest-unavailable` and `delete-failed` to `dsm_api_error`,
-`remote-changed` to `remote_changed`, `listing-incomplete` to `remote_response_invalid`, and
-`server-copy-failed` to `server_copy_failed`. Skips map to `local_entry_unsupported` (attributes,
-links, placeholders), `changed_during_run` (`deferred`) or `protected_conflict` (collisions and the
-case rename). The NDJSON plan stream carries no `skipped` records; read them from the JSON plan or
+`source-unreadable` and `local-permission-denied` to `local_io`, `unsupported-local-entry`,
+`unsupported-entry` and `unrepresentable-name` to `local_entry_unsupported`,
+`remote-digest-unavailable`, `remote-unreadable`, `delete-failed` and `case-rename-pending` to
+`dsm_api_error`, `remote-refused`, `remote-skipped` and `delete-not-permitted` to
+`remote_path_refused`, `remote-changed` to `remote_changed`, `listing-incomplete` to
+`remote_response_invalid`, and `server-copy-failed` to `server_copy_failed`. Skips map to
+`local_entry_unsupported` (attributes, links, placeholders), `changed_during_run` (`deferred`) or
+`protected_conflict` (collisions, the case rename, `type-conflict`, `remote-link` and
+`protected-descendant`). The NDJSON plan stream carries no `skipped` records; read them from the JSON plan or
 the log.
+
+Two breakers turn a share-wide condition into one named failure instead of a wall of per-path warnings:
+
+- **Refusals.** When at least three per-path refusals share one cause (`<api>.<method>:<code>`) and are
+  more than half of the folders and files the run attempted, the run fails once and names the cause and
+  the paths (`remote-refused` above).
+- **Link boundaries.** Right after the remote walk, when at least three folders look like links and
+  they are more than half of the folders listed, the run fails with a message starting
+  `remote-real-path-unusable:`. That pattern means DSM's `real_path` answers do not have the shape the
+  link guard compares, not that the share is made of links; nothing is uploaded or deleted. If DSM
+  reports no `real_path` at all, the guard cannot run and sync and plan print a warning instead.
 
 When a remote checksum fails with the same cause for three files in a row (or three before any
 succeeds; DSM `408` and `105` do not count), the run fails once instead of deferring every file: "N
@@ -420,15 +456,16 @@ ordered as follows:
 
 1. one `sdsync.plan.v1` record with `kind: "summary"`;
 2. zero or more `sdsync.plan-action.v1` records in execution order—`delete-conflict`,
-   `create-directory`, `copy-remote-content`, `upload`, then `delete`;
+   `create-directory`, `copy-remote-content`, `upload`, `delete`, then `rename` (a case-only File Station
+   rename, carried last, with `relative`, `from_remote_path`, `to_remote_path` and `entry_kind`);
 3. for `sync` only, one `sdsync.output.v1` record with `kind: "completion"`.
 
 ```ndjson
-{"schema":"sdsync.plan.v1","kind":"summary","uploads":1,"upload_bytes":5242880,"server_copy_fallback_bytes":4096,"server_copies":1,"directories":1,"deletions":0,"unchanged_files":41,"protected_entries":0,"changes":true}
+{"schema":"sdsync.plan.v1","kind":"summary","uploads":1,"upload_bytes":5242880,"server_copy_fallback_bytes":4096,"server_copies":1,"directories":1,"deletions":0,"renames":0,"unchanged_files":41,"protected_entries":0,"changes":true}
 {"schema":"sdsync.plan-action.v1","action":"create-directory","relative":"releases","remote_path":"/team/export/releases","reason":"missing-remote"}
 {"schema":"sdsync.plan-action.v1","action":"copy-remote-content","from_relative":"old/report.bin","from_remote_path":"/team/export/old/report.bin","to_relative":"new/report.bin","to_remote_path":"/team/export/new/report.bin","expected_size":4096,"expected_mtime_seconds":1785769200,"content_md5":"d41d8cd98f00b204e9800998ecf8427e","source_snapshot_guard":{"entry_kind":"file","size":4096,"mtime_seconds":1785769200,"content_md5":"d41d8cd98f00b204e9800998ecf8427e","require_mtime":true},"verified_upload_fallback":"only-before-copy-task-start"}
 {"schema":"sdsync.plan-action.v1","action":"upload","relative":"release.bin","remote_path":"/team/export/release.bin","bytes":5242880,"mtime_ms":1785769200000,"reason":"content-differs"}
-{"schema":"sdsync.output.v1","kind":"completion","result":{"changed":true,"uploaded":1,"server_copied":1,"upload_bytes":5242880,"directories_created":1,"deleted":0,"deletes_skipped":0,"kept_deletes_uploaded":0,"changed_during_run":0,"failed":false,"outcome":"complete","deferred":[],"mtime_not_kept":0,"skipped":0,"incomplete_listings":0,"incomplete_listing_folders":[],"recovered":{"retries":0,"reauthentications":0,"reauthentication_failures":0,"keepalive_failures":0,"server_tasks_not_stopped":0,"server_copy_fallbacks":0},"elapsed_ms":8421}}
+{"schema":"sdsync.output.v1","kind":"completion","result":{"changed":true,"uploaded":1,"server_copied":1,"upload_bytes":5242880,"directories_created":1,"deleted":0,"renamed":0,"deletes_skipped":0,"kept_deletes_uploaded":0,"changed_during_run":0,"failed":false,"outcome":"complete","deferred":[],"mtime_not_kept":0,"skipped":0,"incomplete_listings":0,"incomplete_listing_folders":[],"recovered":{"retries":0,"reauthentications":0,"reauthentication_failures":0,"keepalive_failures":0,"server_tasks_not_stopped":0,"server_copy_fallbacks":0},"elapsed_ms":8421}}
 ```
 
 A plan-only NDJSON stream ends after its last action. An unchanged sync emits the summary followed
@@ -437,7 +474,8 @@ include their exact `snapshot_guard`; a post-delete also includes nullable `dest
 The linked JSON Schema defines every single-profile plan/action/result variant strictly.
 
 `content_md5` remains the compatibility-stable digest field in existing `sdsync.*.v1` documents.
-Internally, content equality and safety guards require MD5, IEEE CRC32, and SHA-256 together; the
+Internally, comparison uses the MD5 and the safety guards that authorise a deletion or a server-side
+copy require MD5, IEEE CRC32, and SHA-256 together; the
 additional proof is deliberately not added to the strict v1 JSON shape because old consumers may
 reject unknown properties. A future negotiated schema version can expose those fields without
 silently breaking v1 parsers.

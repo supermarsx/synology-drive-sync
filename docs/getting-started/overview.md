@@ -23,7 +23,7 @@ create a missing destination below an existing writable share.
 - The local source is opened read-only and is never intentionally modified.
 - Remote paths are normalized and kept beneath the configured destination root.
 - Missing directories are created shallowest-first, including empty directories.
-- Default content comparison requires size, MD5, IEEE CRC32, SHA-256, and whole-second modification time (floor or rounded).
+- Default content comparison requires size and File Station's server-side MD5 to match; a modification time that moved alone never causes a re-upload. Deleting a remote file or reusing one for a server-side copy needs the complete MD5, IEEE CRC32 and SHA-256 fingerprint.
 - Uploads are verified against the local bytes and then checked again by a final rescan and replan.
 - Remote deletion is disabled by default and guarded by explicit per-profile and aggregate limits.
 - Cancellation requests cooperative shutdown and prevents the later deletion phase from starting.

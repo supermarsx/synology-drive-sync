@@ -364,7 +364,8 @@ records below the configured level before persistence. No threshold, `off` inclu
 `error`-level record: a failure stays visible in Activity and Logs whatever a category is set to, and
 an unlevelled line (raw stderr a child process left in `controller.log`) is read as an error. Each pre-relay API record uses the exact
 stage-derived `bridge`, `authentication`, or `security` category; a corrupt or unsafe policy fails
-closed without writing the record or its coalescing state. Log reads scan bounded rotated history and
+closed without writing the record or its coalescing state. Log reads scan bounded rotated history,
+newest first and at most 1 MiB per source (a source that was cut short says `scan_limited`), and
 return up to the requested number of matching records, so newer trace/debug noise cannot hide an
 older allowed error. A selected log source is emitted alone; `all` divides a fixed encoded-output
 budget across all six sources—API, private Doctor discovery, controller, scheduler, sync, and

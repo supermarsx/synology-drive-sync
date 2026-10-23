@@ -117,7 +117,7 @@ a missing, unsafe, or unrecognised state file degrades that one entry and adds a
 | `partial` | The core exited `3`: finished, but named paths were deferred and sync on the next run. Not a failure: no failure alert, no retry consumed, and a dependent routine may run after it. |
 | `failed` | Ended non-zero, or was refused in preflight. `reason` says why when known. |
 | `busy` | Refused because another run, Doctor, or management action held the run lock (exit `75`). A deferral that is retried; not a failure and not counted by the failure alert. |
-| `cancelled` | Stopped by the user or a package stop (`130`/`143`). No alert. |
+| `cancelled` | Stopped by the user or a package stop (`130`/`143`, or `137` when a package stop had to kill a runner that did not finish cancelling within its 60-second grace). No alert. |
 | `not_run` | No record, or the last aggregate run did not reach this profile; its previous completion is kept. |
 | `stale` | `run.state` says `running` but the runner is gone (see below). Treated as failed. |
 | `unknown` | A record exists but its value is not one this reader knows. Shown as “Status unknown”, never as success. |
@@ -128,7 +128,29 @@ profile (`outcomes.profiles[]`, with `consecutive_failures` and `last_success_ep
 short tokens, never paths or secrets; the dashboard turns each into a cause and a next step, and shows
 any token it does not recognise as `unknown (<token>)` rather than hiding it. `outcomes.alerts` carries
 the consecutive-failure count and threshold, so the failure is durable in every poll rather than only
-in a notification.
+in a notification. The count is per scope: `outcomes.alerts.failure_count` is the consecutive failures
+of the scope that ran last (a profile name or `all`) and `threshold_reached` applies to that scope. Each
+scope keeps its own count and its own last-notification time in `state/alerts-<scope>.state`, so a
+healthy profile's success no longer resets a failing profile's count, and one scope's cooldown does not
+silence another's alert.
+
+**A run that is still going.** While `outcomes.run.outcome` is `running`, `running_for_seconds` says
+how long, and `long_running` turns true past six hours (adding the warning token `long_running`). A
+core waiting on a hung mount or a request with no deadline never fails; it just never finishes, and it
+holds the run lock, so every routine waits behind it. To make that visible the runner refreshes
+`run.state` every 60 seconds with `heartbeat_epoch`, the last time the core showed progress: its I/O
+counters in `/proc/<pid>/io` moved, or, where those cannot be read, its progress record changed
+(`heartbeat_source` is `io`, `progress` or `liveness`; with `liveness` the epoch only proves the core is
+alive). The snapshot reports `outcomes.run.heartbeat_epoch` and `stalled`: `true` when the heartbeat is
+more than 30 minutes old (adding the warning token `stalled`), `false` while it is recent, and `null`
+when the run published no heartbeat. The runner logs `run_stalled` (`error`) once, and `run_stall_cleared`
+if progress resumes. When the heartbeat has been stale for 30 minutes the controller also logs
+`controller_blocked_by_stalled_run` (`error`, once per run; the scope, the last progress time, the number
+of queued jobs and what is waiting: `routines`, `polls`, `schedule`) and raises the failure alert (DSM
+log and desktop) for it. Nothing here stops the core, and the controller's own loop does not become
+responsive: while a run holds it, polls and serialized dashboard jobs still wait. The dashboard lists a long-running or stalled run in
+the attention list and shows a routine waiting behind it as “Waiting (busy)” or, once the run is
+long-running, “Waiting (run may be stuck)”, never as healthy.
 
 **A refusal before the core starts is recorded where a reader looks.** A scheduled run that is refused
 in preflight (invalid configuration, a profile log path that is not the package-managed one, the
@@ -137,7 +159,16 @@ no trace. Every exit of the runner now names a reason and writes four records: `
 (`failed`, with `reason` and a one-line `detail`), the profile's own state, the failure counter (for
 sync), and an error-level Activity `run.failed` with the cause. If a run is already in flight, its
 `running` record is preserved rather than overwritten. A refusal because the run lock is held writes
-only an Activity `run.deferred` and never touches `run.state`.
+only an Activity `run.deferred` and never touches `run.state`, and writes no audit pair either: a run's
+mandatory audit opens only once the run is admitted (lifecycle, service, run lock, management lock).
+Every other refusal before admission (policy, a missing binary or configuration, a lock or admission
+failure) is still audited, requested and then failed.
+
+A runner that never started (the controller got exit `126` or `127`, or found no `run.state` or profile
+record newer than its dispatch) is recorded with reason `runner_error`, as an error-level Activity
+`run.failed`, and counts as a failure; it no longer inherits the previous run's reason. A runner the
+controller could not launch at all is recorded `failed` with `last_reason=admission_failed` and
+retried 30 seconds later instead of ending the controller.
 
 **Captured core stderr for scheduled runs.** A scheduled run captures the core's standard error. The
 last `error:` line (or else the last non-empty line) is sanitised to printable ASCII, cut at 160
@@ -146,6 +177,15 @@ in `var/log/run-stderr.log` (mode `0600`, with a header naming epoch, scope, ope
 rotated per run to `.1` through `.3`). It can contain local and remote paths, as a manual job result
 already can; collect it as evidence like the other package logs. A manual run keeps its output in
 the job result instead.
+
+The same text is readable from the dashboard: the **Logs** source `run-stderr` (shown as *Core error
+output*, and not part of `all`) serves `run-stderr.log` and its rotations, redacted like every other
+source. When the newest block's header names the run that `outcomes.run` reports, the snapshot sets
+`outcomes.run.stderr_log` to `{"source":"run-stderr","finished_epoch":E,"exit_code":X}` and the Overview
+shows that run's lines under the attention list, or says the run's output has since rotated away.
+`outcomes.profiles[].detail` and `failed_path` (the core's last error line and the percent-encoded path
+it failed on) are filled from the profile's own state when the runner recorded them; absent they are
+`null`.
 
 **Per-profile outcomes in an aggregate.** An aggregate run no longer stops at the first profile that
 fails preflight. Each refused profile gets its own failed state and Activity record, and the profiles
@@ -162,12 +202,31 @@ power loss. The controller rewrites the state as `failed` with reason `runner_di
 Activity `run.failed` and the failure alert, and logs `run_runner_died`; the dashboard shows “A run
 died without finishing” with a stale outcome. The bridge applies the same rule at read time, so the
 verdict does not wait for the controller (or survives a stopped one). An owner file that fails its
-ownership or mode check is *not* declared stale, because death cannot be proven.
+ownership or mode check is *not* declared stale, because death cannot be proven. An owner record that
+was torn before the last boot (power loss mid-write) is recovered as dead rather than ending the
+controller.
 
-**Lasting skips and deferrals** exit `0`. The run is `succeeded` with a warning
-(`skipped_entries` or `deferred_entries`); the dashboard renders it as a warning, for example “Synced,
-3 entries skipped and will not sync until fixed”, and the entries are named by `entry.skipped` and
-`entry.deferred` records in the sync log. See
+A package **stop** is not a died run. The controller waits up to 60 seconds for a running sync to cancel
+cooperatively (`SDSYNC_DSM_RUNNER_STOP_GRACE`, 1 to 110 seconds, inside the 120-second lifecycle
+budget; dashboard jobs still get 3 seconds). If the runner still has to be killed, the controller logs
+`runner_stop_forced` (`warn`) and publishes `run.state` `failed` with outcome and reason `cancelled`
+and exit `137`, with an `info` Activity `run.failed` row, no alert and no `runner_died`.
+
+A run read as stale is never reported as running anywhere in the snapshot: the legacy `run.state`,
+`outcomes.run.state` and every covered routine's state read `failed` (`outcomes.run.outcome` stays
+`stale`, reason `runner_died`). A profile that run covered, whose own record predates the run, reads
+`status_cache: last_run_failed`, and keeps doing so after the controller's reconcile; a record written by
+a `plan` (`action=plan`) is reported as `no_run_recorded`, so a plan can never vouch for a profile's
+last sync.
+
+**Lasting skips and deferrals** exit `0`. This covers every condition only a person can clear: names the
+NAS or Synology Drive refuses, permissions, links, type conflicts, a case rename File Station would not
+make. The run is `succeeded` with a warning (`skipped_entries` or `deferred_entries`, never `partial`
+and never plain green); the dashboard renders it as an amber warning, for example “Synced, 3 entries
+skipped and will not sync until fixed”, gives each cause as “not synced until you fix this: …” followed
+by a next step, and the entries are named by `entry.skipped` and `entry.deferred` records in the
+sync log. A condition that clears by itself is `partial` instead
+(exit `3`). See
 [partial runs, deferrals and skips](../observability.md#partial-runs-deferrals-and-skips).
 
 **Degraded echoes.** When a run's own result is sound but some records of it could not be written
@@ -210,10 +269,10 @@ codes are:
 | `run.started` | Package Plan/Sync action started |
 | `run.succeeded` | Package action completed successfully |
 | `run.failed` | Package action completed with a nonzero result, was refused in preflight, or its runner died; the message carries the cause |
-| `run.deferred` | A run was refused only because another operation held the run lock, or a routine wrapper was never admitted; retried, not a failure |
+| `run.deferred` | A run was refused only because another operation held the run lock, or a routine wrapper was never admitted; retried, not a failure. For a scheduled routine or the schedule it is written once per busy episode, not on every 30-second re-check; a manual run's deferral is always written |
 | `routine.deferred` | Routine was outside its window or dependency evidence was not satisfied; recorded once per episode, not on every controller turn |
 | `routine.retry_scheduled` | A whole-action retry was scheduled |
-| `routine.retries_exhausted` | A routine used all its retry attempts; the message carries the attempt count and last reason |
+| `routine.retries_exhausted` | A routine used all its retry attempts (`error`, `failed`; the message carries the attempt count and last reason), or a realtime routine's sixth consecutive partial run (`warn`, `deferred`) |
 | `routine.watch_abandoned` | The controller stopped retrying a native watcher |
 | `doctor.succeeded` | Doctor completed successfully |
 | `doctor.failed` | Doctor completed with a nonzero result |
@@ -238,18 +297,31 @@ The dashboard reads `1..1000` lines and can filter:
 - sync; or
 - mandatory audit history.
 
+Beyond those six, `run-stderr` (the core's own error output of the last runs, described above) can be
+selected explicitly; it is never part of `all`.
+
+The service answers a Logs read itself, newest first and bounded: for each source it reads the
+retained files backwards and stops once it has the requested number of lines or has scanned 1 MiB of
+that source. A read that stops at the scan budget because a strict threshold hid most lines carries
+`"scan_limited": true` on that source, and the dashboard says *newest lines only; older history was not
+scanned* rather than implying there is nothing older. The result is byte-for-byte what the shell
+manager returns for the same files, including the redaction; a test compares the two.
+
 API, controller, scheduler, and audit logs retain five rotations. The core sync log retains three.
 The DSM package's private Doctor discovery history uses a 1 MiB rotation threshold plus three
 rotations (`.1` through `.3`), all package-owned `0600` files. One final bounded record can cross
 the threshold before the next append rotates it. Structured Activity also retains three
-rotations. Reads inspect every retained file, reject symlinks, hard links, unsafe ownership/modes,
-or unreadable state, and traverse from the oldest rotation through the active file. The response is
-the newest requested suffix that fits its byte budget. Doctor discovery is available only through
+rotations. Reads reject symlinks, hard links, unsafe ownership/modes, or unreadable state, and
+read each source's rotations newest first (the active file, then `.1`, `.2`, and so on), stopping once
+they have the requested lines or have scanned 1 MiB of that source, on the default lane and on the
+forced shell lane alike. The response is the newest requested suffix that fits its byte budget. Doctor discovery is available only through
 the local `doctor` Logs source and matching Activity events and is excluded from the core remote-log
 sink. Structured API failure lines obey their exact bridge/authentication/security category
 threshold, but an `error`-level record is never hidden by one: it is read in Activity and Logs
-whatever the category is set to, `off` included, and a line with no level (raw standard error a
-child process left in `controller.log`) is read as an error. The Activity read reports where its
+whatever the category is set to, `off` included, on the default lane as well as on the forced shell
+lane, and a line with no level (raw standard error a child process left in `controller.log`) is read
+as an error. In the sync log, the path of a per-entry record is stored percent-encoded (bytes outside
+`A-Za-z0-9._/:,-` as `%XX`, at most 255 characters); the dashboard shows it decoded. The Activity read reports where its
 history starts (`history`), so a failure rotated away is not mistaken for none. API output replaces private package paths with neutral labels and masks secret-file
 paths; secret values are never an allowed log field. Selecting one of the six sources reads only
 that source; `all` remains globally bounded below the API bridge's 1 MiB response-capture limit.
@@ -265,6 +337,52 @@ sudo tail -n 200 /var/log/packages/synology-drive-sync.log
 sudo tail -n 200 /var/packages/synology-drive-sync/var/log/api.log
 sudo tail -n 200 /var/packages/synology-drive-sync/var/log/doctor-inventory.log
 ```
+
+### Controller and scheduler log events that record a failure
+
+Failures the package used to swallow are now written to `controller.log` or `scheduler.log` at
+`error`, which no category threshold, `off` included, hides. The ones worth
+knowing when reading it:
+
+| Event | Meaning |
+| --- | --- |
+| `controller_reload_failed` | A saved change that needs a reload could not be signalled to the running controller (`reason=`, `pid=`, `operation=`, `marker_status=`); see exit `76` in [CLI parity](cli-parity.md) |
+| `controller_reload_skipped` | The same failure for a save that needs no reload (alert policy, schedule switched off): `warn`, `needed=false`, exit `0`, no marker |
+| `routine_state_write_failed` | A routine's state file could not be written; it now carries `cause=` (the operating system's message). A run whose `running` record cannot be written is not started, and an outcome that cannot be written is held in memory and flushed before any routine is evaluated again. A full or unwritable state directory degrades a turn; it no longer ends the controller |
+| `control_queue_failed` / `control_queue_recovered` | One dashboard queue turn failed (`error`, once per episode, `status=`) and the next one succeeded (`warn`); queue turns are no longer fatal |
+| `clock_step_detected` | A next-run or poll time further ahead than its interval allows, as after a backwards clock step, was clamped to now (`warn`; `field=`, `ahead_seconds=`), so polling and deadlines no longer stall until the old time arrives |
+| `routine_partial_backoff` | A realtime routine finished partial again (`warn`); see [Retry and backoff](routines.md#retry-and-backoff) |
+| `routine_escalation_cooldown` | A retry-ladder exhaustion escalation (DSM log and desktop alert) was suppressed by the alert cooldown (`info`) |
+| `runner_stop_forced` | A package stop had to kill a runner after its 60-second cancellation grace (`warn`; `grace=`, `exit=`) |
+| `runner_wait_guard_failed` / `runner_wait_guard_recovered` | The helper that watches a running sync for the controller could not start or stop (`phase=start` or `stop`, `status=`, `pid=`; `error`, once per episode per phase) / worked again (`warn`). The controller keeps scheduling and polls the run once a second until it ends |
+| `controller_blocked_by_stalled_run` | A run has shown no progress for 30 minutes and holds everything behind it (`error`, once per run) |
+| `runtime_leftovers_pruned` | At start the controller removed leftover capture, admission and fingerprint files of processes that are no longer live (`count=`, `unremovable=`; `info`, `warn` when some could not be removed) |
+| `run_state_write_failed` | The runner could not write its final `run.state` after three attempts one second apart (`attempts=3 outcome= exit=`); it kept its outcome in `state/run.unrecorded` |
+| `run_state_recovered` | The controller found a dead run, matched it to `run.unrecorded` by start time and scope, and published the runner's real outcome (with `degraded=...,run_state`, reason `run_state_write_failed`) instead of `failed/runner_died`; no Activity failure and no alert, because the runner already wrote both |
+| `run_outcome_unrecorded` / `run_outcome_marker_unremovable` | Even `run.unrecorded` could not be written (or removed); the controller will report a dead runner |
+| `run_stalled` / `run_stall_cleared` | The core's heartbeat stopped for 30 minutes / progress resumed; see [A run that is still going](#run-outcomes-reasons-and-where-a-failure-is-recorded) |
+| `run_heartbeat_unwritable` | The runner could not refresh `run.state` while a run was in flight |
+| `controller_reload_marker_unremovable` | The reload marker could not be removed after a successful reload |
+| `dsm_log_gate_failed` / `dsm_log_policy_invalid` | The optional DSM system-log channel could not read its cooldown ledger (`file=system-log.state status=`), or an enabled policy has an invalid field (`field=`); delivery is skipped rather than sent unbounded |
+| `health_cache_write_failed` | Doctor's health record could not be saved; Doctor still writes its Activity line and alerts and exits with its own status |
+| `default_profile_invalid` | `default-profile` exists but names no existing profile; scope-less actions are refused |
+| `routine_watch_unsafe` / `routine_watch_ladder_unwritable` / `routine_watch_setup_failed` | A native watcher path is a symlink / its failure record could not be written, so the watcher is abandoned instead of retried forever / its setup failed |
+| `child_launch_failed` | The controller could not launch a child (`kind=`, `status=`) |
+| `controller_exited` | The controller's last line: `status=` and `shutdown=`, `info` after a requested stop and `error` otherwise |
+| `run_state_unverifiable` | The controller could not decide whether a run was alive (`phase=liveness` or `acquire`) |
+
+Re-levelled from `warn` to `error` because each records a failed write or delivery:
+`activity_append_failed`, `alert_unavailable`, `observability_write_failed` (which now carries the
+helper's `cause=`), `state_unreadable` for `controller.pid`, `dsm_log_emit_failed`,
+`run_stderr_unavailable`, and the runner's `runner_message` for every failure (a busy deferral's
+stays `warn`). `notification.unavailable` now says why (`status N`: the notifier is not installed or
+refused).
+
+A log rotation that fails never drops the line: it is appended to the still-valid active file past the
+size limit, and the failure is recorded once per episode on standard error and in
+`var/state/log-rotation.failed` (package-owned `0600`: `epoch=`, `path=`, `cause=`), which the next
+successful rotation of that log removes. The marker is on-disk evidence only; the dashboard does not
+display it. An unsafe rotation set is still refused with exit `73` and nothing is written to it.
 
 ### Dashboard requests the service could not serve
 
@@ -305,9 +423,9 @@ neither the log nor the coalescing state file, and does not change what the brow
 
 ### Forcing dashboard reads through the shell manager
 
-Most dashboard reads are answered inside the package service, from the package's own files, instead
-of by running the shell manager. Only the Logs view still runs it on every poll. A private marker
-forces every read back onto the manager:
+Dashboard reads, the Logs view included, are answered inside the package service, from the package's
+own files, instead of by running the shell manager. A private marker forces every read back onto the
+manager:
 
 ```bash
 sudo -u "$PACKAGE_USER" -- sh -c \
@@ -363,7 +481,12 @@ Policy fields:
 | Failures before alert | `1..100`; default `1` |
 | Cooldown | `60..2592000` seconds (up to 30 days); dashboard and manager share the same range |
 
-Successful sync resets the tracked sync failure count. Cooldown rate-limits delivery. If
+Failure counts and cooldowns are kept per scope (a profile name, or `all` for an aggregate run), in
+`state/alerts-<scope>.state`: a success resets only its own scope's count, the threshold applies to
+the scope that failed, and a notification for one scope does not start another scope's cooldown. A
+scope with no file of its own starts from the package-wide `alerts.state`, which keeps `failure_count`
+(the consecutive failures of the scope that ran last) and the newest `last_notify_epoch` for older
+readers. Cooldown rate-limits delivery. If
 `/usr/syno/bin/synodsmnotify` is unavailable or fails, synchronization keeps its own result and
 records `notification.unavailable`; alert failure is not disguised as successful delivery.
 
@@ -492,11 +615,16 @@ unattended attention.
 ## Open-session fallback
 
 The dashboard can request a browser notification and play a short local tone when it observes a new
-failed run. This is a non-secret browser preference, not a background transport:
+failure. This is a non-secret browser preference, not a background transport:
 
 - the DSM application must remain open;
 - browser notification permission must be granted;
-- the first already-visible failure does not generate a duplicate alert; and
+- a failure is anything the snapshot's verdict calls one: a failed run, a run whose runner died, an
+  outcome the package could not interpret, and a failed profile of an all-profiles run. Each distinct
+  failure notifies once, however often the page refreshes, and a cancelled run never notifies;
+- the first status a window reads is its baseline, so a failure already present when the window opens
+  is announced by the message in the window and the Overview list, not by a notification;
+- if the browser refuses a notification the window says so instead of dropping it; and
 - closing the page stops this fallback.
 
 Use an externally monitored log/status path when desktop-only delivery is insufficient for

@@ -7,13 +7,17 @@ files, and preserves remote-only entries by default. Mirror behavior is opt-in.
 
 | Mode | Same-path file is unchanged when | Trade-off |
 | --- | --- | --- |
-| `content` | size, MD5, IEEE CRC32, SHA-256, and whole-second mtime all match (the remote second equals the floor or the rounded local time) | Safest and default; streams selected remote files to compute the complete fingerprint. |
+| `content` | size and File Station's server-side MD5 match; the modification time is not consulted, so equal bytes whose time moved (a `touch`, a restore, a daylight-saving shift, a DSM that did not keep the time an upload sent) are not re-sent | Safest and default; one server-side MD5 per same-size file, with no transfer. |
 | `metadata` | size and whole-second mtime match (floor or rounded) | Avoids remote content hashes but cannot detect equal-size changes within the same second. |
 | `size-only` | size matches | Fastest and weakest; use only when that correspondence is explicitly acceptable. |
 
-Content mode requires the File Station account to have download permission for every selected
-remote file. Each proof streams those bytes through the client, so include remote read traffic in
-bandwidth, reverse-proxy timeout, and scheduling estimates.
+Content mode compares with File Station's server-side MD5 (`SYNO.FileStation.MD5`), which DSM computes
+without sending the file to the client. The deletion and server-copy guards are stricter: they act on
+remote data, so they require the complete MD5, IEEE CRC32 and SHA-256 fingerprint, which DSM does not
+compute and the client obtains by streaming the file. That needs download permission, but only for
+the remote-only files a deletion would remove and the files a server-side copy would duplicate, a set
+that is empty when nothing is being deleted or copied. Include that read traffic in bandwidth,
+reverse-proxy timeout, and scheduling estimates for a first mirror run against a populated destination.
 
 Content correspondence is stateless. Every run rebuilds it from current local and remote state; no
 persistent path/hash database can become stale.
@@ -44,14 +48,41 @@ review mirror plans carefully because a formerly included remote path can become
 Exclusion is decided **before** a name is checked for portability, so a rule can exclude a name the
 tool would otherwise refuse to carry — a name such as `~scratch.txt`, a Windows device
 stem such as `aux.h`, a trailing dot, a component over the length limit, or even a name that is not
-valid UTF-8. Without a matching rule those names still fail the whole run, which is the right answer
-for a name that cannot be mapped to a remote path; with one, they are simply skipped.
+valid UTF-8. Without a matching rule such a name no longer fails the run: it is set aside by name as an
+`unsupported-entry` deferral (see [Partial runs, deferrals and skips](../observability.md#partial-runs-deferrals-and-skips)).
+It is never uploaded, the NAS copy of it is never deleted, the rest of the tree syncs, and the run
+exits `0` with a warning that names the path and the rule, on every run until the name is changed or
+excluded. The same applies to a path that is too long once the destination prefix is prepended, a name
+over 255 bytes, a FIFO, socket or device, and a modification time before 1970.
+
+Rules match case-insensitively, with the pattern and the path both Unicode-normalised (NFC), when the
+source resolves names that way. The tool asks the filesystem rather than assuming the platform: it looks
+up the source root's own name with its letters' case swapped, and falls back to the platform default
+(folding on Windows and macOS) when the root's name has no cased letter. An SMB share mounted on Linux
+can therefore fold, and a case-sensitive macOS volume does not. The folding applies to **both** walks. Under
+`--exclude report.pdf` on such a source, a NAS-only `Report.pdf` is excluded (never deleted, never
+overwritten) and a local `Report.pdf` is never uploaded, whichever spelling either side uses. On a
+case-sensitive source the rules stay case-sensitive.
 
 Both walks apply the same rules. On the destination side an excluded directory, and every DSM-managed
 directory (`@eaDir`, `#recycle`, `#snapshot`, `@tmp`), is recorded but not descended into: nothing
 under it can be compared, copied or deleted, so listing its contents would cost round trips and scan
 budget for entries the planner discards. Case-portability checking skips them for the same reason — a
 recycle bin holding both `Report.pdf` and `report.pdf` is not a reason to refuse a run.
+
+The destination walk also sets aside, by name, what it cannot safely carry. A NAS name this tool
+cannot address (a control character such as a stray `Icon
+`, or a backslash) is never descended into,
+compared, overwritten or deleted, and its folder and ancestors are kept: it is a lasting `remote-skipped`
+warning rather than a failed run. A folder whose DSM `real_path` is somewhere else (a symbolic link
+out of the destination) or one already walked is treated like a mount point: never descended, never
+deleted through. The walk asks DSM for `real_path` on every listing and compares each child's real path
+with its parent's relatively, so a volume prefix or an encrypted share's prefix does not make ordinary
+folders look like links. If DSM reports no `real_path` at all for the destination, the link guard cannot
+run; sync and plan print a warning and carry on, and the guard stays unverified until a real NAS answers
+the [link questions](../production-acceptance.md#questions-only-a-real-nas-can-answer). When a
+majority of the folders listed (and at least three) look like links, the run fails with the named cause
+`remote-real-path-unusable` instead of silently syncing nothing there.
 
 ## Enabling mirror deletion
 
@@ -80,8 +111,20 @@ before the later remote-only deletion phase. A changed source file, missing remo
 destination snapshot, cancellation request, or failed verification stops the run before unsafe
 cleanup can continue.
 
-Type conflicts that require replacing a remote entry are destructive and therefore follow the same
-deletion authorization and caps.
+Type conflicts that require replacing a remote entry (a local file where the NAS holds a folder, or
+the reverse) are destructive and therefore follow the same deletion authorization and caps. A
+conflict the run cannot carry no longer fails it. Without `--delete`, or when the NAS folder holds an
+excluded, DSM-managed or mounted entry, only that path is set aside as a lasting `type-conflict`
+skip: both sides are left as they are, nothing beneath it is written, and the run exits `0` with a
+warning. A local entry whose NAS counterpart is a link (a symlink or a folder DSM resolves
+elsewhere) is the lasting `remote-link` skip: nothing is written, deleted or descended at or beneath it.
+
+A file or folder the NAS refuses by name or permission (DSM codes such as 418, 414, 407 or 105 once the
+session is proven alive) is named and left out, and its siblings continue; see
+[Partial runs, deferrals and skips](../observability.md#partial-runs-deferrals-and-skips). A refusal
+that is really about the share is not hidden by that rule: when at least three refusals share one cause
+and they are more than half of the folders and files the run attempted, the run fails once and names
+the cause and the paths, so a share that refuses everything cannot read as a green run.
 
 A planned mirror deletion re-checks that the local path is still absent immediately before it
 deletes the remote copy. If the local file reappeared in the meantime, the remote copy is kept and

@@ -237,8 +237,8 @@ are numbered rather than printed.
 documented, unauthenticated, and available since DSM 4.0. It runs at **every** level including
 Quick: an operator who cannot authenticate at all still learns exactly what their DSM offers.
 
-This is deliberately a *separate* read from API discovery, which keeps its ten-name allowlist and
-its strict wire type because that map feeds every call the client makes. `query=all` on a NAS with
+This is deliberately a *separate* read from API discovery, which keeps its eleven-name allowlist (the optional
+`SYNO.FileStation.Rename` included, which makes case-only renames) and its strict wire type because that map feeds every call the client makes. `query=all` on a NAS with
 third-party packages returns hundreds of entries authored by whoever wrote those packages, and
 decoding that map strictly would let one malformed entry break connection establishment itself. The
 diagnostic read decodes entry by entry into an all-optional type instead, and reports how many

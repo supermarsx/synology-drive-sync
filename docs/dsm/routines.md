@@ -38,6 +38,15 @@ The window is inclusive and uses the NAS local clock. When start is earlier than
 the allowed time is within that same-day interval. When start is later than end, the window crosses
 midnight. The selected weekday is evaluated when the controller checks the routine.
 
+A daily routine runs once per **window day**, the calendar day on which its window opened. In the part
+of a wrapping window after midnight (23:00 to 01:00, at 00:30) the window day is still yesterday. The
+day is recorded when the run is dispatched, not when it finishes, so a run that crosses midnight no
+longer consumes the next night and a wrapping window no longer runs twice in one night. A run cancelled
+(`130`/`143`) is held for 30 seconds before the routine is considered again, so a stop or reboot does
+not turn into an immediate re-run. If the NAS clock steps backwards, a next-run or poll time that is
+further ahead than its interval allows is clamped to now and recorded as `clock_step_detected` in
+`controller.log`.
+
 A due daily routine outside its weekday/window is marked `deferred`, including a daily retry whose
 deadline has passed. Interval and realtime routines never consult weekdays or clock windows.
 Correct the NAS time zone and clock before relying on daily or TOTP behavior.
@@ -46,7 +55,9 @@ Correct the NAS time zone and clock before relying on daily or TOTP behavior.
 
 The first deadline is scheduled one interval after configuration/controller observation. After an
 action finishes, the next interval is measured from completion, so a long-running sync does not
-compress or overlap the next run. Changing routine configuration signals the controller to reload.
+compress or overlap the next run. Changing routine configuration signals the controller to reload; if the signal cannot be delivered
+the change is still saved and the dashboard says it is not yet applied (see
+[a save that is not applied](troubleshooting.md#a-run-failed-died-or-was-refused)).
 Interval mode has no weekday or time-window control.
 
 Interval state normally moves through `never`, `scheduled`, `running`, and `succeeded` or `failed`.
@@ -91,6 +102,13 @@ pruned from the walk, since they can never be synced and are the most common sou
 fails on a permissions error the operator never set. A subtree that is genuinely unreadable is
 reported rather than silently retried forever: the readable part of the source stays observed and
 polled, and the routine's `backend_reason` (below) names which condition applies.
+
+**Known limitation: the poll fingerprint is path, size and mtime.** A rewrite that keeps both the size and
+the mtime, and the creation, removal or rename of an empty directory, change none of those and are not
+seen by polling. Where either matters, use an interval or daily routine, whose runs compare the whole
+tree. A stronger fingerprint (change
+time and directories) was designed and deferred because it would silently re-baseline every realtime
+routine at upgrade and its change-time noise on a real DSM is unmeasured.
 
 This is not a kernel event stream and very short-lived changes between identical fingerprints may not
 be observable; final sync planning still performs the engine's normal complete source/target work. A
@@ -138,8 +156,13 @@ next save writes the supported bounded value.
 When a routine exhausts its retry attempts, Activity records `routine.retries_exhausted` (error)
 with the attempt count and the last reason, a sync routine raises a DSM system-log `sync_failed` and,
 when failure alerts are enabled, a desktop one, and a realtime routine then cools down for 900
-seconds before it may try again. Exit `3` (partial) consumes no retry and no failure count: the
-deferred paths are picked up by the next run.
+seconds before it may try again. The desktop and system-log escalation honours the alert cooldown
+per routine, so a routine stuck on its ladder does not alert on every pass; the Activity row is still
+written each time. Exit `3` (partial) consumes no retry and no failure count: the deferred paths are
+picked up by the next run. A realtime routine whose runs keep finishing partial does not re-run at the
+speed of its events: consecutive partials back off on the routine's own retry ladder (at most 300
+seconds, five steps), then every 15 minutes, and the sixth in a row writes one `warn`
+`routine.retries_exhausted` row (state `deferred`) so the repetition is visible.
 
 Deferrals are recorded once per episode, not every controller turn. A routine outside its daily
 window, or waiting on a dependency, writes one Activity line and one log line when it enters that
@@ -156,7 +179,9 @@ errors instead of using a large retry count to hide them.
 ## Dependencies
 
 **Wait for routines** is a success-state gate, not a distributed workflow engine. Every selected
-profile routine must have a latest state of `succeeded`; otherwise the dependent routine is marked
+profile routine must have a latest state of `succeeded`, and that state comes from a **sync**: a Plan
+never writes a profile's last-run record, its failure count, or the aggregate result, so a manual Plan
+cannot satisfy a dependency and cannot hide a failed sync. Otherwise the dependent routine is marked
 `deferred` and reconsidered later. Changing a dependency's data does not automatically invalidate
 its prior success state.
 
@@ -173,8 +198,11 @@ Remote-only entries are preserved unless every applicable layer agrees:
 
 The routine ceiling is not a second aggregate counter passed to the single-profile core action. It
 is an approval boundary: if a profile is later changed so its cap exceeds the routine ceiling, the
-controller defers the routine. Actual deletion remains bounded by the profile limit and all core
-safety checks.
+controller defers the routine with the reason `delete_bound`. That deferral can never clear by waiting,
+so the dashboard calls the routine *blocked* (a failure-level attention item and a red *Blocked* widget
+row) rather than an ordinary deferral, and tells you to raise the routine's deletion limit or lower the
+profile's maximum deletions on the Routines page. Actual deletion remains bounded by the profile limit
+and all core safety checks.
 
 Manual named Plan/Run needs `--allow-delete`. An all-profile action also needs an aggregate
 `--max-total-delete`. The legacy global schedule has its own `allow_delete` and aggregate ceiling.
@@ -229,6 +257,8 @@ It runs all profiles sequentially after one interval, uses delay-after-completio
 scheduled deletion approval. Its next deadline is kept in `var/state/schedule.state`, so a restart or
 reboot no longer postpones a run by a whole interval: on start the next run is the earlier of the saved
 deadline and one interval from now, and a deadline that passed while the controller was stopped runs
-one minute after it starts. It can coexist in configuration with per-profile routines, but both
+one minute after it starts. An aggregate run cancelled by a package stop or a reboot (`130`/`143`, or
+`137` after the stop had to kill it) is logged at `info` with reason `cancelled`, not as an error, and
+runs again 60 seconds later rather than after a whole interval. It can coexist in configuration with per-profile routines, but both
 share the same run lock. Prefer per-profile routines for new dashboard-managed deployments because
 their mode-specific timing, dependency, fallback, and state are individually visible.

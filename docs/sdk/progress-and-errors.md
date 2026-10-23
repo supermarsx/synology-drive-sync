@@ -23,22 +23,45 @@ your application's privacy policy before exporting them.
 
 A successful `SyncOutcome` is not necessarily a complete one. A path whose check fails for its own
 reason (a file that changed or vanished while it was read, a destination that moved after planning,
-a refused server-side copy or deletion) is deferred rather than failing the run: it is neither uploaded
-nor deleted, and `SyncOutcome::deferred()` lists each as a `DeferredPath` with a `DeferredReason`
-(kebab-case, the same eleven tokens as the CLI result). `SyncOutcome::partial()` is true when any
-deferral is transient, which is the case where the CLI exits `3`; check it before treating the run as
-converged. Lasting deferrals (`unrepresentable-name`, `unsupported-local-entry`, `remote-unreadable`, `listing-incomplete`)
-are listed but do not make the outcome partial. A deferral also raises `MutationEvent::PathDeferred`
-(`"path-deferred"`).
+a refused server-side copy or deletion, a name the NAS or Synology Drive refuses) is deferred rather
+than failing the run: it is neither uploaded nor deleted, and `SyncOutcome::deferred()` lists each as a
+`DeferredPath` with a `DeferredReason` (kebab-case, the same seventeen tokens as the CLI result).
+`SyncOutcome::partial()` is true when any deferral is transient, which is the case where the CLI exits
+`3`; check it before treating the run as converged. `DeferredReason::is_lasting()` says which are
+lasting, and it answers from the engine's own list, so it cannot drift from the CLI. Lasting deferrals
+(`unrepresentable-name`, `unsupported-local-entry`, `remote-unreadable`, `listing-incomplete`,
+`local-permission-denied`, `delete-not-permitted`, `remote-refused`, `remote-skipped`,
+`unsupported-entry` and `case-rename-pending`) are listed but do not make the outcome partial: the
+application should still show them, because they stay until someone renames, excludes or re-permissions
+the path. A deferral also raises `MutationEvent::PathDeferred` (`"path-deferred"`). A case-only rename
+made with File Station `Rename` raises `MutationEvent::Renamed` and is counted in
+`ExecutionSummary::renamed()`.
+
+A refusal confined to one path (`remote-refused`) no longer fails the run, but a share-wide one still
+does: three or more refusals with one cause that are more than half of what the run attempted fail it
+with an error that names the cause and the paths.
 
 `PlanSummary::skipped()` returns the paths the plan declines to carry (links and reparse points,
-SYSTEM files, dehydrated placeholders, case and normalisation collisions) as `SkippedPath` values
+SYSTEM files, dehydrated placeholders, case and normalisation collisions, and the `type-conflict`,
+`remote-link` and `protected-descendant` tags) as `SkippedPath` values
 with `relative`, a reason tag, `detail`, and `is_lasting()`. They no longer fail the run, so an
-embedding application must read them to know what was left out. `SyncOutcome::recovered()` reports the
+embedding application must read them to know what was left out.
+
+`ExecutionSummary` carries the same counters as the command-line result: `deleted()`, `created()`,
+`copied()`, `uploaded()`, `uploaded_bytes()`, `mtime_not_kept()` (destinations whose modification time
+the NAS did not keep, so a `metadata` comparison will see them changed next run),
+`copy_fallbacks()`, `deletes_skipped()`, `kept_deletes_uploaded()` and `renamed()`.
+`SyncOutcome::incomplete_listings()` names the NAS folders DSM listed short, where no deletion was
+made. `SyncOutcome::recovered()` reports the
 retries, re-authentications, keepalive failures and unconfirmed server tasks the engine absorbed; the
 SDK does not install a re-authenticator, so an expired session is not re-established there (the
 keepalive and the pre-mutation touch still run). A server-side copy that finishes with an error
 surfaces as `ErrorCode::Remote`.
+
+When a run fails part-way through execution, mutations that already happened are not lost:
+`SdkError::completed()` returns the `ExecutionSummary` of what was done, or `None` when nothing had
+executed, and `SdkError::deferred()` lists the paths the run had already deferred. Report them with
+the error.
 
 ## Error model
 

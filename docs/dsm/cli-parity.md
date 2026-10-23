@@ -119,13 +119,27 @@ and exact private paths.
 
 <!-- topology: keep this note accurate as reads move between the manager and the service. -->
 
-Of those three commands, only `api logs --lines N` is still one the service runs. The API service
-reads the inputs for `api snapshot` and `api activity --lines N` itself and assembles the same
-documents, under a stricter file contract than the manager's: owner, mode `0600`, link count and
-size, all checked on the descriptor it opened rather than on the path. Both remain supported CLI
+The API service reads the inputs for all three itself and assembles the same documents, under a
+stricter file contract than the manager's: owner, mode `0600`, link count and size, all checked on the
+descriptor it opened rather than on the path. For `api logs` it reads each source backwards from the
+newest line and stops at 1 MiB scanned per source, marking a source it had to stop on with
+`"scan_limited": true`; it shows every error line and every unlevelled line whatever the category
+level, `off` included, and reproduces the manager's redaction. All three remain supported CLI
 contracts and remain the oracles differential tests compare against, byte for byte with the
-snapshot's generation timestamp as the only normalised field, but a dashboard poll no longer reaches
-either.
+snapshot's generation timestamp as the only normalised field (for `logs`, the in-service document
+adds only `scan_limited`), but a dashboard poll no longer reaches the manager for any of them unless
+the forced shell lane is engaged. `api logs --source run-stderr` serves the core's error output of the
+last runs and is not part of `--source all`.
+
+A mutation result (`sdsync.dsm-result.v1` with `"ok": true`) may carry `"warnings"`, a list of one to
+sixteen `{"code", "message"}` entries meaning *the change is saved, but something it depends on did not
+complete*. `controller_reload_failed` says the running controller was not told to reload, so the
+previous schedule, routines or policy stay in effect until the package service restarts or a later save
+reloads it. A manager that prints the older single pair `warning_code` and `warning` is accepted and
+normalised into `warnings`, so the dashboard only ever sees the list. The bridge records each entry as
+one `mutation_warning` record in `api.log` and shows the dashboard a red *Saved, but it is not fully in
+effect* notice with the message. The bridge also captures the queued manager's standard error (16 KiB
+kept, the rest counted) and records a non-empty one as `manager_stderr`, rather than discarding it.
 
 `service.state` and `service.pid` are the one part of the snapshot that is not a function of package
 files, and the service derives them the same way the manager does rather than from the controller's
@@ -223,6 +237,7 @@ code rather than served.
 | `69` | Installed executable or required runtime facility is unavailable |
 | `73` | Unsafe package path, state, lock, log, queue, or untrusted PID |
 | `75` | Another management or Plan/Run operation is active; a deferral, retried, not a failure |
+| `76` | A configuration change that needs the running controller to reload (`configure-routine`, `remove-routine`, `enable` / `set-schedule` with an interval, `configure-performance`) was **saved and audited as succeeded**, but the controller could not be told to reload it. stderr names the reason and PID |
 | `77` | Command was not run as the DSM package identity |
 | `78` | The package supervisor refused to start the core (binary identity mismatch); the core never ran, and one `supervised core refused: <code>` line is printed |
 | `130` / `143` | Interrupted management or terminated Plan/Run operation |
@@ -232,6 +247,28 @@ as is and is recorded as a `partial` outcome, not a failure; `plan` can also exi
 and deferrals exit `0` with a warning. Core planning, transport, authentication, and File Station
 failures propagate their own nonzero status. Treat `75` as a bounded retry only after confirming the recorded operation is expected.
 Investigate every other nonzero result and obtain a fresh Plan before retrying a mutation.
+
+Exit `76` is not a failed save: do not repeat the command. The reasons are `pid_unreadable` (the PID file
+holds no PID), `identity_refused` (the PID is live but not the verified controller), `identity_changed`
+(the identity changed between the two checks) and `signal_failed` (`kill -HUP` failed). A missing PID
+file, or a dead PID, is simply "controller not running" and exits `0`: the controller reads the saved
+files when it starts. The failure leaves `var/state/controller-reload.pending` (package-owned `0600`,
+lines `epoch=`, `reason=`, `pid=`, `operation=`), which the dashboard reads for its *Saved, not yet
+applied* item, and logs `controller_reload_failed` at `error`. The controller removes the marker when
+it starts and each time it processes a reload. Through `sdsync-dsm api <mutation>` the same condition
+is exit `0` with a `controller_reload_failed` warning in the result (see above).
+
+Only saves that need a reload can exit `76`: a routine change restarts watchers and polls, an enabled
+schedule rebases its interval deadline, and a performance level is applied at reload. The controller
+re-reads the alert policy on every event and the schedule file every turn, so `configure-alerts` and
+a schedule switched off (`disable`) need none: if the signal cannot be delivered the save still exits
+`0`, writes no marker, and logs `controller_reload_skipped` (`warn`, with `needed=false`).
+
+`sdsync-dsm status` prints `service=unknown` when `controller.pid` exists but holds no PID. An action
+that names no profile uses the default profile; if `default-profile` exists but names no existing
+profile the action is refused with exit `66` and a `default_profile_invalid` controller-log event,
+rather than quietly running on the first profile (the dashboard snapshot still shows the first profile
+as the default, as before).
 
 ## Package Center parity
 

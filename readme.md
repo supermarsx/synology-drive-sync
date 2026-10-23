@@ -176,7 +176,7 @@ Comparison is independent of the operation:
 
 | Mode | A same-path file matches when | Trade-off |
 | --- | --- | --- |
-| `content` | Size, MD5, IEEE CRC32, SHA-256, and whole-second mtime match (floor or rounded) | Safest and default; streams selected remote bytes and verifies uploads |
+| `content` | Size and server-side MD5 match; modification time alone never triggers an upload. Deletion and server-copy guards need the full MD5/CRC32/SHA-256 fingerprint | Safest and default; one server-side MD5 per same-size file, streams remote bytes only for those guards, and verifies uploads |
 | `metadata` | Size and whole-second mtime match (floor or rounded) | Faster, but can miss equal-size changes within the same second |
 | `size-only` | Size matches | Fastest and weakest; no content verification |
 
@@ -251,7 +251,7 @@ Doctor standard: PASS
   [PASS] step 2/16 Routing and TLS negotiation (181 ms shared with routing and discovery): HTTPS route and TLS negotiation succeeded with certificate verification enabled
   [PASS] step 3/16 DSM API discovery (181 ms shared with routing and discovery): DSM Auth and baseline File Station API versions were validated from the discovery response
            #1 SYNO.API.Info.query v1 session=none -> ok http 200 in 181 ms
-  [PASS] step 4/16 DSM capability enumeration (96 ms): DSM advertises 214 APIs; all 10 APIs this tool uses are present with compatible versions
+  [PASS] step 4/16 DSM capability enumeration (96 ms): DSM advertises 214 APIs; all 11 APIs this tool uses are present with compatible versions
   [PASS] step 15/16 Intermediaries and reverse proxies (no request of its own; summarised from the requests other sections made): no proxy, relay, or cache announced itself on any response
   [PASS] step 6/16 DSM session authentication (407 ms): DSM credentials were accepted and an authenticated File Station session was established
            #3 SYNO.API.Auth.login v6 session=none -> ok http 200 in 402 ms
@@ -289,7 +289,7 @@ $ synology-drive-sync plan /srv/project /home/Backup/project \
 Plan: 3 uploads (12.4 MiB), 0 server copies (verified upload fallback up to 0 B), 1 directories, 0 deletions, 215 unchanged files, 6 protected remote entries.
   MKDIR  /home/Backup/project/reports/2026-q3 (missing-remote: no remote entry at this path)
   UPLOAD reports/2026-q3/summary.pdf -> /home/Backup/project/reports/2026-q3/summary.pdf (missing-remote: no remote entry at this path)
-  UPLOAD notes/decisions.md -> /home/Backup/project/notes/decisions.md (content-differs: size equal, complete MD5/CRC32/SHA-256 fingerprint did not match)
+  UPLOAD notes/decisions.md -> /home/Backup/project/notes/decisions.md (content-differs: size equal, MD5 content digests differ)
   UPLOAD notes/todo.md -> /home/Backup/project/notes/todo.md (mtime-differs: size equal, modification time differs)
 Plan only; no remote changes were made.
 ```
@@ -369,8 +369,10 @@ prevent overlap, and allow enough time for the complete scan-transfer-verify wor
 - Symlinks, junctions, SYSTEM/TEMPORARY entries, dehydrated cloud placeholders, and names that
   collide by case or Unicode normalisation are skipped and reported by name, never uploaded and never
   deleted from the NAS; OS metadata files (`desktop.ini`, `Thumbs.db`, `.DS_Store`, `~$*`) are
-  excluded by default. Special or unreadable entries and unsafe names still fail closed. A file that
-  changes or is locked mid-run is deferred, and the run exits `3` (partial) so it is retried. Keep the
+  excluded by default. Special files, unreadable folders, unsafe or over-long names and names the
+  NAS refuses are set aside by name, never uploaded and never deleted from the NAS, and the rest of the
+  run proceeds with exit `0` and a named warning. A file that changes or is locked mid-run is
+  deferred, and the run exits `3` (partial) so it is retried. Keep the
   source quiescent and run as an unprivileged identity that owns or exclusively controls it.
 - There is no two-way reconciliation, Drive conflict protocol, block-level delta, resumable upload,
   transactional multi-profile rollback, or crash-atomic overwrite/type replacement.

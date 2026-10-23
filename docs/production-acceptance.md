@@ -189,7 +189,7 @@ This optimization requires a unique byte-identical remote candidate, different s
 
 ## 6. Verify bytes and Drive indexing externally
 
-The default `content` comparison requires matching size, MD5, IEEE CRC32, SHA-256, and a file mtime that agrees at File Station's whole-second resolution (the remote second equals the floor or the rounded value of the local time). Each upload is verified against the destination's own length and File Station's server-side MD5, computed from a fingerprint of the bytes that went onto the wire; the bytes are not transferred back. The paths that read a remote file back in full are the ones whose evidence has to stand on its own: a server-side copy's destination, and the guard that authorises a mirror deletion. MD5 is retained for File Station and output compatibility but is never sufficient by itself. Explicit `metadata` and `size-only` performance modes provide weaker change detection and do not establish content equality.
+The default `content` comparison requires matching size and File Station's server-side MD5; the modification time is not consulted, so equal bytes whose time moved are not re-sent. Each upload is verified against the destination's own length and File Station's server-side MD5, computed from a fingerprint of the bytes that went onto the wire; the bytes are not transferred back. The paths that read a remote file back in full are the ones whose evidence has to stand on its own: a server-side copy's source and the guard that authorises a mirror deletion. Those require the complete MD5, IEEE CRC32 and SHA-256 fingerprint, and an MD5 agreement alone is never enough to delete or duplicate remote data. Explicit `metadata` and `size-only` performance modes provide weaker change detection and do not establish content equality.
 
 For production acceptance, independently download the completed destination through File Station, or wait for a separate Synology Drive client to finish downloading it, and compare every file against the recorded SHA-256 manifest. On Unix, place it at `./acceptance-download` and run:
 
@@ -306,9 +306,13 @@ payload creation, then run and confirm the whole descendant hierarchy appears. S
 that a nonexistent top-level shared-folder path fails closed rather than creating a DSM share, and
 that a trailing slash, dot segment, Drive-incompatible name such as `~temporary`, or case-varied
 DSM-managed component such as `@EADIR`/`@APPDATA` is rejected before any target request can mutate
-data. Include a path whose selected prefix plus relative name exceeds the Drive portability limit,
-which must fail during planning. Include a case-only rename (it must converge under `--delete`, or be
-skipped as `case-rename-needs-delete` without it) and a true case collision of two local or two
+data. Include a local entry whose selected prefix plus relative name exceeds the Drive portability limit,
+or whose name is refused (`~name`, `aux.h`, a trailing dot): it must be named in the plan as an
+`unsupported-entry` deferral, never uploaded, its NAS copy preserved by a `--delete` run, with every
+other path syncing and the run exiting `0` with a warning. Include a case-only rename (under `--delete` it must be one File
+Station rename, counted as `renamed`, that uploads and deletes nothing; without it, skipped as
+`case-rename-needs-delete`; and a folder holding `@eaDir` must keep syncing under its NAS spelling with
+a `case-rename-pending` warning and nothing deleted) and a true case collision of two local or two
 remote names (both must be skipped, named in `plan.skipped`, and never deleted). Include a symlink or
 junction and, on Windows, a `desktop.ini` and a SYSTEM-attribute file: each must be excluded or
 skipped and reported, and its NAS counterpart must survive a `--delete` run.
@@ -365,6 +369,137 @@ The package reads the source NAS filesystem and uploads the bytes to the target 
 claim of a direct NAS-to-NAS File Station server-copy primitive: server-side copy optimization is
 limited to matching content already present within the one target NAS.
 
+## Questions only a real NAS can answer
+
+The File Station mock reproduces what DSM is documented to do. It cannot say what DSM actually does in
+fourteen places where a safeguard of the client rests on an assumption. Each is a question to put to a
+disposable share on the exact DSM build in service, and each answer changes what the client or the
+dashboard can be trusted to do. Run them against a scratch path only, with a throwaway account, and
+record the result in the [acceptance record](#acceptance-record). Where a probe gives an expected
+answer, a different one is not a reason to stop using the client, but report it with the DSM build.
+
+Set up once (replace `NAS`, `USER` and `PASS`; `jq` is required). Every probe below uses `$SID`, the
+`GI` helper for `SYNO.FileStation.List.getinfo`, and the `UP` helper for a multipart upload, which
+sends the same fields the client does with the binary part last:
+
+```bash
+NAS=https://nas.example:5001
+SID=$(curl -sk "$NAS/webapi/entry.cgi" -d api=SYNO.API.Auth -d version=6 -d method=login \
+  --data-urlencode account=USER --data-urlencode passwd=PASS -d session=FileStation -d format=sid \
+  | jq -r .data.sid)
+GI() { curl -sk "$NAS/webapi/entry.cgi" -d api=SYNO.FileStation.List -d version=2 -d method=getinfo \
+  --data-urlencode "path=[\"$1\"]" -d 'additional=["size","time","real_path","type"]' -d _sid=$SID; }
+UP() { # UP /share/folder local-file [extra curl -F options]
+  curl -sk "$NAS/webapi/entry.cgi" -F api=SYNO.FileStation.Upload -F version=2 -F method=upload \
+    -F "path=$1" -F create_parents=true -F overwrite=true "${@:3}" -F "_sid=$SID" -F "file=@$2"; }
+```
+
+1. **Does an upload keep its modification time?** `UP /share/t x.bin -F mtime=1700000000700`, then
+   `GI /share/t/x.bin | jq .data.files[0].additional.time.mtime`.
+   - `1700000000` or `1700000001` is the expected answer: DSM keeps the time, and a `metadata`
+     comparison converges.
+   - A time close to now means DSM ignores the field. The client already detects this and reports it
+     as `mtime_not_kept` (CLI result, SDK `ExecutionSummary::mtime_not_kept()` and FFI), and a
+     `metadata` run will call every such file changed next time. Use `--compare content` there.
+2. **Can an interrupted overwrite leave a torn file that looks unchanged?** Upload a 2 GB file over an
+   existing 2 GB file of the same name with `UP ... --limit-rate 5M`, kill `curl` after about 10
+   seconds, then `GI` the path.
+   - The old file intact, or a truncated file, is safe: either differs from the source in size or
+     content.
+   - The **full size with the new modification time** and wrong content would let a `metadata`
+     comparison call the file unchanged. Report it. The client's only defence today is a post-failure
+     check (when the final attempt of an upload fails in transport, it compares the NAS copy's size,
+     time and MD5 and, if they match the source's size and time but not its content, says so and asks
+     for `--compare content`). A cancelled run (Ctrl-C) and the *next* run have no such defence.
+3. **What does a failed server-side copy look like?** `CopyMove.start` `/share/a/f.bin` into `/share/b`
+   where `b/f.bin` already exists (fields `path=["/share/a/f.bin"]`, `dest_folder_path=/share/b`,
+   `remove_src=false`, `accurate_progress=false`; CopyMove is version 3), then poll `CopyMove.status`
+   with the returned `taskid`.
+   - `success:false` with an error code of 1000 to 1007, 414, 415, 416 or 418, or a `data.error`
+     field: both shapes are handled, and the file is deferred as `server-copy-failed` and uploaded next
+     run. Record which shape DSM uses. Also note whether the copy's modification time equals the
+     source's.
+4. **Are remote symbolic links reported, and is `real_path` resolved?** Over SSH:
+   `ln -s /volume1/other /volume1/share/t/link; ln -s .. /volume1/share/t/loop`. Then list `/share/t`
+   and `/share/t/link`, and `GI /share/t/link`.
+   - The client treats a child as a link when its `real_path` is not the parent's real path plus `/` plus
+     its name, and a folder as revisited when its real path was already walked. It needs `real_path` to
+     be the **resolved** path (`/volume1/other`), not the lexical one (`/volume1/share/t/link`). If DSM
+     reports the lexical path, a link looks like an ordinary folder and the guard does not protect
+     you from a delete or write through it. Record what `real_path` says for `link` and for `loop`.
+   - Record the real path of an ordinary folder and one of its children on a normal share, an encrypted
+     share and a USB share, and whether the root of an encrypted share reports `/volumeN/@share@` (with
+     its children under the same prefix). The comparison folds a trailing `/`, Unicode normalisation
+     and case, and tolerates a volume prefix, but any other mismatch would make ordinary folders look
+     like links. The client then fails the run with `remote-real-path-unusable` (at least three link
+     boundaries that are more than half the folders listed), uploading and deleting nothing. If DSM
+     reports no `real_path` at all, `sync` and `plan` print a warning that the check could not run.
+5. **How does an idle session expire?** Log in, wait past the DSM logout timer, call
+   `SYNO.FileStation.List` `list_share`. Separately, start an upload that takes longer than the timer,
+   then `GI` the path. Record codes 106 and 119.
+   - 106 (timeout) or 119 (invalid session) at the next request is the case the client is built
+     for: the CLI re-authenticates once and carries on. The SDK installs no re-authenticator, so for
+     SDK and FFI callers an expired session ends the run. Whether the long upload survives the timer
+     decides whether a slow upload needs a keepalive; record what the `GI` afterwards shows.
+6. **Do task ids survive a re-login?** Start `SYNO.FileStation.MD5` `start` on a big file with session A
+   (`file_path=/share/t/big.bin`), log in again to get session B, then call `MD5.status` with A's
+   `taskid` and `_sid=B`. Also check whether session A is still valid (107 means it is not).
+   - A digest means task ids are global to the account. An error (599 or 408) means they belong to the
+     session, so a task started before a re-login cannot be polled after it. Record which, and whether
+     session A is still valid: the client re-authenticates between requests and the answer decides
+     whether a task can straddle that.
+7. **Where are the name and size limits?** Upload, and `CreateFolder`, a name of 90 repetitions of `日`
+   (270 bytes) on a normal share and 50 repetitions on an encrypted share; also upload a file over 4 GB to
+   a FAT32 USB share. Record each DSM code.
+   - 418, 1100, 400 or 1804 are the expected refusals. The client turns each into a `remote-refused`
+     deferral (418, 414, 1100, 1101, 400, 1802 and 1804 are per-path; 407 and 105 once the session is
+     proven alive too) and carries on with the other files. A refusal it does not classify (for example
+     411 read-only volume, 415 or 416 quota or disk full) fails the run, which is the right answer for a
+     share-wide condition. Note that the client also refuses a component over 255 bytes itself,
+     before sending anything.
+8. **Is a non-recursive delete really non-recursive?** `SYNO.FileStation.Delete` `delete` (version 2)
+   on a non-empty folder with `recursive=false`:
+   `curl -sk "$NAS/webapi/entry.cgi" -d api=SYNO.FileStation.Delete -d version=2 -d method=delete -d 'path=["/share/t/full"]' -d recursive=false -d _sid=$SID`.
+   - It **must** fail and leave the folder and its contents. Success would mean every mirror deletion
+     is recursive, which is a safety defect: report it before enabling `--delete` anywhere.
+9. **Does a hidden entry change the listing total?** `List.list` on an Access-based-enumeration share
+   with a folder the account cannot read, and on a photo folder:
+   `... -d api=SYNO.FileStation.List -d version=2 -d method=list --data-urlencode 'folder_path=/share/t' -d _sid=$SID | jq '.data.total, (.data.files|length)'`.
+   - Equal numbers mean the listing is complete. A `total` larger than the entries returned is the
+     case the client calls an incomplete listing: it withholds deletions there and in the ancestors and
+     reports `listing-incomplete` as a lasting warning. A photo folder where the two differ for no
+     hidden reason would make that warning permanent noise; report it.
+10. **What does a failed download return?** `curl -skD- -o /dev/null "$NAS/webapi/entry.cgi" -d api=SYNO.FileStation.Download -d version=2 -d method=download --data-urlencode 'path=["/share/nope"]' -d mode=download -d _sid=$SID`.
+    - `Content-Type: application/json` is the expected answer: the client decodes the DSM error code
+      from the body. Any other type that is not `application/octet-stream` is reported as
+      "download response was not an octet stream" without a DSM code, so the cause of a failed
+      fingerprint would be harder to read; an HTTP error status is reported with the body withheld.
+11. **Does the NAS treat NFC and NFD spellings as one name?** Upload an NFD-spelled `café.txt`, then `GI`
+    both the NFD and the NFC spelling of its path.
+    - If only the NFD spelling resolves, the volume keeps the two spellings distinct, and the client's
+      pairing of spellings by normalisation is what stops a Mac-written and a Windows-written copy of
+      one name from being uploaded and deleted as a pair. If both resolve, the volume folds
+      normalisation too; exercise a normalisation-only and a case-only rename on it.
+12. **Does a job run by the package inherit a proxy?** With the DSM Control Panel proxy enabled, during
+    a scheduled run: `cat /proc/<sdsync pid>/environ | tr '\0' '\n' | grep -i proxy`.
+    - Any `http_proxy`, `https_proxy` or `all_proxy` means the run reaches the NAS through that proxy.
+      The client honours it and now says so (a warning on `sync`, `plan`, `status` and `doctor`, and the
+      proxy named in a discovery failure). `NO_PROXY=<nas host>` bypasses it. With `--allow-http` the
+      password crosses the proxy unencrypted.
+13. **Is an upload with a bad session written at all?** Upload to a new path with `_sid=bogus` (expect
+    119), then `GI` the path.
+    - Absent is the expected answer, and it confirms the premise of re-sending an upload after a
+      session refusal: that DSM discarded the request before writing anything. A file that exists
+      would make that premise false; report it.
+14. **Does DSM destroy the dashboard when its window is closed?** The dashboard stops its timers, drops
+    the CSRF token and clears secret drafts in its `beforeDestroy` hook, which only runs if DSM calls
+    `$destroy` on the AppWindow instance when the window closes. Open the app with the status refresh
+    set to 3 seconds and the browser's Network tab filtered to `api.cgi`, note the `action=snapshot`
+    requests, close the window with its close button, and watch for two minutes.
+    - Requests that stop mean DSM destroys the instance and the cleanup runs. Requests that continue
+      mean a closed window keeps polling, keeps its CSRF token and any unsaved secret drafts in
+      memory, until the DSM tab itself is closed; report it with the DSM build.
+
 ## Acceptance record
 
 Production approval should retain evidence for all of the following:
@@ -382,5 +517,8 @@ Production approval should retain evidence for all of the following:
 - deletion still disabled unless its operational need and cap were separately approved;
 - for SPK deployments, source-share ACL isolation, arbitrary nested target creation, Package Center
   install/upgrade/start/stop/uninstall evidence, reboot persistence, and two-NAS TOTP/proxy results.
+- the answers to the [questions only a real NAS can answer](#questions-only-a-real-nas-can-answer),
+  at least probes 4 and 8 before enabling deletion, and probe 14 before relying on the dashboard
+  to release its timers and secret drafts when its window closes.
 
 Repeat the relevant steps after DSM/File Station upgrades, reverse-proxy changes, authentication-policy changes, scheduler identity changes, or a major application upgrade.

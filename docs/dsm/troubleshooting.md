@@ -646,7 +646,9 @@ poll leaves it holding whatever it last reported rather than updating to reflect
 
 Start with the dashboard's attention list or the snapshot's `outcomes.run` (`reason` and `detail`);
 the same cause is in Activity `run.failed`. A scheduled run's core stderr tail is in
-`var/log/run-stderr.log`.
+`var/log/run-stderr.log`, which the dashboard shows under the attention list (*Core error output of
+the last run*) and offers as the Logs source *Core error output* (`run-stderr`). A failed profile also
+shows the core's last error line and the path it failed on when the runner recorded them.
 
 | Reason | Meaning | What to do |
 | --- | --- | --- |
@@ -673,7 +675,25 @@ the Activity line, the alert counter, or the DSM log, was not written; check `co
 A **partial** run (exit `3`) is not a failure: some paths were deferred and sync next time. A run with
 **skipped or deferred entries and a warning** exited `0`; the entries are named by `entry.skipped` and
 `entry.deferred` records in the sync log, and the reasons are listed under
-[partial runs, deferrals and skips](../observability.md#partial-runs-deferrals-and-skips).
+[partial runs, deferrals and skips](../observability.md#partial-runs-deferrals-and-skips). Names or
+permissions that only a person can fix (a name the NAS refuses, an unreadable folder, a link, a case
+rename File Station would not make) are in that group and stay amber on every run until fixed; if a
+refusal covers most of the share the run instead **fails**, naming the cause.
+
+**A run that never finishes.** The attention list flags a run going for more than six hours
+(`long_running`) and one whose heartbeat is more than 30 minutes old (`stalled`: its I/O counters and
+progress record stopped moving). Neither stops the run, and nothing in the package stops the core on its
+own. There is no dashboard *Cancel run*: a package stop is the way to end a hung run (Package Center
+stop or `synopkg stop`). The controller stops within 60 seconds, the run is recorded as `cancelled`
+(not `runner_died`), and a core that ignores the termination request is killed after the grace. Meanwhile every routine waits behind the run as “Waiting (busy)”. Check the NAS side first: a hung SMB or NFS
+source mount, or a File Station request with no deadline.
+
+**A save that is not applied.** A green save followed by the red notice *Saved, but it is not fully in
+effect* (and an Overview item *Saved, not yet applied; restart the package service*) means the change
+is on disk but the running controller could not be told to reload; the reason is one of
+`pid_unreadable`, `identity_refused`, `identity_changed` or `signal_failed`. Restart the package in
+Package Center; the controller reads the saved files when it starts. *Cannot tell whether saved changes
+are applied* means the marker file itself failed its safety check.
 
 ## Routine is deferred
 
@@ -730,9 +750,14 @@ expected is more likely a classification gap than a delivery failure; check the 
 
 Status and logs should identify the active operation/PID. Wait for a legitimate operation to finish.
 Stop uses cooperative termination and can wait for the core to unwind; it deliberately refuses an
-untrusted PID and does not force-kill after timeout.
+untrusted PID and does not force-kill after timeout. When the run lock is held by the controller
+itself (it takes the lock to reconcile a dead run), stop verifies and stops it as the controller
+instead of refusing to signal an "unverified plan/sync PID", and recovers the lock afterwards as stale.
 
-Stale locks are recovered only when their recorded PID is no longer live. Do not recursively delete
+Stale locks are recovered only when their recorded PID is no longer live (an owner record torn by
+power loss before the last boot counts as dead and is recovered, rather than ending the controller).
+At controller start it also removes capture, admission and fingerprint leftovers of processes
+that are no longer live and logs `runtime_leftovers_pruned`. Do not recursively delete
 package run/control directories. If identity/path validation reports `73`, preserve evidence and
 repair through a verified reinstall/upgrade rather than manual chmod/chown edits.
 
@@ -816,8 +841,10 @@ record those results from the installed AppWindow.
 - source hash scan, API discovery, authentication, target inventory, and prepared disposable write
   test succeed;
 - reverse-proxy prefix, certificate/private CA, upload limit, timeouts, largest file, password, TOTP,
-  and NAS clock are proven; and
-- Synology Drive visibly indexes the File Station result when that behavior is required.
+  and NAS clock are proven;
+- Synology Drive visibly indexes the File Station result when that behavior is required; and
+- the [questions only a real NAS can answer](../production-acceptance.md#questions-only-a-real-nas-can-answer)
+  are put to the exact DSM build, including whether DSM destroys the dashboard when its window closes.
 
 ### Automation and observability
 
@@ -843,6 +870,8 @@ record those results from the installed AppWindow.
   suppresses a repeated failure, and an intentionally wrong identifier or a removed
   `synologset1` degrades to `notification.unavailable` without failing the run. Record the DSM
   version with the identifier, which is a Synology-internal value with no cross-release promise;
+- a hung source mount holds the run lock without failing: `running_for_seconds`, `long_running` and
+  `stalled` appear in the snapshot, routines wait as “Waiting (busy)”, and nothing is reported healthy;
   and
 - service restart after source-NAS reboot preserves configuration without triggering an unreviewed
   immediate mutation.

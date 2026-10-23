@@ -63,10 +63,12 @@ Legacy `--dry-run` is equivalent to planning. New scripts should use `plan`.
 Exit `3` takes precedence over `0` and `10` only: failure (`1`), usage error (`2`) and cancellation
 (`130`) keep their own codes. It is the exit for transient deferrals alone (a file that changed or
 was locked while it was read, a destination that moved after planning, a refused server-side copy
-or deletion). Lasting skips (links, reparse points, case collisions, names the destination cannot
-hold, incomplete NAS listings) and the lasting deferrals exit `0` with `outcome: "complete"`
-and a warning, because a run that could never be anything but partial would re-run forever under a
-scheduler. Both are always named in the result and the log; see
+or a deletion that failed for a reason other than permission). Anything only a person can clear
+exits `0` with `outcome: "complete"` and a named warning: links, reparse points, case collisions,
+names the destination or Synology Drive refuses, paths the NAS refuses by name or permission,
+unreadable local folders, type conflicts, incomplete NAS listings and a case-only rename that
+could not be made. A run that could never be anything but partial would re-run forever under a
+scheduler. A refusal that covers most of the share is not a warning: it fails the run (`1`). Both are always named in the result and the log; see
 [partial runs, deferrals and skips](../observability.md#partial-runs-deferrals-and-skips) for the
 reasons and what each means. A scheduler should treat `3` as "retry later", not as an alert.
 
