@@ -12,7 +12,7 @@ use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
-use std::sync::{Mutex, MutexGuard};
+use std::sync::{Mutex, MutexGuard, OnceLock};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -403,7 +403,8 @@ impl EventReason {
             Error::HttpsRequired => Self::HttpsRequired,
             Error::UnsafeRemotePath { .. }
             | Error::RemoteEscape(_)
-            | Error::RemoteMountRoot { .. } => Self::RemotePathRefused,
+            | Error::RemoteMountRoot { .. }
+            | Error::RemoteRefused { .. } => Self::RemotePathRefused,
             Error::InvalidSource(_) => Self::SourceInvalid,
             Error::UnsupportedLocalEntry { .. } => Self::LocalEntryUnsupported,
             Error::FileIo { .. } => Self::LocalIo,
@@ -436,6 +437,66 @@ impl EventReason {
             Error::Vault { .. } => Self::CredentialUnavailable,
             Error::Message(_) => Self::Unclassified,
         }
+    }
+}
+
+/// The entry a per-path failure concerns, for the opt-in `path` member of `run.failed`.
+///
+/// A local path is reported relative to `source`, and only when it lies inside it, so no absolute
+/// local path ever reaches a log or a remote collector; a remote path is the one DSM or the planner
+/// named. A failure that is not about one entry has none. [`LogEvent::path`] sanitises and bounds
+/// the result. The match is exhaustive on purpose: a new error variant must decide whether it is
+/// about one entry, as it must decide its [`EventReason`].
+pub fn failure_path(error: &crate::error::Error, source: Option<&Path>) -> Option<String> {
+    use crate::error::Error;
+    let local = |path: &Path| {
+        let relative = path.strip_prefix(source?).ok()?;
+        let text = relative
+            .components()
+            .map(|component| component.as_os_str().to_string_lossy())
+            .collect::<Vec<_>>()
+            .join("/");
+        (!text.is_empty()).then_some(text)
+    };
+    match error {
+        Error::FileIo { path, .. }
+        | Error::UnsupportedLocalEntry { path, .. }
+        | Error::SourceChanged(path) => local(path),
+        Error::UnsafeRemotePath { path, .. }
+        | Error::RemoteMountRoot { path, .. }
+        | Error::RemoteRefused { path, .. }
+        | Error::TypeConflict { path, .. }
+        | Error::RemoteEscape(path)
+        | Error::ProtectedConflict(path)
+        | Error::ContentVerificationFailed(path)
+        | Error::RemoteSnapshotChanged(path)
+        | Error::ServerCopyFailed {
+            destination: path, ..
+        } => Some(path.clone()),
+        Error::InvalidUrl(_)
+        | Error::Configuration(_)
+        | Error::HttpsRequired
+        | Error::InvalidSource(_)
+        | Error::Http { .. }
+        | Error::HttpBody { .. }
+        | Error::HttpStatus { .. }
+        | Error::InvalidResponse { .. }
+        | Error::Api { .. }
+        | Error::UnsupportedApiVersion { .. }
+        | Error::MissingApi(_)
+        | Error::ShareNotWritable(_)
+        | Error::EmptySourceDeletion
+        | Error::DeleteLimit { .. }
+        | Error::ResyncTicketStale { .. }
+        | Error::ScopeNotFound(_)
+        | Error::InvalidContentHash
+        | Error::RemoteDigestsFailing { .. }
+        | Error::ServerCopyNotStarted
+        | Error::OperationTimedOut { .. }
+        | Error::ReconciliationPending { .. }
+        | Error::Cancelled
+        | Error::Vault { .. }
+        | Error::Message(_) => None,
     }
 }
 
@@ -532,6 +593,53 @@ impl<const N: usize> InlineAscii<N> {
         }
     }
 
+    /// As [`InlineAscii::sanitized`], but every byte outside the safe set becomes `%XX`
+    /// (uppercase hex) instead of `_`, and `%` is encoded too, so decoding is exact. Over-long
+    /// input is truncated before an escape that would not fit whole, and marked with `~`.
+    pub fn percent_encoded(input: &str) -> Self {
+        debug_assert!(
+            N <= u8::MAX as usize,
+            "InlineAscii capacity must fit its u8 length"
+        );
+        const HEX: &[u8; 16] = b"0123456789ABCDEF";
+        let mut bytes = [0_u8; N];
+        let mut length = 0_usize;
+        let mut truncated = false;
+        for byte in input.bytes() {
+            let safe = byte.is_ascii_alphanumeric()
+                || matches!(byte, b'.' | b'-' | b'_' | b'/' | b':' | b',');
+            let width = if safe { 1 } else { 3 };
+            if length + width > N {
+                truncated = true;
+                break;
+            }
+            if safe {
+                bytes[length] = byte;
+            } else {
+                bytes[length] = b'%';
+                bytes[length + 1] = HEX[usize::from(byte >> 4)];
+                bytes[length + 2] = HEX[usize::from(byte & 0x0f)];
+            }
+            length += width;
+        }
+        if truncated {
+            // Drop whole escapes until the marker fits after them.
+            while length > N - 1 {
+                length -= if length >= 3 && bytes[length - 3] == b'%' {
+                    3
+                } else {
+                    1
+                };
+            }
+            bytes[length] = b'~';
+            length += 1;
+        }
+        Self {
+            bytes,
+            length: u8::try_from(length).unwrap_or(u8::MAX),
+        }
+    }
+
     pub fn as_str(&self) -> &str {
         let end = usize::from(self.length).min(N);
         // Every stored byte came from `sanitized`, which only ever writes ASCII.
@@ -565,9 +673,11 @@ pub type ProfileToken = InlineAscii<64>;
 
 /// The relative path of the entry a skip, deferral or per-entry failure concerns.
 ///
-/// Opt-in per record and never set on authentication or connection records. Sanitised like every
-/// other runtime text, so a byte outside the safe set (any non-ASCII byte included) reads as `_`.
-pub type EntryPath = InlineAscii<128>;
+/// Opt-in per record and never set on authentication or connection records. Built only by
+/// [`InlineAscii::percent_encoded`]: a byte outside the safe set (any non-ASCII byte, a space, a
+/// newline, `%` itself) is written `%XX`, so the record stays one safe ASCII token and the path is
+/// still exactly recoverable, which `_` replacement made impossible for a non-Latin name.
+pub type EntryPath = InlineAscii<255>;
 
 /// Which session channels one request carried.
 ///
@@ -1444,7 +1554,7 @@ impl LogEvent {
     }
 
     pub fn path(mut self, path: &str) -> Self {
-        self.path = Some(EntryPath::sanitized(path));
+        self.path = Some(EntryPath::percent_encoded(path));
         self
     }
 
@@ -1724,6 +1834,8 @@ pub struct EventLogger {
     stderr: Option<(LogFormat, Mutex<Box<dyn Write + Send>>)>,
     file: Option<(LogFormat, Mutex<RotatingFile>)>,
     remote: Option<RemoteSink>,
+    /// The profile every record is attributed to when it does not name one itself (G-9).
+    profile: OnceLock<ProfileToken>,
 }
 
 impl EventLogger {
@@ -1753,12 +1865,28 @@ impl EventLogger {
             }),
             file,
             remote,
+            profile: OnceLock::new(),
         })
     }
 
-    pub fn emit(&self, event: LogEvent) -> ObservabilityResult<()> {
+    /// Attribute every later record that names no profile of its own to `profile`.
+    ///
+    /// For a logger built for one profile's run, so that records built far from any profile name
+    /// (the transport's `api_call.*` and `retry.scheduled`, uploads, scans) can still be told
+    /// apart in an `all` run whose jobs share one log file. The first attribution stands, so a
+    /// logger is never re-pointed at another profile part way through; the return value says
+    /// whether the logger now carries exactly this profile.
+    pub fn attribute_profile(&self, profile: &str) -> bool {
+        let token = ProfileToken::sanitized(profile);
+        *self.profile.get_or_init(|| token) == token
+    }
+
+    pub fn emit(&self, mut event: LogEvent) -> ObservabilityResult<()> {
         if !self.level.permits(event.level) {
             return Ok(());
+        }
+        if event.profile.is_none() {
+            event.profile = self.profile.get().copied();
         }
         if let Some((format, sink)) = &self.stderr {
             write_event(&mut *lock(sink)?, *format, event, "stderr log write")?;
@@ -2743,16 +2871,159 @@ mod tests {
         assert_eq!(json["event"], "entry.deferred");
         assert_eq!(json["reason"], "changed_during_run");
         assert_eq!(json["profile"], "photos");
-        // A newline cannot forge a second record, and non-ASCII reads as `_`, byte by byte.
-        assert_eq!(json["path"], "albums/__t___2026/a_b.jpg");
+        // A newline cannot forge a second record, and every other byte stays readable: anything
+        // outside the safe set is percent-encoded byte by byte, so a non-ASCII name is recoverable
+        // instead of reading as a row of `_`.
+        assert_eq!(json["path"], "albums/%C3%A9t%C3%A9%202026/a%0Ab.jpg");
         let human = event.human_line();
-        assert!(human.contains(" reason=changed_during_run profile=photos path=albums/"));
+        assert!(human.contains(
+            " reason=changed_during_run profile=photos path=albums/%C3%A9t%C3%A9%202026/a%0Ab.jpg"
+        ));
         assert!(!human.contains('\n'));
+        // A CJK name, and a literal percent sign, which is encoded too so decoding is exact.
+        let cjk = LogEvent::new(LogLevel::Warn, EventCode::EntrySkipped).path("写真/100%.jpg");
+        assert_eq!(cjk.json_value()["path"], "%E5%86%99%E7%9C%9F/100%25.jpg");
         // The path is bounded, and the cut is marked.
         let long = LogEvent::new(LogLevel::Error, EventCode::UploadFailed).path(&"a/".repeat(200));
         let path = long.json_value()["path"].as_str().unwrap().to_owned();
-        assert_eq!(path.len(), 128);
+        assert_eq!(path.len(), 255);
         assert!(path.ends_with('~'));
+        // A cut never splits an escape.
+        let wide = LogEvent::new(LogLevel::Error, EventCode::UploadFailed).path(&"日".repeat(100));
+        let path = wide.json_value()["path"].as_str().unwrap().to_owned();
+        assert!(path.len() <= 255 && path.ends_with('~'), "{path}");
+        let body = path.trim_end_matches('~');
+        assert!(
+            body.len().is_multiple_of(3) && body.split('%').skip(1).all(|escape| escape.len() == 2)
+        );
+    }
+
+    /// G-9: a logger built for one profile's run attributes every record to that profile,
+    /// including the transport observations (`api_call.*`, `retry.scheduled`) that are built far
+    /// from any profile name. A record that names its own profile keeps it.
+    #[test]
+    fn a_profile_attributed_logger_names_the_profile_on_every_record() {
+        let buffer = SharedWriter::default();
+        let logger = EventLogger::with_stderr_writer(
+            LoggerConfig {
+                level: LogLevel::Trace,
+                stderr: Some(LogFormat::Json),
+                file: None,
+                remote: None,
+            },
+            buffer.clone(),
+        )
+        .unwrap();
+        logger
+            .emit(LogEvent::new(LogLevel::Debug, EventCode::ApiCallCompleted))
+            .unwrap();
+        assert!(logger.attribute_profile("photos"));
+        assert!(logger.attribute_profile("photos"));
+        assert!(!logger.attribute_profile("music"));
+        logger
+            .emit(LogEvent::new(LogLevel::Debug, EventCode::ApiCallCompleted))
+            .unwrap();
+        logger
+            .emit(LogEvent::new(LogLevel::Debug, EventCode::RetryScheduled).profile("other"))
+            .unwrap();
+        logger.flush(Duration::from_secs(1)).unwrap();
+        let records = buffer
+            .text()
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(records.len(), 3);
+        assert!(records[0].get("profile").is_none());
+        assert_eq!(records[1]["event"], "api_call.completed");
+        assert_eq!(records[1]["profile"], "photos");
+        assert_eq!(records[2]["profile"], "other");
+    }
+
+    /// ADV-S-19: the entry a per-path failure concerns, for the opt-in `path` member of
+    /// `run.failed`. A local path is made relative to the source and never leaves it; a remote
+    /// path is the one DSM named; a failure about no single entry has none.
+    #[test]
+    fn failure_path_names_the_entry_of_a_per_path_failure_only() {
+        use crate::error::Error;
+        let root = Path::new("/volume1/photos");
+        let io = || std::io::Error::from(std::io::ErrorKind::PermissionDenied);
+        assert_eq!(
+            failure_path(
+                &Error::FileIo {
+                    path: root.join("albums/a.jpg"),
+                    source: io()
+                },
+                Some(root)
+            )
+            .as_deref(),
+            Some("albums/a.jpg")
+        );
+        assert_eq!(
+            failure_path(
+                &Error::UnsupportedLocalEntry {
+                    path: root.join("fifo"),
+                    reason: "a FIFO".to_owned()
+                },
+                Some(root)
+            )
+            .as_deref(),
+            Some("fifo")
+        );
+        assert_eq!(
+            failure_path(&Error::SourceChanged(root.join("b/c.txt")), Some(root)).as_deref(),
+            Some("b/c.txt")
+        );
+        // Outside the source, or with no source to measure from: nothing, never an absolute path.
+        assert_eq!(
+            failure_path(
+                &Error::FileIo {
+                    path: PathBuf::from("/etc/shadow"),
+                    source: io()
+                },
+                Some(root)
+            ),
+            None
+        );
+        assert_eq!(
+            failure_path(&Error::SourceChanged(root.join("x")), None),
+            None
+        );
+        assert_eq!(
+            failure_path(
+                &Error::TypeConflict {
+                    path: "albums/x".to_owned(),
+                    local_kind: "file",
+                    remote_kind: "folder"
+                },
+                Some(root)
+            )
+            .as_deref(),
+            Some("albums/x")
+        );
+        assert_eq!(
+            failure_path(
+                &Error::RemoteRefused {
+                    operation: "SYNO.FileStation.Upload.upload".to_owned(),
+                    path: "/share/albums/x".to_owned(),
+                    code: 418,
+                    description: String::new()
+                },
+                Some(root)
+            )
+            .as_deref(),
+            Some("/share/albums/x")
+        );
+        assert_eq!(failure_path(&Error::Cancelled, Some(root)), None);
+        assert_eq!(
+            failure_path(
+                &Error::DeleteLimit {
+                    planned: 9,
+                    maximum: 1
+                },
+                Some(root)
+            ),
+            None
+        );
     }
 
     /// The reason vocabulary is published (docs, DSM dashboard); names must be stable,

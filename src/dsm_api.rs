@@ -676,28 +676,25 @@ impl PackagePaths<'static> {
 #[cfg(target_os = "linux")]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ReadRung {
-    /// Answered inside the service, from the package's own files.
+    /// Answered inside the service, from the package's own files. The shell
+    /// manager answers it instead only when the operator forces that lane.
     InService,
-    /// Answered by running the shell manager and sanitizing its JSON.
-    ShellManager,
     /// Answered before the ladder: neither rung applies.
     NotLadderRouted,
 }
 
 /// The rung that answers an action when the operator has not forced the lane.
 ///
-/// Using the shell rung for an action with no in-service implementation is the
-/// steady state during the migration, not an error, and it logs nothing. Three
-/// of four ladder reads are legitimately on the shell rung; a record per poll
-/// per open window would exhaust the thirty-second coalescing window and bury
-/// the failures the taxonomy exists to surface.
+/// Every ladder read now has an in-service implementation; `logs` was the last,
+/// moved because the manager's scan of every retained byte timed out on armv7
+/// (ADV-B-4). The shell rung remains the operator's forced lane.
 #[cfg(target_os = "linux")]
 fn read_rung(action: &ReadAction) -> ReadRung {
     match action {
-        ReadAction::StatusRollup | ReadAction::Activity { .. } | ReadAction::Snapshot => {
-            ReadRung::InService
-        }
-        ReadAction::Logs { .. } => ReadRung::ShellManager,
+        ReadAction::StatusRollup
+        | ReadAction::Activity { .. }
+        | ReadAction::Snapshot
+        | ReadAction::Logs { .. } => ReadRung::InService,
         ReadAction::Csrf
         | ReadAction::SourceDirectories { .. }
         | ReadAction::SourcePath { .. }
@@ -1181,6 +1178,9 @@ enum LogSource {
     Scheduler,
     Sync,
     Audit,
+    /// The core's stderr from the last scheduled runs, kept by the runner in run-stderr.log.
+    /// Selectable only, never part of `All`.
+    RunStderr,
 }
 
 impl LogSource {
@@ -1193,6 +1193,7 @@ impl LogSource {
             Self::Scheduler => "scheduler",
             Self::Sync => "sync",
             Self::Audit => "audit",
+            Self::RunStderr => "run-stderr",
         }
     }
 }
@@ -2603,6 +2604,7 @@ fn parse_read_action(mut query: BTreeMap<String, String>) -> BridgeResult<ReadAc
                 "scheduler" => LogSource::Scheduler,
                 "sync" => LogSource::Sync,
                 "audit" => LogSource::Audit,
+                "run-stderr" => LogSource::RunStderr,
                 _ => return Err(BridgeError::bad_request()),
             };
             require_empty_query(&query)?;
@@ -3780,6 +3782,9 @@ fn policy_level_for_log_source(
         "controller" => Some(policy.controller_log_level),
         "scheduler" => Some(policy.scheduler_log_level),
         "sync" => Some(policy.sync_log_level),
+        // Opaque core stderr: every line classes as an error, so this threshold never hides
+        // it, but the source must be known here or every line is dropped as unattributable.
+        "run-stderr" => Some(policy.sync_log_level),
         _ => None,
     }
 }
@@ -6051,7 +6056,19 @@ mod linux_runtime {
 struct CapturedOutput {
     status_success: bool,
     stdout: Zeroizing<Vec<u8>>,
+    /// The manager's stderr. Only the queued mutation path keeps it, bounded to
+    /// `MAX_QUEUED_STDERR_BYTES`; `stderr_bytes` counts everything it wrote.
+    stderr: Zeroizing<Vec<u8>>,
+    stderr_bytes: usize,
 }
+
+/// Most warnings one mutation result may carry.
+const MAX_RESULT_WARNINGS: usize = 16;
+
+/// How much of a queued manager's stderr is kept for its api.log record. Anything beyond it is
+/// read and counted but not kept, so a chatty manager can never fail or stall the job.
+#[cfg(target_os = "linux")]
+const MAX_QUEUED_STDERR_BYTES: usize = 16 * 1024;
 
 #[cfg(target_os = "linux")]
 fn capture_bounded_command(
@@ -6183,7 +6200,7 @@ mod linux_process {
                 Stdio::null()
             })
             .stdout(Stdio::piped())
-            .stderr(Stdio::null());
+            .stderr(Stdio::piped());
         // The manager and everything it starts remain in a dedicated process
         // group. Normal queued work has no deadline, but consumer shutdown can
         // therefore terminate the complete in-flight operation without relying
@@ -6240,12 +6257,14 @@ mod linux_process {
         termination_requested: &AtomicBool,
     ) -> BridgeResult<CapturedOutput> {
         let mut stdout = child.stdout.take().ok_or_else(BridgeError::internal)?;
+        let mut stderr = child.stderr.take().ok_or_else(BridgeError::internal)?;
         let mut stdin = if input.is_some() {
             Some(child.stdin.take().ok_or_else(BridgeError::internal)?)
         } else {
             None
         };
         set_nonblocking(stdout.as_raw_fd())?;
+        set_nonblocking(stderr.as_raw_fd())?;
         if let Some(writer) = &stdin {
             set_nonblocking(writer.as_raw_fd())?;
         }
@@ -6261,12 +6280,17 @@ mod linux_process {
         let mut input_offset = 0_usize;
         let mut stdout_bytes = Zeroizing::new(Vec::with_capacity(maximum_stdout.min(8192)));
         let mut stdout_eof = false;
+        // Diagnostic only: it is drained so the manager can never block on a full pipe, and
+        // kept (bounded) for api.log, but its end-of-file is never waited for. Completion is
+        // decided by stdout and the exit status exactly as before stderr was captured.
+        let mut diagnostics = QueuedStderr::default();
 
         loop {
             if termination_requested.load(AtomicOrdering::Acquire) {
                 return Err(BridgeError::new(ErrorKind::Unavailable));
             }
             stdout_eof |= drain_pipe(&mut stdout, &mut stdout_bytes, maximum_stdout)?;
+            diagnostics.drain(&mut stderr)?;
             write_input(&mut stdin, &input_bytes, &mut input_offset)?;
 
             if let Some(status) = child
@@ -6274,8 +6298,9 @@ mod linux_process {
                 .map_err(|_| BridgeError::new(ErrorKind::Unavailable))?
             {
                 stdout_eof |= drain_pipe(&mut stdout, &mut stdout_bytes, maximum_stdout)?;
+                diagnostics.drain(&mut stderr)?;
                 if stdout_eof && input_offset == input_bytes.len() && stdin.is_none() {
-                    return completed_output(status, stdout_bytes);
+                    return Ok(diagnostics.into_output(status, stdout_bytes));
                 }
                 if input_offset != input_bytes.len() || stdin.is_some() {
                     return Err(BridgeError::new(ErrorKind::Unavailable));
@@ -6289,15 +6314,67 @@ mod linux_process {
                 // slice. There is no deadline here to bound the retry
                 // against -- this path has none by design -- so the slice
                 // itself is the only extra wait this adds.
-                poll_queued_io(&stdout, stdout_eof, None, queued_capture_grace_slice())?;
+                poll_queued_io(
+                    &stdout,
+                    stdout_eof,
+                    None,
+                    None,
+                    queued_capture_grace_slice(),
+                )?;
                 stdout_eof |= drain_pipe(&mut stdout, &mut stdout_bytes, maximum_stdout)?;
+                diagnostics.drain(&mut stderr)?;
                 if stdout_eof {
-                    return completed_output(status, stdout_bytes);
+                    return Ok(diagnostics.into_output(status, stdout_bytes));
                 }
                 return Err(BridgeError::new(ErrorKind::Unavailable));
             }
 
-            poll_queued_io(&stdout, stdout_eof, stdin.as_ref(), POLL_SLICE)?;
+            let stderr_open = (!diagnostics.eof).then_some(&stderr);
+            poll_queued_io(&stdout, stdout_eof, stderr_open, stdin.as_ref(), POLL_SLICE)?;
+        }
+    }
+
+    /// A queued manager's stderr: the first `MAX_QUEUED_STDERR_BYTES` kept, all of it counted.
+    #[derive(Default)]
+    struct QueuedStderr {
+        kept: Zeroizing<Vec<u8>>,
+        total: usize,
+        eof: bool,
+    }
+
+    impl QueuedStderr {
+        /// Read what is available without blocking. Never fails on volume; a read error other
+        /// than "nothing yet" fails the capture like any other pipe error.
+        fn drain(&mut self, reader: &mut ChildStderr) -> BridgeResult<()> {
+            if self.eof {
+                return Ok(());
+            }
+            let mut chunk = Zeroizing::new([0_u8; 8192]);
+            loop {
+                match reader.read(&mut chunk[..]) {
+                    Ok(0) => {
+                        self.eof = true;
+                        return Ok(());
+                    }
+                    Ok(length) => {
+                        self.total = self.total.saturating_add(length);
+                        let room = MAX_QUEUED_STDERR_BYTES.saturating_sub(self.kept.len());
+                        self.kept.extend_from_slice(&chunk[..length.min(room)]);
+                    }
+                    Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Ok(()),
+                    Err(_) => return Err(BridgeError::new(ErrorKind::Unavailable)),
+                }
+            }
+        }
+
+        fn into_output(self, status: ExitStatus, stdout: Zeroizing<Vec<u8>>) -> CapturedOutput {
+            CapturedOutput {
+                status_success: status.success(),
+                stdout,
+                stderr: self.kept,
+                stderr_bytes: self.total,
+            }
         }
     }
 
@@ -6407,6 +6484,8 @@ mod linux_process {
         Ok(CapturedOutput {
             status_success: status.success(),
             stdout,
+            stderr: Zeroizing::new(Vec::new()),
+            stderr_bytes: 0,
         })
     }
 
@@ -6501,12 +6580,18 @@ mod linux_process {
     fn poll_queued_io(
         stdout: &ChildStdout,
         stdout_eof: bool,
+        stderr: Option<&ChildStderr>,
         stdin: Option<&ChildStdin>,
         timeout: Duration,
     ) -> BridgeResult<()> {
         let mut descriptors = [
             libc::pollfd {
                 fd: if stdout_eof { -1 } else { stdout.as_raw_fd() },
+                events: libc::POLLIN,
+                revents: 0,
+            },
+            libc::pollfd {
+                fd: stderr.map_or(-1, AsRawFd::as_raw_fd),
                 events: libc::POLLIN,
                 revents: 0,
             },
@@ -6522,7 +6607,7 @@ mod linux_process {
         // observed promptly; the grace retry below is the one caller that
         // ever passes something else.
         let timeout_ms = timeout.as_millis().max(1).min(libc::c_int::MAX as u128) as libc::c_int;
-        // SAFETY: descriptors is an initialized two-element pollfd array.
+        // SAFETY: descriptors is an initialized three-element pollfd array.
         let status = unsafe {
             libc::poll(
                 descriptors.as_mut_ptr(),
@@ -7515,6 +7600,9 @@ fn parse_manager_result_for_operation(
         "has_password",
         "has_totp",
         "has_remote_log_token",
+        "warnings",
+        "warning_code",
+        "warning",
     ];
     if root
         .keys()
@@ -7523,6 +7611,7 @@ fn parse_manager_result_for_operation(
     {
         return Err(BridgeError::new(ErrorKind::Unavailable));
     }
+    validate_result_warnings(root)?;
     let ok = root
         .get("ok")
         .and_then(Value::as_bool)
@@ -7818,6 +7907,89 @@ fn validate_set_secret_manager_result(value: &Value) -> BridgeResult<()> {
         return Err(BridgeError::new(ErrorKind::Unavailable));
     }
     Ok(())
+}
+
+/// `warnings`: what a successful mutation could not complete in full, such as a saved
+/// configuration the running controller did not reload, or any `warning:` line the manager's
+/// child printed. Only on `ok:true`; 1 to 16 entries, each exactly `{code, message}`. The code is a
+/// token by grammar rather than from a closed list, so a token the shell learns later reaches the
+/// dashboard instead of turning a saved change into a 503.
+fn validate_result_warnings(root: &serde_json::Map<String, Value>) -> BridgeResult<()> {
+    let refused = || BridgeError::new(ErrorKind::Unavailable);
+    // The single-warning shape a manager may still print (`warning_code` + `warning`): both or
+    // neither, never beside `warnings`, held to the same rules as one entry of the list.
+    let single = match (root.get("warning_code"), root.get("warning")) {
+        (None, None) => None,
+        (Some(code), Some(message)) if !root.contains_key("warnings") => {
+            Some(json!([{ "code": code, "message": message }]))
+        }
+        _ => return Err(refused()),
+    };
+    let Some(warnings) = single.as_ref().or_else(|| root.get("warnings")) else {
+        return Ok(());
+    };
+    if root.get("ok").and_then(Value::as_bool) != Some(true) {
+        return Err(refused());
+    }
+    let warnings = warnings
+        .as_array()
+        .filter(|warnings| (1..=MAX_RESULT_WARNINGS).contains(&warnings.len()))
+        .ok_or_else(refused)?;
+    for warning in warnings {
+        let warning = warning.as_object().ok_or_else(refused)?;
+        if warning.len() != 2 {
+            return Err(refused());
+        }
+        let code = warning
+            .get("code")
+            .and_then(Value::as_str)
+            .ok_or_else(refused)?;
+        let message = warning
+            .get("message")
+            .and_then(Value::as_str)
+            .ok_or_else(refused)?;
+        let code_valid = code.len() <= 48
+            && code.as_bytes().first().is_some_and(u8::is_ascii_lowercase)
+            && code
+                .bytes()
+                .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_');
+        if !code_valid || message.is_empty() || message.chars().any(char::is_control) {
+            return Err(refused());
+        }
+        validate_result_text(message, 1024)?;
+    }
+    Ok(())
+}
+
+/// Rewrite the single-warning shape into `warnings`, so the dashboard reads one shape whichever
+/// the manager printed. Only meaningful on a result that already passed `parse_manager_result`.
+fn normalize_result_warnings(result: &mut Value) {
+    let Some(root) = result.as_object_mut() else {
+        return;
+    };
+    if let (Some(code), Some(message)) = (root.remove("warning_code"), root.remove("warning")) {
+        root.insert(
+            "warnings".to_owned(),
+            json!([{ "code": code, "message": message }]),
+        );
+    }
+}
+
+/// The `(code, message)` warnings a successful mutation result carries. Only meaningful on a
+/// result that already passed `parse_manager_result`.
+fn mutation_result_warnings(result: &Value) -> Vec<(&str, &str)> {
+    result
+        .get("warnings")
+        .and_then(Value::as_array)
+        .map(|warnings| {
+            warnings
+                .iter()
+                .filter_map(|warning| {
+                    Some((warning["code"].as_str()?, warning["message"].as_str()?))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 fn validate_result_text(value: &str, maximum: usize) -> BridgeResult<()> {
@@ -9099,6 +9271,52 @@ mod linux_files {
         Ok(true)
     }
 
+    /// Append one `warn` record under the `bridge` category for something a queued mutation
+    /// reported beside its result: a success that carried a warning, or text the manager wrote
+    /// to stderr. `members` are flattened into the record after the fixed envelope; they are
+    /// tokens and bounded, already-sanitised text, never raw output.
+    ///
+    /// `Ok(false)` when the bridge category is silenced below `warn`; an error when the record
+    /// could not be written, which the caller must surface rather than drop.
+    pub(super) fn record_bridge_warning_at(
+        log_root: &Path,
+        api_log: &Path,
+        package_uid: u32,
+        now: u64,
+        policy: &SecurityPolicyArgs,
+        event: &str,
+        members: &serde_json::Map<String, Value>,
+    ) -> BridgeResult<bool> {
+        if !event_visible_at_threshold(policy, "bridge", "warn", false) {
+            return Ok(false);
+        }
+        if now == 0 {
+            return Err(BridgeError::bad_request());
+        }
+        validate_private_directory(log_root, package_uid)?;
+        let mut value = json!({
+            "epoch": now,
+            "level": "warn",
+            "category": "bridge",
+            "event": event,
+            "service": "synology-drive-sync",
+        });
+        let object = value.as_object_mut().ok_or_else(BridgeError::internal)?;
+        for (key, member) in members {
+            if object.contains_key(key) {
+                return Err(BridgeError::internal());
+            }
+            object.insert(key.clone(), member.clone());
+        }
+        let mut record = serde_json::to_vec(&value).map_err(|_| BridgeError::internal())?;
+        record.push(b'\n');
+        if record.len() > MAX_CGI_FAILURE_RECORD_BYTES {
+            return Err(BridgeError::internal());
+        }
+        append_private_api_log_record(log_root, api_log, package_uid, &record)?;
+        Ok(true)
+    }
+
     fn write_single_record(file: &File, record: &[u8]) -> BridgeResult<()> {
         // This is deliberately one bounded O_APPEND write so concurrent API
         // service output cannot be interleaved with a CGI diagnostic. A rare
@@ -9157,7 +9375,8 @@ mod linux_files {
 
         let mut audit_found = false;
         for path in rotating_log_paths(audit_log, 5) {
-            let Some((file, bytes)) = open_private_log_file(&path, package_uid, 11 * 1024 * 1024)?
+            let Some((file, bytes)) =
+                open_private_log_file(&path, package_uid, 11 * 1024 * 1024, true)?
             else {
                 continue;
             };
@@ -9201,7 +9420,8 @@ mod linux_files {
         }
         let mut activity_found = false;
         for path in rotating_log_paths(activity_log, 3) {
-            let Some((file, bytes)) = open_private_log_file(&path, package_uid, 2 * 1024 * 1024)?
+            let Some((file, bytes)) =
+                open_private_log_file(&path, package_uid, 2 * 1024 * 1024, true)?
             else {
                 continue;
             };
@@ -9523,7 +9743,7 @@ mod linux_files {
         let activity_log = log_root.join("activity.log");
         let mut history = Vec::new();
         for path in rotating_log_paths(&activity_log, 3).into_iter().rev() {
-            match open_private_log_file(&path, package_uid, MAX_ACTIVITY_LOG_BYTES) {
+            match open_private_log_file(&path, package_uid, MAX_ACTIVITY_LOG_BYTES, true) {
                 Ok(Some((_, bytes))) => history.push(bytes),
                 Ok(None) => {}
                 Err(_) => return Err(BridgeError::unsafe_because("config_file_unsafe")),
@@ -9588,7 +9808,7 @@ mod linux_files {
         package_uid: u32,
         maximum: usize,
     ) -> BridgeResult<Option<Vec<u8>>> {
-        match open_private_log_file(path, package_uid, maximum) {
+        match open_private_log_file(path, package_uid, maximum, false) {
             Ok(Some((_, bytes))) => Ok(Some(bytes)),
             Ok(None) => Ok(None),
             Err(_) => Err(BridgeError::unsafe_because("config_file_unsafe")),
@@ -9612,6 +9832,63 @@ mod linux_files {
             return Err(BridgeError::unsafe_because("config_file_unsafe"));
         }
         Ok(true)
+    }
+
+    /// Open one package log for a tail read: `None` when it is absent; anything but a
+    /// package-owned, `0600`, single-link regular file is refused on the opened descriptor, as
+    /// the manager refuses it before it prints a byte. Returns the length at `fstat`, which is
+    /// what the reader reads: growth after it is the next read's.
+    pub(super) fn open_private_log_for_tail(
+        path: &Path,
+        package_uid: u32,
+    ) -> BridgeResult<Option<(File, u64)>> {
+        let mut options = OpenOptions::new();
+        options.read(true).custom_flags(NOFOLLOW_CLOEXEC);
+        let file = match options.open(path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(_) => return Err(BridgeError::unsafe_because("config_file_unsafe")),
+        };
+        let metadata = file
+            .metadata()
+            .map_err(|_| BridgeError::unsafe_because("config_file_unsafe"))?;
+        if !metadata.file_type().is_file()
+            || metadata.st_uid() != package_uid
+            || metadata.st_mode() & 0o7777 != 0o600
+            || metadata.st_nlink() != 1
+        {
+            return Err(BridgeError::unsafe_because("config_file_unsafe"));
+        }
+        Ok(Some((file, metadata.len())))
+    }
+
+    /// The secret values the log reader redacts: the first line of every profile password,
+    /// TOTP seed and remote-log token, exactly what the manager's `getline` reads from the same
+    /// three globs. A secret file that is not package-private refuses the read, as the
+    /// manager's preflight does.
+    pub(super) fn log_redaction_needles(
+        secrets_dir: &Path,
+        package_uid: u32,
+    ) -> BridgeResult<Vec<Zeroizing<Vec<u8>>>> {
+        let mut needles = Vec::new();
+        for suffix in [".password", ".totp", ".remote-log-token"] {
+            for name in private_fragment_names(secrets_dir, suffix, package_uid)? {
+                let bytes = read_exact_single_link_private_file(
+                    &secrets_dir.join(&name),
+                    package_uid,
+                    MAX_SECRET_BYTES + 1,
+                )
+                .map_err(|_| BridgeError::unsafe_because("config_file_unsafe"))?;
+                let line = bytes
+                    .split(|byte| *byte == b'\n')
+                    .next()
+                    .unwrap_or_default();
+                if !line.is_empty() {
+                    needles.push(Zeroizing::new(line.to_vec()));
+                }
+            }
+        }
+        Ok(needles)
     }
 
     /// The names of the regular files in `directory` whose name ends in
@@ -9960,10 +10237,15 @@ mod linux_files {
         paths
     }
 
+    /// `append_only`: the file is a log the package appends to while it may be read. What it
+    /// held at `fstat` is read and growth after that is left for the next read (ADV-B-9: an
+    /// ordinary append used to fail the read as an unsafe file). A document, replaced only by
+    /// rename, must still read back exactly as long as it was.
     fn open_private_log_file(
         path: &Path,
         package_uid: u32,
         maximum: usize,
+        append_only: bool,
     ) -> BridgeResult<Option<(File, Vec<u8>)>> {
         let mut options = OpenOptions::new();
         options.read(true).custom_flags(NOFOLLOW_CLOEXEC);
@@ -9982,8 +10264,13 @@ mod linux_files {
             return Err(BridgeError::unsafe_runtime());
         }
         let mut bytes = Vec::with_capacity(metadata.len() as usize);
+        let limit = if append_only {
+            metadata.len()
+        } else {
+            (maximum + 1) as u64
+        };
         Read::by_ref(&mut file)
-            .take((maximum + 1) as u64)
+            .take(limit)
             .read_to_end(&mut bytes)
             .map_err(|_| BridgeError::unsafe_runtime())?;
         if bytes.len() > maximum || bytes.len() as u64 != metadata.len() {
@@ -14982,12 +15269,10 @@ fn execute_read_action(
         ReadRung::InService if !forced_to_shell => {
             run_in_service_read(paths, action, policy, package_uid)
         }
-        // An action with no in-service implementation takes the shell rung, and
-        // that is the steady state for the un-migrated reads rather than an
-        // error. It logs nothing: three of four ladder reads are legitimately
-        // here, and a record per poll per open window would occupy the shared
-        // coalescing window that the failure records need.
-        ReadRung::InService | ReadRung::ShellManager | ReadRung::NotLadderRouted => {
+        // The operator's forced lane, and the manager path a not-ladder-routed
+        // action has always taken here. It logs nothing: the forced lane is
+        // announced once by `note_read_lane_forced_shell`.
+        ReadRung::InService | ReadRung::NotLadderRouted => {
             run_shell_rung_read(paths, action, policy)
         }
     }?;
@@ -15453,6 +15738,8 @@ fn quoted_activity_length(text: &[u8]) -> usize {
 struct ActivityEvent {
     prefix: Vec<u8>,
     message: Vec<u8>,
+    /// The message holds ` request_id=` not followed by a request id: text, not a tag.
+    request_marker_malformed: bool,
 }
 
 /// A record the service read and cannot parse. The manager exits 73 here and
@@ -15578,11 +15865,14 @@ fn render_activity_event(record: &[u8]) -> BridgeResult<ActivityEvent> {
         b"null".to_vec()
     };
 
-    // The client request id is spliced out of the message rather than carried
-    // in its own field, from the first occurrence of the marker, and a marker
-    // that is present but not followed by exactly thirty-two lowercase hex
-    // digits makes the whole feed corrupt rather than that one event untagged.
+    // The client request id is read from the message rather than carried in its
+    // own field, from the first occurrence of the marker. A marker that is not
+    // followed by exactly thirty-two lowercase hex digits used to make the whole
+    // feed corrupt (ADV-B-5), and free text reaches the message: a run's error
+    // line naming `meeting request_id=5.txt` took the Activity tab down. That
+    // event is now untagged, its text kept, and the caller names it in api.log.
     const REQUEST_MARKER: &[u8] = b" request_id=";
+    let mut request_marker_malformed = false;
     let client_request_id = match message
         .windows(REQUEST_MARKER.len())
         .position(|window| window == REQUEST_MARKER)
@@ -15597,9 +15887,11 @@ fn render_activity_event(record: &[u8]) -> BridgeResult<ActivityEvent> {
                     .iter()
                     .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(byte))
             {
-                return Err(PACKAGE_STATE_CORRUPT);
+                request_marker_malformed = true;
+                b"null".to_vec()
+            } else {
+                quote_activity_field(value)
             }
-            quote_activity_field(value)
         }
         None => b"null".to_vec(),
     };
@@ -15627,6 +15919,7 @@ fn render_activity_event(record: &[u8]) -> BridgeResult<ActivityEvent> {
     Ok(ActivityEvent {
         prefix,
         message: message.to_vec(),
+        request_marker_malformed,
     })
 }
 
@@ -15636,14 +15929,25 @@ fn render_activity_event(record: &[u8]) -> BridgeResult<ActivityEvent> {
 /// byte budget is then walked backwards from the newest so that a feed too
 /// large to carry loses its oldest records rather than its newest.
 #[cfg(target_os = "linux")]
-fn render_activity_feed(window: &[u8], requested: usize) -> BridgeResult<Vec<u8>> {
+fn render_activity_feed(window: &[u8], requested: usize) -> BridgeResult<(Vec<u8>, usize)> {
     const OPEN: &[u8] = b"{\"schema\":\"sdsync.dsm-activity.v1\",\"events\":[";
     const EMPTY: &[u8] = b"{\"schema\":\"sdsync.dsm-activity.v1\",\"events\":[]}";
 
     let mut ring: Vec<Option<ActivityEvent>> = (0..requested).map(|_| None).collect();
     let mut count = 0_usize;
-    for record in awk_records(window) {
-        let event = render_activity_event(record)?;
+    let mut malformed_markers = 0_usize;
+    let records = awk_records(window);
+    // An unterminated final record is read like the manager reads it, but if it does not parse
+    // it is a record still being appended (ADV-B-9), and it is the next read's, not a corrupt feed.
+    let in_flight = !window.is_empty() && !window.ends_with(b"\n");
+    let last = records.len().saturating_sub(1);
+    for (index, record) in records.into_iter().enumerate() {
+        let event = match render_activity_event(record) {
+            Ok(event) => event,
+            Err(_) if in_flight && index == last => break,
+            Err(error) => return Err(error),
+        };
+        malformed_markers += usize::from(event.request_marker_malformed);
         ring[count % requested] = Some(event);
         count += 1;
     }
@@ -15679,7 +15983,7 @@ fn render_activity_feed(window: &[u8], requested: usize) -> BridgeResult<Vec<u8>
         document.push(b'}');
     }
     document.extend_from_slice(b"]}");
-    Ok(document)
+    Ok((document, malformed_markers))
 }
 
 /// A package configuration or state document is small by construction. The
@@ -16539,6 +16843,17 @@ fn snapshot_document(
     parse_and_sanitize_manager_json(&document, &ReadAction::Snapshot, None, Some(policy))
 }
 
+/// How long a live run may go before `outcomes.run` flags it `long_running` (ADV-B-6): six
+/// hours, far past any healthy scheduled run on the package's supported sizes, so a run past it
+/// is worth a look whether it is hung or merely enormous.
+#[cfg(target_os = "linux")]
+const LONG_RUNNING_SECONDS: u64 = 6 * 60 * 60;
+
+/// How old a live run's progress heartbeat may be before `outcomes.run` calls it `stalled`
+/// (ADV-B-6): thirty minutes without any sign of core progress.
+#[cfg(target_os = "linux")]
+const STALLED_RUN_SECONDS: u64 = 30 * 60;
+
 /// The schema tag of the snapshot's `outcomes` member.
 #[cfg(target_os = "linux")]
 const OUTCOMES_SCHEMA: &str = "sdsync.dsm-outcomes.v1";
@@ -16854,10 +17169,45 @@ fn run_outcome_value(
         .unwrap_or_else(|| "none".to_owned());
     let mut warnings = entry_warnings(outcome, skipped, deferred);
     let facts = result_facts(&record, &mut warnings, errors);
+    // A live run's age, so a hung one is told apart from a healthy one (ADV-B-6).
+    let running_for = if outcome == "running" {
+        match current_epoch() {
+            Ok(now) => Some(now.saturating_sub(started)),
+            Err(_) => {
+                errors.push("run.state", "clock_unavailable");
+                None
+            }
+        }
+    } else {
+        None
+    };
+    let long_running = running_for.is_some_and(|age| age > LONG_RUNNING_SECONDS);
+    if long_running {
+        warnings.push("long_running");
+    }
+    // `heartbeat_epoch=`: the runner's last sign of core progress. Absent (an older runner, or
+    // one that does not publish it) leaves the question open rather than answering "not stalled".
+    let heartbeat = record.number("heartbeat_epoch", errors);
+    let stalled = match (outcome, heartbeat, current_epoch()) {
+        ("running", Some(heartbeat), Ok(now)) => {
+            Some(now.saturating_sub(heartbeat) > STALLED_RUN_SECONDS)
+        }
+        _ => None,
+    };
+    if stalled == Some(true) {
+        warnings.push("stalled");
+    }
+    let stderr_log = run_stderr_pointer(paths, package_uid, finished, errors);
+    // A dead runner's `running` is not a state anything is in; the stale verdict below is.
+    let state = if stale_reason.is_some() {
+        "failed".into()
+    } else {
+        String::from_utf8_lossy(&state)
+    };
     let mut value = json!({
         "outcome": outcome,
         "reason": reason,
-        "state": String::from_utf8_lossy(&state),
+        "state": state,
         "operation": operation,
         "scope": scope,
         "started_epoch": started,
@@ -16874,9 +17224,77 @@ fn run_outcome_value(
         },
         "aggregate": aggregate_run_value(&record, errors),
         "degraded": degraded_value(&record, errors),
+        "stderr_log": stderr_log,
+        "running_for_seconds": running_for,
+        "long_running": long_running,
+        "stalled": stalled,
+        "heartbeat_epoch": heartbeat,
+        // What the runner last saw advance (`io`, `progress`, `liveness`): a token, passed through.
+        "heartbeat_source": optional_token(&record, "heartbeat_source", errors),
     });
     merge_facts(&mut value, facts);
     value
+}
+
+/// `stderr_log`: whether run-stderr.log holds the core's stderr for the run this block reports.
+///
+/// The runner opens each kept tail with `# epoch=<finished> scope=<..> operation=<..> exit=<n>`,
+/// and only a header naming this run's `finished_epoch` makes the tail this run's cause. The
+/// lines themselves are served by the `run-stderr` logs source, which the manager redacts like
+/// every other log; the snapshot only says they are there. `null` for no file, no header, or
+/// another run's tail; an unsafe file is named in `errors`.
+#[cfg(target_os = "linux")]
+fn run_stderr_pointer(
+    paths: &PackagePaths<'_>,
+    package_uid: u32,
+    finished: u64,
+    errors: &mut OutcomeErrors,
+) -> Value {
+    if finished == 0 {
+        return Value::Null;
+    }
+    let document = match linux_files::read_optional_private_document(
+        &paths.log_root.join("run-stderr.log"),
+        package_uid,
+        MAX_PACKAGE_DOCUMENT_BYTES,
+    ) {
+        Ok(Some(document)) => document,
+        Ok(None) => return Value::Null,
+        Err(_) => {
+            errors.push("run-stderr.log", "unsafe_file");
+            return Value::Null;
+        }
+    };
+    let header = document
+        .split(|byte| *byte == b'\n')
+        .next()
+        .unwrap_or_default();
+    let Some(fields) = header.strip_prefix(b"# ") else {
+        return Value::Null;
+    };
+    let number = |value: &[u8]| {
+        std::str::from_utf8(value)
+            .ok()
+            .filter(|text| !text.is_empty() && text.bytes().all(|byte| byte.is_ascii_digit()))
+            .and_then(|text| text.parse::<u64>().ok())
+    };
+    let mut epoch = None;
+    let mut exit_code = None;
+    for field in fields.split(|byte| *byte == b' ') {
+        if let Some(value) = field.strip_prefix(b"epoch=") {
+            epoch = number(value);
+        } else if let Some(value) = field.strip_prefix(b"exit=") {
+            exit_code = number(value);
+        }
+    }
+    if epoch != Some(finished) {
+        return Value::Null;
+    }
+    json!({
+        "source": "run-stderr",
+        "finished_epoch": finished,
+        "exit_code": exit_code,
+    })
 }
 
 /// Most folders whose incomplete listing one record names; the count says how many there were.
@@ -17193,14 +17611,24 @@ fn profile_outcome_value(
     };
     // A run that died holding the lock leaves this profile's completion record describing the
     // run before it. The rollup row must not read as trustworthy across that gap.
+    // The same gap stays after the controller has reconciled the dead run as `failed`
+    // with `runner_died`: a covered profile whose record predates that run's start is the run
+    // before it, not this one.
     let covered = run["scope"] == "all" || run["scope"] == name;
+    let outcome_epoch = record.number("outcome_epoch", errors);
+    let predates_dead_run = run["reason"] == "runner_died"
+        && outcome_epoch.or(finished).unwrap_or(0) < run["started_epoch"].as_u64().unwrap_or(0);
     let skipped = record.number("skipped", errors);
     let deferred = record.number("deferred", errors);
     let mut warnings = entry_warnings(outcome, skipped, deferred);
     // Entries left out (skipped or lastingly deferred) are what make the rollup row untrustworthy;
     // the other facts below warn without changing that.
-    let trust = if run["outcome"] == "stale" && covered {
+    let trust = if covered && (run["outcome"] == "stale" || predates_dead_run) {
         "last_run_failed"
+    } else if action.as_deref() == Some("plan") {
+        // A plan changes nothing on the NAS, so its record says nothing about whether the
+        // profile's last sync converged; an older writer let it overwrite a failed sync.
+        "no_run_recorded"
     } else if outcome == "succeeded" && !warnings.is_empty() {
         "skipped_entries"
     } else {
@@ -17216,7 +17644,9 @@ fn profile_outcome_value(
         "exit_code": exit_code,
         "consecutive_failures": failures,
         "last_success_epoch": last_success,
-        "outcome_epoch": record.number("outcome_epoch", errors),
+        "outcome_epoch": outcome_epoch,
+        "detail": profile_detail(&record, errors),
+        "failed_path": profile_failed_path(&record, errors),
         "skipped_files": skipped,
         "deferred_files": deferred,
         "warnings": warnings,
@@ -17224,6 +17654,117 @@ fn profile_outcome_value(
     });
     merge_facts(&mut value, facts);
     value
+}
+
+/// `detail=` in a profile record: the core's error line for that profile (S-18), written by the
+/// runner as one line of printable ASCII without `|`, at most 240 bytes, and re-checked here
+/// because it goes to the dashboard verbatim.
+#[cfg(target_os = "linux")]
+fn profile_detail(record: &OutcomeRecord<'_>, errors: &mut OutcomeErrors) -> Option<String> {
+    let value = record.text("detail", errors)?;
+    if value.len() <= 240
+        && value
+            .iter()
+            .all(|byte| (b' '..=b'~').contains(byte) && *byte != b'|')
+    {
+        String::from_utf8(value).ok()
+    } else {
+        errors.push(record.source, "malformed");
+        None
+    }
+}
+
+/// `failed_path=` in a profile record: the entry the profile's failure concerns (S-18),
+/// percent-encoded exactly like the core's log `path` member (bytes outside `A-Za-z0-9._/:,-`
+/// as `%XX`, at most 255 characters, an optional trailing `~` for a cut).
+#[cfg(target_os = "linux")]
+fn profile_failed_path(record: &OutcomeRecord<'_>, errors: &mut OutcomeErrors) -> Option<String> {
+    let value = record.text("failed_path", errors)?;
+    let body = value.strip_suffix(b"~").unwrap_or(&value);
+    let mut index = 0;
+    let mut valid = value.len() <= 255;
+    while valid && index < body.len() {
+        let byte = body[index];
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'_' | b'/' | b':' | b',') {
+            index += 1;
+        } else if byte == b'%'
+            && body.get(index + 1..index + 3).is_some_and(|hex| {
+                hex.iter()
+                    .all(|digit| digit.is_ascii_digit() || (b'A'..=b'F').contains(digit))
+            })
+        {
+            index += 3;
+        } else {
+            valid = false;
+        }
+    }
+    if valid {
+        String::from_utf8(value).ok()
+    } else {
+        errors.push(record.source, "malformed");
+        None
+    }
+}
+
+/// `outcomes.controller_reload`: a saved change the running controller has not picked up yet
+/// (ADV-S-1). The manager writes `state/controller-reload.pending` when its reload signal could
+/// not be delivered and removes it once the controller has reloaded. A marker that is present
+/// is pending whatever its contents; a value that does not parse is named and `null`.
+#[cfg(target_os = "linux")]
+fn controller_reload_value(
+    paths: &PackagePaths<'_>,
+    package_uid: u32,
+    errors: &mut OutcomeErrors,
+) -> Value {
+    const SOURCE: &str = "controller-reload.pending";
+    let document = match linux_files::read_optional_private_document(
+        &paths.state_dir.join(SOURCE),
+        package_uid,
+        MAX_PACKAGE_DOCUMENT_BYTES,
+    ) {
+        Ok(Some(document)) => document,
+        Ok(None) => return json!({ "pending": false }),
+        Err(_) => {
+            errors.push(SOURCE, "unsafe_file");
+            return json!({ "pending": null });
+        }
+    };
+    let record = OutcomeRecord {
+        document: Some(&document),
+        source: SOURCE,
+    };
+    let reason = record.text("reason", errors).and_then(|value| {
+        if valid_reason_token(&value) && !value.contains(&b':') {
+            String::from_utf8(value).ok()
+        } else {
+            errors.push(SOURCE, "malformed");
+            None
+        }
+    });
+    let pid = match record.text("pid", errors).as_deref() {
+        None | Some(b"none") => None,
+        Some(_) => record.number("pid", errors),
+    };
+    let operation = record.text("operation", errors).and_then(|value| {
+        let valid = !value.is_empty()
+            && value.len() <= 48
+            && value
+                .iter()
+                .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || *byte == b'-');
+        if valid {
+            String::from_utf8(value).ok()
+        } else {
+            errors.push(SOURCE, "malformed");
+            None
+        }
+    });
+    json!({
+        "pending": true,
+        "epoch": record.number("epoch", errors),
+        "reason": reason,
+        "pid": pid,
+        "operation": operation,
+    })
 }
 
 /// The snapshot's `outcomes` member: what the last runs did and why, read from the runner's
@@ -17257,8 +17798,10 @@ fn outcomes_value(paths: &PackagePaths<'_>, package_uid: u32) -> Value {
         .collect::<Vec<_>>();
     let routines = routine_outcomes_value(paths, package_uid, &mut errors);
     let cache = status_cache_health_value(paths, &names, &mut errors);
+    let controller_reload = controller_reload_value(paths, package_uid, &mut errors);
     json!({
         "schema": OUTCOMES_SCHEMA,
+        "controller_reload": controller_reload,
         "run": run,
         "alerts": alerts,
         "profiles": profiles,
@@ -17408,12 +17951,82 @@ fn attach_snapshot_outcomes(
     let mut document: Value =
         serde_json::from_slice(&response.body).map_err(|_| MANAGER_OUTPUT_INVALID)?;
     let root = document.as_object_mut().ok_or(MANAGER_OUTPUT_INVALID)?;
-    root.insert("outcomes".to_owned(), outcomes_value(paths, package_uid));
+    let outcomes = outcomes_value(paths, package_uid);
+    align_legacy_run(root, &outcomes["run"]);
+    if outcomes["run"]["stale"]["detected"] == true {
+        retire_stale_running(root, outcomes["run"]["scope"].as_str().unwrap_or("none"));
+    }
+    root.insert("outcomes".to_owned(), outcomes);
     let body = serde_json::to_vec(&document).map_err(|_| BridgeError::internal())?;
     if body.len() > MAX_SNAPSHOT_RESPONSE_BYTES {
         return Err(BridgeError::unavailable_because("manager_output_too_large"));
     }
     Ok(CgiResponse::success(body))
+}
+
+/// Make the legacy `run` block say what `outcomes.run` says (ADV-B-11).
+///
+/// They are two reads of run.state, the legacy one first, so a run that finished between them
+/// left one document saying `running` and `succeeded` at once. The later read is the one the
+/// verdict was built from, so it wins. Only a value inside the legacy block's own vocabulary is
+/// copied (an unrecognised state stays as the legacy reader validated it), and a block without
+/// a `state` is not a run block and is left alone.
+#[cfg(target_os = "linux")]
+fn align_legacy_run(root: &mut serde_json::Map<String, Value>, outcome: &Value) {
+    let Some(run) = root.get_mut("run").and_then(Value::as_object_mut) else {
+        return;
+    };
+    let scope_valid = outcome["scope"].as_str().is_some_and(|scope| {
+        matches!(scope, "none" | "all") || manager_valid_name(scope.as_bytes())
+    });
+    if !run.contains_key("state")
+        || !matches!(
+            outcome["state"].as_str(),
+            Some("never" | "running" | "succeeded" | "failed")
+        )
+        || !matches!(
+            outcome["operation"].as_str(),
+            Some("none" | "sync" | "plan")
+        )
+        || !scope_valid
+        || !outcome["started_epoch"].is_u64()
+        || !outcome["finished_epoch"].is_u64()
+        || !(outcome["exit_code"].is_null() || outcome["exit_code"].is_u64())
+    {
+        return;
+    }
+    for key in [
+        "state",
+        "started_epoch",
+        "finished_epoch",
+        "exit_code",
+        "scope",
+        "operation",
+    ] {
+        run.insert(key.to_owned(), outcome[key].clone());
+    }
+}
+
+/// Make the legacy members agree with a stale verdict: the run block, and every routine the dead
+/// run covered, read `failed` rather than `running`. A routine of a profile the run did not cover
+/// is left alone, because its record is not about this run.
+#[cfg(target_os = "linux")]
+fn retire_stale_running(root: &mut serde_json::Map<String, Value>, scope: &str) {
+    if let Some(run) = root.get_mut("run").and_then(Value::as_object_mut)
+        && run.get("state").and_then(Value::as_str) == Some("running")
+    {
+        run.insert("state".to_owned(), json!("failed"));
+    }
+    let Some(routines) = root.get_mut("routines").and_then(Value::as_array_mut) else {
+        return;
+    };
+    for routine in routines.iter_mut().filter_map(Value::as_object_mut) {
+        let covered =
+            scope == "all" || routine.get("profile").and_then(Value::as_str) == Some(scope);
+        if covered && routine.get("state").and_then(Value::as_str) == Some("running") {
+            routine.insert("state".to_owned(), json!("failed"));
+        }
+    }
 }
 
 /// Rung A for `activity`.
@@ -17448,8 +18061,442 @@ fn activity_document(
         for source in &history {
             combined.extend_from_slice(tail_lines(source, requested));
         }
-        render_activity_feed(tail_lines(&combined, requested), requested)?
+        let (document, malformed_markers) =
+            render_activity_feed(tail_lines(&combined, requested), requested)?;
+        if malformed_markers > 0 {
+            note_malformed_request_markers(paths, package_uid, policy, malformed_markers);
+        }
+        document
     };
+    parse_and_sanitize_manager_json(&document, action, None, Some(policy))
+}
+
+/// Say in api.log that activity records carried a malformed ` request_id=` marker (ADV-B-5).
+///
+/// At most once per five minutes per service: the dashboard re-reads the same records every few
+/// seconds, and one record per poll would bury the failures api.log exists for. A record that
+/// could not be written leaves the window open so the next read retries.
+#[cfg(target_os = "linux")]
+fn note_malformed_request_markers(
+    paths: &PackagePaths<'_>,
+    package_uid: u32,
+    policy: &SecurityPolicyArgs,
+    records: usize,
+) {
+    static LAST_NOTED: AtomicU64 = AtomicU64::new(0);
+    let Ok(now) = current_epoch() else {
+        return;
+    };
+    let last = LAST_NOTED.load(AtomicOrdering::Relaxed);
+    if last != 0 && now.saturating_sub(last) < 300 {
+        return;
+    }
+    if LAST_NOTED
+        .compare_exchange(last, now, AtomicOrdering::Relaxed, AtomicOrdering::Relaxed)
+        .is_err()
+    {
+        return;
+    }
+    let mut members = serde_json::Map::new();
+    members.insert("records".to_owned(), json!(records));
+    let written = linux_files::record_bridge_warning_at(
+        paths.log_root,
+        &paths.log_root.join("api.log"),
+        package_uid,
+        now,
+        policy,
+        "activity_request_marker_malformed",
+        &members,
+    );
+    if written.is_err() {
+        LAST_NOTED.store(last, AtomicOrdering::Relaxed);
+    }
+}
+
+/// The sources `source=all` reads, in the manager's order.
+#[cfg(target_os = "linux")]
+const AGGREGATE_LOG_SOURCES: [LogSource; 6] = [
+    LogSource::Api,
+    LogSource::Doctor,
+    LogSource::Controller,
+    LogSource::Scheduler,
+    LogSource::Sync,
+    LogSource::Audit,
+];
+
+/// How many bytes of one source a logs read scans, newest first, before it stops and says so.
+///
+/// The manager's reader walks every retained byte of every rotation, about 300 MiB at full
+/// retention, and on an armv7 that ran past the manager timeout on every poll (ADV-B-4). A
+/// read that finds the requested number of lines stops long before this; it is reached only
+/// when a strict threshold hides most lines, and then `scan_limited` says older history was
+/// not scanned rather than implying there is none.
+#[cfg(target_os = "linux")]
+const MAX_LOG_SCAN_BYTES: u64 = 1024 * 1024;
+
+/// The manager's per-line ceiling, applied before the threshold test and again after redaction.
+#[cfg(target_os = "linux")]
+const MAX_LOG_LINE_BYTES: usize = 8192;
+
+/// One source's files, oldest first, as the manager lists them.
+#[cfg(target_os = "linux")]
+fn log_source_files(log_root: &Path, source: LogSource) -> Vec<PathBuf> {
+    let (name, rotations) = match source {
+        LogSource::Api => ("api.log", 5),
+        LogSource::Doctor => ("doctor-inventory.log", 3),
+        LogSource::Controller => ("controller.log", 5),
+        LogSource::Scheduler => ("scheduler.log", 5),
+        LogSource::Sync => ("sync.log", 3),
+        LogSource::Audit => ("audit.log", 5),
+        LogSource::RunStderr => ("run-stderr.log", 3),
+        LogSource::All => return Vec::new(),
+    };
+    let mut files = (1..=rotations)
+        .rev()
+        .map(|index| log_root.join(format!("{name}.{index}")))
+        .collect::<Vec<_>>();
+    files.push(log_root.join(name));
+    files
+}
+
+/// What the log reader rewrites in every line it returns: the secret values, the package's
+/// own paths, a path under its secrets directory, terminal escapes and control bytes. The same
+/// rewriting, in the same order, as the manager's `api_json_log_lines`.
+#[cfg(target_os = "linux")]
+struct LogRedaction {
+    needles: Vec<Zeroizing<Vec<u8>>>,
+    /// Each needle as `serde_json` escapes it, for lines that are JSON records.
+    encoded_needles: Vec<Zeroizing<Vec<u8>>>,
+    paths: Vec<(Vec<u8>, &'static [u8])>,
+}
+
+#[cfg(target_os = "linux")]
+impl LogRedaction {
+    fn new(paths: &PackagePaths<'_>, needles: Vec<Zeroizing<Vec<u8>>>) -> Self {
+        let canonical = |path: &Path| fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+        let label_paths = [
+            (
+                paths.package_home.to_path_buf(),
+                b"[package-home]".as_slice(),
+            ),
+            (paths.package_var.to_path_buf(), b"[package-var]".as_slice()),
+            (canonical(paths.package_home), b"[package-home]".as_slice()),
+            (canonical(paths.package_var), b"[package-var]".as_slice()),
+        ];
+        let encoded_needles = needles
+            .iter()
+            .map(|needle| {
+                let encoded =
+                    serde_json::to_vec(&String::from_utf8_lossy(needle)).unwrap_or_default();
+                // Drop the quotes: the needle is matched inside a string token.
+                Zeroizing::new(encoded[1..encoded.len().saturating_sub(1).max(1)].to_vec())
+            })
+            .collect();
+        Self {
+            needles,
+            encoded_needles,
+            paths: label_paths
+                .into_iter()
+                .filter_map(|(path, label)| {
+                    let bytes = path.as_os_str().as_encoded_bytes().to_vec();
+                    (!bytes.is_empty()).then_some((bytes, label))
+                })
+                .collect(),
+        }
+    }
+
+    fn apply(&self, line: &[u8]) -> String {
+        let first = line.iter().position(|byte| !matches!(byte, b' ' | b'\t'));
+        let structured = first.is_some_and(|first| matches!(line[first], b'{' | b'['));
+        let mut text = Zeroizing::new(line.to_vec());
+        if structured {
+            // Only inside string tokens, so a secret that happens to spell a JSON literal can
+            // never break the record's structure.
+            text = Zeroizing::new(redact_json_string_tokens(&text, &self.encoded_needles));
+        } else {
+            for (encoded, raw) in self.encoded_needles.iter().zip(&self.needles) {
+                text = Zeroizing::new(replace_all(&text, encoded, b"[redacted]"));
+                text = Zeroizing::new(replace_all(&text, raw, b"[redacted]"));
+            }
+        }
+        let mut text = strip_ansi(&text);
+        for (path, label) in &self.paths {
+            text = replace_all(&text, path, label);
+        }
+        let mut text = redact_secret_paths(&text);
+        text.truncate(MAX_LOG_LINE_BYTES);
+        for byte in &mut text {
+            if matches!(byte, 0 | 1..=8 | 0x0b | 0x0c | 0x0e..=0x1f) {
+                *byte = b'?';
+            }
+        }
+        String::from_utf8_lossy(&text).into_owned()
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn replace_all(text: &[u8], needle: &[u8], replacement: &[u8]) -> Vec<u8> {
+    if needle.is_empty() || needle.len() > text.len() {
+        return text.to_vec();
+    }
+    let mut result = Vec::with_capacity(text.len());
+    let mut index = 0;
+    while index < text.len() {
+        if text[index..].starts_with(needle) {
+            result.extend_from_slice(replacement);
+            index += needle.len();
+        } else {
+            result.push(text[index]);
+            index += 1;
+        }
+    }
+    result
+}
+
+/// Replace `needles` only inside the JSON string tokens of `line`.
+#[cfg(target_os = "linux")]
+fn redact_json_string_tokens(line: &[u8], needles: &[Zeroizing<Vec<u8>>]) -> Vec<u8> {
+    let mut result = Vec::with_capacity(line.len());
+    let mut index = 0;
+    while index < line.len() {
+        if line[index] != b'"' {
+            result.push(line[index]);
+            index += 1;
+            continue;
+        }
+        let start = index;
+        index += 1;
+        let mut escaped = false;
+        while index < line.len() {
+            match line[index] {
+                _ if escaped => escaped = false,
+                b'\\' => escaped = true,
+                b'"' => break,
+                _ => {}
+            }
+            index += 1;
+        }
+        if index >= line.len() {
+            result.extend_from_slice(&line[start..]);
+            return result;
+        }
+        let mut token = line[start..=index].to_vec();
+        for needle in needles {
+            token = replace_all(&token, needle, b"[redacted]");
+        }
+        result.extend_from_slice(&token);
+        index += 1;
+    }
+    result
+}
+
+/// Remove `ESC [ <0-9;?>* <space-/>* <@-~>` sequences, as the manager's `gsub` does.
+#[cfg(target_os = "linux")]
+fn strip_ansi(text: &[u8]) -> Vec<u8> {
+    let mut result = Vec::with_capacity(text.len());
+    let mut index = 0;
+    while index < text.len() {
+        if text[index] == 0x1b && text.get(index + 1) == Some(&b'[') {
+            let mut cursor = index + 2;
+            while cursor < text.len() && matches!(text[cursor], b'0'..=b'9' | b';' | b'?') {
+                cursor += 1;
+            }
+            while cursor < text.len() && (b' '..=b'/').contains(&text[cursor]) {
+                cursor += 1;
+            }
+            if cursor < text.len() && (b'@'..=b'~').contains(&text[cursor]) {
+                index = cursor + 1;
+                continue;
+            }
+        }
+        result.push(text[index]);
+        index += 1;
+    }
+    result
+}
+
+/// `[package-home]/secrets/<anything up to a space>` becomes `[secret]`.
+#[cfg(target_os = "linux")]
+fn redact_secret_paths(text: &[u8]) -> Vec<u8> {
+    const MARKER: &[u8] = b"[package-home]/secrets/";
+    let mut result = Vec::with_capacity(text.len());
+    let mut index = 0;
+    while index < text.len() {
+        if text[index..].starts_with(MARKER) {
+            let rest = index + MARKER.len();
+            let end = text[rest..]
+                .iter()
+                .position(|byte| *byte == b' ')
+                .map_or(text.len(), |offset| rest + offset);
+            if end > rest {
+                result.extend_from_slice(b"[secret]");
+                index = end;
+                continue;
+            }
+        }
+        result.push(text[index]);
+        index += 1;
+    }
+    result
+}
+
+/// Visit the lines of `file`'s first `length` bytes newest first, reading backwards in chunks,
+/// until `visit` breaks or `budget` bytes have been scanned. Returns whether the budget, rather
+/// than the start of the file or the visitor, ended the walk.
+#[cfg(target_os = "linux")]
+fn visit_lines_newest_first(
+    file: &File,
+    length: u64,
+    budget: &mut u64,
+    mut visit: impl FnMut(&[u8]) -> std::ops::ControlFlow<()>,
+) -> BridgeResult<bool> {
+    use std::ops::ControlFlow;
+    use std::os::unix::fs::FileExt;
+    const CHUNK: u64 = 64 * 1024;
+    let read_error = || BridgeError::unsafe_because("config_file_unsafe");
+    let mut position = length;
+    // A final newline ends the last record; it does not start an empty one.
+    if position > 0 {
+        let mut last = [0_u8; 1];
+        file.read_exact_at(&mut last, position - 1)
+            .map_err(|_| read_error())?;
+        if last[0] == b'\n' {
+            position -= 1;
+        }
+    }
+    let mut carry: Vec<u8> = Vec::new();
+    loop {
+        if position == 0 {
+            // The file's first line, which no newline precedes.
+            if length > 0 {
+                let _visited = visit(&carry);
+            }
+            return Ok(false);
+        }
+        if *budget == 0 {
+            return Ok(true);
+        }
+        let size = CHUNK.min(position).min(*budget);
+        position -= size;
+        *budget -= size;
+        let mut combined = vec![0_u8; size as usize];
+        file.read_exact_at(&mut combined, position)
+            .map_err(|_| read_error())?;
+        combined.extend_from_slice(&carry);
+        let mut end = combined.len();
+        while let Some(newline) = combined[..end].iter().rposition(|byte| *byte == b'\n') {
+            if let ControlFlow::Break(()) = visit(&combined[newline + 1..end]) {
+                return Ok(false);
+            }
+            end = newline;
+        }
+        combined.truncate(end);
+        carry = combined;
+    }
+}
+
+/// The newest `requested` lines of one source that the policy shows, redacted, oldest first,
+/// within `byte_limit` encoded bytes; and whether the scan stopped at its byte budget.
+#[cfg(target_os = "linux")]
+fn tail_log_source(
+    log_root: &Path,
+    package_uid: u32,
+    source: LogSource,
+    requested: usize,
+    byte_limit: usize,
+    policy: &SecurityPolicyArgs,
+    redaction: &LogRedaction,
+) -> BridgeResult<(Vec<String>, bool)> {
+    use std::ops::ControlFlow;
+    // Every file is checked before any is read, as the manager's preflight does.
+    let mut opened = Vec::new();
+    for path in log_source_files(log_root, source) {
+        if let Some(file) = linux_files::open_private_log_for_tail(&path, package_uid)? {
+            opened.push(file);
+        }
+    }
+    let name = source.as_str();
+    let mut selected: Vec<String> = Vec::new();
+    let mut selected_bytes = 2_usize;
+    let mut budget = MAX_LOG_SCAN_BYTES;
+    let mut limited = false;
+    for (file, length) in opened.iter().rev() {
+        let mut done = false;
+        limited = visit_lines_newest_first(file, *length, &mut budget, |line| {
+            let line = &line[..line.len().min(MAX_LOG_LINE_BYTES)];
+            if !log_line_visible_at_threshold(policy, name, &String::from_utf8_lossy(line)) {
+                return ControlFlow::Continue(());
+            }
+            let shown = redaction.apply(line);
+            let cost = serde_json::to_string(&shown).map_or(usize::MAX, |encoded| encoded.len())
+                + usize::from(!selected.is_empty());
+            if selected_bytes.saturating_add(cost) > byte_limit {
+                done = true;
+                return ControlFlow::Break(());
+            }
+            selected_bytes += cost;
+            selected.push(shown);
+            if selected.len() == requested {
+                done = true;
+                return ControlFlow::Break(());
+            }
+            ControlFlow::Continue(())
+        })?;
+        if done || limited {
+            break;
+        }
+    }
+    selected.reverse();
+    Ok((selected, limited))
+}
+
+/// Rung A for `logs`: read each source's newest lines backwards, bounded, instead of having the
+/// manager scan every retained byte (ADV-B-4); and apply the bridge's own visibility rule (an
+/// error is always shown, an unlevelled line is an error) to every line before anything else
+/// filters it (ADV-B-3), where the manager's threshold used to drop them first.
+///
+/// The document is the manager's `sdsync.dsm-logs.v1`, plus `scan_limited: true` on a source
+/// whose scan stopped at its byte budget, and goes through the same sanitize step as the shell
+/// rung's.
+#[cfg(target_os = "linux")]
+fn logs_document(
+    paths: &PackagePaths<'_>,
+    package_uid: u32,
+    action: &ReadAction,
+    policy: &SecurityPolicyArgs,
+) -> BridgeResult<Vec<u8>> {
+    let ReadAction::Logs { lines, source } = action else {
+        return Err(BridgeError::internal());
+    };
+    let needles = linux_files::log_redaction_needles(paths.secrets_dir, package_uid)?;
+    let redaction = LogRedaction::new(paths, needles);
+    let (sources, byte_limit): (&[LogSource], usize) = if *source == LogSource::All {
+        (&AGGREGATE_LOG_SOURCES, 163_840)
+    } else {
+        (std::slice::from_ref(source), 786_432)
+    };
+    let mut logs = Vec::with_capacity(sources.len());
+    for source in sources {
+        let (lines, limited) = tail_log_source(
+            paths.log_root,
+            package_uid,
+            *source,
+            usize::from(*lines),
+            byte_limit,
+            policy,
+            &redaction,
+        )?;
+        let mut entry = json!({ "source": source.as_str(), "lines": lines });
+        if limited {
+            entry["scan_limited"] = json!(true);
+        }
+        logs.push(entry);
+    }
+    let document = serde_json::to_vec(&json!({
+        "schema": "sdsync.dsm-logs.v1",
+        "logs": logs,
+    }))
+    .map_err(|_| BridgeError::internal())?;
     parse_and_sanitize_manager_json(&document, action, None, Some(policy))
 }
 
@@ -17467,11 +18514,11 @@ fn run_in_service_read(
             activity_document(paths, package_uid, action, *lines, policy)?
         }
         ReadAction::Snapshot => snapshot_document(paths, package_uid, policy)?,
+        ReadAction::Logs { .. } => logs_document(paths, package_uid, action, policy)?,
         // `read_rung` routes nothing else here, and it is a total match, so a
         // read that gains an in-service implementation must be added in both
         // places or fail to compile in one of them.
-        ReadAction::Logs { .. }
-        | ReadAction::Csrf
+        ReadAction::Csrf
         | ReadAction::SourceDirectories { .. }
         | ReadAction::SourcePath { .. }
         | ReadAction::Result { .. }
@@ -17550,7 +18597,13 @@ fn run_consumer(request: &Path, response: &Path) -> BridgeResult<()> {
                     &audit_transaction,
                     &request_id,
                 )?;
-                consume_job_inner(&control_paths, &job, package_uid, termination_requested)
+                consume_job_inner(
+                    &control_paths,
+                    Path::new(LOG_ROOT),
+                    &job,
+                    package_uid,
+                    termination_requested,
+                )
             })();
             let result = terminalize_consume_result(execution_result, |state| {
                 let phase = if state == "succeeded" {
@@ -18284,9 +19337,147 @@ fn execute_connection_mutation(
     }
 }
 
+/// One line of manager text made fit for an api.log record: the job's secret removed first,
+/// then ANSI sequences dropped, then reduced to printable ASCII without `"` or `\`, trimmed, and
+/// cut to 160 bytes, the same width the runner gives a run's detail.
+#[cfg(target_os = "linux")]
+fn api_log_safe_line(line: &[u8], secret: Option<&[u8]>) -> String {
+    const MAX_LINE: usize = 160;
+    let mut redacted = Zeroizing::new(Vec::with_capacity(line.len()));
+    let mut index = 0;
+    while index < line.len() {
+        if let Some(secret) = secret.filter(|secret| !secret.is_empty())
+            && line[index..].starts_with(secret)
+        {
+            redacted.extend_from_slice(b"[redacted]");
+            index += secret.len();
+            continue;
+        }
+        redacted.push(line[index]);
+        index += 1;
+    }
+    let mut shown_line = String::with_capacity(redacted.len().min(MAX_LINE));
+    let mut bytes = redacted.iter().copied().peekable();
+    while let Some(byte) = bytes.next() {
+        if byte == 0x1b {
+            // CSI: ESC [ parameters... final byte in @..~
+            if bytes.peek() == Some(&b'[') {
+                bytes.next();
+                for following in bytes.by_ref() {
+                    if (b'@'..=b'~').contains(&following) {
+                        break;
+                    }
+                }
+            }
+            continue;
+        }
+        let shown = match byte {
+            b'"' => '\'',
+            b'\\' => '/',
+            b' '..=b'~' => char::from(byte),
+            _ => '?',
+        };
+        if shown_line.len() == MAX_LINE {
+            break;
+        }
+        shown_line.push(shown);
+    }
+    shown_line.trim().to_owned()
+}
+
+/// The api.log members describing a queued manager's stderr: how much it wrote, whether more
+/// than the kept bound, and its last complete non-blank line, made safe by
+/// [`api_log_safe_line`]. `None` when there is nothing to say.
+#[cfg(target_os = "linux")]
+fn queued_stderr_summary(
+    kept: &[u8],
+    total: usize,
+    secret: Option<&[u8]>,
+) -> Option<serde_json::Map<String, Value>> {
+    let truncated = total > kept.len();
+    // When the bound cut the stream mid-line, that last fragment is not a line anyone wrote.
+    let complete = if truncated && !kept.ends_with(b"\n") {
+        kept.iter()
+            .rposition(|byte| *byte == b'\n')
+            .map_or(&kept[..0], |end| &kept[..end])
+    } else {
+        kept
+    };
+    let last = complete
+        .split(|byte| *byte == b'\n')
+        .rev()
+        .find(|line| line.iter().any(|byte| !byte.is_ascii_whitespace()));
+    let last = match last {
+        Some(line) => line,
+        None if total == 0 => return None,
+        // Output nobody could read as a line still happened, and is still counted.
+        None if kept.iter().all(u8::is_ascii_whitespace) && !truncated => return None,
+        None => &[][..],
+    };
+    let line = api_log_safe_line(last, secret);
+    let mut members = serde_json::Map::new();
+    members.insert("bytes".to_owned(), json!(total));
+    members.insert("truncated".to_owned(), json!(truncated));
+    members.insert("line".to_owned(), json!(line));
+    Some(members)
+}
+
+/// Write what a queued mutation reported beside its result to api.log: the warning a
+/// successful save carried, and the manager's stderr. Returns the events that could not be
+/// written, so the caller can say so where it can; nothing here changes the result, which is
+/// already terminal.
+#[cfg(target_os = "linux")]
+#[allow(clippy::too_many_arguments)]
+fn record_queued_mutation_side_channels(
+    log_root: &Path,
+    package_uid: u32,
+    policy: &SecurityPolicyArgs,
+    operation: &str,
+    job_id: &str,
+    result: &Value,
+    stderr: &[u8],
+    stderr_bytes: usize,
+    secret: Option<&[u8]>,
+) -> Vec<&'static str> {
+    let mut failures = Vec::new();
+    let api_log = log_root.join("api.log");
+    let mut record = |event: &'static str, mut members: serde_json::Map<String, Value>| {
+        members.insert("operation".to_owned(), json!(operation));
+        members.insert("job_id".to_owned(), json!(job_id));
+        let written = current_epoch().and_then(|now| {
+            linux_files::record_bridge_warning_at(
+                log_root,
+                &api_log,
+                package_uid,
+                now,
+                policy,
+                event,
+                &members,
+            )
+        });
+        if written.is_err() {
+            failures.push(event);
+        }
+    };
+    for (code, message) in mutation_result_warnings(result) {
+        let mut members = serde_json::Map::new();
+        members.insert("code".to_owned(), json!(code));
+        members.insert(
+            "message".to_owned(),
+            json!(api_log_safe_line(message.as_bytes(), secret)),
+        );
+        record("mutation_warning", members);
+    }
+    if let Some(members) = queued_stderr_summary(stderr, stderr_bytes, secret) {
+        record("manager_stderr", members);
+    }
+    failures
+}
+
 #[cfg(target_os = "linux")]
 fn consume_job_inner(
     paths: &ControlPaths<'_>,
+    log_root: &Path,
     job: &ParsedJob,
     package_uid: u32,
     termination_requested: &AtomicBool,
@@ -18328,15 +19519,34 @@ fn consume_job_inner(
         termination_requested,
         progress_record.0.as_deref(),
     )?;
-    let result = parse_manager_result(
+    let mut result = parse_manager_result(
         &output.stdout,
         secret.as_ref().map(|secret| secret.as_slice()),
     )?;
+    normalize_result_warnings(&mut result);
     if matches!(&job.mutation, Mutation::SetSecret(_)) {
         validate_set_secret_manager_result(&result)?;
     }
     if result.get("ok").and_then(Value::as_bool) != Some(output.status_success) {
         return Err(BridgeError::new(ErrorKind::Unavailable));
+    }
+    for event in record_queued_mutation_side_channels(
+        log_root,
+        package_uid,
+        &current_policy,
+        job.mutation.operation_id(),
+        &job.request_id,
+        &result,
+        &output.stderr,
+        output.stderr_bytes,
+        secret.as_ref().map(|secret| secret.as_slice()),
+    ) {
+        // The result is terminal and stands; only its api.log echo is missing, and that is said
+        // on the consumer's own stderr, which the controller keeps in controller.log.
+        eprintln!(
+            "sdsync-dsm-api: api.log record {event} for queued job {} not written",
+            job.request_id
+        );
     }
     Ok(result)
 }
@@ -20203,16 +21413,15 @@ mod tests {
     #[test]
     fn every_read_action_is_assigned_a_rung_by_a_total_match() {
         for (action, rung) in [
-            // The last of the three manager-shaped reads to move. `logs` stays
-            // on the shell rung: its algorithmic win is already banked, and what
-            // rung A would buy there is the exec rather than the scan.
             (ReadAction::Snapshot, ReadRung::InService),
+            // The last to move: the manager's scan of every retained byte timed
+            // out on armv7 (ADV-B-4), so what rung A buys here is the scan.
             (
                 ReadAction::Logs {
                     lines: 10,
                     source: LogSource::All,
                 },
-                ReadRung::ShellManager,
+                ReadRung::InService,
             ),
             // Answered in the service since the rollup landed on rung A: the
             // shell's whole contribution was to name the profiles and forward
@@ -20950,6 +22159,229 @@ mod tests {
     ///
     /// No field legitimately differs here — the feed carries no generation
     /// timestamp — so this comparison is exact with nothing normalised at all.
+    /// The package logs every source writes, at levels the default policy shows on both rungs,
+    /// with every kind of text the reader rewrites: a secret value (raw and inside a JSON
+    /// string), the package's own paths, a path under its secrets directory, a terminal escape
+    /// and a control byte.
+    #[cfg(target_os = "linux")]
+    fn write_log_history(fixture: &TestShellPackageFixture) {
+        fs::create_dir_all(&fixture.secrets_dir).unwrap();
+        fs::set_permissions(&fixture.secrets_dir, fs::Permissions::from_mode(0o700)).unwrap();
+        fixture.write_config(
+            &fixture.secrets_dir.join("alpha.password"),
+            "hunter2-secret\n",
+        );
+        let home = fixture.home.display().to_string();
+        let var = fixture.var.display().to_string();
+        fixture.write_log(
+            "api.log.1",
+            b"{\"epoch\":1,\"level\":\"info\",\"category\":\"bridge\",\"event\":\"older\"}\n",
+        );
+        fixture.write_log(
+            "api.log",
+            format!(
+                "{{\"epoch\":2,\"level\":\"warn\",\"category\":\"bridge\",\"event\":\"x\",\"note\":\"hunter2-secret\"}}\n\
+                 {{\"epoch\":3,\"level\":\"error\",\"category\":\"bridge\",\"event\":\"y\",\"path\":\"{home}/config/a\"}}\n"
+            )
+            .as_bytes(),
+        );
+        fixture.write_log(
+            "controller.log",
+            format!(
+                "{{\"epoch\":4,\"level\":\"info\",\"category\":\"controller\",\"event\":\"tick\"}}\n\
+                 refusing unsafe package log file: {var}/log/x \u{1b}[31mred\u{1b}[0m\u{7}bell\n\
+                 password hunter2-secret leaked into {home}/secrets/alpha.password here\n"
+            )
+            .as_bytes(),
+        );
+        fixture.write_log(
+            "scheduler.log",
+            b"{\"epoch\":5,\"level\":\"info\",\"category\":\"scheduler\",\"event\":\"run_started\"}\n",
+        );
+        fixture.write_log(
+            "sync.log",
+            b"1700000000000 INFO  run.started profile=alpha\n1700000000001 ERROR run.failed reason=local_io profile=alpha\n",
+        );
+        fixture.write_log("doctor-inventory.log", b"doctor: profile alpha ok\n");
+        fixture.write_log(
+            "audit.log",
+            b"{\"epoch\":6,\"category\":\"audit\",\"mandatory\":true}\n",
+        );
+    }
+
+    /// The in-service logs read (ADV-B-4) agrees with the manager's own on everything both show:
+    /// same lines, same order, same redaction, for one source and for the aggregate.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn logs_agree_on_the_service_and_the_shell_rungs() {
+        let fixture = TestShellPackageFixture::new("logs-parity");
+        let policy = SecurityPolicyArgs::default();
+        write_log_history(&fixture);
+        for source in [LogSource::All, LogSource::Controller, LogSource::Api] {
+            let action = ReadAction::Logs { lines: 50, source };
+            let arguments = read_manager_arguments(&action).unwrap();
+            let arguments = arguments
+                .iter()
+                .map(|argument| argument.to_str().unwrap())
+                .collect::<Vec<_>>();
+            let shell = fixture.run_manager(&arguments);
+            assert!(
+                shell.status.success(),
+                "shell rung failed ({}):\nstdout: {}\nstderr: {}",
+                shell.status,
+                String::from_utf8_lossy(&shell.stdout),
+                String::from_utf8_lossy(&shell.stderr)
+            );
+            fixture.hand_over();
+            let left = parse_and_sanitize_manager_json(&shell.stdout, &action, None, Some(&policy))
+                .unwrap();
+            let right =
+                logs_document(&fixture.paths(), fixture.package_uid(), &action, &policy).unwrap();
+            assert_eq!(
+                String::from_utf8_lossy(&left),
+                String::from_utf8_lossy(&right),
+                "{source:?}"
+            );
+        }
+        // The fixture reached the rewriting it claims to.
+        let action = ReadAction::Logs {
+            lines: 50,
+            source: LogSource::Controller,
+        };
+        let document: Value = serde_json::from_slice(
+            &logs_document(&fixture.paths(), fixture.package_uid(), &action, &policy).unwrap(),
+        )
+        .unwrap();
+        let text = document["logs"][0]["lines"].to_string();
+        assert!(!text.contains("hunter2-secret"), "{text}");
+        assert!(text.contains("[redacted]"), "{text}");
+        assert!(text.contains("[package-var]/log/x red?bell"), "{text}");
+        assert!(text.contains("[secret] here"), "{text}");
+    }
+
+    /// ADV-B-3: an error is never hidden by a threshold, and raw stderr counts as an error. The
+    /// manager's own threshold used to drop these lines before the bridge's rule could see them.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn logs_show_every_error_at_any_threshold() {
+        let fixture = TestShellPackageFixture::new("logs-errors");
+        write_log_history(&fixture);
+        fixture.hand_over();
+        for level in [PolicyLogLevel::Warn, PolicyLogLevel::Off] {
+            let policy = SecurityPolicyArgs {
+                controller_log_level: level,
+                sync_log_level: level,
+                bridge_log_level: level,
+                ..SecurityPolicyArgs::default()
+            };
+            let action = ReadAction::Logs {
+                lines: 50,
+                source: LogSource::All,
+            };
+            let document: Value = serde_json::from_slice(
+                &logs_document(&fixture.paths(), fixture.package_uid(), &action, &policy).unwrap(),
+            )
+            .unwrap();
+            let lines = |source: &str| {
+                document["logs"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|entry| entry["source"] == source)
+                    .unwrap()["lines"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|line| line.as_str().unwrap().to_owned())
+                    .collect::<Vec<_>>()
+            };
+            let controller = lines("controller");
+            assert!(
+                controller
+                    .iter()
+                    .any(|line| line.starts_with("refusing unsafe package log file")),
+                "{level:?}: {controller:?}"
+            );
+            assert!(
+                !controller.iter().any(|line| line.contains("\"tick\"")),
+                "{level:?}: {controller:?}"
+            );
+            let sync = lines("sync");
+            assert_eq!(sync.len(), 1, "{level:?}: {sync:?}");
+            assert!(sync[0].contains(" ERROR "));
+            let api = lines("api");
+            assert!(api.iter().any(|line| line.contains("\"error\"")), "{api:?}");
+            if level == PolicyLogLevel::Off {
+                assert!(!api.iter().any(|line| line.contains("\"warn\"")), "{api:?}");
+            }
+        }
+    }
+
+    /// ADV-B-4: a source whose lines a strict threshold hides is scanned to its byte budget,
+    /// newest first, and says older history was not scanned, instead of walking every retained
+    /// byte on every poll.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_logs_scan_stops_at_its_budget_and_says_so() {
+        let fixture = TestPackageFixture::new("logs-budget");
+        let uid = TestPackageFixture::package_uid();
+        let line =
+            b"{\"epoch\":1,\"level\":\"debug\",\"category\":\"controller\",\"event\":\"tick\"}\n";
+        let mut bulk = Vec::with_capacity(4 * 1024 * 1024);
+        while bulk.len() < 4 * 1024 * 1024 {
+            bulk.extend_from_slice(line);
+        }
+        let mut older =
+            b"{\"epoch\":0,\"level\":\"error\",\"category\":\"controller\",\"event\":\"old\"}\n"
+                .to_vec();
+        older.extend_from_slice(&bulk);
+        fixture.write_private(&fixture.log_root.join("controller.log.1"), &older);
+        fixture.write_private(&fixture.log_root.join("controller.log"), &bulk);
+        let action = ReadAction::Logs {
+            lines: 100,
+            source: LogSource::Controller,
+        };
+        let started = Instant::now();
+        let document: Value = serde_json::from_slice(
+            &logs_document(
+                &fixture.paths(),
+                uid,
+                &action,
+                &SecurityPolicyArgs::default(),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let elapsed = started.elapsed();
+        assert_eq!(document["logs"][0]["source"], "controller");
+        assert_eq!(document["logs"][0]["lines"], json!([]));
+        assert_eq!(document["logs"][0]["scan_limited"], true);
+        eprintln!("budget-bound scan of hidden lines took {elapsed:?}");
+
+        // Within the budget, every matching line is found, oldest first, and nothing is limited.
+        fixture.write_private(
+            &fixture.log_root.join("controller.log"),
+            b"{\"epoch\":7,\"level\":\"info\",\"category\":\"controller\",\"event\":\"a\"}\n\
+              {\"epoch\":8,\"level\":\"info\",\"category\":\"controller\",\"event\":\"b\"}",
+        );
+        fs::remove_file(fixture.log_root.join("controller.log.1")).unwrap();
+        let document: Value = serde_json::from_slice(
+            &logs_document(
+                &fixture.paths(),
+                uid,
+                &action,
+                &SecurityPolicyArgs::default(),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let lines = document["logs"][0]["lines"].as_array().unwrap();
+        assert_eq!(lines.len(), 2);
+        assert!(lines[0].as_str().unwrap().contains("\"a\""));
+        assert!(lines[1].as_str().unwrap().contains("\"b\""));
+        assert!(document["logs"][0].get("scan_limited").is_none());
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn activity_is_byte_identical_on_the_service_and_the_shell_rungs() {
@@ -21234,9 +22666,11 @@ mod tests {
     /// A read that still takes the shell rung, for the tests that need a manager
     /// to be run at all.
     ///
-    /// `logs` is the only one left. Every test here used `snapshot` until the
-    /// snapshot moved in process, at which point they stopped exercising the
-    /// manager and started passing for the wrong reason — which is what
+    /// Every ladder read is answered in the service now, so these tests force
+    /// the operator's shell lane (`force_shell_lane`) to reach the manager at
+    /// all. They used `snapshot`, then `logs`, until each moved in process, at
+    /// which point they would have stopped exercising the manager and started
+    /// passing for the wrong reason — which is what
     /// `every_read_action_is_assigned_a_rung_by_a_total_match` exists to make
     /// visible.
     #[cfg(target_os = "linux")]
@@ -21245,6 +22679,13 @@ mod tests {
             lines: 10,
             source: LogSource::Api,
         }
+    }
+
+    /// Engage the operator's kill switch, so every ladder read takes the shell rung.
+    #[cfg(target_os = "linux")]
+    fn force_shell_lane(fixture: &TestPackageFixture) {
+        fs::create_dir_all(fixture.read_lane.parent().unwrap()).unwrap();
+        fixture.write_private(&fixture.read_lane, b"shell\n");
     }
 
     /// Fault-injection rows 1, 2, 4 and 5: what the shell rung does when the
@@ -21259,6 +22700,7 @@ mod tests {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let fixture = TestPackageFixture::new("manager-modes");
+        force_shell_lane(&fixture);
         let uid = TestPackageFixture::package_uid();
         let policy = SecurityPolicyArgs::default();
         let read = |fixture: &TestPackageFixture| {
@@ -21367,6 +22809,7 @@ mod tests {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let fixture = TestPackageFixture::new("manager-lane");
+        force_shell_lane(&fixture);
         let uid = TestPackageFixture::package_uid();
         let policy = SecurityPolicyArgs::default();
         // Longer than MANAGER_PERMIT_WAIT, far shorter than
@@ -21724,6 +23167,109 @@ mod tests {
         );
     }
 
+    /// Every reason token the shell writers can put in a state record reaches `outcomes`
+    /// unchanged, read from the writers themselves rather than from a list kept here, so a
+    /// token a writer learns later fails this test instead of reading as `invalid_reason`.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn outcomes_accept_every_reason_token_the_shell_writers_emit() {
+        let libexec =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("packaging/synology/package/libexec");
+        let mut tokens = BTreeSet::new();
+        for (script, needles) in [
+            (
+                "sdsync-run",
+                &[
+                    "runner_fail ",
+                    "run_reason=",
+                    "preflight_reason=",
+                    "run_failure_reason=",
+                    "skipped_first_reason=",
+                ][..],
+            ),
+            (
+                "sdsync-controller",
+                &[
+                    "routine_defer_reason_value=",
+                    "routine_last_reason_value=",
+                    "routine_reason_value=",
+                    "scheduled_reason=",
+                ][..],
+            ),
+        ] {
+            let text = fs::read_to_string(libexec.join(script)).unwrap();
+            for line in text.lines() {
+                for needle in needles {
+                    for (at, _) in line.match_indices(needle) {
+                        let token: String = line[at + needle.len()..]
+                            .chars()
+                            .take_while(|c| {
+                                c.is_ascii_lowercase() || c.is_ascii_digit() || *c == '_'
+                            })
+                            .collect();
+                        if !token.is_empty() && !matches!(token.as_str(), "none" | "ok") {
+                            tokens.insert(token);
+                        }
+                    }
+                }
+            }
+        }
+        // Passed positionally to `runner_profile_outcome`, so not caught by an assignment needle,
+        // and the two the bridge itself derives.
+        for literal in ["core_partial", "not_reached", "runner_died", "lock_busy"] {
+            tokens.insert(literal.to_owned());
+        }
+        for expected in [
+            "core_failed",
+            "profiles_skipped",
+            "policy_http",
+            "dependency",
+        ] {
+            assert!(
+                tokens.contains(expected),
+                "{expected} not found in {tokens:?}"
+            );
+        }
+        assert!(tokens.len() >= 30, "{tokens:?}");
+
+        let fixture = TestPackageFixture::new("outcomes-shell-vocabulary");
+        let uid = TestPackageFixture::package_uid();
+        fixture.write_private(&fixture.profiles_dir.join("alpha.toml"), b"");
+        fixture.write_private(&fixture.routines_dir.join("alpha.conf"), b"");
+        let profiles = fixture.state_dir.join("profiles");
+        fs::create_dir_all(&profiles).unwrap();
+        for token in &tokens {
+            assert!(valid_reason_token(token.as_bytes()), "{token}");
+            fixture.write_private(
+                &fixture.state_dir.join("run.state"),
+                format!(
+                    "state=failed\nstarted_epoch=1\nfinished_epoch=2\nexit_code=1\nscope=all\n\
+                     operation=sync\nreason={token}\naggregate_state=failed\n\
+                     aggregate_exit_code=1\naggregate_reason={token}\n"
+                )
+                .as_bytes(),
+            );
+            fixture.write_private(
+                &profiles.join("alpha.state"),
+                format!("state=failed\nfinished_epoch=2\nexit_code=1\nreason={token}\n").as_bytes(),
+            );
+            fixture.write_private(
+                &fixture.routine_state_dir.join("alpha.state"),
+                format!(
+                    "state=failed\ndefer_reason={token}\nlast_exit_code=1\nlast_reason={token}\n"
+                )
+                .as_bytes(),
+            );
+            let outcomes = outcomes_value(&fixture.paths(), uid);
+            assert_eq!(outcomes["errors"], json!([]), "{token}: {outcomes}");
+            assert_eq!(outcomes["run"]["reason"], token.as_str());
+            assert_eq!(outcomes["run"]["aggregate"]["reason"], token.as_str());
+            assert_eq!(outcomes["profiles"][0]["reason"], token.as_str());
+            assert_eq!(outcomes["routines"][0]["defer_reason"], token.as_str());
+            assert_eq!(outcomes["routines"][0]["last_reason"], token.as_str());
+        }
+    }
+
     /// Routine causes, failed best-effort writers and an unusable stored rollup are all named
     /// in `outcomes` rather than left to look like "nothing happened".
     #[cfg(target_os = "linux")]
@@ -21783,6 +23329,86 @@ mod tests {
         assert_eq!(old["routines"][0]["last_exit_code"], Value::Null);
         assert_eq!(old["run"]["degraded"], Value::Null);
         assert_eq!(old["status_cache_health"]["state"], "ok");
+    }
+
+    /// C-C1: a runner killed by a package stop is published with the SIGKILL status 137 and an
+    /// explicit `outcome=cancelled`. The explicit outcome wins over the exit-code mapping, so it
+    /// reads as cancelled exactly like the runner's own 130/143, never as a failure; and the
+    /// routine state's new numeric fields are ignored by the readers that do not know them.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_runner_killed_by_a_package_stop_reads_as_cancelled() {
+        let fixture = TestPackageFixture::new("outcomes-stop-137");
+        let uid = TestPackageFixture::package_uid();
+        fixture.write_private(
+            &fixture.state_dir.join("run.state"),
+            b"state=failed\nstarted_epoch=100\nfinished_epoch=150\nexit_code=137\nscope=all\n\
+              operation=sync\noutcome=cancelled\nreason=cancelled\n",
+        );
+        fixture.write_private(
+            &fixture.routines_dir.join("alpha.conf"),
+            b"enabled=true\naction=sync\nmode=interval\ninterval_seconds=900\n",
+        );
+        fixture.write_private(
+            &fixture.routine_state_dir.join("alpha.state"),
+            b"state=failed\nnext_run_epoch=0\nlast_success_epoch=0\nlast_reason=admission_failed\n\
+              partial_streak=3\nescalated_epoch=1700000000\n",
+        );
+        let outcomes = outcomes_value(&fixture.paths(), uid);
+        assert_eq!(outcomes["run"]["outcome"], "cancelled");
+        assert_eq!(outcomes["run"]["reason"], "cancelled");
+        assert_eq!(outcomes["run"]["exit_code"], 137);
+        assert_eq!(outcomes["routines"][0]["last_reason"], "admission_failed");
+        assert_eq!(outcomes["errors"], json!([]));
+    }
+
+    /// C-E6: user-fixable conditions (a NAS refusal, an unsupported local entry, a pending case
+    /// rename, a refused delete, a type conflict) are lasting. The core exits 0 and the run is
+    /// complete, but it carries named warnings: never a plain green success, never `partial`, and
+    /// the profile's rollup row is not `trusted`.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_run_with_only_lasting_deferrals_and_skips_is_complete_with_warnings() {
+        let fixture = TestPackageFixture::new("outcomes-lasting");
+        let uid = TestPackageFixture::package_uid();
+        fixture.write_private(&fixture.profiles_dir.join("alpha.toml"), b"");
+        fixture.write_private(&fixture.profiles_dir.join("beta.toml"), b"");
+        fixture.write_private(
+            &fixture.state_dir.join("run.state"),
+            b"state=succeeded\nstarted_epoch=100\nfinished_epoch=200\nexit_code=0\nscope=all\n\
+              operation=sync\noutcome=succeeded\nreason=ok\ndeferred=3\nskipped=2\n",
+        );
+        let profiles = fixture.state_dir.join("profiles");
+        fs::create_dir_all(&profiles).unwrap();
+        // Lasting deferrals only.
+        fixture.write_private(
+            &profiles.join("alpha.state"),
+            b"state=succeeded\nfinished_epoch=200\nexit_code=0\naction=sync\noutcome=succeeded\n\
+              reason=ok\noutcome_epoch=200\ndeferred=3\nskipped=0\n",
+        );
+        // Plan skips only (a type conflict, a NAS link).
+        fixture.write_private(
+            &profiles.join("beta.state"),
+            b"state=succeeded\nfinished_epoch=200\nexit_code=0\naction=sync\noutcome=succeeded\n\
+              reason=ok\noutcome_epoch=200\ndeferred=0\nskipped=2\n",
+        );
+        let outcomes = outcomes_value(&fixture.paths(), uid);
+        let run = &outcomes["run"];
+        assert_eq!(run["outcome"], "succeeded");
+        assert_eq!(
+            run["warnings"],
+            json!(["skipped_entries", "deferred_entries"])
+        );
+        for profile in outcomes["profiles"].as_array().unwrap() {
+            assert_eq!(profile["outcome"], "succeeded", "{profile}");
+            assert_ne!(profile["outcome"], "partial");
+            assert_eq!(profile["status_cache"], "skipped_entries", "{profile}");
+            assert!(
+                !profile["warnings"].as_array().unwrap().is_empty(),
+                "{profile}"
+            );
+        }
+        assert_eq!(outcomes["errors"], json!([]));
     }
 
     /// Result facts that stop the next run converging (incomplete listings, upload times DSM did
@@ -22139,6 +23765,504 @@ mod tests {
         assert_eq!(untouched.body, b"{}");
     }
 
+    /// ADV-B-2: once the controller has rewritten a dead run as `failed/runner_died`, the
+    /// profiles that run covered kept their pre-crash `succeeded` record and read `trusted` again.
+    /// A covered profile whose record predates the dead run's start is not trusted.
+    /// ADV-B-1 (reader half): a record a plan wrote is not a sync outcome, so it never vouches
+    /// for the profile's rollup row.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_reconciled_dead_run_and_a_plan_record_never_read_as_trusted() {
+        let fixture = TestPackageFixture::new("outcomes-reconciled");
+        let uid = TestPackageFixture::package_uid();
+        for name in ["alpha", "beta", "gamma", "delta"] {
+            fixture.write_private(&fixture.profiles_dir.join(format!("{name}.toml")), b"");
+        }
+        let profiles = fixture.state_dir.join("profiles");
+        fs::create_dir_all(&profiles).unwrap();
+        // The controller's rewrite of a runner that died at 150 after starting at 100.
+        fixture.write_private(
+            &fixture.state_dir.join("run.state"),
+            b"state=failed\nstarted_epoch=100\nfinished_epoch=150\nexit_code=-1\nscope=all\n\
+              operation=sync\nreason=runner_died\n",
+        );
+        let record = |name: &str, body: &str| {
+            fixture.write_private(&profiles.join(format!("{name}.state")), body.as_bytes());
+        };
+        // Before the dead run: its success says nothing about the run that died.
+        record(
+            "alpha",
+            "state=succeeded\nfinished_epoch=90\nexit_code=0\naction=sync\noutcome=succeeded\n\
+             reason=ok\noutcome_epoch=90\n",
+        );
+        // Written by the dead run itself before it died (a profile it finished): still trusted.
+        record(
+            "beta",
+            "state=succeeded\nfinished_epoch=120\nexit_code=0\naction=sync\noutcome=succeeded\n\
+             reason=ok\noutcome_epoch=120\n",
+        );
+        // A successful plan over a failed sync.
+        record(
+            "gamma",
+            "state=succeeded\nfinished_epoch=160\nexit_code=0\naction=plan\noutcome=succeeded\n\
+             reason=ok\noutcome_epoch=160\n",
+        );
+        let outcomes = outcomes_value(&fixture.paths(), uid);
+        let by_name = |name: &str| {
+            outcomes["profiles"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|profile| profile["profile"] == name)
+                .unwrap()
+                .clone()
+        };
+        assert_eq!(outcomes["run"]["reason"], "runner_died");
+        assert_eq!(by_name("alpha")["status_cache"], "last_run_failed");
+        assert_eq!(by_name("beta")["status_cache"], "trusted");
+        assert_eq!(by_name("gamma")["status_cache"], "no_run_recorded");
+        assert_eq!(by_name("gamma")["action"], "plan");
+        // No record at all, covered by the dead run: as under `stale`, not trustworthy.
+        assert_eq!(by_name("delta")["status_cache"], "last_run_failed");
+
+        // A single-profile dead run covers only its own profile.
+        fixture.write_private(
+            &fixture.state_dir.join("run.state"),
+            b"state=failed\nstarted_epoch=100\nfinished_epoch=150\nexit_code=-1\nscope=beta\n\
+              operation=sync\nreason=runner_died\n",
+        );
+        let outcomes = outcomes_value(&fixture.paths(), uid);
+        let alpha = outcomes["profiles"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|profile| profile["profile"] == "alpha")
+            .unwrap()
+            .clone();
+        assert_eq!(alpha["status_cache"], "trusted");
+    }
+
+    /// ADV-B-11: the legacy `run` block and `outcomes.run` are two reads of run.state, so a run
+    /// that finished between them gave one document saying `running` and `succeeded` at once.
+    /// The later read wins: the legacy block is brought into line with `outcomes.run`.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_legacy_run_block_agrees_with_outcomes_after_a_run_finishes_between_reads() {
+        let fixture = TestPackageFixture::new("outcomes-two-reads");
+        let uid = TestPackageFixture::package_uid();
+        fixture.write_private(
+            &fixture.state_dir.join("run.state"),
+            b"state=succeeded\nstarted_epoch=100\nfinished_epoch=180\nexit_code=0\nscope=all\n\
+              operation=sync\nreason=ok\n",
+        );
+        let snapshot = CgiResponse::success(
+            serde_json::to_vec(&json!({
+                "schema": "sdsync.dsm-api.v1",
+                "run": {"state": "running", "started_epoch": 100, "finished_epoch": 0,
+                        "exit_code": null, "scope": "all", "operation": "sync"},
+            }))
+            .unwrap(),
+        );
+        let attached = attach_snapshot_outcomes(snapshot, &fixture.paths(), uid).unwrap();
+        let document: Value = serde_json::from_slice(&attached.body).unwrap();
+        assert_eq!(document["outcomes"]["run"]["outcome"], "succeeded");
+        assert_eq!(
+            document["run"],
+            json!({"state": "succeeded", "started_epoch": 100, "finished_epoch": 180,
+                   "exit_code": 0, "scope": "all", "operation": "sync"})
+        );
+    }
+
+    /// S-18: a scheduled `all` run's per-profile cause (the error line and the entry it
+    /// concerns) is persisted by the runner into each profile's state and reaches the snapshot;
+    /// a malformed value is named, never shown.
+    /// ADV-S-1: a saved change the running controller has not picked up is pending until it does,
+    /// and the snapshot says so from the manager's marker.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn outcomes_carry_the_per_profile_cause_and_a_pending_controller_reload() {
+        let fixture = TestPackageFixture::new("outcomes-cause");
+        let uid = TestPackageFixture::package_uid();
+        fixture.write_private(&fixture.profiles_dir.join("alpha.toml"), b"");
+        fixture.write_private(&fixture.profiles_dir.join("beta.toml"), b"");
+        let profiles = fixture.state_dir.join("profiles");
+        fs::create_dir_all(&profiles).unwrap();
+        fixture.write_private(
+            &profiles.join("alpha.state"),
+            b"state=failed\nfinished_epoch=160\nexit_code=1\naction=sync\noutcome=failed\n\
+              reason=core_failed\ndetail=error: failed to read albums/x.jpg: permission denied\n\
+              failed_path=albums/%E5%86%99%E7%9C%9F.jpg\n",
+        );
+        fixture.write_private(
+            &profiles.join("beta.state"),
+            b"state=failed\nfinished_epoch=160\nexit_code=1\naction=sync\noutcome=failed\n\
+              reason=core_failed\ndetail=bad|pipe\nfailed_path=albums/raw path.jpg\n",
+        );
+        let paths = fixture.paths();
+        let outcomes = outcomes_value(&paths, uid);
+        let alpha = &outcomes["profiles"][0];
+        assert_eq!(
+            alpha["detail"],
+            "error: failed to read albums/x.jpg: permission denied"
+        );
+        assert_eq!(alpha["failed_path"], "albums/%E5%86%99%E7%9C%9F.jpg");
+        let beta = &outcomes["profiles"][1];
+        assert_eq!(beta["detail"], Value::Null);
+        assert_eq!(beta["failed_path"], Value::Null);
+        let errors = outcomes["errors"].as_array().unwrap();
+        assert_eq!(
+            errors
+                .iter()
+                .filter(|error| **error
+                    == json!({"source": "profiles/beta.state", "code": "malformed"}))
+                .count(),
+            2,
+            "{errors:?}"
+        );
+        assert_eq!(outcomes["controller_reload"], json!({"pending": false}));
+
+        let marker = fixture.state_dir.join("controller-reload.pending");
+        fixture.write_private(
+            &marker,
+            b"epoch=1700000000\nreason=pid_unreadable\npid=none\noperation=configure-routine\n",
+        );
+        assert_eq!(
+            outcomes_value(&paths, uid)["controller_reload"],
+            json!({"pending": true, "epoch": 1_700_000_000_u64, "reason": "pid_unreadable",
+                   "pid": null, "operation": "configure-routine"})
+        );
+        fixture.write_private(&marker, b"epoch=x\nreason=Bad Reason\npid=12\n");
+        let outcomes = outcomes_value(&paths, uid);
+        assert_eq!(
+            outcomes["controller_reload"],
+            json!({"pending": true, "epoch": null, "reason": null, "pid": 12, "operation": null})
+        );
+        assert!(
+            outcomes["errors"]
+                .as_array()
+                .unwrap()
+                .contains(&json!({"source": "controller-reload.pending", "code": "malformed"}))
+        );
+        fs::set_permissions(&marker, fs::Permissions::from_mode(0o644)).unwrap();
+        let outcomes = outcomes_value(&paths, uid);
+        assert_eq!(outcomes["controller_reload"], json!({"pending": null}));
+        assert!(
+            outcomes["errors"]
+                .as_array()
+                .unwrap()
+                .contains(&json!({"source": "controller-reload.pending", "code": "unsafe_file"}))
+        );
+    }
+
+    /// ADV-B-6: a live run whose runner publishes a progress heartbeat is `stalled` once the
+    /// heartbeat is older than the bound; without a heartbeat the answer is unknown (`null`).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_live_run_with_a_stale_heartbeat_is_stalled() {
+        let fixture = TestPackageFixture::new("outcomes-heartbeat");
+        let uid = TestPackageFixture::package_uid();
+        let now = current_epoch().unwrap();
+        let _lock = write_run_lock(&fixture, &own_lock_identity(0));
+        let run_state = |heartbeat: Option<u64>| {
+            let mut text = format!(
+                "state=running\nstarted_epoch={}\nfinished_epoch=0\nexit_code=-1\nscope=all\n\
+                 operation=sync\n",
+                now - 4000
+            );
+            if let Some(heartbeat) = heartbeat {
+                text.push_str(&format!(
+                    "heartbeat_epoch={heartbeat}\nheartbeat_source=io\n"
+                ));
+            }
+            fixture.write_private(&fixture.state_dir.join("run.state"), text.as_bytes());
+            outcomes_value(&fixture.paths(), uid)["run"].clone()
+        };
+        let stalled = run_state(Some(now - STALLED_RUN_SECONDS - 60));
+        assert_eq!(stalled["stalled"], true);
+        assert!(
+            stalled["warnings"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("stalled"))
+        );
+        assert_eq!(run_state(Some(now - 10))["stalled"], false);
+        assert_eq!(run_state(None)["stalled"], Value::Null);
+        // The heartbeat itself rides beside the verdict, so the dashboard can say since when.
+        let beat = now - STALLED_RUN_SECONDS - 60;
+        assert_eq!(run_state(Some(beat))["heartbeat_epoch"], beat);
+        assert_eq!(run_state(None)["heartbeat_epoch"], Value::Null);
+        assert_eq!(run_state(Some(beat))["heartbeat_source"], "io");
+        assert_eq!(run_state(None)["heartbeat_source"], Value::Null);
+    }
+
+    /// ADV-B-6: a live run had no age, so a hung one read `running` forever with nothing to
+    /// tell it from a healthy one. `outcomes.run` says how long it has been running and flags a
+    /// run past the long-running bound; neither is set when nothing runs.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_live_run_reports_its_age_and_a_long_one_is_flagged() {
+        let fixture = TestPackageFixture::new("outcomes-age");
+        let uid = TestPackageFixture::package_uid();
+        let now = current_epoch().unwrap();
+        let _lock = write_run_lock(&fixture, &own_lock_identity(0));
+        let started = now - LONG_RUNNING_SECONDS - 60;
+        fixture.write_private(
+            &fixture.state_dir.join("run.state"),
+            format!(
+                "state=running\nstarted_epoch={started}\nfinished_epoch=0\nexit_code=-1\n\
+                 scope=all\noperation=sync\n"
+            )
+            .as_bytes(),
+        );
+        let run = outcomes_value(&fixture.paths(), uid)["run"].clone();
+        assert_eq!(run["outcome"], "running");
+        let age = run["running_for_seconds"].as_u64().unwrap();
+        assert!((LONG_RUNNING_SECONDS + 60..LONG_RUNNING_SECONDS + 600).contains(&age));
+        assert_eq!(run["long_running"], true);
+        assert!(
+            run["warnings"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("long_running"))
+        );
+
+        fixture.write_private(
+            &fixture.state_dir.join("run.state"),
+            format!(
+                "state=running\nstarted_epoch={}\nfinished_epoch=0\nexit_code=-1\nscope=all\n\
+                 operation=sync\n",
+                now - 30
+            )
+            .as_bytes(),
+        );
+        let run = outcomes_value(&fixture.paths(), uid)["run"].clone();
+        assert_eq!(run["long_running"], false);
+        assert!(run["running_for_seconds"].as_u64().unwrap() < 600);
+
+        fixture.write_private(
+            &fixture.state_dir.join("run.state"),
+            b"state=succeeded\nstarted_epoch=1\nfinished_epoch=2\nexit_code=0\nscope=all\n\
+              operation=sync\n",
+        );
+        let run = outcomes_value(&fixture.paths(), uid)["run"].clone();
+        assert_eq!(run["running_for_seconds"], Value::Null);
+        assert_eq!(run["long_running"], false);
+    }
+
+    /// ADV-B-5: one record whose free text holds ` request_id=` not followed by a request id
+    /// (a file named `meeting request_id=5.txt` in a run's error line) made the whole Activity
+    /// feed 503 `package_state_corrupt`. The record is kept, untagged, with its text intact,
+    /// the other records still read, and the malformed marker is named once in api.log.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn one_malformed_request_marker_does_not_break_the_activity_feed() {
+        let fixture = TestPackageFixture::new("activity-request-marker");
+        let uid = TestPackageFixture::package_uid();
+        let tagged = "0123456789abcdef0123456789abcdef";
+        fixture.write_private(
+            &fixture.log_root.join("activity.log"),
+            format!(
+                "1700000001|run.failed|alpha|failed|sync|error|error: failed to read meeting request_id=5.txt\n\
+                 1700000002|run.started|alpha|running|sync|info|Run started request_id={tagged}\n"
+            )
+            .as_bytes(),
+        );
+        let policy = SecurityPolicyArgs::default();
+        let document = activity_document(
+            &fixture.paths(),
+            uid,
+            &ReadAction::Activity { lines: 10 },
+            10,
+            &policy,
+        )
+        .unwrap();
+        let value: Value = serde_json::from_slice(&document).unwrap();
+        let events = value["events"].as_array().unwrap();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0]["client_request_id"], Value::Null);
+        assert_eq!(
+            events[0]["message"],
+            "error: failed to read meeting request_id=5.txt"
+        );
+        assert_eq!(events[1]["client_request_id"], tagged);
+        let api_log = fs::read_to_string(fixture.log_root.join("api.log")).unwrap();
+        let record: Value = serde_json::from_str(api_log.lines().next().unwrap()).unwrap();
+        assert_eq!(record["event"], "activity_request_marker_malformed");
+        assert_eq!(record["records"], 1);
+
+        // A record caught half-appended is the next read's, not a corrupt feed.
+        let mut log = OpenOptions::new()
+            .append(true)
+            .open(fixture.log_root.join("activity.log"))
+            .unwrap();
+        std::io::Write::write_all(&mut log, b"1700000003|run.succ").unwrap();
+        let document = activity_document(
+            &fixture.paths(),
+            uid,
+            &ReadAction::Activity { lines: 10 },
+            10,
+            &policy,
+        )
+        .unwrap();
+        let value: Value = serde_json::from_slice(&document).unwrap();
+        assert_eq!(value["events"].as_array().unwrap().len(), 2);
+    }
+
+    /// ADV-B-9: an append landing between `fstat` and the read made the Activity read fail as
+    /// an unsafe file. An append-only log may grow while it is read; what was there at `fstat`
+    /// is read, and the growth is the next read's.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn an_activity_read_racing_appends_never_reports_an_unsafe_file() {
+        use std::io::Write as _;
+        let fixture = TestPackageFixture::new("activity-append-race");
+        let uid = TestPackageFixture::package_uid();
+        let log = fixture.log_root.join("activity.log");
+        fixture.write_private(&log, b"");
+        let stop = Arc::new(AtomicBool::new(false));
+        let writer = {
+            let stop = Arc::clone(&stop);
+            let log = log.clone();
+            std::thread::spawn(move || {
+                let mut file = OpenOptions::new().append(true).open(&log).unwrap();
+                let mut appended = 0_u64;
+                // Paced so the appends overlap the reads, and bounded below the read limit.
+                while !stop.load(AtomicOrdering::Relaxed) && appended < 30_000 {
+                    file.write_all(b"1700000000|run.started|all|running|Run started\n")
+                        .unwrap();
+                    appended += 1;
+                    std::thread::sleep(Duration::from_micros(50));
+                }
+                appended
+            })
+        };
+        let mut failures = 0;
+        for _ in 0..2000 {
+            if linux_files::read_activity_history(&fixture.log_root, uid).is_err() {
+                failures += 1;
+            }
+        }
+        stop.store(true, AtomicOrdering::Relaxed);
+        let appended = writer.join().unwrap();
+        assert!(appended > 0);
+        assert_eq!(
+            failures, 0,
+            "{failures} of 2000 reads failed against {appended} appends"
+        );
+    }
+
+    /// A runner that died leaves `state=running` behind. The outcome said `stale`, but the
+    /// legacy `run` block, `outcomes.run.state` and the covered routine still said `running`,
+    /// so the dashboard showed an active run and a dead one at once. The stale verdict is
+    /// authoritative: nothing in the snapshot reports a run that has no live lock owner.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_stale_run_is_not_reported_as_running_anywhere_in_the_snapshot() {
+        let fixture = TestPackageFixture::new("outcomes-stale-legacy");
+        let uid = TestPackageFixture::package_uid();
+        fixture.write_private(&fixture.profiles_dir.join("alpha.toml"), b"");
+        fixture.write_private(&fixture.profiles_dir.join("beta.toml"), b"");
+        fixture.write_private(
+            &fixture.state_dir.join("run.state"),
+            b"state=running\nstarted_epoch=100\nfinished_epoch=0\nexit_code=-1\nscope=alpha\n\
+              operation=sync\n",
+        );
+        let snapshot = || {
+            CgiResponse::success(
+                serde_json::to_vec(&json!({
+                    "schema": "sdsync.dsm-api.v1",
+                    "run": {"state": "running", "started_epoch": 100, "finished_epoch": 0,
+                            "exit_code": null, "scope": "alpha", "operation": "sync"},
+                    "routines": [
+                        {"profile": "alpha", "state": "running"},
+                        {"profile": "beta", "state": "running"},
+                    ],
+                }))
+                .unwrap(),
+            )
+        };
+        let attached = attach_snapshot_outcomes(snapshot(), &fixture.paths(), uid).unwrap();
+        let document: Value = serde_json::from_slice(&attached.body).unwrap();
+        assert_eq!(document["outcomes"]["run"]["outcome"], "stale");
+        assert_eq!(document["outcomes"]["run"]["state"], "failed");
+        assert_eq!(document["run"]["state"], "failed");
+        assert_eq!(document["run"]["exit_code"], Value::Null);
+        // Only the routine the dead run covered; beta's routine is not this run.
+        assert_eq!(document["routines"][0]["state"], "failed");
+        assert_eq!(document["routines"][1]["state"], "running");
+
+        // A live lock owner: a real run, reported as running everywhere.
+        let _lock = write_run_lock(&fixture, &own_lock_identity(0));
+        let attached = attach_snapshot_outcomes(snapshot(), &fixture.paths(), uid).unwrap();
+        let document: Value = serde_json::from_slice(&attached.body).unwrap();
+        assert_eq!(document["outcomes"]["run"]["outcome"], "running");
+        assert_eq!(document["outcomes"]["run"]["state"], "running");
+        assert_eq!(document["run"]["state"], "running");
+        assert_eq!(document["routines"][0]["state"], "running");
+    }
+
+    /// The snapshot says whether run-stderr.log holds the core's stderr for the run it reports,
+    /// by the runner's header line, so the dashboard knows when the full cause is one logs read
+    /// away. A tail from an older run, or no file, is `null`; an unsafe file is named.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn outcomes_point_at_the_stderr_tail_of_the_run_they_report() {
+        let fixture = TestPackageFixture::new("outcomes-stderr");
+        let uid = TestPackageFixture::package_uid();
+        fixture.write_private(
+            &fixture.state_dir.join("run.state"),
+            b"state=failed\nstarted_epoch=100\nfinished_epoch=200\nexit_code=1\nscope=all\n\
+              operation=sync\nreason=core_failed\n",
+        );
+        let paths = fixture.paths();
+        assert_eq!(
+            outcomes_value(&paths, uid)["run"]["stderr_log"],
+            Value::Null
+        );
+
+        let log = fixture.log_root.join("run-stderr.log");
+        fixture.write_private(
+            &log,
+            b"# epoch=200 scope=all operation=sync exit=1\nerror: failed to read x\n",
+        );
+        let outcomes = outcomes_value(&paths, uid);
+        assert_eq!(
+            outcomes["run"]["stderr_log"],
+            json!({"source": "run-stderr", "finished_epoch": 200, "exit_code": 1})
+        );
+        assert_eq!(outcomes["errors"], json!([]));
+
+        // The tail of an older run is not this run's cause.
+        fixture.write_private(
+            &log,
+            b"# epoch=150 scope=all operation=sync exit=1\nerror: older\n",
+        );
+        assert_eq!(
+            outcomes_value(&paths, uid)["run"]["stderr_log"],
+            Value::Null
+        );
+        fixture.write_private(&log, b"no header\n");
+        assert_eq!(
+            outcomes_value(&paths, uid)["run"]["stderr_log"],
+            Value::Null
+        );
+
+        // A file the package did not write privately is refused and named.
+        fixture.write_private(
+            &log,
+            b"# epoch=200 scope=all operation=sync exit=1\nerror: failed to read x\n",
+        );
+        fs::set_permissions(&log, fs::Permissions::from_mode(0o644)).unwrap();
+        let outcomes = outcomes_value(&paths, uid);
+        assert_eq!(outcomes["run"]["stderr_log"], Value::Null);
+        assert!(
+            outcomes["errors"]
+                .as_array()
+                .unwrap()
+                .contains(&json!({"source": "run-stderr.log", "code": "unsafe_file"}))
+        );
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn reason_tokens_admit_codes_and_qualifiers_but_never_paths() {
@@ -22198,15 +24322,18 @@ mod tests {
             .unwrap_err();
         assert_eq!(error.code, Some("manager_output_invalid"));
 
-        // And a read with no in-service implementation is unaffected either way.
-        // `logs` is the only one left on the shell rung.
-        fs::remove_file(&fixture.read_lane).unwrap();
+        // `logs`, the last read to move, follows the switch the same way.
         assert_eq!(
             execute_read_action(&fixture.paths(), &shell_rung_read(), &policy, uid)
                 .unwrap_err()
                 .code,
             Some("manager_output_invalid")
         );
+        fs::remove_file(&fixture.read_lane).unwrap();
+        let served =
+            execute_read_action(&fixture.paths(), &shell_rung_read(), &policy, uid).unwrap();
+        let document: Value = serde_json::from_slice(&served.body).unwrap();
+        assert_eq!(document["schema"], "sdsync.dsm-logs.v1");
     }
 
     /// The forced lane announces itself in api.log, as a notice rather than a
@@ -24477,6 +26604,144 @@ mod tests {
         assert_eq!(identity.len(), 2);
         assert_eq!(identity[0], identity[1]);
         assert_ne!(identity[1], existing_group);
+    }
+
+    /// A queued manager's stderr used to go to /dev/null, so a warning it printed after a
+    /// mutation (an audit record left pending, a controller it could not reload) vanished. It is
+    /// kept now, bounded, and a manager that writes far more than the bound neither fails nor
+    /// stalls: the excess is read and counted. Completion still never waits on stderr.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn queued_mutation_capture_keeps_bounded_stderr_without_waiting_on_it() {
+        let termination_requested = AtomicBool::new(false);
+        let mut command = Command::new("/bin/sh");
+        command.args([
+            "-c",
+            "printf 'warning: terminal audit is pending\\n' >&2; printf '{\"ok\":true}\\n'",
+        ]);
+        let output =
+            capture_queued_mutation_command(&mut command, 128, None, &termination_requested)
+                .unwrap();
+        assert!(output.status_success);
+        assert_eq!(output.stdout.as_slice(), b"{\"ok\":true}\n");
+        assert_eq!(
+            output.stderr.as_slice(),
+            b"warning: terminal audit is pending\n"
+        );
+        assert_eq!(output.stderr_bytes, output.stderr.len());
+
+        // 200 KiB of stderr, far past both the bound and a pipe buffer.
+        let mut chatty = Command::new("/bin/sh");
+        chatty.args([
+            "-c",
+            "head -c 204800 /dev/zero | tr '\\0' e >&2; printf 'done\\n'",
+        ]);
+        let output =
+            capture_queued_mutation_command(&mut chatty, 128, None, &termination_requested)
+                .unwrap();
+        assert!(output.status_success);
+        assert_eq!(output.stdout.as_slice(), b"done\n");
+        assert_eq!(output.stderr.len(), MAX_QUEUED_STDERR_BYTES);
+        assert_eq!(output.stderr_bytes, 204_800);
+    }
+
+    /// The api.log record for a queued manager's stderr names its last line, reduced to safe
+    /// printable text, with the job's own secret removed, and says how much there was.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn queued_stderr_summary_is_bounded_redacted_and_counted() {
+        assert!(queued_stderr_summary(b"", 0, None).is_none());
+        assert!(queued_stderr_summary(b"\n \n", 3, None).is_none());
+
+        let written: &[u8] = b"first\nwarning: secret hunter2 \"quoted\" \\ \x1b[31mred\x1b[0m\n\n";
+        let summary = queued_stderr_summary(written, written.len(), Some(b"hunter2")).unwrap();
+        assert_eq!(summary["bytes"], written.len());
+        assert_eq!(summary["truncated"], false);
+        let line = summary["line"].as_str().unwrap();
+        assert!(!line.contains("hunter2"), "{line}");
+        assert_eq!(line, "warning: secret [redacted] 'quoted' / red");
+        assert!(
+            line.bytes()
+                .all(|byte| (b' '..=b'~').contains(&byte) && byte != b'"' && byte != b'\\'),
+            "{line}"
+        );
+
+        let long = vec![b'x'; 1000];
+        let summary = queued_stderr_summary(&long, 50_000, None).unwrap();
+        assert_eq!(summary["truncated"], true);
+        assert_eq!(summary["bytes"], 50_000);
+        assert!(summary["line"].as_str().unwrap().len() <= 160);
+    }
+
+    /// A save that landed with a warning, and a manager that wrote to stderr, each leave one
+    /// bounded `warn` record in api.log, and a silenced bridge category writes nothing.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn queued_mutation_side_channels_are_recorded_in_api_log() {
+        let fixture = TestPackageFixture::new("queued-side-channels");
+        let uid = TestPackageFixture::package_uid();
+        let api_log = fixture.log_root.join("api.log");
+        let policy = SecurityPolicyArgs::default();
+        let result = json!({
+            "schema":"sdsync.dsm-result.v1","ok":true,"message":"Routine configuration changed",
+            "warnings":[{"code":"controller_reload_failed","message":"not reloaded: \"pid\" unreadable"}]
+        });
+        let job_id = "0123456789abcdef0123456789abcdef";
+        let failures = record_queued_mutation_side_channels(
+            &fixture.log_root,
+            uid,
+            &policy,
+            "routine",
+            job_id,
+            &result,
+            b"warning: controller could not be reloaded\n",
+            41,
+            None,
+        );
+        assert!(failures.is_empty(), "{failures:?}");
+        let text = fs::read_to_string(&api_log).unwrap();
+        let records = text
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(records.len(), 2, "{text}");
+        assert_eq!(records[0]["event"], "mutation_warning");
+        assert_eq!(records[0]["level"], "warn");
+        assert_eq!(records[0]["category"], "bridge");
+        assert_eq!(records[0]["operation"], "routine");
+        assert_eq!(records[0]["job_id"], job_id);
+        assert_eq!(records[0]["code"], "controller_reload_failed");
+        assert_eq!(records[0]["message"], "not reloaded: 'pid' unreadable");
+        assert_eq!(records[1]["event"], "manager_stderr");
+        assert_eq!(records[1]["bytes"], 41);
+        assert_eq!(
+            records[1]["line"],
+            "warning: controller could not be reloaded"
+        );
+
+        // Nothing to say: nothing written.
+        fs::remove_file(&api_log).unwrap();
+        let plain = json!({"schema":"sdsync.dsm-result.v1","ok":true,"message":"ok"});
+        let failures = record_queued_mutation_side_channels(
+            &fixture.log_root,
+            uid,
+            &policy,
+            "routine",
+            job_id,
+            &plain,
+            b"",
+            0,
+            None,
+        );
+        assert!(failures.is_empty());
+        assert!(!api_log.exists());
+
+        // A log that cannot be written is reported back, never dropped.
+        let missing = fixture.log_root.join("missing-root");
+        let failures = record_queued_mutation_side_channels(
+            &missing, uid, &policy, "routine", job_id, &result, b"", 0, None,
+        );
+        assert_eq!(failures, vec!["mutation_warning"]);
     }
 
     #[cfg(target_os = "linux")]
@@ -29249,6 +31514,101 @@ mod tests {
         }
     }
 
+    /// A save that landed but whose controller reload did not, or whose child printed a
+    /// `warning:` line, is a success that carries warnings, and they must reach the dashboard.
+    /// The validator used to refuse any extra member, which turned a saved change into an
+    /// unavailable result.
+    #[test]
+    fn manager_result_carries_named_warnings_on_success_only() {
+        let warned = json!({
+            "schema":"sdsync.dsm-result.v1",
+            "ok":true,
+            "message":"Routine configuration changed",
+            "warnings":[
+                {"code":"controller_reload_failed",
+                 "message":"configuration was saved but the running controller was not reloaded (reason=pid_unreadable pid=none)"},
+                {"code":"manager_warning","message":"warning: terminal audit is pending durable reconciliation"}
+            ]
+        });
+        let parsed = parse_manager_result(&serde_json::to_vec(&warned).unwrap(), None).unwrap();
+        assert_eq!(parsed["warnings"][0]["code"], "controller_reload_failed");
+        let warnings = mutation_result_warnings(&parsed);
+        assert_eq!(warnings.len(), 2);
+        assert_eq!(warnings[1].0, "manager_warning");
+        assert!(
+            mutation_result_warnings(
+                &json!({"schema":"sdsync.dsm-result.v1","ok":true,"message":"ok"})
+            )
+            .is_empty()
+        );
+
+        let entry = |code: Value, message: Value| {
+            json!({"schema":"sdsync.dsm-result.v1","ok":true,"message":"ok",
+                   "warnings":[{"code":code,"message":message}]})
+        };
+        let mut rejected = vec![
+            // Never on a failure: the failure's code is the verdict.
+            json!({"schema":"sdsync.dsm-result.v1","ok":false,"code":"unsafe_state","message":"no",
+                   "warnings":[{"code":"controller_reload_failed","message":"text"}]}),
+            // Not a list, an empty list, or more than the bound.
+            json!({"schema":"sdsync.dsm-result.v1","ok":true,"message":"ok","warnings":"text"}),
+            json!({"schema":"sdsync.dsm-result.v1","ok":true,"message":"ok","warnings":[]}),
+            json!({"schema":"sdsync.dsm-result.v1","ok":true,"message":"ok",
+                   "warnings":vec![json!({"code":"manager_warning","message":"x"}); MAX_RESULT_WARNINGS + 1]}),
+            // Exactly two members.
+            json!({"schema":"sdsync.dsm-result.v1","ok":true,"message":"ok",
+                   "warnings":[{"code":"manager_warning"}]}),
+            json!({"schema":"sdsync.dsm-result.v1","ok":true,"message":"ok",
+                   "warnings":[{"code":"manager_warning","message":"x","path":"/x"}]}),
+            // The single-warning shape: both members or neither, never beside the list.
+            json!({"schema":"sdsync.dsm-result.v1","ok":true,"message":"ok",
+                   "warning_code":"controller_reload_failed"}),
+            json!({"schema":"sdsync.dsm-result.v1","ok":true,"message":"ok",
+                   "warning_code":"controller_reload_failed","warning":"text",
+                   "warnings":[{"code":"manager_warning","message":"x"}]}),
+            json!({"schema":"sdsync.dsm-result.v1","ok":true,"message":"ok",
+                   "warning_code":"Bad Code","warning":"text"}),
+        ];
+        // The code is a token, not text; the message is one bounded line.
+        rejected.push(entry(json!("Reload failed"), json!("text")));
+        rejected.push(entry(json!(""), json!("text")));
+        rejected.push(entry(json!("manager_warning"), json!("a\nb")));
+        rejected.push(entry(json!("manager_warning"), json!("")));
+        rejected.push(entry(json!("manager_warning"), json!("x".repeat(1025))));
+        rejected.push(entry(json!("manager_warning"), json!(7)));
+        for rejected in rejected {
+            assert!(
+                parse_manager_result(&serde_json::to_vec(&rejected).unwrap(), None).is_err(),
+                "{rejected}"
+            );
+        }
+        // The single-warning shape a manager may print is accepted and becomes the list.
+        let mut single = parse_manager_result(
+            &serde_json::to_vec(
+                &json!({"schema":"sdsync.dsm-result.v1","ok":true,"message":"ok",
+                "warning_code":"controller_reload_failed","warning":"not reloaded"}),
+            )
+            .unwrap(),
+            None,
+        )
+        .unwrap();
+        normalize_result_warnings(&mut single);
+        assert_eq!(
+            single,
+            json!({"schema":"sdsync.dsm-result.v1","ok":true,"message":"ok",
+                   "warnings":[{"code":"controller_reload_failed","message":"not reloaded"}]})
+        );
+        assert!(parse_manager_result(&serde_json::to_vec(&single).unwrap(), None).is_ok());
+        // A future token the shell learns is not a 503.
+        let future = entry(json!("audit_reconciliation_pending"), json!("later"));
+        assert!(parse_manager_result(&serde_json::to_vec(&future).unwrap(), None).is_ok());
+        // The secret-shaped exact result does not grow the member.
+        let secret = json!({"schema":"sdsync.dsm-result.v1","ok":true,"message":"secret state updated",
+                            "has_password":true,"has_totp":false,"has_remote_log_token":false,
+                            "warnings":[{"code":"manager_warning","message":"text"}]});
+        assert!(validate_set_secret_manager_result(&secret).is_err());
+    }
+
     /// The reader accepts every operation the writer can put on a queued response envelope.
     ///
     /// Regression. `canonical_queued_response_bytes` names the job's operation on the v2 envelope
@@ -29718,6 +32078,65 @@ mod tests {
         .unwrap();
         let value: Value = serde_json::from_slice(&hidden).unwrap();
         assert!(value["logs"][0]["lines"].as_array().unwrap().is_empty());
+    }
+
+    /// The core's stderr from the last scheduled runs (run-stderr.log) had a writer and no
+    /// reader, so a failure whose cause needed more than the 160-character detail was
+    /// unrecoverable from the dashboard. It is a selectable source now, answered by the manager
+    /// (which redacts it like every other log), and its opaque lines are errors, so no level
+    /// threshold can hide the only record of why a run failed.
+    #[test]
+    fn run_stderr_log_source_is_selectable_and_never_hidden_by_policy() {
+        let request = validate_http_request(environment(
+            "GET",
+            "action=logs&lines=200&source=run-stderr&SynoToken=abc123",
+        ))
+        .unwrap();
+        assert!(matches!(
+            request,
+            ValidatedHttpRequest::Get {
+                action: ReadAction::Logs {
+                    lines: 200,
+                    source: LogSource::RunStderr
+                },
+                ..
+            }
+        ));
+        assert_eq!(
+            read_manager_arguments(&ReadAction::Logs {
+                lines: 200,
+                source: LogSource::RunStderr,
+            })
+            .unwrap(),
+            ["api", "logs", "--lines", "1000", "--source", "run-stderr"]
+                .into_iter()
+                .map(OsString::from)
+                .collect::<Vec<_>>()
+        );
+
+        let document = br##"{"schema":"sdsync.dsm-logs.v1","logs":[{"source":"run-stderr","lines":["# epoch=200 scope=all operation=sync exit=1","error: failed to read \"[package-home]/x\": permission denied"]}]}"##;
+        for policy in [
+            SecurityPolicyArgs::default(),
+            SecurityPolicyArgs {
+                sync_log_level: PolicyLogLevel::Off,
+                operations_log_level: PolicyLogLevel::Off,
+                ..SecurityPolicyArgs::default()
+            },
+        ] {
+            let selected = parse_and_sanitize_manager_json(
+                document,
+                &ReadAction::Logs {
+                    lines: 10,
+                    source: LogSource::RunStderr,
+                },
+                None,
+                Some(&policy),
+            )
+            .unwrap();
+            let value: Value = serde_json::from_slice(&selected).unwrap();
+            assert_eq!(value["logs"][0]["source"], "run-stderr");
+            assert_eq!(value["logs"][0]["lines"].as_array().unwrap().len(), 2);
+        }
     }
 
     #[test]

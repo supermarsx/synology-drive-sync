@@ -177,9 +177,10 @@
           "pattern": "^[A-Za-z0-9._/:~,-]{0,64}$"
         },
         "path": {
-          "description": "Relative path of the entry a skip, deferral or per-entry failure concerns, sanitised (any other byte reads as `_`) and bounded; a trailing `~` marks truncation. Opt-in per record.",
+          "description": "Relative path of the entry a skip, deferral or per-entry failure concerns, percent-encoded (every byte outside `A-Za-z0-9._/:,-`, including non-ASCII, space and `%`, is written `%XX`, so the path decodes exactly) and bounded to 255 characters; a trailing `~` marks truncation, which never splits an escape. Opt-in per record.",
           "type": "string",
-          "pattern": "^[A-Za-z0-9._/:~,-]{0,128}$"
+          "maxLength": 255,
+          "pattern": "^([A-Za-z0-9._/:,-]|%[0-9A-F]{2})*~?$"
         }
       }
     },
@@ -559,6 +560,7 @@
         "server_copies",
         "directories",
         "deletions",
+        "renames",
         "unchanged_files",
         "protected_entries",
         "changes"
@@ -570,6 +572,10 @@
         "server_copies": { "$ref": "#/$defs/nonNegativeInteger" },
         "directories": { "$ref": "#/$defs/nonNegativeInteger" },
         "deletions": { "$ref": "#/$defs/nonNegativeInteger" },
+        "renames": {
+          "description": "Case-only renames this plan makes with File Station Rename.",
+          "$ref": "#/$defs/nonNegativeInteger"
+        },
         "unchanged_files": { "$ref": "#/$defs/nonNegativeInteger" },
         "protected_entries": { "$ref": "#/$defs/nonNegativeInteger" },
         "changes": { "type": "boolean" }
@@ -642,6 +648,18 @@
         "reason": { "$ref": "#/$defs/changeReason" }
       }
     },
+    "renamePlanAction": {
+      "type": "object",
+      "description": "A case-only rename: the NAS holds `from_remote_path` and the source now spells it `relative`. Carried last, by File Station Rename, never by a delete and re-upload.",
+      "additionalProperties": false,
+      "required": ["relative", "from_remote_path", "to_remote_path", "entry_kind"],
+      "properties": {
+        "relative": { "$ref": "#/$defs/relativePath" },
+        "from_remote_path": { "$ref": "#/$defs/remotePath" },
+        "to_remote_path": { "$ref": "#/$defs/remotePath" },
+        "entry_kind": { "$ref": "#/$defs/entryKind" }
+      }
+    },
     "plan": {
       "type": "object",
       "additionalProperties": false,
@@ -649,7 +667,7 @@
       "properties": {
         "summary": { "$ref": "#/$defs/planSummary" },
         "skipped": {
-          "description": "Paths this plan neither carries nor deletes, and why. Each used to fail the whole run; now only its own path is left alone, on both sides. `deferred` entries are named again, with their precise reason, in the result's `deferred`.",
+          "description": "Paths this plan neither carries nor deletes, and why. Each used to fail the whole run; now only its own path is left alone, on both sides. `deferred` entries are named again, with their precise reason, in the result's `deferred`. `type-conflict`: a local file where the NAS has a folder (or the reverse), or a local entry at a NAS mount point, that this run may not replace. `remote-link`: a local entry where the NAS holds a link; nothing is written, deleted or descended at or beneath it. `protected-descendant`: a NAS-only folder a mirror would delete, kept because it holds an excluded or DSM-managed entry. A local entry Synology Drive cannot hold is a `deferred` skip whose detail starts `unsupported-entry:`.",
           "type": "array",
           "items": {
             "type": "object",
@@ -665,7 +683,10 @@
                   "local-case-collision",
                   "remote-case-collision",
                   "case-rename-needs-delete",
-                  "deferred"
+                  "deferred",
+                  "type-conflict",
+                  "remote-link",
+                  "protected-descendant"
                 ]
               },
               "detail": { "type": "string" }
@@ -675,7 +696,7 @@
         "actions": {
           "type": "object",
           "additionalProperties": false,
-          "required": ["pre_deletes", "creates", "copies", "uploads", "post_deletes"],
+          "required": ["pre_deletes", "creates", "copies", "uploads", "post_deletes", "renames"],
           "properties": {
             "pre_deletes": {
               "type": "array",
@@ -696,6 +717,10 @@
             "post_deletes": {
               "type": "array",
               "items": { "$ref": "#/$defs/deletePlanAction" }
+            },
+            "renames": {
+              "type": "array",
+              "items": { "$ref": "#/$defs/renamePlanAction" }
             }
           }
         }
@@ -712,6 +737,7 @@
         "upload_bytes",
         "directories_created",
         "deleted",
+        "renamed",
         "deletes_skipped",
         "kept_deletes_uploaded",
         "changed_during_run",
@@ -732,6 +758,10 @@
         "upload_bytes": { "$ref": "#/$defs/nonNegativeInteger" },
         "directories_created": { "$ref": "#/$defs/nonNegativeInteger" },
         "deleted": { "$ref": "#/$defs/nonNegativeInteger" },
+        "renamed": {
+          "description": "Case-only renames made with File Station Rename.",
+          "$ref": "#/$defs/nonNegativeInteger"
+        },
         "deletes_skipped": {
           "description": "Planned mirror deletions kept rather than performed: the local path exists again, or a kept deletion beneath a directory left it non-empty.",
           "$ref": "#/$defs/nonNegativeInteger"
@@ -749,11 +779,11 @@
           "type": "boolean"
         },
         "outcome": {
-          "description": "The run's verdict. `complete`: everything converged. `partial`: everything converged except the transient paths in `deferred` (every reason but `unrepresentable-name`, `unsupported-local-entry`, `listing-incomplete` and `remote-unreadable`), which the next run picks up; the process exits 3. Lasting skips and lasting deferrals are reported and logged but leave the outcome `complete` and the exit code 0. `failed`: the run stopped (see `failed`).",
+          "description": "The run's verdict. `complete`: everything converged. `partial`: everything converged except the transient paths in `deferred` (every reason but `unrepresentable-name`, `unsupported-local-entry`, `listing-incomplete`, `remote-unreadable`, `local-permission-denied`, `delete-not-permitted`, `remote-refused`, `remote-skipped`, `unsupported-entry` and `case-rename-pending`), which the next run picks up; the process exits 3. Lasting skips and lasting deferrals are reported and logged but leave the outcome `complete` and the exit code 0. `failed`: the run stopped (see `failed`).",
           "enum": ["complete", "partial", "failed"]
         },
         "deferred": {
-          "description": "Each path this run left for the next run, by name. A deferred path was neither uploaded nor deleted, and nothing else was deleted on its account. Any transient reason makes the outcome `partial`; `unrepresentable-name`, `unsupported-local-entry`, `listing-incomplete` and `remote-unreadable` recur every run until someone acts, so they are reported without changing the outcome.",
+          "description": "Each path this run left for the next run, by name. A deferred path was neither uploaded nor deleted, and nothing else was deleted on its account. Any transient reason makes the outcome `partial`; `unrepresentable-name`, `unsupported-local-entry`, `listing-incomplete`, `remote-unreadable`, `local-permission-denied`, `delete-not-permitted`, `remote-refused`, `remote-skipped`, `unsupported-entry` and `case-rename-pending` recur every run until someone acts, so they are reported without changing the outcome.",
           "type": "array",
           "items": { "$ref": "#/$defs/deferredPath" }
         },
@@ -802,9 +832,28 @@
       "type": "object",
       "description": "One line of the `--result-record` file: one finished sync or plan job, written whatever `--output` says, so a supervisor reads counts without parsing output meant for a person.",
       "additionalProperties": false,
-      "required": ["schema", "profile", "status", "result"],
+      "required": ["schema", "profile", "status", "error", "result"],
       "properties": {
         "schema": { "const": "sdsync.result-record.v1" },
+        "error": {
+          "description": "Why the job failed, or `null` for a job that did not fail. A scheduled run discards the core's standard output, so this is where the cause and the entry it concerns are kept.",
+          "oneOf": [
+            { "type": "null" },
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["code", "detail", "path"],
+              "properties": {
+                "code": { "$ref": "#/$defs/eventReason" },
+                "detail": { "description": "The failure's message on one line.", "type": "string" },
+                "path": {
+                  "description": "The entry the failure concerns (source-relative for a local path, the NAS path for a remote one), or `null` when it is not about one entry.",
+                  "oneOf": [{ "type": "string" }, { "type": "null" }]
+                }
+              }
+            }
+          ]
+        },
         "profile": { "type": "string", "minLength": 1 },
         "status": {
           "description": "A single sync: `complete`, `partial` or `failed`; a single plan: `planned` or `failed`; a batch job: its batch status (`success`, `preflighted`, `failed`, `partial` meaning failed after mutating, `not-run`). Read `result.outcome` for the deferral verdict.",
@@ -843,7 +892,7 @@
           "type": "string"
         },
         "reason": {
-          "description": "`source-changed`: the local file changed while it was read or sent. `source-vanished`: deleted locally during the run. `source-unreadable`: locked or not readable. `unsupported-local-entry`: not a regular file or directory the sync carries. `remote-digest-unavailable`: the NAS could not checksum it. `remote-unreadable`: the NAS refuses this one file to the account (lasting until its permissions change). `remote-changed`: the NAS entry changed after planning and was left as found. `unrepresentable-name`: a NAS name this host's filesystem cannot hold; never deleted on that account. `listing-incomplete`: its NAS folder listed fewer entries than it counted, so no deletion was made there. `server-copy-failed`: the NAS-side copy finished with an error. `delete-failed`: the NAS refused the deletion.",
+          "description": "`source-changed`: the local file changed while it was read or sent. `source-vanished`: deleted locally during the run. `source-unreadable`: locked or briefly unreadable (transient). `unsupported-local-entry`: not a regular file or directory the sync carries. `remote-digest-unavailable`: the NAS could not checksum it. `remote-unreadable`: the NAS refuses this one file to the account (lasting until its permissions change). `remote-changed`: the NAS entry changed after planning and was left as found. `unrepresentable-name`: a NAS name this host's filesystem cannot hold; never deleted on that account. `listing-incomplete`: its NAS folder listed fewer entries than it counted, so no deletion was made there. `server-copy-failed`: the NAS-side copy finished with an error. `delete-failed`: the NAS refused the deletion. `remote-refused`: the NAS refuses this name or this account's access to it (lasting until it is renamed or its permissions change; three or more refusals with one cause that are more than half the attempts fail the run instead). `local-permission-denied`: this account may not read it (lasting until its permissions change). `case-rename-pending`: a case-only rename on the NAS was not made or did not finish, and the content keeps syncing under the NAS spelling (lasting until the NAS spelling is changed or the blocking entry removed). `remote-skipped`: a NAS name or link this tool will not follow; never deleted, overwritten or descended (lasting). `unsupported-entry`: a local name, path or entry kind Synology Drive cannot hold (a refused name, a path too long once the destination is prepended, a non-UTF-8 name, a FIFO, socket or device, a modification time before 1970); lasting until it is renamed or excluded. `delete-not-permitted`: DSM refused to delete it for permission (lasting until the folder's rights change).",
           "enum": [
             "source-changed",
             "source-vanished",
@@ -855,7 +904,13 @@
             "unrepresentable-name",
             "listing-incomplete",
             "server-copy-failed",
-            "delete-failed"
+            "delete-failed",
+            "remote-refused",
+            "local-permission-denied",
+            "case-rename-pending",
+            "remote-skipped",
+            "unsupported-entry",
+            "delete-not-permitted"
           ]
         },
         "detail": {
@@ -908,6 +963,7 @@
         "server_copies",
         "directories",
         "deletions",
+        "renames",
         "unchanged_files",
         "protected_entries",
         "changes"
@@ -921,6 +977,10 @@
         "server_copies": { "$ref": "#/$defs/nonNegativeInteger" },
         "directories": { "$ref": "#/$defs/nonNegativeInteger" },
         "deletions": { "$ref": "#/$defs/nonNegativeInteger" },
+        "renames": {
+          "description": "Case-only renames this plan makes with File Station Rename.",
+          "$ref": "#/$defs/nonNegativeInteger"
+        },
         "unchanged_files": { "$ref": "#/$defs/nonNegativeInteger" },
         "protected_entries": { "$ref": "#/$defs/nonNegativeInteger" },
         "changes": { "type": "boolean" }
@@ -1024,13 +1084,27 @@
         "verified_upload_fallback": { "const": "only-before-copy-task-start" }
       }
     },
+    "ndjsonRenameAction": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema", "action", "relative", "from_remote_path", "to_remote_path", "entry_kind"],
+      "properties": {
+        "schema": { "const": "sdsync.plan-action.v1" },
+        "action": { "const": "rename" },
+        "relative": { "$ref": "#/$defs/relativePath" },
+        "from_remote_path": { "$ref": "#/$defs/remotePath" },
+        "to_remote_path": { "$ref": "#/$defs/remotePath" },
+        "entry_kind": { "$ref": "#/$defs/entryKind" }
+      }
+    },
     "ndjsonPlanAction": {
       "oneOf": [
         { "$ref": "#/$defs/ndjsonPreDeleteAction" },
         { "$ref": "#/$defs/ndjsonPostDeleteAction" },
         { "$ref": "#/$defs/ndjsonCreateAction" },
         { "$ref": "#/$defs/ndjsonCopyAction" },
-        { "$ref": "#/$defs/ndjsonUploadAction" }
+        { "$ref": "#/$defs/ndjsonUploadAction" },
+        { "$ref": "#/$defs/ndjsonRenameAction" }
       ]
     },
     "ndjsonCompletionWithResult": {

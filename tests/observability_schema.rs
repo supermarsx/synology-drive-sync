@@ -84,6 +84,13 @@ fn validate(root: &Value, schema: &Value, instance: &Value, path: &str) -> Resul
     {
         return Err(format!("{path}: string is shorter than {minimum}"));
     }
+    if let Some(maximum) = schema.get("maxLength").and_then(Value::as_u64)
+        && instance
+            .as_str()
+            .is_some_and(|value| value.chars().count() > maximum as usize)
+    {
+        return Err(format!("{path}: string is longer than {maximum}"));
+    }
     if let Some(pattern) = schema.get("pattern").and_then(Value::as_str) {
         let value = instance
             .as_str()
@@ -107,13 +114,32 @@ fn validate(root: &Value, schema: &Value, instance: &Value, path: &str) -> Resul
                             || matches!(byte, b'.' | b'-' | b'_' | b'/' | b':' | b'~' | b',')
                     })
             }
-            // The same token, at the longer bound an entry path is given.
-            "^[A-Za-z0-9._/:~,-]{0,128}$" => {
-                value.len() <= 128
-                    && value.bytes().all(|byte| {
-                        byte.is_ascii_alphanumeric()
-                            || matches!(byte, b'.' | b'-' | b'_' | b'/' | b':' | b'~' | b',')
-                    })
+            // An entry path: the safe set, or `%` and two uppercase hex digits, with an optional
+            // trailing truncation mark.
+            "^([A-Za-z0-9._/:,-]|%[0-9A-F]{2})*~?$" => {
+                let body = value.strip_suffix('~').unwrap_or(value).as_bytes();
+                let mut index = 0;
+                let mut valid = true;
+                while index < body.len() {
+                    let byte = body[index];
+                    if byte.is_ascii_alphanumeric()
+                        || matches!(byte, b'.' | b'-' | b'_' | b'/' | b':' | b',')
+                    {
+                        index += 1;
+                    } else if byte == b'%'
+                        && body.get(index + 1..index + 3).is_some_and(|hex| {
+                            hex.iter().all(|digit| {
+                                digit.is_ascii_digit() || (b'A'..=b'F').contains(digit)
+                            })
+                        })
+                    {
+                        index += 3;
+                    } else {
+                        valid = false;
+                        break;
+                    }
+                }
+                valid
             }
             "^[a-z_]{1,32}$" => {
                 (1..=32).contains(&value.len())
@@ -210,6 +236,26 @@ fn representative_plan() -> Value {
                 "reason": "deferred",
                 "detail": "left for the next run: source file changed while it was being synchronized",
             },
+            {
+                "path": "notes/aux.txt",
+                "reason": "deferred",
+                "detail": "unsupported-entry: reserved Windows device name",
+            },
+            {
+                "path": "exports",
+                "reason": "type-conflict",
+                "detail": "local file, NAS folder; rerun with --delete to replace it",
+            },
+            {
+                "path": "old",
+                "reason": "protected-descendant",
+                "detail": "holds the excluded entry old/.keep",
+            },
+            {
+                "path": "shared",
+                "reason": "remote-link",
+                "detail": "the NAS holds a link here; nothing is written, deleted or descended",
+            },
         ],
         "summary": {
             "uploads": 1,
@@ -218,6 +264,7 @@ fn representative_plan() -> Value {
             "server_copies": 1,
             "directories": 1,
             "deletions": 2,
+            "renames": 1,
             "unchanged_files": 3,
             "protected_entries": 0,
             "changes": true,
@@ -250,6 +297,12 @@ fn representative_plan() -> Value {
                 "type_conflict": false,
                 "snapshot_guard": snapshot("file", 4096, Some(DIGEST), true),
                 "destination_guard": destination_guard(),
+            }],
+            "renames": [{
+                "relative": "Photos/IMG_0001.JPG",
+                "from_remote_path": "/team/export/Photos/img_0001.jpg",
+                "to_remote_path": "/team/export/Photos/IMG_0001.JPG",
+                "entry_kind": "file",
             }],
         },
     })
@@ -292,6 +345,7 @@ fn strict_schema_accepts_runtime_server_copy_and_guard_shapes() {
                 "upload_bytes": 8192,
                 "directories_created": 1,
                 "deleted": 2,
+                "renamed": 1,
                 "deletes_skipped": 1,
                 "kept_deletes_uploaded": 1,
                 "changed_during_run": 0,
@@ -318,6 +372,7 @@ fn strict_schema_accepts_runtime_server_copy_and_guard_shapes() {
             "server_copies": 1,
             "directories": 1,
             "deletions": 2,
+            "renames": 1,
             "unchanged_files": 3,
             "protected_entries": 0,
             "changes": true,
@@ -354,6 +409,14 @@ fn strict_schema_accepts_runtime_server_copy_and_guard_shapes() {
         }),
         json!({
             "schema": "sdsync.plan-action.v1",
+            "action": "rename",
+            "relative": "Photos/IMG_0001.JPG",
+            "from_remote_path": "/team/export/Photos/img_0001.jpg",
+            "to_remote_path": "/team/export/Photos/IMG_0001.JPG",
+            "entry_kind": "file",
+        }),
+        json!({
+            "schema": "sdsync.plan-action.v1",
             "action": "delete",
             "relative": "old/report.bin",
             "remote_path": "/team/export/old/report.bin",
@@ -371,6 +434,7 @@ fn strict_schema_accepts_runtime_server_copy_and_guard_shapes() {
                 "upload_bytes": 8192,
                 "directories_created": 1,
                 "deleted": 2,
+                "renamed": 0,
                 "deletes_skipped": 0,
                 "kept_deletes_uploaded": 0,
                 "changed_during_run": 2,
@@ -396,6 +460,7 @@ fn strict_schema_accepts_runtime_server_copy_and_guard_shapes() {
                 "upload_bytes": 8192,
                 "directories_created": 0,
                 "deleted": 0,
+                "renamed": 0,
                 "deletes_skipped": 0,
                 "kept_deletes_uploaded": 0,
                 "changed_during_run": 0,
@@ -411,6 +476,16 @@ fn strict_schema_accepts_runtime_server_copy_and_guard_shapes() {
                         "path": "photos",
                         "reason": "listing-incomplete",
                         "detail": "the listing of its folder returned a different number of entries",
+                    },
+                    {
+                        "path": "Photos/IMG_0002.JPG",
+                        "reason": "case-rename-pending",
+                        "detail": "a case-only rename was not made; the content keeps syncing under the NAS spelling",
+                    },
+                    {
+                        "path": "private/ledger.xlsx",
+                        "reason": "local-permission-denied",
+                        "detail": "permission denied",
                     },
                 ],
                 "mtime_not_kept": 0,
@@ -433,6 +508,7 @@ fn strict_schema_accepts_runtime_server_copy_and_guard_shapes() {
                 "upload_bytes": 8192,
                 "directories_created": 3,
                 "deleted": 0,
+                "renamed": 0,
                 "deletes_skipped": 0,
                 "kept_deletes_uploaded": 0,
                 "changed_during_run": 0,
@@ -463,20 +539,23 @@ fn strict_schema_pins_the_deferral_vocabulary() {
         .iter()
         .map(|reason| reason.as_str().unwrap().to_owned())
         .collect::<Vec<_>>();
-    for reason in [
-        synology_drive_sync::sync::DeferReason::SourceChanged,
-        synology_drive_sync::sync::DeferReason::SourceVanished,
-        synology_drive_sync::sync::DeferReason::SourceUnreadable,
-        synology_drive_sync::sync::DeferReason::UnsupportedLocalEntry,
-        synology_drive_sync::sync::DeferReason::RemoteDigestUnavailable,
-        synology_drive_sync::sync::DeferReason::RemoteUnreadable,
-        synology_drive_sync::sync::DeferReason::RemoteChanged,
-        synology_drive_sync::sync::DeferReason::UnrepresentableName,
-        synology_drive_sync::sync::DeferReason::ListingIncomplete,
-        synology_drive_sync::sync::DeferReason::ServerCopyFailed,
-        synology_drive_sync::sync::DeferReason::DeleteFailed,
-    ] {
+    // The outcome's documented "lasting" list is the writer's `is_lasting`, exactly.
+    let outcome_text = schema["$defs"]["executionResult"]["properties"]["outcome"]["description"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let lasting_text = outcome_text
+        .split_once("(every reason but ")
+        .and_then(|(_, rest)| rest.split_once(')'))
+        .map(|(list, _)| list.to_owned())
+        .expect("the outcome description names the lasting reasons");
+    for reason in synology_drive_sync::sync::DeferReason::ALL {
         assert!(reasons.contains(&reason.as_str().to_owned()), "{reason}");
+        assert_eq!(
+            lasting_text.contains(&format!("`{}`", reason.as_str())),
+            reason.is_lasting(),
+            "{reason}: lasting list is {lasting_text}"
+        );
     }
     assert_eq!(
         reasons.len(),
@@ -488,7 +567,7 @@ fn strict_schema_pins_the_deferral_vocabulary() {
         "kind": "completion",
         "result": {
             "changed": false, "uploaded": 0, "server_copied": 0, "upload_bytes": 0,
-            "directories_created": 0, "deleted": 0, "deletes_skipped": 0,
+            "directories_created": 0, "deleted": 0, "renamed": 0, "deletes_skipped": 0,
             "kept_deletes_uploaded": 0, "changed_during_run": 0, "failed": false,
             "outcome": "partial", "deferred": [], "mtime_not_kept": 0, "skipped": 0, "incomplete_listings": 0, "incomplete_listing_folders": [], "recovered": {"retries": 0, "reauthentications": 0, "reauthentication_failures": 0, "keepalive_failures": 0, "server_tasks_not_stopped": 0, "server_copy_fallbacks": 0}, "elapsed_ms": 1,
         },
@@ -594,6 +673,19 @@ fn strict_schema_accepts_attributed_records_and_rejects_unsanitised_ones() {
     let mut raw_path = record.clone();
     raw_path["path"] = json!("albums/été/a.jpg");
     assert!(validate(&schema, &schema, &raw_path, "$").is_err());
+
+    // A non-ASCII name travels percent-encoded, as the writer renders it, truncation included.
+    let mut encoded = record.clone();
+    encoded["path"] = json!("albums/%C3%A9t%C3%A9%202026/%E5%86%99%E7%9C%9F.jpg");
+    assert_valid(&schema, &encoded);
+    encoded["path"] = json!("albums/%E5%86~");
+    assert_valid(&schema, &encoded);
+    // A bare or malformed `%`, or a lowercase escape, is not what the writer produces.
+    for invalid in ["100%.jpg", "a%2", "a%e5%86%99", "a~b"] {
+        let mut bad = record.clone();
+        bad["path"] = json!(invalid);
+        assert!(validate(&schema, &schema, &bad, "$").is_err(), "{invalid}");
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1206,6 +1298,33 @@ fn real_result_records_conform_to_the_shipped_schema() {
             let mut invented = lines[0].clone();
             invented["status"] = json!("mostly");
             assert!(validate(&schema, &schema, &invented, "$").is_err());
+
+            // A completed job carries `error: null`; a failed one names its class, message and
+            // entry, and nothing else.
+            assert_eq!(lines[0]["error"], Value::Null);
+            let mut failed = lines[0].clone();
+            failed["status"] = json!("failed");
+            failed["error"] = json!({
+                "code": "local_io",
+                "detail": "failed to read \"2026/a.jpg\": permission denied",
+                "path": "2026/a.jpg",
+            });
+            assert_valid(&schema, &failed);
+            failed["error"]["path"] = Value::Null;
+            assert_valid(&schema, &failed);
+            for invalid in [
+                json!({"code": "bad luck", "detail": "x", "path": null}),
+                json!({"code": "local_io", "detail": "x"}),
+                json!({"code": "local_io", "detail": "x", "path": null, "stack": "y"}),
+                json!("failed"),
+            ] {
+                let mut bad = lines[0].clone();
+                bad["error"] = invalid;
+                assert!(validate(&schema, &schema, &bad, "$").is_err(), "{bad}");
+            }
+            let mut missing = lines[0].clone();
+            missing.as_object_mut().unwrap().remove("error");
+            assert!(validate(&schema, &schema, &missing, "$").is_err());
         } else {
             assert_eq!(lines[0]["status"], "planned");
             assert_eq!(lines[0]["result"]["planned_only"], true);
