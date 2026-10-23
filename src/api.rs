@@ -46,6 +46,7 @@ const DISCOVERY_APIS: &[&str] = &[
     "SYNO.FileStation.Download",
     "SYNO.FileStation.CopyMove",
     "SYNO.FileStation.CheckPermission",
+    "SYNO.FileStation.Rename",
 ];
 const LIST_PAGE_SIZE: usize = 500;
 const MAX_JSON_RESPONSE: u64 = 32 * 1024 * 1024;
@@ -102,6 +103,8 @@ const SESSION_CONFIRMATION_TIMEOUT: Duration = Duration::from_secs(5);
 const DIAGNOSTIC_RELATIVE_PATH_MAX_CHARS: usize = 512;
 const DIAGNOSTIC_NAME_MAX_CHARS: usize = 255;
 const DISCOVERY_FAILURE_OPERATION: &str = "File Station API discovery";
+/// How a failed discovery's message begins, whatever route it names after it.
+pub const DISCOVERY_FAILED_PREFIX: &str = "File Station API discovery failed";
 const X_SYNO_TOKEN_HEADER: &str = "x-syno-token";
 const MAX_SESSION_HEADER_BYTES: usize = 4 * 1024;
 static WRITE_PROBE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
@@ -235,6 +238,8 @@ pub struct ApiClient {
     /// What this client recovered from on the caller's behalf, shared by every clone, so a run can
     /// report every retry, re-login and abandoned server task rather than absorb them silently.
     counters: Arc<ClientCounters>,
+    /// The forward proxy the environment routes this client's requests through, if any.
+    forward_proxy: Option<ForwardProxy>,
 }
 
 #[derive(Debug, Default)]
@@ -249,7 +254,7 @@ struct ClientCounters {
 /// What a client recovered from, or could not, during a run. Every one of these used to happen
 /// without a trace in the result: each is also visible request by request through the
 /// [`RequestObserver`].
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize)]
 pub struct TransportCounters {
     /// Requests sent again after a transient failure.
     pub retries: usize,
@@ -369,7 +374,115 @@ pub struct ScopedRemoteInventory {
     /// nothing in these directories may be deleted on the strength of its absence from it: a
     /// caller that mutates must withhold every deletion inside them.
     pub incomplete_directories: Vec<String>,
+    /// Remote entries the walk saw and will not carry: a name this tool cannot address, or a
+    /// folder whose real path is not where the listing puts it. See [`SkippedRemoteEntry`].
+    pub skipped: Vec<SkippedRemoteEntry>,
+    /// Whether DSM reported a real path for the walked destination. False means the link guard
+    /// (see [`RemoteSkipReason::LinksOutsideDestination`]) could not run, and a caller should say
+    /// so: links inside the destination are then walked like folders.
+    pub real_paths_reported: bool,
 }
+
+/// The direct children of one remote folder, by name. See [`ApiClient::list_child_names`].
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RemoteChildNames {
+    pub names: Vec<String>,
+    /// False when DSM's listing returned fewer or more entries than it counted, consistently, so
+    /// a name's absence from `names` proves nothing.
+    pub complete: bool,
+}
+
+/// One remote entry the walk listed but will never descend into, compare, overwrite or delete.
+///
+/// A single such entry used to fail every `sync`, `plan` and `status` with a configuration exit,
+/// and no exclude could help (ADV-R-2). It is now named here instead, and the run goes on.
+///
+/// * An [`RemoteSkipReason::UnrepresentableName`] entry (a macOS `Icon\r`, a Linux name with a
+///   newline or a backslash) has no root-relative path this tool can express, so it is *not* in
+///   [`RemoteInventory::entries`], and the planner cannot see that its folder is not empty. A caller
+///   that mutates must keep that folder and every folder above it:
+///   `sync::protect_skipped_remote_entries` does, and names the entry.
+/// * A linked or revisited folder ([`RemoteSkipReason::LinksOutsideDestination`],
+///   [`RemoteSkipReason::RevisitedFolder`]) has an ordinary name, and *is* in `entries`, marked
+///   with [`LINKED_ENTRY_MOUNT_TYPE`] so every mount-point protection applies to it: never
+///   descended, never deleted, its ancestors kept, nothing uploaded beneath it.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SkippedRemoteEntry {
+    /// Root-relative folder holding the entry (`""` for the root). Always a valid relative path.
+    pub parent: String,
+    /// The name exactly as DSM listed it.
+    pub name: String,
+    /// The absolute path exactly as DSM listed it.
+    pub remote_path: String,
+    pub kind: EntryKind,
+    pub reason: RemoteSkipReason,
+    /// An ignore rule or a DSM-managed name matched the raw path: it is protected like any
+    /// excluded entry, but is not a skip to report.
+    pub excluded: bool,
+    /// Why, in words: the validator's refusal, or the real path DSM reported.
+    pub cause: String,
+}
+
+impl SkippedRemoteEntry {
+    /// The root-relative path with the name escaped, safe to log and to show.
+    pub fn display(&self) -> String {
+        let name = self.name.escape_debug().to_string();
+        if self.parent.is_empty() {
+            name
+        } else {
+            format!("{}/{name}", self.parent)
+        }
+    }
+
+    /// One sentence naming the cause and what the run does about it.
+    pub fn detail(&self) -> String {
+        format!(
+            "{}: {}; never deleted, overwritten or descended into",
+            self.reason.describe(),
+            self.cause
+        )
+    }
+}
+
+/// Why the remote walk will not carry an entry. See [`SkippedRemoteEntry`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RemoteSkipReason {
+    /// The NAS name holds a control character or a backslash, which no path this tool sends can
+    /// address.
+    UnrepresentableName,
+    /// DSM reported a real path for the entry that is not its listed path: a symbolic link, or
+    /// something like it, possibly into another folder or share.
+    LinksOutsideDestination,
+    /// The folder's real path was already walked in this run: a link back into the tree, which
+    /// would otherwise make the walk unbounded.
+    RevisitedFolder,
+}
+
+impl RemoteSkipReason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::UnrepresentableName => "unrepresentable-remote-name",
+            Self::LinksOutsideDestination => "remote-link-outside-destination",
+            Self::RevisitedFolder => "remote-folder-revisited",
+        }
+    }
+
+    pub fn describe(self) -> &'static str {
+        match self {
+            Self::UnrepresentableName => "the NAS name cannot be addressed by this tool",
+            Self::LinksOutsideDestination => {
+                "the NAS reports that this entry really lives somewhere else (a link)"
+            }
+            Self::RevisitedFolder => {
+                "the NAS folder was already walked under another name (a link)"
+            }
+        }
+    }
+}
+
+/// The `mount_point_type` a linked or revisited remote entry is recorded with, so the planner's
+/// mount-point protections cover it. See [`SkippedRemoteEntry`].
+pub const LINKED_ENTRY_MOUNT_TYPE: &str = "link";
 
 /// One bounded, display-safe entry returned by a target diagnostic.
 ///
@@ -551,6 +664,12 @@ pub const API_REQUIREMENTS: &[ApiRequirement] = &[
         version: 3,
         optional: true,
         purpose: "server-side copy; verified upload is used without it",
+    },
+    ApiRequirement {
+        api: "SYNO.FileStation.Rename",
+        version: 2,
+        optional: true,
+        purpose: "case-only renames of NAS entries to the local spelling",
     },
 ];
 
@@ -1060,6 +1179,7 @@ impl ApiClient {
         // Settled before `base` is moved into the client. The endpoint is named once per run
         // rather than once per request.
         let connection = connection_detail(&base, options);
+        let forward_proxy = environment_forward_proxy(&base);
         let mut client = Self {
             http,
             download_http,
@@ -1079,6 +1199,7 @@ impl ApiClient {
             remote_mtime_unhonoured: Arc::new(AtomicUsize::new(0)),
             md5_tasks: Arc::new(TaskGate::new(REMOTE_MD5_CONCURRENCY)),
             counters: Arc::new(ClientCounters::default()),
+            forward_proxy,
         };
         // Announced before discovery so the endpoint is named ahead of the first request it
         // explains, which is the order a reader needs.
@@ -1089,6 +1210,12 @@ impl ApiClient {
             client.validate_api(api, version)?;
         }
         Ok(client)
+    }
+
+    /// The forward proxy the process environment routes this client's requests through, if any.
+    /// A caller reports it: NAS traffic, and under `--allow-http` the password, crosses it.
+    pub fn forward_proxy(&self) -> Option<&ForwardProxy> {
+        self.forward_proxy.as_ref()
     }
 
     /// Cap upload throughput at `bytes_per_second`, shared by this client and every clone of it
@@ -1291,6 +1418,23 @@ impl ApiClient {
                 .unwrap_or_else(PoisonError::into_inner)
                 .bytes_per_second
         })
+    }
+
+    /// The least time an upload of `size` bytes can take under the rate cap, or `None` without one.
+    ///
+    /// A lower bound: one bucket (a second of traffic) is available at once, and peers sharing
+    /// the cap only make it longer. A plan can compare it against [`Self::upload_timeout`] before
+    /// anything is sent.
+    #[must_use]
+    pub fn minimum_upload_duration(&self, size: u64) -> Option<Duration> {
+        let rate = self.max_upload_rate()?.max(1);
+        Some(Duration::from_secs(size.saturating_sub(rate) / rate))
+    }
+
+    /// The total deadline of one upload attempt (`--timeout`).
+    #[must_use]
+    pub fn upload_timeout(&self) -> Duration {
+        self.upload_timeout
     }
 
     pub fn require_delete_api(&self) -> Result<()> {
@@ -1814,7 +1958,10 @@ impl ApiClient {
             .checked_add(self.operation_timeout)
             .ok_or_else(|| Error::Message("operation timeout is too large".to_owned()))?;
 
-        let task_result: Result<Option<TaskStartData>> = self.call_bounded(
+        // Session-recovered: DSM refusing the session created no task, so sending the start
+        // again under a fresh session cannot leave a second copy running. Every other mutation
+        // already re-authenticated; this one failed the run on an expiry (ADV-R-7).
+        let task_result: Result<Option<TaskStartData>> = self.call_bounded_recovering(
             "SYNO.FileStation.CopyMove",
             3,
             "start",
@@ -1870,6 +2017,17 @@ impl ApiClient {
                         message: "successful response contained no task status".to_owned(),
                     });
                 }
+                // DSM documents a failed copy as an error *code* on `status` (1000 copy failed,
+                // 1002 destination error, 1003/1004 a name clash, 1006/1007 FAT32 limits), not
+                // only as an `error` member of a finished status. The task has ended, so it is
+                // not stopped, and the copy is deferred like any other failed copy rather than
+                // failing the run after its pre-deletes and creates (ADV-R-3).
+                Err(error) if copy_status_reports_failed_task(&error) => {
+                    return Err(Error::ServerCopyFailed {
+                        destination: destination_path.to_owned(),
+                        detail: bounded_diagnostic_text(&error.to_string(), 256).0,
+                    });
+                }
                 Err(error) => {
                     self.stop_task("SYNO.FileStation.CopyMove", 3, &task.taskid);
                     return Err(error);
@@ -1902,7 +2060,7 @@ impl ApiClient {
     /// replace it; it is counted in [`TransportCounters::server_tasks_not_stopped`] instead.
     fn stop_task(&self, api: &'static str, version: u32, taskid: &str) {
         let stopped = json_string(taskid).and_then(|taskid| {
-            self.call_bounded::<Value>(
+            self.call_bounded_recovering::<Value>(
                 api,
                 version,
                 "stop",
@@ -1996,6 +2154,40 @@ impl ApiClient {
             return Ok(false);
         }
         self.uploaded_digest_matches(remote_path, expected_size, expected_md5, cancellation)
+    }
+
+    /// Whether an upload attempt that failed in transport landed anyway, holding these bytes *and*
+    /// the modification time it sent.
+    ///
+    /// The retry path's question. Size and digest alone answered it for a re-upload of identical
+    /// content whose only change was its modification time: the old copy matched, the upload was
+    /// credited, and the NAS kept the old time, so the next run uploaded it again (ADV-R-11). A
+    /// time that does not agree is therefore "no", and the attempt is sent again. When it does
+    /// agree, the time is recorded exactly as the success path records it.
+    fn earlier_attempt_landed(
+        &self,
+        local: &LocalEntry,
+        remote_file: &str,
+        expected_md5: ContentMd5,
+        cancellation: &CancellationToken,
+    ) -> Result<bool> {
+        cancellation.check()?;
+        let Some(facts) = self.remote_file_facts(remote_file)? else {
+            return Ok(false);
+        };
+        // A DSM that reports no modification time cannot refute the one sent; see
+        // `note_uploaded_mtime`.
+        let sent_time_kept = facts
+            .mtime_seconds
+            .is_none_or(|reported| crate::plan::mtimes_agree(local.mtime_ms, reported));
+        if facts.size != local.size || !sent_time_kept {
+            return Ok(false);
+        }
+        if !self.uploaded_digest_matches(remote_file, local.size, expected_md5, cancellation)? {
+            return Ok(false);
+        }
+        self.note_uploaded_mtime(local, facts.mtime_seconds);
+        Ok(true)
     }
 
     /// The digest half of [`Self::uploaded_content_matches`], for a caller that has already
@@ -3076,8 +3268,10 @@ impl ApiClient {
     ) -> Result<ScopedRemoteInventory> {
         let mut entries = BTreeMap::new();
         let scope_path = root.join(scope.as_str())?;
-        let mut pending = vec![scope_path.clone()];
+        // Each folder to list, with the real path DSM reported for it (when it did).
+        let mut pending: Vec<(String, Option<String>)> = vec![(scope_path.clone(), None)];
         let mut root_exists = true;
+        let mut skipped = Vec::new();
 
         // Inspect every ancestor before traversing. This also catches a destination below
         // a mounted remote folder, including when the final destination does not exist yet.
@@ -3098,6 +3292,8 @@ impl ApiClient {
                         },
                         complete: true,
                         incomplete_directories: Vec::new(),
+                        skipped,
+                        real_paths_reported: false,
                     });
                 }
                 Err(error) => return Err(error),
@@ -3117,6 +3313,9 @@ impl ApiClient {
                 .filter(|value| !value.trim().is_empty())
             {
                 return Err(Error::RemoteMountRoot { path, mount_type });
+            }
+            if is_scope_path && let Some(first) = pending.first_mut() {
+                first.1 = reported_real_path(&additional);
             }
             if root.contains_child(&path) {
                 let relative = root.relative(&path)?;
@@ -3148,7 +3347,13 @@ impl ApiClient {
 
         let mut complete = true;
         let mut incomplete_directories = Vec::new();
-        'walk: while let Some(folder) = pending.pop() {
+        let real_paths_reported = pending.iter().any(|(_, real_path)| real_path.is_some());
+        // Real paths already walked, so a link back into the tree cannot make the walk unbounded.
+        let mut visited_real_paths: BTreeSet<String> = pending
+            .iter()
+            .filter_map(|(_, real_path)| real_path.as_deref().map(walked_real_path_key))
+            .collect();
+        'walk: while let Some((folder, folder_real_path)) = pending.pop() {
             cancellation.check()?;
             let listing = match self.list_directory(&folder, cancellation) {
                 Ok(listing) => listing,
@@ -3160,8 +3365,9 @@ impl ApiClient {
                 Err(error) if folder == scope_path && error.api_code() == Some(408) => break,
                 Err(error) => return Err(error),
             };
+            let folder_relative = root.relative(&folder)?;
             if !listing.whole {
-                incomplete_directories.push(root.relative(&folder)?);
+                incomplete_directories.push(folder_relative.clone());
             }
             let files = listing.items;
 
@@ -3177,24 +3383,96 @@ impl ApiClient {
                         ),
                     });
                 }
-                let relative = root.relative(&item.path)?;
+                let kind = if item.isdir {
+                    EntryKind::Directory
+                } else {
+                    EntryKind::File
+                };
+                let relative = match root.relative(&item.path) {
+                    Ok(relative) => relative,
+                    // A name no path this tool sends can address (a macOS `Icon\r`, a Linux name
+                    // with a newline or a backslash). It used to fail every run with a
+                    // configuration exit that no exclude could cure. It is named and never
+                    // touched; a caller that mutates keeps its folders with
+                    // `sync::protect_skipped_remote_entries`.
+                    Err(Error::UnsafeRemotePath { reason, .. }) => {
+                        let raw = if folder_relative.is_empty() {
+                            item.name.clone()
+                        } else {
+                            format!("{folder_relative}/{}", item.name)
+                        };
+                        let excluded = is_dsm_managed(&raw) || rules.is_ignored(&raw, item.isdir);
+                        skipped.push(SkippedRemoteEntry {
+                            parent: folder_relative.clone(),
+                            name: item.name.clone(),
+                            remote_path: item.path.clone(),
+                            kind,
+                            reason: RemoteSkipReason::UnrepresentableName,
+                            excluded,
+                            cause: reason,
+                        });
+                        continue;
+                    }
+                    Err(error) => return Err(error),
+                };
                 if relative.is_empty() {
                     return Err(Error::InvalidResponse {
                         operation: "SYNO.FileStation.List.list".to_owned(),
                         message: "directory listing unexpectedly included its own root".to_owned(),
                     });
                 }
-                let kind = if item.isdir {
-                    EntryKind::Directory
-                } else {
-                    EntryKind::File
-                };
                 let additional = item.additional.unwrap_or_default();
                 let (size, mtime_seconds) =
                     file_metadata("SYNO.FileStation.List.list", kind, &additional)?;
-                let mount_point_type = additional
-                    .mount_point_type
-                    .filter(|value| !value.trim().is_empty());
+                let real_path = reported_real_path(&additional);
+                // A link inside the destination (ADV-R-5): DSM's real path for the entry is not
+                // its listed path. Descending would walk, and `--delete` would delete, whatever
+                // the link points at, possibly in another share; a link back up the tree would
+                // make the walk unbounded. Recorded as a mount boundary, which every planner guard
+                // already keeps whole, and named.
+                //
+                // Fail closed: once DSM has reported a real path for the folder being listed, an
+                // entry in it whose real path is missing, not absolute, not exactly
+                // `<folder real path>/<name>`, or already walked is treated as a link. Only a DSM
+                // that reports no real path at all, for the destination itself, leaves the guard
+                // unable to run; `real_paths_reported` says so.
+                let link = folder_real_path
+                    .as_deref()
+                    .and_then(|parent_real| {
+                        linked_entry_cause(parent_real, &item.name, real_path.as_deref())
+                    })
+                    .or_else(|| {
+                        real_path
+                            .as_ref()
+                            .filter(|real| {
+                                item.isdir
+                                    && visited_real_paths.contains(&walked_real_path_key(real))
+                            })
+                            .map(|real| {
+                                (
+                                    RemoteSkipReason::RevisitedFolder,
+                                    format!("its real path {real:?} was already walked"),
+                                )
+                            })
+                    });
+                let mount_point_type = match &link {
+                    Some(_) => Some(LINKED_ENTRY_MOUNT_TYPE.to_owned()),
+                    None => additional
+                        .mount_point_type
+                        .filter(|value| !value.trim().is_empty()),
+                };
+                if let Some((reason, cause)) = link {
+                    skipped.push(SkippedRemoteEntry {
+                        parent: folder_relative.clone(),
+                        name: item.name.clone(),
+                        remote_path: item.path.clone(),
+                        kind,
+                        reason,
+                        excluded: is_dsm_managed(&relative)
+                            || rules.is_ignored(&relative, item.isdir),
+                        cause,
+                    });
+                }
                 let entry = RemoteEntry {
                     relative: relative.clone(),
                     remote_path: item.path.clone(),
@@ -3226,7 +3504,10 @@ impl ApiClient {
                     || is_dsm_managed(&relative)
                     || rules.is_ignored(&relative, item.isdir);
                 if item.isdir && !protected {
-                    pending.push(item.path);
+                    if let Some(real) = &real_path {
+                        visited_real_paths.insert(walked_real_path_key(real));
+                    }
+                    pending.push((item.path, real_path));
                 }
             }
         }
@@ -3238,6 +3519,8 @@ impl ApiClient {
             },
             complete,
             incomplete_directories,
+            skipped,
+            real_paths_reported,
         })
     }
 
@@ -3875,14 +4158,87 @@ impl ApiClient {
             pair("name", json_array([name])?),
             pair("force_parent", "true"),
         ];
-        self.call::<Value>(
+        match self.call::<Value>(
             "SYNO.FileStation.CreateFolder",
             2,
             "create",
             parameters,
             true,
-        )?;
-        Ok(())
+        ) {
+            Ok(_) => Ok(()),
+            // "Already exists" is the answer the run wanted when what exists is a folder: a
+            // retried create whose first attempt landed, or a folder another writer made since
+            // planning. Only something else in its place is a refusal of this path.
+            Err(error) if error.api_code() == Some(414) => {
+                match self.remote_path_state(remote_path) {
+                    Ok(RemotePathState::Directory) => Ok(()),
+                    Ok(_) => Err(classify_path_refusal(error, remote_path)),
+                    Err(probe) => Err(naming_remote_path(probe, remote_path)),
+                }
+            }
+            Err(error) => Err(classify_path_refusal(error, remote_path)),
+        }
+    }
+
+    /// The names DSM lists directly under `remote_dir`, exactly as it lists them: protected and
+    /// DSM-managed names included, no ignore rules applied.
+    ///
+    /// One non-recursive, fully paginated listing, read twice when the first pass disagrees with
+    /// DSM's `total`, as the walk reads a folder. A folder that does not exist has no children. A
+    /// listing DSM returns short in the same way twice (Access-Based Enumeration) is returned with
+    /// `complete: false`, so a caller deciding that a name is *absent* can refuse to.
+    pub fn list_child_names(
+        &self,
+        remote_dir: &str,
+        cancellation: &CancellationToken,
+    ) -> Result<RemoteChildNames> {
+        match self.list_directory(remote_dir, cancellation) {
+            Ok(read) => Ok(RemoteChildNames {
+                names: read.items.into_iter().map(|item| item.name).collect(),
+                complete: read.whole,
+            }),
+            Err(error) if error.api_code() == Some(408) => Ok(RemoteChildNames {
+                names: Vec::new(),
+                complete: true,
+            }),
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Whether DSM offers the Rename API this tool calls. Optional: only a case-only rename needs it.
+    pub fn supports_rename(&self) -> bool {
+        self.validate_api("SYNO.FileStation.Rename", 2).is_ok()
+    }
+
+    /// Rename `remote_path` to `new_name` in the same folder, and return the new absolute path.
+    ///
+    /// Both the source and the result must lie inside `root`, and `new_name` is one path component.
+    /// Session-recovered but never retried: a resend after a rename that landed would find the
+    /// source gone. DSM answering `success` is not taken as proof; `getinfo` must then find the new
+    /// path, or this fails with [`Error::ContentVerificationFailed`] naming it. A refusal of this
+    /// path (414: the new name is taken) is [`Error::RemoteRefused`].
+    pub fn rename(&self, root: &RemoteRoot, remote_path: &str, new_name: &str) -> Result<String> {
+        validate_mutation_target(root, remote_path)?;
+        let (parent, _) = parent_and_name(remote_path)?;
+        let destination = format!("{parent}/{new_name}");
+        if new_name.contains('/') {
+            return Err(Error::UnsafeRemotePath {
+                path: destination,
+                reason: "a new name must be a single path component".to_owned(),
+            });
+        }
+        validate_mutation_target(root, &destination)?;
+        let parameters = vec![
+            pair("path", json_array([remote_path])?),
+            pair("name", json_array([new_name])?),
+        ];
+        self.call::<Value>("SYNO.FileStation.Rename", 2, "rename", parameters, false)
+            .map_err(|error| classify_path_refusal(error, remote_path))?;
+        match self.remote_path_state(&destination) {
+            Ok(RemotePathState::Absent) => Err(Error::ContentVerificationFailed(destination)),
+            Ok(_) => Ok(destination),
+            Err(error) => Err(naming_remote_path(error, &destination)),
+        }
     }
 
     pub fn upload(&self, local: &LocalEntry, remote_file: &str) -> Result<()> {
@@ -3908,6 +4264,22 @@ impl ApiClient {
         create_parents: bool,
         cancellation: &CancellationToken,
     ) -> Result<()> {
+        // A file the rate cap cannot carry within the upload deadline was sent `retries + 1`
+        // times per run, each attempt timing out, and never converged (ADV-R-10). Refused before
+        // the first byte instead, naming the file and the setting to change.
+        if let Some(minimum) = self.minimum_upload_duration(local.size)
+            && minimum > self.upload_timeout
+        {
+            return Err(Error::Configuration(format!(
+                "uploading {:?} ({} bytes) takes at least {} s at --max-rate {} bytes/s, longer \
+                 than --timeout {} s, so it could never finish; raise --timeout or --max-rate",
+                local.relative,
+                local.size,
+                minimum.as_secs(),
+                self.max_upload_rate().unwrap_or_default(),
+                self.upload_timeout.as_secs()
+            )));
+        }
         // A session refusal means DSM discarded the request before writing anything, so the
         // transfer is sent again from the start under the replacement session.
         let result = self.with_session_recovery(|| {
@@ -3927,7 +4299,7 @@ impl ApiClient {
                 UploadTransferEvent::Failed
             });
         }
-        result
+        result.map_err(|error| classify_path_refusal(error, remote_file))
     }
 
     fn upload_observed_inner(
@@ -4072,9 +4444,9 @@ impl ApiClient {
                         // the success path checks, so it takes the same evidence -- and a
                         // reconciliation that used to re-transfer the whole file before deciding
                         // whether to re-transmit it now costs two control requests.
-                        match self.uploaded_content_matches(
+                        match self.earlier_attempt_landed(
+                            local,
                             remote_file,
-                            local.size,
                             expected,
                             cancellation,
                         ) {
@@ -4086,10 +4458,76 @@ impl ApiClient {
                     }
                     retry_pause_cancellable(attempt, cancellation)?;
                 }
+                Err(error) if retryable(&error) => {
+                    return self.last_attempt_failed_in_transport(
+                        local,
+                        remote_file,
+                        error,
+                        cancellation,
+                    );
+                }
                 Err(error) => return Err(error),
             }
         }
         unreachable!("retry loop always returns")
+    }
+
+    /// The answer for an upload whose last attempt failed in transport.
+    ///
+    /// The bytes may have landed after all, and then the upload succeeded: the same question, and
+    /// the same evidence, as the retry path. Otherwise the destination is whatever DSM left. If DSM
+    /// writes an overwrite in place, sizes it up front and applies the `mtime` field before the body
+    /// arrives, that is a file with this one's size and time and not its content, and the next
+    /// `metadata` comparison would call it unchanged for good (ADV-R-6, unverified on a NAS). That
+    /// is detectable only now, so the failure says so, naming the path and the repair.
+    fn last_attempt_failed_in_transport(
+        &self,
+        local: &LocalEntry,
+        remote_file: &str,
+        error: Error,
+        cancellation: &CancellationToken,
+    ) -> Result<()> {
+        let Some(expected) = local.content_md5 else {
+            return Err(error);
+        };
+        if cancellation.is_cancelled() {
+            return Err(error);
+        }
+        let facts = match self.remote_file_facts(remote_file) {
+            Ok(Some(facts)) => facts,
+            Ok(None) => return Err(error),
+            // The link is still down, so the probe says nothing the transfer's own error does
+            // not, and the error keeps its kind.
+            Err(probe) if retryable(&probe) => return Err(error),
+            Err(probe) => {
+                return Err(Error::Message(format!(
+                    "{error}; checking what the failed upload left at {remote_file:?} also failed: {probe}"
+                )));
+            }
+        };
+        let looks_complete = facts.size == local.size
+            && facts
+                .mtime_seconds
+                .is_none_or(|reported| crate::plan::mtimes_agree(local.mtime_ms, reported));
+        if !looks_complete {
+            return Err(error);
+        }
+        match self.uploaded_digest_matches(remote_file, local.size, expected, cancellation) {
+            Ok(true) => {
+                self.note_uploaded_mtime(local, facts.mtime_seconds);
+                Ok(())
+            }
+            Ok(false) => Err(Error::Message(format!(
+                "{error}; the NAS copy of {remote_file:?} now has this file's size and modification \
+                 time but not its content, so a metadata comparison would call it unchanged; run \
+                 once with --compare content to repair it"
+            ))),
+            Err(probe) => Err(Error::Message(format!(
+                "{error}; the NAS copy of {remote_file:?} now has this file's size and modification \
+                 time, and its content could not be checked ({probe}); run once with --compare \
+                 content to make sure it is whole"
+            ))),
+        }
     }
 
     /// Prove an upload source is present, unchanged and openable, without reading it.
@@ -4141,7 +4579,10 @@ impl ApiClient {
             pair("path", json_array([remote_path])?),
             pair("recursive", "false"),
         ];
-        self.call::<Value>("SYNO.FileStation.Delete", 2, "delete", parameters, false)?;
+        // Named, but kept an `Error::Api`: the delete loop decides per code whether a refusal
+        // concerns this entry or every entry after it.
+        self.call::<Value>("SYNO.FileStation.Delete", 2, "delete", parameters, false)
+            .map_err(|error| naming_remote_path(error, remote_path))?;
         Ok(())
     }
 
@@ -4152,8 +4593,15 @@ impl ApiClient {
             Err(first_error) => match self.discover_at("query.cgi") {
                 Ok(apis) => Ok(apis),
                 Err(second_error) => {
+                    // Named for the route it really took. "Through the reverse proxy" was said of
+                    // every failure, including a direct connection and one an environment
+                    // forward proxy swallowed, which sent operators to the wrong machine.
+                    let route = match &self.forward_proxy {
+                        Some(proxy) => format!(" through the {proxy}"),
+                        None => format!(" at {}", self.base.origin().ascii_serialization()),
+                    };
                     let message = format!(
-                        "File Station API discovery failed through the reverse proxy; entry.cgi: {first_error}; query.cgi fallback: {second_error}"
+                        "{DISCOVERY_FAILED_PREFIX}{route}; entry.cgi: {first_error}; query.cgi fallback: {second_error}"
                     );
                     if discovery_route_returned_response(&first_error)
                         || discovery_route_returned_response(&second_error)
@@ -4265,7 +4713,7 @@ impl ApiClient {
                 pair("filetype", json_string("all")?),
                 pair(
                     "additional",
-                    json_array(["size", "time", "mount_point_type"])?,
+                    json_array(["size", "time", "mount_point_type", "real_path"])?,
                 ),
             ];
             let data: ListData = self
@@ -4316,7 +4764,7 @@ impl ApiClient {
             pair("path", json_array([path])?),
             pair(
                 "additional",
-                json_array(["size", "time", "mount_point_type"])?,
+                json_array(["size", "time", "mount_point_type", "real_path"])?,
             ),
         ];
         let mut data: GetInfoData = self
@@ -4383,6 +4831,27 @@ impl ApiClient {
         let fields = self.authenticated_fields(api, version, method, parameters)?;
         let url = self.api_url(api)?;
         self.send_form_once_with_timeout(url, fields, api, version, method, timeout)
+    }
+
+    /// A bounded, single-attempt request that is sent once more under a fresh session when DSM
+    /// refused the one it carried.
+    ///
+    /// For requests that must not be retried on a transport failure, because one that reached DSM
+    /// may have acted (`CopyMove.start`), but whose session refusal proves DSM did nothing.
+    fn call_bounded_recovering<T: DeserializeOwned>(
+        &self,
+        api: &'static str,
+        version: u32,
+        method: &'static str,
+        parameters: Vec<(String, String)>,
+        timeout: Duration,
+    ) -> Result<Option<T>> {
+        self.validate_api(api, version)?;
+        let url = self.api_url(api)?;
+        self.with_session_recovery(|| {
+            let fields = self.authenticated_fields(api, version, method, parameters.clone())?;
+            self.send_form_once_with_timeout(url.clone(), fields, api, version, method, timeout)
+        })
     }
 
     /// A bounded control request that still gets the retry predicate.
@@ -4816,6 +5285,199 @@ struct DirectoryRead {
     whole: bool,
 }
 
+/// A forward proxy the process environment routes NAS traffic through.
+///
+/// reqwest honours `HTTP_PROXY`, `HTTPS_PROXY` and `ALL_PROXY` (and their lower-case spellings,
+/// less `NO_PROXY`) for every client this tool builds. That used to happen silently: a LAN NAS
+/// behind a corporate `HTTPS_PROXY` failed with an error that blamed "the reverse proxy", and under
+/// `--allow-http` the password crossed the forward proxy in plain text (ADV-R-9). It is now named:
+/// [`ApiClient::forward_proxy`] reports it, and a failed discovery says it went through it.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ForwardProxy {
+    /// The environment variable it came from.
+    pub variable: &'static str,
+    /// The proxy URL with any user name and password removed.
+    pub url: String,
+}
+
+impl fmt::Display for ForwardProxy {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "forward proxy {} (from {})",
+            self.url, self.variable
+        )
+    }
+}
+
+/// The forward proxy reqwest will use for `base`, read from the process environment.
+pub fn environment_forward_proxy(base: &Url) -> Option<ForwardProxy> {
+    forward_proxy_from(base, |name| std::env::var(name).ok())
+}
+
+/// [`environment_forward_proxy`] over any variable source, mirroring the rules of the matcher
+/// reqwest uses (hyper-util's `Matcher::from_env`): the first of the upper- and lower-case
+/// spelling that is *set* wins, an empty value means none, `ALL_PROXY` is the fallback for both
+/// schemes, nothing applies when `REQUEST_METHOD` is set (a CGI environment), and `NO_PROXY`
+/// excludes `*`, a host, a domain suffix, an IP address or an IP network.
+fn forward_proxy_from(
+    base: &Url,
+    variable: impl Fn(&str) -> Option<String>,
+) -> Option<ForwardProxy> {
+    if variable("REQUEST_METHOD").is_some() {
+        return None;
+    }
+    let first_set = |names: [&'static str; 2]| {
+        names
+            .into_iter()
+            .find_map(|name| variable(name).map(|value| (name, value)))
+            .filter(|(_, value)| !value.trim().is_empty())
+    };
+    let scheme_specific = match base.scheme() {
+        "http" => first_set(["HTTP_PROXY", "http_proxy"]),
+        "https" => first_set(["HTTPS_PROXY", "https_proxy"]),
+        _ => return None,
+    };
+    let (name, value) = scheme_specific.or_else(|| first_set(["ALL_PROXY", "all_proxy"]))?;
+    let host = base.host_str()?;
+    if let Some((_, no_proxy)) = first_set(["NO_PROXY", "no_proxy"])
+        && no_proxy_excludes(&no_proxy, host)
+    {
+        return None;
+    }
+    Some(ForwardProxy {
+        variable: name,
+        url: redacted_proxy_url(value.trim()),
+    })
+}
+
+/// Whether a `NO_PROXY` list exempts `host`, by the rules curl and reqwest share.
+fn no_proxy_excludes(list: &str, host: &str) -> bool {
+    let host = host.trim_start_matches('[').trim_end_matches(']');
+    let address = host.parse::<std::net::IpAddr>().ok();
+    list.split(',').map(str::trim).any(|entry| {
+        if entry.is_empty() {
+            return false;
+        }
+        if entry == "*" {
+            return true;
+        }
+        if let Some(address) = address {
+            return match entry.split_once('/') {
+                Some((network, prefix)) => ip_network_contains(network, prefix, address),
+                None => entry.parse::<std::net::IpAddr>().ok() == Some(address),
+            };
+        }
+        let domain = entry.strip_prefix('.').unwrap_or(entry);
+        host.eq_ignore_ascii_case(domain)
+            || (host.len() > domain.len()
+                && host.as_bytes()[host.len() - domain.len() - 1] == b'.'
+                && host[host.len() - domain.len()..].eq_ignore_ascii_case(domain))
+    })
+}
+
+fn ip_network_contains(network: &str, prefix: &str, address: std::net::IpAddr) -> bool {
+    let (Ok(network), Ok(prefix)) = (network.parse::<std::net::IpAddr>(), prefix.parse::<u32>())
+    else {
+        return false;
+    };
+    match (network, address) {
+        (std::net::IpAddr::V4(network), std::net::IpAddr::V4(address)) if prefix <= 32 => {
+            let mask = u32::MAX.checked_shl(32 - prefix).unwrap_or(0);
+            u32::from(network) & mask == u32::from(address) & mask
+        }
+        (std::net::IpAddr::V6(network), std::net::IpAddr::V6(address)) if prefix <= 128 => {
+            let mask = u128::MAX.checked_shl(128 - prefix).unwrap_or(0);
+            u128::from(network) & mask == u128::from(address) & mask
+        }
+        _ => false,
+    }
+}
+
+/// A proxy URL without its credentials, so it can be logged.
+fn redacted_proxy_url(value: &str) -> String {
+    match Url::parse(value) {
+        Ok(mut url) if url.has_host() => {
+            // Neither setter can fail on a URL that has a host.
+            let user_removed = url.set_username("").is_ok();
+            let password_removed = url.set_password(None).is_ok();
+            if user_removed && password_removed {
+                url.to_string()
+            } else {
+                "(a proxy URL that could not be redacted)".to_owned()
+            }
+        }
+        // reqwest also accepts `host:port`; credentials there would be `user:pass@host:port`.
+        _ => match value.rsplit_once('@') {
+            Some((_, host)) => host.to_owned(),
+            None => value.to_owned(),
+        },
+    }
+}
+
+/// Why an entry listed in a folder whose real path is `parent_real` is not where its listing puts
+/// it, or `None` when its real path is exactly `<parent_real>/<name>`. See the walk.
+fn linked_entry_cause(
+    parent_real: &str,
+    name: &str,
+    real: Option<&str>,
+) -> Option<(RemoteSkipReason, String)> {
+    let expected = format!("{}/{name}", parent_real.trim_end_matches('/'));
+    match real {
+        Some(real) if real_path_key(real) == real_path_key(&expected) => None,
+        Some(real) if !real.starts_with('/') => Some((
+            RemoteSkipReason::LinksOutsideDestination,
+            format!("its real path {real:?} cannot be resolved against {expected:?}"),
+        )),
+        Some(real) => Some((
+            RemoteSkipReason::LinksOutsideDestination,
+            format!("listed under the destination, but its real path is {real:?}"),
+        )),
+        None => Some((
+            RemoteSkipReason::LinksOutsideDestination,
+            format!(
+                "the NAS reported no real path for it, though it did for its folder {parent_real:?}"
+            ),
+        )),
+    }
+}
+
+/// The form two real paths are compared in.
+///
+/// Only the *relation* between a child's real path and its folder's is ever checked, never a
+/// volume prefix, so `/volume1`, a share on another volume, or an encrypted share's own prefix
+/// cannot matter. What can differ for the same entry without it being a link is spelling: a
+/// trailing `/`, Unicode normalisation (a name listed NFD and a real path reported NFC, or the
+/// reverse) and letter case. Those are folded away. A link that differs only in those ways from
+/// where it is listed resolves to the same entry, so the fold loses nothing the guard needs.
+fn real_path_key(path: &str) -> String {
+    let trimmed = path.trim_end_matches('/');
+    crate::path::portable_fold(if trimmed.is_empty() { "/" } else { trimmed })
+}
+
+/// The key a walked folder's real path is remembered by, to recognise the same folder reached
+/// again through a link.
+///
+/// Exact apart from a trailing `/` and Unicode normalisation, and deliberately *not* case-folded:
+/// DSM volumes (ext4, btrfs) are case-sensitive, so `Photos` and `photos` side by side are two
+/// folders, and folding them made the second one look like a link back to the first, hiding it
+/// from every plan. [`real_path_key`] may fold case because it only compares one entry with
+/// itself (its real path against its folder's plus its own name), which cannot merge siblings.
+fn walked_real_path_key(path: &str) -> String {
+    let trimmed = path.trim_end_matches('/');
+    crate::path::nfc(if trimmed.is_empty() { "/" } else { trimmed }).into_owned()
+}
+
+/// The real path DSM reported for an entry, when it reported a usable one.
+fn reported_real_path(additional: &RemoteAdditionalWire) -> Option<String> {
+    additional
+        .real_path
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+}
+
 /// Attach the folder a failed listing was for, keeping the error's kind and DSM code.
 ///
 /// A walk lists thousands of directories, and "List.list failed with code 105" without the folder
@@ -5028,6 +5690,9 @@ struct RemoteAdditionalWire {
     time: Option<RemoteTimeWire>,
     #[serde(default)]
     mount_point_type: Option<String>,
+    /// Where the entry really is on the NAS volume (`/volume1/share/...`), when DSM reports it.
+    #[serde(default)]
+    real_path: Option<String>,
     #[serde(default)]
     perm: Option<RemotePermissionWire>,
 }
@@ -6405,6 +7070,85 @@ fn naming_remote_file(error: Error, remote_path: &str) -> Error {
     }
 }
 
+/// Classify a failed mutation of one remote path: a refusal confined to that path becomes
+/// [`Error::RemoteRefused`], and anything else keeps its kind and gains the path.
+///
+/// Before this, one name DSM refused (a CJK name over 255 bytes, a folder whose ACL denies this
+/// account, a 5 GB file on a FAT32-limited share) failed the whole run and stopped every peer
+/// upload, on every run, with an error that named no path at all (ADV-R-1).
+///
+/// Only codes that describe the path are per-path: its name (400, 418, 1802), this account's
+/// rights on it (105 that survived the liveness probe, 407), a clash with what is there (414),
+/// its folder's limits (1100, 1101) or its size for the destination filesystem (1804). A dead
+/// session, a busy subsystem, a read-only volume or a full quota (415, 416) is about every path
+/// after it, and stays a run failure.
+fn classify_path_refusal(error: Error, remote_path: &str) -> Error {
+    match error {
+        Error::Api {
+            api,
+            operation,
+            code,
+            description,
+            ..
+        } if is_per_path_refusal_code(code) => Error::RemoteRefused {
+            operation: format!("{api}.{operation}"),
+            path: remote_path.to_owned(),
+            code,
+            description,
+        },
+        other => naming_remote_path(other, remote_path),
+    }
+}
+
+/// See [`classify_path_refusal`].
+fn is_per_path_refusal_code(code: i64) -> bool {
+    matches!(
+        code,
+        105 | 400 | 407 | 414 | 418 | 1100 | 1101 | 1802 | 1804
+    )
+}
+
+/// Attach the remote path a failed mutation was for, keeping the error's kind and DSM code.
+fn naming_remote_path(error: Error, remote_path: &str) -> Error {
+    match error {
+        Error::Api {
+            api,
+            operation,
+            code,
+            description,
+            details,
+        } => Error::Api {
+            api,
+            operation,
+            code,
+            description: format!("{description} (path {remote_path:?})"),
+            details,
+        },
+        Error::InvalidResponse { operation, message } => Error::InvalidResponse {
+            operation,
+            message: format!("{message} (path {remote_path:?})"),
+        },
+        Error::HttpStatus {
+            operation,
+            status,
+            message,
+        } => Error::HttpStatus {
+            operation: format!("{operation} (path {remote_path:?})"),
+            status,
+            message,
+        },
+        Error::Http { operation, source } => Error::Http {
+            operation: format!("{operation} (path {remote_path:?})"),
+            source,
+        },
+        Error::HttpBody { operation, source } => Error::HttpBody {
+            operation: format!("{operation} (path {remote_path:?})"),
+            source,
+        },
+        other => other,
+    }
+}
+
 /// Whether a failed digest is about that one file, rather than about the run.
 ///
 /// Only a cause confined to the file may defer it: the file is gone (408), DSM rejected that
@@ -6976,6 +7720,12 @@ fn copy_start_error(error: Error) -> Error {
     }
 }
 
+/// Whether a failed `CopyMove.status` is DSM reporting that the task itself failed, rather than the
+/// poll failing. See [`ApiClient::copy_file_verified`].
+fn copy_status_reports_failed_task(error: &Error) -> bool {
+    matches!(error.api_code(), Some(1000..=1007 | 414 | 415 | 416 | 418))
+}
+
 fn control_request_timeout(upload_timeout: Duration) -> Duration {
     upload_timeout.min(MAX_CONTROL_REQUEST_TIMEOUT)
 }
@@ -7505,6 +8255,7 @@ mod tests {
             remote_mtime_unhonoured: Arc::new(AtomicUsize::new(0)),
             md5_tasks: Arc::new(TaskGate::new(REMOTE_MD5_CONCURRENCY)),
             counters: Arc::new(ClientCounters::default()),
+            forward_proxy: None,
         }
     }
 
@@ -9393,6 +10144,7 @@ mod tests {
             size: Some(9),
             time: Some(RemoteTimeWire { mtime: Some(13) }),
             mount_point_type: None,
+            real_path: None,
             perm: None,
         };
         for kind in [EntryKind::File, EntryKind::Directory] {
@@ -10210,6 +10962,7 @@ mod tests {
             remote_mtime_unhonoured: Arc::new(AtomicUsize::new(0)),
             md5_tasks: Arc::new(TaskGate::new(REMOTE_MD5_CONCURRENCY)),
             counters: Arc::new(ClientCounters::default()),
+            forward_proxy: None,
         };
         assert_eq!(client.max_upload_rate(), None);
 
@@ -13574,7 +14327,10 @@ mod tests {
         let Error::Http { operation, .. } = &error else {
             panic!("expected a transport error, got {error}");
         };
-        assert_eq!(operation, "uploading abc.bin");
+        assert_eq!(
+            operation,
+            "uploading abc.bin (path \"/share/root/abc.bin\")"
+        );
         assert!(
             error.to_string().contains("abc.bin"),
             "the reported failure must name the file: {error}"
@@ -13683,9 +14439,10 @@ mod tests {
         ]);
         let (client, server) = upload_client(responses, 1);
         let error = client.upload(&local, "/share/root/abc.bin").unwrap_err();
+        // The account may not read that one path: a refusal of it, named (ADV-R-1).
         assert_eq!(
             error.to_string(),
-            "Synology API SYNO.FileStation.List.getinfo failed with code 105: session does not have permission"
+            "NAS refused SYNO.FileStation.List.getinfo of \"/share/root/abc.bin\" with code 105: session does not have permission"
         );
         assert_eq!(server.join().unwrap().len(), 4);
         fs::remove_file(path).unwrap();
@@ -13813,9 +14570,13 @@ mod tests {
         };
         assert!(is_discovery_response_failure(&error));
         let rendered = error.to_string();
-        assert!(rendered.starts_with(
-            "unexpected response during File Station API discovery: File Station API discovery failed through the reverse proxy"
-        ));
+        // Named for the route it took (a direct connection here), not "the reverse proxy".
+        assert!(
+            rendered.starts_with(
+                "unexpected response during File Station API discovery: File Station API discovery failed at http://127.0.0.1:"
+            ),
+            "{rendered}"
+        );
         assert!(rendered.contains("entry.cgi: unexpected response during SYNO.API.Info.query"));
         assert!(rendered.contains("query.cgi fallback:"));
         assert_eq!(
@@ -14021,6 +14782,7 @@ mod tests {
             remote_mtime_unhonoured: Arc::new(AtomicUsize::new(0)),
             md5_tasks: Arc::new(TaskGate::new(REMOTE_MD5_CONCURRENCY)),
             counters: Arc::new(ClientCounters::default()),
+            forward_proxy: None,
         };
 
         let md5_only = client_for("SYNO.FileStation.MD5");
@@ -14238,10 +15000,12 @@ FplE
         let mut client = connect_test_client(url);
         client.login("alice", "password", None).unwrap();
         let error = client.create_folder("/share/root/new").unwrap_err();
+        // A refusal of that one folder, naming it (ADV-R-1).
         assert_eq!(
             error.to_string(),
-            "Synology API SYNO.FileStation.CreateFolder.create failed with code 1101: parent folder item-count limit exceeded"
+            "NAS refused SYNO.FileStation.CreateFolder.create of \"/share/root/new\" with code 1101: parent folder item-count limit exceeded"
         );
+        assert_eq!(error.refused_remote_path(), Some("/share/root/new"));
         let requests = server.join().unwrap();
         assert_eq!(requests.len(), 3);
         let create = String::from_utf8_lossy(&requests[2].body);
@@ -15247,5 +16011,254 @@ FplE
             }
         })
         .to_string()
+    }
+
+    fn variables(pairs: &[(&'static str, &'static str)]) -> impl Fn(&str) -> Option<String> {
+        let map = pairs
+            .iter()
+            .map(|(name, value)| ((*name).to_owned(), (*value).to_owned()))
+            .collect::<HashMap<_, _>>();
+        move |name| map.get(name).cloned()
+    }
+
+    /// ADV-R-9: the forward proxy reported is the one reqwest will use, by reqwest's own rules.
+    #[test]
+    fn the_reported_forward_proxy_follows_the_rules_reqwest_applies() {
+        let https = Url::parse("https://nas.example.com:5001/").unwrap();
+        let http = Url::parse("http://192.168.1.20:5000/").unwrap();
+        let proxy = |variable: &'static str, url: &str| {
+            Some(ForwardProxy {
+                variable,
+                url: url.to_owned(),
+            })
+        };
+
+        assert_eq!(forward_proxy_from(&https, variables(&[])), None);
+        // Credentials are never kept.
+        assert_eq!(
+            forward_proxy_from(
+                &https,
+                variables(&[("HTTPS_PROXY", "http://user:secret@proxy:3128")])
+            ),
+            proxy("HTTPS_PROXY", "http://proxy:3128/")
+        );
+        // A scheme's own variable only; ALL_PROXY is the fallback for both.
+        assert_eq!(
+            forward_proxy_from(&https, variables(&[("HTTP_PROXY", "http://proxy:3128")])),
+            None
+        );
+        assert_eq!(
+            forward_proxy_from(&http, variables(&[("all_proxy", "socks5://proxy:1080")])),
+            proxy("all_proxy", "socks5://proxy:1080")
+        );
+        assert_eq!(
+            forward_proxy_from(&http, variables(&[("http_proxy", "proxy:3128")])),
+            proxy("http_proxy", "proxy:3128")
+        );
+        // The upper-case spelling wins when it is set, even empty; empty means none.
+        assert_eq!(
+            forward_proxy_from(
+                &http,
+                variables(&[("HTTP_PROXY", ""), ("http_proxy", "http://proxy:3128")])
+            ),
+            None
+        );
+        // NO_PROXY: a domain suffix, `*`, an address and a network all exempt.
+        let set = [
+            ("HTTPS_PROXY", "http://proxy:3128"),
+            ("HTTP_PROXY", "http://proxy:3128"),
+        ];
+        for no_proxy in [".example.com", "example.com", "*", "nas.example.com"] {
+            let mut pairs = set.to_vec();
+            pairs.push(("NO_PROXY", no_proxy));
+            assert_eq!(
+                forward_proxy_from(&https, variables(&pairs)),
+                None,
+                "{no_proxy}"
+            );
+        }
+        for no_proxy in [
+            "192.168.1.20",
+            "192.168.0.0/16",
+            "localhost, 192.168.1.0/24",
+        ] {
+            let mut pairs = set.to_vec();
+            pairs.push(("no_proxy", no_proxy));
+            assert_eq!(
+                forward_proxy_from(&http, variables(&pairs)),
+                None,
+                "{no_proxy}"
+            );
+        }
+        for no_proxy in ["ample.com", "192.168.2.0/24", "10.0.0.1"] {
+            let mut pairs = set.to_vec();
+            pairs.push(("NO_PROXY", no_proxy));
+            assert!(
+                forward_proxy_from(&https, variables(&pairs)).is_some(),
+                "{no_proxy}"
+            );
+            assert!(
+                forward_proxy_from(&http, variables(&pairs)).is_some(),
+                "{no_proxy}"
+            );
+        }
+        // A CGI environment uses no proxy at all.
+        assert_eq!(
+            forward_proxy_from(
+                &https,
+                variables(&[
+                    ("HTTPS_PROXY", "http://proxy:3128"),
+                    ("REQUEST_METHOD", "GET")
+                ])
+            ),
+            None
+        );
+    }
+
+    /// ADV-R-1: which DSM codes are a refusal of one path, and which concern every path.
+    #[test]
+    fn only_codes_about_the_path_become_a_per_path_refusal() {
+        let api = |code| Error::Api {
+            api: "SYNO.FileStation.Upload".to_owned(),
+            operation: "upload".to_owned(),
+            code,
+            description: api_error_description("SYNO.FileStation.Upload", code)
+                .map(|text| format!(": {text}"))
+                .unwrap_or_default(),
+            details: Vec::new(),
+        };
+        for code in [105, 400, 407, 414, 418, 1100, 1101, 1802, 1804] {
+            let error = classify_path_refusal(api(code), "/share/x");
+            assert_eq!(error.refused_remote_path(), Some("/share/x"), "{code}");
+            assert_eq!(error.api_code(), Some(code));
+            assert!(
+                error.to_string().starts_with(
+                    "NAS refused SYNO.FileStation.Upload.upload of \"/share/x\" with code"
+                ),
+                "{error}"
+            );
+        }
+        for code in [106, 107, 119, 402, 408, 411, 415, 416, 417] {
+            let error = classify_path_refusal(api(code), "/share/x");
+            assert!(matches!(error, Error::Api { .. }), "{code}");
+            assert!(error.to_string().contains("(path \"/share/x\")"), "{error}");
+        }
+        let local = classify_path_refusal(Error::SourceChanged(PathBuf::from("a")), "/share/x");
+        assert!(matches!(local, Error::SourceChanged(_)));
+    }
+
+    /// ADV-R-3: a CopyMove status error that reports the task failed, as DSM documents it.
+    #[test]
+    fn copy_status_codes_that_report_a_failed_task_are_recognised() {
+        let status = |code| Error::Api {
+            api: "SYNO.FileStation.CopyMove".to_owned(),
+            operation: "status".to_owned(),
+            code,
+            description: String::new(),
+            details: Vec::new(),
+        };
+        for code in [
+            1000, 1001, 1002, 1003, 1004, 1005, 1006, 1007, 414, 415, 416, 418,
+        ] {
+            assert!(copy_status_reports_failed_task(&status(code)), "{code}");
+        }
+        for code in [105, 106, 119, 408, 599, 1100] {
+            assert!(!copy_status_reports_failed_task(&status(code)), "{code}");
+        }
+    }
+
+    #[test]
+    fn a_skipped_remote_entry_displays_its_name_escaped() {
+        let entry = SkippedRemoteEntry {
+            parent: "photos".to_owned(),
+            name: "Icon\r".to_owned(),
+            remote_path: "/share/photos/Icon\r".to_owned(),
+            kind: EntryKind::File,
+            reason: RemoteSkipReason::UnrepresentableName,
+            excluded: false,
+            cause: "control characters are not allowed".to_owned(),
+        };
+        assert_eq!(entry.display(), "photos/Icon\\r");
+        assert!(
+            entry
+                .detail()
+                .contains("control characters are not allowed")
+        );
+        assert_eq!(
+            RemoteSkipReason::UnrepresentableName.as_str(),
+            "unrepresentable-remote-name"
+        );
+    }
+
+    /// ADV-R-5: realistic DSM real paths for ordinary entries are never mistaken for links. Only the
+    /// relation to the folder's real path is checked, in a spelling-insensitive form.
+    #[test]
+    fn ordinary_real_paths_are_not_links_however_dsm_spells_them() {
+        let nfd = "cafe\u{301}";
+        let nfc = "caf\u{e9}";
+        let ordinary = [
+            // Volume-prefixed real paths for a walked `/share/dir`.
+            ("/volume1/share/dir", "a.txt", "/volume1/share/dir/a.txt"),
+            // Trailing slashes on either side.
+            ("/volume1/share/dir/", "a.txt", "/volume1/share/dir/a.txt"),
+            ("/volume1/share/dir", "sub", "/volume1/share/dir/sub/"),
+            // A name listed NFD whose real path is reported NFC, and the reverse.
+            ("/volume1/share", nfd, "/volume1/share/caf\u{e9}"),
+            ("/volume1/share", nfc, "/volume1/share/cafe\u{301}"),
+            // Letter case.
+            (
+                "/volume1/Share/Dir",
+                "Photo.JPG",
+                "/volume1/share/dir/photo.jpg",
+            ),
+            // A share on another volume, and an encrypted share's own prefix.
+            ("/volume2/backup", "a.txt", "/volume2/backup/a.txt"),
+            (
+                "/volume1/@secret@/docs",
+                "a.txt",
+                "/volume1/@secret@/docs/a.txt",
+            ),
+            (
+                "/volumeUSB1/usbshare1-2",
+                "a.txt",
+                "/volumeUSB1/usbshare1-2/a.txt",
+            ),
+        ];
+        for (parent, name, real) in ordinary {
+            assert_eq!(
+                linked_entry_cause(parent, name, Some(real)),
+                None,
+                "{parent:?} + {name:?} vs {real:?}"
+            );
+        }
+        let linked = [
+            ("/volume1/share/dir", "link", Some("/volume1/other")),
+            (
+                "/volume1/share/dir",
+                "link",
+                Some("/volume2/share/dir/link"),
+            ),
+            ("/volume1/share/dir", "link", Some("share/dir/link")),
+            ("/volume1/share/dir", "link", None),
+        ];
+        for (parent, name, real) in linked {
+            assert!(
+                linked_entry_cause(parent, name, real).is_some(),
+                "{parent:?} + {name:?} vs {real:?}"
+            );
+        }
+        assert_eq!(
+            real_path_key("/volume1/Share/caf\u{e9}/"),
+            real_path_key("/volume1/share/cafe\u{301}")
+        );
+        // The revisit key keeps case: `Photos` and `photos` are two folders on DSM's volumes.
+        assert_ne!(
+            walked_real_path_key("/volume1/share/Photos"),
+            walked_real_path_key("/volume1/share/photos")
+        );
+        assert_eq!(
+            walked_real_path_key("/volume1/share/caf\u{e9}/"),
+            walked_real_path_key("/volume1/share/cafe\u{301}")
+        );
     }
 }

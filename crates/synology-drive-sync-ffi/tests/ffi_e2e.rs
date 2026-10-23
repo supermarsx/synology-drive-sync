@@ -270,6 +270,17 @@ fn ffi_apply_executes_and_returns_reconciled_json() {
     assert_eq!(result["outcome"]["applied"], true);
     assert_eq!(result["outcome"]["reconciled"], true);
     assert_eq!(result["outcome"]["execution"]["uploaded"], 1);
+    // ADV-R-4: what the run recovered from, and the parity counters, reach FFI callers too.
+    assert_eq!(result["outcome"]["recovered"]["retries"], 0, "{result}");
+    assert_eq!(result["outcome"]["recovered"]["reauthentications"], 0);
+    assert_eq!(
+        result["outcome"]["execution"]["mtime_not_kept"], 0,
+        "{result}"
+    );
+    assert!(
+        result["outcome"]["incomplete_listings"].is_array(),
+        "{result}"
+    );
     assert_eq!(
         server.file_contents("/team/ffi/nested/hello.txt"),
         Some(b"FFI applied".to_vec())

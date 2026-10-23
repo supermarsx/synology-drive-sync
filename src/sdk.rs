@@ -117,6 +117,16 @@ pub enum ErrorCode {
 pub struct SdkError {
     code: ErrorCode,
     message: String,
+    /// What a run that failed part-way through execution had done first. Boxed, so the common
+    /// error stays small.
+    partial: Option<Box<PartialExecution>>,
+}
+
+/// What execution completed, and deferred, before the run failed.
+#[derive(Debug)]
+struct PartialExecution {
+    completed: ExecutionSummary,
+    deferred: Vec<DeferredPath>,
 }
 
 impl SdkError {
@@ -130,11 +140,37 @@ impl SdkError {
         &self.message
     }
 
+    /// What execution completed before the run failed part-way through, or `None` when it failed
+    /// before executing anything. Mutations counted here did happen on the NAS.
+    pub fn completed(&self) -> Option<ExecutionSummary> {
+        self.partial.as_ref().map(|partial| partial.completed)
+    }
+
+    /// Paths the run had deferred, each with its reason, before it failed.
+    pub fn deferred(&self) -> &[DeferredPath] {
+        self.partial
+            .as_ref()
+            .map_or(&[], |partial| partial.deferred.as_slice())
+    }
+
     fn new(code: ErrorCode, message: impl Into<String>) -> Self {
         Self {
             code,
             message: message.into(),
+            partial: None,
         }
+    }
+
+    fn with_partial_execution(
+        mut self,
+        completed: ExecutionSummary,
+        deferred: Vec<DeferredPath>,
+    ) -> Self {
+        self.partial = Some(Box::new(PartialExecution {
+            completed,
+            deferred,
+        }));
+        self
     }
 
     fn from_core(error: Error) -> Self {
@@ -162,6 +198,7 @@ impl SdkError {
             Error::Message(_) => ErrorCode::Internal,
             Error::InvalidResponse { .. }
             | Error::Api { .. }
+            | Error::RemoteRefused { .. }
             | Error::UnsupportedApiVersion { .. }
             | Error::MissingApi(_)
             | Error::ShareNotWritable(_)
@@ -500,6 +537,8 @@ pub enum PlanOperation {
     CopyRemoteContent,
     Upload,
     DeleteRemoteExtra,
+    /// A NAS entry renamed in place to the local spelling (a case-only rename). Carried out last.
+    RenameCaseOnly,
 }
 
 /// One read-only planned change.
@@ -545,6 +584,7 @@ pub struct PlanSummary {
     unchanged_files: usize,
     protected_entries: usize,
     upload_bytes: u64,
+    renames: usize,
     skipped: Vec<SkippedPath>,
 }
 
@@ -566,8 +606,8 @@ impl SkippedPath {
     }
 
     /// Stable tag: `windows-attributes`, `link-or-reparse-point`, `dehydrated-placeholder`,
-    /// `local-case-collision`,
-    /// `remote-case-collision`, `case-rename-needs-delete` or `deferred`.
+    /// `local-case-collision`, `remote-case-collision`, `case-rename-needs-delete`, `deferred`,
+    /// `type-conflict`, `remote-link` or `protected-descendant`.
     pub fn reason(&self) -> &'static str {
         self.reason
     }
@@ -619,6 +659,11 @@ impl PlanSummary {
 
     pub fn upload_bytes(&self) -> u64 {
         self.upload_bytes
+    }
+
+    /// Case-only renames this plan carries out on the NAS. Each is also in [`Self::changes`].
+    pub fn renames(&self) -> usize {
+        self.renames
     }
 
     pub fn is_empty(&self) -> bool {
@@ -711,6 +756,11 @@ pub enum MutationEvent {
         relative: String,
         reason: DeferredReason,
     },
+    /// A NAS entry renamed in place to the local spelling (a case-only rename).
+    Renamed {
+        from_remote_path: String,
+        to_remote_path: String,
+    },
 }
 
 /// Why a path was left for the next run.
@@ -726,24 +776,74 @@ pub enum DeferredReason {
     SourceChanged,
     /// The local file disappeared while the run was working.
     SourceVanished,
-    /// The local file could not be opened or read.
+    /// The local file could not be opened or read (locked); retried next run.
     SourceUnreadable,
-    /// The local entry is not a regular file or directory the sync carries.
+    /// The local entry is not a regular file or directory the sync carries. Lasting.
     UnsupportedLocalEntry,
-    /// File Station could not compute the remote file's checksum.
+    /// File Station could not compute the remote file's checksum; compared again next run.
     RemoteDigestUnavailable,
     /// The account may not read this remote file; lasting until its permissions change.
     RemoteUnreadable,
-    /// The remote entry changed after planning and was left as found.
+    /// The remote entry changed after planning and was left as found; planned again next run.
     RemoteChanged,
-    /// The remote name cannot exist on this host's filesystem.
+    /// The remote name cannot exist on this host's filesystem; lasting, never deleted on that
+    /// account.
     UnrepresentableName,
     /// The listing of the containing remote folder was incomplete, so no deletion was made there.
+    /// Lasting while DSM keeps listing it short.
     ListingIncomplete,
-    /// The NAS-side copy finished with an error.
+    /// The NAS-side copy finished with an error; uploaded next run.
     ServerCopyFailed,
-    /// The NAS refused the deletion.
+    /// The NAS refused the deletion; retried next run.
     DeleteFailed,
+    /// The NAS refuses this one path (its name, this account's access to it, its size for the
+    /// destination filesystem); lasting until it is renamed or its permissions change.
+    RemoteRefused,
+    /// This account may not read the local file or folder; lasting until its permissions change.
+    LocalPermissionDenied,
+    /// A case-only rename on the NAS did not finish (File Station refused it, or the old spelling
+    /// is still there beside the new one). Nothing was deleted on its account; lasting, and named
+    /// on every run until someone resolves the two spellings.
+    CaseRenamePending,
+    /// A NAS entry the remote walk will not carry (a name this tool cannot address, a link out of
+    /// the destination, a folder seen twice); never deleted, overwritten or descended. Lasting.
+    RemoteSkipped,
+    /// A local name, path or entry kind this tool refuses to carry; lasting until it is renamed.
+    UnsupportedEntry,
+    /// The NAS refuses this account the deletion (no permission); lasting until that changes.
+    DeleteNotPermitted,
+}
+
+impl DeferredReason {
+    /// Whether the path stays left out of every run until someone changes it. Such a path is
+    /// reported, but does not make a run [partial](SyncOutcome::partial). The command line's rule.
+    ///
+    /// Answered by the engine's own rule, so the SDK cannot disagree with the command line.
+    pub fn is_lasting(self) -> bool {
+        self.core().is_lasting()
+    }
+
+    fn core(self) -> sync::DeferReason {
+        match self {
+            Self::SourceChanged => sync::DeferReason::SourceChanged,
+            Self::SourceVanished => sync::DeferReason::SourceVanished,
+            Self::SourceUnreadable => sync::DeferReason::SourceUnreadable,
+            Self::UnsupportedLocalEntry => sync::DeferReason::UnsupportedLocalEntry,
+            Self::RemoteDigestUnavailable => sync::DeferReason::RemoteDigestUnavailable,
+            Self::RemoteUnreadable => sync::DeferReason::RemoteUnreadable,
+            Self::RemoteChanged => sync::DeferReason::RemoteChanged,
+            Self::UnrepresentableName => sync::DeferReason::UnrepresentableName,
+            Self::ListingIncomplete => sync::DeferReason::ListingIncomplete,
+            Self::ServerCopyFailed => sync::DeferReason::ServerCopyFailed,
+            Self::DeleteFailed => sync::DeferReason::DeleteFailed,
+            Self::RemoteRefused => sync::DeferReason::RemoteRefused,
+            Self::LocalPermissionDenied => sync::DeferReason::LocalPermissionDenied,
+            Self::CaseRenamePending => sync::DeferReason::CaseRenamePending,
+            Self::RemoteSkipped => sync::DeferReason::RemoteSkipped,
+            Self::UnsupportedEntry => sync::DeferReason::UnsupportedEntry,
+            Self::DeleteNotPermitted => sync::DeferReason::DeleteNotPermitted,
+        }
+    }
 }
 
 impl From<sync::DeferReason> for DeferredReason {
@@ -760,6 +860,12 @@ impl From<sync::DeferReason> for DeferredReason {
             sync::DeferReason::ListingIncomplete => Self::ListingIncomplete,
             sync::DeferReason::ServerCopyFailed => Self::ServerCopyFailed,
             sync::DeferReason::DeleteFailed => Self::DeleteFailed,
+            sync::DeferReason::RemoteRefused => Self::RemoteRefused,
+            sync::DeferReason::LocalPermissionDenied => Self::LocalPermissionDenied,
+            sync::DeferReason::CaseRenamePending => Self::CaseRenamePending,
+            sync::DeferReason::RemoteSkipped => Self::RemoteSkipped,
+            sync::DeferReason::UnsupportedEntry => Self::UnsupportedEntry,
+            sync::DeferReason::DeleteNotPermitted => Self::DeleteNotPermitted,
         }
     }
 }
@@ -830,6 +936,10 @@ pub enum EventControl {
 }
 
 /// Counts returned after an applied plan.
+///
+/// Carries the same signals the command line reports, so an embedding application is never the
+/// one caller left without them: before these were added, a DSM that ignored the upload `mtime`
+/// made every SDK run re-upload the whole tree with nothing in the outcome to say why (ADV-R-4).
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize)]
 pub struct ExecutionSummary {
     deleted: usize,
@@ -837,6 +947,32 @@ pub struct ExecutionSummary {
     copied: usize,
     uploaded: usize,
     uploaded_bytes: u64,
+    mtime_not_kept: usize,
+    copy_fallbacks: usize,
+    deletes_skipped: usize,
+    kept_deletes_uploaded: usize,
+    renamed: usize,
+}
+
+impl ExecutionSummary {
+    fn from_report(report: &sync::ExecutionReport, client: &ApiClient) -> Self {
+        Self {
+            deleted: report.deleted,
+            created: report.created,
+            copied: report.copied,
+            uploaded: report.uploaded,
+            uploaded_bytes: report.uploaded_bytes,
+            // The command line's sum: copies counted by the executor, uploads by the client,
+            // which is the only place that sees the time DSM kept.
+            mtime_not_kept: report
+                .mtime_not_kept
+                .saturating_add(client.remote_mtime_unhonoured_count()),
+            copy_fallbacks: report.copy_fallbacks,
+            deletes_skipped: report.deletes_skipped,
+            kept_deletes_uploaded: report.kept_deletes_uploaded,
+            renamed: report.renamed,
+        }
+    }
 }
 
 impl ExecutionSummary {
@@ -859,6 +995,33 @@ impl ExecutionSummary {
     pub fn uploaded_bytes(self) -> u64 {
         self.uploaded_bytes
     }
+
+    /// Files written whose modification time DSM did not keep within tolerance of the one sent.
+    /// Non-zero means `metadata` and `content` comparison will see them as changed next run: the
+    /// NAS is ignoring the upload `mtime`, and every run re-uploads them.
+    pub fn mtime_not_kept(self) -> usize {
+        self.mtime_not_kept
+    }
+
+    /// Planned server-side copies DSM refused to start, uploaded instead (also in `uploaded`).
+    pub fn copy_fallbacks(self) -> usize {
+        self.copy_fallbacks
+    }
+
+    /// Planned mirror deletions kept rather than performed.
+    pub fn deletes_skipped(self) -> usize {
+        self.deletes_skipped
+    }
+
+    /// Files uploaded because their planned deletion was kept (not in `uploaded`).
+    pub fn kept_deletes_uploaded(self) -> usize {
+        self.kept_deletes_uploaded
+    }
+
+    /// Case-only renames carried out on the NAS.
+    pub fn renamed(self) -> usize {
+        self.renamed
+    }
 }
 
 /// Result of one complete, logged-out engine run.
@@ -869,8 +1032,12 @@ pub struct SyncOutcome {
     reconciled: bool,
     execution: Option<ExecutionSummary>,
     deferred: Vec<DeferredPath>,
-    #[serde(skip)]
+    /// Serialised, so FFI callers see retries, re-logins, keepalive failures and orphaned server
+    /// tasks too; skipping it left them the only callers who could not (ADV-R-4).
     recovered: crate::api::TransportCounters,
+    /// Root-relative NAS folders whose listing DSM returned incomplete (`""` is the destination
+    /// itself). No deletion is made inside them; reported even when none was planned there.
+    incomplete_listings: Vec<String>,
 }
 
 impl SyncOutcome {
@@ -902,20 +1069,19 @@ impl SyncOutcome {
     pub fn partial(&self) -> bool {
         // The command line's rule: a path that will be left out of every run (a name this host
         // cannot hold, an entry the sync never carries) is reported, but is not "partial".
-        self.deferred.iter().any(|record| {
-            !matches!(
-                record.reason,
-                DeferredReason::UnrepresentableName
-                    | DeferredReason::UnsupportedLocalEntry
-                    | DeferredReason::ListingIncomplete
-                    | DeferredReason::RemoteUnreadable
-            )
-        })
+        self.deferred
+            .iter()
+            .any(|record| !record.reason.is_lasting())
     }
 
     /// Retries, re-logins and abandoned server tasks the run recovered from, or could not.
     pub fn recovered(&self) -> crate::api::TransportCounters {
         self.recovered
+    }
+
+    /// NAS folders whose listing was incomplete, so nothing in them was deleted. See the field.
+    pub fn incomplete_listings(&self) -> &[String] {
+        &self.incomplete_listings
     }
 }
 
@@ -1036,7 +1202,12 @@ impl Engine {
                 )
                 .map_err(SdkError::from_core)?;
             let incomplete_directories = scanned.incomplete_directories;
+            let skipped_remote = scanned.skipped;
             let mut remote = scanned.inventory;
+            // The command line's breaker: link boundaries on most folders mean DSM's real paths
+            // are not what the link guard assumes, and the run fails by name rather than
+            // skipping the tree folder by folder.
+            sync::check_link_boundaries(&remote).map_err(SdkError::from_core)?;
             emit(
                 cancellation,
                 &mut on_event,
@@ -1065,7 +1236,7 @@ impl Engine {
                     },
                 )?;
             }
-            let mut deferred = sync::populate_plan_digests(
+            let mut deferred = sync::populate_plan_digests_with_listings(
                 &client,
                 &mut local,
                 &mut remote,
@@ -1073,6 +1244,7 @@ impl Engine {
                 options.compare,
                 server_copy,
                 options.delete,
+                &incomplete_directories,
                 cancellation,
             )
             .map_err(SdkError::from_core)?;
@@ -1099,6 +1271,14 @@ impl Engine {
                 &mut deferred,
                 sync::withhold_deletions_in_incomplete_listings(&mut plan, &incomplete_directories),
             );
+            // The command line's guards, in its order: a NAS entry the walk would not carry keeps
+            // its folders, and a deferral the plan names among its skips is a record too.
+            merge_deferred(
+                &mut deferred,
+                sync::protect_skipped_remote_entries(&mut plan, &skipped_remote),
+            );
+            let named_in_plan = sync::deferrals_in_plan_skips(&plan, &deferred);
+            merge_deferred(&mut deferred, named_in_plan);
             // This plan is executed, so its uploads need the strong digest the upload path
             // verifies against. See `plan::promote_upload_fingerprints`.
             merge_deferred(
@@ -1134,6 +1314,7 @@ impl Engine {
                     execution: None,
                     deferred: sdk_deferred(&deferred),
                     recovered: client.transport_counters(),
+                    incomplete_listings: incomplete_directories.clone(),
                 });
             }
             check_cancellation(cancellation)?;
@@ -1145,14 +1326,15 @@ impl Engine {
                     phase: Phase::Execution,
                 },
             )?;
-            let report = if plan.is_empty() {
-                crate::sync::ExecutionReport::default()
-            } else {
+            let mut report = crate::sync::ExecutionReport::default();
+            if !plan.is_empty() {
                 // Long local phases are over; touch the session before the first upload so an
                 // idle timeout that expired during hashing is renewed rather than failing it.
                 client.touch_session();
                 let observer_factory: UploadObserverFactory = Arc::new(|_| None);
-                sync::execute_observed(
+                // Reporting what completed even when the run then fails: a mid-run failure used
+                // to lose every deferral and count collected so far from the outcome.
+                let executed = sync::execute_observed_reporting_partial(
                     &client,
                     &root,
                     &plan,
@@ -1162,6 +1344,7 @@ impl Engine {
                     },
                     cancellation.clone(),
                     observer_factory,
+                    &mut report,
                     |event| {
                         if on_event(&SdkEvent::Mutation {
                             mutation: mutation_event(event),
@@ -1170,9 +1353,15 @@ impl Engine {
                             cancellation.cancel();
                         }
                     },
-                )
-                .map_err(SdkError::from_core)?
-            };
+                );
+                if let Err(error) = executed {
+                    merge_deferred(&mut deferred, report.deferred.clone());
+                    return Err(SdkError::from_core(error).with_partial_execution(
+                        ExecutionSummary::from_report(&report, &client),
+                        sdk_deferred(&deferred),
+                    ));
+                }
+            }
             merge_deferred(&mut deferred, report.deferred.clone());
             emit(
                 cancellation,
@@ -1216,15 +1405,10 @@ impl Engine {
                 plan: summary,
                 applied: true,
                 reconciled: true,
-                execution: Some(ExecutionSummary {
-                    deleted: report.deleted,
-                    created: report.created,
-                    copied: report.copied,
-                    uploaded: report.uploaded,
-                    uploaded_bytes: report.uploaded_bytes,
-                }),
+                execution: Some(ExecutionSummary::from_report(&report, &client)),
                 deferred: sdk_deferred(&deferred),
                 recovered: client.transport_counters(),
+                incomplete_listings: incomplete_directories,
             })
         }));
         let operation = match operation {
@@ -1392,7 +1576,7 @@ fn reconciliation_plan(
     check_cancellation(cancellation)?;
     // No promotion: a reconciliation plan is inspected for emptiness, never executed, so nothing
     // consumes an upload's digest here.
-    let mut deferred = sync::populate_plan_digests(
+    let mut deferred = sync::populate_plan_digests_with_listings(
         client,
         &mut local,
         &mut remote,
@@ -1400,6 +1584,7 @@ fn reconciliation_plan(
         run_options.compare,
         run_options.server_copy,
         run_options.delete,
+        &scanned.incomplete_directories,
         cancellation,
     )
     .map_err(SdkError::from_core)?;
@@ -1415,6 +1600,12 @@ fn reconciliation_plan(
         &mut plan,
         &scanned.incomplete_directories,
     ));
+    deferred.extend(sync::protect_skipped_remote_entries(
+        &mut plan,
+        &scanned.skipped,
+    ));
+    let named_in_plan = sync::deferrals_in_plan_skips(&plan, &deferred);
+    deferred.extend(named_in_plan);
     Ok((plan, deferred))
 }
 
@@ -1455,6 +1646,15 @@ fn summarize_plan(plan: &SyncPlan) -> PlanSummary {
         bytes: action.snapshot.size,
         reason: "missing-local".to_owned(),
     }));
+    // A rename changes the NAS as surely as an upload does, so a caller previewing the plan has
+    // to see it before it is applied, not only in the execution count afterwards.
+    changes.extend(plan.renames.iter().map(|action| PlannedChange {
+        operation: PlanOperation::RenameCaseOnly,
+        remote_path: action.to_remote_path.clone(),
+        source: Some(action.from_remote_path.clone()),
+        bytes: 0,
+        reason: "case-only-rename".to_owned(),
+    }));
     PlanSummary {
         changes,
         creates: plan.creates.len(),
@@ -1464,6 +1664,7 @@ fn summarize_plan(plan: &SyncPlan) -> PlanSummary {
         unchanged_files: plan.unchanged_files,
         protected_entries: plan.protected_entries,
         upload_bytes: plan.upload_bytes,
+        renames: plan.renames.len(),
         skipped: plan
             .skipped
             .iter()
@@ -1482,6 +1683,7 @@ fn operation_count(plan: &SyncPlan) -> usize {
         + plan.copies.len()
         + plan.uploads.len()
         + plan.post_deletes.len()
+        + plan.renames.len()
 }
 
 fn mutation_event(event: ExecutionEvent) -> MutationEvent {
@@ -1527,12 +1729,29 @@ fn mutation_event(event: ExecutionEvent) -> MutationEvent {
             relative,
             reason: reason.into(),
         },
+        ExecutionEvent::Renamed {
+            from_remote_path,
+            to_remote_path,
+        } => MutationEvent::Renamed {
+            from_remote_path,
+            to_remote_path,
+        },
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every engine reason has an SDK reason that maps back to it, so `is_lasting` is the engine's.
+    #[test]
+    fn every_deferral_reason_round_trips_through_the_sdk() {
+        for reason in sync::DeferReason::ALL {
+            let sdk = DeferredReason::from(reason);
+            assert_eq!(sdk.core(), reason);
+            assert_eq!(sdk.is_lasting(), reason.is_lasting(), "{}", reason.as_str());
+        }
+    }
 
     #[test]
     fn request_defaults_are_safe_and_fields_are_validated() {

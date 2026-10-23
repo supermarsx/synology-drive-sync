@@ -99,6 +99,27 @@ struct ServerState {
     fail_next_copy: bool,
     /// Whether `Upload` rounds the millisecond `mtime` to the nearest second rather than flooring.
     round_upload_mtime: bool,
+    /// ADV: refuse uploads/creates whose final name exceeds this many UTF-8 bytes (ext4/btrfs 255,
+    /// eCryptfs ~143), answering with the given DSM code.
+    refuse_names_over_bytes: Option<(usize, i64)>,
+    /// ADV: copy tasks whose `status` fails with an envelope error, the shape DSM documents for
+    /// CopyMove failures (codes 1000-1007), rather than an `error` member inside `data`.
+    envelope_failing_copy_tasks: BTreeMap<String, i64>,
+    fail_next_copy_envelope: Option<i64>,
+    /// ADV: DSM ignores the upload `mtime` and stamps this time instead.
+    upload_stamps_mtime: Option<i64>,
+    /// ADV: expire the session when the first request for this operation arrives.
+    expire_session_on: Option<String>,
+    /// Folder symbolic links, link path to target folder, the way a link made over SSH inside a
+    /// share appears to File Station: listed as a folder, and every path through it resolved to
+    /// the target. Each entry's `real_path` (when asked for) is where it really is.
+    symlinks: BTreeMap<String, String>,
+    /// Paths whose `real_path` the mock leaves out even when asked, the way an entry DSM cannot
+    /// resolve might be described.
+    real_path_withheld: BTreeSet<String>,
+    /// Whether every `real_path` is wrong: the entry's name under one unrelated folder, the shape a
+    /// DSM whose real paths mean something other than the link guard assumes would produce.
+    misreport_real_paths: bool,
     /// Actions to run once, when the first request for an operation arrives and before it is
     /// answered: the way a test changes the local tree at a known point in a run.
     request_hooks: Vec<RequestHook>,
@@ -195,6 +216,14 @@ impl MockFileStation {
             failing_copy_tasks: BTreeSet::new(),
             fail_next_copy: false,
             round_upload_mtime: false,
+            refuse_names_over_bytes: None,
+            envelope_failing_copy_tasks: BTreeMap::new(),
+            fail_next_copy_envelope: None,
+            upload_stamps_mtime: None,
+            expire_session_on: None,
+            symlinks: BTreeMap::new(),
+            real_path_withheld: BTreeSet::new(),
+            misreport_real_paths: false,
             request_hooks: Vec::new(),
         }));
         let shutdown = Arc::new(AtomicBool::new(false));
@@ -362,6 +391,68 @@ impl MockFileStation {
             .round_upload_mtime = true;
     }
 
+    #[allow(dead_code)]
+    pub fn refuse_names_over_bytes(&self, limit: usize, code: i64) {
+        self.state
+            .lock()
+            .expect("mock state lock")
+            .refuse_names_over_bytes = Some((limit, code));
+    }
+
+    #[allow(dead_code)]
+    pub fn fail_next_copy_status_with_envelope(&self, code: i64) {
+        self.state
+            .lock()
+            .expect("mock state lock")
+            .fail_next_copy_envelope = Some(code);
+    }
+
+    #[allow(dead_code)]
+    pub fn expire_session_on(&self, operation: &str) {
+        self.state
+            .lock()
+            .expect("mock state lock")
+            .expire_session_on = Some(operation.to_owned());
+    }
+
+    #[allow(dead_code)]
+    pub fn stamp_uploads_with(&self, mtime_seconds: i64) {
+        self.state
+            .lock()
+            .expect("mock state lock")
+            .upload_stamps_mtime = Some(mtime_seconds);
+    }
+
+    /// Make `link` a symbolic link to the folder `target`, the way `ln -s` over SSH does. Opt-in:
+    /// without one, every path resolves to itself.
+    #[allow(dead_code)]
+    pub fn add_directory_symlink(&self, link: &str, target: &str) {
+        self.state
+            .lock()
+            .expect("mock state lock")
+            .symlinks
+            .insert(link.to_owned(), target.to_owned());
+    }
+
+    /// Report every entry's `real_path` wrongly. See the field.
+    #[allow(dead_code)]
+    pub fn misreport_real_paths(&self) {
+        self.state
+            .lock()
+            .expect("mock state lock")
+            .misreport_real_paths = true;
+    }
+
+    /// Describe `path` without a `real_path`, even when one is asked for.
+    #[allow(dead_code)]
+    pub fn withhold_real_path(&self, path: &str) {
+        self.state
+            .lock()
+            .expect("mock state lock")
+            .real_path_withheld
+            .insert(path.to_owned());
+    }
+
     /// Run `action` once, when the next `operation` request arrives and before it is answered.
     #[allow(dead_code)]
     pub fn on_next_request(&self, operation: &str, action: impl FnOnce() + Send + 'static) {
@@ -476,6 +567,18 @@ impl MockFileStation {
             phase: FaultPhase::BeforeOperation,
             response: FaultResponse::ApiError(code),
             remaining: 1,
+        });
+    }
+
+    /// Answer the next `times` requests for `operation` with DSM error `code`, before acting.
+    #[allow(dead_code)]
+    pub fn fail_api_operation_times(&self, operation: &str, code: i64, times: usize) {
+        self.inject_fault(InjectedFault {
+            operation: operation.to_owned(),
+            request_path: None,
+            phase: FaultPhase::BeforeOperation,
+            response: FaultResponse::ApiError(code),
+            remaining: times,
         });
     }
 
@@ -708,6 +811,10 @@ fn route_request(
     {
         return api_error(107);
     }
+    if state.expire_session_on.as_deref() == Some(&format!("{api}.{method}")) {
+        state.expire_session_on = None;
+        state.session_generation += 1;
+    }
     if !valid_session(state, fields, headers) {
         return api_error(119);
     }
@@ -759,19 +866,20 @@ fn route_request(
         }
         ("SYNO.FileStation.List", "getinfo") => {
             let path = first_json_string(fields.get("path"));
-            match path.and_then(|path| node_value(state, &path)) {
+            let real_path = wants_real_path(fields);
+            match path.and_then(|path| listed_node(state, &path, real_path)) {
                 Some(node) => success(json!({"files": [node]})),
                 None => api_error(408),
             }
         }
         ("SYNO.FileStation.List", "list") => {
             let folder = json_string(fields.get("folder_path")).unwrap_or_default();
-            if !state.directories.contains(&folder) {
+            if !state.directories.contains(&resolve_links(state, &folder)) {
                 return api_error(408);
             }
             // Paged the way DSM pages: `offset` and `limit` select from a stable order, and
             // `total` counts the whole directory, including entries DSM withholds from the page.
-            let files = direct_children(state, &folder);
+            let files = listed_children(state, &folder, wants_real_path(fields));
             let hidden = state.hidden_list_entries.get(&folder).copied().unwrap_or(0);
             let total = files.len() + hidden;
             let offset = fields
@@ -824,6 +932,12 @@ fn route_request(
             let Some(name) = first_json_string(fields.get("name")) else {
                 return api_error(101);
             };
+            let parent = resolve_links(state, &parent);
+            if let Some((limit, code)) = state.refuse_names_over_bytes
+                && name.len() > limit
+            {
+                return api_error(code);
+            }
             let path = format!("{}/{}", parent.trim_end_matches('/'), name);
             if fields.get("force_parent").map(String::as_str) == Some("true") {
                 insert_directory_tree(&mut state.directories, &parent);
@@ -844,6 +958,12 @@ fn route_request(
             let Some(parent) = fields.get("path") else {
                 return api_error(101);
             };
+            let parent = &resolve_links(state, parent);
+            if let Some((limit, code)) = state.refuse_names_over_bytes
+                && upload.filename.len() > limit
+            {
+                return api_error(code);
+            }
             if fields.get("create_parents").map(String::as_str) == Some("true") {
                 insert_directory_tree(&mut state.directories, parent);
             }
@@ -860,7 +980,9 @@ fn route_request(
                 .get("mtime")
                 .and_then(|value| value.parse::<i64>().ok())
                 .unwrap_or(0);
-            let mtime_seconds = if state.round_upload_mtime {
+            let mtime_seconds = if let Some(stamp) = state.upload_stamps_mtime {
+                stamp
+            } else if state.round_upload_mtime {
                 (mtime_ms + 500).div_euclid(1000)
             } else {
                 mtime_ms.div_euclid(1000)
@@ -943,6 +1065,10 @@ fn route_request(
             let task = format!("copy-task-{}", state.next_task);
             state.next_task += 1;
             state.copy_tasks.insert(task.clone());
+            if let Some(code) = state.fail_next_copy_envelope.take() {
+                state.envelope_failing_copy_tasks.insert(task.clone(), code);
+                return success(json!({"taskid": task}));
+            }
             if std::mem::take(&mut state.fail_next_copy) {
                 state.failing_copy_tasks.insert(task.clone());
                 return success(json!({"taskid": task}));
@@ -961,6 +1087,9 @@ fn route_request(
             if !state.copy_tasks.contains(&task) {
                 return api_error(408);
             }
+            if let Some(code) = state.envelope_failing_copy_tasks.get(&task) {
+                return api_error(*code);
+            }
             if state.failing_copy_tasks.contains(&task) {
                 return success(json!({
                     "finished": true,
@@ -969,10 +1098,67 @@ fn route_request(
             }
             success(json!({"finished": true}))
         }
+        ("SYNO.FileStation.Rename", "rename") => {
+            let Some(path) = first_json_string(fields.get("path")) else {
+                return api_error(101);
+            };
+            let Some(name) = first_json_string(fields.get("name")) else {
+                return api_error(101);
+            };
+            let path = resolve_links(state, &path);
+            let Some((parent, _)) = path.rsplit_once('/') else {
+                return api_error(400);
+            };
+            if name.is_empty() || name.contains('/') {
+                return api_error(418);
+            }
+            let renamed = format!("{parent}/{name}");
+            if renamed == path {
+                return success(json!({"files": [{"path": renamed, "name": name}]}));
+            }
+            // Case-sensitive, as ext4 and btrfs are: a case-only rename is an ordinary rename,
+            // and only an entry that already holds the exact new name refuses it.
+            if state.files.contains_key(&renamed) || state.directories.contains(&renamed) {
+                return api_error(414);
+            }
+            if let Some(file) = state.files.remove(&path) {
+                state.files.insert(renamed.clone(), file);
+            } else if state.directories.contains(&path) {
+                let prefix = format!("{path}/");
+                let moved_directories = state
+                    .directories
+                    .iter()
+                    .filter(|candidate| **candidate == path || candidate.starts_with(&prefix))
+                    .cloned()
+                    .collect::<Vec<_>>();
+                for directory in moved_directories {
+                    state.directories.remove(&directory);
+                    state
+                        .directories
+                        .insert(format!("{renamed}{}", &directory[path.len()..]));
+                }
+                let moved_files = state
+                    .files
+                    .keys()
+                    .filter(|candidate| candidate.starts_with(&prefix))
+                    .cloned()
+                    .collect::<Vec<_>>();
+                for file in moved_files {
+                    let node = state.files.remove(&file).expect("listed above");
+                    state
+                        .files
+                        .insert(format!("{renamed}{}", &file[path.len()..]), node);
+                }
+            } else {
+                return api_error(408);
+            }
+            success(json!({"files": [{"path": renamed, "name": name}]}))
+        }
         ("SYNO.FileStation.Delete", "delete") => {
             let Some(path) = first_json_string(fields.get("path")) else {
                 return api_error(101);
             };
+            let path = resolve_links(state, &path);
             if state.files.remove(&path).is_some() {
                 return success(Value::Null);
             }
@@ -1089,7 +1275,8 @@ fn discovery() -> Value {
             "SYNO.FileStation.MD5": {"path": "entry.cgi", "minVersion": 1, "maxVersion": 2},
             "SYNO.FileStation.Download": {"path": "entry.cgi", "minVersion": 1, "maxVersion": 2},
             "SYNO.FileStation.CopyMove": {"path": "entry.cgi", "minVersion": 1, "maxVersion": 3},
-            "SYNO.FileStation.CheckPermission": {"path": "entry.cgi", "minVersion": 3, "maxVersion": 3}
+            "SYNO.FileStation.CheckPermission": {"path": "entry.cgi", "minVersion": 3, "maxVersion": 3},
+            "SYNO.FileStation.Rename": {"path": "entry.cgi", "minVersion": 1, "maxVersion": 2}
         }
     })
 }
@@ -1168,6 +1355,74 @@ fn api_error_with_marker(code: i64, marker: &str) -> MockResponse {
         "success": false,
         "error": {"code": code, "errors": {"token": marker}}
     }))
+}
+
+/// Whether the request asked for each entry's `real_path`.
+fn wants_real_path(fields: &BTreeMap<String, String>) -> bool {
+    fields
+        .get("additional")
+        .is_some_and(|additional| additional.contains("real_path"))
+}
+
+/// The path File Station really operates on: every folder link along `path` followed. Bounded, so
+/// a link cycle resolves to *something* rather than hanging the mock.
+fn resolve_links(state: &ServerState, path: &str) -> String {
+    let mut resolved = path.to_owned();
+    for _ in 0..32 {
+        let Some((link, target)) = state
+            .symlinks
+            .iter()
+            .find(|(link, _)| resolved == **link || resolved.starts_with(&format!("{link}/")))
+        else {
+            break;
+        };
+        resolved = format!("{target}{}", &resolved[link.len()..]);
+    }
+    resolved
+}
+
+/// One entry as File Station describes it at the path it was asked about, links followed.
+fn listed_node(state: &ServerState, path: &str, real_path: bool) -> Option<Value> {
+    let resolved = resolve_links(state, path);
+    let mut node = node_value(state, &resolved)?;
+    node["path"] = json!(path);
+    node["name"] = json!(path.rsplit('/').next().unwrap_or(path));
+    if real_path && !state.real_path_withheld.contains(path) {
+        node["additional"]["real_path"] = if state.misreport_real_paths {
+            let name = resolved.rsplit('/').next().unwrap_or(&resolved);
+            json!(format!("/volume1/@misreported/{name}"))
+        } else {
+            json!(format!("/volume1{resolved}"))
+        };
+    }
+    Some(node)
+}
+
+/// A folder's children as listed through `folder`, links followed, each with its listed path.
+fn listed_children(state: &ServerState, folder: &str, real_path: bool) -> Vec<Value> {
+    let resolved = resolve_links(state, folder);
+    let prefix = format!("{}/", resolved.trim_end_matches('/'));
+    let mut names = direct_children(state, &resolved)
+        .iter()
+        .filter_map(|child| child["name"].as_str().map(str::to_owned))
+        .collect::<BTreeSet<_>>();
+    names.extend(
+        state
+            .symlinks
+            .keys()
+            .filter(|link| link.starts_with(&prefix) && !link[prefix.len()..].contains('/'))
+            .map(|link| link[prefix.len()..].to_owned()),
+    );
+    names
+        .into_iter()
+        .filter_map(|name| {
+            listed_node(
+                state,
+                &format!("{}/{name}", folder.trim_end_matches('/')),
+                real_path,
+            )
+        })
+        .collect()
 }
 
 fn node_value(state: &ServerState, path: &str) -> Option<Value> {

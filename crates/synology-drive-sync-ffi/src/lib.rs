@@ -127,6 +127,15 @@ struct FfiFailure {
     status: i32,
     code: &'static str,
     message: String,
+    /// What execution completed, and deferred, before a run failed part-way through. Boxed, so
+    /// the common failure stays small.
+    partial: Option<Box<PartialFailure>>,
+}
+
+#[derive(Debug)]
+struct PartialFailure {
+    completed: synology_drive_sync::sdk::ExecutionSummary,
+    deferred: Vec<synology_drive_sync::sdk::DeferredPath>,
 }
 
 impl FfiFailure {
@@ -135,6 +144,7 @@ impl FfiFailure {
             status: SDSYNC_STATUS_INVALID_ARGUMENT,
             code: "invalid-argument",
             message: message.into(),
+            partial: None,
         }
     }
 
@@ -143,6 +153,7 @@ impl FfiFailure {
             status: SDSYNC_STATUS_CALLBACK_FAILED,
             code: "callback-failed",
             message: message.into(),
+            partial: None,
         }
     }
 
@@ -151,6 +162,7 @@ impl FfiFailure {
             status: SDSYNC_STATUS_PANIC,
             code: "panic",
             message: "the Rust library caught an internal panic".to_owned(),
+            partial: None,
         }
     }
 }
@@ -169,6 +181,12 @@ struct ResultEnvelope<T: Serialize> {
 struct ErrorEnvelope {
     code: String,
     message: String,
+    /// Present when the run failed part-way through execution: what it completed first.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    completed: Option<synology_drive_sync::sdk::ExecutionSummary>,
+    /// Paths the run had deferred before it failed.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    deferred: Vec<synology_drive_sync::sdk::DeferredPath>,
 }
 
 #[derive(Serialize)]
@@ -605,6 +623,12 @@ unsafe fn run_inner(
             status,
             code: error_code_name(error.code()),
             message: error.message().to_owned(),
+            partial: error.completed().map(|completed| {
+                Box::new(PartialFailure {
+                    completed,
+                    deferred: error.deferred().to_vec(),
+                })
+            }),
         }
     })
 }
@@ -727,6 +751,7 @@ fn invoke_plan(
             status: SDSYNC_STATUS_CANCELLED,
             code: "cancelled",
             message: "plan callback cancelled the operation".to_owned(),
+            partial: None,
         }),
         _ => Err(FfiFailure::callback(
             "plan callback returned an unknown decision",
@@ -777,6 +802,12 @@ fn serialize_failure(failure: &FfiFailure) -> Vec<u8> {
         error: Some(ErrorEnvelope {
             code: failure.code.to_owned(),
             message: failure.message.clone(),
+            completed: failure.partial.as_ref().map(|partial| partial.completed),
+            deferred: failure
+                .partial
+                .as_ref()
+                .map(|partial| partial.deferred.clone())
+                .unwrap_or_default(),
         }),
     })
     .unwrap_or_else(serialization_fallback)

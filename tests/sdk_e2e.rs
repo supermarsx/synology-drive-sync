@@ -9,8 +9,9 @@ use support::TestDir;
 use support::file_station_mock::MockFileStation;
 use synology_drive_sync::cancel::CancellationToken;
 use synology_drive_sync::sdk::{
-    DeferredReason, Engine, ErrorCode, EventControl, MutationEvent, OtpChallenge, PlanDecision,
-    SdkEvent, Secret, SecretProvider, SecretProviderError, SyncRequest,
+    Comparison, DeferredReason, DeletionPolicy, Engine, ErrorCode, EventControl, MutationEvent,
+    OtpChallenge, PlanDecision, PlanOperation, SdkError, SdkEvent, Secret, SecretProvider,
+    SecretProviderError, SyncOutcome, SyncRequest,
 };
 
 struct FixedSecrets {
@@ -461,4 +462,254 @@ fn a_file_changing_during_hashing_makes_an_sdk_run_partial_not_failed() {
     assert!(server.file_contents("/team/sdk/busy.log").is_none());
     // Deferred during planning, so it is reported in the outcome rather than as an execution event.
     assert_eq!(deferred_events.load(Ordering::Acquire), 0);
+}
+
+fn run_applying(request: &SyncRequest) -> Result<SyncOutcome, SdkError> {
+    let mut secrets = FixedSecrets::new();
+    Engine.run(
+        request,
+        &mut secrets,
+        &CancellationToken::default(),
+        |_| PlanDecision::Apply,
+        |_| EventControl::Continue,
+    )
+}
+
+/// ADV-R-4: a DSM that ignores the upload `mtime` makes every run re-upload the whole tree. The
+/// command line warns and counts it; the SDK outcome said nothing at all.
+#[test]
+fn an_ignored_upload_mtime_is_counted_in_the_sdk_outcome() {
+    let server = MockFileStation::start();
+    server.stamp_uploads_with(1_800_000_000);
+    let source = TestDir::new("sdk-mtime");
+    source.write("a.txt", b"a");
+    source.write("b.txt", b"b");
+    let request = SyncRequest::builder(server.base_url(), "e2e-user", source.path(), "/team/sdk")
+        .allow_http(true)
+        .comparison(Comparison::Metadata)
+        .build()
+        .expect("build SDK request");
+
+    for run in 1..=2 {
+        let outcome = run_applying(&request).expect("SDK run succeeds");
+        let execution = outcome.execution().expect("executed");
+        assert_eq!(execution.uploaded(), 2, "run {run}");
+        assert_eq!(
+            execution.mtime_not_kept(),
+            2,
+            "run {run}: the reason every file is re-uploaded is reported"
+        );
+    }
+}
+
+/// ADV-R-4: `recovered` reaches the serialised outcome, which is what the FFI returns.
+#[test]
+fn the_serialised_outcome_carries_what_the_run_recovered_from() {
+    let server = MockFileStation::start();
+    server.fail_next_http_operation("SYNO.FileStation.Upload.upload", 502);
+    let source = TestDir::new("sdk-recovered");
+    source.write("a.txt", b"a");
+    let request = SyncRequest::builder(server.base_url(), "e2e-user", source.path(), "/team/sdk")
+        .allow_http(true)
+        .build()
+        .expect("build SDK request");
+
+    let outcome = run_applying(&request).expect("SDK run succeeds");
+
+    assert_eq!(outcome.recovered().retries, 1);
+    let document = serde_json::to_value(&outcome).expect("serialise outcome");
+    assert_eq!(document["recovered"]["retries"], 1, "{document}");
+    for key in [
+        "reauthentications",
+        "reauthentication_failures",
+        "keepalive_failures",
+        "server_tasks_not_stopped",
+    ] {
+        assert_eq!(document["recovered"][key], 0, "{key}: {document}");
+    }
+    for key in [
+        "mtime_not_kept",
+        "copy_fallbacks",
+        "deletes_skipped",
+        "kept_deletes_uploaded",
+        "renamed",
+    ] {
+        assert_eq!(document["execution"][key], 0, "{key}: {document}");
+    }
+}
+
+/// ADV-R-4: a folder whose listing DSM returned incomplete is named even when no deletion was
+/// planned there, as the command line names it.
+#[test]
+fn an_incomplete_remote_listing_is_named_in_the_sdk_outcome() {
+    let server = MockFileStation::start();
+    server.add_directory("/team/sdk");
+    server.add_directory("/team/sdk/abe");
+    server.add_file("/team/sdk/abe/visible.txt", b"v", 1_700_000_000);
+    server.hide_list_entries("/team/sdk/abe", 1);
+    let source = TestDir::new("sdk-incomplete");
+    source.write("abe/visible.txt", b"v");
+    let request = SyncRequest::builder(server.base_url(), "e2e-user", source.path(), "/team/sdk")
+        .allow_http(true)
+        .build()
+        .expect("build SDK request");
+
+    let outcome = run_applying(&request).expect("SDK run succeeds");
+
+    assert_eq!(outcome.incomplete_listings(), ["abe".to_owned()]);
+    let document = serde_json::to_value(&outcome).expect("serialise outcome");
+    assert_eq!(document["incomplete_listings"][0], "abe");
+}
+
+/// ADV-R-4: a run that fails part-way still says what it completed first. Before, the error
+/// carried only a message, and the folder this run had already created was reported nowhere.
+#[test]
+fn a_run_failing_mid_execution_reports_what_it_completed() {
+    let server = MockFileStation::start();
+    server.add_directory("/team/sdk");
+    server.fail_next_api_operation("SYNO.FileStation.Upload.upload", 415);
+    let source = TestDir::new("sdk-partial-failure");
+    source.write("dir/x.txt", b"x");
+    let request = SyncRequest::builder(server.base_url(), "e2e-user", source.path(), "/team/sdk")
+        .allow_http(true)
+        .build()
+        .expect("build SDK request");
+
+    let error = run_applying(&request).expect_err("quota exceeded fails the run");
+
+    assert!(
+        error.message().contains("/team/sdk/dir/x.txt"),
+        "{}",
+        error.message()
+    );
+    let completed = error.completed().expect("execution had started");
+    assert_eq!(
+        completed.created(),
+        1,
+        "the folder was created before the failure"
+    );
+    assert_eq!(completed.uploaded(), 0);
+}
+
+/// ADV-R-4: a planned server-side copy DSM refuses to start is uploaded instead, and counted.
+#[test]
+fn a_copy_fallback_is_counted_in_the_sdk_outcome() {
+    let server = MockFileStation::start();
+    server.add_directory("/team/sdk");
+    server.add_directory("/team/sdk/old");
+    let source = TestDir::new("sdk-copy-fallback");
+    let local = source.write("new/item.bin", b"copy-me-on-nas");
+    let mtime = std::fs::metadata(&local)
+        .unwrap()
+        .modified()
+        .unwrap()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    server.add_file("/team/sdk/old/item.bin", b"copy-me-on-nas", mtime);
+    server.fail_next_api_operation("SYNO.FileStation.CopyMove.start", 407);
+    let request = SyncRequest::builder(server.base_url(), "e2e-user", source.path(), "/team/sdk")
+        .allow_http(true)
+        .comparison(Comparison::Content)
+        .build()
+        .expect("build SDK request");
+
+    let outcome = run_applying(&request).expect("SDK run succeeds");
+
+    let execution = outcome.execution().expect("executed");
+    assert_eq!(execution.copy_fallbacks(), 1, "{execution:?}");
+    assert_eq!(
+        server.file_contents("/team/sdk/new/item.bin"),
+        Some(b"copy-me-on-nas".to_vec())
+    );
+}
+
+/// ADV-R-2 through the SDK: a remote name this tool cannot address no longer fails the run, is
+/// never deleted, and its folder is kept and named.
+#[test]
+fn an_unaddressable_remote_name_is_named_and_its_folder_kept_by_the_sdk() {
+    let server = MockFileStation::start();
+    server.add_directory("/team/sdk");
+    server.add_directory("/team/sdk/photos");
+    server.add_file("/team/sdk/photos/Icon\r", b"", 1_700_000_000);
+    let source = TestDir::new("sdk-icon");
+    source.write("a.txt", b"a");
+    let request = SyncRequest::builder(server.base_url(), "e2e-user", source.path(), "/team/sdk")
+        .allow_http(true)
+        .deletion(DeletionPolicy::bounded(100).expect("deletion policy"))
+        .build()
+        .expect("build SDK request");
+
+    let outcome = run_applying(&request).expect("an odd remote name does not fail the run");
+
+    assert!(server.file_contents("/team/sdk/photos/Icon\r").is_some());
+    assert!(
+        server
+            .directories()
+            .contains(&"/team/sdk/photos".to_owned())
+    );
+    assert!(
+        outcome
+            .deferred()
+            .iter()
+            .any(|record| record.reason() == DeferredReason::RemoteSkipped),
+        "{:?}",
+        outcome.deferred()
+    );
+    // A lasting, named warning: only the user can fix the name, so the run is complete rather
+    // than partial, which would re-run forever under a realtime trigger (main's decision).
+    assert!(DeferredReason::RemoteSkipped.is_lasting());
+    assert!(
+        !outcome.partial(),
+        "a skipped NAS entry is a lasting warning, not a partial run"
+    );
+}
+
+/// A case-only rename is in the plan an SDK caller previews, before it is applied: counted, listed
+/// among the changes, and enough on its own to make the plan non-empty.
+#[test]
+fn a_case_only_rename_is_visible_in_the_previewed_plan() {
+    let server = MockFileStation::start();
+    server.add_directory("/team/sdk");
+    server.add_directory("/team/sdk/Photos");
+    server.add_file("/team/sdk/Photos/a.jpg", b"jpeg-a", 1_700_000_000);
+    let source = TestDir::new("sdk-rename-preview");
+    source.write("photos/a.jpg", b"jpeg-a");
+    let request = SyncRequest::builder(server.base_url(), "e2e-user", source.path(), "/team/sdk")
+        .allow_http(true)
+        .comparison(Comparison::Content)
+        .deletion(DeletionPolicy::bounded(100).expect("deletion policy"))
+        .build()
+        .expect("build SDK request");
+    let mut secrets = FixedSecrets::new();
+
+    let outcome = Engine
+        .run(
+            &request,
+            &mut secrets,
+            &CancellationToken::default(),
+            |_| PlanDecision::PreviewOnly,
+            |_| EventControl::Continue,
+        )
+        .expect("preview succeeds");
+
+    let plan = outcome.plan();
+    assert_eq!(plan.renames(), 1, "{plan:?}");
+    assert!(!plan.is_empty());
+    let rename = plan
+        .changes()
+        .iter()
+        .find(|change| change.operation() == PlanOperation::RenameCaseOnly)
+        .expect("the rename is listed among the changes");
+    assert_eq!(rename.remote_path(), "/team/sdk/photos");
+    assert_eq!(rename.source(), Some("/team/sdk/Photos"));
+    let document = serde_json::to_value(plan).expect("serialise plan");
+    assert_eq!(document["renames"], 1, "{document}");
+    assert!(
+        server
+            .requests()
+            .iter()
+            .all(|request| request.operation() != "SYNO.FileStation.Rename.rename"),
+        "a preview renames nothing"
+    );
 }
