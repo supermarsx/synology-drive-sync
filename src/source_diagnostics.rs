@@ -328,15 +328,21 @@ mod tests {
         let root = TestDir::new("scanner-guard");
         fs::write(root.path().join("~unsupported"), b"payload").unwrap();
 
+        // A name the sync refuses is the scanner's skip (ADV-E-3), and the diagnosis reports it
+        // exactly as the sync would.
+        let report = diagnose_source(
+            root.path(),
+            &[],
+            SourceDiagnosticOptions::default(),
+            &CancellationToken::default(),
+        )
+        .unwrap();
         assert!(matches!(
-            diagnose_source(
-                root.path(),
-                &[],
-                SourceDiagnosticOptions::default(),
-                &CancellationToken::default(),
-            ),
-            Err(Error::UnsupportedLocalEntry { .. })
+            report.inventory.skipped.as_slice(),
+            [local::SkippedEntry { relative, reason: local::SkipReason::Deferred { detail } }]
+                if relative == "~unsupported" && detail.starts_with("unsupported-entry: ")
         ));
+        assert!(!report.inventory.entries.contains_key("~unsupported"));
     }
 
     /// A file that changes while it is hashed is reported as the sync would report it, named and

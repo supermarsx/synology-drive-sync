@@ -298,12 +298,18 @@ fn routing_only_doctor_stops_after_reverse_proxy_discovery() {
         .as_array()
         .expect("File Station tier");
     assert_eq!(file_station.len(), 12);
+    let unused = file_station
+        .iter()
+        .find(|api| api["name"] == "SYNO.FileStation.VirtualFolder")
+        .expect("an advertised API this tool does not use");
+    assert_eq!(unused["used"], false);
+    assert_eq!(unused["required_version"], Value::Null);
+    // Case-only renames are carried by File Station Rename now (ADV-E-1).
     let rename = file_station
         .iter()
         .find(|api| api["name"] == "SYNO.FileStation.Rename")
-        .expect("an advertised API this tool does not use");
-    assert_eq!(rename["used"], false);
-    assert_eq!(rename["required_version"], Value::Null);
+        .expect("Rename is advertised");
+    assert_eq!(rename["used"], true, "{rename}");
     // Tier 3 counts everything else by namespace rather than naming it.
     assert_eq!(
         capabilities["namespaces"]
@@ -2027,6 +2033,7 @@ fn additive_plan_then_sync_preserves_folder_parity_and_verifies_every_upload() {
             "server_copies": 0,
             "directories": 2,
             "deletions": 0,
+            "renames": 0,
             "unchanged_files": 0,
             "protected_entries": 0,
             "changes": true
@@ -3628,6 +3635,7 @@ fn destructive_type_conflicts_delete_deepest_first_then_fully_reconcile() {
             "server_copies": 0,
             "directories": 0,
             "deletions": 0,
+            "renames": 0,
             "unchanged_files": 3,
             "protected_entries": 0,
             "changes": false
@@ -5041,14 +5049,24 @@ fn a_case_rename_whose_upload_is_deferred_never_deletes_the_old_spelling() {
             .all(|request| request.operation() != "SYNO.FileStation.Delete.delete"),
         "the old spelling must not be deleted while the new one is not on the NAS"
     );
+    // ADV-E-1: the case-only rename is a File Station Rename, not an upload and a deletion, so
+    // the deferred upload takes nothing with it: the NAS holds the last good content under exactly
+    // one spelling, and the edit is named for the next run.
     assert_eq!(
-        server.file_contents("/team/rename/Report.pdf"),
+        server.file_paths(),
+        vec!["/team/rename/report.pdf".to_owned()],
+        "{document}"
+    );
+    assert_eq!(
+        server.file_contents("/team/rename/report.pdf"),
         Some(b"report body".to_vec())
     );
     let deferred = document["result"]["deferred"].as_array().unwrap();
     assert!(
-        deferred.iter().any(|record| record["path"] == "Report.pdf"),
-        "the withheld deletion is named: {deferred:?}"
+        deferred
+            .iter()
+            .any(|record| record["path"] == "report.pdf" && record["reason"] == "source-changed"),
+        "the deferred upload is named: {deferred:?}"
     );
 }
 

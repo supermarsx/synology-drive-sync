@@ -197,6 +197,15 @@ pub(crate) fn drive_path_issue(path: &str) -> Option<String> {
                 "a path component exceeds Synology Drive's 255-character limit".to_owned(),
             );
         }
+        // The NAS volume's own limit is 255 *bytes* per name (ext4 and btrfs NAME_MAX), which a
+        // name of 86 CJK characters already exceeds. DSM refuses it on upload; refusing it here
+        // names it before anything is sent.
+        if component.len() > 255 {
+            return Some(format!(
+                "a path component is {} bytes in UTF-8, over the NAS filesystem's 255-byte name limit",
+                component.len()
+            ));
+        }
         if component.starts_with('~') {
             return Some(
                 "names beginning with ~ are not synchronized by Synology Drive".to_owned(),

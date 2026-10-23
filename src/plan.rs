@@ -1,5 +1,5 @@
 use std::borrow::Cow;
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::PathBuf;
 
 use crate::api::{RemoteEntry, RemoteInventory};
@@ -154,13 +154,15 @@ pub enum ChangeReason {
     SizeDiffers,
     /// Sizes agree and the File Station-resolution modification times differ.
     MtimeDiffers,
-    /// Sizes agree and the content digests were both present and did not compare equal.
+    /// Sizes agree and the content digests were both present and did not compare equal. The
+    /// comparison is by MD5: File Station's server-side digest is the only one the NAS computes
+    /// without a transfer. The full MD5/CRC32/SHA-256 fingerprint guards deletions and server copies.
     ContentDiffers,
     /// Sizes and modification times agree but the local file carries no digest, so no content
     /// comparison happened. The file is scheduled rather than assumed equal.
     LocalDigestUnavailable,
-    /// Sizes and modification times agree but no complete remote MD5/CRC32/SHA-256 fingerprint was retrieved, so no content
-    /// comparison happened. The file is scheduled rather than assumed equal.
+    /// Sizes and modification times agree but File Station produced no MD5 digest for the remote
+    /// file, so no content comparison happened. The file is scheduled rather than assumed equal.
     RemoteDigestUnavailable,
     /// A remote entry of the other kind occupies the path and is replaced.
     TypeReplaced,
@@ -188,14 +190,12 @@ impl ChangeReason {
             Self::MissingRemote => "no remote entry at this path",
             Self::SizeDiffers => "local and remote sizes differ",
             Self::MtimeDiffers => "size equal, modification time differs",
-            Self::ContentDiffers => {
-                "size equal, complete MD5/CRC32/SHA-256 fingerprint did not match"
-            }
+            Self::ContentDiffers => "size equal, MD5 content digests differ",
             Self::LocalDigestUnavailable => {
-                "size and time equal, no complete local MD5/CRC32/SHA-256 fingerprint, uploading unverified"
+                "size and time equal, no local MD5 content digest, uploading unverified"
             }
             Self::RemoteDigestUnavailable => {
-                "size and time equal, no complete remote MD5/CRC32/SHA-256 fingerprint, uploading unverified"
+                "size and time equal, no MD5 content digest from the NAS, uploading unverified"
             }
             Self::TypeReplaced => "remote entry has the conflicting kind",
             Self::Forced => "comparison skipped, forced re-upload overwrites the remote copy",
@@ -266,6 +266,26 @@ pub struct DeleteAction {
     pub destination_guard: Option<DestinationGuard>,
 }
 
+/// A case-only rename, carried by File Station Rename rather than by an upload and a deletion.
+///
+/// The NAS entry keeps its content, its DSM-managed children (`@eaDir` thumbnails) and its Drive
+/// version history. Everything else the plan does to that entry is planned against its current
+/// spelling, and the rename runs after every other operation, deepest first, so each one names its
+/// parent by the spelling the parent still has.
+#[derive(Clone, Debug)]
+pub struct RenameAction {
+    /// The local spelling the entry takes.
+    pub relative: String,
+    /// The entry as the plan found it.
+    pub from_relative: String,
+    pub from_remote_path: String,
+    /// The new final component.
+    pub new_name: String,
+    /// Where the entry is once renamed, under its parent's current spelling.
+    pub to_remote_path: String,
+    pub kind: EntryKind,
+}
+
 #[derive(Clone, Debug)]
 pub struct SyncPlan {
     /// The local tree this plan was derived from.
@@ -295,6 +315,8 @@ pub struct SyncPlan {
     pub copies: Vec<CopyAction>,
     pub uploads: Vec<UploadAction>,
     pub post_deletes: Vec<DeleteAction>,
+    /// Case-only renames, deepest first. Executed last.
+    pub renames: Vec<RenameAction>,
     pub unchanged_files: usize,
     pub protected_entries: usize,
     pub upload_bytes: u64,
@@ -317,6 +339,7 @@ impl SyncPlan {
             && self.copies.is_empty()
             && self.uploads.is_empty()
             && self.post_deletes.is_empty()
+            && self.renames.is_empty()
     }
 }
 
@@ -343,54 +366,153 @@ pub fn select_deletion_guard_hashes(
     remote: &RemoteInventory,
     rules: &IgnoreRules,
 ) -> BTreeSet<String> {
-    let pairs = Correspondence::build(local, remote);
+    select_deletion_guard_hashes_excluding(local, remote, rules, &[])
+}
+
+/// [`select_deletion_guard_hashes`], leaving out the deletions a short listing of one of
+/// `incomplete` withholds anyway.
+pub fn select_deletion_guard_hashes_excluding(
+    local: &LocalInventory,
+    remote: &RemoteInventory,
+    rules: &IgnoreRules,
+    incomplete: &[String],
+) -> BTreeSet<String> {
+    let resolution = resolve(local, remote, rules, true, Vec::new());
+    deletion_guard_candidates(local, remote, rules, &resolution, incomplete)
+}
+
+/// The remote files a mirror deletion could actually remove, which are the only ones whose
+/// deletion guard is worth a download.
+///
+/// A file the plan can never delete -- shielded because the local walk skipped its counterpart
+/// (a OneDrive placeholder, a SYSTEM file, a link), because its spelling could not be resolved, or
+/// because the listing of its folder came back short -- used to be selected anyway. Its strong
+/// digest is a full download, paid on every run (and again for reconciliation), for a deletion the
+/// plan then declined. The same shield and the same short-listing rule that decide the deletion
+/// now decide the download.
+fn deletion_guard_candidates(
+    local: &LocalInventory,
+    remote: &RemoteInventory,
+    rules: &IgnoreRules,
+    resolution: &Resolution,
+    incomplete: &[String],
+) -> BTreeSet<String> {
     let mut selected = BTreeSet::new();
     for entry in remote.entries.values() {
         // An empty file's content is known without reading it, so its deletion is guarded by its
         // size alone. See `deletion_snapshot`.
-        if entry.kind != EntryKind::File || entry.size == 0 || is_protected(entry, rules) {
+        if entry.kind != EntryKind::File
+            || entry.size == 0
+            || is_protected(entry, rules)
+            || resolution.shield.covers(&entry.relative)
+            || resolution.is_leftover(&entry.relative)
+        {
             continue;
         }
-        let is_delete_candidate = pairs
+        let is_delete_candidate = resolution
+            .pairs
             .local_of(local, &entry.relative)
             .is_none_or(|local_entry| local_entry.kind != EntryKind::File);
-        if is_delete_candidate {
+        // A type-conflict pre-delete (a local file above it) is not withheld by a short listing;
+        // only a mirror deletion is.
+        if is_delete_candidate
+            && (!listing_withholds(&entry.relative, incomplete)
+                || has_local_file_ancestor(&entry.relative, local))
+        {
             selected.insert(entry.relative.clone());
         }
     }
     selected
 }
 
+/// The remote files whose deletion guard [`select_deletion_guard_hashes_excluding`] left out
+/// because a short listing withholds their deletion anyway.
+///
+/// Their deletion is planned before it is withheld, and a content-mode deletion without its
+/// digest fails the plan closed. So the caller takes each one out of the run up front, by name,
+/// as the listing-incomplete deferral it would have become.
+pub fn deletions_withheld_by_listing(
+    local: &LocalInventory,
+    remote: &RemoteInventory,
+    rules: &IgnoreRules,
+    incomplete: &[String],
+) -> BTreeSet<String> {
+    if incomplete.is_empty() {
+        return BTreeSet::new();
+    }
+    let resolution = resolve(local, remote, rules, true, Vec::new());
+    let everything = deletion_guard_candidates(local, remote, rules, &resolution, &[]);
+    let selected = deletion_guard_candidates(local, remote, rules, &resolution, incomplete);
+    everything.difference(&selected).cloned().collect()
+}
+
+/// Whether a short listing of one of `incomplete` withholds a mirror deletion of `relative`.
+///
+/// The folder itself, its direct children and every folder above it are withheld: an entry missing
+/// from a short listing may simply be one DSM did not return.
+pub fn listing_withholds(relative: &str, incomplete: &[String]) -> bool {
+    if incomplete.is_empty() {
+        return false;
+    }
+    let parent = relative.rfind('/').map_or("", |slash| &relative[..slash]);
+    incomplete.iter().any(|directory| {
+        parent == directory
+            || relative == directory
+            || directory
+                .strip_prefix(relative)
+                .is_some_and(|rest| rest.starts_with('/'))
+    })
+}
+
 /// Select the remote files a same-path comparison needs a digest for, and nothing else.
 ///
-/// These are the entries where local and remote agree on size *and* modification time, so only a
-/// digest can separate "identical" from "changed without moving either". Every other pairing is
-/// already decided: a size difference short-circuits before any digest is read, and a modification
-/// time difference is reported as such.
+/// These are the entries where local and remote agree on size, so only a digest can separate
+/// "identical" from "changed". A size difference short-circuits before any digest is read.
+///
+/// A modification time difference does not. Content mode used to upload every same-size file whose
+/// time had moved without looking at its content: every file on a FAT32 volume after a daylight
+/// saving change, every file after a restore or a `touch`, and every file on every run on a DSM that
+/// does not keep the time an upload sends. One server-side MD5 now settles each of those instead of
+/// a full transfer. Metadata mode never asks for these, so its cost is unchanged.
 ///
 /// This set is the whole tree in the steady state, which is exactly why its digests must be cheap
 /// to obtain. Nothing here guards a mutation -- the answer only decides whether to upload -- so an
 /// MD5 comparison is sufficient and [`select_strong_remote_digests`] carries the rest.
+///
+/// `delete` is the run's own: it decides whether a case-only rename pairs the two spellings, and
+/// so which remote file a local one is compared with.
 pub fn select_comparison_remote_digests(
     local: &LocalInventory,
     remote: &RemoteInventory,
     rules: &IgnoreRules,
+    delete: bool,
 ) -> BTreeSet<String> {
-    let pairs = Correspondence::build(local, remote);
+    let resolution = resolve(local, remote, rules, delete, Vec::new());
+    comparison_candidates(local, remote, rules, &resolution)
+}
+
+fn comparison_candidates(
+    local: &LocalInventory,
+    remote: &RemoteInventory,
+    rules: &IgnoreRules,
+    resolution: &Resolution,
+) -> BTreeSet<String> {
     let mut selected = BTreeSet::new();
     for local_entry in local.entries.values() {
         // Two empty files are identical by definition, so `compare_files` never asks for their
         // digests. Asking DSM to hash one anyway costs a background task per empty file, and its
         // answer for an empty file is exactly the behaviour nobody has verified.
-        if local_entry.kind != EntryKind::File || local_entry.size == 0 {
+        if local_entry.kind != EntryKind::File
+            || local_entry.size == 0
+            || resolution.shield.covers(&local_entry.relative)
+        {
             continue;
         }
-        let Some(remote_entry) = pairs.remote_of(remote, &local_entry.relative) else {
+        let Some(remote_entry) = resolution.pairs.remote_of(remote, &local_entry.relative) else {
             continue;
         };
         if remote_entry.kind == EntryKind::File
             && remote_entry.size == local_entry.size
-            && mtimes_agree(local_entry.mtime_ms, remote_entry.mtime_seconds)
             && !is_protected(remote_entry, rules)
         {
             selected.insert(remote_entry.relative.clone());
@@ -421,21 +543,55 @@ pub fn select_strong_remote_digests(
     server_copy: bool,
     delete: bool,
 ) -> BTreeSet<String> {
+    let resolution = resolve(local, remote, rules, delete, Vec::new());
+    strong_candidates(
+        local,
+        remote,
+        rules,
+        &StrongSelection {
+            server_copy,
+            delete,
+            incomplete: &[],
+        },
+        &resolution,
+    )
+}
+
+struct StrongSelection<'a> {
+    server_copy: bool,
+    delete: bool,
+    incomplete: &'a [String],
+}
+
+fn strong_candidates(
+    local: &LocalInventory,
+    remote: &RemoteInventory,
+    rules: &IgnoreRules,
+    selection: &StrongSelection<'_>,
+    resolution: &Resolution,
+) -> BTreeSet<String> {
     let mut selected = BTreeSet::new();
-    if delete {
-        selected.extend(select_deletion_guard_hashes(local, remote, rules));
+    if selection.delete {
+        selected.extend(deletion_guard_candidates(
+            local,
+            remote,
+            rules,
+            resolution,
+            selection.incomplete,
+        ));
     }
-    if !server_copy {
+    if !selection.server_copy {
         return selected;
     }
 
-    let pairs = Correspondence::build(local, remote);
+    let pairs = &resolution.pairs;
     let mut missing_by_size_name_and_mtime: BTreeMap<(u64, String, i64), BTreeSet<String>> =
         BTreeMap::new();
     for entry in local.entries.values() {
         if entry.kind != EntryKind::File
             || entry.size == 0
             || pairs.remote_of(remote, &entry.relative).is_some()
+            || resolution.shield.covers(&entry.relative)
         {
             continue;
         }
@@ -451,6 +607,8 @@ pub fn select_strong_remote_digests(
             || entry.size == 0
             || pairs.local_of(local, &entry.relative).is_some()
             || is_protected(entry, rules)
+            || resolution.shield.covers(&entry.relative)
+            || resolution.is_leftover(&entry.relative)
             || has_local_file_ancestor(&entry.relative, local)
         {
             continue;
@@ -468,6 +626,36 @@ pub fn select_strong_remote_digests(
     selected
 }
 
+/// Both digest selections a content-mode plan needs, from one spelling resolution.
+///
+/// `(comparison, strong)`: MD5-only comparison digests and strong mutation guards, as
+/// [`select_comparison_remote_digests`] and [`select_strong_remote_digests`] return them, except
+/// that a deletion a short listing of one of `incomplete` withholds is not paid for either.
+pub fn select_plan_digests(
+    local: &LocalInventory,
+    remote: &RemoteInventory,
+    rules: &IgnoreRules,
+    server_copy: bool,
+    delete: bool,
+    incomplete: &[String],
+) -> (BTreeSet<String>, BTreeSet<String>) {
+    let resolution = resolve(local, remote, rules, delete, Vec::new());
+    (
+        comparison_candidates(local, remote, rules, &resolution),
+        strong_candidates(
+            local,
+            remote,
+            rules,
+            &StrongSelection {
+                server_copy,
+                delete,
+                incomplete,
+            },
+            &resolution,
+        ),
+    )
+}
+
 /// Select remote content needed for comparison, optional server-copy reuse, and deletion guards.
 /// A content-mode mirror must pass `delete = true` so every file that could be removed has a
 /// plan-time digest. `build_plan` fails closed if such a digest is absent.
@@ -481,14 +669,9 @@ pub fn select_remote_content_hashes_for_plan(
     server_copy: bool,
     delete: bool,
 ) -> BTreeSet<String> {
-    let mut selected = select_comparison_remote_digests(local, remote, rules);
-    selected.extend(select_strong_remote_digests(
-        local,
-        remote,
-        rules,
-        server_copy,
-        delete,
-    ));
+    let (mut selected, strong) =
+        select_plan_digests(local, remote, rules, server_copy, delete, &[]);
+    selected.extend(strong);
     selected
 }
 
@@ -529,15 +712,13 @@ pub fn build_plan(
     options: &PlanOptions,
 ) -> Result<SyncPlan> {
     // The selected destination prefix is part of every Synology Drive-visible path. Validate the
-    // complete mapping even for entries that may ultimately compare as unchanged, then reject
-    // case variants across either inventory before File Station can create a second spelling.
-    for relative in local.entries.keys() {
-        root.join(relative)?;
-    }
-    let pairs = Correspondence::build(local, remote);
-    let (shield, mut skipped) = resolve_spellings(local, remote, rules, options.delete);
+    // complete mapping even for entries that may ultimately compare as unchanged. A path that is
+    // only too long once the destination is prepended used to fail the whole plan, so one deep
+    // `node_modules` file meant nothing synced; it is now that path's skip.
+    let refused = paths_the_destination_refuses(root, local);
+    let mut resolution = resolve(local, remote, rules, options.delete, refused);
+    let mut skipped = std::mem::take(&mut resolution.skipped);
     skipped.extend(local.skipped.iter().cloned());
-    skipped.sort_by(|left, right| left.relative.cmp(&right.relative));
 
     let mut plan = SyncPlan {
         source_root: local.root.clone(),
@@ -548,11 +729,14 @@ pub fn build_plan(
         copies: Vec::new(),
         uploads: Vec::new(),
         post_deletes: Vec::new(),
+        renames: Vec::new(),
         unchanged_files: 0,
         protected_entries: 0,
         upload_bytes: 0,
         skipped,
     };
+    let pairs = &resolution.pairs;
+    let shield = &resolution.shield;
 
     if !remote.root_exists {
         if root.as_str() == root.share_path() {
@@ -565,8 +749,9 @@ pub fn build_plan(
         });
     }
 
-    // File Station can expose CIFS/NFS/ISO mounts as directories. Their contents belong
-    // to another filesystem, so never synthesize uploads beneath a pruned mount boundary.
+    // File Station can expose CIFS/NFS/ISO mounts, and links, as directories. Their contents belong
+    // to another filesystem or folder, so nothing is ever written at or beneath one: `resolve`
+    // shields such a path as a `type-conflict`. This stays as the fail-closed backstop.
     for mount in remote
         .entries
         .values()
@@ -576,6 +761,7 @@ pub fn build_plan(
         if local
             .entries
             .keys()
+            .filter(|relative| !shield.covers(relative))
             .any(|relative| pairs.remote_relative(relative).starts_with(&prefix))
         {
             return Err(Error::ProtectedConflict(mount.remote_path.clone()));
@@ -588,8 +774,8 @@ pub fn build_plan(
             continue;
         }
         // The remote spelling of this path: the local one, unless the destination already holds
-        // the same name under a different Unicode normalisation. Writing to the local spelling
-        // then would create a second, visually identical entry beside it.
+        // the same name under a different Unicode normalisation, or under the case a rename is
+        // about to change. Writing to the local spelling then would create a second entry beside it.
         let remote_relative = pairs.remote_relative(&entry.relative);
         let Some(remote_entry) = remote.entries.get(remote_relative.as_ref()) else {
             schedule_missing(root, &mut plan, entry, &remote_relative)?;
@@ -611,6 +797,9 @@ pub fn build_plan(
                     )?,
                 }
             }
+            // Without `--delete`, and over an entry nothing may delete, the conflict is skipped
+            // and shielded by `resolve`, so neither guard below can fire. They stay as the fail-
+            // closed backstop: a deletion is never planned on the strength of that shield alone.
             (local_kind, remote_kind) if !options.delete => {
                 return Err(Error::TypeConflict {
                     path: remote_entry.remote_path.clone(),
@@ -664,24 +853,100 @@ pub fn build_plan(
     }
 
     if options.compare == CompareMode::Content {
-        replace_uploads_with_server_copies(
-            &mut plan, local, remote, rules, options, &pairs, &shield,
-        )?;
+        replace_uploads_with_server_copies(&mut plan, local, remote, rules, options, &resolution)?;
+    }
+
+    // Deepest first: each rename names its parent by the spelling the parent still has, because
+    // the parent's own rename runs after it.
+    for (local_spelling, remote_spelling) in &resolution.renames {
+        if !options.scope.matches(local_spelling) {
+            continue;
+        }
+        let Some(remote_entry) = remote.entries.get(remote_spelling) else {
+            continue;
+        };
+        // Renamed only when nothing beneath the old spelling is excluded, DSM-managed, mounted or
+        // shielded: a rename would move those too, and they are not this run's to move. The
+        // content still syncs into the spelling the NAS has, and the rename is named as not
+        // finished, a warning on every run until someone renames it in File Station.
+        if let Some(kept) = remote_subtree(&remote.entries, remote_spelling)
+            .into_iter()
+            .find(|candidate| is_protected(candidate, rules) || shield.covers(&candidate.relative))
+        {
+            plan.skipped.push(SkippedEntry {
+                relative: local_spelling.clone(),
+                reason: SkipReason::Deferred {
+                    detail: format!(
+                        "case-rename-pending: the source spells it {local_spelling:?} and the NAS \
+                         {remote_spelling:?}, which holds {:?}, an excluded, DSM-managed, \
+                         mounted or skipped entry this run does not move; the content is kept in \
+                         sync under {remote_spelling:?}, and renaming it in File Station finishes \
+                         the rename",
+                        kept.relative
+                    ),
+                },
+            });
+            continue;
+        }
+        let (parent, _) = crate::path::parent_and_name(&remote_entry.remote_path)?;
+        let (_, local_name) = relative_parent_and_name(local_spelling);
+        // Composed, the form Synology Drive clients write: a decomposed local name then pairs with
+        // it by normalisation on the next run instead of looking like another rename.
+        let new_name = nfc(local_name).into_owned();
+        plan.renames.push(RenameAction {
+            relative: local_spelling.clone(),
+            from_relative: remote_spelling.clone(),
+            from_remote_path: remote_entry.remote_path.clone(),
+            to_remote_path: format!("{parent}/{new_name}"),
+            new_name,
+            kind: remote_entry.kind,
+        });
+    }
+
+    let mut protected_by: HashMap<String, String> = HashMap::new();
+    let mut protected_dirs = HashSet::new();
+    for entry in remote.entries.values().filter(|_| options.delete) {
+        if is_protected(entry, rules) {
+            plan.protected_entries += 1;
+            add_ancestor_directories(&entry.relative, &mut protected_dirs);
+            let mut current = entry.relative.as_str();
+            while let Some((parent, _)) = current.rsplit_once('/') {
+                protected_by
+                    .entry(parent.to_owned())
+                    .or_insert_with(|| entry.relative.clone());
+                current = parent;
+            }
+        } else if shield.covers(&entry.relative) {
+            // Kept, so its ancestors stay non-empty and must be kept too: a non-recursive
+            // delete of one would only be refused by DSM, failing the run.
+            add_ancestor_directories(&entry.relative, &mut protected_dirs);
+        }
+    }
+
+    // A second spelling the NAS holds beside the one the source holds. It is never touched: not
+    // deleted (its DSM-managed or excluded children would go with it, and the only proof the two
+    // are the same is their names), not written, not renamed. The source's spelling syncs as
+    // usual, and the old one is named as not finished, a warning on every run until someone
+    // removes it. It used to be a collision that froze both spellings: every later edit was
+    // silently never uploaded.
+    for (old, kept) in &resolution.leftovers {
+        if !options.scope.matches(old) {
+            continue;
+        }
+        plan.skipped.push(SkippedEntry {
+            relative: old.clone(),
+            reason: SkipReason::Deferred {
+                detail: format!(
+                    "case-rename-pending: the NAS holds {old:?} beside {kept:?}, two spellings \
+                     Synology Drive clients cannot hold together; {old:?} is left as it is, so \
+                     remove it in File Station once its contents are in {kept:?}"
+                ),
+            },
+        });
     }
 
     if options.delete {
-        let mut protected_dirs = HashSet::new();
-        for entry in remote.entries.values() {
-            if is_protected(entry, rules) {
-                plan.protected_entries += 1;
-                add_ancestor_directories(&entry.relative, &mut protected_dirs);
-            } else if shield.covers(&entry.relative) {
-                // Kept, so its ancestors stay non-empty and must be kept too: a non-recursive
-                // delete of one would only be refused by DSM, failing the run.
-                add_ancestor_directories(&entry.relative, &mut protected_dirs);
-            }
-        }
-
+        let mut reported_kept: Vec<&str> = Vec::new();
         for entry in remote.entries.values() {
             if pairs.local_of(local, &entry.relative).is_some()
                 || predeleted.contains(&entry.relative)
@@ -692,38 +957,70 @@ pub fn build_plan(
             if !options.scope.matches(&entry.relative) {
                 continue;
             }
-            if is_protected(entry, rules)
-                || (entry.kind == EntryKind::Directory && protected_dirs.contains(&entry.relative))
-            {
+            if is_protected(entry, rules) {
                 continue;
             }
             // A path the local walk skipped, or whose spelling the plan could not resolve, is
             // not absent locally. Its state is unknown, and unknown is never grounds to delete.
-            if shield.covers(&entry.relative) {
+            if shield.covers(&entry.relative) || resolution.is_leftover(&entry.relative) {
                 continue;
             }
-            let destination_guard = plan
-                .copies
-                .iter()
-                .find(|copy| copy.from_relative == entry.relative)
-                .map(|copy| DestinationGuard {
-                    remote_path: copy.to_remote_path.clone(),
-                    local: copy.local.clone(),
-                    expected_size: copy.expected_size,
-                    expected_mtime_seconds: local_mtime_seconds(&copy.local),
-                    content_md5: copy.content_md5,
-                });
+            if entry.kind == EntryKind::Directory && protected_dirs.contains(&entry.relative) {
+                // Kept because an excluded or DSM-managed entry beneath it is never deleted. Named
+                // once, at the topmost such folder, so a folder deleted locally does not survive on
+                // the NAS with the run reporting nothing about it.
+                if let Some(protected) = protected_by.get(&entry.relative)
+                    && !reported_kept.iter().any(|reported| {
+                        entry
+                            .relative
+                            .strip_prefix(reported)
+                            .is_some_and(|rest| rest.starts_with('/'))
+                    })
+                {
+                    reported_kept.push(&entry.relative);
+                    plan.skipped.push(SkippedEntry {
+                        relative: entry.relative.clone(),
+                        reason: SkipReason::ProtectedDescendant {
+                            entry: protected.clone(),
+                        },
+                    });
+                }
+                continue;
+            }
             plan.post_deletes.push(DeleteAction {
                 relative: entry.relative.clone(),
                 remote_path: entry.remote_path.clone(),
                 kind: entry.kind,
                 type_conflict: false,
                 snapshot: deletion_snapshot(entry, &remote.entries, options.compare)?,
-                destination_guard,
+                destination_guard: None,
             });
+        }
+        // One index of the copies by source, rather than a scan of every copy per deletion: a
+        // directory move under `--delete` is exactly the plan with as many copies as deletions.
+        if !plan.copies.is_empty() {
+            let copies_by_source: HashMap<&str, &CopyAction> = plan
+                .copies
+                .iter()
+                .map(|copy| (copy.from_relative.as_str(), copy))
+                .collect();
+            for action in &mut plan.post_deletes {
+                action.destination_guard =
+                    copies_by_source
+                        .get(action.relative.as_str())
+                        .map(|copy| DestinationGuard {
+                            remote_path: copy.to_remote_path.clone(),
+                            local: copy.local.clone(),
+                            expected_size: copy.expected_size,
+                            expected_mtime_seconds: local_mtime_seconds(&copy.local),
+                            content_md5: copy.content_md5,
+                        });
+            }
         }
     }
 
+    plan.skipped
+        .sort_by(|left, right| left.relative.cmp(&right.relative));
     sort_plan(&mut plan);
     let delete_count = plan.delete_count();
     if options.delete && local.files() == 0 && delete_count > 0 && !options.allow_empty_source {
@@ -738,7 +1035,36 @@ pub fn build_plan(
     Ok(plan)
 }
 
-/// How local spellings pair with remote ones whose bytes differ but whose name does not.
+/// Local paths the destination cannot hold once its prefix is prepended, as skips, topmost only.
+fn paths_the_destination_refuses(root: &RemoteRoot, local: &LocalInventory) -> Vec<SkippedEntry> {
+    let mut refused: Vec<SkippedEntry> = Vec::new();
+    for relative in local.entries.keys() {
+        // Keys sort a folder before everything beneath it, so a refused folder is always seen
+        // first, and what is beneath it is already covered.
+        if refused.last().is_some_and(|parent| {
+            relative
+                .strip_prefix(parent.relative.as_str())
+                .is_some_and(|rest| rest.starts_with('/'))
+        }) {
+            continue;
+        }
+        if let Err(error) = root.join(relative) {
+            let reason = match error {
+                Error::UnsafeRemotePath { path, reason } => {
+                    format!("the destination path {path:?} is refused: {reason}")
+                }
+                other => other.to_string(),
+            };
+            refused.push(SkippedEntry {
+                relative: relative.clone(),
+                reason: crate::local::unsupported_entry(reason),
+            });
+        }
+    }
+    refused
+}
+
+// How local spellings pair with remote ones whose bytes differ but whose name does not.
 ///
 /// Exact byte equality pairs almost everything, and then this holds nothing and costs one
 /// `is_ascii` per key. What it adds is the pair whose spellings differ only by Unicode
@@ -842,15 +1168,33 @@ impl Correspondence {
             .get(self.remote_relative(local_relative).as_ref())
     }
 
+    /// The local counterpart of a remote path, through the same pairing in reverse.
+    ///
+    /// A path inside a paired directory is looked up under the directory's local spelling. For a
+    /// case-only rename the directory is the only pair there is: `Photos/a.jpg` on the NAS is
+    /// `photos/a.jpg` locally, and looked up by its own spelling it read as remote-only -- a
+    /// deletion candidate.
     pub(crate) fn local_of<'l>(
         &self,
         local: &'l LocalInventory,
         remote_relative: &str,
     ) -> Option<&'l LocalEntry> {
-        match self.to_local.get(remote_relative) {
-            Some(local_relative) => local.entries.get(local_relative),
-            None => local.entries.get(remote_relative),
+        if let Some(local_relative) = self.to_local.get(remote_relative) {
+            return local.entries.get(local_relative);
         }
+        if !self.to_local.is_empty() {
+            let mut current = remote_relative;
+            while let Some((parent, _)) = current.rsplit_once('/') {
+                if let Some(local_parent) = self.to_local.get(parent) {
+                    return local.entries.get(&format!(
+                        "{local_parent}{}",
+                        &remote_relative[parent.len()..]
+                    ));
+                }
+                current = parent;
+            }
+        }
+        local.entries.get(remote_relative)
     }
 
     /// True for a remote spelling that is the partner of a differently spelled local entry.
@@ -912,21 +1256,179 @@ fn note_spelling<'a>(first: &mut Option<&'a str>, other: &mut Option<&'a str>, s
     }
 }
 
+/// What a plan decided about spellings, computed once and shared by digest selection and
+/// planning, so the files a run pays to fingerprint are the files it can act on.
+#[derive(Debug, Default)]
+pub(crate) struct Resolution {
+    pub(crate) pairs: Correspondence,
+    pub(crate) shield: Shield,
+    pub(crate) skipped: Vec<SkippedEntry>,
+    /// Case-only renames this plan carries, as (local spelling, remote spelling), deepest first.
+    pub(crate) renames: Vec<(String, String)>,
+    /// Spellings the NAS holds beside the one the source holds, as (old remote spelling, kept
+    /// remote spelling).
+    pub(crate) leftovers: Vec<(String, String)>,
+}
+
+impl Resolution {
+    /// Whether `relative` is a leftover old spelling, or lies beneath one. Compared by exact
+    /// spelling: the kept spelling folds to the same key and must stay untouched by this.
+    pub(crate) fn is_leftover(&self, relative: &str) -> bool {
+        self.leftovers.iter().any(|(old, _)| {
+            relative == old
+                || relative
+                    .strip_prefix(old.as_str())
+                    .is_some_and(|rest| rest.starts_with('/'))
+        })
+    }
+}
+
+/// Resolve every spelling and every type conflict of one local/remote pair of inventories.
+///
+/// `refused` are local paths the caller found the destination cannot hold; they are shielded and
+/// reported like the walk's own skips.
+pub(crate) fn resolve(
+    local: &LocalInventory,
+    remote: &RemoteInventory,
+    rules: &IgnoreRules,
+    delete: bool,
+    refused: Vec<SkippedEntry>,
+) -> Resolution {
+    let mut resolution = resolve_spellings(local, remote, rules, delete, refused);
+    let mut pairs = Correspondence::build(local, remote);
+    for (local_spelling, remote_spelling) in &resolution.renames {
+        pairs.insert(local_spelling, remote_spelling);
+    }
+    resolution.pairs = pairs;
+    shield_type_conflicts(local, remote, rules, delete, &mut resolution);
+    resolution
+}
+
+/// Skip, and shield, every local/remote kind conflict this run cannot carry.
+///
+/// Without `--delete` nothing may replace the remote entry, and a remote folder that holds an
+/// excluded, DSM-managed, mounted or shielded entry cannot be emptied by any run. Both used to fail
+/// the whole run, on every run: a `.DS_Store` or an `@eaDir` in a folder the user had replaced with
+/// a file stopped every other upload. The conflict is now that path's skip, and both sides of it are
+/// left as they are.
+fn shield_type_conflicts(
+    local: &LocalInventory,
+    remote: &RemoteInventory,
+    rules: &IgnoreRules,
+    delete: bool,
+    resolution: &mut Resolution,
+) {
+    for entry in local.entries.values() {
+        if resolution.shield.covers(&entry.relative) {
+            continue;
+        }
+        let remote_relative = resolution.pairs.remote_relative(&entry.relative);
+        let Some(remote_entry) = remote.entries.get(remote_relative.as_ref()) else {
+            continue;
+        };
+        // A mount point or a link on the NAS where the source holds an entry: nothing is written
+        // at or beneath it, whatever the kinds. It used to fail every run (a whole-run
+        // `ProtectedConflict`) as soon as one local file sat beneath a symlinked NAS folder.
+        if let Some(mount_type) = &remote_entry.mount_point_type {
+            resolution
+                .shield
+                .folds
+                .insert(portable_fold(&entry.relative));
+            let reason = if mount_type == crate::api::LINKED_ENTRY_MOUNT_TYPE {
+                SkipReason::RemoteLink {
+                    remote_path: remote_entry.remote_path.clone(),
+                }
+            } else {
+                SkipReason::TypeConflict {
+                    detail: format!(
+                        "the NAS entry {:?} is a mount point ({mount_type}); nothing is written at \
+                         or beneath it, and nothing there is deleted",
+                        remote_entry.remote_path
+                    ),
+                }
+            };
+            resolution.skipped.push(SkippedEntry {
+                relative: entry.relative.clone(),
+                reason,
+            });
+            continue;
+        }
+        if entry.kind == remote_entry.kind {
+            continue;
+        }
+        let detail = if !delete {
+            Some(format!(
+                "the source holds a {} where the NAS holds a {}; run with --delete to replace the \
+                 NAS {}",
+                entry.kind.as_str(),
+                remote_entry.kind.as_str(),
+                remote_entry.kind.as_str()
+            ))
+        } else if remote_entry.kind == EntryKind::Directory {
+            remote_subtree(&remote.entries, &remote_entry.relative)
+                .into_iter()
+                .find(|candidate| {
+                    is_protected(candidate, rules) || resolution.shield.covers(&candidate.relative)
+                })
+                .map(|kept| {
+                    format!(
+                        "the source holds a file where the NAS folder holds {:?}, which is \
+                         excluded, DSM-managed, mounted or skipped and is never deleted, so the \
+                         folder cannot be replaced; remove that entry in File Station",
+                        kept.relative
+                    )
+                })
+        } else {
+            None
+        };
+        if let Some(detail) = detail {
+            resolution
+                .shield
+                .folds
+                .insert(portable_fold(&entry.relative));
+            resolution.skipped.push(SkippedEntry {
+                relative: entry.relative.clone(),
+                reason: SkipReason::TypeConflict { detail },
+            });
+        }
+    }
+}
+
+/// The final component of a `/`-separated path.
+fn final_name(relative: &str) -> &str {
+    relative.rsplit_once('/').map_or(relative, |(_, name)| name)
+}
+
+/// Whether two spellings of one fold differ in their own name, rather than only in a folder above
+/// them, whose own class decides for them.
+fn names_differ(left: &str, right: &str) -> bool {
+    nfc(final_name(left)) != nfc(final_name(right))
+}
+
 /// Decide, for every path, whether its spelling can be carried, and shield the ones that cannot.
 ///
 /// Synology Drive clients cannot hold two names that differ only by case or Unicode normalisation.
 /// This used to be enforced by failing the whole run at the first such pair, which made a case-only
 /// rename -- `Report.pdf` to `report.pdf`, `Photos/` to `photos/`, an ordinary action on Windows and
 /// macOS -- a permanent failure that not even `--delete` could get past. Each fold class is now
-/// decided on its own:
+/// decided on its own, and only where the spellings differ in the class's own name (a difference in
+/// a folder above it is that folder's class to decide):
 ///
 /// * one spelling on each side, the same bytes: the ordinary case, nothing to do;
 /// * one spelling on each side, equal after NFC: the same name, paired by [`Correspondence`];
-/// * one spelling on each side, differing by case: a rename. A mirror run carries it as an upload
-///   of the new spelling plus a deletion of the old one, so the run converges. Without `--delete`
-///   the old spelling cannot be removed, and writing the new one beside it would create exactly the
-///   pair Drive clients cannot hold, so the class is skipped and reported;
-/// * two spellings on one side: a genuine collision. Skipped and reported, both spellings untouched.
+/// * one spelling on each side, differing by case: a rename. A mirror run carries it with File
+///   Station Rename, which keeps the entry's content, its `@eaDir` thumbnails and its Drive version
+///   history, and deletes nothing. The two spellings are paired, so the run compares and uploads
+///   against the spelling the NAS still has, and renames it last. Without `--delete` the class is
+///   skipped and reported, as the rename is a change to the destination's names;
+/// * two spellings on the NAS, one of which the source holds: the other is left over from a rename
+///   (an earlier version's upload and deletion, a third party). The source's spelling syncs as
+///   usual; the old one is an ordinary remote-only entry, removed by a mirror run, and reported as
+///   not finished while it stands. It used to freeze both spellings as a lasting collision;
+/// * two spellings on one side otherwise: a genuine collision. Skipped and reported, both spellings
+///   untouched;
+/// * a NAS spelling of a name the source holds but excludes: kept and reported. On a
+///   case-insensitive source the two are one file, and excluding it must not make it deletable.
 ///
 /// A skipped class shields its whole subtree on both sides, and every other path is planned as
 /// usual. Protected remote entries take no part, because the plan never touches them: a recycle bin
@@ -936,7 +1438,8 @@ fn resolve_spellings(
     remote: &RemoteInventory,
     rules: &IgnoreRules,
     delete: bool,
-) -> (Shield, Vec<SkippedEntry>) {
+    refused: Vec<SkippedEntry>,
+) -> Resolution {
     let mut classes: BTreeMap<String, Spellings<'_>> = BTreeMap::new();
     let considered = local
         .entries
@@ -981,9 +1484,12 @@ fn resolve_spellings(
     let mut blocked: BTreeSet<String> = local
         .skipped
         .iter()
+        .chain(&refused)
         .map(|skip| portable_fold(&skip.relative))
         .collect();
-    let mut skipped = Vec::new();
+    let mut skipped = refused;
+    let mut renames = Vec::new();
+    let mut leftovers = Vec::new();
     // Folds sort every ancestor before its descendants, so a blocked class is always seen before
     // anything beneath it, which it already covers and does not report again.
     for (fold, class) in &classes {
@@ -992,53 +1498,78 @@ fn resolve_spellings(
         }
         let mut reports: Vec<(&str, SkipReason)> = Vec::new();
         if let (Some(first), Some(second)) = (class.local, class.local_other) {
-            reports.push((
-                first,
-                SkipReason::LocalCaseCollision {
-                    other: second.to_owned(),
-                },
-            ));
-            reports.push((
-                second,
-                SkipReason::LocalCaseCollision {
-                    other: first.to_owned(),
-                },
-            ));
-        } else if let (Some(first), Some(second)) = (class.remote, class.remote_other) {
-            reports.push((
-                first,
-                SkipReason::RemoteCaseCollision {
-                    other: second.to_owned(),
-                },
-            ));
-            reports.push((
-                second,
-                SkipReason::RemoteCaseCollision {
-                    other: first.to_owned(),
-                },
-            ));
-            if let Some(local_spelling) = class
-                .local
-                .filter(|spelling| *spelling != first && *spelling != second)
-            {
+            if names_differ(first, second) {
                 reports.push((
-                    local_spelling,
-                    SkipReason::RemoteCaseCollision {
+                    first,
+                    SkipReason::LocalCaseCollision {
+                        other: second.to_owned(),
+                    },
+                ));
+                reports.push((
+                    second,
+                    SkipReason::LocalCaseCollision {
                         other: first.to_owned(),
                     },
                 ));
             }
+        } else if let (Some(first), Some(second)) = (class.remote, class.remote_other) {
+            if names_differ(first, second) {
+                let kept = class.local.and_then(|local_spelling| {
+                    [first, second]
+                        .into_iter()
+                        .find(|remote_spelling| nfc(remote_spelling) == nfc(local_spelling))
+                });
+                match kept {
+                    Some(kept) => {
+                        let old = if kept == first { second } else { first };
+                        leftovers.push((old.to_owned(), kept.to_owned()));
+                    }
+                    None => {
+                        reports.push((
+                            first,
+                            SkipReason::RemoteCaseCollision {
+                                other: second.to_owned(),
+                            },
+                        ));
+                        reports.push((
+                            second,
+                            SkipReason::RemoteCaseCollision {
+                                other: first.to_owned(),
+                            },
+                        ));
+                        if let Some(local_spelling) = class
+                            .local
+                            .filter(|spelling| *spelling != first && *spelling != second)
+                        {
+                            reports.push((
+                                local_spelling,
+                                SkipReason::RemoteCaseCollision {
+                                    other: first.to_owned(),
+                                },
+                            ));
+                        }
+                    }
+                }
+            }
         } else if let (Some(local_spelling), Some(remote_spelling)) = (class.local, class.remote)
             && local_spelling != remote_spelling
             && nfc(local_spelling) != nfc(remote_spelling)
-            && !delete
+            && names_differ(local_spelling, remote_spelling)
         {
-            reports.push((
-                local_spelling,
-                SkipReason::CaseRenameNeedsDelete {
-                    remote: remote_spelling.to_owned(),
-                },
-            ));
+            if !delete {
+                reports.push((
+                    local_spelling,
+                    SkipReason::CaseRenameNeedsDelete {
+                        remote: remote_spelling.to_owned(),
+                    },
+                ));
+            } else if local.entries.get(local_spelling).map(|entry| entry.kind)
+                == remote.entries.get(remote_spelling).map(|entry| entry.kind)
+            {
+                renames.push((local_spelling.to_owned(), remote_spelling.to_owned()));
+            }
+            // A rename that also changes the kind is a type replacement under another name: the
+            // new spelling is written and the old one is an ordinary mirror deletion.
         }
         if reports.is_empty() {
             continue;
@@ -1049,8 +1580,21 @@ fn resolve_spellings(
             reason,
         }));
     }
+    // A rename beneath a blocked folder never happens: the folder's class shields it.
+    renames.retain(|(local_spelling, _): &(String, String)| {
+        !fold_has_ancestor_in(&portable_fold(local_spelling), &blocked)
+    });
+    renames.sort_by(|(left, _), (right, _)| {
+        depth(right).cmp(&depth(left)).then_with(|| left.cmp(right))
+    });
 
-    (Shield { folds: blocked }, skipped)
+    Resolution {
+        pairs: Correspondence::default(),
+        shield: Shield { folds: blocked },
+        skipped,
+        renames,
+        leftovers,
+    }
 }
 
 fn schedule_missing(
@@ -1177,10 +1721,12 @@ fn compare_files(
                 // as equality is the whole point of the change -- and is a decision about
                 // *comparison* only. Deletion and server-copy still require strong proof
                 // and obtain it separately; see `select_remote_digests`.
+                //
+                // Equal content is equal whatever the modification times say. A time that moved
+                // alone (a daylight saving shift on FAT32, a `touch`, a restore, a DSM that does not
+                // keep the time an upload sends) used to re-send every byte of the file.
                 match local_digest.compare_content(&remote_digest) {
-                    ContentMatch::Strong | ContentMatch::Md5Only => {
-                        mtime_differs.then_some(ChangeReason::MtimeDiffers)
-                    }
+                    ContentMatch::Strong | ContentMatch::Md5Only => None,
                     ContentMatch::Differs => Some(ChangeReason::ContentDiffers),
                 }
             }
@@ -1202,9 +1748,10 @@ fn replace_uploads_with_server_copies(
     remote: &RemoteInventory,
     rules: &IgnoreRules,
     options: &PlanOptions,
-    pairs: &Correspondence,
-    shield: &Shield,
+    resolution: &Resolution,
 ) -> Result<()> {
+    let pairs = &resolution.pairs;
+    let shield = &resolution.shield;
     if !options.server_copy {
         return Ok(());
     }
@@ -1246,6 +1793,7 @@ fn replace_uploads_with_server_copies(
             || is_protected(entry, rules)
             || predeleted.contains(entry.relative.as_str())
             || shield.covers(&entry.relative)
+            || resolution.is_leftover(&entry.relative)
         {
             continue;
         }
@@ -1375,14 +1923,15 @@ fn local_mtime_seconds(local: &LocalEntry) -> i64 {
 /// The residual is inherent, not a choice: an edit that keeps the size and lands in the same second
 /// (or the same rounding bucket) as the previous version is undetectable in `--compare metadata`,
 /// because File Station cannot say anything finer. `--compare content` compares digests for every
-/// pair this accepts, because `select_comparison_remote_digests` applies this same test.
+/// same-size pair, whether or not this accepts their times, because
+/// `select_comparison_remote_digests` selects every one of them.
 ///
 /// Copy-candidate matching stays exact on purpose -- it authorises a server copy and a guarded
 /// delete -- and remote-to-remote snapshot checks never use this.
 ///
 /// The one definition every local-to-remote comparison uses -- the planner's re-upload decision,
-/// its digest selection, the post-upload "did DSM keep the time" latch and the executor's
-/// destination checks -- so no two of them can disagree about whether a file changed.
+/// the post-upload "did DSM keep the time" latch and the executor's destination checks -- so no
+/// two of them can disagree about whether a file changed.
 pub fn mtimes_agree(local_mtime_ms: i64, remote_mtime_seconds: i64) -> bool {
     let floored = local_mtime_ms.div_euclid(1000);
     let rounded = local_mtime_ms.saturating_add(500).div_euclid(1000);
@@ -2364,15 +2913,15 @@ mod tests {
     fn unverified_content_details_report_the_missing_digest_not_a_mismatch() {
         assert_eq!(
             ChangeReason::LocalDigestUnavailable.detail(),
-            "size and time equal, no complete local MD5/CRC32/SHA-256 fingerprint, uploading unverified"
+            "size and time equal, no local MD5 content digest, uploading unverified"
         );
         assert_eq!(
             ChangeReason::RemoteDigestUnavailable.detail(),
-            "size and time equal, no complete remote MD5/CRC32/SHA-256 fingerprint, uploading unverified"
+            "size and time equal, no MD5 content digest from the NAS, uploading unverified"
         );
         assert_eq!(
             ChangeReason::ContentDiffers.detail(),
-            "size equal, complete MD5/CRC32/SHA-256 fingerprint did not match"
+            "size equal, MD5 content digests differ"
         );
     }
 
@@ -2621,10 +3170,13 @@ mod tests {
         assert!(plan.creates.is_empty());
     }
 
-    /// N-2 under `--delete`: the rename converges as an upload of the new spelling and a deletion
-    /// of the old one, for a file and for a directory with its contents.
+    /// N-2 under `--delete`, ADV-E-1: a case-only rename is one File Station Rename, planned last
+    /// and deepest first. Everything else is compared against the spelling the NAS still has, and
+    /// nothing on either spelling is deleted. A folder holding an excluded or DSM-managed entry is
+    /// not renamed (a rename would move it too): its content keeps syncing under the NAS spelling
+    /// and the rename is named as not finished.
     #[test]
-    fn a_case_only_rename_under_delete_converges_as_upload_and_delete() {
+    fn a_case_only_rename_under_delete_is_a_rename_and_deletes_nothing() {
         let root = RemoteRoot::parse("/share/root").unwrap();
         let plan = build_plan(
             &root,
@@ -2632,36 +3184,50 @@ mod tests {
                 ("report.pdf", EntryKind::File, 5, 5_000),
                 ("photos", EntryKind::Directory, 0, 0),
                 ("photos/a.jpg", EntryKind::File, 3, 3_000),
+                ("photos/new.jpg", EntryKind::File, 2, 2_000),
+                ("photos/sub", EntryKind::Directory, 0, 0),
             ]),
             &remote(&[
                 ("Report.pdf", EntryKind::File, 5, 5),
                 ("Photos", EntryKind::Directory, 0, 0),
                 ("Photos/a.jpg", EntryKind::File, 3, 3),
+                ("Photos/gone.jpg", EntryKind::File, 1, 1),
+                ("Photos/Sub", EntryKind::Directory, 0, 0),
+                ("Photos/@eaDir", EntryKind::Directory, 0, 0),
+                ("Photos/@eaDir/a.jpg", EntryKind::Directory, 0, 0),
             ]),
             &rules(&[]),
             &options(true),
         )
         .unwrap();
-        assert!(plan.skipped.is_empty(), "{:?}", plan.skipped);
-        assert_eq!(
-            plan.creates
-                .iter()
-                .map(|create| create.remote_path.as_str())
-                .collect::<Vec<_>>(),
-            ["/share/root/photos"]
-        );
+        assert_eq!(skips(&plan), [("photos", "deferred")]);
+        assert!(!crate::sync::skip_is_transient_deferral(&plan.skipped[0]));
+        assert!(plan.skipped[0].reason.detail().contains("@eaDir"));
+        assert!(plan.creates.is_empty(), "{:?}", plan.creates);
+        // Unchanged files stay; new ones land under the spelling the NAS has now.
         assert_eq!(
             uploaded(&plan),
+            [("photos/new.jpg", "/share/root/Photos/new.jpg")]
+        );
+        // Only the genuinely remote-only file, never a spelling of a local one.
+        assert_eq!(deleted(&plan), ["Photos/gone.jpg"]);
+        assert_eq!(
+            plan.renames
+                .iter()
+                .map(|rename| (
+                    rename.from_remote_path.as_str(),
+                    rename.to_remote_path.as_str()
+                ))
+                .collect::<Vec<_>>(),
             [
-                ("photos/a.jpg", "/share/root/photos/a.jpg"),
-                ("report.pdf", "/share/root/report.pdf"),
+                ("/share/root/Photos/Sub", "/share/root/Photos/sub"),
+                ("/share/root/Report.pdf", "/share/root/report.pdf"),
             ]
         );
-        assert_eq!(deleted(&plan), ["Photos/a.jpg", "Photos", "Report.pdf"]);
     }
 
-    /// Two remote spellings of one name are a genuine collision. Neither is changed or deleted, the
-    /// local spelling is not written beside them, both are named, and the rest of the tree syncs.
+    /// Two remote spellings of one name are a genuine collision when the source holds neither.
+    /// Neither is changed or deleted, both are named, and the rest of the tree syncs.
     #[test]
     fn a_remote_case_collision_is_skipped_on_both_sides_and_never_deleted() {
         let root = RemoteRoot::parse("/share/root").unwrap();
@@ -2670,7 +3236,7 @@ mod tests {
                 &root,
                 &local(&[
                     ("keep.txt", EntryKind::File, 1, 1_000),
-                    ("Report.pdf", EntryKind::File, 9, 9_000),
+                    ("REPORT.pdf", EntryKind::File, 9, 9_000),
                 ]),
                 &remote(&[
                     ("keep.txt", EntryKind::File, 1, 1),
@@ -2688,6 +3254,7 @@ mod tests {
                 skips(&plan),
                 [
                     ("Archive", "remote-case-collision"),
+                    ("REPORT.pdf", "remote-case-collision"),
                     ("Report.pdf", "remote-case-collision"),
                     ("archive", "remote-case-collision"),
                     ("report.pdf", "remote-case-collision"),
@@ -2695,7 +3262,7 @@ mod tests {
             );
             assert!(
                 plan.uploads.is_empty(),
-                "the changed Report.pdf is held back"
+                "the changed REPORT.pdf is held back"
             );
             if delete {
                 assert_eq!(deleted(&plan), ["stale.txt"]);
@@ -2705,6 +3272,455 @@ mod tests {
         }
     }
 
+    /// ADV-E-1: the NAS holds a second spelling beside the one the source holds. The source's
+    /// spelling keeps syncing; the old one is never touched -- not deleted, not written -- and is
+    /// named `case-rename-pending`, a lasting warning on every run until someone removes it. It
+    /// used to freeze both spellings as a lasting collision.
+    #[test]
+    fn a_leftover_spelling_does_not_freeze_the_kept_one() {
+        let root = RemoteRoot::parse("/share/root").unwrap();
+        let local_inventory = local(&[
+            ("photos", EntryKind::Directory, 0, 0),
+            ("photos/a.jpg", EntryKind::File, 9, 9_000),
+            ("photos/b.jpg", EntryKind::File, 2, 2_000),
+            ("report.pdf", EntryKind::File, 5, 5_000),
+        ]);
+        let remote_inventory = remote(&[
+            ("Photos", EntryKind::Directory, 0, 0),
+            ("Photos/a.jpg", EntryKind::File, 3, 3),
+            ("Photos/@eaDir", EntryKind::Directory, 0, 0),
+            ("photos", EntryKind::Directory, 0, 0),
+            ("photos/a.jpg", EntryKind::File, 3, 3),
+            ("Report.pdf", EntryKind::File, 5, 5),
+            ("report.pdf", EntryKind::File, 5, 5),
+            ("stale.txt", EntryKind::File, 1, 1),
+        ]);
+        for delete in [true, false] {
+            let plan = build_plan(
+                &root,
+                &local_inventory,
+                &remote_inventory,
+                &rules(&[]),
+                &options(delete),
+            )
+            .unwrap();
+            assert_eq!(
+                uploaded(&plan),
+                [
+                    ("photos/a.jpg", "/share/root/photos/a.jpg"),
+                    ("photos/b.jpg", "/share/root/photos/b.jpg"),
+                ]
+            );
+            if delete {
+                assert_eq!(
+                    deleted(&plan),
+                    ["stale.txt"],
+                    "the old spellings are never deleted"
+                );
+            } else {
+                assert!(deleted(&plan).is_empty());
+            }
+            assert!(plan.renames.is_empty());
+            assert_eq!(
+                skips(&plan),
+                [("Photos", "deferred"), ("Report.pdf", "deferred")]
+            );
+            assert!(
+                plan.skipped
+                    .iter()
+                    .all(|skip| !crate::sync::skip_is_transient_deferral(skip))
+            );
+            assert!(
+                plan.skipped[0]
+                    .reason
+                    .detail()
+                    .contains("case-rename-pending")
+            );
+        }
+    }
+
+    /// ADV-E-1, delete safety: whatever the rename's fate, the plan deletes no spelling of a path
+    /// the source holds, so a failed rename can never leave the NAS with neither; and a folder
+    /// holding DSM's `@eaDir` is not renamed at all.
+    #[test]
+    fn a_rename_plan_deletes_no_spelling_of_a_local_path() {
+        let root = RemoteRoot::parse("/share/root").unwrap();
+        let plan = build_plan(
+            &root,
+            &local(&[
+                ("photos", EntryKind::Directory, 0, 0),
+                ("photos/a.jpg", EntryKind::File, 9, 9_000),
+            ]),
+            &remote(&[
+                ("Photos", EntryKind::Directory, 0, 0),
+                ("Photos/a.jpg", EntryKind::File, 3, 3),
+                ("Photos/@eaDir", EntryKind::Directory, 0, 0),
+                ("Photos/@eaDir/thumb.jpg", EntryKind::File, 1, 1),
+            ]),
+            &rules(&[]),
+            &options(true),
+        )
+        .unwrap();
+        assert!(deleted(&plan).is_empty(), "{:?}", deleted(&plan));
+        assert_eq!(
+            uploaded(&plan),
+            [("photos/a.jpg", "/share/root/Photos/a.jpg")]
+        );
+        assert!(plan.renames.is_empty());
+        assert_eq!(skips(&plan), [("photos", "deferred")]);
+    }
+
+    /// A local entry where the NAS holds a mount point or a link is that path's skip: nothing is
+    /// written at or beneath it, nothing there is deleted, and the rest of the run proceeds. It used
+    /// to fail every run.
+    #[test]
+    fn a_local_entry_at_a_remote_mount_or_link_is_a_skip() {
+        let root = RemoteRoot::parse("/share/root").unwrap();
+        let mut remote_inventory = remote(&[
+            ("keep.txt", EntryKind::File, 1, 1),
+            ("linked", EntryKind::Directory, 0, 0),
+        ]);
+        remote_inventory
+            .entries
+            .get_mut("linked")
+            .unwrap()
+            .mount_point_type = Some("link".to_owned());
+        for delete in [false, true] {
+            let plan = build_plan(
+                &root,
+                &local(&[
+                    ("keep.txt", EntryKind::File, 1, 1_000),
+                    ("linked", EntryKind::Directory, 0, 0),
+                    ("linked/x.txt", EntryKind::File, 1, 1_000),
+                    ("other.txt", EntryKind::File, 1, 1_000),
+                ]),
+                &remote_inventory,
+                &rules(&[]),
+                &options(delete),
+            )
+            .unwrap();
+            assert_eq!(skips(&plan), [("linked", "remote-link")]);
+            assert!(
+                plan.skipped[0]
+                    .reason
+                    .detail()
+                    .contains("/share/root/linked")
+            );
+            assert_eq!(uploaded(&plan), [("other.txt", "/share/root/other.txt")]);
+            assert!(plan.creates.is_empty());
+            assert!(deleted(&plan).is_empty());
+        }
+    }
+
+    /// ADV-E-4: a type conflict this run cannot carry is that path's skip, not the run's failure.
+    #[test]
+    fn a_type_conflict_that_cannot_be_carried_is_skipped_and_shielded() {
+        let root = RemoteRoot::parse("/share/root").unwrap();
+        let local_inventory = local(&[
+            ("photos", EntryKind::File, 4, 4_000),
+            ("other.txt", EntryKind::File, 1, 1_000),
+        ]);
+        let remote_inventory = remote(&[
+            ("photos", EntryKind::Directory, 0, 0),
+            ("photos/a.jpg", EntryKind::File, 3, 3),
+            ("photos/.DS_Store", EntryKind::File, 3, 3),
+        ]);
+        let ignore = IgnoreRules::build(&std::env::temp_dir(), &[]).unwrap();
+        for delete in [false, true] {
+            let plan = build_plan(
+                &root,
+                &local_inventory,
+                &remote_inventory,
+                &ignore,
+                &options(delete),
+            )
+            .unwrap();
+            assert_eq!(skips(&plan), [("photos", "type-conflict")]);
+            assert_eq!(uploaded(&plan), [("other.txt", "/share/root/other.txt")]);
+            assert!(deleted(&plan).is_empty(), "{:?}", deleted(&plan));
+        }
+    }
+
+    /// ADV-E-5: a remote-only folder kept because it holds an excluded or DSM-managed entry is
+    /// named, once, at the topmost such folder.
+    #[test]
+    fn a_folder_kept_for_a_protected_entry_is_named_once() {
+        let root = RemoteRoot::parse("/share/root").unwrap();
+        let ignore = IgnoreRules::build(&std::env::temp_dir(), &[]).unwrap();
+        let plan = build_plan(
+            &root,
+            &local(&[("keep.txt", EntryKind::File, 1, 1_000)]),
+            &remote(&[
+                ("keep.txt", EntryKind::File, 1, 1),
+                ("Old", EntryKind::Directory, 0, 0),
+                ("Old/a.jpg", EntryKind::File, 1, 1),
+                ("Old/sub", EntryKind::Directory, 0, 0),
+                ("Old/sub/.DS_Store", EntryKind::File, 1, 1),
+            ]),
+            &ignore,
+            &options(true),
+        )
+        .unwrap();
+        assert_eq!(skips(&plan), [("Old", "protected-descendant")]);
+        assert!(
+            plan.skipped[0]
+                .reason
+                .detail()
+                .contains("Old/sub/.DS_Store")
+        );
+        assert_eq!(deleted(&plan), ["Old/a.jpg"]);
+    }
+
+    /// ADV-E-10: on a source that resolves names regardless of case, an exclude covers every
+    /// spelling of the name, on both sides. The NAS `Report.pdf` under `--exclude report.pdf` is
+    /// excluded, so it is neither deleted nor overwritten; on a case-sensitive source it is a
+    /// different name and mirrors as one.
+    #[test]
+    fn an_exclude_covers_every_spelling_on_a_folding_source() {
+        let root = RemoteRoot::parse("/share/root").unwrap();
+        let ignore = rules(&["report.pdf", "build/"]);
+        let plan = build_plan(
+            &root,
+            &local(&[("keep.txt", EntryKind::File, 1, 1_000)]),
+            &remote(&[
+                ("keep.txt", EntryKind::File, 1, 1),
+                ("Report.pdf", EntryKind::File, 1, 1),
+                ("Build", EntryKind::Directory, 0, 0),
+                ("Build/out.o", EntryKind::File, 1, 1),
+                ("stale.txt", EntryKind::File, 1, 1),
+            ]),
+            &ignore,
+            &options(true),
+        )
+        .unwrap();
+        assert!(plan.skipped.is_empty(), "{:?}", plan.skipped);
+        if ignore.folds_names() {
+            assert_eq!(deleted(&plan), ["stale.txt"]);
+        } else {
+            assert_eq!(
+                deleted(&plan),
+                ["Build/out.o", "Build", "Report.pdf", "stale.txt"]
+            );
+        }
+    }
+
+    /// ADV-E-3: a path the destination cannot hold once its prefix is prepended is that path's
+    /// lasting `unsupported-entry` deferral (a named warning), reported once at its topmost folder, and
+    /// never deleted on the NAS.
+    #[test]
+    fn a_path_too_long_for_the_destination_is_skipped_not_fatal() {
+        let root = RemoteRoot::parse("/share/Backups/Laptop-2026").unwrap();
+        let top = "a".repeat(120);
+        let deep = format!("{top}/{}", "b".repeat(120));
+        let file = format!("{deep}/report.pdf");
+        let plan = build_plan(
+            &root,
+            &local(&[
+                ("keep.txt", EntryKind::File, 1, 1_000),
+                (top.as_str(), EntryKind::Directory, 0, 0),
+                (deep.as_str(), EntryKind::Directory, 0, 0),
+                (file.as_str(), EntryKind::File, 1, 1_000),
+            ]),
+            &remote(&[(file.as_str(), EntryKind::File, 1, 1)]),
+            &rules(&[]),
+            &options(true),
+        )
+        .unwrap();
+        assert_eq!(skips(&plan), [(deep.as_str(), "deferred")]);
+        assert!(!crate::sync::skip_is_transient_deferral(&plan.skipped[0]));
+        assert!(
+            plan.skipped[0]
+                .reason
+                .detail()
+                .contains("unsupported-entry: ")
+        );
+        assert_eq!(
+            uploaded(&plan),
+            [("keep.txt", "/share/Backups/Laptop-2026/keep.txt")]
+        );
+        assert!(deleted(&plan).is_empty());
+    }
+
+    /// ADV-E-2: a remote file the plan can never delete -- its local counterpart skipped, its
+    /// spelling unresolved, or its folder listed short -- is never downloaded for a deletion guard.
+    #[test]
+    fn deletion_guards_are_not_selected_for_files_the_plan_cannot_delete() {
+        let mut local_inventory = local(&[("keep.txt", EntryKind::File, 1, 1_000)]);
+        local_inventory.skipped.push(SkippedEntry {
+            relative: "vault.bin".to_owned(),
+            reason: SkipReason::WindowsAttributes,
+        });
+        local_inventory.skipped.push(SkippedEntry {
+            relative: "Online".to_owned(),
+            reason: SkipReason::DehydratedPlaceholder,
+        });
+        let remote_inventory = remote(&[
+            ("keep.txt", EntryKind::File, 1, 1),
+            ("vault.bin", EntryKind::File, 9, 9),
+            ("online", EntryKind::Directory, 0, 0),
+            ("online/big.bin", EntryKind::File, 9, 9),
+            ("abe", EntryKind::Directory, 0, 0),
+            ("abe/hidden-sibling.bin", EntryKind::File, 9, 9),
+            ("gone.bin", EntryKind::File, 9, 9),
+        ]);
+        let ignore = rules(&[]);
+        assert_eq!(
+            select_deletion_guard_hashes_excluding(
+                &local_inventory,
+                &remote_inventory,
+                &ignore,
+                &["abe".to_owned()]
+            ),
+            BTreeSet::from(["gone.bin".to_owned()])
+        );
+        let (_, strong) = select_plan_digests(
+            &local_inventory,
+            &remote_inventory,
+            &ignore,
+            false,
+            true,
+            &["abe".to_owned()],
+        );
+        assert_eq!(strong, BTreeSet::from(["gone.bin".to_owned()]));
+    }
+
+    /// ADV-E-8: content mode compares a same-size pair whose time moved by content, and does not
+    /// re-upload identical bytes.
+    #[test]
+    fn content_mode_compares_a_time_only_change_by_content() {
+        let mut local_inventory = local(&[
+            ("same.bin", EntryKind::File, 4, 9_000_000),
+            ("edited.bin", EntryKind::File, 4, 9_000_000),
+        ]);
+        let mut remote_inventory = remote(&[
+            ("same.bin", EntryKind::File, 4, 5_400),
+            ("edited.bin", EntryKind::File, 4, 5_400),
+        ]);
+        let ignore = rules(&[]);
+        assert_eq!(
+            select_comparison_remote_digests(&local_inventory, &remote_inventory, &ignore, false),
+            BTreeSet::from(["edited.bin".to_owned(), "same.bin".to_owned()])
+        );
+        for (relative, local_digest, remote_digest) in [("same.bin", 1, 1), ("edited.bin", 2, 3)] {
+            local_inventory
+                .entries
+                .get_mut(relative)
+                .unwrap()
+                .content_md5 = Some(digest(local_digest));
+            remote_inventory
+                .entries
+                .get_mut(relative)
+                .unwrap()
+                .content_md5 = Some(digest(remote_digest));
+        }
+        let plan = build_plan(
+            &RemoteRoot::parse("/share/root").unwrap(),
+            &local_inventory,
+            &remote_inventory,
+            &ignore,
+            &content_options(false, false),
+        )
+        .unwrap();
+        assert_eq!(
+            plan.uploads
+                .iter()
+                .map(|action| (action.local.relative.as_str(), action.reason))
+                .collect::<Vec<_>>(),
+            [("edited.bin", ChangeReason::ContentDiffers)]
+        );
+        assert_eq!(plan.unchanged_files, 1);
+    }
+
+    /// ADV-E-7: a directory move under `--delete` with server copy plans in time linear in its
+    /// size. Each copy used to be looked up by scanning every copy per deletion.
+    #[test]
+    fn planning_a_large_directory_move_is_not_quadratic() {
+        fn moved(count: usize) -> (LocalInventory, RemoteInventory) {
+            let mut local_entries = vec![("new".to_owned(), EntryKind::Directory, 0, 0)];
+            let mut remote_entries = vec![("old".to_owned(), EntryKind::Directory, 0, 0)];
+            for index in 0..count {
+                local_entries.push((
+                    format!("new/photo-{index:07}.jpg"),
+                    EntryKind::File,
+                    1000,
+                    1_700_000_000_000,
+                ));
+                remote_entries.push((
+                    format!("old/photo-{index:07}.jpg"),
+                    EntryKind::File,
+                    1000,
+                    1_700_000_000,
+                ));
+            }
+            let borrow = |entries: &[(String, EntryKind, u64, i64)]| {
+                entries
+                    .iter()
+                    .map(|(relative, kind, size, mtime)| (relative.clone(), *kind, *size, *mtime))
+                    .collect::<Vec<_>>()
+            };
+            let local_entries = borrow(&local_entries);
+            let remote_entries = borrow(&remote_entries);
+            let mut local_inventory = local(
+                &local_entries
+                    .iter()
+                    .map(|(relative, kind, size, mtime)| (relative.as_str(), *kind, *size, *mtime))
+                    .collect::<Vec<_>>(),
+            );
+            let mut remote_inventory = remote(
+                &remote_entries
+                    .iter()
+                    .map(|(relative, kind, size, mtime)| (relative.as_str(), *kind, *size, *mtime))
+                    .collect::<Vec<_>>(),
+            );
+            // A distinct digest per file, the same on both sides, so every copy is unambiguous.
+            let unique = |index: usize| {
+                let mut md5 = [0_u8; 16];
+                md5[..8].copy_from_slice(&(index as u64).to_le_bytes());
+                let mut sha256 = [0_u8; 32];
+                sha256[..8].copy_from_slice(&(index as u64).to_le_bytes());
+                ContentMd5::from_digests(md5, index as u32, sha256)
+            };
+            for (index, entry) in local_inventory.entries.values_mut().enumerate() {
+                if entry.kind == EntryKind::File {
+                    entry.content_md5 = Some(unique(index));
+                }
+            }
+            for (index, entry) in remote_inventory.entries.values_mut().enumerate() {
+                if entry.kind == EntryKind::File {
+                    entry.content_md5 = Some(unique(index));
+                }
+            }
+            (local_inventory, remote_inventory)
+        }
+        let root = RemoteRoot::parse("/share/root").unwrap();
+        let ignore = IgnoreRules::none();
+        let options = PlanOptions {
+            max_delete: usize::MAX,
+            ..content_options(true, true)
+        };
+        let mut timings = Vec::new();
+        for count in [4_000, 16_000] {
+            let (local_inventory, remote_inventory) = moved(count);
+            let started = std::time::Instant::now();
+            let plan = build_plan(
+                &root,
+                &local_inventory,
+                &remote_inventory,
+                &ignore,
+                &options,
+            )
+            .unwrap();
+            timings.push(started.elapsed().as_secs_f64());
+            assert_eq!(plan.post_deletes.len(), count + 1);
+            assert_eq!(plan.copies.len(), count);
+        }
+        // Linear is 4x for 4x the entries; quadratic is 16x. 10x leaves room for a noisy runner.
+        let ratio = timings[1] / timings[0].max(1e-6);
+        assert!(
+            ratio < 10.0,
+            "4x the entries took {ratio:.1}x as long: {timings:?}"
+        );
+    }
     /// Two local spellings are still never carried, whichever inventory reached the planner. The
     /// walk normally removes them first; the planner refuses them independently.
     #[test]
@@ -2872,7 +3888,12 @@ mod tests {
         let local_inventory = local(&[("cafe\u{301}.txt", EntryKind::File, 4, 4_000)]);
         let remote_inventory = remote(&[("caf\u{e9}.txt", EntryKind::File, 4, 4)]);
         assert_eq!(
-            select_comparison_remote_digests(&local_inventory, &remote_inventory, &rules(&[])),
+            select_comparison_remote_digests(
+                &local_inventory,
+                &remote_inventory,
+                &rules(&[]),
+                false
+            ),
             BTreeSet::from(["caf\u{e9}.txt".to_owned()])
         );
         assert!(
@@ -2908,7 +3929,12 @@ mod tests {
             .content_md5 = Some(digest(1));
 
         assert_eq!(
-            select_comparison_remote_digests(&local_inventory, &remote_inventory, &rules(&[])),
+            select_comparison_remote_digests(
+                &local_inventory,
+                &remote_inventory,
+                &rules(&[]),
+                false
+            ),
             BTreeSet::from(["keep.txt".to_owned()])
         );
         assert!(
@@ -3162,7 +4188,11 @@ mod tests {
             ("node/child/file", EntryKind::File, 1, 1),
         ]);
         let root = RemoteRoot::parse("/share/root").unwrap();
-        assert!(build_plan(&root, &local, &remote, &rules(&[]), &options(false)).is_err());
+        // ADV-E-4: without `--delete` the conflict is that path's skip, not the run's failure.
+        let additive = build_plan(&root, &local, &remote, &rules(&[]), &options(false)).unwrap();
+        assert_eq!(skips(&additive), [("node", "type-conflict")]);
+        assert!(additive.uploads.is_empty());
+        assert!(deleted(&additive).is_empty());
         let plan = build_plan(&root, &local, &remote, &rules(&[]), &options(true)).unwrap();
         assert_eq!(
             plan.pre_deletes
@@ -3264,8 +4294,9 @@ mod tests {
         assert_eq!(plan.uploads[0].reason, ChangeReason::ContentDiffers);
     }
 
-    /// 3.499 s floors and rounds to 3, so a remote 4 is a change. (3.5 s or later would round to 4
-    /// and agree: DSM may have stored it that way.)
+    /// 3.499 s floors and rounds to 3, so a remote 4 is a change of time. (3.5 s or later would
+    /// round to 4 and agree: DSM may have stored it that way.) Content mode settles it by content
+    /// (ADV-E-8): equal digests are unchanged; without a remote digest the time difference is named.
     #[test]
     fn content_mode_detects_mtime_only_changes_at_file_station_resolution() {
         let mut local = local(&[("mtime-only.bin", EntryKind::File, 4, 3_499)]);
@@ -3277,6 +4308,22 @@ mod tests {
             .unwrap()
             .content_md5 = Some(digest(6));
 
+        let plan = build_plan(
+            &RemoteRoot::parse("/share/root").unwrap(),
+            &local,
+            &remote,
+            &rules(&[]),
+            &content_options(false, false),
+        )
+        .unwrap();
+        assert!(plan.uploads.is_empty());
+        assert_eq!(plan.unchanged_files, 1);
+
+        remote
+            .entries
+            .get_mut("mtime-only.bin")
+            .unwrap()
+            .content_md5 = None;
         let plan = build_plan(
             &RemoteRoot::parse("/share/root").unwrap(),
             &local,
@@ -4756,6 +5803,7 @@ mod resync_ticket_tests {
             copies: Vec::new(),
             uploads,
             post_deletes: Vec::new(),
+            renames: Vec::new(),
             unchanged_files: 0,
             protected_entries: 0,
             upload_bytes,

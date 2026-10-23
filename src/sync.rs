@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
@@ -66,6 +66,8 @@ trait SyncOperations: Clone + Send + Sync {
     ) -> Result<()>;
     fn delete_non_recursive(&self, root: &RemoteRoot, remote_path: &str) -> Result<()>;
     fn create_folder(&self, remote_path: &str) -> Result<()>;
+    fn supports_rename(&self) -> bool;
+    fn rename(&self, root: &RemoteRoot, remote_path: &str, new_name: &str) -> Result<String>;
     fn copy_file_verified(
         &self,
         root: &RemoteRoot,
@@ -129,6 +131,14 @@ impl SyncOperations for ApiClient {
 
     fn create_folder(&self, remote_path: &str) -> Result<()> {
         self.create_folder(remote_path)
+    }
+
+    fn supports_rename(&self) -> bool {
+        self.supports_rename()
+    }
+
+    fn rename(&self, root: &RemoteRoot, remote_path: &str, new_name: &str) -> Result<String> {
+        self.rename(root, remote_path, new_name)
     }
 
     fn copy_file_verified(
@@ -323,6 +333,23 @@ enum LocalPresence {
     /// `notes.` or `notes ` (Win32 strips the trailing dot or space and finds `notes` instead),
     /// nor a reserved device name or a character NTFS refuses.
     Unrepresentable,
+}
+
+/// The local spelling of a remote path, through the plan's case-only renames.
+///
+/// A remote path beneath a folder a rename pairs is spelled the NAS way (`Photos/gone.jpg`) while
+/// the file it stands for, if it is back, is spelled the local way (`photos/gone.jpg`). Asked by
+/// its remote spelling, the exact-spelling presence check could not see a file recreated there.
+fn local_spelling<'a>(plan: &SyncPlan, relative: &'a str) -> std::borrow::Cow<'a, str> {
+    // Deepest first, so the most specific rename wins.
+    for rename in &plan.renames {
+        if let Some(rest) = relative.strip_prefix(rename.from_relative.as_str())
+            && (rest.is_empty() || rest.starts_with('/'))
+        {
+            return std::borrow::Cow::Owned(format!("{}{rest}", rename.relative));
+        }
+    }
+    std::borrow::Cow::Borrowed(relative)
 }
 
 /// Re-establish the precondition that made a remote entry a deletion candidate.
@@ -616,6 +643,33 @@ pub enum DeferReason {
     ServerCopyFailed,
     /// DSM refused the deletion.
     DeleteFailed,
+    /// DSM refused this one path: its name (too long, illegal on the volume), this account's
+    /// permissions on it, or its size for the destination filesystem. Every other path proceeds.
+    /// Lasting: it recurs until someone renames the path or changes its rights, and a partial run
+    /// would re-trigger a realtime profile forever. It is named on every run, as a warning, never
+    /// as a plain green run. A refusal that is really about the share (most paths refused for one
+    /// cause) fails the run instead.
+    RemoteRefused,
+    /// This account may not read the local file or folder. Not a lock that clears: it stays out of
+    /// reach until someone changes its permissions.
+    LocalPermissionDenied,
+    /// A case-only rename on the NAS did not finish: File Station refused the rename, the old
+    /// spelling holds entries a rename must not move, or the NAS still holds the old spelling beside
+    /// the new one. Nothing was deleted on its account. Lasting, as only someone renaming or
+    /// removing it in File Station settles it; the rename is still tried on every run where it can
+    /// be.
+    CaseRenamePending,
+    /// A NAS entry the remote walk will not carry (a name this tool cannot address, a link out of
+    /// the destination, a folder seen twice). Never deleted, overwritten or descended.
+    RemoteSkipped,
+    /// A local name, path or entry kind Synology Drive cannot hold: a name it refuses, a path too
+    /// long once the destination is prepended, a name that is not UTF-8, a FIFO, socket or device,
+    /// or a modification time before 1970. It used to fail the whole scan; it is now this path's,
+    /// named as a warning on every run until it is renamed or excluded.
+    UnsupportedEntry,
+    /// DSM refused to delete this entry for permission (105 once the session is proven alive, or
+    /// 407). That recurs until someone changes the folder's rights, so it is lasting.
+    DeleteNotPermitted,
 }
 
 impl DeferReason {
@@ -632,6 +686,12 @@ impl DeferReason {
             Self::ListingIncomplete => "listing-incomplete",
             Self::ServerCopyFailed => "server-copy-failed",
             Self::DeleteFailed => "delete-failed",
+            Self::RemoteRefused => "remote-refused",
+            Self::LocalPermissionDenied => "local-permission-denied",
+            Self::CaseRenamePending => "case-rename-pending",
+            Self::RemoteSkipped => "remote-skipped",
+            Self::UnsupportedEntry => "unsupported-entry",
+            Self::DeleteNotPermitted => "delete-not-permitted",
         }
     }
 
@@ -659,6 +719,24 @@ impl DeferReason {
             }
             Self::ServerCopyFailed => "the NAS-side copy failed; uploaded next run",
             Self::DeleteFailed => "the NAS refused the deletion; retried next run",
+            Self::RemoteRefused => {
+                "the NAS refuses this name or this account's access to it; named on every run until it is renamed or its permissions change"
+            }
+            Self::LocalPermissionDenied => {
+                "this account may not read it (permission denied); left out of every run until its permissions change"
+            }
+            Self::CaseRenamePending => {
+                "a case-only rename on the NAS is not finished; nothing was deleted on its account; named on every run until it is renamed or removed in File Station"
+            }
+            Self::RemoteSkipped => {
+                "has a NAS name or link this tool will not follow; never deleted, overwritten or descended; named every run until it is renamed or removed on the NAS"
+            }
+            Self::UnsupportedEntry => {
+                "has a name, path or file type Synology Drive cannot hold; named every run until it is renamed or excluded"
+            }
+            Self::DeleteNotPermitted => {
+                "the NAS does not let this account delete it; kept until its permissions change"
+            }
         }
     }
 
@@ -675,11 +753,17 @@ impl DeferReason {
                 | Self::UnsupportedLocalEntry
                 | Self::ListingIncomplete
                 | Self::RemoteUnreadable
+                | Self::LocalPermissionDenied
+                | Self::DeleteNotPermitted
+                | Self::RemoteRefused
+                | Self::RemoteSkipped
+                | Self::UnsupportedEntry
+                | Self::CaseRenamePending
         )
     }
 
     /// Every reason, so readers can be checked against the whole vocabulary.
-    pub const ALL: [Self; 11] = [
+    pub const ALL: [Self; 17] = [
         Self::SourceChanged,
         Self::SourceVanished,
         Self::SourceUnreadable,
@@ -691,6 +775,12 @@ impl DeferReason {
         Self::ListingIncomplete,
         Self::ServerCopyFailed,
         Self::DeleteFailed,
+        Self::RemoteRefused,
+        Self::LocalPermissionDenied,
+        Self::CaseRenamePending,
+        Self::RemoteSkipped,
+        Self::UnsupportedEntry,
+        Self::DeleteNotPermitted,
     ];
 
     /// The reason a failure reading one local file defers it, or `None` when the failure is not
@@ -707,10 +797,40 @@ impl DeferReason {
             Error::FileIo { source, .. } if is_entry_without_data(source) => {
                 Some(Self::UnsupportedLocalEntry)
             }
+            // This account may not read it. Not a lock that clears, so lasting: classed as
+            // unreadable, every run was partial forever with a promise of a retry that could not
+            // succeed. (`ERROR_ACCESS_DENIED` is the same kind on Windows.)
+            Error::FileIo { source, .. }
+                if source.kind() == std::io::ErrorKind::PermissionDenied =>
+            {
+                Some(Self::LocalPermissionDenied)
+            }
             Error::FileIo { .. } => Some(Self::SourceUnreadable),
             Error::UnsupportedLocalEntry { .. } => Some(Self::UnsupportedLocalEntry),
             _ => None,
         }
+    }
+
+    /// The reason a failure writing one path defers it: a local failure as
+    /// [`Self::for_local_error`] has it, or DSM refusing that one path for a lasting reason.
+    pub fn for_path_error(error: &Error) -> Option<Self> {
+        match error {
+            Error::RemoteRefused { .. } => Some(Self::RemoteRefused),
+            other => Self::for_local_error(other),
+        }
+    }
+}
+
+/// The reason a deletion DSM refused is deferred.
+///
+/// A permission refusal (105 once the session is proven alive, 407) recurs on every run until
+/// someone changes the folder's rights, so it is lasting. Anything else DSM says about the entry
+/// (900 among them) is retried by the next run.
+fn delete_refusal_reason(error: &Error) -> DeferReason {
+    if matches!(error.api_code(), Some(105 | 407)) {
+        DeferReason::DeleteNotPermitted
+    } else {
+        DeferReason::DeleteFailed
     }
 }
 
@@ -901,6 +1021,11 @@ pub enum ExecutionEvent {
         relative: String,
         reason: DeferReason,
     },
+    /// A case-only rename carried out on the NAS by File Station Rename.
+    Renamed {
+        from_remote_path: String,
+        to_remote_path: String,
+    },
 }
 
 impl std::fmt::Display for ExecutionEvent {
@@ -954,6 +1079,10 @@ impl std::fmt::Display for ExecutionEvent {
                 "deferred ({reason}): {relative} {}",
                 reason.describe()
             ),
+            Self::Renamed {
+                from_remote_path,
+                to_remote_path,
+            } => write!(formatter, "renamed: {from_remote_path} -> {to_remote_path}"),
         }
     }
 }
@@ -982,6 +1111,8 @@ pub struct ExecutionReport {
     /// Planned server-side copies DSM refused to start, uploaded instead. Counted in `uploaded`
     /// too; named here because a fallback costs the transfer the copy was planned to save.
     pub copy_fallbacks: usize,
+    /// Case-only renames carried out with File Station Rename.
+    pub renamed: usize,
 }
 
 impl ExecutionReport {
@@ -1006,7 +1137,8 @@ impl ExecutionReport {
         }
     }
 
-    /// Defer `relative` for a local failure that concerns only that file, or return the failure.
+    /// Defer `relative` for a failure that concerns only that path (its local file, or DSM
+    /// refusing its name), or return the failure.
     fn defer_local(
         &mut self,
         index: &mut DeferralIndex,
@@ -1014,7 +1146,7 @@ impl ExecutionReport {
         error: Error,
         report: &mut impl FnMut(ExecutionEvent),
     ) -> Result<()> {
-        match DeferReason::for_local_error(&error) {
+        match DeferReason::for_path_error(&error) {
             Some(reason) => {
                 self.defer(index, relative, reason, error.to_string(), report);
                 Ok(())
@@ -1114,8 +1246,53 @@ fn execute_with<O: SyncOperations>(
 /// What one upload worker settled for one file.
 enum UploadOutcome {
     Uploaded,
-    Deferred(DeferReason, String),
+    /// The reason, the detail, and DSM's refusal cause when DSM refused the path.
+    Deferred(DeferReason, String, Option<String>),
     Failed(Error),
+}
+
+/// Fails the run when DSM's per-path refusals are really one refusal of the share.
+///
+/// A refusal of one path is that path's deferral and the run goes on. But the same cause behind
+/// most of what the run tried (an account that may not write the share, a destination volume that
+/// rejects every name of some kind) would otherwise end as hundreds of deferrals and a run that
+/// merely reads partial. Once at least three refusals share one cause and they are more than half
+/// of the folders and files the run attempted, it fails, once, naming the cause and the paths.
+#[derive(Debug, Default)]
+struct RefusalBreaker {
+    attempted: usize,
+    by_cause: BTreeMap<String, Vec<String>>,
+}
+
+impl RefusalBreaker {
+    fn attempt(&mut self) {
+        self.attempted += 1;
+    }
+
+    fn refused(&mut self, cause: Option<String>, relative: &str) {
+        if let Some(cause) = cause {
+            self.by_cause
+                .entry(cause)
+                .or_default()
+                .push(relative.to_owned());
+        }
+    }
+
+    fn check(&self) -> Result<()> {
+        for (cause, paths) in &self.by_cause {
+            if paths.len() >= 3 && paths.len() * 2 > self.attempted {
+                return Err(Error::Message(format!(
+                    "the NAS refused {} of the {} folders and files this run wrote, all for one \
+                     cause ({cause}), so the share or the account rather than these paths is the \
+                     likely problem: {}",
+                    paths.len(),
+                    self.attempted,
+                    paths.join(", ")
+                )));
+            }
+        }
+        Ok(())
+    }
 }
 
 /// The detail recorded when a destination was found changed since planning.
@@ -1204,17 +1381,37 @@ fn execute_with_observer<O: SyncOperations>(
             remote_path: action.remote_path.clone(),
         });
     }
+    let mut breaker = RefusalBreaker::default();
     for action in &plan.creates {
         cancellation.check()?;
         if deferrals.covering(&action.relative).is_some() {
             continue;
         }
-        client.create_folder(&action.remote_path)?;
-        completed.created += 1;
-        report(ExecutionEvent::DirectoryCreated {
-            remote_path: action.remote_path.clone(),
-        });
+        breaker.attempt();
+        match client.create_folder(&action.remote_path) {
+            Ok(()) => {
+                completed.created += 1;
+                report(ExecutionEvent::DirectoryCreated {
+                    remote_path: action.remote_path.clone(),
+                });
+            }
+            // DSM refused this one folder (its name, this account's rights on its parent). Its
+            // subtree is covered by the deferral and left out; every other folder and upload
+            // proceeds. It used to fail the run before a single upload.
+            Err(error @ Error::RemoteRefused { .. }) => {
+                breaker.refused(error.refusal_cause_key(), &action.relative);
+                completed.defer(
+                    &mut deferrals,
+                    &action.relative,
+                    DeferReason::RemoteRefused,
+                    error.to_string(),
+                    &mut report,
+                );
+            }
+            Err(error) => return Err(error),
+        }
     }
+    breaker.check()?;
 
     let copies = plan
         .copies
@@ -1372,6 +1569,9 @@ fn execute_with_observer<O: SyncOperations>(
         .filter(|action| deferrals.covering(&action.local.relative).is_none())
         .cloned()
         .collect::<VecDeque<_>>();
+    for _ in &uploads {
+        breaker.attempt();
+    }
     if !uploads.is_empty() {
         let worker_count = options.jobs.clamp(1, 16).min(uploads.len());
         let queue = Arc::new(Mutex::new(uploads));
@@ -1418,6 +1618,7 @@ fn execute_with_observer<O: SyncOperations>(
                             Ok(false) => UploadOutcome::Deferred(
                                 DeferReason::RemoteChanged,
                                 remote_changed_detail(&action.remote_path),
+                                None,
                             ),
                             Err(error) => UploadOutcome::Failed(error),
                             Ok(true) => {
@@ -1446,12 +1647,15 @@ fn execute_with_observer<O: SyncOperations>(
                                     &cancellation,
                                 ) {
                                     Ok(()) => UploadOutcome::Uploaded,
-                                    // One file that changed under its own transfer is that
-                                    // file's problem; its peers keep going.
-                                    Err(error) => match DeferReason::for_local_error(&error) {
-                                        Some(reason) => {
-                                            UploadOutcome::Deferred(reason, error.to_string())
-                                        }
+                                    // One file that changed under its own transfer, or whose
+                                    // name DSM refuses, is that file's problem; its peers keep
+                                    // going.
+                                    Err(error) => match DeferReason::for_path_error(&error) {
+                                        Some(reason) => UploadOutcome::Deferred(
+                                            reason,
+                                            error.to_string(),
+                                            error.refusal_cause_key(),
+                                        ),
                                         None => UploadOutcome::Failed(error),
                                     },
                                 }
@@ -1483,7 +1687,8 @@ fn execute_with_observer<O: SyncOperations>(
                             bytes: size,
                         });
                     }
-                    UploadOutcome::Deferred(reason, detail) => {
+                    UploadOutcome::Deferred(reason, detail, cause) => {
+                        breaker.refused(cause, &relative);
                         completed.defer(&mut deferrals, &relative, reason, detail, &mut report);
                     }
                     UploadOutcome::Failed(error) => record_worker_error(&mut first_error, error),
@@ -1492,7 +1697,7 @@ fn execute_with_observer<O: SyncOperations>(
             if let Some(error) = first_error {
                 return Err(error);
             }
-            Ok(())
+            breaker.check()
         })?;
     }
 
@@ -1622,29 +1827,31 @@ fn execute_with_observer<O: SyncOperations>(
             );
             continue;
         }
-        let deferral = match local_presence(&plan.source_root, &action.relative) {
-            Ok(LocalPresence::Absent) => None,
-            Ok(LocalPresence::Present) => {
-                kept_relatives.insert(action.relative.clone());
-                reappeared.insert(action.relative.clone());
-                completed.deletes_skipped += 1;
-                report(ExecutionEvent::RemoteExtraDeleteSkipped {
-                    remote_path: action.remote_path.clone(),
-                    relative: action.relative.clone(),
-                    reason: DeleteKeptReason::LocalPathExists,
-                });
-                continue;
-            }
-            Ok(LocalPresence::Unrepresentable) => Some((
-                DeferReason::UnrepresentableName,
-                format!(
-                    "{:?} cannot be spelled on this host's filesystem",
-                    action.relative
-                ),
-            )),
-            // Absence was not established, so the remote copy stays.
-            Err(error) => Some((DeferReason::SourceUnreadable, error.to_string())),
-        };
+        // Under a folder a case-only rename pairs, the local file is spelled the local way.
+        let deferral =
+            match local_presence(&plan.source_root, &local_spelling(plan, &action.relative)) {
+                Ok(LocalPresence::Absent) => None,
+                Ok(LocalPresence::Present) => {
+                    kept_relatives.insert(action.relative.clone());
+                    reappeared.insert(action.relative.clone());
+                    completed.deletes_skipped += 1;
+                    report(ExecutionEvent::RemoteExtraDeleteSkipped {
+                        remote_path: action.remote_path.clone(),
+                        relative: action.relative.clone(),
+                        reason: DeleteKeptReason::LocalPathExists,
+                    });
+                    continue;
+                }
+                Ok(LocalPresence::Unrepresentable) => Some((
+                    DeferReason::UnrepresentableName,
+                    format!(
+                        "{:?} cannot be spelled on this host's filesystem",
+                        action.relative
+                    ),
+                )),
+                // Absence was not established, so the remote copy stays.
+                Err(error) => Some((DeferReason::SourceUnreadable, error.to_string())),
+            };
         let deferral = deferral.or_else(|| {
             delete_changed[index].then(|| {
                 (
@@ -1722,17 +1929,26 @@ fn execute_with_observer<O: SyncOperations>(
                 // Named before anything else happens, so a run that stops here still says which
                 // deletion it stopped on, after the ones it had already made.
                 kept_relatives.insert(action.relative.clone());
-                let transient = !matches!(error, Error::Api { .. });
+                // A DSM refusal concerns this entry. Anything else concerns every deletion after
+                // it, so the run stops: the transport, cancellation, and the session -- including a
+                // re-login that failed, which DSM also answers with an API code. Treating that as a
+                // refusal of this entry attempted every remaining deletion on a dead session and
+                // named each one `delete-failed`, "retried next run".
+                let concerns_run =
+                    !matches!(error, Error::Api { .. } | Error::RemoteRefused { .. })
+                        || error.is_session_failure();
                 completed.defer(
                     &mut deferrals,
                     &action.relative,
-                    DeferReason::DeleteFailed,
+                    if concerns_run {
+                        DeferReason::DeleteFailed
+                    } else {
+                        delete_refusal_reason(&error)
+                    },
                     error.to_string(),
                     &mut report,
                 );
-                // A DSM refusal concerns this entry. Anything else (the transport, the session,
-                // cancellation) concerns every deletion after it, so the run stops.
-                if transient {
+                if concerns_run {
                     return Err(error);
                 }
             }
@@ -1803,6 +2019,100 @@ fn execute_with_observer<O: SyncOperations>(
         });
     }
 
+    execute_renames(
+        client,
+        root,
+        plan,
+        &cancellation,
+        completed,
+        &mut deferrals,
+        &mut report,
+    )
+}
+
+/// Carry the plan's case-only renames, last, deepest first.
+///
+/// Last, because everything else the plan does to these entries was planned against the spelling
+/// they have now. A rename that does not happen therefore leaves nothing half done: the content is
+/// already where the NAS keeps it, nothing was deleted on its account, and the rename is named
+/// `case-rename-pending` and retried by the next run. The upload-and-delete it replaces could leave
+/// both spellings on the NAS, which every later run then froze as a lasting collision.
+fn execute_renames<O: SyncOperations>(
+    client: &O,
+    root: &RemoteRoot,
+    plan: &SyncPlan,
+    cancellation: &CancellationToken,
+    completed: &mut ExecutionReport,
+    deferrals: &mut DeferralIndex,
+    report: &mut impl FnMut(ExecutionEvent),
+) -> Result<()> {
+    if plan.renames.is_empty() {
+        return Ok(());
+    }
+    if !client.supports_rename() {
+        for action in &plan.renames {
+            completed.defer(
+                deferrals,
+                &action.relative,
+                DeferReason::CaseRenamePending,
+                format!(
+                    "this DSM does not offer SYNO.FileStation.Rename, so {:?} cannot be renamed to {:?}; rename it in File Station",
+                    action.from_remote_path, action.new_name
+                ),
+                report,
+            );
+        }
+        return Ok(());
+    }
+    for action in &plan.renames {
+        cancellation.check()?;
+        // Something at or beneath it was left for the next run: the entry is not in the state the
+        // rename was planned on, so it is not moved, and the rename waits with it.
+        if let Some((other, _)) = deferrals.spelling_related(&action.relative) {
+            let detail = format!(
+                "{:?} was not renamed to {:?} because {other:?} beneath it was left for the next run",
+                action.from_remote_path, action.new_name
+            );
+            completed.defer(
+                deferrals,
+                &action.relative,
+                DeferReason::CaseRenamePending,
+                detail,
+                report,
+            );
+            continue;
+        }
+        match client.rename(root, &action.from_remote_path, &action.new_name) {
+            Ok(renamed) => {
+                completed.renamed += 1;
+                report(ExecutionEvent::Renamed {
+                    from_remote_path: action.from_remote_path.clone(),
+                    to_remote_path: renamed,
+                });
+            }
+            // The transport, the session and cancellation concern every rename after this one.
+            Err(error)
+                if !matches!(
+                    error,
+                    Error::Api { .. }
+                        | Error::RemoteRefused { .. }
+                        | Error::ContentVerificationFailed(_)
+                ) || error.is_session_failure() =>
+            {
+                return Err(error);
+            }
+            Err(error) => completed.defer(
+                deferrals,
+                &action.relative,
+                DeferReason::CaseRenamePending,
+                format!(
+                    "renaming {:?} to {:?} failed: {error}",
+                    action.from_remote_path, action.new_name
+                ),
+                report,
+            ),
+        }
+    }
     Ok(())
 }
 
@@ -1854,18 +2164,69 @@ pub fn populate_plan_digests(
     delete: bool,
     cancellation: &CancellationToken,
 ) -> Result<Vec<DeferredPath>> {
+    populate_plan_digests_with_listings(
+        client,
+        local,
+        remote,
+        rules,
+        compare,
+        server_copy,
+        delete,
+        &[],
+        cancellation,
+    )
+}
+
+/// [`populate_plan_digests`] for a remote inventory with folders DSM listed short.
+///
+/// A deletion inside one of `incomplete` is withheld after planning
+/// ([`withhold_deletions_in_incomplete_listings`]), so the full download its strong digest costs is
+/// not paid for it either.
+#[allow(clippy::too_many_arguments)]
+pub fn populate_plan_digests_with_listings(
+    client: &ApiClient,
+    local: &mut LocalInventory,
+    remote: &mut RemoteInventory,
+    rules: &IgnoreRules,
+    compare: CompareMode,
+    server_copy: bool,
+    delete: bool,
+    incomplete: &[String],
+    cancellation: &CancellationToken,
+) -> Result<Vec<DeferredPath>> {
     let mut deferred = Vec::new();
+    // A remote file whose deletion a short listing withholds is not worth its guard's download,
+    // and a content-mode deletion planned without one fails the plan. Taken out up front, by name,
+    // as the deferral it would have become.
+    if delete && matches!(compare, CompareMode::Content | CompareMode::Force) {
+        for relative in crate::plan::deletions_withheld_by_listing(local, remote, rules, incomplete)
+        {
+            local.withhold(
+                &relative,
+                crate::local::SkipReason::Deferred {
+                    detail: format!(
+                        "{}: {LISTING_INCOMPLETE_DETAIL}",
+                        DeferReason::ListingIncomplete
+                    ),
+                },
+            );
+            deferred.push(DeferredPath {
+                relative,
+                reason: DeferReason::ListingIncomplete,
+                detail: LISTING_INCOMPLETE_DETAIL.to_owned(),
+            });
+        }
+    }
     match compare {
         CompareMode::Content => {
             client.require_content_fingerprint_api()?;
-            let mut comparison =
-                crate::plan::select_comparison_remote_digests(local, remote, rules);
-            let mut strong = crate::plan::select_strong_remote_digests(
+            let (mut comparison, mut strong) = crate::plan::select_plan_digests(
                 local,
                 remote,
                 rules,
                 server_copy,
                 delete,
+                incomplete,
             );
             // Local strength mirrors remote strength, entry for entry: MD5 where the remote side
             // will only carry MD5, full strength everywhere else. Uploads promoted out of the
@@ -1901,7 +2262,9 @@ pub fn populate_plan_digests(
             client.require_content_fingerprint_api()?;
             // Forced runs compare nothing, so every digest here guards a deletion and must be
             // strong. Unchanged by the comparison split.
-            let selected = crate::plan::select_deletion_guard_hashes(local, remote, rules);
+            let selected = crate::plan::select_deletion_guard_hashes_excluding(
+                local, remote, rules, incomplete,
+            );
             let failed = client.populate_remote_content_fingerprints_deferring(
                 remote,
                 &selected,
@@ -1916,6 +2279,10 @@ pub fn populate_plan_digests(
     }
     Ok(deferred)
 }
+
+/// Why a deletion inside a folder DSM listed short was withheld.
+const LISTING_INCOMPLETE_DETAIL: &str =
+    "the listing of its folder returned a different number of entries than the NAS counted";
 
 /// The deferral a remote digest failure gets: an account refused this one file (lasting), or the
 /// NAS could not produce its checksum this time.
@@ -2060,6 +2427,121 @@ fn withheld_with(relative: &str, other: &str, reason: DeferReason) -> DeferredPa
     }
 }
 
+/// Every deferral the plan's `skipped` list names that `deferred` does not, as records.
+///
+/// The local walk withholds a folder it could not read, and the planner a case-only rename it could
+/// not finish, as skips tagged `deferred` with a `<reason>: <cause>` detail. A run's result is built
+/// from its deferral records, so without these the path would be in `plan.skipped`, counted nowhere,
+/// and the run complete. Records already present (a withheld digest failure) are left alone.
+pub fn deferrals_in_plan_skips(plan: &SyncPlan, deferred: &[DeferredPath]) -> Vec<DeferredPath> {
+    let known: HashSet<&str> = deferred
+        .iter()
+        .map(|record| record.relative.as_str())
+        .collect();
+    plan.skipped
+        .iter()
+        .filter(|entry| !known.contains(entry.relative.as_str()))
+        .filter_map(|entry| {
+            let crate::local::SkipReason::Deferred { detail } = &entry.reason else {
+                return None;
+            };
+            DeferReason::ALL.iter().find_map(|reason| {
+                let cause = detail.strip_prefix(reason.as_str())?.strip_prefix(':')?;
+                Some(DeferredPath {
+                    relative: entry.relative.clone(),
+                    reason: *reason,
+                    detail: cause.trim_start().to_owned(),
+                })
+            })
+        })
+        .collect()
+}
+
+/// Keep every folder holding a remote entry the walk would not carry, and name each one.
+///
+/// Such an entry (a name this tool cannot address, a link out of the destination, a folder seen
+/// twice) is never in the inventory's entries, or is there as a mount point, so the planner cannot
+/// see that its folder is not empty. A deletion of that folder, or of any folder above it, is
+/// withheld here, by name; a type replacement that needed one is withheld with everything that
+/// depended on it. Each entry nobody excluded is named as a lasting `remote-skipped` deferral.
+pub fn protect_skipped_remote_entries(
+    plan: &mut SyncPlan,
+    skipped: &[crate::api::SkippedRemoteEntry],
+) -> Vec<DeferredPath> {
+    let mut deferred = Vec::new();
+    if skipped.is_empty() {
+        return deferred;
+    }
+    // Every folder that holds one, and every folder above those.
+    let mut kept: BTreeMap<String, String> = BTreeMap::new();
+    for entry in skipped {
+        if !entry.excluded {
+            deferred.push(DeferredPath {
+                relative: entry.display(),
+                reason: DeferReason::RemoteSkipped,
+                detail: entry.detail(),
+            });
+        }
+        let mut folder = entry.parent.as_str();
+        loop {
+            kept.entry(folder.to_owned())
+                .or_insert_with(|| entry.display());
+            match folder.rfind('/') {
+                Some(slash) => folder = &folder[..slash],
+                None if folder.is_empty() => break,
+                None => folder = "",
+            }
+        }
+    }
+    let mut withheld_replacements: Vec<String> = Vec::new();
+    let withhold = |action: &crate::plan::DeleteAction, deferred: &mut Vec<DeferredPath>| {
+        let Some(holding) = kept.get(&action.relative) else {
+            return true;
+        };
+        deferred.push(DeferredPath {
+            relative: action.relative.clone(),
+            reason: DeferReason::RemoteSkipped,
+            detail: format!(
+                "kept because {holding:?} beneath it is a NAS entry this tool will not follow"
+            ),
+        });
+        false
+    };
+    plan.post_deletes
+        .retain(|action| withhold(action, &mut deferred));
+    plan.pre_deletes.retain(|action| {
+        let keep = withhold(action, &mut deferred);
+        if !keep {
+            withheld_replacements.push(action.relative.clone());
+        }
+        keep
+    });
+    if !withheld_replacements.is_empty() {
+        // The replacement cannot land where the entry it was to replace still stands.
+        let replaced = |relative: &str| {
+            withheld_replacements.iter().any(|path| {
+                relative == path
+                    || relative
+                        .strip_prefix(path.as_str())
+                        .is_some_and(|rest| rest.starts_with('/'))
+            })
+        };
+        plan.uploads
+            .retain(|action| !replaced(&action.local.relative));
+        plan.copies.retain(|action| !replaced(&action.to_relative));
+        plan.creates.retain(|action| !replaced(&action.relative));
+        plan.pre_deletes
+            .retain(|action| !replaced(&action.relative));
+        plan.upload_bytes = plan
+            .uploads
+            .iter()
+            .map(|action| action.local.size)
+            .chain(plan.copies.iter().map(|action| action.expected_size))
+            .fold(0_u64, u64::saturating_add);
+    }
+    deferred
+}
+
 /// Name every deferral in the plan's `skipped` list, tagged `deferred`, unless it is there already.
 ///
 /// Planning-time withholds arrive there on their own; promotion deferrals and withheld deletions
@@ -2067,12 +2549,15 @@ fn withheld_with(relative: &str, other: &str, reason: DeferReason) -> DeferredPa
 /// could be fingerprinted.
 pub fn record_deferrals_in_plan(plan: &mut SyncPlan, deferred: &[DeferredPath]) {
     let mut added = false;
+    // Indexed once rather than scanned per deferral: a run that defers thousands of paths (a NAS
+    // that cannot checksum, a folder listed short) made this quadratic.
+    let mut named: HashSet<String> = plan
+        .skipped
+        .iter()
+        .map(|entry| entry.relative.clone())
+        .collect();
     for record in deferred {
-        if plan
-            .skipped
-            .iter()
-            .any(|entry| entry.relative == record.relative)
-        {
+        if !named.insert(record.relative.clone()) {
             continue;
         }
         plan.skipped.push(crate::local::SkippedEntry {
@@ -2089,6 +2574,117 @@ pub fn record_deferrals_in_plan(plan: &mut SyncPlan, deferred: &[DeferredPath]) 
     }
 }
 
+/// Shield a scoped run's path where the NAS holds it under another spelling.
+///
+/// A scoped walk reads only the scope's own path on the NAS, each folder of it by its exact
+/// spelling, so it cannot see `Photos/` when the scope is `photos`. Planned on that walk, the run
+/// created `photos/` beside `Photos/` -- without `--delete` -- and every mirror run after it froze
+/// both. So before planning, each folder of the scope path that the NAS does not hold by this
+/// spelling has its parent's names listed (`list_names`, one non-recursive listing each), and a
+/// sibling that is the same name under another case or normalisation withholds that folder, and so
+/// the scope beneath it, as a `remote-case-collision`. The unscoped mirror run carries the rename.
+pub fn withhold_scope_spelling_conflicts(
+    root: &RemoteRoot,
+    scope: &crate::plan::Scope,
+    local: &mut LocalInventory,
+    remote: &RemoteInventory,
+    mut list_names: impl FnMut(&str) -> Result<(Vec<String>, bool)>,
+) -> Result<()> {
+    if scope.is_root() || !remote.root_exists {
+        return Ok(());
+    }
+    let mut parent = String::new();
+    for name in scope.as_str().split('/') {
+        let relative = if parent.is_empty() {
+            name.to_owned()
+        } else {
+            format!("{parent}/{name}")
+        };
+        if !remote.entries.contains_key(&relative) {
+            let fold = crate::path::portable_fold(name);
+            let (names, complete) = list_names(&root.join(&parent)?)?;
+            if let Some(other) = names.iter().find(|candidate| {
+                *candidate != name && crate::path::portable_fold(candidate) == fold
+            }) {
+                let other = if parent.is_empty() {
+                    other.clone()
+                } else {
+                    format!("{parent}/{other}")
+                };
+                local.withhold(
+                    &relative,
+                    crate::local::SkipReason::RemoteCaseCollision { other },
+                );
+                return Ok(());
+            }
+            // A listing DSM returned short cannot prove the other spelling absent: the scope is
+            // withheld, by name, rather than created on the strength of it.
+            if !complete {
+                local.withhold(
+                    &relative,
+                    crate::local::SkipReason::Deferred {
+                        detail: format!(
+                            "{}: the NAS listing of {:?} was incomplete, so a differently spelled \
+                             {name:?} there cannot be ruled out; nothing was created",
+                            DeferReason::ListingIncomplete,
+                            if parent.is_empty() {
+                                "."
+                            } else {
+                                parent.as_str()
+                            }
+                        ),
+                    },
+                );
+            }
+            // Absent here, so nothing beneath it is on the NAS either.
+            return Ok(());
+        }
+        parent = relative;
+    }
+    Ok(())
+}
+
+/// Fail the run when the remote walk found link boundaries almost everywhere.
+///
+/// A link is recognised by DSM reporting, for a folder, a real path that is not where the listing
+/// put it. Genuine links are rare. Most or all folders looking like links says instead that this
+/// DSM's real paths do not have the shape the walk expects -- a different volume prefix, a lexical
+/// rather than resolved path -- and acting on that would skip the whole tree folder by folder,
+/// thousands of warnings and nothing synced. So once at least three folders are link boundaries and
+/// they are more than half of the folders listed, the run fails with that cause, by name.
+pub fn check_link_boundaries(remote: &RemoteInventory) -> Result<()> {
+    let mut folders = 0_usize;
+    let mut links = Vec::new();
+    for entry in remote.entries.values() {
+        if entry.kind != crate::local::EntryKind::Directory {
+            continue;
+        }
+        folders += 1;
+        if entry.mount_point_type.as_deref() == Some(crate::api::LINKED_ENTRY_MOUNT_TYPE) {
+            links.push(entry.relative.as_str());
+        }
+    }
+    if links.len() >= 3 && links.len() * 2 > folders {
+        let shown = links
+            .iter()
+            .take(10)
+            .copied()
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Err(Error::Message(format!(
+            "{REMOTE_REAL_PATH_UNUSABLE}: {} of the {folders} NAS folders listed look like links to \
+             somewhere else, which points to DSM reporting real paths in a shape this tool does not \
+             expect rather than to real links; nothing was synced. Folders: {shown}{}",
+            links.len(),
+            if links.len() > 10 { ", ..." } else { "" }
+        )));
+    }
+    Ok(())
+}
+
+/// The named cause [`check_link_boundaries`] fails a run with.
+pub const REMOTE_REAL_PATH_UNUSABLE: &str = "remote-real-path-unusable";
+
 /// Withhold every mirror deletion a short directory listing could have misled.
 ///
 /// A directory in `incomplete` was listed with fewer (or more) entries than DSM counted, so an
@@ -2102,21 +2698,13 @@ pub fn withhold_deletions_in_incomplete_listings(
     if incomplete.is_empty() {
         return Vec::new();
     }
-    let affected = |relative: &str| {
-        incomplete.iter().any(|directory| {
-            let parent = relative.rfind('/').map_or("", |slash| &relative[..slash]);
-            parent == directory
-                || relative == directory
-                || directory.starts_with(&format!("{relative}/"))
-        })
-    };
     let mut withheld = Vec::new();
     plan.post_deletes.retain(|action| {
-        if affected(&action.relative) {
+        if crate::plan::listing_withholds(&action.relative, incomplete) {
             withheld.push(DeferredPath {
                 relative: action.relative.clone(),
                 reason: DeferReason::ListingIncomplete,
-                detail: "the listing of its folder returned a different number of entries than the NAS counted".to_owned(),
+                detail: LISTING_INCOMPLETE_DETAIL.to_owned(),
             });
             false
         } else {
@@ -2203,6 +2791,16 @@ pub fn ensure_reconciled(
     }
     let pending = || reconciliation_pending(rebuilt);
     let mut changed_during_run = 0;
+    // Indexed once. Asked per rebuilt action, a scan of the executed plan made reconciliation
+    // quadratic in exactly the case it is most needed for: a DSM that does not keep upload times
+    // rebuilds a plan holding every upload the run made.
+    let written = ExecutedWrites::index(executed);
+    // A rename the run could not make is named; one it did not plan is pending like anything else.
+    for action in &rebuilt.renames {
+        if !deferred.relates_to(&action.relative) {
+            return Err(pending());
+        }
+    }
     for action in &rebuilt.pre_deletes {
         if !deferred.relates_to(&action.relative) {
             return Err(pending());
@@ -2217,7 +2815,7 @@ pub fn ensure_reconciled(
         // or an upload's milliseconds rounded). Counted as `mtime_not_kept` where it was observed,
         // and corrected by the next run's upload rather than failed here.
         if action.reason == crate::plan::ChangeReason::MtimeDiffers
-            && run_wrote_exactly(executed, &action.local.relative)
+            && written.exactly(&action.local.relative)
         {
             continue;
         }
@@ -2260,15 +2858,10 @@ pub fn ensure_reconciled(
         if deferred.relates_to(&action.relative) {
             continue;
         }
-        let scheduled = executed
-            .post_deletes
-            .iter()
-            .chain(&executed.pre_deletes)
-            .any(|planned| planned.relative == action.relative);
-        if scheduled {
+        if written.deleted(&action.relative) {
             return Err(pending());
         }
-        let written_by_run = run_wrote_at_or_beneath(executed, &action.relative);
+        let written_by_run = written.at_or_beneath(&action.relative);
         let predates_run =
             started_seconds.is_some_and(|started| action.snapshot.mtime_seconds <= started);
         if !written_by_run && !predates_run {
@@ -2279,32 +2872,71 @@ pub fn ensure_reconciled(
     Ok(Reconciliation { changed_during_run })
 }
 
-fn run_wrote_exactly(executed: &SyncPlan, relative: &str) -> bool {
-    executed
-        .uploads
-        .iter()
-        .any(|action| action.local.relative == relative)
-        || executed
-            .copies
-            .iter()
-            .any(|action| action.to_relative == relative)
+/// What the executed plan wrote and deleted, indexed for the per-action questions reconciliation
+/// asks.
+struct ExecutedWrites<'plan> {
+    /// Paths an upload or a copy wrote.
+    exact: HashSet<&'plan str>,
+    /// Paths an upload, a copy or a create wrote, and every folder above one.
+    at_or_above: HashSet<&'plan str>,
+    /// Paths a pre- or post-deletion was scheduled for.
+    deleted: HashSet<&'plan str>,
 }
 
-fn run_wrote_at_or_beneath(executed: &SyncPlan, relative: &str) -> bool {
-    let prefix = format!("{relative}/");
-    let at_or_beneath = |candidate: &str| candidate == relative || candidate.starts_with(&prefix);
-    executed
-        .uploads
-        .iter()
-        .any(|action| at_or_beneath(&action.local.relative))
-        || executed
-            .copies
+impl<'plan> ExecutedWrites<'plan> {
+    fn index(executed: &'plan SyncPlan) -> Self {
+        let exact: HashSet<&str> = executed
+            .uploads
             .iter()
-            .any(|action| at_or_beneath(&action.to_relative))
-        || executed
-            .creates
+            .map(|action| action.local.relative.as_str())
+            .chain(
+                executed
+                    .copies
+                    .iter()
+                    .map(|action| action.to_relative.as_str()),
+            )
+            .collect();
+        let mut at_or_above = HashSet::new();
+        for written in exact.iter().copied().chain(
+            executed
+                .creates
+                .iter()
+                .map(|action| action.relative.as_str()),
+        ) {
+            let mut current = written;
+            // Stops at the first folder already present: everything above it is present too.
+            while at_or_above.insert(current) {
+                match current.rfind('/') {
+                    Some(slash) => current = &current[..slash],
+                    None => break,
+                }
+            }
+        }
+        let deleted = executed
+            .post_deletes
             .iter()
-            .any(|action| at_or_beneath(&action.relative))
+            .chain(&executed.pre_deletes)
+            .map(|action| action.relative.as_str())
+            .collect();
+        Self {
+            exact,
+            at_or_above,
+            deleted,
+        }
+    }
+
+    fn exactly(&self, relative: &str) -> bool {
+        self.exact.contains(relative)
+    }
+
+    /// Whether the run wrote `relative` or anything beneath it.
+    fn at_or_beneath(&self, relative: &str) -> bool {
+        self.at_or_above.contains(relative)
+    }
+
+    fn deleted(&self, relative: &str) -> bool {
+        self.deleted.contains(relative)
+    }
 }
 
 fn reconciliation_pending(plan: &SyncPlan) -> Error {
@@ -2313,7 +2945,8 @@ fn reconciliation_pending(plan: &SyncPlan) -> Error {
             + plan.creates.len()
             + plan.copies.len()
             + plan.uploads.len()
-            + plan.post_deletes.len(),
+            + plan.post_deletes.len()
+            + plan.renames.len(),
     }
 }
 
@@ -2373,6 +3006,8 @@ mod tests {
         source_changes_during_upload: Option<String>,
         /// The batch verdict for a destination whose modification time DSM did not keep.
         mtime_not_kept_path: Option<String>,
+        /// The DSM code a rename fails with.
+        fail_rename: Option<i64>,
     }
 
     /// The one entry a streaming [`MockOperations`] fails immediately.
@@ -2425,6 +3060,27 @@ mod tests {
                 Err(Error::Message("create failed".to_owned()))
             } else {
                 Ok(())
+            }
+        }
+
+        fn supports_rename(&self) -> bool {
+            true
+        }
+
+        fn rename(&self, _root: &RemoteRoot, remote_path: &str, new_name: &str) -> Result<String> {
+            self.event(format!("rename:{remote_path}->{new_name}"));
+            match self.fail_rename {
+                Some(code) => Err(Error::Api {
+                    api: "SYNO.FileStation.Rename".to_owned(),
+                    operation: "rename".to_owned(),
+                    code,
+                    description: String::new(),
+                    details: Vec::new(),
+                }),
+                None => {
+                    let (parent, _) = crate::path::parent_and_name(remote_path)?;
+                    Ok(format!("{parent}/{new_name}"))
+                }
             }
         }
 
@@ -2659,6 +3315,7 @@ mod tests {
                 snapshot: file_snapshot(1, None),
                 destination_guard: None,
             }],
+            renames: Vec::new(),
             unchanged_files: 0,
             protected_entries: 0,
             upload_bytes: 1,
@@ -3794,8 +4451,8 @@ mod tests {
     #[test]
     fn a_refused_deletion_is_named_and_the_others_proceed() {
         let client = RefusingDelete {
-            inner: MockOperations::default(),
             refused: "/share/root/a/refused".to_owned(),
+            ..RefusingDelete::default()
         };
         let mut plan = populated_plan();
         plan.pre_deletes.clear();
@@ -3869,7 +4526,12 @@ mod tests {
     #[derive(Clone, Default)]
     struct RefusingDelete {
         inner: MockOperations,
+        /// The remote path refused, or `*` for every one.
         refused: String,
+        /// The API and code of the refusal; `SYNO.FileStation.Delete` 900 when unset.
+        refused_with: Option<(&'static str, i64)>,
+        /// Every deletion attempted, refused or not.
+        attempts: Arc<std::sync::atomic::AtomicUsize>,
     }
 
     macro_rules! delegate_operations {
@@ -3887,6 +4549,19 @@ mod tests {
 
                 fn create_folder(&self, remote_path: &str) -> Result<()> {
                     self.$inner.create_folder(remote_path)
+                }
+
+                fn supports_rename(&self) -> bool {
+                    self.$inner.supports_rename()
+                }
+
+                fn rename(
+                    &self,
+                    root: &RemoteRoot,
+                    remote_path: &str,
+                    new_name: &str,
+                ) -> Result<String> {
+                    self.$inner.rename(root, remote_path, new_name)
                 }
 
                 fn verify_remote_snapshot_batch(
@@ -4011,11 +4686,15 @@ mod tests {
         }
 
         fn delete_non_recursive(&self, root: &RemoteRoot, remote_path: &str) -> Result<()> {
-            if remote_path == self.refused {
+            self.attempts.fetch_add(1, Ordering::AcqRel);
+            if self.refused == "*" || remote_path == self.refused {
+                let (api, code) = self
+                    .refused_with
+                    .unwrap_or(("SYNO.FileStation.Delete", 900));
                 return Err(Error::Api {
-                    api: "SYNO.FileStation.Delete".to_owned(),
+                    api: api.to_owned(),
                     operation: "delete".to_owned(),
-                    code: 900,
+                    code,
                     description: String::new(),
                     details: Vec::new(),
                 });
@@ -4470,6 +5149,7 @@ mod tests {
             copies: Vec::new(),
             uploads: Vec::new(),
             post_deletes: Vec::new(),
+            renames: Vec::new(),
             unchanged_files: 0,
             protected_entries: 0,
             upload_bytes: 0,
@@ -4887,5 +5567,522 @@ mod tests {
             ),
             Err(Error::ReconciliationPending { operations: 1 })
         ));
+    }
+
+    fn deletions(relatives: &[&str]) -> Vec<DeleteAction> {
+        relatives
+            .iter()
+            .map(|relative| DeleteAction {
+                relative: (*relative).to_owned(),
+                remote_path: format!("/share/root/{relative}"),
+                kind: EntryKind::File,
+                type_conflict: false,
+                snapshot: file_snapshot(1, None),
+                destination_guard: None,
+            })
+            .collect()
+    }
+
+    fn deletion_only_plan(relatives: &[&str]) -> SyncPlan {
+        let mut plan = populated_plan();
+        plan.pre_deletes.clear();
+        plan.creates.clear();
+        plan.uploads.clear();
+        plan.post_deletes = deletions(relatives);
+        plan
+    }
+
+    /// ADV-E-9 / ADV-R-8: a session DSM will not give back (a re-login refused) is not a refusal
+    /// of one entry. The run stops at the first deletion, once, with that cause; it used to attempt
+    /// every remaining deletion on the dead session and name each `delete-failed`.
+    #[test]
+    fn a_dead_session_in_the_delete_phase_stops_at_the_first_deletion() {
+        let client = RefusingDelete {
+            refused: "*".to_owned(),
+            refused_with: Some(("SYNO.API.Auth", 400)),
+            ..RefusingDelete::default()
+        };
+        let plan = deletion_only_plan(&["a.txt", "b.txt", "c.txt"]);
+        let error = execute_with(
+            &client,
+            &RemoteRoot::parse("/share/root").unwrap(),
+            &plan,
+            ExecuteOptions {
+                jobs: 1,
+                dry_run: false,
+            },
+            |_| {},
+        )
+        .unwrap_err();
+        assert!(error.is_session_failure(), "{error}");
+        assert_eq!(client.attempts.load(Ordering::Acquire), 1);
+    }
+
+    /// ADV-E-6: DSM refusing a deletion for permission recurs on every run, so it is lasting and
+    /// does not make every run partial. A transient refusal (900) stays `delete-failed`.
+    #[test]
+    fn a_permission_refused_deletion_is_lasting() {
+        for (code, expected) in [
+            (407, DeferReason::DeleteNotPermitted),
+            (105, DeferReason::DeleteNotPermitted),
+            (900, DeferReason::DeleteFailed),
+        ] {
+            let client = RefusingDelete {
+                refused: "/share/root/a.txt".to_owned(),
+                refused_with: Some(("SYNO.FileStation.Delete", code)),
+                ..RefusingDelete::default()
+            };
+            let report = execute_with(
+                &client,
+                &RemoteRoot::parse("/share/root").unwrap(),
+                &deletion_only_plan(&["a.txt", "b.txt"]),
+                ExecuteOptions {
+                    jobs: 1,
+                    dry_run: false,
+                },
+                |_| {},
+            )
+            .unwrap();
+            assert_eq!(report.deleted, 1);
+            assert_eq!(only_deferral(&report).reason, expected, "code {code}");
+            assert_eq!(expected.is_lasting(), code != 900);
+        }
+    }
+
+    /// ADV-E-6: a local file this account may not read is lasting; a lock is not.
+    #[test]
+    fn permission_denied_is_lasting_and_a_lock_is_not() {
+        let denied = Error::FileIo {
+            path: PathBuf::from("secret.txt"),
+            source: std::io::Error::from(std::io::ErrorKind::PermissionDenied),
+        };
+        assert_eq!(
+            DeferReason::for_local_error(&denied),
+            Some(DeferReason::LocalPermissionDenied)
+        );
+        assert!(DeferReason::LocalPermissionDenied.is_lasting());
+        let locked = Error::FileIo {
+            path: PathBuf::from("mailbox"),
+            source: std::io::Error::other("sharing violation"),
+        };
+        assert_eq!(
+            DeferReason::for_local_error(&locked),
+            Some(DeferReason::SourceUnreadable)
+        );
+        assert!(!DeferReason::SourceUnreadable.is_lasting());
+    }
+
+    fn rename_plan() -> SyncPlan {
+        let mut plan = deletion_only_plan(&["Photos/gone.jpg"]);
+        plan.renames.push(crate::plan::RenameAction {
+            relative: "photos".to_owned(),
+            from_relative: "Photos".to_owned(),
+            from_remote_path: "/share/root/Photos".to_owned(),
+            new_name: "photos".to_owned(),
+            to_remote_path: "/share/root/photos".to_owned(),
+            kind: EntryKind::Directory,
+        });
+        plan
+    }
+
+    /// ADV-E-1: a case-only rename runs last, after every deletion, and is counted.
+    #[test]
+    fn a_case_rename_runs_last() {
+        let client = MockOperations::default();
+        let mut events = Vec::new();
+        let report = execute_with(
+            &client,
+            &RemoteRoot::parse("/share/root").unwrap(),
+            &rename_plan(),
+            ExecuteOptions {
+                jobs: 1,
+                dry_run: false,
+            },
+            |event| events.push(event),
+        )
+        .unwrap();
+        assert_eq!(report.renamed, 1);
+        assert!(report.deferred.is_empty());
+        let recorded = client.events.lock().unwrap().clone();
+        let delete = recorded
+            .iter()
+            .position(|event| event == "delete:/share/root/Photos/gone.jpg")
+            .expect("the deletion ran");
+        let rename = recorded
+            .iter()
+            .position(|event| event == "rename:/share/root/Photos->photos")
+            .expect("the rename ran");
+        assert!(delete < rename, "{recorded:?}");
+        assert!(events.contains(&ExecutionEvent::Renamed {
+            from_remote_path: "/share/root/Photos".to_owned(),
+            to_remote_path: "/share/root/photos".to_owned(),
+        }));
+    }
+
+    /// ADV-E-1, mandatory: a rename DSM refuses deletes nothing on its account, is named
+    /// `case-rename-pending` (a lasting warning; the next run tries the rename again), and the
+    /// run still completes everything else.
+    #[test]
+    fn a_refused_case_rename_is_pending_and_deletes_nothing() {
+        let client = MockOperations {
+            fail_rename: Some(900),
+            ..MockOperations::default()
+        };
+        let mut plan = rename_plan();
+        plan.post_deletes.clear();
+        let report = execute_with(
+            &client,
+            &RemoteRoot::parse("/share/root").unwrap(),
+            &plan,
+            ExecuteOptions {
+                jobs: 1,
+                dry_run: false,
+            },
+            |_| {},
+        )
+        .unwrap();
+        assert_eq!(report.renamed, 0);
+        assert_eq!(report.deleted, 0);
+        let deferred = only_deferral(&report);
+        assert_eq!(deferred.relative, "photos");
+        assert_eq!(deferred.reason, DeferReason::CaseRenamePending);
+        // Lasting: only renaming it in File Station settles it, and the rename is tried again on
+        // every run where it can be.
+        assert!(deferred.reason.is_lasting());
+        assert!(
+            deferred.detail.contains("/share/root/Photos"),
+            "{}",
+            deferred.detail
+        );
+        assert!(
+            !client
+                .events
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|event| event.starts_with("delete:"))
+        );
+    }
+
+    /// A rename the rebuilt plan still holds is pending unless the run named it.
+    #[test]
+    fn reconciliation_holds_a_pending_rename_to_its_deferral() {
+        let executed = rename_plan();
+        let mut rebuilt = rename_plan();
+        rebuilt.post_deletes.clear();
+        let started_at = std::time::SystemTime::now();
+        assert!(matches!(
+            ensure_reconciled(
+                std::path::Path::new("."),
+                &executed,
+                &rebuilt,
+                started_at,
+                &DeferralIndex::default()
+            ),
+            Err(Error::ReconciliationPending { operations: 1 })
+        ));
+        let mut named = DeferralIndex::default();
+        named.insert("photos", DeferReason::CaseRenamePending);
+        assert!(
+            ensure_reconciled(
+                std::path::Path::new("."),
+                &executed,
+                &rebuilt,
+                started_at,
+                &named
+            )
+            .is_ok()
+        );
+    }
+
+    /// Deferrals the plan names among its skips (a folder the walk could not read, a rename
+    /// planning could not finish) become records, once.
+    #[test]
+    fn deferrals_named_in_plan_skips_become_records() {
+        let mut plan = populated_plan();
+        plan.skipped = vec![
+            crate::local::SkippedEntry {
+                relative: "locked".to_owned(),
+                reason: crate::local::SkipReason::Deferred {
+                    detail: "local-permission-denied: failed to read \"locked\": denied".to_owned(),
+                },
+            },
+            crate::local::SkippedEntry {
+                relative: "Photos".to_owned(),
+                reason: crate::local::SkipReason::Deferred {
+                    detail: "case-rename-pending: the NAS holds both".to_owned(),
+                },
+            },
+            crate::local::SkippedEntry {
+                relative: "link".to_owned(),
+                reason: crate::local::SkipReason::LinkOrReparsePoint,
+            },
+        ];
+        let known = [DeferredPath {
+            relative: "Photos".to_owned(),
+            reason: DeferReason::CaseRenamePending,
+            detail: "already named".to_owned(),
+        }];
+        let records = deferrals_in_plan_skips(&plan, &known);
+        assert_eq!(records.len(), 1, "{records:?}");
+        assert_eq!(records[0].relative, "locked");
+        assert_eq!(records[0].reason, DeferReason::LocalPermissionDenied);
+        assert_eq!(records[0].detail, "failed to read \"locked\": denied");
+    }
+
+    /// C-R3: a folder holding a NAS entry the walk would not carry is never deleted, nor is any
+    /// folder above it, and a type replacement that needed one is withheld with what depended on it.
+    #[test]
+    fn folders_holding_an_uncarried_remote_entry_are_never_deleted() {
+        let mut plan = deletion_only_plan(&["top/odd", "top", "elsewhere.txt"]);
+        plan.pre_deletes = deletions(&["swap"]);
+        plan.creates.push(CreateAction {
+            relative: "swap".to_owned(),
+            remote_path: "/share/root/swap".to_owned(),
+            reason: ChangeReason::TypeReplaced,
+        });
+        let skipped = [
+            crate::api::SkippedRemoteEntry {
+                parent: "top/odd".to_owned(),
+                name: "Icon\r".to_owned(),
+                remote_path: "/share/root/top/odd/Icon\r".to_owned(),
+                kind: EntryKind::File,
+                reason: crate::api::RemoteSkipReason::UnrepresentableName,
+                excluded: false,
+                cause: "control character".to_owned(),
+            },
+            crate::api::SkippedRemoteEntry {
+                parent: "swap".to_owned(),
+                name: "a\\b".to_owned(),
+                remote_path: "/share/root/swap/a\\b".to_owned(),
+                kind: EntryKind::File,
+                reason: crate::api::RemoteSkipReason::UnrepresentableName,
+                excluded: true,
+                cause: "backslash".to_owned(),
+            },
+        ];
+        let deferred = protect_skipped_remote_entries(&mut plan, &skipped);
+        assert_eq!(
+            plan.post_deletes
+                .iter()
+                .map(|action| action.relative.as_str())
+                .collect::<Vec<_>>(),
+            ["elsewhere.txt"]
+        );
+        assert!(plan.pre_deletes.is_empty());
+        assert!(plan.creates.is_empty(), "the replacement cannot land");
+        let named = deferred
+            .iter()
+            .map(|record| (record.relative.as_str(), record.reason))
+            .collect::<Vec<_>>();
+        assert!(
+            named.contains(&("top/odd/Icon\\r", DeferReason::RemoteSkipped)),
+            "{named:?}"
+        );
+        assert!(
+            named.contains(&("top", DeferReason::RemoteSkipped)),
+            "{named:?}"
+        );
+        assert!(
+            named.contains(&("swap", DeferReason::RemoteSkipped)),
+            "{named:?}"
+        );
+        assert!(
+            !named
+                .iter()
+                .any(|(relative, _)| relative.ends_with("a\\\\b")),
+            "an excluded entry is protected but not reported: {named:?}"
+        );
+        // Reported, by name, on every run until someone renames or removes it on the NAS: a
+        // lasting warning, never a partial run that would re-trigger forever.
+        assert!(DeferReason::RemoteSkipped.is_lasting());
+    }
+
+    /// ADV-E-1 delete safety: a remote-only file beneath a folder a case rename pairs is checked
+    /// for local presence under its *local* spelling. A file recreated there since the scan keeps
+    /// its NAS copy, as it would anywhere else.
+    #[test]
+    fn a_deletion_beneath_a_renamed_folder_checks_the_local_spelling() {
+        let source = std::env::temp_dir().join(format!(
+            "sdsync-rename-presence-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(source.join("photos")).unwrap();
+        std::fs::write(source.join("photos/gone.jpg"), b"back again").unwrap();
+        let mut plan = rename_plan();
+        plan.source_root = source.clone();
+        let client = MockOperations::default();
+        let report = execute_with(
+            &client,
+            &RemoteRoot::parse("/share/root").unwrap(),
+            &plan,
+            ExecuteOptions {
+                jobs: 1,
+                dry_run: false,
+            },
+            |_| {},
+        );
+        std::fs::remove_dir_all(&source).unwrap();
+        let report = report.unwrap();
+        assert_eq!(report.deleted, 0, "{report:?}");
+        assert_eq!(report.deletes_skipped, 1);
+        assert!(
+            !client
+                .events
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|event| event.starts_with("delete:"))
+        );
+    }
+
+    fn scoped_local(relatives: &[(&str, EntryKind)]) -> LocalInventory {
+        LocalInventory {
+            root: absent_source_root(),
+            entries: relatives
+                .iter()
+                .map(|(relative, kind)| {
+                    (
+                        (*relative).to_owned(),
+                        LocalEntry {
+                            relative: (*relative).to_owned(),
+                            full_path: PathBuf::from(relative),
+                            kind: *kind,
+                            size: 1,
+                            mtime_ms: 1_000,
+                            identity: Default::default(),
+                            content_md5: None,
+                        },
+                    )
+                })
+                .collect(),
+            skipped: Vec::new(),
+        }
+    }
+
+    fn scoped_remote(relatives: &[&str]) -> RemoteInventory {
+        RemoteInventory {
+            root_exists: true,
+            entries: relatives
+                .iter()
+                .map(|relative| {
+                    (
+                        (*relative).to_owned(),
+                        crate::api::RemoteEntry {
+                            relative: (*relative).to_owned(),
+                            remote_path: format!("/share/root/{relative}"),
+                            kind: EntryKind::Directory,
+                            size: 0,
+                            mtime_seconds: 0,
+                            mount_point_type: None,
+                            content_md5: None,
+                        },
+                    )
+                })
+                .collect(),
+        }
+    }
+
+    /// ADV-E-1: a scoped run naming the new spelling of a renamed folder never creates it beside
+    /// the old one; the scope is withheld as a remote case collision, by name.
+    #[test]
+    fn a_scope_the_nas_holds_under_another_spelling_is_withheld() {
+        let root = RemoteRoot::parse("/share/root").unwrap();
+        let mut listed = Vec::new();
+        let mut local = scoped_local(&[
+            ("docs", EntryKind::Directory),
+            ("docs/photos", EntryKind::Directory),
+            ("docs/photos/a.jpg", EntryKind::File),
+        ]);
+        withhold_scope_spelling_conflicts(
+            &root,
+            &crate::plan::Scope::parse("docs/photos").unwrap(),
+            &mut local,
+            &scoped_remote(&["docs"]),
+            |path| {
+                listed.push(path.to_owned());
+                Ok((vec!["Photos".to_owned(), "other".to_owned()], true))
+            },
+        )
+        .unwrap();
+        assert_eq!(listed, ["/share/root/docs"]);
+        assert_eq!(local.entries.keys().collect::<Vec<_>>(), ["docs"]);
+        assert_eq!(
+            local.skipped,
+            [crate::local::SkippedEntry {
+                relative: "docs/photos".to_owned(),
+                reason: crate::local::SkipReason::RemoteCaseCollision {
+                    other: "docs/Photos".to_owned(),
+                },
+            }]
+        );
+
+        // No other spelling: nothing is withheld, and an existing scope is never listed.
+        let mut local = scoped_local(&[("photos", EntryKind::Directory)]);
+        withhold_scope_spelling_conflicts(
+            &root,
+            &crate::plan::Scope::parse("photos").unwrap(),
+            &mut local,
+            &scoped_remote(&[]),
+            |_| Ok((vec!["photos-old".to_owned()], true)),
+        )
+        .unwrap();
+        assert!(local.skipped.is_empty());
+        // A short listing cannot rule the other spelling out.
+        let mut short = scoped_local(&[("photos", EntryKind::Directory)]);
+        withhold_scope_spelling_conflicts(
+            &root,
+            &crate::plan::Scope::parse("photos").unwrap(),
+            &mut short,
+            &scoped_remote(&[]),
+            |_| Ok((Vec::new(), false)),
+        )
+        .unwrap();
+        assert!(short.entries.is_empty());
+        assert!(matches!(
+            short.skipped.as_slice(),
+            [crate::local::SkippedEntry { reason: crate::local::SkipReason::Deferred { detail }, .. }]
+                if detail.starts_with("listing-incomplete: ")
+        ));
+        withhold_scope_spelling_conflicts(
+            &root,
+            &crate::plan::Scope::parse("photos").unwrap(),
+            &mut local,
+            &scoped_remote(&["photos"]),
+            |_| panic!("an existing scope needs no listing"),
+        )
+        .unwrap();
+        assert!(local.skipped.is_empty());
+    }
+
+    /// Link boundaries almost everywhere are an API-shape mismatch, not links: the run fails with
+    /// the named cause. A few real links among many folders are per-path skips.
+    #[test]
+    fn link_boundaries_almost_everywhere_fail_the_run() {
+        let mut remote = scoped_remote(&["a", "b", "c", "d"]);
+        for entry in remote.entries.values_mut().take(3) {
+            entry.mount_point_type = Some(crate::api::LINKED_ENTRY_MOUNT_TYPE.to_owned());
+        }
+        let error = check_link_boundaries(&remote).unwrap_err();
+        assert!(
+            error.to_string().starts_with(REMOTE_REAL_PATH_UNUSABLE),
+            "{error}"
+        );
+
+        let mut mostly_folders = scoped_remote(&["a", "b", "c", "d", "e", "f", "g"]);
+        for entry in mostly_folders.entries.values_mut().take(3) {
+            entry.mount_point_type = Some(crate::api::LINKED_ENTRY_MOUNT_TYPE.to_owned());
+        }
+        assert!(check_link_boundaries(&mostly_folders).is_ok());
+        // A real mount point is not a link.
+        let mut mounts = scoped_remote(&["a", "b", "c"]);
+        for entry in mounts.entries.values_mut() {
+            entry.mount_point_type = Some("cifs".to_owned());
+        }
+        assert!(check_link_boundaries(&mounts).is_ok());
     }
 }

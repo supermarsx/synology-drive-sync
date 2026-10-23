@@ -1,7 +1,7 @@
 #![forbid(unsafe_code)]
 
 use std::cell::RefCell;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fmt::Write as FmtWrite;
 use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
@@ -25,7 +25,7 @@ use synology_drive_sync::local::{self, IgnoreRules, LocalEntry};
 use synology_drive_sync::observability::{
     BUILD, BearerTokenSource, BoundedText, DecodeFault, EventCode, EventLogger, EventMetrics,
     EventReason, FileLogConfig, LogEvent, LogFormat as EventLogFormat, LogLevel as EventLogLevel,
-    LoggerConfig, RemoteDelivery, RemoteLogConfig, RequestOutcome, SessionTransport,
+    LoggerConfig, RemoteDelivery, RemoteLogConfig, RequestOutcome, SessionTransport, failure_path,
 };
 use synology_drive_sync::path::RemoteRoot;
 use synology_drive_sync::plan::{self, CompareMode, PlanOptions, RemoteSnapshot, SyncPlan};
@@ -467,11 +467,14 @@ fn diagnose_source_job(
                     ),
                 )
             }),
-        Err(error) => log_event(
-            logger.as_ref(),
-            LogEvent::new(EventLogLevel::Error, EventCode::RunFailed)
-                .reason(EventReason::of(error)),
-        ),
+        Err(error) => {
+            let mut event = LogEvent::new(EventLogLevel::Error, EventCode::RunFailed)
+                .reason(EventReason::of(error));
+            if let Some(path) = failure_path(error, Some(&settings.source)) {
+                event = event.path(&path);
+            }
+            log_event(logger.as_ref(), event)
+        }
     };
     if operation.is_ok()
         && let Err(error) = final_log
@@ -774,6 +777,8 @@ struct SyncBatchOutcome {
     report: Option<SyncCompletion>,
     elapsed: Option<Duration>,
     error: Option<String>,
+    /// The failure as the result record carries it; see [`failure_record`].
+    failure_record: Option<Value>,
 }
 
 fn run_sync_batch(
@@ -803,6 +808,7 @@ fn run_sync_batch(
                 report: None,
                 elapsed: None,
                 error: None,
+                failure_record: None,
             });
             continue;
         }
@@ -823,6 +829,7 @@ fn run_sync_batch(
                 report: None,
                 elapsed: Some(result.elapsed),
                 error: None,
+                failure_record: None,
             }),
             Err(error) => {
                 cancelled |= matches!(error, Error::Cancelled);
@@ -835,6 +842,7 @@ fn run_sync_batch(
                     report: None,
                     elapsed: None,
                     error: Some(error.to_string()),
+                    failure_record: Some(failure_record(&error, &job.settings.source)),
                 });
             }
         }
@@ -964,6 +972,7 @@ fn run_sync_batch(
                 outcome.report = result.completion;
                 outcome.elapsed = Some(result.elapsed);
                 outcome.error = Some(failure.to_string());
+                outcome.failure_record = Some(failure_record(&failure, &job.settings.source));
                 stopped = budget_refused || cancelled;
             }
             Ok(result) => {
@@ -973,6 +982,7 @@ fn run_sync_batch(
                 outcome.report = result.completion;
                 outcome.elapsed = Some(result.elapsed);
                 outcome.error = None;
+                outcome.failure_record = None;
             }
             Err(error) => {
                 cancelled |= matches!(error, Error::Cancelled);
@@ -986,6 +996,7 @@ fn run_sync_batch(
                 outcome.report = None;
                 outcome.elapsed = None;
                 outcome.error = Some(error.to_string());
+                outcome.failure_record = Some(failure_record(&error, &job.settings.source));
                 stopped = budget_refused || cancelled;
             }
         }
@@ -1200,6 +1211,7 @@ fn write_sync_batch_output(
                 result_record_line(
                     &outcome.name,
                     outcome.status.as_str(),
+                    outcome.failure_record.clone(),
                     match (
                         &outcome.report,
                         &outcome.execution_plan,
@@ -1452,7 +1464,12 @@ fn run_sync(
         Err(error) => {
             // Failed before it had a plan: the record still says so, with no result.
             write_result_record(
-                &[result_record_line(profile, "failed", Value::Null)],
+                &[result_record_line(
+                    profile,
+                    "failed",
+                    Some(failure_record(&error, &settings.source)),
+                    Value::Null,
+                )],
                 &settings.output,
                 Some(profile),
             );
@@ -1475,6 +1492,10 @@ fn run_sync(
             } else {
                 "complete"
             },
+            result
+                .failure
+                .as_ref()
+                .map(|failure| failure_record(failure, &settings.source)),
             result_record_result(
                 Some(&result.plan),
                 result.completion.as_ref(),
@@ -1587,12 +1608,15 @@ impl SyncCompletion {
 
     /// Record `extra`, keeping the first reason for a path already recorded.
     fn add_deferred(&mut self, extra: impl IntoIterator<Item = DeferredPath>) {
+        // Indexed once: a scan of every record per added record made a run that deferred
+        // thousands of paths quadratic here.
+        let mut named: HashSet<String> = self
+            .deferred
+            .iter()
+            .map(|existing| existing.relative.clone())
+            .collect();
         for record in extra {
-            if !self
-                .deferred
-                .iter()
-                .any(|existing| existing.relative == record.relative)
-            {
+            if named.insert(record.relative.clone()) {
                 self.deferred.push(record);
             }
         }
@@ -1628,6 +1652,11 @@ fn run_sync_job(
 ) -> Result<TimedSyncResult> {
     warn_for_insecure_network(&settings.network, &settings.output);
     let logger = build_logger(&settings.output)?;
+    // Every later record that names no profile (the transport's `api_call.*`, `retry.scheduled`)
+    // is this profile's. The answer only says whether the logger now carries exactly it.
+    if let Some(logger) = &logger {
+        logger.attribute_profile(profile);
+    }
     let start_log = log_event(
         logger.as_ref(),
         LogEvent::new(EventLogLevel::Info, EventCode::RunStarted).profile(profile),
@@ -1676,12 +1705,15 @@ fn run_sync_job(
             };
             log_event(logger.as_ref(), event.profile(profile).metrics(metrics))
         }
-        (Err(error), _) => log_event(
-            logger.as_ref(),
-            LogEvent::new(EventLogLevel::Error, EventCode::RunFailed)
+        (Err(error), _) => {
+            let mut event = LogEvent::new(EventLogLevel::Error, EventCode::RunFailed)
                 .reason(EventReason::of(error))
-                .profile(profile),
-        ),
+                .profile(profile);
+            if let Some(path) = failure_path(error, Some(&settings.source)) {
+                event = event.path(&path);
+            }
+            log_event(logger.as_ref(), event)
+        }
         (Ok(()), None) => log_event(
             logger.as_ref(),
             LogEvent::new(EventLogLevel::Error, EventCode::RunFailed)
@@ -2011,6 +2043,12 @@ fn run_status(
         &cancellation,
         None,
     )?;
+    warn_forward_proxy(
+        &settings.output,
+        &client,
+        &settings.connection.url,
+        settings.network.allow_http,
+    );
     let mut vault = credentials::VaultSession::new(
         !settings.authentication.no_vault,
         &settings.connection.url,
@@ -2342,7 +2380,9 @@ fn populate_status_digests(
     output: &config::ResolvedOutput,
     cancellation: &CancellationToken,
 ) -> Result<(BTreeSet<String>, status_cache::CacheReport)> {
-    let comparison = plan::select_comparison_remote_digests(local, remote, rules);
+    // A status query never deletes, so a case-only rename is not paired: the same answer a
+    // non-mirror run would act on.
+    let comparison = plan::select_comparison_remote_digests(local, remote, rules, false);
 
     // Both populators skip whatever already carries a digest, so a warm cache narrows their work
     // without either of them being told about it -- and, deliberately, without a set naming the
@@ -2441,6 +2481,47 @@ fn warn_cache(output: &config::ResolvedOutput, message: &str) {
         return;
     }
     eprintln!("warning: status cache: {message}");
+}
+
+/// Say so when NAS traffic goes through a forward proxy taken from the environment.
+///
+/// `HTTP(S)_PROXY`/`ALL_PROXY` are honoured, and nothing else says the NAS is reached through a
+/// third party, let alone that `--allow-http` sends the password across it in the clear.
+fn warn_forward_proxy(
+    output: &config::ResolvedOutput,
+    client: &ApiClient,
+    url: &str,
+    allow_http: bool,
+) {
+    if output.quiet {
+        return;
+    }
+    let Some(proxy) = client.forward_proxy() else {
+        return;
+    };
+    let host = reqwest::Url::parse(url)
+        .ok()
+        .and_then(|url| url.host_str().map(str::to_owned))
+        .unwrap_or_else(|| "<nas-host>".to_owned());
+    eprintln!(
+        "warning: NAS traffic goes through the {proxy}; set NO_PROXY={host} to connect directly{}",
+        if allow_http {
+            ", and with --allow-http the password crosses it unencrypted"
+        } else {
+            ""
+        }
+    );
+}
+
+/// Say so when DSM reported no real paths, so the walk could not tell a link from a folder.
+fn warn_unchecked_links(output: &config::ResolvedOutput, real_paths_reported: bool) {
+    if output.quiet || real_paths_reported {
+        return;
+    }
+    eprintln!(
+        "warning: DSM reported no real path for the destination's folders, so this run could not \
+         check for symbolic links inside it; a link there is walked like a folder"
+    );
 }
 
 /// Warn once per run when the destination did not keep the modification time an upload sent.
@@ -2582,6 +2663,12 @@ fn prepare_and_run_sync_reporting(
         cancellation,
         logger.as_ref().map(request_observer),
     )?;
+    warn_forward_proxy(
+        &settings.output,
+        &client,
+        &settings.connection.url,
+        settings.network.allow_http,
+    );
     let server_copy = client.supports_server_copy();
     if settings.safety.delete {
         client.require_delete_api()?;
@@ -2633,17 +2720,13 @@ fn prepare_and_run_sync_reporting(
         let scanned =
             client.remote_inventory_scoped(&root, &scope, &rules, usize::MAX, cancellation)?;
         let incomplete_directories = scanned.incomplete_directories;
+        let skipped_remote = scanned.skipped;
+        warn_unchecked_links(&settings.output, scanned.real_paths_reported);
         let mut remote = scanned.inventory;
+        sync::check_link_boundaries(&remote)?;
         if !settings.output.quiet {
             for directory in &incomplete_directories {
-                eprintln!(
-                    "warning: the NAS listed a different number of entries than it counted in {:?};                      nothing there is deleted by this run",
-                    if directory.is_empty() {
-                        "."
-                    } else {
-                        directory.as_str()
-                    }
-                );
+                eprintln!("{}", incomplete_listing_warning(directory));
             }
         }
         cancellation.check()?;
@@ -2660,13 +2743,18 @@ fn prepare_and_run_sync_reporting(
         // Before any digest is computed and before anything is planned: a scope that names nothing is
         // not a plan with no work in it.
         require_scope_present(&scope, &local, &remote)?;
+        // A scoped walk cannot see a second spelling of the scope on the NAS.
+        sync::withhold_scope_spelling_conflicts(&root, &scope, &mut local, &remote, |folder| {
+            let listed = client.list_child_names(folder, cancellation)?;
+            Ok((listed.names, listed.complete))
+        })?;
 
         cancellation.phase("compare");
         let run_options = run_plan_options(settings, server_copy, &scope);
         // A file that cannot be hashed, or whose remote digest File Station cannot produce, is left
         // out of both inventories and named, rather than failing the run. See
         // `sync::populate_plan_digests`.
-        let mut deferred = sync::populate_plan_digests(
+        let mut deferred = sync::populate_plan_digests_with_listings(
             &client,
             &mut local,
             &mut remote,
@@ -2674,6 +2762,7 @@ fn prepare_and_run_sync_reporting(
             run_options.compare,
             server_copy,
             run_options.delete,
+            &incomplete_directories,
             cancellation,
         )?;
 
@@ -2683,6 +2772,14 @@ fn prepare_and_run_sync_reporting(
             &mut plan,
             &incomplete_directories,
         ));
+        deferred.extend(sync::protect_skipped_remote_entries(
+            &mut plan,
+            &skipped_remote,
+        ));
+        // A folder the walk could not read, and a case-only rename planning could not finish, are
+        // deferrals the plan names among its skips.
+        let named_in_plan = sync::deferrals_in_plan_skips(&plan, &deferred);
+        deferred.extend(named_in_plan);
         // A comparison-set file that turned out to differ is now an upload, and uploads are
         // verified against a strong digest. Raise them here, before the plan is reported or
         // executed, so every consumer of it sees fingerprints of the strength it expects.
@@ -2782,6 +2879,8 @@ fn prepare_and_run_sync_reporting(
                     ExecutionEvent::RemoteExtraDeleteSkipped { .. } => None,
                     // Named in the result's `deferred` list and on the `-v` line below.
                     ExecutionEvent::PathDeferred { .. } => None,
+                    // Counted in the result's `renamed`, and named on the `-v` line below.
+                    ExecutionEvent::Renamed { .. } => None,
                 };
                 if let Some(code) = code
                     && let Some(logger) = &execution_logger
@@ -2925,13 +3024,20 @@ fn defer_event_reason(reason: sync::DeferReason) -> EventReason {
         sync::DeferReason::SourceChanged | sync::DeferReason::SourceVanished => {
             EventReason::ChangedDuringRun
         }
-        sync::DeferReason::SourceUnreadable => EventReason::LocalIo,
-        sync::DeferReason::UnsupportedLocalEntry | sync::DeferReason::UnrepresentableName => {
-            EventReason::LocalEntryUnsupported
+        sync::DeferReason::SourceUnreadable | sync::DeferReason::LocalPermissionDenied => {
+            EventReason::LocalIo
         }
+        sync::DeferReason::UnsupportedLocalEntry
+        | sync::DeferReason::UnrepresentableName
+        | sync::DeferReason::UnsupportedEntry => EventReason::LocalEntryUnsupported,
         sync::DeferReason::RemoteDigestUnavailable
         | sync::DeferReason::RemoteUnreadable
-        | sync::DeferReason::DeleteFailed => EventReason::DsmApiError,
+        | sync::DeferReason::DeleteFailed
+        | sync::DeferReason::CaseRenamePending => EventReason::DsmApiError,
+        // DSM refused this one path, or the walk will not address it.
+        sync::DeferReason::RemoteRefused
+        | sync::DeferReason::DeleteNotPermitted
+        | sync::DeferReason::RemoteSkipped => EventReason::RemotePathRefused,
         sync::DeferReason::RemoteChanged => EventReason::RemoteChanged,
         sync::DeferReason::ListingIncomplete => EventReason::RemoteResponseInvalid,
         sync::DeferReason::ServerCopyFailed => EventReason::ServerCopyFailed,
@@ -2949,7 +3055,16 @@ fn skip_event_reason(reason: &local::SkipReason) -> EventReason {
     }
 }
 
-/// The plan options a sync run plans with./// Plan skips other than `deferred` ones, which are counted among the deferrals instead.
+/// The warning printed for a folder DSM listed short.
+fn incomplete_listing_warning(directory: &str) -> String {
+    format!(
+        "warning: the NAS listed a different number of entries than it counted in {:?}; \
+         nothing there is deleted by this run",
+        if directory.is_empty() { "." } else { directory }
+    )
+}
+
+/// Plan skips other than `deferred` ones, which are counted among the deferrals instead.
 fn lasting_skips(plan: &SyncPlan) -> usize {
     plan.skipped
         .iter()
@@ -2972,12 +3087,34 @@ fn listing_names(folders: &[String]) -> Vec<String> {
 }
 
 /// One `sdsync.result-record.v1` line.
-fn result_record_line(profile: &str, status: &str, result: Value) -> Value {
+///
+/// `error` is the failure of a job that has one (see [`failure_record`]), and `null` for every
+/// other job. A scheduled run discards the core's standard output, so without it the record said a
+/// profile failed and never why or where.
+fn result_record_line(profile: &str, status: &str, error: Option<Value>, result: Value) -> Value {
     json!({
         "schema": "sdsync.result-record.v1",
         "profile": profile,
         "status": status,
+        "error": error,
         "result": result,
+    })
+}
+
+/// A failure as a result record carries it: its event-log class, its message on one line, and
+/// the path it concerns (relative to `source` for a local path), or `null`.
+fn failure_record(error: &Error, source: &Path) -> Value {
+    let detail = error
+        .to_string()
+        .split(['\r', '\n'])
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ");
+    json!({
+        "code": EventReason::of(error).as_str(),
+        "detail": detail,
+        "path": failure_path(error, Some(source)),
     })
 }
 
@@ -3212,7 +3349,7 @@ fn build_reconciliation_plan(
     // reconciliation plan is only ever inspected by `ensure_reconciled` and is never executed, so
     // nothing consumes an upload's digest and raising it would read every changed file again to
     // answer a question nobody asks.
-    let mut deferred = sync::populate_plan_digests(
+    let mut deferred = sync::populate_plan_digests_with_listings(
         client,
         &mut local,
         &mut remote,
@@ -3220,6 +3357,7 @@ fn build_reconciliation_plan(
         compare,
         run_options.server_copy,
         run_options.delete,
+        &scanned.incomplete_directories,
         cancellation,
     )?;
     let mut plan = plan::build_plan(
@@ -3233,6 +3371,12 @@ fn build_reconciliation_plan(
         &mut plan,
         &scanned.incomplete_directories,
     ));
+    deferred.extend(sync::protect_skipped_remote_entries(
+        &mut plan,
+        &scanned.skipped,
+    ));
+    let named_in_plan = sync::deferrals_in_plan_skips(&plan, &deferred);
+    deferred.extend(named_in_plan);
     cancellation.check()?;
     Ok((plan, deferred))
 }
@@ -3292,11 +3436,14 @@ fn run_doctor_job(
             LogEvent::new(EventLogLevel::Error, EventCode::RunFailed)
                 .reason(EventReason::Unclassified),
         ),
-        Err(error) => log_event(
-            logger.as_ref(),
-            LogEvent::new(EventLogLevel::Error, EventCode::RunFailed)
-                .reason(EventReason::of(error)),
-        ),
+        Err(error) => {
+            let mut event = LogEvent::new(EventLogLevel::Error, EventCode::RunFailed)
+                .reason(EventReason::of(error));
+            if let Some(path) = failure_path(error, None) {
+                event = event.path(&path);
+            }
+            log_event(logger.as_ref(), event)
+        }
     };
     if let Err(error) = final_log {
         match &mut operation {
@@ -3834,10 +3981,7 @@ fn safe_doctor_error(error: &Error) -> String {
         }
         Error::FileIo { .. } => "a configured local file could not be read".to_owned(),
         Error::Configuration(_) => "diagnostic configuration was rejected".to_owned(),
-        Error::Message(message)
-            if message.starts_with(
-                "File Station API discovery failed through the reverse proxy;",
-            ) =>
+        Error::Message(message) if message.starts_with(api::DISCOVERY_FAILED_PREFIX) =>
         {
             "DSM API discovery failed on both entry.cgi and query.cgi routes; inspect the protected logs"
                 .to_owned()
@@ -5523,7 +5667,15 @@ fn doctor_run(
         cancellation,
         Some(result.call_log.observer(logger.as_ref())),
     ) {
-        Ok(client) => client,
+        Ok(client) => {
+            warn_forward_proxy(
+                &settings.output,
+                &client,
+                &settings.url,
+                settings.network.allow_http,
+            );
+            client
+        }
         Err(error) => {
             let elapsed = connection_started.elapsed();
             if matches!(
@@ -6564,6 +6716,9 @@ impl ProgressWiring {
             // against a plan that counted this entry as a deletion or a transfer.
             ExecutionEvent::RemoteExtraDeleteSkipped { .. }
             | ExecutionEvent::PathDeferred { .. } => return,
+            // A rename moves no bytes and the progress plan declares no operation for it; the
+            // result counts it as `renamed`.
+            ExecutionEvent::Renamed { .. } => return,
         };
         // The event arrives only after the mutation succeeded, so the operation opens and
         // closes together; `finish_success` credits the whole declared byte count.
@@ -7506,6 +7661,14 @@ fn write_completion_human_to<W: Write>(
     .map_err(output_error)?;
     // Each of the three below is printed only when it happened: a zero would read as a warning
     // about nothing on every run.
+    if report.renamed > 0 {
+        writeln!(
+            writer,
+            "{} case-only rename(s) were made on the NAS with File Station Rename.",
+            report.renamed,
+        )
+        .map_err(output_error)?;
+    }
     if report.deletes_skipped > 0 {
         writeln!(
             writer,
@@ -7766,6 +7929,14 @@ fn write_plan_human_to<W: Write>(
             .map_err(output_error)?;
         }
     }
+    for action in &plan.renames {
+        writeln!(
+            writer,
+            "  RENAME {} -> {} (case-only rename, File Station Rename)",
+            action.from_remote_path, action.to_remote_path
+        )
+        .map_err(output_error)?;
+    }
     Ok(())
 }
 
@@ -7834,6 +8005,7 @@ fn plan_value(plan: &SyncPlan) -> Value {
             "server_copies": plan.copies.len(),
             "directories": plan.creates.len(),
             "deletions": plan.delete_count(),
+            "renames": plan.renames.len(),
             "unchanged_files": plan.unchanged_files,
             "protected_entries": plan.protected_entries,
             "changes": !plan.is_empty(),
@@ -7882,6 +8054,13 @@ fn plan_value(plan: &SyncPlan) -> Value {
                     "expected_mtime_seconds": guard.expected_mtime_seconds,
                     "content_md5": guard.content_md5.to_string(),
                 })),
+            })).collect::<Vec<_>>(),
+            // Case-only renames, carried last by File Station Rename.
+            "renames": plan.renames.iter().map(|action| json!({
+                "relative": action.relative,
+                "from_remote_path": action.from_remote_path,
+                "to_remote_path": action.to_remote_path,
+                "entry_kind": action.kind.as_str(),
             })).collect::<Vec<_>>(),
         },
         // Paths this plan neither carries nor deletes, and why: each one used to fail the run.
@@ -7977,6 +8156,18 @@ fn write_plan_ndjson_to<W: Write>(writer: &mut W, plan: &SyncPlan) -> Result<()>
                     "expected_mtime_seconds": guard.expected_mtime_seconds,
                     "content_md5": guard.content_md5.to_string(),
                 })),
+            }),
+        )?;
+    }
+    for action in &plan.renames {
+        write_json_line_to(
+            writer,
+            &json!({
+                "schema": "sdsync.plan-action.v1", "action": "rename",
+                "relative": action.relative,
+                "from_remote_path": action.from_remote_path,
+                "to_remote_path": action.to_remote_path,
+                "entry_kind": action.kind.as_str(),
             }),
         )?;
     }
@@ -8306,6 +8497,7 @@ fn plan_summary_record(plan: &SyncPlan) -> Value {
         "server_copies": plan.copies.len(),
         "directories": plan.creates.len(),
         "deletions": plan.delete_count(),
+        "renames": plan.renames.len(),
         "unchanged_files": plan.unchanged_files,
         "protected_entries": plan.protected_entries,
         "changes": !plan.is_empty(),
@@ -8315,12 +8507,14 @@ fn plan_summary_record(plan: &SyncPlan) -> Value {
 fn execution_value(completion: &SyncCompletion, elapsed: Duration) -> Value {
     let report = &completion.report;
     json!({
-        "changed": report.uploaded > 0 || report.copied > 0 || report.created > 0 || report.deleted > 0,
+        "changed": report.uploaded > 0 || report.copied > 0 || report.created > 0 || report.deleted > 0 || report.renamed > 0,
         "uploaded": report.uploaded,
         "server_copied": report.copied,
         "upload_bytes": report.uploaded_bytes,
         "directories_created": report.created,
         "deleted": report.deleted,
+        // Case-only renames made with File Station Rename.
+        "renamed": report.renamed,
         // Deletions kept rather than performed, and the files among them this run then uploaded so
         // the mirror converged instead of deferring to a run that may never be scheduled.
         "deletes_skipped": report.deletes_skipped,
@@ -9614,7 +9808,8 @@ fn operation_count(plan: &SyncPlan) -> u64 {
         + plan.creates.len()
         + plan.copies.len()
         + plan.uploads.len()
-        + plan.post_deletes.len()) as u64
+        + plan.post_deletes.len()
+        + plan.renames.len()) as u64
 }
 
 fn copy_fallback_bytes(plan: &SyncPlan) -> u64 {
@@ -9712,11 +9907,50 @@ mod tests {
             copies: Vec::new(),
             uploads: Vec::new(),
             post_deletes: Vec::new(),
+            renames: Vec::new(),
             unchanged_files: 2,
             protected_entries: 1,
             upload_bytes: 0,
             skipped: Vec::new(),
         }
+    }
+
+    /// ADV-S-18: a failed job's result-record line says why and where, since a scheduled run
+    /// discards the core's standard output; every other line carries `error: null`.
+    #[test]
+    fn a_failed_result_record_line_names_its_cause_and_path() {
+        let source = std::path::PathBuf::from("/srv/photos");
+        let error = Error::FileIo {
+            path: source.join("2026/a.jpg"),
+            source: io::Error::from(io::ErrorKind::PermissionDenied),
+        };
+        let line = result_record_line(
+            "photos",
+            "failed",
+            Some(failure_record(&error, &source)),
+            Value::Null,
+        );
+        assert_eq!(line["error"]["code"], EventReason::of(&error).as_str());
+        assert_eq!(line["error"]["detail"], error.to_string());
+        assert_eq!(line["error"]["path"], "2026/a.jpg");
+        let multi = failure_record(&Error::Message("first\nsecond".to_owned()), &source);
+        assert_eq!(multi["detail"], "first second");
+        assert_eq!(multi["path"], Value::Null);
+        let complete = result_record_line("photos", "complete", None, Value::Null);
+        assert_eq!(complete["error"], Value::Null);
+    }
+
+    /// ADV-E-11: the incomplete-listing warning carries no run of spaces from a broken string
+    /// continuation.
+    #[test]
+    fn incomplete_listing_warning_reads_as_one_sentence() {
+        let warning = incomplete_listing_warning("photos/abe");
+        assert_eq!(
+            warning,
+            "warning: the NAS listed a different number of entries than it counted in \
+             \"photos/abe\"; nothing there is deleted by this run"
+        );
+        assert!(incomplete_listing_warning("").contains("in \".\";"));
     }
 
     fn resolved_output(format: cli::OutputFormat) -> config::ResolvedOutput {
@@ -9947,6 +10181,7 @@ mod tests {
                     content_md5: digest,
                 }),
             }],
+            renames: Vec::new(),
             unchanged_files: 3,
             protected_entries: 2,
             upload_bytes: 11,
@@ -10005,6 +10240,7 @@ mod tests {
             report: None,
             elapsed: None,
             error: None,
+            failure_record: None,
         }
     }
 
@@ -10709,6 +10945,7 @@ mod tests {
                 "deletions",
                 "directories",
                 "protected_entries",
+                "renames",
                 "server_copies",
                 "server_copy_fallback_bytes",
                 "unchanged_files",
@@ -10723,6 +10960,7 @@ mod tests {
                 "creates",
                 "post_deletes",
                 "pre_deletes",
+                "renames",
                 "uploads",
             ])
         );
@@ -10750,6 +10988,7 @@ mod tests {
                 "mtime_not_kept",
                 "outcome",
                 "recovered",
+                "renamed",
                 "server_copied",
                 "skipped",
                 "upload_bytes",
@@ -10768,6 +11007,7 @@ mod tests {
                 "directories",
                 "kind",
                 "protected_entries",
+                "renames",
                 "schema",
                 "server_copies",
                 "server_copy_fallback_bytes",
@@ -11548,7 +11788,7 @@ mod tests {
             (
                 plan::ChangeReason::ContentDiffers,
                 "content-differs",
-                "size equal, complete MD5/CRC32/SHA-256 fingerprint did not match",
+                "size equal, MD5 content digests differ",
             ),
             (
                 plan::ChangeReason::TypeReplaced,
@@ -11665,6 +11905,7 @@ mod tests {
                 deferred: Vec::new(),
                 mtime_not_kept: 0,
                 copy_fallbacks: 0,
+                renamed: 0,
             },
             changed_during_run: 0,
             failed: false,
@@ -12159,7 +12400,7 @@ mod tests {
         ));
         assert!(detailed.contains("COPY   /share/root/source/copied.bin"));
         assert!(detailed.contains(
-            "UPLOAD uploaded.bin -> /share/root/uploaded.bin (content-differs: size equal, complete MD5/CRC32/SHA-256 fingerprint did not match)"
+            "UPLOAD uploaded.bin -> /share/root/uploaded.bin (content-differs: size equal, MD5 content digests differ)"
         ));
         assert!(detailed.contains("destination guarded by 13 bytes+mtime+MD5+CRC32+SHA-256"));
         assert!(
@@ -12192,6 +12433,7 @@ mod tests {
                 deferred: Vec::new(),
                 mtime_not_kept: 0,
                 copy_fallbacks: 0,
+                renamed: 0,
             },
             changed_during_run: 0,
             failed: false,
@@ -12341,6 +12583,7 @@ mod tests {
                 deferred: Vec::new(),
                 mtime_not_kept: 0,
                 copy_fallbacks: 0,
+                renamed: 0,
             },
             changed_during_run: 0,
             failed: false,
@@ -13099,7 +13342,9 @@ mod tests {
     #[test]
     fn the_capability_enumeration_folds_dsm_into_three_tiers_a_reader_can_use() {
         let mut entries = satisfying_entries();
-        entries.push(("SYNO.FileStation.Rename", Some(1), Some(2)));
+        // An advertised File Station API this tool does not use. (Rename is used now, for case-only
+        // renames.)
+        entries.push(("SYNO.FileStation.Search", Some(1), Some(2)));
         for index in 0..3 {
             entries.push((
                 match index {
@@ -13117,13 +13362,13 @@ mod tests {
         assert_eq!(enumeration.unsatisfied_optional(), 0);
 
         // Tier 1: every File Station entry, with the version this tool asks of it when it asks.
-        let rename = enumeration
+        let unused = enumeration
             .file_station
             .iter()
-            .find(|api| api.name == "SYNO.FileStation.Rename")
+            .find(|api| api.name == "SYNO.FileStation.Search")
             .expect("an advertised API this tool does not use");
-        assert_eq!(rename.required, None);
-        assert_eq!(rename.range(), "v1-2");
+        assert_eq!(unused.required, None);
+        assert_eq!(unused.range(), "v1-2");
         // Tier 3: namespaces outside File Station, largest first.
         assert_eq!(
             enumeration.namespaces,
@@ -13137,10 +13382,13 @@ mod tests {
 
         let (status, detail, _) = capability_enumeration_verdict(&enumeration);
         assert_eq!(status, DoctorSectionStatus::Pass);
-        assert!(detail.contains("all 10 APIs this tool uses are present"));
+        assert!(detail.contains(&format!(
+            "all {} APIs this tool uses are present",
+            API_REQUIREMENTS.len()
+        )));
 
         let lines = capability_enumeration_lines(&enumeration).join("\n");
-        assert!(lines.contains("SYNO.FileStation.Rename"));
+        assert!(lines.contains("SYNO.FileStation.Search"));
         assert!(lines.contains("unused by this tool"));
         assert!(lines.contains("SYNO.Core.* (2)"));
         assert!(lines.contains("APIs this tool requires:"));
@@ -14056,6 +14304,7 @@ mod status_command_tests {
                 },
             ],
             post_deletes: Vec::new(),
+            renames: Vec::new(),
             unchanged_files: 0,
             protected_entries: 0,
             upload_bytes: 1_024,
@@ -14156,6 +14405,7 @@ mod resync_output_tests {
             copies: Vec::new(),
             uploads: vec![upload("docs/a.txt", 1_000), upload("docs/b.txt", 24)],
             post_deletes: Vec::new(),
+            renames: Vec::new(),
             unchanged_files: 0,
             protected_entries: 0,
             upload_bytes: 1_024,
@@ -14260,6 +14510,7 @@ mod resync_output_tests {
                 deferred: Vec::new(),
                 mtime_not_kept: 0,
                 copy_fallbacks: 0,
+                renamed: 0,
             },
             changed_during_run: 0,
             failed: false,

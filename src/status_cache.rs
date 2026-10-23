@@ -6,8 +6,8 @@
 //! two digests per file: the local MD5, which costs a full read of every byte, and File Station's
 //! server-side MD5, which costs a task start plus at least one status poll — two serial round trips
 //! per file. In the steady state both answers are the same as last time, because
-//! [`crate::plan::select_comparison_remote_digests`] only asks about pairs whose size *and*
-//! modification time already agree on both sides.
+//! [`crate::plan::select_comparison_remote_digests`] only asks about pairs whose size already
+//! agrees on both sides (and whose modification times, in the steady state, agree too).
 //!
 //! This module stores those digests so an unchanged file need not be re-read and re-hashed. It is
 //! a **cache, not a ledger**: deleting it is always safe and only ever costs time. Every guarantee
@@ -275,6 +275,36 @@ impl std::fmt::Display for CacheIssue {
 impl std::error::Error for CacheIssue {}
 
 /// Remove a temporary or stale file, reporting anything but "already gone".
+/// How old a writer's temporary must be before another pass may remove it: far longer than any
+/// write takes, so a live writer's file is never swept from under it.
+const STALE_TEMPORARY_AGE: std::time::Duration = std::time::Duration::from_secs(15 * 60);
+
+/// Remove the temporaries (`.tmp.*`) a killed pass left in `directory`, naming any that could not
+/// be removed. ADV-B-8: left behind, one shadowed nothing but sat there for good, and was read as a
+/// corrupt rollup.
+fn sweep_stale_temporaries(directory: &Path, now: std::time::SystemTime) -> Vec<CacheIssue> {
+    let mut issues = Vec::new();
+    let Ok(entries) = fs::read_dir(directory) else {
+        // No directory yet, or one the store itself is about to report on.
+        return issues;
+    };
+    for entry in entries.flatten() {
+        if !entry.file_name().to_string_lossy().starts_with(".tmp.") {
+            continue;
+        }
+        let stale = entry
+            .metadata()
+            .and_then(|metadata| metadata.modified())
+            .ok()
+            .and_then(|modified| now.duration_since(modified).ok())
+            .is_some_and(|age| age > STALE_TEMPORARY_AGE);
+        if stale && let Err(issue) = remove_reporting(&entry.path(), CacheIssue::CLEANUP_FAILED) {
+            issues.push(issue);
+        }
+    }
+    issues
+}
+
 fn remove_reporting(path: &Path, code: &str) -> Result<(), CacheIssue> {
     match fs::remove_file(path) {
         Ok(()) => Ok(()),
@@ -795,6 +825,7 @@ impl StatusCache {
         comparison: &BTreeSet<String>,
         scoped: bool,
     ) -> std::io::Result<()> {
+        self.sweep_temporaries();
         // One unusable stored record discards the whole stored file rather than half of it — the
         // policy `read_into` documents and applies, for the same reason: nothing here can tell which
         // half of a mangled file is trustworthy. A streaming writer cannot retract records it has
@@ -1049,6 +1080,7 @@ impl StatusCache {
         if scoped {
             return Ok(());
         }
+        self.sweep_temporaries();
         let document = RollupDocument {
             schema: ROLLUP_SCHEMA.to_owned(),
             binary: env!("SDSYNC_VERSION").to_owned(),
@@ -1095,6 +1127,14 @@ impl StatusCache {
             return Err(error);
         }
         Ok(())
+    }
+
+    /// Remove what a killed pass left behind before writing, naming any that would not go.
+    fn sweep_temporaries(&self) {
+        for issue in sweep_stale_temporaries(&self.options.directory, std::time::SystemTime::now())
+        {
+            self.note(issue);
+        }
     }
 
     /// Remove a temporary file after a failed write, reporting a removal that itself fails: the
@@ -1765,7 +1805,10 @@ pub fn compose_rollups(directory: &Path, expected: Option<&[String]>, now: i64) 
                     }
                 };
                 let path = entry.path();
-                if !path.to_string_lossy().ends_with(".rollup.json") {
+                // A writer's temporary (`.tmp.<profile>.<pid>.rollup.json`) is not a rollup.
+                if !path.to_string_lossy().ends_with(".rollup.json")
+                    || entry.file_name().to_string_lossy().starts_with('.')
+                {
                     continue;
                 }
                 let text = match fs::read_to_string(&path) {
@@ -3087,6 +3130,41 @@ mod tests {
         );
         let absent = compose_rollups(&scratch.0.join("nowhere"), None, NOW);
         assert!(absent.issues.is_empty(), "no directory yet is not a fault");
+    }
+
+    /// ADV-B-8: a writer's in-flight temporary (`.tmp.<profile>.<pid>.rollup.json`) is not a
+    /// rollup. Read as one, a snapshot taken mid-write reported `rollup-corrupt`, and a pass killed
+    /// mid-write left that corrupt document behind for good.
+    #[test]
+    fn a_writer_temporary_is_not_read_as_a_rollup() {
+        let scratch = Scratch::new();
+        fs::write(
+            scratch.0.join(".tmp.photos.4242.rollup.json"),
+            "{half a docu",
+        )
+        .expect("write");
+        let aggregate = compose_rollups(&scratch.0, None, NOW);
+        assert!(aggregate.issues.is_empty(), "{:?}", aggregate.issues);
+    }
+
+    /// ADV-B-8: a temporary a killed pass left behind is swept by the next store, once it is old
+    /// enough that no live writer can still own it.
+    #[test]
+    fn a_stale_writer_temporary_is_swept_by_the_next_store() {
+        let scratch = Scratch::new();
+        let stale = scratch.0.join(".tmp.photos.4242.rollup.json");
+        fs::write(&stale, "{half a docu").expect("write");
+        let fresh = scratch.0.join(".tmp.photos.4243.ndjson");
+        fs::write(&fresh, "in flight").expect("write");
+        let old = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
+        fs::File::options()
+            .write(true)
+            .open(&stale)
+            .and_then(|file| file.set_modified(old))
+            .expect("age the temporary");
+        sweep_stale_temporaries(&scratch.0, std::time::SystemTime::now());
+        assert!(!stale.exists(), "a stale temporary is removed");
+        assert!(fresh.exists(), "a fresh one may belong to a live writer");
     }
 
     /// The rollup is a separate document describing the whole profile, so a scoped pass — whose

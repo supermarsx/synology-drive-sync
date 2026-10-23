@@ -131,6 +131,14 @@ pub enum SkipReason {
     /// Withheld after the walk because it could not be read consistently, with the error that said
     /// so. See [`LocalInventory::withhold`].
     Deferred { detail: String },
+    /// A local file where the NAS holds a folder, or the reverse, that this run cannot replace.
+    TypeConflict { detail: String },
+    /// A local entry where the NAS holds a symbolic link (or something DSM resolves elsewhere).
+    /// Nothing is written, deleted or descended at or beneath it.
+    RemoteLink { remote_path: String },
+    /// A remote-only folder mirror deletion would remove, kept because it holds an entry that is
+    /// excluded or DSM-managed and is never deleted.
+    ProtectedDescendant { entry: String },
 }
 
 impl SkipReason {
@@ -144,6 +152,9 @@ impl SkipReason {
             Self::RemoteCaseCollision { .. } => "remote-case-collision",
             Self::CaseRenameNeedsDelete { .. } => "case-rename-needs-delete",
             Self::Deferred { .. } => "deferred",
+            Self::TypeConflict { .. } => "type-conflict",
+            Self::RemoteLink { .. } => "remote-link",
+            Self::ProtectedDescendant { .. } => "protected-descendant",
         }
     }
 
@@ -160,7 +171,8 @@ impl SkipReason {
                     .to_owned()
             }
             Self::DehydratedPlaceholder => {
-                "an online-only placeholder whose content is not on this disk; reading it would                  download it, so it is skipped until it is made available offline"
+                "an online-only placeholder whose content is not on this disk; reading it would \
+                 download it, so it is skipped until it is made available offline"
                     .to_owned()
             }
             Self::LocalCaseCollision { other } => format!(
@@ -176,6 +188,16 @@ impl SkipReason {
                  or rename it in File Station"
             ),
             Self::Deferred { detail } => format!("left for the next run: {detail}"),
+            Self::TypeConflict { detail } => detail.clone(),
+            Self::RemoteLink { remote_path } => format!(
+                "the NAS entry {remote_path:?} is a link to somewhere else; nothing is written, \
+                 deleted or descended at or beneath it, so the local content there is not backed \
+                 up until the link is replaced by a folder"
+            ),
+            Self::ProtectedDescendant { entry } => format!(
+                "kept on the NAS because it holds {entry:?}, which is excluded or DSM-managed and \
+                 is never deleted; remove that entry in File Station to let the folder go"
+            ),
         }
     }
 }
@@ -223,12 +245,18 @@ impl LocalInventory {
             self.entries.remove(&candidate);
         }
         self.entries.remove(relative);
-        self.skipped.push(SkippedEntry {
-            relative: relative.to_owned(),
-            reason,
-        });
-        self.skipped
-            .sort_by(|left, right| left.relative.cmp(&right.relative));
+        // Inserted where it sorts rather than re-sorting the whole list on every call: a run that
+        // withholds thousands of files (a NAS that cannot checksum) made that quadratic.
+        let at = self
+            .skipped
+            .partition_point(|entry| entry.relative.as_str() <= relative);
+        self.skipped.insert(
+            at,
+            SkippedEntry {
+                relative: relative.to_owned(),
+                reason,
+            },
+        );
     }
 
     pub fn files(&self) -> usize {
@@ -247,6 +275,14 @@ impl LocalInventory {
 #[derive(Clone)]
 pub struct IgnoreRules {
     matcher: Gitignore,
+    /// Whether patterns match regardless of case and Unicode normalisation.
+    ///
+    /// True when the source resolves names that way (Windows, macOS, most SMB shares). There
+    /// `report.pdf` and `Report.pdf` are one file, so an exclude written for one spelling has to
+    /// cover the other on both sides. Matched by spelling only, `--exclude report.pdf` left the NAS
+    /// `Report.pdf` looking remote-only, and a mirror run deleted it (ADV-E-10); the same rule did
+    /// not stop a local `Report.pdf` from being uploaded either.
+    fold: bool,
 }
 
 impl std::fmt::Debug for IgnoreRules {
@@ -279,7 +315,20 @@ impl IgnoreRules {
             source: source_error,
         })?;
         reject_filesystem_root(&source_root)?;
+        let fold = resolves_names_case_insensitively(&source_root);
         let mut builder = GitignoreBuilder::new(&source_root);
+        builder
+            .case_insensitive(fold)
+            .map_err(|error| Error::Message(format!("failed to build ignore rules: {error}")))?;
+        // Patterns are matched against composed (NFC) paths when names fold, so a pattern is
+        // composed too: macOS writes names decomposed, and either side may hold either form.
+        let pattern_form = |pattern: &str| -> String {
+            if fold {
+                crate::path::nfc(pattern).into_owned()
+            } else {
+                pattern.to_owned()
+            }
+        };
         // First, so that every operator rule -- the ignore file's and the command line's -- is
         // later and can negate one of them.
         for pattern in DEFAULT_EXCLUDES {
@@ -297,11 +346,34 @@ impl IgnoreRules {
                             .to_owned(),
                     });
                 }
-                if let Some(error) = builder.add(&default_file) {
-                    return Err(Error::Message(format!(
-                        "invalid ignore file {}: {error}",
-                        default_file.display()
-                    )));
+                let composed = if fold {
+                    fs::read_to_string(&default_file).ok()
+                } else {
+                    None
+                };
+                match composed {
+                    // Line by line, exactly as `GitignoreBuilder::add` reads the file, with each
+                    // line composed.
+                    Some(text) => {
+                        for line in text.lines() {
+                            builder
+                                .add_line(Some(default_file.clone()), &pattern_form(line))
+                                .map_err(|error| {
+                                    Error::Message(format!(
+                                        "invalid ignore file {}: {error}",
+                                        default_file.display()
+                                    ))
+                                })?;
+                        }
+                    }
+                    None => {
+                        if let Some(error) = builder.add(&default_file) {
+                            return Err(Error::Message(format!(
+                                "invalid ignore file {}: {error}",
+                                default_file.display()
+                            )));
+                        }
+                    }
                 }
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -313,14 +385,16 @@ impl IgnoreRules {
             }
         }
         for pattern in extra_patterns {
-            builder.add_line(None, pattern).map_err(|error| {
-                Error::Message(format!("invalid --exclude pattern {pattern:?}: {error}"))
-            })?;
+            builder
+                .add_line(None, &pattern_form(pattern))
+                .map_err(|error| {
+                    Error::Message(format!("invalid --exclude pattern {pattern:?}: {error}"))
+                })?;
         }
         let matcher = builder
             .build()
             .map_err(|error| Error::Message(format!("failed to build ignore rules: {error}")))?;
-        Ok(Self { matcher })
+        Ok(Self { matcher, fold })
     }
 
     /// Rules that exclude nothing.
@@ -331,6 +405,7 @@ impl IgnoreRules {
     pub fn none() -> Self {
         Self {
             matcher: Gitignore::empty(),
+            fold: false,
         }
     }
 
@@ -343,10 +418,69 @@ impl IgnoreRules {
         if relative == DEFAULT_IGNORE_FILE {
             return true;
         }
+        if self.fold {
+            return self
+                .matcher
+                .matched_path_or_any_parents(path_for_match(&crate::path::nfc(relative)), is_dir)
+                .is_ignore();
+        }
         self.matcher
             .matched_path_or_any_parents(path_for_match(relative), is_dir)
             .is_ignore()
     }
+
+    /// Whether these rules match regardless of case and Unicode normalisation.
+    pub fn folds_names(&self) -> bool {
+        self.fold
+    }
+}
+
+/// Whether the filesystem holding `root` resolves names regardless of case.
+///
+/// Asked of the filesystem rather than assumed from the platform: a Linux host can mount an SMB
+/// share that folds, and a macOS volume can be case-sensitive. The root's own name is looked up
+/// with its letters' case swapped; the same directory answering means names fold. A root whose name
+/// has no cased letter cannot be asked, and the platform's usual answer stands.
+fn resolves_names_case_insensitively(root: &Path) -> bool {
+    let platform_default = cfg!(any(windows, target_os = "macos"));
+    let Some(name) = root.file_name().and_then(|name| name.to_str()) else {
+        return platform_default;
+    };
+    let swapped: String = name
+        .chars()
+        .map(|character| {
+            if character.is_ascii_lowercase() {
+                character.to_ascii_uppercase()
+            } else {
+                character.to_ascii_lowercase()
+            }
+        })
+        .collect();
+    if swapped == name {
+        return platform_default;
+    }
+    match fs::canonicalize(root.with_file_name(&swapped)) {
+        Ok(resolved) => resolved == root || same_directory(&resolved, root),
+        // Absent under the other case: names are kept apart.
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+        Err(_) => platform_default,
+    }
+}
+
+#[cfg(unix)]
+fn same_directory(left: &Path, right: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    match (fs::metadata(left), fs::metadata(right)) {
+        (Ok(left), Ok(right)) => left.dev() == right.dev() && left.ino() == right.ino(),
+        _ => false,
+    }
+}
+
+#[cfg(not(unix))]
+fn same_directory(left: &Path, right: &Path) -> bool {
+    // Windows hands back the name as stored, so a folding volume canonicalises both spellings to
+    // one path; a case-sensitive directory (WSL-style) holding both would differ in case.
+    left == right
 }
 
 /// Ceiling on entries recorded by one scoped scan, per side.
@@ -478,9 +612,11 @@ pub fn scan(
 /// [`Scope::matches`], which admits only the scope itself and its descendants.
 ///
 /// A scoped walk sees only scanned entries, so its portable-case-collision check covers the scope
-/// alone. A collision outside the scope goes undetected — but is also untouched, so a scoped run
-/// cannot create one. Callers must say so in their output rather than let a clean scoped result
-/// read as a whole-tree clean bill of health.
+/// alone. A collision outside the scope goes undetected and untouched. The scope's own path is the
+/// exception: the NAS may hold it under another spelling the scoped remote walk cannot see, and a
+/// run that creates it there makes a second spelling, so a syncing caller checks the scope's
+/// sibling names first (`sync::withhold_scope_spelling_conflicts`). Callers must say so in their
+/// output rather than let a clean scoped result read as a whole-tree clean bill of health.
 pub fn scan_scoped(
     source: &Path,
     rules: &IgnoreRules,
@@ -873,6 +1009,61 @@ fn verify_metadata_snapshot(entry: &LocalEntry, metadata: &fs::Metadata) -> Resu
     Ok(())
 }
 
+/// The `<reason>: <cause>` detail a local read failure is withheld with.
+///
+/// Permission denied is lasting: this account will not be allowed to read the entry on the next run
+/// either, and calling it transient made every run partial forever. Anything else (a lock, a sharing
+/// violation, an I/O error) is retried by the next run.
+/// The skip a name, path or entry kind Synology Drive cannot hold is withheld with.
+///
+/// An `unsupported-entry` deferral, named with its reason: one refusal policy for every path the
+/// tool or DSM will not take. It is lasting (a warning on a complete run, never a plain green one),
+/// because only renaming or excluding the path clears it and a partial run would re-trigger a
+/// realtime profile forever. It used to fail the whole scan.
+pub(crate) fn unsupported_entry(reason: String) -> SkipReason {
+    SkipReason::Deferred {
+        detail: format!("{}: {reason}", crate::sync::DeferReason::UnsupportedEntry),
+    }
+}
+
+pub(crate) fn read_failure_detail(path: &Path, error: &std::io::Error) -> String {
+    let reason = if error.kind() == std::io::ErrorKind::PermissionDenied {
+        crate::sync::DeferReason::LocalPermissionDenied
+    } else {
+        crate::sync::DeferReason::SourceUnreadable
+    };
+    format!("{reason}: failed to read {path:?}: {error}")
+}
+
+impl ScanOutput {
+    /// Withhold a folder the walk could not read, with what it had recorded for it.
+    ///
+    /// Its contents are unknown, so it is shielded (never a deletion candidate) and named, rather
+    /// than failing the whole scan: one folder the sync account may not list stopped every run.
+    fn withhold_unreadable(&mut self, relative: &str, path: &Path, error: &std::io::Error) {
+        let prefix = format!("{relative}/");
+        let beneath: Vec<String> = self
+            .entries
+            .range::<str, _>((
+                std::ops::Bound::Included(prefix.as_str()),
+                std::ops::Bound::Unbounded,
+            ))
+            .take_while(|(candidate, _)| candidate.starts_with(&prefix))
+            .map(|(candidate, _)| candidate.clone())
+            .collect();
+        for candidate in beneath {
+            self.entries.remove(&candidate);
+        }
+        self.entries.remove(relative);
+        self.skipped.push(SkippedEntry {
+            relative: relative.to_owned(),
+            reason: SkipReason::Deferred {
+                detail: read_failure_detail(path, error),
+            },
+        });
+    }
+}
+
 fn scan_dir(
     directory: &Path,
     relative_parent: &str,
@@ -882,17 +1073,35 @@ fn scan_dir(
     let cancellation = context.cancellation;
     let rules = context.rules;
     cancellation.check()?;
-    let reader = fs::read_dir(directory).map_err(|source| Error::FileIo {
-        path: directory.to_owned(),
-        source,
-    })?;
+    // The source root itself must be readable; any folder beneath it is that folder's problem.
+    let reader = match fs::read_dir(directory) {
+        Ok(reader) => reader,
+        Err(source) if !relative_parent.is_empty() => {
+            output.withhold_unreadable(relative_parent, directory, &source);
+            return Ok(());
+        }
+        Err(source) => {
+            return Err(Error::FileIo {
+                path: directory.to_owned(),
+                source,
+            });
+        }
+    };
     let mut children = Vec::new();
     for child in reader {
-        let child = child.map_err(|source| Error::FileIo {
-            path: directory.to_owned(),
-            source,
-        })?;
-        children.push(child);
+        match child {
+            Ok(child) => children.push(child),
+            Err(source) if !relative_parent.is_empty() => {
+                output.withhold_unreadable(relative_parent, directory, &source);
+                return Ok(());
+            }
+            Err(source) => {
+                return Err(Error::FileIo {
+                    path: directory.to_owned(),
+                    source,
+                });
+            }
+        }
     }
     children.sort_by_key(|entry| entry.file_name());
 
@@ -903,33 +1112,44 @@ fn scan_dir(
             Ok(name) => name,
             Err(raw) => {
                 // A name that cannot be represented as UTF-8 cannot be mapped to a remote path, so
-                // refusing it is right. Refusing it *after* the operator excluded it is not. The
-                // rules are matched against the lossy spelling to decide exclusion only; a name
-                // that survives that still fails the scan, because there is no spelling of it that
-                // could be uploaded.
+                // it is never carried. Refusing it *after* the operator excluded it would be wrong,
+                // so the rules are matched against the lossy spelling first; one that survives is
+                // skipped under that spelling. It used to fail the whole scan.
                 let lossy = raw.to_string_lossy().into_owned();
                 let relative = if relative_parent.is_empty() {
                     lossy
                 } else {
                     format!("{relative_parent}/{lossy}")
                 };
-                let is_dir = child
-                    .file_type()
-                    .map_err(|source| Error::FileIo {
-                        path: child.path(),
-                        source,
-                    })?
-                    .is_dir();
+                let is_dir = match child.file_type() {
+                    Ok(file_type) => file_type.is_dir(),
+                    Err(source) => {
+                        if !output.skip(
+                            relative,
+                            SkipReason::Deferred {
+                                detail: read_failure_detail(&child.path(), &source),
+                            },
+                            context.budget,
+                        ) {
+                            return Ok(());
+                        }
+                        continue;
+                    }
+                };
                 if is_dsm_managed(&relative) || rules.is_ignored(&relative, is_dir) {
                     if context.include_excluded && context.scope.matches(&relative) {
                         output.excluded.insert(relative);
                     }
                     continue;
                 }
-                return Err(Error::UnsupportedLocalEntry {
-                    path: child.path(),
-                    reason: "name is not valid UTF-8".to_owned(),
-                });
+                if !output.skip(
+                    relative,
+                    unsupported_entry("the name is not valid UTF-8".to_owned()),
+                    context.budget,
+                ) {
+                    return Ok(());
+                }
+                continue;
             }
         };
         let relative = if relative_parent.is_empty() {
@@ -957,43 +1177,66 @@ fn scan_dir(
             continue;
         }
 
-        // Excluded before validated, and the order is the finding. These two checks refuse names
-        // the tool will not carry -- anything beginning with `~`, a Windows device stem like
-        // `aux.h`, a component over 255 characters -- by failing the *whole scan*, so one such name
-        // anywhere in the tree meant nothing was uploaded. Running them before the rules made that
-        // unfixable by the operator: Word opens `report.docx`, creates `~$report.docx` beside it,
-        // and every scheduled run fails until the document is closed, with `--exclude '~$*'` having
-        // no effect because the refusal happened first. Excluding an ancestor *directory* did work,
-        // because a directory's own name passes validation and the walk never descends -- so the
-        // remedy that worked was unrelated in shape to the remedy the error invited, and there was
-        // no remedy at all when the offending file sat beside files that had to be synced.
-        //
-        // An entry the rules exclude is not going anywhere, so whether its name could be carried is
-        // not a question this run has to answer.
-        let file_type = child.file_type().map_err(|source| Error::FileIo {
-            path: child.path(),
-            source,
-        })?;
+        // Excluded before validated, and the order is the finding: an entry the rules exclude is
+        // not going anywhere, so whether its name could be carried is not a question this run has
+        // to answer. Word opens `report.docx` and creates `~$report.docx` beside it; refusing that
+        // name before the rules were consulted made `--exclude '~$*'` useless.
+        let file_type = match child.file_type() {
+            Ok(file_type) => file_type,
+            Err(source) => {
+                if !output.skip(
+                    relative,
+                    SkipReason::Deferred {
+                        detail: read_failure_detail(&child.path(), &source),
+                    },
+                    context.budget,
+                ) {
+                    return Ok(());
+                }
+                continue;
+            }
+        };
         if rules.is_ignored(&relative, file_type.is_dir()) {
             // Recorded as a single entry and not descended into, so asking for excluded paths
             // cannot turn a bounded scan into an unbounded one.
             if context.include_excluded && in_scope {
-                output.excluded.insert(relative);
+                output.excluded.insert(relative.clone());
             }
             continue;
         }
 
-        validate_relative(&relative)?;
-        if let Some(reason) = drive_path_issue(&relative) {
-            return Err(Error::UnsupportedLocalEntry {
-                path: child.path(),
-                reason,
-            });
+        // A name or path the tool will not carry -- anything beginning with `~`, a Windows device
+        // stem like `aux.h`, a component over 255 characters or bytes -- is that path's skip. It
+        // used to fail the whole scan, so one Word `~WRL0001.tmp` anywhere meant nothing synced.
+        let refusal = match validate_relative(&relative) {
+            Err(Error::UnsafeRemotePath { reason, .. }) => Some(reason),
+            Err(other) => Some(other.to_string()),
+            Ok(()) => drive_path_issue(&relative),
+        };
+        if let Some(reason) = refusal {
+            if !output.skip(relative, unsupported_entry(reason), context.budget) {
+                return Ok(());
+            }
+            continue;
         }
-        let metadata = fs::symlink_metadata(child.path()).map_err(|source| Error::FileIo {
-            path: child.path(),
-            source,
-        })?;
+        let metadata = match fs::symlink_metadata(child.path()) {
+            Ok(metadata) => metadata,
+            // Listed, then gone before it could be read: absent, as a later listing would say.
+            // A mirror deletion of its remote copy re-checks local presence before it acts.
+            Err(source) if source.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(source) => {
+                if !output.skip(
+                    relative,
+                    SkipReason::Deferred {
+                        detail: read_failure_detail(&child.path(), &source),
+                    },
+                    context.budget,
+                ) {
+                    return Ok(());
+                }
+                continue;
+            }
+        };
         // Skipped, not refused, and never descended into. These used to fail the whole scan, and
         // ordinary trees are full of them: every Files-On-Demand OneDrive file is a reparse point,
         // and Windows marks assorted shell files SYSTEM. One of them meant nothing synced. The skip
@@ -1002,6 +1245,12 @@ fn scan_dir(
             Some(reason)
         } else if has_unsupported_windows_attributes(&metadata) {
             Some(SkipReason::WindowsAttributes)
+        } else if !metadata.is_dir() && !metadata.is_file() {
+            Some(unsupported_entry(
+                "only regular files and directories can be synchronized (a FIFO, socket \
+                 or device is not)"
+                    .to_owned(),
+            ))
         } else {
             None
         };
@@ -1035,24 +1284,32 @@ fn scan_dir(
             if !output.complete {
                 return Ok(());
             }
-        } else if metadata.is_file() {
+        } else {
             let full_path = child.path();
-            let modified = metadata.modified().map_err(|source| Error::FileIo {
-                path: full_path.clone(),
-                source,
-            })?;
-            let duration =
-                modified
-                    .duration_since(UNIX_EPOCH)
-                    .map_err(|_| Error::UnsupportedLocalEntry {
-                        path: full_path.clone(),
-                        reason: "modification time is before the Unix epoch".to_owned(),
-                    })?;
-            let mtime_ms =
-                i64::try_from(duration.as_millis()).map_err(|_| Error::UnsupportedLocalEntry {
-                    path: full_path.clone(),
-                    reason: "modification time is outside DSM's supported range".to_owned(),
-                })?;
+            let mtime_ms = match metadata.modified() {
+                Err(source) => Err(SkipReason::Deferred {
+                    detail: read_failure_detail(&full_path, &source),
+                }),
+                Ok(modified) => match modified.duration_since(UNIX_EPOCH) {
+                    Err(_) => Err(unsupported_entry(
+                        "its modification time is before 1970, which DSM cannot store".to_owned(),
+                    )),
+                    Ok(duration) => i64::try_from(duration.as_millis()).map_err(|_| {
+                        unsupported_entry(
+                            "its modification time is outside DSM's supported range".to_owned(),
+                        )
+                    }),
+                },
+            };
+            let mtime_ms = match mtime_ms {
+                Ok(mtime_ms) => mtime_ms,
+                Err(reason) => {
+                    if in_scope && !output.skip(relative, reason, context.budget) {
+                        return Ok(());
+                    }
+                    continue;
+                }
+            };
             // A file is only ever recorded when it is itself in scope. A file cannot be an
             // ancestor of anything, so a file sitting where the scope expects a directory simply
             // means the scope names nothing.
@@ -1073,11 +1330,6 @@ fn scan_dir(
             {
                 return Ok(());
             }
-        } else {
-            return Err(Error::UnsupportedLocalEntry {
-                path: child.path(),
-                reason: "only regular files and directories can be synchronized".to_owned(),
-            });
         }
     }
     Ok(())
@@ -2238,19 +2490,26 @@ mod tests {
         fs::write(dir.join(name), b"payload").is_ok()
     }
 
+    /// ADV-E-3: a name that is not UTF-8 is never carried, and is that entry's skip rather than
+    /// the whole scan's failure.
     #[test]
-    fn scan_rejects_a_non_utf8_file_name() {
+    fn scan_skips_a_non_utf8_file_name() {
         let root = temp_dir("non-utf8-name");
         if !write_non_utf8_named_file(&root) {
-            eprintln!("skipping scan_rejects_a_non_utf8_file_name: filesystem rejected the name");
+            eprintln!("skipping scan_skips_a_non_utf8_file_name: filesystem rejected the name");
             fs::remove_dir_all(root).unwrap();
             return;
         }
+        fs::write(root.join("keep.txt"), b"payload").unwrap();
 
         let rules = IgnoreRules::build(&root, &[]).unwrap();
+        let inventory = scan(&root, &rules, &CancellationToken::default()).unwrap();
+        assert_eq!(inventory.entries.len(), 1);
+        assert!(inventory.entries.contains_key("keep.txt"));
         assert!(matches!(
-            scan(&root, &rules, &CancellationToken::default()),
-            Err(Error::UnsupportedLocalEntry { reason, .. }) if reason.contains("UTF-8")
+            inventory.skipped.as_slice(),
+            [SkippedEntry { reason: SkipReason::Deferred { detail }, .. }]
+                if detail.starts_with("unsupported-entry: ") && detail.contains("UTF-8")
         ));
 
         fs::remove_dir_all(root).unwrap();
@@ -2290,24 +2549,46 @@ mod tests {
         }
     }
 
-    /// A refused name that nothing excludes still fails the scan. The reorder must not weaken the
-    /// refusal. (`~$report.docx`, the Office lock file, is a built-in exclusion now, so the name
-    /// here is an ordinary `~` name.)
+    /// ADV-E-3: a refused name that nothing excludes is still never carried, but it is that
+    /// path's skip, named with its reason, and every other entry is scanned. One Word
+    /// `~WRL0001.tmp` anywhere used to mean nothing synced. (`~$report.docx`, the Office lock file,
+    /// is a built-in exclusion now, so the name here is an ordinary `~` name.)
     #[test]
-    fn an_unexcluded_name_the_tool_refuses_still_fails_the_scan() {
+    fn an_unexcluded_name_the_tool_refuses_is_skipped_by_name() {
         let root = temp_dir("unexcluded-refused-name");
         if fs::write(root.join("~scratch.txt"), b"payload").is_err() {
             fs::remove_dir_all(&root).unwrap();
             return;
         }
+        fs::write(root.join("keep.txt"), b"payload").unwrap();
         let rules = IgnoreRules::build(&root, &[]).unwrap();
 
+        let inventory = scan(&root, &rules, &CancellationToken::default()).unwrap();
+        assert!(inventory.entries.contains_key("keep.txt"));
+        assert!(!inventory.entries.contains_key("~scratch.txt"));
         assert!(matches!(
-            scan(&root, &rules, &CancellationToken::default()),
-            Err(Error::UnsupportedLocalEntry { reason, .. }) if reason.contains("beginning with ~")
+            inventory.skipped.as_slice(),
+            [SkippedEntry { relative, reason: SkipReason::Deferred { detail } }]
+                if relative == "~scratch.txt"
+                    && detail.starts_with("unsupported-entry: ")
+                    && detail.contains("beginning with ~")
         ));
 
         fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// ADV-E-3: a component over 255 bytes is refused even under 255 characters (ext4/btrfs
+    /// NAME_MAX is bytes).
+    #[test]
+    fn a_name_over_255_bytes_is_refused_by_the_drive_rules() {
+        let name = format!("m-{}.txt", "\u{65e5}".repeat(90));
+        assert!(name.chars().count() <= 255);
+        let reason = drive_path_issue(&name).expect("refused");
+        assert!(reason.contains("255-byte"), "{reason}");
+        assert_eq!(
+            drive_path_issue(&format!("m-{}.txt", "\u{65e5}".repeat(80))),
+            None
+        );
     }
 
     /// A non-UTF-8 name the operator excluded is skipped; one they did not still fails.
@@ -2339,25 +2620,82 @@ mod tests {
         fs::remove_dir_all(root).unwrap();
     }
 
+    /// A folder beneath the root the walk cannot read is withheld by name, with the folder it
+    /// could not read and why, rather than failing the whole scan.
     #[test]
-    fn scan_dir_reports_the_missing_directory_it_could_not_read() {
+    fn scan_dir_withholds_the_directory_it_could_not_read() {
         let root = temp_dir("scan-dir-missing");
         let missing = root.join("does-not-exist");
         let mut output = ScanOutput::default();
+        output.entries.insert(
+            "does-not-exist".to_owned(),
+            LocalEntry {
+                relative: "does-not-exist".to_owned(),
+                full_path: missing.clone(),
+                kind: EntryKind::Directory,
+                size: 0,
+                mtime_ms: 0,
+                identity: FileIdentity::default(),
+                content_md5: None,
+            },
+        );
         let rules = IgnoreRules::build(&root, &[]).unwrap();
 
+        walk_dir(
+            &missing,
+            "does-not-exist",
+            &rules,
+            &CancellationToken::default(),
+            &mut output,
+        )
+        .unwrap();
+        assert!(output.entries.is_empty(), "withheld, not an empty folder");
         assert!(matches!(
-            walk_dir(
-                &missing,
-                "does-not-exist",
-                &rules,
-                &CancellationToken::default(),
-                &mut output,
-            ),
+            output.skipped.as_slice(),
+            [SkippedEntry { relative, reason: SkipReason::Deferred { detail } }]
+                if relative == "does-not-exist"
+                    && detail.starts_with("source-unreadable: ")
+                    && detail.contains("does-not-exist")
+        ));
+
+        // The source root itself is still required to be readable.
+        assert!(matches!(
+            walk_dir(&missing, "", &rules, &CancellationToken::default(), &mut output),
             Err(Error::FileIo { path, .. }) if path == missing
         ));
-        assert!(output.entries.is_empty());
 
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// ADV-E-6: a folder this account may not list is lasting (`local-permission-denied`), and
+    /// it is withheld rather than failing the scan.
+    #[cfg(unix)]
+    #[test]
+    fn an_unlistable_folder_is_withheld_as_permission_denied() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = temp_dir("unlistable");
+        fs::create_dir_all(root.join("private")).unwrap();
+        fs::write(root.join("private/secret.txt"), b"secret").unwrap();
+        fs::write(root.join("keep.txt"), b"payload").unwrap();
+        fs::set_permissions(root.join("private"), fs::Permissions::from_mode(0o000)).unwrap();
+        if fs::read_dir(root.join("private")).is_ok() {
+            eprintln!("skipping: this account can list a mode-000 folder (root)");
+            fs::set_permissions(root.join("private"), fs::Permissions::from_mode(0o755)).unwrap();
+            fs::remove_dir_all(root).unwrap();
+            return;
+        }
+        let rules = IgnoreRules::build(&root, &[]).unwrap();
+        let inventory = scan(&root, &rules, &CancellationToken::default());
+        fs::set_permissions(root.join("private"), fs::Permissions::from_mode(0o755)).unwrap();
+        let inventory = inventory.unwrap();
+        assert!(inventory.entries.contains_key("keep.txt"));
+        assert!(!inventory.entries.contains_key("private"));
+        assert!(matches!(
+            inventory.skipped.as_slice(),
+            [SkippedEntry { relative, reason: SkipReason::Deferred { detail } }]
+                if relative == "private" && detail.starts_with("local-permission-denied: ")
+        ));
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -2411,15 +2749,51 @@ mod tests {
             return;
         }
 
-        let expected_path = fs::canonicalize(&target).unwrap();
         let rules = IgnoreRules::build(&root, &[]).unwrap();
+        let inventory = scan(&root, &rules, &CancellationToken::default()).unwrap();
+        assert!(inventory.entries.is_empty());
         assert!(matches!(
-            scan(&root, &rules, &CancellationToken::default()),
-            Err(Error::UnsupportedLocalEntry { path, reason })
-                if path == expected_path && reason.contains("before the Unix epoch")
+            inventory.skipped.as_slice(),
+            [SkippedEntry { relative, reason: SkipReason::Deferred { detail } }]
+                if relative == "old.bin"
+                    && detail.starts_with("unsupported-entry: ")
+                    && detail.contains("before 1970")
         ));
 
         fs::remove_dir_all(root).unwrap();
+    }
+
+    /// ADV-E-11: wire-visible skip details carry no runs of spaces from a broken string
+    /// continuation.
+    #[test]
+    fn skip_details_have_no_runs_of_spaces() {
+        let reasons = [
+            SkipReason::WindowsAttributes,
+            SkipReason::LinkOrReparsePoint,
+            SkipReason::DehydratedPlaceholder,
+            SkipReason::LocalCaseCollision {
+                other: "A".to_owned(),
+            },
+            SkipReason::RemoteCaseCollision {
+                other: "A".to_owned(),
+            },
+            SkipReason::CaseRenameNeedsDelete {
+                remote: "A".to_owned(),
+            },
+            SkipReason::TypeConflict {
+                detail: "d".to_owned(),
+            },
+            SkipReason::RemoteLink {
+                remote_path: "/share/l".to_owned(),
+            },
+            SkipReason::ProtectedDescendant {
+                entry: "e".to_owned(),
+            },
+        ];
+        for reason in reasons {
+            let detail = reason.detail();
+            assert!(!detail.contains("  "), "{:?}: {detail:?}", reason.as_str());
+        }
     }
 
     #[cfg(windows)]
@@ -2603,12 +2977,18 @@ mod tests {
             return;
         }
 
-        let expected_path = fs::canonicalize(&fifo_path).unwrap();
+        // ADV-E-3: still never carried, but that path's lasting `unsupported-entry` deferral (a
+        // named warning) instead of the whole scan's failure. The documented abort
+        // (docs/configuration/safety.md) changed on purpose: one FIFO stopped every run.
         let rules = IgnoreRules::build(&root, &[]).unwrap();
+        let inventory = scan(&root, &rules, &CancellationToken::default()).unwrap();
+        assert!(inventory.entries.is_empty());
         assert!(matches!(
-            scan(&root, &rules, &CancellationToken::default()),
-            Err(Error::UnsupportedLocalEntry { path, reason })
-                if path == expected_path && reason.contains("only regular files and directories")
+            inventory.skipped.as_slice(),
+            [SkippedEntry { relative, reason: SkipReason::Deferred { detail } }]
+                if relative == "pipe"
+                    && detail.starts_with("unsupported-entry: ")
+                    && detail.contains("only regular files and directories")
         ));
 
         fs::remove_dir_all(root).unwrap();
