@@ -39,7 +39,7 @@
           <header class="sdsync-topbar">
             <div><h1 id="sdsync-page-title">{{ pageTitle }}</h1></div>
             <div class="sdsync-topbar-actions">
-              <span class="sdsync-freshness" aria-live="polite">{{ freshness }}</span>
+              <span class="sdsync-freshness">{{ freshness }}</span>
               <span :class="['sdsync-autosave-state', 'is-' + autosavePhase]" aria-live="polite"><action-icon name="save" :size="13" />{{ autosaveMessage }}</span>
               <v-button
                 type="border"
@@ -75,6 +75,14 @@
               <strong>{{ bridgeIssue.title || 'Read-only mode' }}</strong>
               <span>{{ bridgeIssue.message || 'Live status remains available, but changes stay disabled until the authenticated DSM bridge is ready.' }}</span>
               <v-button type="border" display="icon-text" :tooltip="snapshotRefreshBlocked ? 'Close the profile editor before retrying package status' : 'Retry DSM authentication and reload package status'" :disabled="snapshotLoading || snapshotRefreshBlocked" :aria-busy="snapshotLoading ? 'true' : 'false'" @click="refreshSnapshot(true)"><template #icon><action-icon :class="{ 'sdsync-is-spinning': snapshotLoading }" name="refresh" /></template>Retry</v-button>
+            </div>
+          </div>
+
+          <div v-if="mutationWarning" class="sdsync-banner sdsync-mutation-warning" role="alert">
+            <div>
+              <strong>Saved, but it is not fully in effect</strong>
+              <span v-for="(warning, index) in mutationWarning" :key="index">{{ warning.text }}</span>
+              <v-button type="border" display="icon-text" tooltip="Hide this notice. It returns if the next save has the same problem." @click="mutationWarning = null"><template #icon><action-icon name="close" /></template>Dismiss</v-button>
             </div>
           </div>
 
@@ -124,7 +132,7 @@
             <div class="sdsync-overview-status" aria-label="Service status and actions">
               <div class="sdsync-service-status">
                 <span>Service</span>
-                <strong :class="pillClass(serviceState)">{{ serviceState }}</strong>
+                <strong :class="pillClass(serviceState === 'unknown' ? 'failed' : serviceState)">{{ serviceState }}</strong>
                 <small>{{ overviewSummary }}</small>
               </div>
               <div class="sdsync-action-row">
@@ -134,11 +142,12 @@
             </div>
 
             <ul v-if="attentionItems.length" class="sdsync-attention" role="status" aria-label="Run outcomes needing attention"><li v-for="item in attentionItems" :key="item.id" :class="'is-' + item.level"><strong>{{ item.title }}</strong> <span>{{ item.detail }}</span></li></ul>
+            <details v-if="runStderrView" class="sdsync-run-stderr"><summary>Core error output of the last run<span v-if="runStderrView.error"> (could not be read)</span></summary><p v-if="runStderrView.error" class="is-fail">{{ runStderrView.error }}</p><pre v-else>{{ runStderrView.text }}</pre></details>
             <div class="sdsync-metrics" aria-label="Package summary">
               <article><span>Profiles</span><strong>{{ profiles.length }}</strong><small>{{ readyProfileCount }} with protected password material</small></article>
               <article><span>Next routine</span><strong>{{ nextRun }}</strong><small>{{ enabledRoutines.length }} enabled routine{{ enabledRoutines.length === 1 ? '' : 's' }}</small></article>
               <article><span>Last result</span><strong :class="'is-' + lastResult.level">{{ lastResult.title }}</strong><small>{{ lastResult.detail }}</small></article>
-              <article><span>Active scope</span><strong>{{ runStatus === 'running' ? runScope : 'Idle' }}</strong><small>{{ runStatus === 'running' ? runOperation : 'No active operation' }}</small></article>
+              <article><span>Active scope</span><strong>{{ runActive ? runScope : 'Idle' }}</strong><small>{{ runActive ? runOperation + runningForSuffix : 'No active operation' }}</small></article>
               <article><span>Realtime</span><strong>{{ realtimeRoutines.length ? realtimeRoutines.length + ' active' : 'Off' }}</strong><small>{{ realtimeDetail }}</small></article>
             </div>
 
@@ -147,7 +156,7 @@
                 <div class="sdsync-panel-heading"><div><p class="sdsync-eyebrow">Destinations</p><h3>Profile readiness</h3></div><v-button type="styleless" display="icon-text" tooltip="Open profile configuration and protected credentials" @click="navigate('profiles')"><template #icon><action-icon name="navigate" /></template>Manage profiles</v-button></div>
                 <p v-if="!profiles.length" class="sdsync-empty">No configured profiles.</p>
                 <div v-for="profile in profiles" :key="profile.name" class="sdsync-compact-profile">
-                  <div><strong>{{ profile.name }}</strong><span>{{ profile.remote || profile.remote_path || 'Destination unavailable' }}</span><small class="sdsync-profile-outcome" :class="'is-' + profileOutcome(profile.name).level">{{ profileOutcome(profile.name).text }}</small></div>
+                  <div><strong><bdi>{{ shownName(profile.name) }}</bdi></strong><span>{{ profile.remote || profile.remote_path || 'Destination unavailable' }}</span><small class="sdsync-profile-outcome" :class="'is-' + profileOutcome(profile.name).level">{{ profileOutcome(profile.name).text }}</small></div>
                   <span>{{ profile.has_password === true ? 'Credential stored' : 'Password required' }}</span>
                 </div>
               </article>
@@ -184,7 +193,7 @@
                   :disabled="operationBusy"
                   @click="openProfile(profile.name)"
                 >
-                  <span><strong><action-icon name="edit" />&nbsp;{{ profile.name }}</strong><span>{{ profile.remote || profile.remote_path || 'Destination unavailable' }}</span></span>
+                  <span><strong><action-icon name="edit" />&nbsp;<bdi>{{ shownName(profile.name) }}</bdi></strong><span>{{ profile.remote || profile.remote_path || 'Destination unavailable' }}</span></span>
                   <span class="sdsync-badges"><i :class="['sdsync-mini-badge', { ready: profile.has_password === true }]">{{ profile.has_password === true ? 'Ready' : 'Needs password' }}</i><i v-if="profile.is_default === true || profile.default === true" class="sdsync-mini-badge">Default</i></span>
                 </button>
               </div>
@@ -288,7 +297,7 @@
               <article v-if="!routineEditorOpen" key="routine-catalog" class="sdsync-panel sdsync-routine-catalog">
                 <div class="sdsync-panel-heading"><div><p class="sdsync-eyebrow">Configured routines</p><h3>Per-profile automation</h3></div><span class="sdsync-mini-badge">{{ routines.length }} total</span></div>
                 <p v-if="!routines.length" class="sdsync-empty">No configured routines. Choose New routine to automate a profile.</p>
-                <button v-for="routine in routines" :key="routine.profile" type="button" :class="['sdsync-routine-row', { 'is-selected': selectedRoutine && selectedRoutine.profile === routine.profile }]" :title="'Edit routine for ' + routine.profile" :disabled="operationBusy" @click="openRoutine(routine.profile)"><span><strong><action-icon name="edit" />&nbsp;{{ routine.profile }}</strong><small>{{ routine.mode || 'interval' }} · {{ routine.backend || 'fallback unreported' }} · {{ routine.state || (routine.enabled ? 'enabled' : 'disabled') }}{{ routine.backend_reason && routine.backend_reason !== 'ok' ? ' · ' + routine.backend_reason : '' }}</small></span><time>{{ routineNextRunLabel(routine) }}</time></button>
+                <button v-for="routine in routines" :key="routine.profile" type="button" :class="['sdsync-routine-row', { 'is-selected': selectedRoutine && selectedRoutine.profile === routine.profile }]" :title="'Edit routine for ' + routine.profile" :disabled="operationBusy" @click="openRoutine(routine.profile)"><span><strong><action-icon name="edit" />&nbsp;<bdi>{{ shownName(routine.profile) }}</bdi></strong><small>{{ routine.mode || 'interval' }} · {{ routine.backend || 'fallback unreported' }} · {{ routine.state || (routine.enabled ? 'enabled' : 'disabled') }}{{ routine.backend_reason && routine.backend_reason !== 'ok' ? ' · ' + routine.backend_reason : '' }}</small></span><time>{{ routineNextRunLabel(routine) }}</time></button>
               </article>
               <v-form v-else key="routine-editor" v-model="routineForm" class="sdsync-panel sdsync-editor sdsync-horizontal-form sdsync-routine-editor" direction="horizontal" @submit="saveRoutine">
                     <div class="sdsync-panel-heading"><div><p class="sdsync-eyebrow">Routine editor</p><h3>{{ selectedRoutine ? 'Edit ' + selectedRoutine.profile : 'New profile routine' }}</h3></div><v-button type="border" display="icon-text" tooltip="Close the routine editor and discard unsaved values" @click="closeRoutine"><template #icon><action-icon name="close" /></template>Close</v-button></div>
@@ -368,7 +377,7 @@
                     <thead><tr><th>Path</th><th>State</th><th>Local</th><th>On the NAS</th><th>Why</th><th><span class="sdsync-sr-only">Actions</span></th></tr></thead>
                     <tbody>
                       <tr v-for="entry in syncStatusResult.entries" :key="entry.key">
-                        <td><strong class="sdsync-sync-path">{{ entry.relative }}</strong><small>{{ entry.kind }} &#183; {{ entry.remotePath }}</small></td>
+                        <td><strong class="sdsync-sync-path"><bdi>{{ shownName(entry.relative) }}</bdi></strong><small>{{ entry.kind }} &#183; <bdi>{{ shownName(entry.remotePath) }}</bdi></small></td>
                         <td><span :class="syncStateClass(entry.state)">{{ entry.label }}</span></td>
                         <td>{{ syncEntrySide(entry.localSize, entry.localEpoch) }}</td>
                         <td>{{ syncEntrySide(entry.remoteSize, entry.remoteEpoch) }}</td>
@@ -457,12 +466,13 @@
               </ol>
               <details v-if="diagnostic.output" class="sdsync-doctor-raw"><summary>{{ doctorReport.structured ? 'Structured terminal summary' : 'Raw terminal evidence' }}</summary><pre>{{ diagnostic.output }}</pre></details>
             </article>
-            <article class="sdsync-panel"><div class="sdsync-panel-heading"><div><p class="sdsync-eyebrow">Cached per-profile evidence</p><h3>Target health</h3></div><span class="sdsync-freshness">{{ healthFreshness }}</span></div><div class="sdsync-table-wrap"><table><thead><tr><th>Profile</th><th>Last check</th><th>Reachable</th><th>Auth</th><th>Writable</th><th>Latency</th><th>Last success</th><th>Doctor</th><th>Last run</th><th>Free space</th></tr></thead><tbody><tr v-if="!healthRows.length"><td colspan="10">No cached target-health evidence.</td></tr><tr v-for="health in healthRows" :key="health.profile"><td>{{ health.profile || 'Unknown' }}</td><td>{{ formatDate(health.last_check_epoch || health.checked_at_epoch || health.checked_epoch) }}</td><td :class="healthClass(health.reachable)">{{ booleanEvidence(health.reachable) }}</td><td :class="healthClass(health.authenticated !== undefined ? health.authenticated : health.auth)">{{ booleanEvidence(health.authenticated !== undefined ? health.authenticated : health.auth) }}</td><td :class="healthClass(health.writable)">{{ booleanEvidence(health.writable) }}</td><td>{{ formatDuration(health.latency_ms) }}</td><td>{{ formatDate(health.last_success_epoch || health.last_successful_sync_epoch) }}</td><td>{{ health.doctor_status || health.last_doctor_status || health.state || 'Unavailable' }}</td><td :class="'is-' + profileOutcome(health.profile).level">{{ profileOutcome(health.profile).text }}</td><td>{{ health.free_space_proven === true ? formatBytes(health.free_space_bytes) : 'Unavailable' }}</td></tr></tbody></table></div></article>
+            <article class="sdsync-panel"><div class="sdsync-panel-heading"><div><p class="sdsync-eyebrow">Cached per-profile evidence</p><h3>Target health</h3></div><span class="sdsync-freshness">{{ healthFreshness }}</span></div><div class="sdsync-table-wrap"><table><thead><tr><th>Profile</th><th>Last check</th><th>Reachable</th><th>Auth</th><th>Writable</th><th>Latency</th><th>Last success</th><th>Doctor</th><th>Last run</th><th>Free space</th></tr></thead><tbody><tr v-if="!healthRows.length"><td colspan="10">No cached target-health evidence.</td></tr><tr v-for="health in healthRows" :key="health.profile"><td><bdi>{{ shownName(health.profile) || 'Unknown' }}</bdi></td><td>{{ formatDate(health.last_check_epoch || health.checked_at_epoch || health.checked_epoch) }}</td><td :class="healthClass(health.reachable)">{{ booleanEvidence(health.reachable) }}</td><td :class="healthClass(health.authenticated !== undefined ? health.authenticated : health.auth)">{{ booleanEvidence(health.authenticated !== undefined ? health.authenticated : health.auth) }}</td><td :class="healthClass(health.writable)">{{ booleanEvidence(health.writable) }}</td><td>{{ formatDuration(health.latency_ms) }}</td><td>{{ formatDate(health.last_success_epoch || health.last_successful_sync_epoch) }}</td><td>{{ health.doctor_status || health.last_doctor_status || health.state || 'Unavailable' }}</td><td :class="'is-' + profileOutcome(health.profile).level">{{ profileOutcome(health.profile).text }}</td><td>{{ health.free_space_proven === true ? formatBytes(health.free_space_bytes) : 'Unavailable' }}</td></tr></tbody></table></div></article>
           </section>
 
           <section v-else-if="route === 'activity'" class="sdsync-page" aria-labelledby="sdsync-page-title">
             <div class="sdsync-page-actions"><v-button suffix="grey" display="icon-text" tooltip="Pause or resume browser-side log refreshes" @click="toggleLogs"><template #icon><action-icon :name="logsPaused ? 'run' : 'pause'" /></template>{{ logsPaused ? 'Resume live updates' : 'Pause live updates' }}</v-button><v-button suffix="grey" display="icon-text" tooltip="Clear only this rendered view; package logs remain intact" @click="clearLogView"><template #icon><action-icon name="clear" /></template>Clear view</v-button></div>
             <ul v-if="attentionItems.length" class="sdsync-attention" role="status" aria-label="Run outcomes needing attention"><li v-for="item in attentionItems" :key="item.id" :class="'is-' + item.level"><strong>{{ item.title }}</strong> <span>{{ item.detail }}</span></li></ul>
+            <ul v-if="feedProblem" class="sdsync-attention sdsync-feed-problem" role="alert" aria-label="Activity feed problem"><li class="is-fail"><strong>Activity feed unavailable</strong> <span>{{ feedProblem }}</span></li></ul>
             <p class="sdsync-field-note">{{ activityHistoryNote }}</p>
             <div class="sdsync-subtabs" data-subtabs="activity" role="tablist" aria-label="Activity views" @keydown="moveSubtab('activityTab', activityTabs, $event)">
               <button v-for="tab in activityTabs" :id="'sdsync-activity-tab-' + tab.id" :key="tab.id" type="button" :class="['sdsync-subtab', { 'is-active': activityTab === tab.id }]" :data-subtab="tab.id" role="tab" :aria-selected="activityTab === tab.id" :aria-controls="'sdsync-activity-panel-' + tab.id" :tabindex="activityTab === tab.id ? 0 : -1" @click="activityTab = tab.id">{{ tab.label }}</button>
@@ -474,7 +484,7 @@
                     <div class="sdsync-panel-heading"><div><p class="sdsync-eyebrow">Bounded package logs</p><h3>Troubleshooting evidence</h3></div><div class="sdsync-evidence-heading-actions"><span class="sdsync-log-state">{{ logState }}</span><v-button type="border" display="icon-text" aria-label="Copy all visible package logs" tooltip="Copy the selected log sources as bounded, sanitized troubleshooting text" :disabled="!logRecords.length" @click="copyVisibleLogs"><template #icon><action-icon name="copy" /></template>Copy visible</v-button></div></div>
                     <div class="sdsync-filter-list sdsync-log-filters" aria-label="Log filters"><div class="sdsync-filter-row"><span class="sdsync-filter-label">Source</span><div class="sdsync-filter-control"><v-single-select class="sdsync-select-control" v-model="logSource" :options="logSourceOptions" width="100%" :custom-dropdown-cls="'sdsync-select-dropdown ' + themeClass" aria-label="Log source" aria-describedby="sdsync-help-log-source" @input="refreshLogs"><template #dropdown-icon><action-icon name="chevron-down" /></template></v-single-select><control-help help-key="log-source" /></div></div><div class="sdsync-filter-row"><span class="sdsync-filter-label">Lines</span><div class="sdsync-filter-control"><v-single-select class="sdsync-select-control" v-model="logLines" :options="logLineOptions" width="100%" :custom-dropdown-cls="'sdsync-select-dropdown ' + themeClass" aria-label="Log line count" aria-describedby="sdsync-help-log-lines" @input="refreshLogs"><template #dropdown-icon><action-icon name="chevron-down" /></template></v-single-select><control-help help-key="log-lines" /></div></div></div>
                     <p v-if="!logRecords.length" class="sdsync-empty">{{ logOutput }}</p>
-                    <div v-else class="sdsync-log-records"><section v-for="record in logRecords" :key="record.id" class="sdsync-log-record"><header><span><strong>{{ record.source }}</strong><small>{{ record.lineCount }} line{{ record.lineCount === 1 ? '' : 's' }}</small></span><span class="sdsync-log-record-actions"><v-button class="sdsync-evidence-copy" type="border" display="icon-text" :aria-label="'Copy ' + record.source + ' log evidence'" tooltip="Copy this log record as bounded, sanitized troubleshooting text" @click="copyLogRecord(record)"><template #icon><action-icon name="copy" /></template>Copy</v-button><v-button class="sdsync-evidence-copy sdsync-log-clear" type="border" display="icon-text" :aria-label="'Clear the ' + record.source + ' package log'" :tooltip="logClearTooltip(record.source)" :disabled="!logSourceClearable(record.source) || !canRunOperations" @click="clearLogSource(record.source)"><template #icon><action-icon name="delete" /></template>Clear</v-button></span></header><div v-if="record.doctorInventories.length" class="sdsync-log-inventory-evidence"><div v-for="(inventoryRecord, recordIndex) in record.doctorInventories" :key="inventoryRecord.epoch + ':' + inventoryRecord.profile + ':' + recordIndex" class="sdsync-inventory-evidence"><div class="sdsync-inventory-evidence-summary"><strong>{{ inventoryRecord.profile }} · {{ doctorInventoryScopeLabel(inventoryRecord.inventory.scope) }}</strong><span>{{ inventoryRecord.inventory.total }} total · {{ inventoryRecord.inventory.entries.length }} shown<span v-if="inventoryRecord.inventory.truncated"> · truncated</span></span></div><p v-if="!inventoryRecord.inventory.entries.length">No logical entries were visible.</p><div v-for="(entry, index) in inventoryRecord.inventory.entries" :key="entry.path + ':' + index" class="sdsync-inventory-evidence-entry"><span>{{ entry.kind }}</span><code>{{ entry.path }}</code><small>{{ entry.name }}</small></div></div></div><p v-if="!record.lines.length" class="sdsync-empty sdsync-log-empty">No lines to show. This log can still hold records that the current log level for its category keeps out of this view.</p><ol v-else class="sdsync-log-lines" tabindex="0"><li v-for="line in record.lines" :key="line.id"><time v-if="line.epoch">{{ formatDate(line.epoch) }}</time><time v-else class="is-unrecorded" title="This line was written without a recorded time; the package now stamps every record it writes.">Time not recorded</time><span>{{ line.text }}</span></li></ol></section></div>
+                    <div v-else class="sdsync-log-records"><section v-for="record in logRecords" :key="record.id" class="sdsync-log-record"><header><span><strong>{{ record.source }}</strong><small>{{ record.lineCount }} line{{ record.lineCount === 1 ? '' : 's' }}</small><small v-if="record.scanLimited">newest lines only; older history was not scanned</small></span><span class="sdsync-log-record-actions"><v-button class="sdsync-evidence-copy" type="border" display="icon-text" :aria-label="'Copy ' + record.source + ' log evidence'" tooltip="Copy this log record as bounded, sanitized troubleshooting text" @click="copyLogRecord(record)"><template #icon><action-icon name="copy" /></template>Copy</v-button><v-button class="sdsync-evidence-copy sdsync-log-clear" type="border" display="icon-text" :aria-label="'Clear the ' + record.source + ' package log'" :tooltip="logClearTooltip(record.source)" :disabled="!logSourceClearable(record.source) || !canRunOperations" @click="clearLogSource(record.source)"><template #icon><action-icon name="delete" /></template>Clear</v-button></span></header><div v-if="record.doctorInventories.length" class="sdsync-log-inventory-evidence"><div v-for="(inventoryRecord, recordIndex) in record.doctorInventories" :key="inventoryRecord.epoch + ':' + inventoryRecord.profile + ':' + recordIndex" class="sdsync-inventory-evidence"><div class="sdsync-inventory-evidence-summary"><strong>{{ inventoryRecord.profile }} · {{ doctorInventoryScopeLabel(inventoryRecord.inventory.scope) }}</strong><span>{{ inventoryRecord.inventory.total }} total · {{ inventoryRecord.inventory.entries.length }} shown<span v-if="inventoryRecord.inventory.truncated"> · truncated</span></span></div><p v-if="!inventoryRecord.inventory.entries.length">No logical entries were visible.</p><div v-for="(entry, index) in inventoryRecord.inventory.entries" :key="entry.path + ':' + index" class="sdsync-inventory-evidence-entry"><span>{{ entry.kind }}</span><code>{{ entry.path }}</code><small>{{ entry.name }}</small></div></div></div><p v-if="!record.lines.length" class="sdsync-empty sdsync-log-empty">No lines to show. This log can still hold records that the current log level for its category keeps out of this view.</p><ol v-else class="sdsync-log-lines" tabindex="0"><li v-for="line in record.lines" :key="line.id"><time v-if="line.epoch">{{ formatDate(line.epoch) }}</time><time v-else class="is-unrecorded" title="This line was written without a recorded time; the package now stamps every record it writes.">Time not recorded</time><span>{{ line.text }}</span></li></ol></section></div>
                   </article>
                 </div>
                 <div v-else :id="'sdsync-activity-panel-' + activityTab" :key="activityTab" class="sdsync-subtab-panel" :data-subtab-panel="activityTab" role="tabpanel" :aria-labelledby="'sdsync-activity-tab-' + activityTab" tabindex="0">
@@ -488,7 +498,7 @@
                       <div class="sdsync-filter-row"><span class="sdsync-filter-label">Category</span><div class="sdsync-filter-control"><v-single-select class="sdsync-select-control" v-model="activityCategory" :options="activityLensCategoryOptions" width="100%" :custom-dropdown-cls="'sdsync-select-dropdown ' + themeClass" aria-label="Activity category" aria-describedby="sdsync-help-activity-category"><template #dropdown-icon><action-icon name="chevron-down" /></template></v-single-select><control-help help-key="activity-category" /></div></div>
                       <div class="sdsync-filter-row"><span class="sdsync-filter-label">Level</span><div class="sdsync-filter-control"><v-single-select class="sdsync-select-control" v-model="activityLevel" :options="activityLevelOptions" width="100%" :custom-dropdown-cls="'sdsync-select-dropdown ' + themeClass" aria-label="Activity level" aria-describedby="sdsync-help-activity-level"><template #dropdown-icon><action-icon name="chevron-down" /></template></v-single-select><control-help help-key="activity-level" /></div></div>
                     </div>
-                    <ol class="sdsync-activity-feed"><li v-if="!reversedActivity.length" class="sdsync-empty">{{ activityEmptyText }}</li><li v-for="event in reversedActivity" :key="[event.epoch, event.code, event.profile, event.category, event.level, event.client_request_id].join(':')"><time>{{ formatDate(event.epoch) }}</time><div class="sdsync-activity-detail"><strong>{{ event.code }}</strong><p v-if="event.message && !event.doctor_inventory">{{ event.message }}</p><div v-if="event.doctor_inventory" class="sdsync-inventory-evidence"><div class="sdsync-inventory-evidence-summary"><strong>{{ doctorInventoryScopeLabel(event.doctor_inventory.inventory.scope) }}</strong><span>{{ event.doctor_inventory.inventory.total }} total · {{ event.doctor_inventory.inventory.entries.length }} shown<span v-if="event.doctor_inventory.inventory.truncated"> · truncated</span></span></div><p v-if="!event.doctor_inventory.inventory.entries.length">No logical entries were visible.</p><div v-for="(entry, index) in event.doctor_inventory.inventory.entries" :key="entry.path + ':' + index" class="sdsync-inventory-evidence-entry"><span>{{ entry.kind }}</span><code>{{ entry.path }}</code><small>{{ entry.name }}</small></div></div><code v-if="event.client_request_id">Client request ID: {{ event.client_request_id }}</code></div><small>{{ event.profile }} · {{ event.state }} · {{ event.category }} / {{ event.level }}</small><v-button class="sdsync-evidence-copy" type="border" display="icon-text" :aria-label="'Copy activity event ' + event.code" tooltip="Copy this event as bounded, sanitized troubleshooting text" @click="copyActivityEvent(event)"><template #icon><action-icon name="copy" /></template>Copy</v-button></li></ol>
+                    <ol class="sdsync-activity-feed"><li v-if="!reversedActivity.length" class="sdsync-empty">{{ activityEmptyText }}</li><li v-for="event in reversedActivity" :key="event.rowKey"><time>{{ formatDate(event.epoch) }}</time><div class="sdsync-activity-detail"><strong>{{ event.code }}</strong><p v-if="event.message && !event.doctor_inventory">{{ event.message }}</p><div v-if="event.doctor_inventory" class="sdsync-inventory-evidence"><div class="sdsync-inventory-evidence-summary"><strong>{{ doctorInventoryScopeLabel(event.doctor_inventory.inventory.scope) }}</strong><span>{{ event.doctor_inventory.inventory.total }} total · {{ event.doctor_inventory.inventory.entries.length }} shown<span v-if="event.doctor_inventory.inventory.truncated"> · truncated</span></span></div><p v-if="!event.doctor_inventory.inventory.entries.length">No logical entries were visible.</p><div v-for="(entry, index) in event.doctor_inventory.inventory.entries" :key="entry.path + ':' + index" class="sdsync-inventory-evidence-entry"><span>{{ entry.kind }}</span><code>{{ entry.path }}</code><small>{{ entry.name }}</small></div></div><code v-if="event.client_request_id">Client request ID: {{ event.client_request_id }}</code></div><small><bdi>{{ shownName(event.profile) }}</bdi> · {{ event.state }} · {{ event.category }} / {{ event.level }}</small><v-button class="sdsync-evidence-copy" type="border" display="icon-text" :aria-label="'Copy activity event ' + event.code" tooltip="Copy this event as bounded, sanitized troubleshooting text" @click="copyActivityEvent(event)"><template #icon><action-icon name="copy" /></template>Copy</v-button></li></ol>
                   </article>
                 </div>
               </transition>
@@ -637,17 +647,17 @@ import { ActionIcon } from "./ActionIcon";
 import { createAutosaveCoordinator } from "./autosave";
 import { installControlLayout } from "./controlLayout";
 // The desktop card and this window now share a retry problem, so they share the
-// cadence policy rather than growing a second one. widgetModel.mjs imports
-// nothing, which is what makes it safe to depend on from here; the dependency
-// runs one way only and these three numbers are reviewed literals pinned by
-// validate_spk.py.
+// cadence policy rather than growing a second one. widgetModel.mjs imports only
+// pure modules (no DOM, no transport), which is what makes it safe to depend on
+// from here; the dependency runs one way only and these three numbers are
+// reviewed literals pinned by validate_spk.py.
 import {
   WIDGET_ACTIVE_POLL_MS,
   WIDGET_BACKOFF_RAMP_MS,
+  WIDGET_CLOCK_TICK_MS,
   WIDGET_IDLE_POLL_MS
 } from "./widgetModel.mjs";
 import {
-  OUTCOMES_MISSING_ITEM,
   attentionItems as outcomeAttentionItems,
   cacheHealthNote,
   failureKey as outcomeFailureKey,
@@ -655,11 +665,28 @@ import {
   normalizeOutcomes,
   outcomeLabel,
   outcomeLevel,
+  outcomesUnavailableItem,
   profileOutcomeRow,
   reasonCopy,
   resultDisplay,
+  runIsActive,
+  runIsStale,
+  spanLabel,
+  staleRunCovers,
   warningsSentence
 } from "./outcomes.mjs";
+import { causeSentence, errorCause } from "./errorCopy.mjs";
+import {
+  ACTIVITY_SCHEMA,
+  LOGS_SCHEMA,
+  activityContentKey,
+  feedDocumentProblem,
+  feedSignature,
+  runStderrBlock,
+  uniqueRowKeys
+} from "./feedModel.mjs";
+import { decodeLogPaths, plainText, visibleText } from "./textSafety.mjs";
+import { patchGuard } from "./uiErrors.mjs";
 import {
   ACTIONS,
   AUTOSAVE_API_LIMITS,
@@ -1703,7 +1730,7 @@ const CONTROL_HELP = Object.freeze({
   "activity-search": "Search the rendered event text, metadata, or an exact client request ID.",
   "activity-category": "Show structured activity from one audited subsystem or from every category.",
   "activity-level": "Show activity at one exact recorded severity or at every severity.",
-  "log-source": "Limit the live view to DSM API, audit, controller, scheduler, sync, or all package logs.",
+  "log-source": "Limit the live view to DSM API, audit, controller, scheduler, sync, the core's error output of the last runs, or all package logs.",
   "log-lines": "Maximum number of recent bounded log lines to display.",
   "alerts-enabled": "Allow fixed, non-secret package events to reach the DSM desktop.",
   "alerts-success": "Send a DSM desktop alert after a successful sync.",
@@ -1719,6 +1746,7 @@ const CONTROL_HELP = Object.freeze({
 
 const ControlHelp = {
   name: "ControlHelp",
+  mixins: [patchGuard],
   components: { ActionIcon },
   props: { helpKey: { type: String, required: true } },
   computed: {
@@ -3192,9 +3220,9 @@ function normalizedActivityEvent(event) {
   // but credential terminators may sit beyond the much smaller display limits.
   // Redact the complete API field first so slicing cannot preserve a partial
   // URL userinfo or contextual cookie secret after discarding its terminator.
-  const field = (value, fallback, limit = ACTIVITY_FIELD_LIMIT) => redactedTroubleshootingText(
+  const field = (value, fallback, limit = ACTIVITY_FIELD_LIMIT) => visibleText(redactedTroubleshootingText(
     typeof value === "string" ? value : fallback
-  ).slice(0, limit);
+  ).slice(0, limit));
   const rawMessage = typeof event.message === "string" ? event.message : "";
   // Parse only the exact private Doctor prefix and strict nested schema before
   // applying generic credential-field redaction. A legitimate logical name
@@ -3204,7 +3232,8 @@ function normalizedActivityEvent(event) {
   const doctorInventory = normalizedDoctorInventoryRecord(event.doctor_inventory)
     || doctorInventoryRecordFromActivityMessage(rawMessage);
   const completeMessage = redactedTroubleshootingText(rawMessage).slice(0, 4096);
-  const message = completeMessage.slice(0, ACTIVITY_MESSAGE_LIMIT);
+  // Names inside a message may carry bidi or zero-width controls; show their code points.
+  const message = visibleText(completeMessage.slice(0, ACTIVITY_MESSAGE_LIMIT));
   return {
     epoch: numberOr(event.epoch, 0),
     code: field(event.code, "unknown.event"),
@@ -3224,7 +3253,12 @@ function normalizedActivityEvent(event) {
 // function, not itself a computed, purely so that computed can be one more
 // caller of it rather than the only place the work is expressed.
 function normalizedEvents(events) {
-  return events.map(normalizedActivityEvent).filter(Boolean);
+  const normalized = events.map(normalizedActivityEvent).filter(Boolean);
+  // v-for keys: identical events in one second are ordinary, and Vue 2 throws out
+  // of its patch on a shared key (see feedModel.mjs).
+  const keys = uniqueRowKeys(normalized, activityContentKey);
+  normalized.forEach((event, index) => { event.rowKey = keys[index]; });
+  return normalized;
 }
 
 function canonicalProfileConfiguration(value, snapshot = false) {
@@ -3555,8 +3589,226 @@ function resyncPlanFromDocument(document, profile) {
   };
 }
 
+// What to tell the operator about a read that failed: a title, and a message
+// that names the cause. Module-level so the feed polls can use it without a
+// component method, and so a test can call it with no component at all.
+function describeBridgeFailure(error, phase = "status") {
+  const status = Number(error && error.status) || 0;
+  const code = String((error && error.code) || "").toLowerCase();
+  const message = String((error && error.message) || "").toLowerCase();
+  const stage = boundedText(error && error.stage, "").trim().slice(0, 128);
+  // The cause rides on every answer, named or not: the status, the bridge's
+  // own code and, when it is safe to show, its message. Before this, a 500, a
+  // response guard and a stopped package all read "could not be reached".
+  const cause = causeSentence(error);
+  const issue = (title, detail) => ({
+    title,
+    message: [stage ? `${detail} Failure stage: ${stage}.` : detail, cause].filter(Boolean).join(" ")
+  });
+  if ((status === 0 || status === 401) && code === "dsm_authentication_quickconnect_unsupported") {
+    return issue(
+      "QuickConnect relay unsupported",
+      "QuickConnect relay cannot authenticate this third-party package AppWindow. Connect through the NAS LAN address, DDNS, a VPN, or a separately tested DSM custom reverse proxy, then reopen the app from the DSM desktop."
+    );
+  }
+  if (status === 401) {
+    return issue("DSM session expired", "Sign in to DSM again, then reopen this app from the DSM desktop.");
+  }
+  if (status === 403) {
+    return issue("DSM access denied", "Use a DSM administrator account and, if HTTPS is required by policy, reopen this app over HTTPS.");
+  }
+  if ((status === 0 || status === 503) && code === "dsm_authentication_helper_unsafe") {
+    return issue(
+      "DSM authentication helper rejected",
+      "Repair or reinstall the latest complete package release, then reopen this app from the DSM desktop. If the rejection continues, inspect the package API log; do not change helper ownership or permissions manually."
+    );
+  }
+  if ((status === 0 || status === 503) && code === "dsm_authentication_helper_unavailable") {
+    return issue(
+      "DSM authentication helper unavailable",
+      "Repair or reinstall the latest complete package release, then reopen this app from the DSM desktop. If the helper still cannot start, inspect the package API log."
+    );
+  }
+  if ((status === 0 || status === 503) && code === "dsm_authentication_webapi_unavailable") {
+    return issue(
+      "DSM session validation unavailable",
+      "Reopen this app from the DSM desktop. If validation still fails, inspect the package API log and confirm DSM web services are available."
+    );
+  }
+  if (status === 400) {
+    return issue("DSM request metadata rejected", "Install or repair the latest complete package release, then reopen this app from the DSM desktop.");
+  }
+  if (status === 404) {
+    return issue("Package UI route unavailable", "DSM did not reach this package's native API. Repair or reinstall the same package release, then reopen the app.");
+  }
+  // The named in-service failures, above the bare 503 that used to answer
+  // for all of them with "Restart Synology Drive Sync". The catch-all below
+  // stays: it is still the right answer for a 503 with no code, and for any
+  // code a newer package emits that this release has never heard of.
+  const named = BRIDGE_FAILURE_COPY[code];
+  if (named && (status === 503 || status === 0)) {
+    return issue(named.title, named.message);
+  }
+  if (status === 503) {
+    return issue("Package service unavailable", "Restart Synology Drive Sync and inspect its API log if the package bridge does not recover.");
+  }
+  if (status === 0 && code.includes("forbidden")) {
+    return issue("DSM access denied", "Use a DSM administrator account and, if HTTPS is required by policy, reopen this app over HTTPS.");
+  }
+  if (status === 0 && (code === "dsm_authentication_webapi_rejected" || code.includes("unauthorized") || code.includes("authentication") || message.includes("redirect"))) {
+    return issue("DSM session expired", "Sign in to DSM again, then reopen this app from the DSM desktop.");
+  }
+  if ((status === 0 || (status >= 200 && status < 300)) && (code === "non_json_response" || code === "malformed_json")) {
+    return issue("Package UI route unavailable", "DSM did not reach this package's native API. Repair or reinstall the same package release, then reopen the app.");
+  }
+  if (status === 0 && code.includes("unavailable")) {
+    return issue("Package service unavailable", "Restart Synology Drive Sync and inspect its API log if the package bridge does not recover.");
+  }
+  if (message.includes("unsupported dsm api schema") || code === "invalid_document") {
+    return issue("UI and package versions differ", "Repair or reinstall one complete release so the AppWindow and package API use the same schema.");
+  }
+  if (message.includes("cancel")) {
+    return issue("DSM request cancelled", "The window stopped the request. Retry while this AppWindow remains open.");
+  }
+  // Three different things used to share one sentence. The package answered
+  // with an error; this window refused the answer (a guard tripped); or
+  // nothing came back at all. Only the last is "could not be reached".
+  const answered = status >= 400 || (status >= 200 && status < 300 && Boolean(code));
+  const refusedByWindow = !answered && !code && Boolean(error) && error.name === "Error" && Boolean(error.message);
+  let fallback;
+  if (phase === "authentication") {
+    fallback = "DSM authentication could not be completed. Reopen this app from the DSM desktop.";
+  } else if (answered) {
+    fallback = "The package answered with an error instead of its status. Retry; if it repeats, inspect the package API log.";
+  } else if (refusedByWindow) {
+    fallback = "This window refused the package's answer. Retry; if it repeats, inspect the package API log and confirm one complete release is installed.";
+  } else {
+    fallback = "The package endpoint could not be reached. Confirm the package is running, then retry.";
+  }
+  return issue("Package bridge unavailable", fallback);
+}
+
+// The cause of a rejected feed read, in the vocabulary of describeBridgeFailure:
+// "Package service unavailable (HTTP 503 · corrupt_state · message)".
+function feedFailureText(reason) {
+  const issue = describeBridgeFailure(reason, "status");
+  const cause = errorCause(reason).text;
+  return cause ? `${issue.title} (${cause})` : issue.title;
+}
+
+// Apply one step of a good snapshot. The read has already succeeded and been
+// validated; an exception here is a defect in this window, and it must be shown
+// as one rather than turned into "package bridge unavailable" with every
+// mutation disabled.
+function applyStep(vm, label, step) {
+  try {
+    step();
+    return true;
+  } catch (error) {
+    const message = plainText(error && error.message ? error.message : String(error), 160);
+    if (typeof console !== "undefined" && console.error) console.error(`[sdsync] ${label}: ${message}`, error);
+    vm.applyError = `${label}: ${message}`;
+    vm.toast("Dashboard error", `The package answered, but this window failed while applying ${label}: ${message}`, true);
+    return false;
+  }
+}
+
+// The clock behind every "N min ago" and the stale-reading text. Between polls
+// that change nothing the snapshot object is deliberately left alone, so without
+// this tick no age would ever move.
+// The core's error output for the last failed run, from the run-stderr log. The
+// snapshot says whether it belongs to the reported run; it is read once per run
+// and shown beside the attention list, so the cause that run.state's 160 sanitised
+// characters cannot hold is on the page. A failed read is shown, retried at most
+// once a minute, and never mistaken for "no output".
+async function refreshRunStderr(vm) {
+  const outcomes = vm.outcomes;
+  const run = outcomes && outcomes.run;
+  if (!run) return;
+  const wanted = run.stderrLog && ["failed", "partial", "stale", "unknown"].includes(run.outcome) ? run.stderrLog.finishedEpoch : 0;
+  const held = vm.runStderr;
+  if (!wanted) {
+    if (held && held.epoch) vm.runStderr = { epoch: 0, lines: [], error: "", fetchedAtMs: 0 };
+    return;
+  }
+  if (vm.runStderrLoading) return;
+  if (held && held.epoch === wanted && !held.error) return;
+  if (held && held.epoch === wanted && held.error && Date.now() - held.fetchedAtMs < 60000) return;
+  vm.runStderrLoading = true;
+  try {
+    const document = await apiGet(vm.auth, "logs", { lines: 200, source: "run-stderr" });
+    if (vm.disposed) return;
+    const problem = feedDocumentProblem(document, LOGS_SCHEMA, "logs", "core error output");
+    if (problem) throw new Error(problem);
+    const entry = document.logs.find((item) => item && item.source === "run-stderr") || document.logs[0];
+    const lines = entry && Array.isArray(entry.lines) ? entry.lines.filter((line) => typeof line === "string") : [];
+    const block = runStderrBlock(lines, wanted);
+    vm.runStderr = block.found
+      ? { epoch: wanted, lines: block.lines.map((line) => visibleText(redactedTroubleshootingText(line).slice(0, 240))), error: "", fetchedAtMs: Date.now() }
+      : { epoch: wanted, lines: [], error: "this run's error output is no longer kept (older runs are rotated away)", fetchedAtMs: Date.now() };
+  } catch (error) {
+    if (vm.disposed) return;
+    const reason = error && error.name === "DsmApiError" ? feedFailureText(error) : plainText(error && error.message ? error.message : String(error), 200);
+    vm.runStderr = { epoch: wanted, lines: [], error: reason, fetchedAtMs: Date.now() };
+  } finally {
+    vm.runStderrLoading = false;
+  }
+}
+
+// How long to wait before the next Activity/Logs read. Beyond the operator's
+// cadence: a window DSM has minimised waits for the resting cadence; a read that
+// took long waits three times as long again, because asking sooner only stacks
+// the same scan; and two failures in a row ramp like the status poll does.
+function logsPollDelay(vm, interval) {
+  let delay = vm.windowHidden ? Math.max(interval, WIDGET_IDLE_POLL_MS) : interval;
+  const took = Number(vm.logsLastDurationMs);
+  if (took > 0) delay = Math.max(delay, took * 3);
+  const streak = Number(vm.logsFailureStreak);
+  if (streak >= 2) delay = Math.max(delay, WIDGET_BACKOFF_RAMP_MS[Math.min(streak - 2, WIDGET_BACKOFF_RAMP_MS.length - 1)]);
+  return delay;
+}
+
+function tickClock(vm, nowMs = Date.now()) {
+  vm.nowMs = nowMs;
+  if (vm.staleFreshnessCode !== null && vm.staleFreshnessCode !== undefined && !vm.connected && vm.snapshot) {
+    vm.freshness = retainedDocumentFreshness(vm.snapshotReceivedAtMs, vm.staleFreshnessCode, nowMs);
+  }
+}
+
+function scheduleClock(vm) {
+  window.clearTimeout(vm.clockTimer);
+  vm.clockTimer = 0;
+  if (vm.disposed || document.hidden) return;
+  vm.clockTimer = window.setTimeout(() => {
+    vm.clockTimer = 0;
+    tickClock(vm);
+    scheduleClock(vm);
+  }, WIDGET_CLOCK_TICK_MS);
+}
+
+// A minimised DSM window is not document.hidden. Its element loses its layout box
+// (zero width and height), which IntersectionObserver reports; a window that is
+// merely scrolled or overlapped still has one and is not slowed.
+function observeWindowVisibility(vm) {
+  if (typeof window.IntersectionObserver !== "function" || !vm.$el || vm.$el.nodeType !== 1) return;
+  vm.visibilityObserver = new window.IntersectionObserver((entries) => {
+    const entry = entries[entries.length - 1];
+    if (!entry || vm.disposed) return;
+    const box = entry.boundingClientRect || {};
+    const hidden = !entry.isIntersecting && box.width === 0 && box.height === 0;
+    if (hidden === vm.windowHidden) return;
+    vm.windowHidden = hidden;
+    if (hidden) return;
+    tickClock(vm);
+    vm.refreshSnapshot(false);
+    if (vm.route === "activity") vm.refreshLogs();
+  });
+  vm.visibilityObserver.observe(vm.$el);
+}
+
 export default {
   name: "SynologyDriveSyncApp",
+  mixins: [patchGuard],
   components: { ActionIcon, ControlHelp, SecurityPanel },
   data() {
     const settings = loadSettings();
@@ -3588,9 +3840,30 @@ export default {
       // The last named read failure and how many consecutive reads have failed.
       // Together they select the polling ladder in snapshotRetryDelay().
       snapshotFailureCode: "", snapshotFailureStreak: 0,
+      // The HTTP status of that failure (0 for a transport error), which decides
+      // whether an unnamed failure is a transport outage that backs off.
+      snapshotFailureStatus: 0,
+      // The package-reported code behind the stale-reading text, kept so the
+      // clock tick can re-render its age; null while the reading is live.
+      staleFreshnessCode: null,
+      // Browser time, advanced by tickClock() so that ages and the stale-reading
+      // text keep moving between polls (a poll that changes nothing leaves the
+      // snapshot object alone, so nothing else would re-render them).
+      nowMs: Date.now(), clockTimer: 0,
+      // True while the window's element has no layout box (a minimised DSM
+      // window); polling then slows to the widget's resting cadence.
+      windowHidden: false, visibilityObserver: null,
       connected: false, connectionLabel: "Connecting to package…", freshness: "Waiting for status",
       bridgeIssue: { title: "", message: "" },
-      snapshotTimer: 0, logTimer: 0, snapshotLoading: false, snapshotPromise: null, snapshotRefreshQueued: false, snapshotGeneration: 0, logsLoading: false, operationBusy: false,
+      snapshotTimer: 0, logTimer: 0, snapshotLoading: false, snapshotPromise: null, snapshotRefreshQueued: false, snapshotGeneration: 0, logsLoading: false, operationBusy: false, applyError: "",
+      // "Saved, but ..." from the last successful mutation, until dismissed or a
+      // later save succeeds without one: { code, text } or null.
+      mutationWarning: null,
+      // The core's own error output for the last failed run, fetched once per run.
+      runStderr: { epoch: 0, lines: [], error: "", fetchedAtMs: 0 }, runStderrLoading: false,
+      // How long the last Activity/Logs read took and how many in a row failed, so a
+      // slow or failing feed is asked for less often rather than as often.
+      logsLastDurationMs: 0, logsFailureStreak: 0,
       autosaveCoordinator: null, autosavePhase: "saved", autosaveMessage: "Autosave ready", alertDirty: false,
       autosaveFailureScopes: { profile: false, routine: false, alerts: false, security: false, interface: false },
       autosaveOutcomeUnknownScopes: { profile: false, routine: false, alerts: false, security: false, interface: false },
@@ -3625,6 +3898,10 @@ export default {
       diagnostic: { title: "Not run in this session", output: "No diagnostic output yet." }, doctorReport: idleDoctorReport(), doctorProgress: emptyDoctorProgress(),
       liveProgress: emptyLiveProgress(),
       logsPaused: false, logSource: "all", logLines: 200, logState: "Waiting for logs", logOutput: "No log data yet.", logRecords: [], activityEvents: [], activityHistory: null, activitySearch: "",
+      // Why each feed's last read failed, "" while it is healthy. A feed that
+      // fails keeps its old rows, so without these a dead feed and an empty one
+      // look the same on every tab but Package logs.
+      activityFeedError: "", logsFeedError: "", activitySignature: "",
       // reversedActivity() filters on this debounced copy instead of
       // activitySearch directly, so a redaction-and-filter pass over
       // potentially thousands of events runs at most once per quiet 250ms
@@ -3640,7 +3917,7 @@ export default {
         { id: "package-logs", label: "Package logs" }
       ],
       activityTab: "events",
-      lastFailureKey: "", lastOutcomeFailureKey: "", toasts: [], toastSequence: 0,
+      lastFailureKey: "", lastOutcomeFailureKey: "", failureBaselineSeen: false, toasts: [], toastSequence: 0,
       confirmation: { visible: false, title: "", message: "", button: "Confirm", resolve: null },
       confirmationPriorFocus: null, confirmationKeyHandler: null,
       pathBrowserPriorFocus: null, pathBrowserKeyHandler: null,
@@ -4035,9 +4312,23 @@ export default {
     // True once a poll has failed while an earlier snapshot is still on screen.
     // Every value derived from it is then history, not evidence.
     retainedStale() { return Boolean(this.snapshot) && !this.connected; },
+    // "Now" on the package's clock: the snapshot's own generation time plus the
+    // time since this window received it. The browser's clock alone moves every
+    // age by however far it is from the NAS, and it is advanced by tickClock() so
+    // an idle NAS's "moments ago" does not freeze for hours.
+    packageNowSeconds() {
+      const now = Number(this.nowMs) || Date.now();
+      const generated = Number(this.snapshot && this.snapshot.generated_at_epoch);
+      const received = Number(this.snapshotReceivedAtMs);
+      if (!Number.isFinite(generated) || generated <= 0 || !(received > 0)) return now / 1000;
+      return generated + Math.max(0, now - received) / 1000;
+    },
     attentionItems() {
       if (!this.snapshot) return [];
-      const items = this.outcomes ? outcomeAttentionItems(this.outcomes, Date.now() / 1000) : [OUTCOMES_MISSING_ITEM];
+      const items = this.outcomes ? outcomeAttentionItems(this.outcomes, this.packageNowSeconds) : [outcomesUnavailableItem(this.snapshot.outcomes)];
+      // A defect in this window while applying a good snapshot is shown for as long
+      // as it lasts, not only in a six-second toast.
+      if (this.applyError) items.push({ id: "ui-apply-error", level: "warn", title: "This window failed to apply part of the package status", detail: `${this.applyError}. The package itself answered.` });
       return this.retainedStale
         ? [{ id: "stale-poll", level: "unknown", title: "Showing a stale reading", detail: `${this.freshness} Rows below are history, not current status.` }].concat(items)
         : items;
@@ -4051,10 +4342,24 @@ export default {
       const shownRun = resultDisplay(run);
       const level = shownRun.level;
       const warn = run.warnings.length ? warningsSentence(run) : "";
-      return { level: this.retainedStale && level === "ok" ? "unknown" : level, title: shownRun.label + (this.retainedStale ? " (stale)" : ""), detail: [this.lastRunDetail, why, warn, run.countsAvailable === false ? "entry counts unavailable for this run" : ""].filter(Boolean).join(" · ") };
+      return { level: this.retainedStale && level === "ok" ? "unknown" : (!this.retainedStale && level === "unknown" ? "warn" : level), title: shownRun.label + (this.retainedStale ? " (stale)" : ""), detail: [this.lastRunDetail, why, warn, run.countsAvailable === false ? "entry counts unavailable for this run" : ""].filter(Boolean).join(" · ") };
     },
     run() { return this.snapshot && this.snapshot.run && typeof this.snapshot.run === "object" ? this.snapshot.run : ((this.snapshot && this.snapshot.last_run) || {}); },
-    runStatus() { return boundedText(pick(this.run, "status", "state", "result"), "Unavailable"); },
+    // The package's outcome verdict wins over the legacy run.state: a runner that
+    // died leaves "running" behind, and the Overview must not say a run is active
+    // beside a headline saying it died.
+    runningForSuffix() {
+      const run = this.outcomes && this.outcomes.run;
+      const stuck = run && (run.longRunning || run.stalled);
+      return run && run.outcome === "running" && run.runningFor !== null ? ` · running for ${spanLabel(run.runningFor)}${stuck ? " (check whether it is stuck)" : ""}` : "";
+    },
+    runStderrView() {
+      const held = this.runStderr;
+      if (!held || !held.epoch) return null;
+      return { error: held.error, text: held.lines.join("\n") };
+    },
+    runActive() { return runIsActive(this.outcomes, boundedText(pick(this.run, "status", "state", "result"), "")); },
+    runStatus() { return runIsStale(this.outcomes) ? "stale" : boundedText(pick(this.run, "status", "state", "result"), "Unavailable"); },
     runScope() { return boundedText(this.run.scope, "Unavailable"); },
     runOperation() { return boundedText(this.run.operation, "Unavailable"); },
     lastRunDetail() { return this.run.finished_epoch ? formatDate(this.run.finished_epoch) : "No completion time"; },
@@ -4134,7 +4439,7 @@ export default {
       if (liveness.activePid > 0) {
         const operation = boundedText(this.run.operation, "");
         const scope = boundedText(this.run.scope, "");
-        const named = this.runStatus === "running" && operation && operation !== "none";
+        const named = this.runActive && operation && operation !== "none";
         const behind = named
           ? `the ${operation}${scope && scope !== "none" ? ` of ${scope}` : ""}${numberOr(this.run.started_epoch, 0) ? `, started ${formatDate(this.run.started_epoch)}` : ""}`
           : "another operation the controller has already started";
@@ -4215,8 +4520,20 @@ export default {
         ? this.activityCategoryOptions.filter((option) => option.value === "all" || lensCategories.includes(option.value))
         : this.activityCategoryOptions;
     },
+    // What is wrong with the feeds, or "". A feed that fails keeps its previous
+    // rows, so the cause has to be said where the rows are: on every Activity tab,
+    // not only inside Package logs. The Package logs read only runs on that tab.
+    feedProblem() {
+      const parts = [];
+      if (this.activityFeedError) parts.push(`Activity events: ${this.activityFeedError}.`);
+      if (this.activityTab === "package-logs" && this.logsFeedError) parts.push(`Package log: ${this.logsFeedError}.`);
+      return parts.join(" ");
+    },
     activityEmptyText() {
       if (this.activityLensTotal > 0) return "No package events match these filters.";
+      // Never "nothing was recorded" while the read failed or has not happened.
+      if (this.activityFeedError) return `Activity events could not be read, so nothing can be said about what was recorded: ${this.activityFeedError}.`;
+      if (this.activityReceivedAtMs === 0) return "Reading package events…";
       return {
         changes: "No configuration changes have been recorded yet.",
         operations: "No operations have been recorded yet.",
@@ -4237,7 +4554,7 @@ export default {
     routineActionOptions() { return options([["sync", "Sync"], ["plan", "Plan only"]]); },
     routineModeOptions() { return options([["interval", "Interval"], ["daily", "Daily window"], ["realtime", "Realtime watcher"]]); },
     weekdayOptions() { return options([[1, "Mon"], [2, "Tue"], [3, "Wed"], [4, "Thu"], [5, "Fri"], [6, "Sat"], [7, "Sun"]]); },
-    logSourceOptions() { return options([["all", "All logs"], ["api", "DSM API"], ["doctor", "Doctor discovery"], ["audit", "Audit"], ["controller", "Controller"], ["scheduler", "Scheduler"], ["sync", "Sync"]]); },
+    logSourceOptions() { return options([["all", "All logs"], ["api", "DSM API"], ["doctor", "Doctor discovery"], ["audit", "Audit"], ["controller", "Controller"], ["scheduler", "Scheduler"], ["sync", "Sync"], ["run-stderr", "Core error output"]]); },
     activityCategoryOptions() { return options([["all", "All categories"], ["audit", "Audit"], ["bridge", "Bridge"], ["authentication", "Authentication"], ["security", "Security"], ["configuration", "Configuration"], ["secrets", "Secrets"], ["routines", "Routines"], ["operations", "Operations"], ["notifications", "Notifications"], ["sync", "Sync"], ["controller", "Controller"], ["scheduler", "Scheduler"]]); },
     activityLevelOptions() { return options([["all", "All levels"], ...["trace", "debug", "info", "warn", "error"].map((level) => [level, level])]); },
     logLineOptions() { return options([[100, "100 lines"], [200, "200 lines"], [500, "500 lines"], [1000, "1000 lines"]]); },
@@ -4309,12 +4626,15 @@ export default {
       signal: this.abortController ? this.abortController.signal : undefined,
       onCsrfReissued: (previousToken, replacementToken) => {
         if (!this.disposed && this.csrfToken === previousToken) this.csrfToken = replacementToken;
-      }
+      },
+      onMutationWarning: (warning) => { if (!this.disposed) this.noteMutationWarning(warning); }
     };
     this.mediaQuery = window.matchMedia ? window.matchMedia("(prefers-color-scheme: light)") : null;
     this.systemLight = Boolean(this.mediaQuery && this.mediaQuery.matches);
     this.mediaHandler = (event) => { this.systemLight = event.matches; };
     if (this.mediaQuery && this.mediaQuery.addEventListener) this.mediaQuery.addEventListener("change", this.mediaHandler);
+    observeWindowVisibility(this);
+    scheduleClock(this);
     this.visibilityHandler = () => {
       if (document.hidden) {
         this.stopTimers();
@@ -4328,6 +4648,8 @@ export default {
         if (this.autosaveCoordinator) this.autosaveCoordinator.setGlobalBusy(true);
       } else {
         if (this.autosaveCoordinator) this.autosaveCoordinator.setGlobalBusy(this.operationBusy);
+        tickClock(this);
+        scheduleClock(this);
         this.refreshSnapshot(false);
         if (this.route === "activity") this.refreshLogs();
         this.scheduleIncidentProbe();
@@ -4363,6 +4685,8 @@ export default {
     this.removeProfileWindowGuard();
     if (this.mediaQuery && this.mediaQuery.removeEventListener && this.mediaHandler) this.mediaQuery.removeEventListener("change", this.mediaHandler);
     if (this.controlLayoutCleanup) this.controlLayoutCleanup();
+    if (this.visibilityObserver) this.visibilityObserver.disconnect();
+    this.visibilityObserver = null;
     this.connectionWatchCleanups.forEach((cleanup) => { if (typeof cleanup === "function") cleanup(); });
     this.connectionWatchCleanups = [];
     this.clearConnectionProofTimer();
@@ -4842,85 +5166,7 @@ export default {
       clearScopeIncident(this, scope);
       this.refreshAutosaveStatus();
     },
-    describeBridgeError(error, phase = "status") {
-      const status = Number(error && error.status) || 0;
-      const code = String((error && error.code) || "").toLowerCase();
-      const message = String((error && error.message) || "").toLowerCase();
-      const stage = boundedText(error && error.stage, "").trim().slice(0, 128);
-      const issue = (title, detail) => ({
-        title,
-        message: stage ? `${detail} Failure stage: ${stage}.` : detail
-      });
-      if ((status === 0 || status === 401) && code === "dsm_authentication_quickconnect_unsupported") {
-        return issue(
-          "QuickConnect relay unsupported",
-          "QuickConnect relay cannot authenticate this third-party package AppWindow. Connect through the NAS LAN address, DDNS, a VPN, or a separately tested DSM custom reverse proxy, then reopen the app from the DSM desktop."
-        );
-      }
-      if (status === 401) {
-        return issue("DSM session expired", "Sign in to DSM again, then reopen this app from the DSM desktop.");
-      }
-      if (status === 403) {
-        return issue("DSM access denied", "Use a DSM administrator account and, if HTTPS is required by policy, reopen this app over HTTPS.");
-      }
-      if ((status === 0 || status === 503) && code === "dsm_authentication_helper_unsafe") {
-        return issue(
-          "DSM authentication helper rejected",
-          "Repair or reinstall the latest complete package release, then reopen this app from the DSM desktop. If the rejection continues, inspect the package API log; do not change helper ownership or permissions manually."
-        );
-      }
-      if ((status === 0 || status === 503) && code === "dsm_authentication_helper_unavailable") {
-        return issue(
-          "DSM authentication helper unavailable",
-          "Repair or reinstall the latest complete package release, then reopen this app from the DSM desktop. If the helper still cannot start, inspect the package API log."
-        );
-      }
-      if ((status === 0 || status === 503) && code === "dsm_authentication_webapi_unavailable") {
-        return issue(
-          "DSM session validation unavailable",
-          "Reopen this app from the DSM desktop. If validation still fails, inspect the package API log and confirm DSM web services are available."
-        );
-      }
-      if (status === 400) {
-        return issue("DSM request metadata rejected", "Install or repair the latest complete package release, then reopen this app from the DSM desktop.");
-      }
-      if (status === 404) {
-        return issue("Package UI route unavailable", "DSM did not reach this package's native API. Repair or reinstall the same package release, then reopen the app.");
-      }
-      // The named in-service failures, above the bare 503 that used to answer
-      // for all of them with "Restart Synology Drive Sync". The catch-all below
-      // stays: it is still the right answer for a 503 with no code, and for any
-      // code a newer package emits that this release has never heard of.
-      const named = BRIDGE_FAILURE_COPY[code];
-      if (named && (status === 503 || status === 0)) {
-        return issue(named.title, named.message);
-      }
-      if (status === 503) {
-        return issue("Package service unavailable", "Restart Synology Drive Sync and inspect its API log if the package bridge does not recover.");
-      }
-      if (status === 0 && code.includes("forbidden")) {
-        return issue("DSM access denied", "Use a DSM administrator account and, if HTTPS is required by policy, reopen this app over HTTPS.");
-      }
-      if (status === 0 && (code === "dsm_authentication_webapi_rejected" || code.includes("unauthorized") || code.includes("authentication") || message.includes("redirect"))) {
-        return issue("DSM session expired", "Sign in to DSM again, then reopen this app from the DSM desktop.");
-      }
-      if ((status === 0 || (status >= 200 && status < 300)) && (code === "non_json_response" || code === "malformed_json")) {
-        return issue("Package UI route unavailable", "DSM did not reach this package's native API. Repair or reinstall the same package release, then reopen the app.");
-      }
-      if (status === 0 && code.includes("unavailable")) {
-        return issue("Package service unavailable", "Restart Synology Drive Sync and inspect its API log if the package bridge does not recover.");
-      }
-      if (message.includes("unsupported dsm api schema") || code === "invalid_document") {
-        return issue("UI and package versions differ", "Repair or reinstall one complete release so the AppWindow and package API use the same schema.");
-      }
-      if (message.includes("cancel")) {
-        return issue("DSM request cancelled", "The window stopped the request. Retry while this AppWindow remains open.");
-      }
-      const fallback = phase === "authentication"
-        ? "DSM authentication could not be completed. Reopen this app from the DSM desktop."
-        : "The package endpoint could not be reached. Confirm the package is running, then retry.";
-      return issue("Package bridge unavailable", fallback);
-    },
+    describeBridgeError(error, phase = "status") { return describeBridgeFailure(error, phase); },
     openDsmHelp() {
       /* global SYNO */
       const launch = typeof SYNO !== "undefined" && SYNO.SDS && SYNO.SDS.AppLaunch;
@@ -5497,7 +5743,7 @@ export default {
       this.profileSaveMessage = `Step ${boundedCurrent} of ${boundedTotal}: ${stageMessage} ${PROFILE_CREATION_WINDOW_WARNING}`;
     },
     clearProfileCreationProgress() { this.profileCreationProgress = emptyProfileCreationProgress(); },
-    stopTimers() { window.clearTimeout(this.snapshotTimer); window.clearTimeout(this.logTimer); window.clearTimeout(this.incidentProbeTimer); window.clearTimeout(this.activitySearchDebounceTimer); this.snapshotTimer = 0; this.logTimer = 0; this.incidentProbeTimer = 0; this.activitySearchDebounceTimer = 0; },
+    stopTimers() { window.clearTimeout(this.snapshotTimer); window.clearTimeout(this.logTimer); window.clearTimeout(this.incidentProbeTimer); window.clearTimeout(this.activitySearchDebounceTimer); window.clearTimeout(this.clockTimer); this.clockTimer = 0; this.snapshotTimer = 0; this.logTimer = 0; this.incidentProbeTimer = 0; this.activitySearchDebounceTimer = 0; },
     // How long to wait before the next status read, given what the last one
     // failed with.
     //
@@ -5523,14 +5769,39 @@ export default {
     // An unnamed code keeps today's behaviour exactly: the configured cadence,
     // no backoff, which is what every 503 did before any of them had a name.
     snapshotRetryDelay(interval) {
+      // A window DSM has minimised has no layout box; nobody is reading it, so it
+      // looks at the package no faster than the desktop card does.
+      const floor = this.windowHidden ? WIDGET_IDLE_POLL_MS : 0;
       const named = BRIDGE_FAILURE_COPY[this.snapshotFailureCode];
-      if (!named) return interval;
+      if (!named) {
+        // An unnamed failure keeps the operator's cadence for the first miss. From
+        // the second consecutive one, a transport outage (no answer, an expired
+        // session, a proxy or server error) backs off on the widget's ramp: a dead
+        // NAS or a signed-out session was otherwise retried every one to five
+        // seconds for as long as the window stayed open. A 4xx other than 401 and
+        // 429 is a request problem, not an outage, and keeps the cadence.
+        const status = Number(this.snapshotFailureStatus);
+        const outage = status === 0 || status === 401 || status === 429 || status >= 500;
+        const streak = Number(this.snapshotFailureStreak);
+        if (streak >= 2 && outage) {
+          return Math.max(interval, floor, WIDGET_BACKOFF_RAMP_MS[Math.min(streak - 2, WIDGET_BACKOFF_RAMP_MS.length - 1)]);
+        }
+        return Math.max(interval, floor);
+      }
       if (named.retry === "stop") return 0;
-      if (named.retry === "auto") return Math.max(interval, WIDGET_ACTIVE_POLL_MS);
+      if (named.retry === "auto") return Math.max(interval, floor, WIDGET_ACTIVE_POLL_MS);
       const step = Number(this.snapshotFailureStreak) - 2;
-      if (step < 0) return interval;
-      return Math.max(interval, WIDGET_BACKOFF_RAMP_MS[Math.min(step, WIDGET_BACKOFF_RAMP_MS.length - 1)]);
+      if (step < 0) return Math.max(interval, floor);
+      return Math.max(interval, floor, WIDGET_BACKOFF_RAMP_MS[Math.min(step, WIDGET_BACKOFF_RAMP_MS.length - 1)]);
     },
+    tickClock(nowMs = Date.now()) { tickClock(this, nowMs); },
+    // `warnings` is the list of { code, text } the save returned, or null.
+    noteMutationWarning(warnings) {
+      const list = Array.isArray(warnings) && warnings.length ? warnings : null;
+      this.mutationWarning = list;
+      if (list) this.toast("Saved, but not fully in effect", list.map((warning) => warning.text).join(" "), true);
+    },
+    shownName(value) { return visibleText(typeof value === "string" ? value : String(value === undefined || value === null ? "" : value)); },
     scheduleSnapshot() {
       window.clearTimeout(this.snapshotTimer);
       this.snapshotTimer = 0;
@@ -5540,7 +5811,7 @@ export default {
       if (!(delay > 0)) return;
       this.snapshotTimer = window.setTimeout(() => this.refreshSnapshot(false), delay);
     },
-    scheduleLogs() { window.clearTimeout(this.logTimer); this.logTimer = 0; const interval = Number(this.settings.log_refresh); if (interval > 0 && !this.disposed && !document.hidden && this.route === "activity" && !this.logsPaused) this.logTimer = window.setTimeout(() => this.refreshLogs(), interval); },
+    scheduleLogs() { window.clearTimeout(this.logTimer); this.logTimer = 0; const interval = Number(this.settings.log_refresh); if (interval > 0 && !this.disposed && !document.hidden && this.route === "activity" && !this.logsPaused) this.logTimer = window.setTimeout(() => this.refreshLogs(), logsPollDelay(this, interval)); },
     async refreshCsrf(options = undefined) { if (this.disposed) return; this.csrfToken = ""; const model = await apiGet(this.auth, "csrf", {}, options); if (this.disposed) return; if (typeof model.csrf_token !== "string" || !model.csrf_token || model.csrf_token.length > 4096) throw new Error("Authenticated bridge did not issue a valid CSRF token"); this.csrfToken = model.csrf_token; },
     async refreshSnapshot(manual, requirePostMutationRead = false) {
       if (this.disposed || document.hidden) return false;
@@ -5608,16 +5879,21 @@ export default {
             this.snapshot.generated_at_epoch = snapshot.generated_at_epoch;
           }
           this.snapshotReceivedAtMs = Date.now();
+          this.nowMs = this.snapshotReceivedAtMs;
           this.snapshotFailureCode = "";
+          this.snapshotFailureStatus = 0;
           this.snapshotFailureStreak = 0;
+          this.staleFreshnessCode = null;
           if (typeof snapshot.csrf_token === "string" && snapshot.csrf_token) this.csrfToken = snapshot.csrf_token;
           this.connected = true;
           this.bridgeIssue = { title: "", message: "" };
           this.connectionLabel = this.canMutate ? "Authenticated package bridge" : "Package status · read-only";
           this.freshness = `Updated ${new Intl.DateTimeFormat(undefined, { timeStyle: "medium" }).format(new Date())}`;
-          this.hydrateAlerts();
-          this.hydrateSecurityPolicy();
-          this.maybeNotifyFailure();
+          this.applyError = "";
+          applyStep(this, "the alert settings", () => this.hydrateAlerts());
+          applyStep(this, "the security policy", () => this.hydrateSecurityPolicy());
+          applyStep(this, "the failure notification", () => this.maybeNotifyFailure());
+          applyStep(this, "the core error output", () => { void refreshRunStderr(this); });
           succeeded = true;
           if (manual) this.toast("Status refreshed", "The latest package snapshot is displayed.");
         } catch (error) {
@@ -5625,6 +5901,8 @@ export default {
           this.csrfToken = "";
           this.connected = false;
           this.snapshotFailureCode = String((error && error.code) || "").toLowerCase();
+          this.snapshotFailureStatus = Number(error && error.status) || 0;
+          this.staleFreshnessCode = this.snapshotFailureCode;
           this.snapshotFailureStreak = Math.min(Number(this.snapshotFailureStreak) + 1, WIDGET_BACKOFF_RAMP_MS.length + 1);
           this.bridgeIssue = this.describeBridgeError(error, "status");
           this.connectionLabel = this.bridgeIssue.title;
@@ -5737,6 +6015,7 @@ export default {
             message: "The security policy was saved, but DSM did not issue a replacement mutation token. Select Retry to request one; do not repeat the save."
           };
           this.connectionLabel = this.bridgeIssue.title;
+          this.staleFreshnessCode = String((csrfError && csrfError.code) || "").toLowerCase();
           this.freshness = this.snapshot
             ? retainedDocumentFreshness(this.snapshotReceivedAtMs, csrfError && csrfError.code)
             : "Status unavailable";
@@ -6997,7 +7276,11 @@ export default {
           if (!entry || typeof entry !== "object") return;
           const source = typeof entry.source === "string" ? entry.source : "log";
           if (Array.isArray(entry.lines)) {
-            append(source, entry.lines.map((line) => typeof line === "string" ? line : "").join("\n"), true);
+            const before = records.length;
+            append(source, entry.lines.map((line) => typeof line === "string" ? decodeLogPaths(line) : "").join("\n"), true);
+            // The bridge reads only the newest bytes of a large log; say so rather
+            // than letting a short list read as the whole history.
+            if (entry.scan_limited === true && records.length > before) records[records.length - 1].scanLimited = true;
             return;
           }
           const timestamp = typeof entry.timestamp === "string" ? entry.timestamp : "";
@@ -7020,6 +7303,7 @@ export default {
     async refreshLogs() {
       if (this.disposed || this.logsLoading || this.logsPaused || document.hidden || this.route !== "activity") return;
       this.logsLoading = true;
+      const startedAt = Date.now();
       // The package log read forks the shell manager on the NAS; the event
       // tabs never show it, so asking for it on every poll while one of them
       // is open would pay that fork for a scan nothing on screen can display.
@@ -7038,30 +7322,63 @@ export default {
         if (this.disposed) return;
         // Both feeds are retained through their own failure — the settled-pair
         // guard above is what retains them — so both carry a receipt time for
-        // the same reason the snapshot does.
-        if (fetchLogs && logs.status === "fulfilled") {
-          const records = this.logRecordsFrom(logs.value);
-          this.logRecords = records;
-          this.logsReceivedAtMs = Date.now();
-          this.logOutput = records.length
-            ? records.map((record) => `[${record.source}] ${record.text}`).join("\n").slice(0, MAX_RESPONSE_BYTES)
-            : "No log data yet.";
+        // the same reason the snapshot does. A feed that answered with a document
+        // of the wrong schema, or with no list, has failed: its rows are not
+        // replaced, and it is never read as "nothing was recorded".
+        let logsOk = false;
+        let logsProblem = "";
+        if (fetchLogs) {
+          const problem = logs.status === "fulfilled"
+            ? feedDocumentProblem(logs.value, LOGS_SCHEMA, "logs", "package log")
+            : feedFailureText(logs.reason);
+          logsProblem = problem;
+          this.logsFeedError = problem;
+          if (!problem) {
+            logsOk = true;
+            const records = this.logRecordsFrom(logs.value);
+            this.logRecords = records;
+            this.logsReceivedAtMs = Date.now();
+            this.logOutput = records.length
+              ? records.map((record) => `[${record.source}] ${record.text}`).join("\n").slice(0, MAX_RESPONSE_BYTES)
+              : "No log data yet.";
+          }
         }
-        if (activity.status === "fulfilled") {
-          this.activityEvents = arrayOf(activity.value.events);
+        const activityProblem = activity.status === "fulfilled"
+          ? feedDocumentProblem(activity.value, ACTIVITY_SCHEMA, "events", "activity")
+          : feedFailureText(activity.reason);
+        this.activityFeedError = activityProblem;
+        this.logsLastDurationMs = Date.now() - startedAt;
+        this.logsFailureStreak = activityProblem || logsProblem ? Math.min(Number(this.logsFailureStreak) + 1, 6) : 0;
+        if (!activityProblem) {
+          // The cost of normalising, redacting and keying up to 1000 events is paid
+          // only when the feed changed: an identical poll keeps the same array, so
+          // no computed that reads it is invalidated.
+          const signature = feedSignature(activity.value.events);
+          if (!signature || signature !== this.activitySignature) {
+            this.activityEvents = activity.value.events;
+            this.activitySignature = signature;
+          }
           this.activityHistory = activity.value.history === undefined ? null : activity.value.history;
           this.activityReceivedAtMs = Date.now();
         }
         this.logState = logsFeedState(
           fetchLogs,
-          fetchLogs && logs.status === "fulfilled",
-          activity.status === "fulfilled",
+          logsOk,
+          !activityProblem,
           lines,
           this.logsReceivedAtMs,
           this.activityReceivedAtMs
         );
-      } catch (_error) {
-        if (!this.disposed) this.logState = logsFeedState(fetchLogs, false, false, 0, this.logsReceivedAtMs, this.activityReceivedAtMs);
+      } catch (error) {
+        // An exception while applying the answers is this window's defect, not the
+        // package's: say so, with the message, rather than "feed unavailable".
+        const message = plainText(error && error.message ? error.message : String(error), 160);
+        if (typeof console !== "undefined" && console.error) console.error(`[sdsync] refreshLogs: ${message}`, error);
+        if (!this.disposed) {
+          this.activityFeedError = `this window failed while applying the feeds: ${message}`;
+          this.logsFailureStreak = Math.min(Number(this.logsFailureStreak) + 1, 6);
+          this.logState = logsFeedState(fetchLogs, false, false, 0, this.logsReceivedAtMs, this.activityReceivedAtMs);
+        }
       } finally {
         this.logsLoading = false;
         if (!this.disposed) this.scheduleLogs();
@@ -7071,6 +7388,9 @@ export default {
     clearLogView() { this.logRecords = []; this.logOutput = "View cleared. The package log was not deleted."; },
     logSourceClearable(source) { return CLEARABLE_LOG_SOURCES.includes(source); },
     logClearTooltip(source) {
+      if (source === "run-stderr") {
+        return "The core's error output is rotated by the package after a few runs and is not clearable from the dashboard.";
+      }
       if (!this.logSourceClearable(source)) {
         return "The audit log records who cleared each package log, so it is deliberately not clearable from the dashboard.";
       }
@@ -7246,19 +7566,55 @@ export default {
     profileOutcome(name) {
       if (!this.snapshot) return { level: "unknown", text: "" };
       if (!this.outcomes) return { level: "unknown", text: "Last run: outcome not reported by this package" };
+      // A dead run that covered this profile outranks the record it left behind.
+      if (staleRunCovers(this.outcomes, name)) {
+        return { level: "fail", text: ["Last run: Run died", reasonCopy("runner_died").text, this.retainedStale ? "stale reading" : ""].filter(Boolean).join(" · ") };
+      }
       const entry = this.outcomes.profiles.find((item) => item.profile === String(name));
       if (!entry) return { level: "unknown", text: "Last run: not reported" };
-      const row = profileOutcomeRow(entry, Date.now() / 1000);
+      const row = profileOutcomeRow(entry, this.packageNowSeconds);
       const stale = this.retainedStale;
-      return { level: stale && row.level !== "fail" ? "unknown" : row.level, text: ["Last run: " + row.label, row.detail, row.age, stale ? "stale reading" : ""].filter(Boolean).join(" · ") };
+      // A retained reading is dimmed (unknown); a token this window cannot read is a
+      // warning, never the neutral colour of "nobody has looked".
+      const shownLevel = stale ? (row.level !== "fail" ? "unknown" : row.level) : (row.level === "unknown" ? "warn" : row.level);
+      return { level: shownLevel, text: ["Last run: " + row.label, row.detail, row.age, stale ? "stale reading" : ""].filter(Boolean).join(" · ") };
     },
     // The tree comparison is not a run verdict; say so beside it whenever the
     // last run did not finish cleanly.
     rollupTrustNote(name) {
       const entry = this.outcomes && this.outcomes.profiles.find((item) => item.profile === String(name));
-      return entry ? profileOutcomeRow(entry, Date.now() / 1000).note : "";
+      return entry ? profileOutcomeRow(entry, this.packageNowSeconds).note : "";
     },
-    maybeNotifyFailure() { this.announceOutcomeFailure(); if (this.outcomes && this.outcomes.run.outcome === "partial") return; if (this.runStatus !== "failed") return; const key = [this.run.profile || this.run.scope || "unknown", this.run.finished_epoch || this.run.started_epoch || "unknown", this.run.exit_code || "unknown"].join(":"); if (!this.lastFailureKey) { this.lastFailureKey = key; return; } if (key === this.lastFailureKey) return; this.lastFailureKey = key; if (this.settings.desktop_notifications && window.Notification && Notification.permission === "granted") new Notification("Synology Drive Sync failed", { body: "A newly observed package run failed. Open DSM for details.", icon: "/webman/3rdparty/synology-drive-sync/images/icon_64.png", tag: "sdsync-run-failure" }); if (this.settings.audible) this.playCue(); },
+    // The desktop notification and audible cue the operator opted into. The key
+    // comes from the package's outcome verdict when there is one, so a dead
+    // runner, an unknown outcome and a failed profile of an all-profiles run count
+    // as failures, not only the legacy run.state "failed". The first snapshot of a
+    // window is a baseline: a failure already on screen is announced by the toast
+    // alone, and each later distinct failure notifies once, however often it is
+    // polled.
+    maybeNotifyFailure() {
+      this.announceOutcomeFailure();
+      const outcomes = this.outcomes;
+      let key = "";
+      if (outcomes) {
+        if (outcomes.run.outcome !== "partial") key = outcomeFailureKey(outcomes);
+      } else if (this.runStatus === "failed" && ![130, 143].includes(Number(this.run.exit_code))) {
+        key = [this.run.profile || this.run.scope || "unknown", this.run.finished_epoch || this.run.started_epoch || "unknown", this.run.exit_code || "unknown"].join(":");
+      }
+      const baselineSeen = this.failureBaselineSeen === true;
+      this.failureBaselineSeen = true;
+      if (!key || key === this.lastFailureKey) return;
+      this.lastFailureKey = key;
+      if (!baselineSeen) return;
+      if (this.settings.desktop_notifications && window.Notification && Notification.permission === "granted") {
+        try {
+          new Notification("Synology Drive Sync failed", { body: "A newly observed package run failed. Open DSM for details.", icon: "/webman/3rdparty/synology-drive-sync/images/icon_64.png", tag: "sdsync-run-failure" });
+        } catch (error) {
+          this.toast("Desktop notification failed", `The browser refused the failure notification: ${plainText(error && error.message ? error.message : String(error), 160)}`, true);
+        }
+      }
+      if (this.settings.audible) this.playCue();
+    },
     // Derived from snapshot state, so a failure that happened while no window
     // was open is still announced once per failure per window. Nothing a read
     // returns is persisted in the browser, so a new window announces again.

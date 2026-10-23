@@ -7,6 +7,7 @@ import {
   WIDGET_BACKOFF_RAMP_MS,
   WIDGET_IDLE_POLL_MS
 } from "../src/widgetModel.mjs";
+import { APP_MODULE_STUBS } from "./helpers/app-stubs.mjs";
 
 const appSource = await readFile(new URL("../src/App.vue", import.meta.url), "utf8");
 const apiSource = await readFile(new URL("../src/api.js", import.meta.url), "utf8");
@@ -26,6 +27,7 @@ function loadAppComponent(postSpy = async () => ({ ok: true })) {
     .replace("export default {", "const AppComponent = {");
   executable += "\nreturn AppComponent;";
   const stubs = {
+    ...APP_MODULE_STUBS,
     // The real cadence literals, not stand-ins: App.vue's retry ladder and
     // stale-age escalation are only meaningful against the ramp the widget
     // actually ships and validate_spk.py actually pins.

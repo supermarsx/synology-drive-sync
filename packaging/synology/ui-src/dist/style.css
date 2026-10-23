@@ -4431,6 +4431,9 @@ color: var(--sdsync-amber);
 .sdsync-widget.is-fail .sdsync-widget-dot {
 color: var(--sdsync-red);
 }
+.sdsync-widget.is-unknown .sdsync-widget-dot {
+color: var(--sdsync-amber);
+}
 .sdsync-widget-headline-text {
 display: flex;
 min-width: 0;
@@ -4499,6 +4502,9 @@ color: var(--sdsync-amber);
 .sdsync-widget-profile.is-fail .sdsync-widget-profile-outcome {
 color: var(--sdsync-red);
 }
+.sdsync-widget-profile.is-unknown:not(.is-stale) .sdsync-widget-profile-outcome {
+color: var(--sdsync-amber);
+}
 .sdsync-widget-profile-age {
 color: var(--sdsync-muted);
 font-family: "Cascadia Mono", Consolas, monospace;
@@ -4544,6 +4550,39 @@ border-left-color: var(--sdsync-red);
 }
 .sdsync-attention li.is-warn {
 border-left-color: var(--sdsync-amber);
+}
+.sdsync-attention li.is-unknown {
+border-left-color: var(--sdsync-amber);
+}
+.sdsync-ui-error {
+border-left-color: var(--sdsync-red);
+color: var(--sdsync-text);
+}
+.sdsync-ui-error-reload {
+padding: 3px 10px;
+border: 1px solid var(--sdsync-red);
+border-radius: 2px;
+color: var(--sdsync-text);
+background: transparent;
+cursor: pointer;
+}
+.sdsync-run-stderr {
+margin: 0 0 12px;
+padding: 7px 10px;
+border: 1px solid var(--sdsync-border);
+border-left: 3px solid var(--sdsync-red);
+font-size: 12px;
+}
+.sdsync-run-stderr summary {
+cursor: pointer;
+}
+.sdsync-run-stderr pre {
+max-height: 220px;
+margin: 8px 0 0;
+overflow: auto;
+white-space: pre-wrap;
+word-break: break-word;
+font-family: "Cascadia Mono", Consolas, monospace;
 }
 .sdsync-profile-outcome {
 display: block;

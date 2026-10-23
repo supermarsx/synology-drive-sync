@@ -40,6 +40,9 @@ async function loadDoctorHelpers() {
     function troubleshootingField(value, fallback) {
       return sanitizedTroubleshootingText(String(value || fallback || ""), 128).replace(/\\s+/g, " ").trim() || fallback;
     }
+    function visibleText(value) {
+      return typeof value === "string" ? value.trim() : "";
+    }
     function numberOr(value, fallback = 0) {
       const number = Number(value);
       return Number.isFinite(number) ? number : fallback;

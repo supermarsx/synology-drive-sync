@@ -1,10 +1,10 @@
 import assert from "node:assert/strict";
-import { existsSync } from "node:fs";
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 import { spawnSync } from "node:child_process";
+import { findBrowser } from "./helpers/browser.mjs";
 import test from "node:test";
 
 const css = await readFile(new URL("../src/styles/native.css", import.meta.url), "utf8");
@@ -15,43 +15,6 @@ const physicalControlFixture = await readFile(
 );
 const baselineCss = css.slice(0, css.indexOf("@container (max-width: 520px)"));
 const inlineControlLayout = controlLayout.replace(/^export\s+/gm, "");
-
-function chromeCandidates() {
-  const configured = [process.env.CHROME_BIN, process.env.GOOGLE_CHROME_BIN].filter(Boolean);
-  if (process.platform === "win32") {
-    return configured.concat([
-      "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe",
-      "C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe",
-      "C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe",
-      "C:\\Program Files\\Microsoft\\Edge\\Application\\msedge.exe"
-    ]);
-  }
-  if (process.platform === "darwin") {
-    return configured.concat([
-      "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
-      "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge",
-      "google-chrome",
-      "chromium"
-    ]);
-  }
-  return configured.concat(["google-chrome-stable", "google-chrome", "chromium", "chromium-browser"]);
-}
-
-function findChrome() {
-  for (const candidate of chromeCandidates()) {
-    if (candidate.includes("/") || candidate.includes("\\")) {
-      if (existsSync(candidate)) return candidate;
-      continue;
-    }
-    const probe = spawnSync(candidate, ["--version"], {
-      encoding: "utf8",
-      timeout: 5000,
-      windowsHide: true
-    });
-    if (!probe.error && probe.status === 0) return candidate;
-  }
-  return null;
-}
 
 function overlapsVertically(a, b) {
   return Math.min(a.bottom, b.bottom) - Math.max(a.top, b.top) > 4;
@@ -185,7 +148,7 @@ function browserProbePolicy({ chromeAvailable, ci, platform, arch, gate = "" }) 
   return { mandatory: true, skipReason: "" };
 }
 
-const chrome = findChrome();
+const chrome = findBrowser();
 const runningInCi = /^(?:1|true)$/i.test(process.env.CI || "");
 const browserPolicy = browserProbePolicy({
   chromeAvailable: Boolean(chrome),

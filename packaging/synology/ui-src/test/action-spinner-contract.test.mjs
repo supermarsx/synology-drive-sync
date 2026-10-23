@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
-import { existsSync } from "node:fs";
 import { spawnSync } from "node:child_process";
+import { findBrowser } from "./helpers/browser.mjs";
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -210,23 +210,6 @@ test("source and built CSS keep busy icons rotating without layout shift", async
   assertSpinnerCss(dist, "built CSS");
 });
 
-function browserCandidate() {
-  const configured = [process.env.CHROME_BIN, process.env.GOOGLE_CHROME_BIN].filter(Boolean);
-  const candidates = process.platform === "win32"
-    ? configured.concat([
-      "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe",
-      "C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe",
-      "C:\\Program Files\\Microsoft\\Edge\\Application\\msedge.exe"
-    ])
-    : configured.concat(["google-chrome-stable", "google-chrome", "chromium", "chromium-browser"]);
-  for (const candidate of candidates) {
-    if ((candidate.includes("/") || candidate.includes("\\")) && !existsSync(candidate)) continue;
-    const probe = spawnSync(candidate, ["--version"], { encoding: "utf8", timeout: 5000, windowsHide: true });
-    if (!probe.error && probe.status === 0) return candidate;
-  }
-  return null;
-}
-
 function terminateOwnedBrowserProcesses(profileDirectory) {
   if (!profileDirectory) return;
   if (process.platform === "win32") {
@@ -335,7 +318,7 @@ function browserProbePolicy({ chromeAvailable, ci, platform, arch, gate = "" }) 
 const browserGate = process.env.SDSYNC_UI_BROWSER_GATE || "";
 const runningInCi = /^(?:1|true)$/i.test(process.env.CI || "");
 const reviewedMatrixSkip = browserGate === "skip-synology-architecture-matrix" && runningInCi;
-const chrome = reviewedMatrixSkip ? null : browserCandidate();
+const chrome = reviewedMatrixSkip ? null : findBrowser();
 const browserPolicy = browserProbePolicy({
   chromeAvailable: Boolean(chrome),
   ci: runningInCi,

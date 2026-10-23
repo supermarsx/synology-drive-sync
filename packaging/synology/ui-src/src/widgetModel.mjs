@@ -2,7 +2,7 @@
  * Pure snapshot-to-view-model derivation and poll cadence policy for the DSM
  * desktop widget.
  *
- * This module imports only ./outcomes.mjs, itself a pure module. DSM instantiates the widget on the
+ * This module imports only the pure modules ./outcomes.mjs, ./errorCopy.mjs and ./textSafety.mjs. DSM instantiates the widget on the
  * desktop document, outside the AppWindow and outside any Vue tree, so the
  * decisions that matter most here -- how often a background card on a NAS
  * desktop is allowed to talk to the package, and what a 318x84 pixel card is
@@ -42,12 +42,19 @@ export const WIDGET_MAX_POLL_MS = WIDGET_BACKOFF_RAMP_MS[WIDGET_BACKOFF_RAMP_MS.
 export const WIDGET_CLOCK_TICK_MS = 30000;
 
 import {
-  OUTCOMES_MISSING_ITEM,
   attentionItems,
   normalizeOutcomes,
-  outcomeLabel,
-  profileOutcomeRow
+  outcomesUnavailableItem,
+  profileOutcomeRow,
+  reasonCopy,
+  routineDeferCopy,
+  runIsActive,
+  runIsStale,
+  spanLabel,
+  staleRunCovers
 } from "./outcomes.mjs";
+import { errorCause } from "./errorCopy.mjs";
+import { visibleText } from "./textSafety.mjs";
 
 export const WIDGET_LEVELS = Object.freeze({
   ok: "ok",
@@ -134,19 +141,30 @@ export function widgetRun(snapshot) {
   // Same two-name read the AppWindow uses, so both surfaces survive a snapshot
   // that carries the older `last_run` spelling.
   const run = current.state === undefined ? objectOf(model.last_run) : current;
-  const state = textOf(run.state);
+  // The package's own verdict outranks the legacy state: a runner that died
+  // leaves run.state at "running" until the controller rewrites it, and a
+  // stopped controller never does. When the snapshot carries a readable outcomes
+  // block, "running" and "stale" come from that block alone.
+  const outcomes = normalizeOutcomes(model.outcomes);
+  const stale = runIsStale(outcomes);
+  const state = stale ? "stale" : textOf(run.state);
   const scope = textOf(run.scope);
   const operation = textOf(run.operation);
   const named = scope && scope !== "none" && scope !== "all" ? scope : "";
   const noun = operation === "plan" ? "Plan" : "Sync";
+  const active = runIsActive(outcomes, textOf(run.state));
+  const runningFor = active && outcomes && outcomes.run.runningFor !== null ? outcomes.run.runningFor : null;
   return {
-    active: state === "running",
+    active,
+    stale,
+    runningFor,
+    longRunning: active && Boolean(outcomes && outcomes.run.longRunning),
     state,
     scope,
     operation,
     profile: named,
-    label: state === "running"
-      ? `${noun} running${named ? ` · ${named}` : (scope === "all" ? " · all profiles" : "")}`
+    label: active
+      ? `${noun} running${named ? ` · ${named}` : (scope === "all" ? " · all profiles" : "")}${runningFor !== null && runningFor >= 5400 ? ` · ${spanLabel(runningFor)}` : ""}`
       : "",
     startedEpoch: numberOf(run.started_epoch),
     finishedEpoch: numberOf(run.finished_epoch)
@@ -173,7 +191,9 @@ function widgetProfileRow(profile, routines, run, nowMs, outcomes = null, stale 
   const routineModel = objectOf(routine);
   const routineState = textOf(routineModel.state);
   const runningRun = run.active && (run.scope === "all" || run.profile === name);
-  const running = runningRun || routineState === "running";
+  // A dead run covering this profile also ends a routine's own "running".
+  const deadRun = staleRunCovers(outcomes, name);
+  const running = runningRun || (routineState === "running" && !deadRun);
 
   const healthState = textOf(health.state);
   let level = WIDGET_LEVELS.unknown;
@@ -181,6 +201,8 @@ function widgetProfileRow(profile, routines, run, nowMs, outcomes = null, stale 
   let source = "none";
   let epoch = 0;
   let epochPrefix = "";
+  let deferNote = "";
+  let waiting = false;
 
   if (routine) {
     source = "routine";
@@ -193,8 +215,31 @@ function widgetProfileRow(profile, routines, run, nowMs, outcomes = null, stale 
       level = WIDGET_LEVELS.ok;
       outcome = "Succeeded";
     } else if (routineState === "deferred") {
-      level = WIDGET_LEVELS.warn;
-      outcome = "Deferred";
+      // The AppWindow hides a routine waiting for its window or for a busy lock;
+      // an amber card for every daily-window routine outside its window would
+      // train operators to ignore it. Any other reason is a real deferral.
+      const deferral = outcomes ? outcomes.routines.find((item) => item.profile === name) : null;
+      const deferReason = deferral ? deferral.deferReason : "";
+      if (deferReason === "window") {
+        // Healthy: it ran, and its next run is the window.
+        level = epoch > 0 ? WIDGET_LEVELS.ok : WIDGET_LEVELS.idle;
+        outcome = "Waiting for window";
+        waiting = true;
+        deferNote = reasonCopy(deferReason).text;
+      } else if (deferReason === "busy") {
+        // Not green: a run holds the package, and a run that never ends would keep
+        // every routine here for ever. Past the long-running bound it is a warning.
+        const stuck = Boolean(outcomes && (outcomes.run.longRunning || outcomes.run.stalled) && outcomes.run.outcome === "running");
+        level = stuck ? WIDGET_LEVELS.warn : WIDGET_LEVELS.idle;
+        outcome = stuck ? "Waiting (run may be stuck)" : "Waiting (busy)";
+        waiting = !stuck;
+        deferNote = stuck ? (outcomes.run.stalled ? "run may be stuck, no progress for over 30 minutes" : "a run has been going for " + spanLabel(outcomes.run.runningFor) + "; check whether it is stuck") : reasonCopy(deferReason).text;
+      } else {
+        const copy = deferReason ? routineDeferCopy(deferReason) : null;
+        level = copy && copy.blocked ? WIDGET_LEVELS.fail : WIDGET_LEVELS.warn;
+        outcome = copy && copy.blocked ? "Blocked" : "Deferred";
+        deferNote = copy ? copy.text : "";
+      }
     } else if (routineState === "scheduled") {
       level = WIDGET_LEVELS.idle;
       outcome = "Scheduled";
@@ -221,6 +266,7 @@ function widgetProfileRow(profile, routines, run, nowMs, outcomes = null, stale 
   let detail = epoch > 0 ? `${epochPrefix} ${relativeEpochLabel(epoch, nowMs)}` : (
     source === "routine" ? "no successful run yet" : "never checked"
   );
+  if (deferNote) detail = `${deferNote} (${detail})`;
 
   // The package's own record of the last run of this profile outranks the
   // routine and Doctor evidence whenever it is bad, and replaces the Doctor
@@ -240,7 +286,13 @@ function widgetProfileRow(profile, routines, run, nowMs, outcomes = null, stale 
     }
   }
 
-  if (running) {
+  if (deadRun) {
+    // The bridge marks every profile a dead run covered as untrustworthy; this
+    // row says so rather than keeping the routine's last green word.
+    level = WIDGET_LEVELS.fail;
+    outcome = "Run died";
+    detail = reasonCopy("runner_died").text;
+  } else if (running) {
     level = WIDGET_LEVELS.warn;
     outcome = "Running";
   }
@@ -254,6 +306,8 @@ function widgetProfileRow(profile, routines, run, nowMs, outcomes = null, stale 
 
   return {
     name,
+    displayName: visibleText(name),
+    waiting,
     level,
     outcome,
     running,
@@ -305,7 +359,7 @@ function deriveOverview(snapshot, nowMs, options) {
   const stale = objectOf(options).stale === true;
   const rows = deriveProfileRows(snapshot, nowMs, options);
   const outcomes = normalizeOutcomes(snapshot.outcomes);
-  const items = outcomes ? attentionItems(outcomes, numberOf(nowMs) / 1000) : [OUTCOMES_MISSING_ITEM];
+  const items = outcomes ? attentionItems(outcomes, numberOf(nowMs) / 1000) : [outcomesUnavailableItem(snapshot.outcomes)];
   const shared = (level) => items.find((item) => item.level === level && !item.id.startsWith("profile-"));
   const view = (item) => ({ level: item.level, title: item.title, detail: item.detail });
   const staleNote = stale ? "Stale: the package has stopped answering. " : "";
@@ -318,7 +372,7 @@ function deriveOverview(snapshot, nowMs, options) {
     return {
       level: WIDGET_LEVELS.fail,
       title: `${plural(failing.length, "profile", "profiles")} failing`,
-      detail: failing.map((row) => row.name).join(", ")
+      detail: failing.map((row) => row.displayName).join(", ")
     };
   }
   if (!rows.length) {
@@ -340,7 +394,7 @@ function deriveOverview(snapshot, nowMs, options) {
     return {
       level: WIDGET_LEVELS.warn,
       title: `${plural(needing.length, "profile", "profiles")} need attention`,
-      detail: staleNote + needing.map((row) => `${row.name}: ${row.outcome}`).join(", ")
+      detail: staleNote + needing.map((row) => `${row.displayName}: ${row.outcome}`).join(", ")
     };
   }
   const caution = shared("unknown") || shared("warn");
@@ -354,7 +408,14 @@ function deriveOverview(snapshot, nowMs, options) {
       detail: "The package has stopped answering; these rows are the last reading, not current status."
     };
   }
-  const pending = rows.filter((row) => row.level === WIDGET_LEVELS.idle);
+  if (rows.every((row) => row.waiting)) {
+    return {
+      level: WIDGET_LEVELS.idle,
+      title: "Every routine is waiting",
+      detail: "Each is waiting for its daily window or for the current run to finish."
+    };
+  }
+  const pending = rows.filter((row) => row.level === WIDGET_LEVELS.idle && !row.waiting);
   if (pending.length === rows.length) {
     return {
       level: WIDGET_LEVELS.idle,
@@ -366,7 +427,7 @@ function deriveOverview(snapshot, nowMs, options) {
     return {
       level: WIDGET_LEVELS.warn,
       title: `${plural(pending.length, "profile", "profiles")} not yet run`,
-      detail: pending.map((row) => row.name).join(", ")
+      detail: pending.map((row) => row.displayName).join(", ")
     };
   }
   return {
@@ -462,7 +523,14 @@ export function widgetBridgeIssue(error) {
   const status = Number(error && error.status) || 0;
   const code = textOf(error && error.code).toLowerCase();
   const message = textOf(error && error.message).toLowerCase();
+  // The card's titles are fixed copy; the cause rides beside the guidance so a
+  // 500, a response guard and a stopped package no longer read alike.
+  // A bare status adds nothing to the title and does not fit a 318-pixel line; a
+  // bridge code or message does, bounded to what fits.
+  const found = errorCause(error);
+  const cause = found.code || found.message ? found.text.slice(0, 70) : "";
   const issue = (level, title, detail) => ({ level, title, detail });
+  const withCause = (level, title, detail) => issue(level, title, cause ? `${detail} (${cause})` : detail);
 
   if (status === 401) {
     return issue(WIDGET_LEVELS.warn, "DSM session expired", "Sign in to DSM again.");
@@ -483,7 +551,7 @@ export function widgetBridgeIssue(error) {
   // would otherwise claim them and tell the operator to sign in again while the
   // real answer is that the package is not running.
   if (status === 503 || code.includes("unavailable")) {
-    return issue(WIDGET_LEVELS.warn, "Package service unavailable", "Start the package in Package Center.");
+    return withCause(WIDGET_LEVELS.warn, "Package service unavailable", "Start the package in Package Center.");
   }
   if (status === 404 || code === "non_json_response" || code === "malformed_json") {
     return issue(WIDGET_LEVELS.fail, "Package UI route unavailable", "Repair or reinstall the package release.");
@@ -500,7 +568,7 @@ export function widgetBridgeIssue(error) {
   // Anything left is a transport that did not complete: an unreachable NAS, a
   // dropped connection, a proxy in the way. The card says it does not know,
   // rather than blaming a component it has no evidence against.
-  return issue(WIDGET_LEVELS.unknown, "Package bridge unavailable", "Confirm the package is running.");
+  return withCause(WIDGET_LEVELS.unknown, "Package bridge unavailable", "Confirm the package is running.");
 }
 
 /**

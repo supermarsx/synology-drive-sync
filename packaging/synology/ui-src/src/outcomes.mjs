@@ -5,9 +5,12 @@
  * `sdsync.dsm-outcomes.v1`) to every snapshot. Nothing may fail silently, so
  * this module turns that block into copy that names the cause and the next
  * step, and every value it does not recognise is shown as `unknown (<token>)`
- * instead of being hidden or thrown on. Imports nothing, so the widget, the
- * AppWindow and the tests all read the same rules.
+ * instead of being hidden or thrown on. Imports only the dependency-free
+ * textSafety.mjs, so the widget, the AppWindow and the tests all read the same
+ * rules.
  */
+
+import { decodePercentPath, plainText, visibleText } from "./textSafety.mjs";
 
 const OUTCOME_LABELS = Object.freeze({
   succeeded: "Succeeded", partial: "Partial", failed: "Failed", not_run: "Not run",
@@ -26,6 +29,42 @@ const REASONS = Object.freeze({
   preflight_policy: ["the security policy refused the profile", "Review Security: plain HTTP, unverified TLS or destructive options are refused."],
   preflight_unsafe_state: ["a package file failed its ownership or mode check", "Repair or reinstall the package."],
   no_password: ["no password is stored", "Enter the password on the Profiles page."],
+  // Every token below is written by sdsync-run, sdsync-controller or the bridge
+  // (test/reason-vocabulary.test.mjs reads those writers and fails on a token
+  // with no row here).
+  core_failed: ["the sync core exited with an error", "Review Logs for the cause, then run again."],
+  profiles_skipped: ["some profiles were not run because they failed their pre-run checks", "Fix the profiles listed above, then run again."],
+  runner_error: ["the package runner stopped before the core started, without naming a cause", "Review Logs, then run again."],
+  audit_unavailable: ["the mandatory audit record could not be written", "Check free space on the volume, then repair or reinstall the package."],
+  binary_missing: ["the installed sync program is missing or not executable", "Repair or reinstall the package."],
+  config_missing: ["no readable package configuration was found", "Create a profile on the Profiles page, or repair the package."],
+  policy_unreadable: ["the security policy file is not a readable private document", "Repair or reinstall the package."],
+  policy_operational: ["the security policy blocks Doctor, plan and run actions", "Allow operational actions on the Security page."],
+  admission_failed: ["the package could not confirm it was safe to start a run", "Review Logs and run again; repair the package if it repeats."],
+  no_profiles: ["no profiles are configured", "Create a profile on the Profiles page."],
+  state_unwritable: ["a package state file could not be written", "Check free space and file ownership, or repair the package."],
+  identity_failed: ["the runner could not record its own identity before the core started", "Review Logs and run again; repair the package if it repeats."],
+  profile_unreadable: ["the profile file could not be read", "Save the profile again on the Profiles page, or repair the package."],
+  profile_invalid: ["the profile did not validate", "Open Profiles and correct the highlighted setting."],
+  policy_destructive: ["the security policy forbids destructive sync (deleting on the target)", "Allow destructive sync on the Security page, or turn deletions off in the profile."],
+  policy_http: ["the security policy forbids plain HTTP targets", "Use HTTPS, or allow HTTP targets on the Security page."],
+  policy_invalid_tls: ["the security policy forbids skipping TLS certificate verification", "Install a valid certificate, or allow it on the Security page."],
+  policy_remote_logging: ["the security policy forbids remote logging", "Turn remote logging off in the profile, or allow it on the Security page."],
+  policy_empty_source: ["the security policy forbids syncing an empty source", "Check the source folder is mounted, or allow empty sources on the Security page."],
+  password_missing: ["no password is stored for the profile", "Enter the password on the Profiles page."],
+  secret_unsafe: ["a stored secret file failed its ownership or mode check", "Enter the password again on the Profiles page, or repair the package."],
+  log_file_unsafe: ["the profile's log file path failed its ownership or mode check", "Repair the package, or reset the profile's log file setting."],
+  log_path_mismatch: ["package paths mismatch (the profile log file is not the package-managed path)", "Repair the package, or reset the profile's log file setting."],
+  busy: ["another run, Doctor or management action holds the package, or the package is stopping or upgrading", "Nothing to do; the run is retried."],
+  interrupted: ["the routine was interrupted before it finished", "It is retried automatically."],
+  admission_refused: ["the package refused to start the run (lifecycle change or lock)", "It is retried automatically."],
+  dependency: ["a routine this one depends on has not succeeded", "Fix the dependency routine first."],
+  source: ["the routine's source folder is missing or unreadable", "Check the source folder is mounted and readable."],
+  window: ["the routine is outside its daily window", "It runs when the window opens."],
+  pid_unreadable: ["controller.pid exists but holds no process ID", "Restart the package service."],
+  identity_refused: ["the process the PID file names is not the verified controller", "Restart the package service."],
+  identity_changed: ["the controller's identity changed while the package was telling it to reload", "Restart the package service."],
+  signal_failed: ["the package could not signal the running controller", "Restart the package service."],
   lock_busy: ["another run, Doctor or management action held the run lock", "Nothing to do; the run is retried."],
   runner_died: ["the runner died before it finished (killed, out of memory or power loss)", "Review Logs, then run again."],
   core_partial: ["the run changed the destination and then failed part-way", "Review Logs, then run again; nothing is rolled back."],
@@ -79,6 +118,16 @@ const REASONS = Object.freeze({
   "remote-unreadable": ["the NAS does not let this account read this file, so it is never compared or deleted", "Grant the sync account read permission on it."],
   deferred_paths: ["some paths were deferred", "They sync on the next run; review the entry.deferred records in the sync log."],
   "listing-incomplete": ["the destination listed fewer or more entries than expected, so deletions in those folders are withheld", "Run again; review Logs if it repeats."],
+  "remote-refused": ["not synced until you fix this: the NAS refuses this name, or this account's access to it", "Rename it, or fix the sync account's permissions on it in File Station. It is named on every run until then."],
+  "delete-not-permitted": ["not synced until you fix this: the NAS does not let this account delete it, so it is kept", "Grant the sync account delete permission on it in File Station, or remove it there."],
+  "local-permission-denied": ["not synced until you fix this: the sync account may not read it", "Grant the sync account read permission on it. It is named on every run until then."],
+  "case-rename-pending": ["not synced until you fix this: a case-only rename on the NAS cannot finish (the old spelling is still there, or the renamed folder holds @eaDir or excluded items)", "Rename the folder or remove the old spelling in File Station."],
+  "remote-skipped": ["not synced until you fix this: a NAS name or link this tool will not follow was left alone", "It is never deleted or overwritten and is named on every run; rename or remove it in File Station."],
+  "unsupported-entry": ["not synced until you fix this: a name, path or file type Synology Drive cannot hold", "Rename it, or exclude it. It is named on every run until then."],
+  "type-conflict": ["not synced until you fix this: a file replaced a folder, the reverse, or a local folder sits where the NAS has a mount point", "Run with deletion enabled, or remove the excluded or DSM-managed items inside the NAS folder."],
+  "remote-link": ["not synced until you fix this: a local folder sits where the NAS has a link to somewhere else, and nothing is synced there", "Replace the link with a folder on the NAS."],
+  "remote-real-path-unusable": ["DSM reported real paths in an unexpected shape, so almost every folder looked like a link; nothing was synced", "Update the package; if it repeats, report it with the DSM version."],
+  "protected-descendant": ["not synced until you fix this: a folder deleted locally is kept on the NAS because it still holds an excluded or DSM-managed item", "Remove that item in File Station."],
   deferred: ["a path was deferred", "It syncs on the next run; the entry.deferred record names the cause."],
   "server-copy-failed": ["server-side copy failed", "Files re-upload on the next run."],
   "delete-failed": ["a deletion failed", "It is retried on the next run."],
@@ -109,6 +158,26 @@ export function outcomeLabel(value) {
 export function outcomeLevel(value) {
   const key = token(value);
   return Object.prototype.hasOwnProperty.call(OUTCOME_LEVELS, key) ? OUTCOME_LEVELS[key] : "unknown";
+}
+
+/**
+ * What a routine's `defer_reason` means. Most are the same facts the run-level
+ * reasons name, but `delete_bound` differs: for the core it says a run's
+ * deletions were bounded and the rest follows next run; for a routine it says the
+ * routine's own deletion limit is weaker than its profile's max-delete, so the
+ * controller refuses every run before it starts and the routine can never run
+ * until someone changes a limit. { text, level, blocked }.
+ */
+export function routineDeferCopy(reason) {
+  const code = token(reason);
+  if (code === "delete_bound") {
+    return {
+      text: "this routine can never run: its deletion limit is lower than the profile's max-delete, so every run is refused before it starts. Raise the routine's deletion limit, or lower the profile's max-delete, on the Routines page.",
+      level: "fail",
+      blocked: true
+    };
+  }
+  return { text: has(REASONS, code) ? reasonCopy(code).text : `reason ${unknownLabel(code)}`, level: "warn", blocked: false };
 }
 
 /** { text, known } for a reason code; text names the cause and the next step. */
@@ -159,6 +228,8 @@ export function warningText(warning, r = {}) {
   if (warning === "reauthentication_failures") return `${rec.reauthenticationFailures > 0 ? n(rec.reauthenticationFailures, "re-login failure", "re-login failures") : "Re-login failures"} during the run; check the account and password on the target DSM`;
   if (warning === "server_tasks_not_stopped") return `${rec.serverTasksNotStopped > 0 ? n(rec.serverTasksNotStopped, "server-side task", "server-side tasks") : "Server-side tasks"} could not be stopped on the target; check its Task Manager`;
   if (warning === "keepalive_failures") return `Recovered from ${rec.keepaliveFailures > 0 ? n(rec.keepaliveFailures, "keep-alive failure", "keep-alive failures") : "keep-alive failures"}; check the network if it repeats`;
+  if (warning === "stalled") return "Run may be stuck: no progress for over 30 minutes";
+  if (warning === "long_running") return `Running for ${r.runningFor !== null && r.runningFor !== undefined ? spanLabel(r.runningFor) : "a long time"}; check whether it is stuck`;
   return `unknown warning (${shown(warning)})`;
 }
 
@@ -177,6 +248,22 @@ export function resultDisplay(record) {
     : { label: outcomeLabel(r.outcome), level: outcomeLevel(r.outcome), warned: false };
 }
 
+/** "7 h", "40 min": a span, as opposed to ageLabel's "7 h ago". */
+export function spanLabel(seconds) {
+  const n = Number(seconds);
+  if (!Number.isFinite(n) || n < 0) return "";
+  if (n < 90) return "under a minute";
+  if (n < 5400) return `${Math.round(n / 60)} min`;
+  if (n < 172800) return `${Math.round(n / 3600)} h`;
+  return `${Math.floor(n / 86400)} d`;
+}
+
+const HEARTBEAT_SOURCE_COPY = Object.freeze({
+  io: "The last sign of life was the core reading or writing data.",
+  progress: "The last sign of life was a change in the core's progress record.",
+  liveness: "This runner can only tell that the core is alive, not that it is making progress, so a hang cannot be ruled out from here."
+});
+
 function ageLabel(epoch, nowSeconds) {
   const e = Number(epoch);
   if (!Number.isFinite(e) || e <= 0) return "";
@@ -187,13 +274,50 @@ function ageLabel(epoch, nowSeconds) {
   return `${Math.floor(s / 86400)} d ago`;
 }
 
+export const OUTCOMES_SCHEMA = "sdsync.dsm-outcomes.v1";
+
+/**
+ * "" when the block has the shape this UI reads, otherwise the reason it does
+ * not. A block that is present but hollow (`{}`), of another schema, or with a
+ * wrong-typed run outcome used to read as "All profiles healthy": every missing
+ * member defaulted to "not run" or "ok". Absence of evidence is never green, so
+ * anything short of the reviewed shape is "status unavailable" with its reason.
+ */
+export function outcomesProblem(raw) {
+  if (raw === undefined || raw === null) return "this package did not report run outcomes, so failures cannot be ruled out";
+  if (typeof raw !== "object" || Array.isArray(raw)) return "the run outcomes were not a document";
+  if (raw.schema !== OUTCOMES_SCHEMA) {
+    return `the run outcomes have schema ${typeof raw.schema === "string" && SAFE_TOKEN.test(raw.schema) ? raw.schema : "none"}, expected ${OUTCOMES_SCHEMA}`;
+  }
+  const run = raw.run;
+  if (!run || typeof run !== "object" || Array.isArray(run)) return "the run outcomes have no run record";
+  if (typeof run.outcome !== "string" || !run.outcome) return "the last run's outcome is missing or not text";
+  if (!raw.alerts || typeof raw.alerts !== "object" || Array.isArray(raw.alerts)) return "the run outcomes have no alert state";
+  if (!Array.isArray(raw.profiles)) return "the per-profile outcomes are not a list";
+  if (raw.routines !== undefined && !Array.isArray(raw.routines)) return "the routine outcomes are not a list";
+  if (raw.errors !== undefined && !Array.isArray(raw.errors)) return "the record-error list is not a list";
+  if (raw.status_cache_health !== undefined && (!raw.status_cache_health || typeof raw.status_cache_health !== "object" || Array.isArray(raw.status_cache_health))) {
+    return "the status-figure health is not a document";
+  }
+  return "";
+}
+
+/** The attention item for a snapshot whose outcomes block is absent or unreadable. */
+export function outcomesUnavailableItem(raw) {
+  const problem = outcomesProblem(raw);
+  return {
+    id: "outcomes-missing", level: "unknown", title: "Run outcomes unavailable",
+    detail: `Status unavailable: ${problem || "the run outcomes could not be read"}. Update the package, or repair it so one complete release is installed.`
+  };
+}
+
 /**
  * Validate and flatten the block. Returns null when the snapshot carries none
- * (an older package), which callers must show as "outcomes unavailable" rather
- * than as success.
+ * (an older package) or one of an unreviewed shape (see outcomesProblem), which
+ * callers must show as "outcomes unavailable" rather than as success.
  */
 export function normalizeOutcomes(raw) {
-  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
+  if (outcomesProblem(raw)) return null;
   const run = obj(raw.run);
   const stale = obj(run.stale);
   const alerts = obj(raw.alerts);
@@ -214,6 +338,18 @@ export function normalizeOutcomes(raw) {
       } : null,
       countsAvailable: typeof run.counts_available === "boolean" ? run.counts_available : null,
       warnings: tokens(run.warnings),
+      runningFor: count(run.running_for_seconds),
+      // true / false / null (the runner writes no heartbeat): no progress for 30 min.
+      stalled: run.stalled === true,
+      // When the runner last showed progress, if the bridge says (optional).
+      heartbeatEpoch: count(run.heartbeat_epoch),
+      // What the runner last saw advance: io (the core read or wrote), progress (its
+      // progress record changed) or liveness (only that it is alive).
+      heartbeatSource: ["io", "progress", "liveness"].includes(token(run.heartbeat_source)) ? token(run.heartbeat_source) : "",
+      longRunning: run.long_running === true || tokens(run.warnings).includes("long_running"),
+      stderrLog: run.stderr_log && typeof run.stderr_log === "object" && !Array.isArray(run.stderr_log) && count(run.stderr_log.finished_epoch) !== null
+        ? { finishedEpoch: count(run.stderr_log.finished_epoch), exitCode: Number.isFinite(Number(run.stderr_log.exit_code)) ? Number(run.stderr_log.exit_code) : null }
+        : null,
       ...factsOf(run),
       deferred: count(run.deferred_files),
       skipped: count(run.skipped_files),
@@ -234,8 +370,14 @@ export function normalizeOutcomes(raw) {
       const p = obj(item);
       return {
         profile: token(p.profile),
-        outcome: token(p.outcome) || "not_run",
+        // A profile record whose outcome is missing or not text is unknown, which is
+        // a failure level; "not run" would be idle grey and read as nothing to do.
+        outcome: token(p.outcome) || "unknown",
         reason: token(p.reason),
+        // The core's own error line and the path it failed on, written by the runner.
+        // The path arrives percent-encoded.
+        detail: typeof p.detail === "string" ? plainText(p.detail, 240) : "",
+        failedPath: typeof p.failed_path === "string" ? visibleText(decodePercentPath(p.failed_path)).slice(0, 255) : "",
         action: token(p.action),
         finishedEpoch: count(p.finished_epoch),
         outcomeEpoch: count(p.outcome_epoch),
@@ -258,6 +400,18 @@ export function normalizeOutcomes(raw) {
         lastReason: token(r.last_reason)
       };
     }).filter((r) => r.profile),
+    // Whether a saved change is still waiting for the running controller to pick it
+    // up: pending true / false, or null when the marker could not be read.
+    controllerReload: (() => {
+      const c = raw.controller_reload;
+      if (!c || typeof c !== "object" || Array.isArray(c)) return { pending: false, operation: "", reason: "", epoch: null };
+      return {
+        pending: c.pending === true ? true : (c.pending === null ? null : false),
+        operation: token(c.operation) ? shown(token(c.operation)) : "",
+        reason: token(c.reason) ? shown(token(c.reason)) : "",
+        epoch: count(c.epoch)
+      };
+    })(),
     cacheHealth: (() => {
       const h = obj(raw.status_cache_health);
       const issues = (Array.isArray(h.issues) ? h.issues : []).map((i) => ({
@@ -304,8 +458,13 @@ export function profileOutcomeRow(entry, nowSeconds = Date.now() / 1000) {
   const age = ageLabel(p.outcomeEpoch || p.finishedEpoch, nowSeconds);
   // Not run because an aggregate stopped short is a skip, not idleness.
   const shownResult = resultDisplay(p);
-  const level = p.outcome === "not_run" && p.reason ? "warn" : shownResult.level;
+  let level = p.outcome === "not_run" && p.reason ? "warn" : shownResult.level;
+  // A reason this UI cannot read is never shown in a calm colour: the code is in
+  // the detail, and the row is at least a warning until someone has looked.
+  if (p.reason && !reasonCopy(p.reason).known && (level === "ok" || level === "idle")) level = "warn";
   if (tokens(p.warnings).length) parts.push(warningsSentence(p));
+  if (p.detail) parts.push(`core said: ${p.detail}`);
+  if (p.failedPath) parts.push(`failed on ${p.failedPath}`);
   return {
     profile: p.profile,
     outcome: token(p.outcome),
@@ -360,6 +519,8 @@ export function attentionItems(outcomes, nowSeconds = Date.now() / 1000) {
     items.push({ id: "run-partial", level: "warn", title: "Last run was partial", detail: `${n ? `${n} file${n === 1 ? "" : "s"} deferred or skipped` : (run.countsAvailable === false ? "Entry counts were not recorded for this run, so how many files were deferred or skipped is unknown" : "An unrecorded number of files were deferred or skipped")}${run.reason ? ` (${reasonCopy(run.reason).text})` : ""}; they are left for the next run${when}.` });
   } else if (run.outcome === "succeeded" && run.warnings.length) {
     items.push({ id: "run-warnings", level: "warn", title: "Last run synced with warnings", detail: `${warningsSentence(run)}. Skipped and deferred entries are listed as entry.skipped / entry.deferred records in the sync log${when}.` });
+  } else if (run.outcome === "running" && run.longRunning) {
+    items.push({ id: "run-long", level: "warn", title: `A run has been going for ${run.runningFor !== null ? spanLabel(run.runningFor) : "a long time"}`, detail: "Check whether it is stuck: a core waiting on an unresponsive source or target never fails, it just never finishes. Review Logs, and stop and restart the package if nothing is moving." });
   } else if (run.outcome === "busy") {
     items.push({ id: "run-busy", level: "warn", title: "Last run was refused as busy", detail: `${reasonCopy("lock_busy").text}${when}` });
   } else if (run.outcome === "cancelled") {
@@ -369,8 +530,24 @@ export function attentionItems(outcomes, nowSeconds = Date.now() / 1000) {
   } else if (!Object.prototype.hasOwnProperty.call(OUTCOME_LABELS, run.outcome)) {
     items.push({ id: "run-unknown", level: "unknown", title: `Last run ${unknownLabel(run.outcome)}`, detail: "This UI does not recognise the run outcome. Review Logs." });
   }
-  if (run.warnings.length && run.outcome !== "succeeded") {
-    items.push({ id: "run-warnings-extra", level: "warn", title: "The last run also reported warnings", detail: `${warningsSentence(run)}${when}.` });
+  if (run.reason && !reasonCopy(run.reason).known && ["succeeded", "not_run", "running", "busy", "cancelled"].includes(run.outcome)) {
+    items.push({ id: "run-reason-unknown", level: "warn", title: "The last run reported a reason this UI does not recognise", detail: `${reasonCopy(run.reason).text}. Review Logs.${when}` });
+  }
+  if (run.outcome === "running" && run.stalled) {
+    const quiet = run.heartbeatEpoch ? spanLabel(Math.max(0, nowSeconds - run.heartbeatEpoch)) : "";
+    const how = HEARTBEAT_SOURCE_COPY[run.heartbeatSource] ? ` ${HEARTBEAT_SOURCE_COPY[run.heartbeatSource]}` : "";
+    items.push({ id: "run-stalled", level: "warn", title: quiet ? `Run may be stuck: no progress for ${quiet}` : "Run may be stuck: no progress for 30 minutes", detail: `The runner's heartbeat has stopped advancing. Check whether it is stuck on an unresponsive source or target: review Logs, and restart the package service if nothing is moving.${how}` });
+  }
+  if (outcomes.controllerReload.pending === true) {
+    const reload = outcomes.controllerReload;
+    const when = reload.epoch ? ` (${ageLabel(reload.epoch, nowSeconds)})` : "";
+    const why = reload.reason ? reasonCopy(reload.reason).text : "";
+    items.push({ id: "controller-reload", level: "warn", title: "Saved, not yet applied; restart the package service", detail: `A change${reload.operation ? ` (${reload.operation})` : ""} was saved${when}, but the running controller was not told to reload it, so it keeps the previous settings${why ? `: ${why.split(". ")[0]}` : ""}. Restart the package service in Package Center.` });
+  } else if (outcomes.controllerReload.pending === null) {
+    items.push({ id: "controller-reload", level: "warn", title: "Cannot tell whether saved changes are applied", detail: "The marker that records a pending controller reload could not be read. If a recent save did not take effect, restart the package service." });
+  }
+  if (run.warnings.some((w) => w !== "long_running" && w !== "stalled") && run.outcome !== "succeeded") {
+    items.push({ id: "run-warnings-extra", level: "warn", title: "The last run also reported warnings", detail: `${warningsSentence(Object.assign({}, run, { warnings: run.warnings.filter((w) => w !== "long_running" && w !== "stalled") }))}${when}.` });
   }
   if (run.degraded) {
     const sinks = run.degraded.sinks.join(", ");
@@ -384,15 +561,19 @@ export function attentionItems(outcomes, nowSeconds = Date.now() / 1000) {
   for (const p of outcomes.profiles) {
     const row = profileOutcomeRow(p, nowSeconds);
     if (row.level === "fail" || row.level === "unknown" || (row.level === "warn" && p.outcome !== "busy")) {
-      items.push({ id: `profile-${p.profile}`, level: row.level, title: `${p.profile}: ${row.label}`, detail: `${row.detail || "Review Logs."}${row.age ? ` (${row.age})` : ""}` });
+      items.push({ id: `profile-${p.profile}`, level: row.level, title: `${visibleText(p.profile)}: ${row.label}`, detail: `${row.detail || "Review Logs."}${row.age ? ` (${row.age})` : ""}` });
     }
   }
   for (const r of outcomes.routines) {
     if (r.deferReason && !["window", "busy"].includes(r.deferReason)) {
-      const why = has(REASONS, r.deferReason) ? reasonCopy(r.deferReason).text : `reason ${unknownLabel(r.deferReason)}`;
-      items.push({ id: `routine-${r.profile}`, level: "warn", title: `Routine ${r.profile} is deferred`, detail: why });
+      const why = routineDeferCopy(r.deferReason);
+      items.push({
+        id: `routine-${r.profile}`, level: why.level,
+        title: why.blocked ? `Routine ${visibleText(r.profile)} is blocked` : `Routine ${visibleText(r.profile)} is deferred`,
+        detail: why.text
+      });
     } else if (r.lastExit !== null && r.lastExit !== 0 && ![3, 75, 130, 143].includes(r.lastExit) && !r.deferReason) {
-      items.push({ id: `routine-${r.profile}`, level: "warn", title: `Routine ${r.profile} last exited ${r.lastExit}`, detail: reasonCopy(r.lastReason).text || "Review Logs." });
+      items.push({ id: `routine-${r.profile}`, level: "warn", title: `Routine ${visibleText(r.profile)} last exited ${r.lastExit}`, detail: reasonCopy(r.lastReason).text || "Review Logs." });
     }
   }
   const cacheNote = cacheHealthNote(outcomes);
@@ -409,14 +590,41 @@ export function attentionItems(outcomes, nowSeconds = Date.now() / 1000) {
     const named = outcomes.errors.slice(0, 3).map((e) => `${e.source} ${e.code}`).join(", ");
     items.push({ id: "record-errors", level: "warn", title: "Package record-keeping is degraded", detail: `${outcomes.errors.length} record${outcomes.errors.length === 1 ? "" : "s"} could not be read: ${named}${outcomes.errors.length > 3 ? ", …" : ""}. Results above may be incomplete.` });
   }
-  return items;
+  // The ids are v-for keys; two profiles or routines with one id would collide.
+  const seen = new Map();
+  return items.map((item) => {
+    const count = seen.get(item.id) || 0;
+    seen.set(item.id, count + 1);
+    return count ? Object.assign({}, item, { id: `${item.id}#${count}` }) : item;
+  });
 }
 
 /** Shown when the snapshot has no outcomes block: absence is never green. */
-export const OUTCOMES_MISSING_ITEM = Object.freeze({
-  id: "outcomes-missing", level: "unknown", title: "Run outcomes unavailable",
-  detail: "This package did not report run outcomes, so failures cannot be ruled out. Update the package."
-});
+export const OUTCOMES_MISSING_ITEM = Object.freeze(outcomesUnavailableItem(undefined));
+
+/**
+ * Whether a run is in flight. The legacy `run.state` stays "running" after the
+ * runner dies, until the controller rewrites it, and a stopped controller never
+ * does; so a stale verdict in the outcomes block always wins over it. Otherwise
+ * either record saying "running" is enough. Callers pass the normalised block, or
+ * null when there is none and the legacy state is all there is to go on.
+ */
+export function runIsActive(outcomes, legacyState) {
+  if (runIsStale(outcomes)) return false;
+  return legacyState === "running" || Boolean(outcomes && outcomes.run.outcome === "running");
+}
+
+/** The verdict word for the run: "stale" beats the legacy state everywhere. */
+export function runIsStale(outcomes) {
+  return Boolean(outcomes) && (outcomes.run.outcome === "stale" || outcomes.run.staleDetected);
+}
+
+/** Whether a dead run covers this profile, so its row cannot read as healthy or running. */
+export function staleRunCovers(outcomes, profileName) {
+  if (!runIsStale(outcomes)) return false;
+  const scope = outcomes.run.scope;
+  return !scope || scope === "none" || scope === "all" || scope === String(profileName);
+}
 
 export function worstLevel(items) {
   const order = ["fail", "unknown", "warn"];

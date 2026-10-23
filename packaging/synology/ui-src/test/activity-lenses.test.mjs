@@ -6,6 +6,7 @@ import {
   WIDGET_BACKOFF_RAMP_MS,
   WIDGET_IDLE_POLL_MS
 } from "../src/widgetModel.mjs";
+import { APP_MODULE_STUBS } from "./helpers/app-stubs.mjs";
 
 // Behavioral coverage for the Activity route's five subtabs: the four event
 // lenses that share one feed and filter reversedActivity by category, and the
@@ -27,6 +28,7 @@ function loadAppComponent(overrides = {}) {
     .replace("export default {", "const AppComponent = {");
   executable += "\nreturn AppComponent;";
   const stubs = {
+    ...APP_MODULE_STUBS,
     // The real cadence literals, matching the pattern the other App.vue unit
     // test files use to load the component's script in isolation.
     WIDGET_ACTIVE_POLL_MS,

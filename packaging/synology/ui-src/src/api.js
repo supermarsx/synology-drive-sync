@@ -456,15 +456,23 @@ export function pick(model, ...keys) {
   return key === undefined ? undefined : model[key];
 }
 
+// Building an Intl.DateTimeFormat costs about 140 microseconds, and a 1000-row
+// Activity feed formats a date per row on every render. The locale and options
+// never change inside a window, so the formatter is built once.
+let cachedDateFormatter = null;
+
 export function formatDate(value) {
   const numeric = Number(value);
   if (!Number.isFinite(numeric) || numeric <= 0) return "Unavailable";
   const milliseconds = numeric < 100000000000 ? numeric * 1000 : numeric;
   try {
-    return new Intl.DateTimeFormat(undefined, {
-      dateStyle: "medium",
-      timeStyle: "short"
-    }).format(new Date(milliseconds));
+    if (cachedDateFormatter === null) {
+      cachedDateFormatter = new Intl.DateTimeFormat(undefined, {
+        dateStyle: "medium",
+        timeStyle: "short"
+      });
+    }
+    return cachedDateFormatter.format(new Date(milliseconds));
   } catch (_error) {
     return "Unavailable";
   }
@@ -1219,7 +1227,62 @@ async function pollJobResult(
         : "";
       throw failure;
     }
+    announceMutationWarning(auth, status.result, expectedOperation);
     return status.result;
+  }
+}
+
+// The operations whose success can carry a warning (the shell reloads the running
+// controller after each; if that fails the change is on disk but not in effect).
+const MUTATION_WARNING_OPERATIONS = Object.freeze([
+  "configure-profile", "remove-profile", "set-default", "schedule", "routine", "remove-routine",
+  "alert-policy", "performance-policy", "security-policy"
+]);
+
+function printableLine(value, limit) {
+  let out = "";
+  for (const character of String(value || "")) {
+    const code = character.codePointAt(0);
+    out += code < 0x20 || (code >= 0x7f && code <= 0x9f) ? " " : character;
+  }
+  return out.replace(/ +/g, " ").trim().slice(0, limit);
+}
+
+/**
+ * "Saved, but ..." (result.warning_code / result.warning). The bridge reports a
+ * successful save whose side effect failed -- the running controller was not
+ * told to reload -- as ok:true with a warning, and a plain success toast would
+ * hide that the old schedule keeps running. The window's callback gets
+ * a list of { code, text }; a later successful mutation with no warning gets null so the
+ * notice does not outlive its cause. A callback that throws is re-raised on a later tick, never
+ * allowed to turn a saved change into a failure, nor to disappear.
+ */
+function announceMutationWarning(auth, result, operation) {
+  if (!auth || typeof auth.onMutationWarning !== "function") return;
+  if (!MUTATION_WARNING_OPERATIONS.includes(operation)) return;
+  const codePattern = /^[a-z][a-z0-9_]{0,47}$/;
+  const warnings = [];
+  // The bridge normalises the shell's single warning_code/warning pair into
+  // result.warnings; the pair is still read so an older bridge is not silent.
+  if (Array.isArray(result.warnings)) {
+    result.warnings.slice(0, 16).forEach((item) => {
+      if (!item || typeof item !== "object") return;
+      const code = typeof item.code === "string" && codePattern.test(item.code) ? item.code : "warning";
+      const text = typeof item.message === "string" ? printableLine(item.message, 400) : "";
+      warnings.push({ code, text: text || `The change was saved with a warning (${code}). Inspect Activity and Logs.` });
+    });
+  }
+  if (!warnings.length) {
+    const code = typeof result.warning_code === "string" && codePattern.test(result.warning_code) ? result.warning_code : "";
+    const text = typeof result.warning === "string" ? printableLine(result.warning, 400) : "";
+    if (code || text) warnings.push({ code: code || "warning", text: text || `The change was saved with a warning (${code}). Inspect Activity and Logs.` });
+  }
+  try {
+    auth.onMutationWarning(warnings.length ? warnings : null);
+  } catch (error) {
+    // Re-raised on a later tick: it reaches the page's error reporting (the banner,
+    // via the window's error handling) without failing the already-saved change.
+    window.setTimeout(() => { throw error; }, 0);
   }
 }
 

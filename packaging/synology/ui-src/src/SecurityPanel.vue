@@ -136,6 +136,7 @@
 
 <script>
 import { ActionIcon } from "./ActionIcon";
+import { patchGuard } from "./uiErrors.mjs";
 
 const POLICY_HELP = Object.freeze({
   policy_version: "Immutable on-disk security policy schema reported by the package snapshot; updates are managed only by package migrations.",
@@ -182,6 +183,7 @@ const PolicyHelp = {
 
 export default {
   name: "SecurityPanel",
+  mixins: [patchGuard],
   components: { ActionIcon, PolicyHelp },
   props: {
     value: { type: Object, required: true },

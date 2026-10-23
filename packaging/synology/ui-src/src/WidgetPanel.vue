@@ -15,8 +15,8 @@
       <span>{{ run.label }}</span>
     </p>
     <ul v-if="!compact && rows.length" class="sdsync-widget-profiles" aria-label="Per-profile sync outcome">
-      <li v-for="row in rows" :key="row.name" class="sdsync-widget-profile" :class="['is-' + row.level, { 'is-stale': row.stale }]" :title="row.name + ' — ' + row.outcome + ', ' + row.detail">
-        <span class="sdsync-widget-profile-name">{{ row.name }}</span>
+      <li v-for="row in rows" :key="row.name" class="sdsync-widget-profile" :class="['is-' + row.level, { 'is-stale': row.stale }]" :title="row.displayName + ' — ' + row.outcome + ', ' + row.detail">
+        <span class="sdsync-widget-profile-name"><bdi>{{ row.displayName }}</bdi></span>
         <span class="sdsync-widget-profile-outcome">{{ row.outcome }}</span>
         <span class="sdsync-widget-profile-age">{{ row.age }}</span>
       </li>
@@ -31,6 +31,8 @@
 <script>
 import { ActionIcon } from "./ActionIcon";
 import { SNAPSHOT_SCHEMA, apiGet } from "./api";
+import { patchGuard } from "./uiErrors.mjs";
+import { plainText } from "./textSafety.mjs";
 import {
   APPWINDOW_SETTINGS_KEY,
   WIDGET_CLOCK_TICK_MS,
@@ -49,6 +51,7 @@ const DEGRADED_AFTER_FAILURES = 2;
 
 export default {
   name: "WidgetPanel",
+  mixins: [patchGuard],
   components: { ActionIcon },
   data() {
     return {
@@ -69,7 +72,27 @@ export default {
   computed: {
     // Failed polls make every retained row history; both derivations dim it.
     stale() { return Boolean(this.snapshot) && this.failures > 0; },
-    view() { return widgetView(this.snapshot, this.nowMs, { stale: this.stale }); },
+    // The age labels count from the package's own clock: its snapshot says when
+    // it was generated, and the time since this card received it is added. The
+    // browser's clock alone would move every "N min ago" by however far it is
+    // from the NAS.
+    packageNowMs() {
+      const generated = Number(this.snapshot && this.snapshot.generated_at_epoch);
+      if (!Number.isFinite(generated) || generated <= 0 || !this.updatedAtMs) return this.nowMs;
+      return generated * 1000 + Math.max(0, this.nowMs - this.updatedAtMs);
+    },
+    // A derivation that throws must not leave the card blank or frozen on its
+    // last good paint: the failure is the headline, with its message.
+    view() {
+      try {
+        return widgetView(this.snapshot, this.packageNowMs, { stale: this.stale });
+      } catch (error) {
+        return {
+          overview: { level: "fail", title: "The widget could not read this status", detail: plainText(error && error.message, 120) || "internal error" },
+          rows: []
+        };
+      }
+    },
     overview() { return this.view.overview; },
     // What the card actually leads with. A bridge failure takes the headline as
     // soon as there is nothing better to show, and once it is clearly not a

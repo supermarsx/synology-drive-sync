@@ -6,6 +6,7 @@ import {
   WIDGET_BACKOFF_RAMP_MS,
   WIDGET_IDLE_POLL_MS
 } from "../src/widgetModel.mjs";
+import { APP_MODULE_STUBS } from "./helpers/app-stubs.mjs";
 
 // Behavioral coverage for how the dashboard surfaces a realtime routine's
 // backend_reason: the Overview three-way summary (realtimeDetail), the
@@ -28,6 +29,7 @@ function loadAppComponent(overrides = {}) {
     .replace("export default {", "const AppComponent = {");
   executable += "\nreturn AppComponent;";
   const stubs = {
+    ...APP_MODULE_STUBS,
     WIDGET_ACTIVE_POLL_MS,
     WIDGET_BACKOFF_RAMP_MS,
     WIDGET_IDLE_POLL_MS,

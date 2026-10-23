@@ -7,6 +7,7 @@ import {
   WIDGET_IDLE_POLL_MS,
   widgetBridgeIssue
 } from "../src/widgetModel.mjs";
+import { APP_MODULE_STUBS } from "./helpers/app-stubs.mjs";
 
 const appSource = await readFile(new URL("../src/App.vue", import.meta.url), "utf8");
 
@@ -159,6 +160,7 @@ function loadAppComponent({ apiGet = async () => ({}) } = {}) {
     .replace("export default {", "const AppComponent = {")
     + "\nreturn AppComponent;";
   const stubs = {
+    ...APP_MODULE_STUBS,
     // The real cadence literals, not stand-ins: App.vue's retry ladder and
     // stale-age escalation are only meaningful against the ramp the widget
     // actually ships and validate_spk.py actually pins.
@@ -290,14 +292,16 @@ test("each named failure renders its own title and text, never the bare 503 catc
   for (const row of SHIPPED_COPY) {
     const issue = describe(component, { status: 503, code: row.code });
     assert.equal(issue.title, row.title, row.code);
-    assert.equal(issue.message, row.message, row.code);
+    // The cause rides after the copy: status and the bridge's own code, never its prose.
+    assert.equal(issue.message, `${row.message} Detail: HTTP 503 · ${row.code}.`, row.code);
     assert.notEqual(issue.title, CATCH_ALL.title, `${row.code} fell through to the catch-all`);
     // The envelope's own message is discarded on purpose: this window renders
     // only copy it owns. A branch that leaked server text would show it here.
     const withServerText = describe(component, {
       status: 503, code: row.code, message: "server-supplied text that must not be rendered"
     });
-    assert.equal(withServerText.message, row.message, `${row.code} rendered the envelope's message`);
+    assert.equal(withServerText.message, issue.message, `${row.code} rendered the envelope's message`);
+    assert.ok(!withServerText.message.includes("server-supplied"), `${row.code} rendered the envelope's message`);
   }
 });
 
@@ -306,7 +310,7 @@ test("the bare 503 catch-all survives for an unnamed code", () => {
   for (const code of ["", "service_unavailable", "bridge_protocol_unavailable", "a_code_from_a_newer_package"]) {
     const issue = describe(component, { status: 503, code });
     assert.equal(issue.title, CATCH_ALL.title, code);
-    assert.equal(issue.message, CATCH_ALL.message, code);
+    assert.equal(issue.message, `${CATCH_ALL.message} Detail: HTTP 503${code ? ` · ${code}` : ""}.`, code);
   }
   // And the authentication branches keep their precedence over the new table.
   assert.equal(
@@ -322,7 +326,7 @@ test("the bare 503 catch-all survives for an unnamed code", () => {
 test("named failures still carry the failure stage when the envelope names one", () => {
   const component = loadAppComponent();
   const issue = describe(component, { status: 503, code: "manager_timeout", stage: "service_request" });
-  assert.match(issue.message, /Failure stage: service_request\.$/);
+  assert.match(issue.message, /Failure stage: service_request\. Detail: HTTP 503 · manager_timeout\.$/);
 });
 
 /**
@@ -774,17 +778,17 @@ test("retained read documents are per-component state with no cross-session rete
   try {
     const context = {
       disposed: false, auth: {}, autosaveCoordinator: null, abortController: null,
-      snapshotTimer: 7, logTimer: 8, incidentProbeTimer: 9, activitySearchDebounceTimer: 10,
+      snapshotTimer: 7, logTimer: 8, incidentProbeTimer: 9, activitySearchDebounceTimer: 10, clockTimer: 11,
       snapshot: validSnapshot(), snapshotReceivedAtMs: 12345,
       controlLayoutCleanup: null, beforeUnloadHandler: null, visibilityHandler: null,
       connectionProofTimer: 0
     };
     context.stopTimers = () => component.methods.stopTimers.call(context);
     component.methods.stopTimers.call(context);
-    assert.deepEqual(cleared, [7, 8, 9, 10]);
+    assert.deepEqual(cleared, [7, 8, 9, 10, 11]);
     assert.deepEqual(
-      [context.snapshotTimer, context.logTimer, context.incidentProbeTimer, context.activitySearchDebounceTimer],
-      [0, 0, 0, 0]
+      [context.snapshotTimer, context.logTimer, context.incidentProbeTimer, context.activitySearchDebounceTimer, context.clockTimer],
+      [0, 0, 0, 0, 0]
     );
   } finally {
     if (previousWindow === undefined) delete globalThis.window;

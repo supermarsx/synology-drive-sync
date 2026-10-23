@@ -19,6 +19,7 @@ import {
   widgetRun,
   widgetView
 } from "../src/widgetModel.mjs";
+import { APP_MODULE_STUBS } from "./helpers/app-stubs.mjs";
 
 const adapter = await readFile(new URL("../src/widget.js", import.meta.url), "utf8");
 const panel = await readFile(new URL("../src/WidgetPanel.vue", import.meta.url), "utf8");
@@ -92,6 +93,7 @@ function loadWidgetPanel(environment) {
     .replace("export default {", "const WidgetPanelComponent = {")}\nreturn WidgetPanelComponent;`;
 
   const stubs = {
+    ...APP_MODULE_STUBS,
     window: environment.window,
     document: environment.document,
     ActionIcon: { name: "ActionIcon" },
@@ -564,6 +566,7 @@ function loadAdapter(ext, syno, calls) {
     }
   };
   const stubs = {
+    ...APP_MODULE_STUBS,
     Vue,
     WidgetPanel: { name: "WidgetPanel" },
     Ext: ext,

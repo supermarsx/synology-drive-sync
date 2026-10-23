@@ -10,6 +10,7 @@ import {
   widgetProfileRows,
   widgetView
 } from "../src/widgetModel.mjs";
+import { APP_MODULE_STUBS } from "./helpers/app-stubs.mjs";
 
 const {
   attentionItems, failureKey, normalizeOutcomes, outcomeLabel, outcomeLevel,
@@ -248,6 +249,7 @@ function loadApp(exports = "") {
     .replace("export default {", "const AppComponent = {")
     + (exports ? `\nreturn { AppComponent, ${exports} };` : "\nreturn AppComponent;");
   const stubs = {
+    ...APP_MODULE_STUBS,
     WIDGET_ACTIVE_POLL_MS, WIDGET_BACKOFF_RAMP_MS, WIDGET_IDLE_POLL_MS,
     OUTCOMES_MISSING_ITEM: outcomesModule.OUTCOMES_MISSING_ITEM,
     outcomeAttentionItems: outcomesModule.attentionItems,

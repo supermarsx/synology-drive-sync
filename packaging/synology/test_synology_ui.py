@@ -1156,6 +1156,7 @@ const ACTIONS = { execute: "action" };
 const SNAPSHOT_SCHEMA = "sdsync.dsm-api.v1";
 const ActionIcon = {};
 const SecurityPanel = {};
+const patchGuard = {};
 const boundedText = (value, fallback = "") =>
   String(typeof value === "string" && value ? value : fallback).slice(0, 65536);
 const formatBytes = (value) => String(value);
@@ -1556,6 +1557,7 @@ const ACTIONS = { execute: "action" };
 const SNAPSHOT_SCHEMA = "sdsync.dsm-api.v1";
 const ActionIcon = {};
 const SecurityPanel = {};
+const patchGuard = {};
 const boundedText = (value, fallback = "") =>
   String(typeof value === "string" && value ? value : fallback).slice(0, 65536);
 const formatBytes = (value) => String(value);

@@ -5138,6 +5138,10 @@
   color: var(--sdsync-red);
 }
 
+.sdsync-widget.is-unknown .sdsync-widget-dot {
+  color: var(--sdsync-amber);
+}
+
 .sdsync-widget-headline-text {
   display: flex;
   min-width: 0;
@@ -5217,6 +5221,11 @@
   color: var(--sdsync-red);
 }
 
+/* Unknown is a warning, except on a retained reading, which is dimmed on purpose. */
+.sdsync-widget-profile.is-unknown:not(.is-stale) .sdsync-widget-profile-outcome {
+  color: var(--sdsync-amber);
+}
+
 .sdsync-widget-profile-age {
   color: var(--sdsync-muted);
   font-family: "Cascadia Mono", Consolas, monospace;
@@ -5275,6 +5284,49 @@
 
 .sdsync-attention li.is-warn {
   border-left-color: var(--sdsync-amber);
+}
+
+/* A token this window does not recognise, an unreadable outcomes block and a stale
+   reading are warnings, not neutral grey: nobody has looked at them yet. */
+.sdsync-attention li.is-unknown {
+  border-left-color: var(--sdsync-amber);
+}
+
+/* Shown by uiErrors.mjs when the dashboard itself failed while drawing. */
+.sdsync-ui-error {
+  border-left-color: var(--sdsync-red);
+  color: var(--sdsync-text);
+}
+
+.sdsync-ui-error-reload {
+  padding: 3px 10px;
+  border: 1px solid var(--sdsync-red);
+  border-radius: 2px;
+  color: var(--sdsync-text);
+  background: transparent;
+  cursor: pointer;
+}
+
+/* The core's own error output for the last failed run (outcomes.run.stderr_log). */
+.sdsync-run-stderr {
+  margin: 0 0 12px;
+  padding: 7px 10px;
+  border: 1px solid var(--sdsync-border);
+  border-left: 3px solid var(--sdsync-red);
+  font-size: 12px;
+}
+
+.sdsync-run-stderr summary {
+  cursor: pointer;
+}
+
+.sdsync-run-stderr pre {
+  max-height: 220px;
+  margin: 8px 0 0;
+  overflow: auto;
+  white-space: pre-wrap;
+  word-break: break-word;
+  font-family: "Cascadia Mono", Consolas, monospace;
 }
 
 .sdsync-profile-outcome {

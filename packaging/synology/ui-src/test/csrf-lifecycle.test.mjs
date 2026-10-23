@@ -7,6 +7,7 @@ import {
   WIDGET_BACKOFF_RAMP_MS,
   WIDGET_IDLE_POLL_MS
 } from "../src/widgetModel.mjs";
+import { APP_MODULE_STUBS } from "./helpers/app-stubs.mjs";
 
 const appSource = await readFile(new URL("../src/App.vue", import.meta.url), "utf8");
 const apiSource = await readFile(new URL("../src/api.js", import.meta.url), "utf8");
@@ -52,6 +53,7 @@ async function loadAppComponent(postSpy, getSpy) {
   executable += "\nreturn AppComponent;";
 
   const stubs = {
+    ...APP_MODULE_STUBS,
     // The real cadence literals, not stand-ins: App.vue's retry ladder and
     // stale-age escalation are only meaningful against the ramp the widget
     // actually ships and validate_spk.py actually pins.
@@ -168,6 +170,8 @@ test("failed initial CSRF bootstrap is reported once before the scheduled retry"
   try {
     globalThis.window = {
       AbortController: globalThis.AbortController,
+      clearTimeout() {},
+      setTimeout() { return 0; },
       addEventListener() {},
       removeEventListener() {},
       matchMedia: () => ({

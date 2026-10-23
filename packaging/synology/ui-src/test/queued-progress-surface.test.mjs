@@ -6,6 +6,7 @@ import {
   WIDGET_BACKOFF_RAMP_MS,
   WIDGET_IDLE_POLL_MS
 } from "../src/widgetModel.mjs";
+import { APP_MODULE_STUBS } from "./helpers/app-stubs.mjs";
 
 // Component loader copied from reconciliation-barrier.test.mjs, for the reason
 // that file gives for copying its own harness: a self-contained copy cannot
@@ -25,6 +26,7 @@ function loadAppComponent() {
     .replace("export default {", "const AppComponent = {")
     + "\nreturn AppComponent;";
   const stubs = {
+    ...APP_MODULE_STUBS,
     // The real cadence literals, not stand-ins: App.vue's retry ladder and
     // stale-age escalation are only meaningful against the ramp the widget
     // actually ships and validate_spk.py actually pins.
@@ -99,6 +101,7 @@ function snapshotContext({ service = "running", controller = {}, run = {}, liveP
   context.serviceState = computed.serviceState.call(context);
   context.run = computed.run.call(context);
   context.runStatus = computed.runStatus.call(context);
+  context.runActive = computed.runActive.call(context);
   context.controllerLiveness = computed.controllerLiveness.call(context);
   context.queuedWaitDetail = computed.queuedWaitDetail.call(context);
   context.liveProgressDetail = computed.liveProgressDetail.call(context);

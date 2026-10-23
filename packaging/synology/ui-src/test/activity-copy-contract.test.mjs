@@ -6,6 +6,7 @@ import {
   WIDGET_BACKOFF_RAMP_MS,
   WIDGET_IDLE_POLL_MS
 } from "../src/widgetModel.mjs";
+import { APP_MODULE_STUBS } from "./helpers/app-stubs.mjs";
 
 const appSource = await readFile(new URL("../src/App.vue", import.meta.url), "utf8");
 const cssSource = await readFile(new URL("../src/styles/native.css", import.meta.url), "utf8");
@@ -23,6 +24,7 @@ function loadAppComponent(overrides = {}) {
     .replace("export default {", "const AppComponent = {");
   executable += "\nObject.defineProperty(AppComponent, '__testSanitizedTroubleshootingText', { value: sanitizedTroubleshootingText });\nreturn AppComponent;";
   const stubs = {
+    ...APP_MODULE_STUBS,
     // The real cadence literals, not stand-ins: App.vue's retry ladder and
     // stale-age escalation are only meaningful against the ramp the widget
     // actually ships and validate_spk.py actually pins.
@@ -1065,6 +1067,8 @@ test("a failing package log read never discards the activity feed", async () => 
       scheduleLogs() {}
     };
     context.logRecordsFrom = (...args) => scoped.methods.logRecordsFrom.apply(context, args);
+    context.describeBridgeError = (...args) => scoped.methods.describeBridgeError.apply(context, args);
+    context.feedFailureText = (...args) => scoped.methods.feedFailureText.apply(context, args);
     await scoped.methods.refreshLogs.call(context);
     return { context, requested };
   };
