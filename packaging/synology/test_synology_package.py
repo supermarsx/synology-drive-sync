@@ -21680,6 +21680,757 @@ fi
             stopped = self.shell(self.lifecycle, "stop", timeout=15)
             self.assertEqual(stopped.returncode, 0, stopped.stdout + stopped.stderr)
 
+    # ------------------------------------------------------------------
+    # Controller resilience (fix2-ctl, ADV-C-1..16). Each test names the
+    # finding it pins. Every wait is bounded and driven by the fake clock:
+    # the controller's calendar (date +%s/%u/%H%M/%Y-%m-%d, date -d @N) is
+    # derived from one epoch the test writes, and "nothing happened" is
+    # proved by a turn barrier, never by sleeping.
+    # ------------------------------------------------------------------
+
+    def ctl_profile(self, name: str, source: Path) -> None:
+        self.assertEqual(self.configure(name, source, f"/home/Drive/{name}", True).returncode, 0)
+        secret, _ = self.api(
+            "set-secret", "--profile", name, "--kind", "password", "--mode", "replace",
+            input_text="test-password\n",
+        )
+        self.assertEqual(secret.returncode, 0, secret.stderr)
+
+    def ctl_routine(
+        self, name: str, mode: str, *, start: str = "00:00", end: str = "23:59",
+        retries: str = "0", interval: str = "60", poll: str = "5", backoff: str = "10",
+        action: str = "sync",
+    ) -> None:
+        routine, _ = self.api(
+            "routine", "--profile", name, "--enabled", "true", "--action", action,
+            "--mode", mode, "--interval", interval, "--weekdays", "1,2,3,4,5,6,7",
+            "--time-window-start", start, "--time-window-end", end,
+            "--debounce-seconds", "1", "--retry-count", retries,
+            "--retry-backoff-seconds", backoff, "--retry-exponential", "true",
+            "--poll-seconds", poll, "--allow-delete", "false", "--max-total-delete", "100",
+        )
+        self.assertEqual(routine.returncode, 0, routine.stdout + routine.stderr)
+
+    def ctl_world(self, label: str, epoch: int) -> tuple[dict[str, str], Path]:
+        """A fake clock whose whole calendar derives from one UTC epoch."""
+        fake_bin = self.root / f"{label}-ctl-bin"
+        fake_bin.mkdir(mode=0o700)
+        clock = self.root / f"{label}-ctl-clock"
+        write_clock(clock, f"{epoch}\n")
+        scripts = {
+            "date": (
+                "#!/bin/sh\n"
+                ': "${SDSYNC_TEST_CLOCK:?}"\n'
+                'case "${1:-}" in\n'
+                '  +%s) printf x >> "$SDSYNC_TEST_CLOCK.reads"; exec /bin/cat "$SDSYNC_TEST_CLOCK" ;;\n'
+                '  +*) IFS= read -r now < "$SDSYNC_TEST_CLOCK"; exec /bin/date -u -d "@$now" "$1" ;;\n'
+                '  -d) exec /bin/date -u "$@" ;;\n'
+                '  *) exec /bin/date "$@" ;;\n'
+                "esac\n"
+            ),
+            "sleep": "#!/bin/sh\ncase ${1:-} in 1) exec /bin/sleep 1 ;; *) exec /bin/sleep 0.03 ;; esac\n",
+            "inotifywait": "#!/bin/sh\nexit 69\n",
+        }
+        for name, text in scripts.items():
+            path = fake_bin / name
+            path.write_text(text, encoding="utf-8")
+            path.chmod(0o755)
+            if os.getuid() == 0:
+                os.chown(path, self.drop_uid, self.drop_gid)
+        if os.getuid() == 0:
+            os.chown(fake_bin, self.drop_uid, self.drop_gid)
+            os.chown(clock, self.drop_uid, self.drop_gid)
+        return {"PATH": f"{fake_bin}:{self.environment['PATH']}", "SDSYNC_TEST_CLOCK": str(clock)}, clock
+
+    # The core's clock advance, in seconds of NAS time, for a sync.
+    CTL_ADVANCE = (
+        'ctl_advance() { IFS= read -r ctl_now < "$SDSYNC_TEST_CLOCK"; '
+        'printf "%s\\n" $((ctl_now + $1)) > "$SDSYNC_TEST_CLOCK.core"; '
+        'mv -f "$SDSYNC_TEST_CLOCK.core" "$SDSYNC_TEST_CLOCK"; }\n'
+    )
+
+    def ctl_start(self, env: dict[str, str]) -> None:
+        started = self.shell(self.lifecycle, "start", extra_environment=env, timeout=30)
+        self.assertEqual(started.returncode, 0, started.stdout + started.stderr)
+
+    def ctl_events(self, event: str, needle: str = "") -> list[dict[str, object]]:
+        return [
+            record for record in self.controller_events()
+            if record.get("event") == event and needle in str(record.get("detail", ""))
+        ]
+
+    def ctl_wait(self, predicate, what: str, timeout: float = 40.0):
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            value = predicate()
+            if value:
+                return value
+            time.sleep(0.05)
+        self.fail(f"timed out waiting for {what}\n{self.ctl_dump()}")
+
+    def ctl_runs(self, profile: str) -> list[dict[str, object]]:
+        return self.ctl_events("routine_run", f"profile={profile} ")
+
+    def ctl_wait_runs(self, profile: str, count: int, timeout: float = 40.0) -> list[dict[str, object]]:
+        return self.ctl_wait(
+            lambda: (lambda runs: runs if len(runs) >= count else None)(self.ctl_runs(profile)),
+            f"{count} routine_run event(s) for {profile}", timeout,
+        )
+
+    def ctl_kv(self, path: Path) -> dict[str, str]:
+        values: dict[str, str] = {}
+        if not path.exists():
+            return values
+        for line in path.read_text(encoding="utf-8").splitlines():
+            key, separator, value = line.partition("=")
+            if separator and key not in values:
+                values[key] = value
+        return values
+
+    def ctl_state(self, profile: str) -> dict[str, str]:
+        return self.ctl_kv(self.real_var / f"state/routines/{profile}.state")
+
+    def ctl_controller_epoch(self) -> int:
+        value = self.ctl_kv(self.real_var / "state/controller.state").get("updated_epoch", "0")
+        return int(value) if value.isdigit() else 0
+
+    def ctl_settle(self, clock: Path, epoch: int, turns: int = 3) -> int:
+        """Set the clock to EPOCH and prove that whole controller turns ran at it.
+
+        controller.state is rewritten at least once per turn with the clock's
+        value, so seeing EPOCH+k after writing it proves a turn began after the
+        previous value was seen. Returns the last epoch written.
+        """
+        for step in range(turns):
+            value = epoch + step
+            write_clock(clock, f"{value}\n")
+            self.ctl_wait(lambda: self.ctl_controller_epoch() == value, f"a controller turn at {value}")
+        return epoch + turns - 1
+
+    def ctl_alive(self) -> bool:
+        pid_path = self.real_var / "run/controller.pid"
+        try:
+            pid = int(pid_path.read_text(encoding="utf-8").strip())
+            os.kill(pid, 0)
+        except (OSError, ValueError):
+            return False
+        return True
+
+    def ctl_clock_reads(self, clock: Path) -> int:
+        reads = clock.with_name(clock.name + ".reads")
+        return reads.stat().st_size if reads.exists() else 0
+
+    def ctl_turns(self, clock: Path, reads: int = 40) -> None:
+        """Wait until the controller has read the clock READS more times: whole turns ran."""
+        target = self.ctl_clock_reads(clock) + reads
+        self.ctl_wait(lambda: self.ctl_clock_reads(clock) >= target, f"{reads} more controller clock reads")
+
+    def ctl_activity_rows(self) -> list[list[str]]:
+        rows = []
+        for line in self.ctl_activity():
+            fields = line.split("|")
+            if len(fields) >= 7:
+                rows.append(fields)
+        return rows
+
+    def ctl_activity(self) -> list[str]:
+        path = self.real_var / "log/activity.log"
+        return path.read_text(encoding="utf-8").splitlines() if path.exists() else []
+
+    def ctl_dump(self) -> str:
+        parts = []
+        for relative in ("state/run.state", "state/alerts.state", "state/controller.state"):
+            path = self.real_var / relative
+            parts.append(f"--- {relative}:\n" + (path.read_text(encoding="utf-8") if path.exists() else "<absent>"))
+        for path in sorted((self.real_var / "state/routines").glob("*.state")):
+            parts.append(f"--- {path.name}:\n" + path.read_text(encoding="utf-8"))
+        parts.append("--- activity tail:\n" + "\n".join(self.ctl_activity()[-15:]))
+        log = self.real_var / "log/controller.log"
+        if log.exists():
+            parts.append("--- controller.log tail:\n" + "\n".join(log.read_text(encoding="utf-8").splitlines()[-25:]))
+        return "\n".join(parts)
+
+    def ctl_syncs(self, needle: str = " sync ") -> list[str]:
+        if not self.capture.exists():
+            return []
+        return [line for line in self.capture.read_text(encoding="utf-8").splitlines() if needle in f" {line} "]
+
+    # ------------------------------------------------------------- ADV-C-1
+    def test_a_daily_run_that_ends_after_midnight_still_runs_the_next_night(self) -> None:
+        self.ctl_profile("nightly", self.source_one)
+        self.ctl_routine("nightly", "daily", start="23:30", end="23:59")
+        env, clock = self.ctl_world("c1", 1787614200)  # 2026-08-24 23:30 UTC
+        # Each sync takes 45 minutes of NAS time, so it ends at 00:15.
+        self.install_test_core(
+            self.CTL_ADVANCE + 'case " $* " in *" sync "*) ctl_advance 2700 ;; esac\nexit 0\n'
+        )
+        self.capture.write_text("", encoding="utf-8")
+        self.ctl_start(env)
+        self.ctl_wait_runs("nightly", 1)
+        self.assertEqual(self.ctl_state("nightly").get("last_day"), "2026-08-24", self.ctl_dump())
+        write_clock(clock, "1787700600\n")  # 2026-08-25 23:30: the 25th's run is due
+        self.ctl_wait_runs("nightly", 2)
+        self.assertEqual(self.ctl_state("nightly").get("last_day"), "2026-08-25", self.ctl_dump())
+
+    def test_a_wrapping_daily_window_runs_once_per_night_on_the_day_it_opened(self) -> None:
+        self.ctl_profile("wrap", self.source_one)
+        self.ctl_routine("wrap", "daily", start="23:00", end="01:00")
+        env, clock = self.ctl_world("c1w", 1787612400)  # 2026-08-24 23:00 UTC
+        self.install_test_core(
+            self.CTL_ADVANCE + 'case " $* " in *" sync "*) ctl_advance 600 ;; esac\nexit 0\n'
+        )
+        self.capture.write_text("", encoding="utf-8")
+        self.ctl_start(env)
+        self.ctl_wait_runs("wrap", 1)
+        self.assertEqual(self.ctl_state("wrap").get("last_day"), "2026-08-24", self.ctl_dump())
+        # 00:30 on the 25th is the same night's window: no second run.
+        self.ctl_settle(clock, 1787617800)
+        self.assertEqual(len(self.ctl_runs("wrap")), 1, self.ctl_dump())
+        write_clock(clock, "1787698800\n")  # 2026-08-25 23:00: the next night opens
+        self.ctl_wait_runs("wrap", 2)
+        self.assertEqual(self.ctl_state("wrap").get("last_day"), "2026-08-25", self.ctl_dump())
+
+    # ------------------------------------------------------------- ADV-C-7
+    def test_a_cancelled_daily_run_waits_out_the_cancellation_floor(self) -> None:
+        self.ctl_profile("dc", self.source_one)
+        self.ctl_routine("dc", "daily")
+        env, clock = self.ctl_world("c7", 1787572800)  # 2026-08-24 12:00 UTC
+        self.install_test_core('case " $* " in *" sync "*) exit 130 ;; esac\nexit 0\n')
+        self.capture.write_text("", encoding="utf-8")
+        self.ctl_start(env)
+        first = self.ctl_wait_runs("dc", 1)
+        self.assertIn("exit=130", str(first[0].get("detail")))
+        self.assertIn("reason=cancelled", str(first[0].get("detail")))
+        self.ctl_settle(clock, 1787572800, turns=5)
+        self.assertEqual(len(self.ctl_runs("dc")), 1, self.ctl_dump())
+        write_clock(clock, "1787572840\n")
+        self.ctl_wait_runs("dc", 2)
+
+    # ------------------------------------------------------------- ADV-C-6
+    def test_a_backwards_clock_step_is_clamped_and_recorded(self) -> None:
+        self.ctl_profile("rt", self.source_two)
+        self.ctl_profile("iv", self.source_one)
+        (self.source_two / "a.txt").write_text("one\n", encoding="utf-8")
+        self.ctl_routine("rt", "realtime", poll="5")
+        self.ctl_routine("iv", "interval", interval="600")
+        env, clock = self.ctl_world("c6", 100000)
+        self.install_test_core("exit 0\n")
+        self.capture.write_text("", encoding="utf-8")
+        self.ctl_start(env)
+        self.ctl_wait(
+            lambda: "fingerprint=v" in (self.real_var / "state/routines/rt.state").read_text(encoding="utf-8")
+            if (self.real_var / "state/routines/rt.state").exists() else False,
+            "a realtime baseline",
+        )
+        self.ctl_wait(lambda: self.ctl_state("iv").get("next_run_epoch") not in (None, "0"), "an interval deadline")
+        # NTP steps the clock back about half a day; the source changes.
+        (self.source_two / "a.txt").write_text("two two\n", encoding="utf-8")
+        epoch = 50000
+        while epoch < 50300 and not (self.ctl_syncs("sync --profile rt") and self.ctl_syncs("sync --profile iv")):
+            epoch = self.ctl_settle(clock, epoch, turns=2) + 10
+        self.assertTrue(self.ctl_syncs("sync --profile rt"), "realtime polling stalled after the step\n" + self.ctl_dump())
+        self.assertTrue(self.ctl_syncs("sync --profile iv"), "interval deadline stalled after the step\n" + self.ctl_dump())
+        details = [str(record.get("detail")) for record in self.ctl_events("clock_step_detected")]
+        self.assertTrue(any("profile=rt" in detail and "field=last_poll_epoch" in detail for detail in details), details)
+        self.assertTrue(any("profile=iv" in detail and "field=next_run_epoch" in detail for detail in details), details)
+
+    # ------------------------------------------------------------- ADV-C-11
+    def test_an_interrupted_aggregate_is_rescheduled_soon_and_not_an_error(self) -> None:
+        self.ctl_profile("agg", self.source_one)
+        scheduled, _ = self.api(
+            "schedule", "--enabled", "true", "--interval", "86400",
+            "--allow-delete", "false", "--max-total-delete", "100",
+        )
+        self.assertEqual(scheduled.returncode, 0, scheduled.stderr)
+        self.write_private_state(self.real_var / "state/schedule.state", "next_run_epoch=1\n")
+        env, clock = self.ctl_world("c11", 200000)
+        marker = self.root / "c11-once"
+        self.install_test_core(
+            'case " $* " in *" sync "*)\n'
+            f'  if [ ! -e {marker} ]; then : > {marker}; exit 143; fi ;;\n'
+            "esac\nexit 0\n"
+        )
+        self.capture.write_text("", encoding="utf-8")
+        self.ctl_start(env)
+        write_clock(clock, "200061\n")  # the past deadline runs a minute after start
+        first = self.ctl_wait(lambda: self.ctl_events("scheduled_run"), "the interrupted aggregate")
+        self.assertEqual(first[0].get("level"), "info", first)
+        detail = str(first[0].get("detail"))
+        self.assertIn("exit=143", detail)
+        self.assertIn("reason=cancelled", detail)
+        next_run = int(detail.split("next=")[1].split()[0])
+        self.assertLessEqual(next_run, 200061 + 120, detail)
+        write_clock(clock, f"{next_run + 1}\n")
+        second = self.ctl_wait(lambda: (lambda e: e if len(e) >= 2 else None)(self.ctl_events("scheduled_run")),
+                               "the re-run of the interrupted aggregate")
+        self.assertIn("exit=0", str(second[1].get("detail")))
+
+    # ------------------------------------------------------------- ADV-C-2
+    def ctl_inject_state_write_fault(self, fault: Path) -> None:
+        """While FAULT names a path, routine-state temp files are written there instead."""
+        controller = self.real_target / "libexec/sdsync-controller"
+        source = controller.read_text(encoding="utf-8")
+        needle = "    routine_state_temp=$routine_state_dir/.${routine_state_profile}.state.$$\n"
+        self.assertEqual(source.count(needle), 1, "routine-state temp path changed")
+        controller.write_text(
+            source.replace(
+                needle,
+                f'    routine_state_temp=$(cat {fault} 2>/dev/null || '
+                'printf \'%s\' "$routine_state_dir/.${routine_state_profile}.state.$$")\n',
+            ),
+            encoding="utf-8",
+        )
+
+    def ctl_state_write_failure_survives(self, label: str, target: str, cause: str) -> None:
+        self.ctl_profile("wr", self.source_one)
+        self.ctl_routine("wr", "interval", interval="60")
+        env, clock = self.ctl_world(label, 300000)
+        fault = self.root / f"{label}-fault"
+        self.ctl_inject_state_write_fault(fault)
+        self.install_test_core("exit 0\n")
+        self.capture.write_text("", encoding="utf-8")
+        self.ctl_start(env)
+        write_clock(clock, "300061\n")
+        self.ctl_wait_runs("wr", 1)
+        pid = int((self.real_var / "run/controller.pid").read_text(encoding="utf-8").strip())
+        syncs = len(self.ctl_syncs())
+        fault.write_text(target, encoding="utf-8")
+        write_clock(clock, "300200\n")  # the routine is due again, and its record cannot be written
+        failures = self.ctl_wait(lambda: self.ctl_events("routine_state_write_failed"), "routine_state_write_failed")
+        self.ctl_turns(clock)
+        self.assertTrue(self.ctl_alive(), "the controller ended on a failed state write\n" + self.ctl_dump())
+        self.assertEqual(failures[0].get("level"), "error")
+        detail = str(failures[0].get("detail"))
+        self.assertIn("routines/wr.state", detail)
+        self.assertIn(cause, detail)
+        # Exactly one record per episode, not one per turn.
+        self.assertEqual(len(self.ctl_events("routine_state_write_failed")), 1, self.ctl_dump())
+        # A run whose record cannot be written is not started.
+        self.assertEqual(len(self.ctl_syncs()), syncs, self.ctl_dump())
+        fault.unlink()
+        self.ctl_wait_runs("wr", 2)
+        self.ctl_wait(lambda: self.ctl_events("state_write_recovered", "routines/wr.state"), "state_write_recovered")
+        self.assertEqual(int((self.real_var / "run/controller.pid").read_text(encoding="utf-8").strip()), pid)
+        self.assertTrue(self.ctl_alive())
+
+    def test_a_full_volume_never_ends_the_controller(self) -> None:
+        self.ctl_state_write_failure_survives("c2nospc", "/dev/full", "No space left on device")
+
+    def test_an_unwritable_state_directory_never_ends_the_controller(self) -> None:
+        locked = self.root / "c2-locked"
+        locked.mkdir(mode=0o500)
+        self.ctl_state_write_failure_survives("c2acces", str(locked / "wr.state.tmp"), "Permission denied")
+
+    # ------------------------------------------------------------- ADV-C-14 / ADV-C-10
+    def test_a_runner_that_never_started_is_recorded_with_its_own_reason(self) -> None:
+        self.ctl_profile("nostart", self.source_one)
+        self.ctl_routine("nostart", "interval", interval="60", retries="0")
+        env, clock = self.ctl_world("c14", 400000)
+        self.install_test_core("exit 0\n")
+        # The previous run of this profile failed for another reason; a new
+        # failure must not inherit it.
+        self.write_private_state(
+            self.real_var / "state/run.state",
+            "state=failed\nstarted_epoch=10\nfinished_epoch=11\nexit_code=1\nscope=nostart\n"
+            "operation=sync\nreason=password_missing\n",
+        )
+        self.capture.write_text("", encoding="utf-8")
+        self.ctl_start(env)
+        self.ctl_wait(lambda: self.ctl_state("nostart").get("state") == "scheduled", "a scheduled routine")
+        (self.real_target / "libexec/sdsync-run").chmod(0o644)
+        write_clock(clock, "400061\n")
+        runs = self.ctl_wait_runs("nostart", 1)
+        detail = str(runs[0].get("detail"))
+        self.assertRegex(detail, r"exit=12[67] ")
+        self.assertIn("reason=runner_error", detail)
+        self.assertEqual(self.ctl_state("nostart").get("last_reason"), "runner_error")
+        rows = [row for row in self.ctl_activity_rows() if row[1] == "run.failed" and row[2] == "nostart"]
+        self.assertEqual(len(rows), 1, self.ctl_dump())
+        self.assertEqual(rows[0][5], "error")
+        self.assertEqual(self.ctl_kv(self.real_var / "state/alerts.state").get("failure_count"), "1", self.ctl_dump())
+
+    def test_a_lock_failure_is_not_reported_as_a_core_failure(self) -> None:
+        self.ctl_profile("lockp", self.source_one)
+        self.ctl_routine("lockp", "interval", interval="60", retries="0")
+        env, clock = self.ctl_world("c10", 500000)
+        self.install_test_core("exit 0\n")
+        self.write_private_state(
+            self.real_var / "state/run.state",
+            "state=failed\nstarted_epoch=10\nfinished_epoch=11\nexit_code=1\nscope=lockp\n"
+            "operation=sync\nreason=password_missing\n",
+        )
+        self.capture.write_text("", encoding="utf-8")
+        self.ctl_start(env)
+        self.ctl_wait(lambda: self.ctl_state("lockp").get("state") == "scheduled", "a scheduled routine")
+        # An unsafe run lock: the runner cannot acquire it and says so.
+        lock = self.real_var / "run/run.lock"
+        lock.mkdir(mode=0o755)
+        write_clock(clock, "500061\n")
+        runs = self.ctl_wait_runs("lockp", 1)
+        detail = str(runs[0].get("detail"))
+        self.assertIn("exit=73 ", detail)
+        self.assertIn("reason=admission_failed", detail)
+        self.assertNotIn("core_failed", detail)
+        self.assertEqual(self.ctl_state("lockp").get("last_reason"), "admission_failed")
+
+    # ------------------------------------------------------------- ADV-C-12
+    def test_ladder_exhaustion_escalation_honours_the_alert_cooldown(self) -> None:
+        self.ctl_profile("esc", self.source_one)
+        self.ctl_routine("esc", "interval", interval="60", retries="1", backoff="10")
+        alerts, _ = self.api(
+            "alert-policy", "--enabled", "true", "--on-success", "false",
+            "--on-failure", "true", "--failure-threshold", "1", "--cooldown", "3600",
+        )
+        self.assertEqual(alerts.returncode, 0, alerts.stdout + alerts.stderr)
+        env, clock = self.ctl_world("c12", 600000)
+        self.install_test_core(
+            'case " $* " in *" sync "*) echo "error: authentication failed" >&2; exit 1 ;; esac\nexit 0\n'
+        )
+        self.capture.write_text("", encoding="utf-8")
+        self.ctl_start(env)
+        epoch = 600000
+
+        def escalations() -> list[dict[str, object]]:
+            return self.ctl_events("alert_unavailable", "profile=esc channel=desktop")
+
+        def exhausted() -> int:
+            return len(self.ctl_events("routine_retries_exhausted", "profile=esc "))
+
+        while exhausted() < 3 and epoch < 600000 + 1200:
+            epoch = self.ctl_settle(clock, epoch + 15, turns=2)
+        self.assertGreaterEqual(exhausted(), 3, self.ctl_dump())
+        self.assertEqual(len(escalations()), 1, self.ctl_dump())
+        self.assertTrue(self.ctl_events("routine_escalation_cooldown", "profile=esc "), self.ctl_dump())
+        # Past the cooldown the next exhaustion escalates again.
+        epoch = self.ctl_settle(clock, epoch + 3600, turns=2)
+        target = exhausted() + 1
+        while exhausted() < target and epoch < 600000 + 6000:
+            epoch = self.ctl_settle(clock, epoch + 15, turns=2)
+        self.assertEqual(len(escalations()), 2, self.ctl_dump())
+
+    # ------------------------------------------------------------- ADV-C-5
+    def ctl_slow_cancel_core(self, label: str, *, ignore_term: bool) -> tuple[Path, Path]:
+        pid_file = self.root / f"{label}-core.pid"
+        term_seen = self.root / f"{label}-term"
+        handler = "'' TERM INT" if ignore_term else f"': > {term_seen}; /bin/sleep 6; exit 130' TERM INT"
+        once = self.root / f"{label}-once"
+        self.install_test_core(
+            'case " $* " in *" sync "*)\n'
+            f'  if [ ! -e {once} ]; then : > {once}\n'
+            f'    printf "%s\\n" "$$" > {pid_file}\n'
+            f"    trap {handler}\n"
+            "    while :; do /bin/sleep 1; done\n"
+            "  fi ;;\nesac\nexit 0\n"
+        )
+        return pid_file, term_seen
+
+    def ctl_assert_stop_was_a_cancellation(self, env: dict[str, str]) -> None:
+        state = self.ctl_kv(self.real_var / "state/run.state")
+        self.assertEqual(state.get("state"), "failed", self.ctl_dump())
+        self.assertEqual(state.get("reason"), "cancelled", self.ctl_dump())
+        runs = self.ctl_runs("slow")
+        self.assertTrue(runs, self.ctl_dump())
+        self.assertIn("reason=cancelled", str(runs[-1].get("detail")))
+        self.assertEqual(runs[-1].get("level"), "info")
+        self.assertEqual(self.ctl_state("slow").get("last_reason"), "cancelled")
+        started = self.shell(self.lifecycle, "start", extra_environment=env, timeout=30)
+        self.assertEqual(started.returncode, 0, started.stdout + started.stderr)
+        self.ctl_turns(Path(env["SDSYNC_TEST_CLOCK"]))
+        self.assertFalse(self.ctl_events("run_runner_died"), self.ctl_dump())
+        self.assertNotIn(
+            "error", [row[5] for row in self.ctl_activity_rows() if row[1] == "run.failed"], self.ctl_dump()
+        )
+        self.assertIn(
+            self.ctl_kv(self.real_var / "state/alerts.state").get("failure_count"), (None, "0"), self.ctl_dump()
+        )
+
+    def test_a_package_stop_waits_for_a_slow_cooperative_cancel(self) -> None:
+        self.ctl_profile("slow", self.source_one)
+        self.ctl_routine("slow", "interval", interval="60")
+        env, clock = self.ctl_world("c5a", 700000)
+        pid_file, term_seen = self.ctl_slow_cancel_core("c5a", ignore_term=False)
+        self.capture.write_text("", encoding="utf-8")
+        self.ctl_start(env)
+        write_clock(clock, "700061\n")
+        self.ctl_wait(pid_file.exists, "the core to start")
+        core_pid = int(pid_file.read_text(encoding="utf-8").strip())
+        stopped = self.shell(self.lifecycle, "stop", timeout=150)
+        self.assertEqual(stopped.returncode, 0, stopped.stdout + stopped.stderr)
+        self.assertTrue(term_seen.exists(), "the core was never asked to cancel")
+        with self.assertRaises(ProcessLookupError):
+            os.kill(core_pid, 0)
+        self.assertNotIn("exit=137", " ".join(str(r.get("detail")) for r in self.ctl_runs("slow")), self.ctl_dump())
+        self.ctl_assert_stop_was_a_cancellation(env)
+
+    def test_a_runner_killed_by_a_package_stop_is_recorded_as_cancelled(self) -> None:
+        self.ctl_profile("slow", self.source_one)
+        self.ctl_routine("slow", "interval", interval="60")
+        env, clock = self.ctl_world("c5b", 800000)
+        env["SDSYNC_DSM_RUNNER_STOP_GRACE"] = "2"
+        pid_file, _ = self.ctl_slow_cancel_core("c5b", ignore_term=True)
+        self.capture.write_text("", encoding="utf-8")
+        self.ctl_start(env)
+        write_clock(clock, "800061\n")
+        self.ctl_wait(pid_file.exists, "the core to start")
+        stopped = self.shell(self.lifecycle, "stop", timeout=150)
+        self.assertEqual(stopped.returncode, 0, stopped.stdout + stopped.stderr)
+        self.assertTrue(self.ctl_events("runner_stop_forced", "profile=slow"), self.ctl_dump())
+        self.ctl_assert_stop_was_a_cancellation(env)
+
+    # ------------------------------------------------------------- ADV-C-16
+    def test_runtime_leftovers_of_dead_processes_are_pruned_at_start(self) -> None:
+        import subprocess
+        dead = subprocess.Popen(["/bin/true"])
+        dead.wait()
+        dead_pid = dead.pid
+        live_pid = os.getpid()
+        with open(f"/proc/{live_pid}/stat", encoding="utf-8") as handle:
+            live_start = handle.read().rsplit(") ", 1)[1].split()[19]
+        run = self.real_var / "run"
+        run.mkdir(parents=True, exist_ok=True)
+        stale_files = [
+            run / f"core-stdout.{dead_pid}", run / f"core-stderr.{dead_pid}", run / f"core-result.{dead_pid}",
+            run / f".child-admission.{dead_pid}.12345.3",
+            run / f".child-admission.{live_pid}.1.4",  # a reused pid: wrong start tick
+            run / f".runner-wait-guard-admit.{dead_pid}.12345.5",
+        ]
+        stale_dirs = [run / f".runner-wait-guard-admit.{dead_pid}.12345.6.stop", run / f"fingerprint.{dead_pid}.0"]
+        kept_files = [run / f"core-stdout.{live_pid}", run / f".child-admission.{live_pid}.{live_start}.7"]
+        kept_dirs = [run / f"fingerprint.{live_pid}.1"]
+        for path in stale_files + kept_files:
+            self.write_private_state(path, "x\n")
+        for path in stale_dirs + kept_dirs:
+            path.mkdir(mode=0o700)
+        (run / f"fingerprint.{dead_pid}.0" / "metadata").write_text("x\n", encoding="utf-8")
+        env, _ = self.ctl_world("c16", 900000)
+        self.ctl_start(env)
+        pruned = self.ctl_wait(lambda: self.ctl_events("runtime_leftovers_pruned"), "runtime_leftovers_pruned")
+        self.assertIn(f"count={len(stale_files) + len(stale_dirs)}", str(pruned[0].get("detail")))
+        for path in stale_files + stale_dirs:
+            self.assertFalse(path.exists(), path)
+        for path in kept_files + kept_dirs:
+            self.assertTrue(path.exists(), path)
+
+    # ------------------------------------------------------------- ADV-C-8
+    def test_a_realtime_routine_that_keeps_deferring_paths_backs_off(self) -> None:
+        self.ctl_profile("part", self.source_two)
+        (self.source_two / "a.txt").write_text("one\n", encoding="utf-8")
+        self.ctl_routine("part", "realtime", poll="5", backoff="10")
+        env, clock = self.ctl_world("c8", 1000000)
+        self.install_test_core('case " $* " in *" sync "*) exit 3 ;; esac\nexit 0\n')
+        self.capture.write_text("", encoding="utf-8")
+        self.ctl_start(env)
+        self.ctl_wait(
+            lambda: "fingerprint=v" in (self.real_var / "state/routines/part.state").read_text(encoding="utf-8")
+            if (self.real_var / "state/routines/part.state").exists() else False,
+            "a realtime baseline",
+        )
+        (self.source_two / "a.txt").write_text("two two\n", encoding="utf-8")
+        epoch = 1000000
+        while epoch < 1000000 + 1500:  # 25 minutes of NAS time
+            epoch = self.ctl_settle(clock, epoch + 20, turns=2)
+        syncs = len(self.ctl_syncs("sync --profile part"))
+        # Backoff 10, 20, 40, 80, 160 s, then the 15-minute cool-down.
+        self.assertGreaterEqual(syncs, 3, self.ctl_dump())
+        self.assertLessEqual(syncs, 8, self.ctl_dump())
+        rows = [row for row in self.ctl_activity_rows() if row[1] == "routine.retries_exhausted" and row[2] == "part"]
+        self.assertEqual(len(rows), 1, self.ctl_dump())
+        self.assertEqual(rows[0][5], "warn")
+
+    # ------------------------------------------------------------- ADV-C-9
+    def test_a_busy_deferral_writes_no_failed_audit_rows(self) -> None:
+        self.ctl_profile("routed", self.source_two)
+        self.ctl_routine("routed", "interval", interval="60")
+        env, clock = self.ctl_world("c9", 1100000)
+        self.install_test_core("exit 0\n")
+        holder = self.root / "c9-holder.sh"
+        holder.write_text(
+            "#!/bin/sh\nset -eu\n"
+            f'. "{self.real_target / "libexec/sdsync-common"}"\n'
+            "ensure_layout\n"
+            "while :; do\n"
+            '    status=0; acquire_private_process_lock "$run_lock" || status=$?\n'
+            '    [ "$status" -ne 0 ] || break\n'
+            '    [ "$status" -eq 75 ] || exit "$status"\n'
+            "    /bin/sleep 0.05\n"
+            "done\n"
+            ': > "$1"\n'
+            'while [ ! -e "$2" ]; do /bin/sleep 0.02; done\n'
+            'release_private_process_lock "$run_lock"\n',
+            encoding="utf-8",
+        )
+        holder.chmod(0o755)
+        ready = self.root / "c9.ready"
+        release = self.root / "c9.release"
+        self.ctl_start(env)
+        held = self.shell_process(holder, str(ready), str(release))
+        self.addCleanup(lambda: [stream.close() for stream in (held.stdout, held.stderr) if stream])
+        try:
+            self.wait_for_path(ready, "the run lock holder did not take the lock", timeout=20)
+            epoch = 1100061
+            while len([r for r in self.ctl_runs("routed") if "exit=75 " in str(r.get("detail"))]) < 3:
+                epoch = self.ctl_settle(clock, epoch + 31, turns=1)
+        finally:
+            release.write_text("", encoding="utf-8")
+            held.wait(timeout=30)
+        errors = [row for row in self.ctl_activity_rows() if row[5] == "error"]
+        self.assertEqual(errors, [], self.ctl_dump())
+        deferred = [row for row in self.ctl_activity_rows() if row[1] == "run.deferred"]
+        self.assertEqual(len(deferred), 1, self.ctl_dump())
+
+    # ------------------------------------------------------------- ADV-C-13
+    def test_a_stalled_run_is_reported_and_alerted_without_being_killed(self) -> None:
+        self.ctl_profile("hung", self.source_one)
+        self.ctl_routine("hung", "interval", interval="60")
+        env, clock = self.ctl_world("c13", 1200000)
+        env["SDSYNC_DSM_RUNNER_STOP_GRACE"] = "10"
+        pid_file = self.root / "c13-core.pid"
+        self.install_test_core(
+            'case " $* " in *" sync "*)\n'
+            f'  printf "%s\n" "$$" > {pid_file}\n'
+            "  exec /bin/sleep 100000 ;;\n"
+            "esac\nexit 0\n"
+        )
+        self.capture.write_text("", encoding="utf-8")
+        self.ctl_start(env)
+        write_clock(clock, "1200061\n")
+        self.ctl_wait(pid_file.exists, "the core to start")
+        core_pid = int(pid_file.read_text(encoding="utf-8").strip())
+        try:
+            # The core has exec'd its final image and its I/O counters are
+            # still; three more heartbeat writes then carry the settled reading.
+            self.ctl_wait(
+                lambda: Path(f"/proc/{core_pid}/cmdline").read_bytes().split(b"\0")[0].endswith(b"sleep"),
+                "the core to settle",
+            )
+            run_state = self.real_var / "state/run.state"
+            for _ in range(3):
+                seen = run_state.stat().st_ino if run_state.exists() else None
+                self.ctl_wait(
+                    lambda: run_state.exists() and run_state.stat().st_ino != seen
+                    and "heartbeat_epoch=" in run_state.read_text(encoding="utf-8"),
+                    "a run heartbeat",
+                )
+            write_clock(clock, "1202100\n")  # 34 minutes later, and the core has made no progress
+            blocked = self.ctl_wait(
+                lambda: self.ctl_events("controller_blocked_by_stalled_run", "scope=hung"),
+                "controller_blocked_by_stalled_run", timeout=60,
+            )
+            self.assertEqual(blocked[0].get("level"), "error")
+            self.assertIn("queued_jobs=", str(blocked[0].get("detail")))
+            self.ctl_wait(
+                lambda: self.ctl_events("alert_unavailable", "scope=hung channel=desktop reason=stalled"),
+                "the stalled-run alert",
+            )
+            os.kill(core_pid, 0)  # never killed
+            self.assertEqual(len(self.ctl_events("controller_blocked_by_stalled_run")), 1)
+            # A package stop still reaches the run the controller is blocked
+            # on, within the runner grace, and records a cancellation.
+            started = time.monotonic()
+            stopped = self.shell(self.lifecycle, "stop", timeout=150)
+            self.assertEqual(stopped.returncode, 0, stopped.stdout + stopped.stderr)
+            self.assertLess(time.monotonic() - started, 60)
+            with self.assertRaises(ProcessLookupError):
+                os.kill(core_pid, 0)
+            self.assertEqual(self.ctl_kv(self.real_var / "state/run.state").get("reason"), "cancelled", self.ctl_dump())
+            self.assertIn("reason=cancelled", str(self.ctl_runs("hung")[-1].get("detail")))
+        finally:
+            try:
+                os.kill(core_pid, 15)
+            except ProcessLookupError:
+                pass
+
+    # ------------------------------------------------------------- ADV-C-4
+    def test_a_healthy_profile_does_not_mask_a_failing_profiles_alert(self) -> None:
+        self.ctl_profile("bad", self.source_one)
+        self.ctl_profile("good", self.source_two)
+        self.ctl_routine("bad", "interval", interval="60")
+        self.ctl_routine("good", "interval", interval="60")
+        alerts, _ = self.api(
+            "alert-policy", "--enabled", "true", "--on-success", "false",
+            "--on-failure", "true", "--failure-threshold", "2", "--cooldown", "60",
+        )
+        self.assertEqual(alerts.returncode, 0, alerts.stdout + alerts.stderr)
+        env, clock = self.ctl_world("c4", 1300000)
+        self.install_test_core(
+            'case " $* " in *" --profile bad "*) echo "error: authentication failed" >&2; exit 1 ;; esac\nexit 0\n'
+        )
+        self.capture.write_text("", encoding="utf-8")
+        self.ctl_start(env)
+        epoch = 1300000
+        while (len(self.ctl_runs("bad")) < 3 or len(self.ctl_runs("good")) < 3) and epoch < 1300000 + 900:
+            # One routine runs per turn, in name order: whole turns after the
+            # step give good its turn once bad has run.
+            epoch = self.ctl_settle(clock, epoch + 61, turns=4)
+        # The runs interleave: bad, good, bad, good, ...
+        self.assertGreaterEqual(len(self.ctl_runs("bad")), 3, self.ctl_dump())
+        self.assertGreaterEqual(len(self.ctl_runs("good")), 3, self.ctl_dump())
+        attempts = [row for row in self.ctl_activity_rows() if row[1] == "notification.unavailable" and row[2] == "bad"]
+        self.assertTrue(attempts, "the failing profile never reached its alert threshold\n" + self.ctl_dump())
+        # Each scope keeps its own count (contract C-S9: state/alerts-<scope>.state).
+        bad = self.ctl_kv(self.real_var / "state/alerts-bad.state")
+        good = self.ctl_kv(self.real_var / "state/alerts-good.state")
+        self.assertGreaterEqual(int(bad.get("failure_count", "0")), 2, self.ctl_dump())
+        self.assertEqual(good.get("failure_count"), "0", self.ctl_dump())
+
+    # ------------------------------------------------------------- ADV-C-2 (runner-wait guard)
+    def ctl_guard_failure_survives(self, label: str, phase: str) -> None:
+        self.ctl_profile("guarded", self.source_one)
+        self.ctl_routine("guarded", "interval", interval="60")
+        env, clock = self.ctl_world(label, 1400000)
+        fault = self.root / f"{label}-fault"
+        controller = self.real_target / "libexec/sdsync-controller"
+        source = controller.read_text(encoding="utf-8")
+        needle = {
+            "start": "start_runner_wait_guard() {\n",
+            "stop": '    [ -n "$runner_guard_pid" ] || return 0\n',
+        }[phase]
+        self.assertEqual(source.count(needle), 1, needle)
+        controller.write_text(
+            source.replace(needle, needle + f"    [ ! -e {fault} ] || return 73\n"), encoding="utf-8"
+        )
+        release = self.root / f"{label}-release"
+        self.install_test_core(
+            'case " $* " in *" sync "*)\n'
+            f'  while [ ! -e {release} ]; do /bin/sleep 0.05; done ;;\n'
+            "esac\nexit 0\n"
+        )
+        self.capture.write_text("", encoding="utf-8")
+        fault.write_text("", encoding="utf-8")
+        self.ctl_start(env)
+        pid = int((self.real_var / "run/controller.pid").read_text(encoding="utf-8").strip())
+        write_clock(clock, "1400061\n")
+        self.ctl_wait(lambda: self.ctl_syncs(), "the first run to start")
+        release.write_text("", encoding="utf-8")
+        first = self.ctl_wait_runs("guarded", 1)
+        self.assertIn("exit=0 ", str(first[0].get("detail")))
+        failed = self.ctl_wait(lambda: self.ctl_events("runner_wait_guard_failed"), "runner_wait_guard_failed")
+        self.assertEqual(failed[0].get("level"), "error")
+        self.assertIn(f"phase={phase}", str(failed[0].get("detail")))
+        self.assertIn("status=73", str(failed[0].get("detail")))
+        self.assertTrue(self.ctl_alive(), self.ctl_dump())
+        # Scheduling goes on, with and then without the fault.
+        write_clock(clock, "1400130\n")
+        self.ctl_wait_runs("guarded", 2)
+        fault.unlink()
+        write_clock(clock, "1400200\n")
+        self.ctl_wait_runs("guarded", 3)
+        self.ctl_wait(lambda: self.ctl_events("runner_wait_guard_recovered"), "runner_wait_guard_recovered")
+        # Once per episode per phase. A retirement that keeps failing also
+        # fails the next start where the shell cannot reuse the live guard
+        # (bash), which is its own phase and its own single record.
+        phases = [str(record.get("detail")).split()[0] for record in self.ctl_events("runner_wait_guard_failed")]
+        self.assertEqual(len(phases), len(set(phases)), self.ctl_dump())
+        self.assertEqual(int((self.real_var / "run/controller.pid").read_text(encoding="utf-8").strip()), pid)
+        self.assertTrue(self.ctl_alive())
+
+    def test_a_runner_wait_guard_that_cannot_start_never_ends_the_controller(self) -> None:
+        self.ctl_guard_failure_survives("c2gs", "start")
+
+    def test_a_runner_wait_guard_that_cannot_stop_never_ends_the_controller(self) -> None:
+        self.ctl_guard_failure_survives("c2gt", "stop")
+
+
 # ---------------------------------------------------------------------------
 # Wait profiling (measurement only)
 #

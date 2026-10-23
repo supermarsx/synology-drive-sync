@@ -19,11 +19,52 @@ ensure_layout
 load_runtime_poll_resolution
 load_performance_policy_runtime
 [ ! -L "$controller_log" ] || { echo "refusing symlinked controller log: $controller_log" >&2; exit 73; }
-rotate_log "$controller_log" 10485760 5
+rotate_log_or_record "$controller_log" 10485760 5
 [ ! -f "$controller_log" ] || finish_private_file "$controller_log"
 
+# Most calls are bare under `set -e`, so a refused log write -- a full disk, a
+# lock it could not take -- used to end the controller in mid-turn, between
+# acting on a queued job and recording what it did. It now neither ends the
+# controller nor vanishes: the event goes to stderr, which the lifecycle points
+# at controller.log, as an unlevelled line a reader treats as an error.
 controller_log_event() {
-    append_controller_log_event "$@"
+    controller_log_status=0
+    append_controller_log_event "$@" || controller_log_status=$?
+    [ "$controller_log_status" -ne 0 ] || return 0
+    printf 'controller log event %s could not be written (status %s): level=%s %s\n' \
+        "${2:-unknown}" "$controller_log_status" "${1:-unknown}" "${3:-}" >&2
+    return 0
+}
+
+# A queue turn that cannot finish -- a consumer that could not be launched, an
+# audit outbox that would not reconcile -- used to end the controller with it.
+# The turn's own records say what failed; the queue is tried again next turn,
+# and a run of failed turns is logged once, with its status, until one succeeds.
+control_queue_failing=false
+run_control_queue_turn() {
+    control_queue_status=0
+    process_control_queue "$@" || control_queue_status=$?
+    if [ "$control_queue_status" -eq 0 ]; then
+        if [ "$control_queue_failing" = true ]; then
+            control_queue_failing=false
+            controller_log_event warn control_queue_recovered
+        fi
+        return 0
+    fi
+    if [ "$control_queue_failing" = false ]; then
+        control_queue_failing=true
+        controller_log_event error control_queue_failed "status=$control_queue_status"
+    fi
+    return 0
+}
+
+# launch_admitted_child leaves its cause in admitted_child_status. Every
+# failure used to be logged as an identity-capture failure whatever it was.
+log_child_launch_failure() {
+    case ${admitted_child_status:-unknown} in
+        capture_failed) controller_log_event error child_identity_capture_failed "kind=$1" ;;
+        *) controller_log_event error child_launch_failed "kind=$1 status=${admitted_child_status:-unknown}" ;;
+    esac
 }
 
 # An Activity record the controller could not write is reported in
@@ -33,8 +74,22 @@ controller_activity() {
     controller_activity_status=0
     append_activity "$@" || controller_activity_status=$?
     if [ "$controller_activity_status" -ne 0 ]; then
-        controller_log_event warn activity_append_failed "code=$1 status=$controller_activity_status" \
+        controller_log_event error activity_append_failed "code=$1 status=$controller_activity_status" \
             || echo "activity record $1 could not be written (status $controller_activity_status)" >&2
+    fi
+    return 0
+}
+
+# The controller has just read its configuration from disk, so a save whose
+# reload signal never arrived (controller-reload.pending) is now in effect.
+# A marker that cannot be removed keeps telling the dashboard a reload is
+# pending, which is the safe direction, and is logged.
+retire_pending_controller_reload() {
+    retire_reload_status=0
+    clear_controller_reload_marker || retire_reload_status=$?
+    if [ "$retire_reload_status" -ne 0 ]; then
+        controller_log_event error controller_reload_marker_unremovable "status=$retire_reload_status" \
+            || echo "pending-reload marker $controller_reload_marker could not be removed (status $retire_reload_status)" >&2
     fi
     return 0
 }
@@ -44,50 +99,107 @@ controller_activity() {
 # quarter hour rather than one per poll.
 realtime_exhausted_cooldown=900
 
-# The reason the runner recorded for the run that just ended, when run.state
-# still describes it. The controller waits for its runner synchronously, so the
-# slot can only have been rewritten by a run that started afterwards, which the
-# scope check catches.
+# A stored instant further ahead of the clock than any deadline this
+# controller writes can only be a clock that stepped backwards: NTP correcting
+# an RTC that ran ahead, an administrator fixing the date, or an offline NAS
+# whose RTC reset after a power loss. Polling and deadlines used to stall,
+# without a word, until the clock caught up with the old value -- on the
+# offline NAS, never. The value is brought back to now and the step is logged.
+# Sets clock_step_value; returns 0 when it clamped.
+#   clamp_clock_step SCOPE FIELD VALUE NOW HORIZON
+clamp_clock_step() {
+    clock_step_value=$3
+    [ "$3" -gt $(($4 + $5 + 60)) ] || return 1
+    controller_log_event warn clock_step_detected \
+        "$1 field=$2 ahead_seconds=$(($3 - $4))" scheduler
+    clock_step_value=$4
+    return 0
+}
+
+# The reason the runner recorded for the run that just ended. run.state is read
+# when it describes this run -- the same scope, started at or after the
+# dispatch -- and otherwise the profile's own record, which the runner writes
+# even when another run's lock keeps it out of run.state. Either record older
+# than the dispatch belongs to an earlier run: reading it regardless gave a
+# lock failure "core failed", or the cause of whatever failed last time. When
+# neither describes this run the runner left no record at all, and
+# routine_reason_recorded=false says so.
+#   routine_run_reason SCOPE SINCE  -> routine_reason_value, routine_reason_recorded
+routine_reason_record() {
+    reason_record_scope=
+    reason_record_epoch=
+    reason_record_reason=
+    [ -f "$1" ] && [ ! -L "$1" ] && [ -r "$1" ] || return 1
+    reason_record_lines=0
+    while IFS= read -r reason_record_line || [ -n "$reason_record_line" ]; do
+        reason_record_lines=$((reason_record_lines + 1))
+        [ "$reason_record_lines" -le 64 ] || break
+        case $reason_record_line in
+            scope=*) [ -n "$reason_record_scope" ] || reason_record_scope=${reason_record_line#scope=} ;;
+            reason=*) [ -n "$reason_record_reason" ] || reason_record_reason=${reason_record_line#reason=} ;;
+            "$2"=*) [ -n "$reason_record_epoch" ] || reason_record_epoch=${reason_record_line#*=} ;;
+        esac
+    done < "$1"
+    case $reason_record_epoch in ''|*[!0-9]*) return 1 ;; esac
+    [ "$reason_record_epoch" -ge "$routine_reason_since" ]
+}
 routine_run_reason() {
     routine_reason_scope=$1
-    routine_reason_value=core_failed
-    routine_reason_seen_scope=
-    routine_reason_candidate=
-    [ -f "$run_state" ] && [ ! -L "$run_state" ] && [ -r "$run_state" ] || { printf '%s' "$routine_reason_value"; return 0; }
-    routine_reason_lines=0
-    while IFS= read -r routine_reason_line || [ -n "$routine_reason_line" ]; do
-        routine_reason_lines=$((routine_reason_lines + 1))
-        [ "$routine_reason_lines" -le 64 ] || break
-        case $routine_reason_line in
-            scope=*) [ -n "$routine_reason_seen_scope" ] || routine_reason_seen_scope=${routine_reason_line#scope=} ;;
-            reason=*) routine_reason_candidate=${routine_reason_line#reason=} ;;
-        esac
-    done < "$run_state"
-    if [ "$routine_reason_seen_scope" = "$routine_reason_scope" ]; then
-        case ${routine_reason_candidate:-} in
-            ''|none|ok|*[!a-z0-9_]*) ;;
-            *) routine_reason_value=$routine_reason_candidate ;;
-        esac
+    routine_reason_since=$2
+    case $routine_reason_since in ''|*[!0-9]*) routine_reason_since=0 ;; esac
+    routine_reason_recorded=false
+    if routine_reason_record "$run_state" started_epoch \
+        && [ "$reason_record_scope" = "$routine_reason_scope" ]; then
+        routine_reason_recorded=true
+    elif [ "$routine_reason_scope" != all ] \
+        && routine_reason_record "$profile_state_dir/$routine_reason_scope.state" finished_epoch; then
+        routine_reason_recorded=true
     fi
-    printf '%s' "$routine_reason_value"
+    if [ "$routine_reason_recorded" = true ]; then
+        case $reason_record_reason in
+            ''|none|ok|*[!a-z0-9_]*) routine_reason_value=core_failed ;;
+            *) routine_reason_value=$reason_record_reason ;;
+        esac
+    else
+        routine_reason_value=runner_error
+    fi
 }
 
 # An exhausted retry ladder is the point an administrator needs to hear about
 # even if each failure's own notification was in cooldown: DSM's system log
 # (its own gate and cooldown) and, when the alert policy wants failures, a
 # desktop notification. safe_notify records its own delivery failure.
+#
+# The escalation honours the alert policy's cooldown itself, per routine
+# (escalated_epoch in the routine's state). A routine that stays broken
+# exhausts its ladder every 20-35 minutes, and bypassing the cooldown sent a
+# notification and a Log Center entry each time while the policy said one an
+# hour. A suppressed escalation is logged; the routine's own
+# routine.retries_exhausted Activity row is written every time regardless.
 routine_escalate_alert() {
     escalate_profile=$1
     escalate_exit=$2
     case $escalate_exit in ''|*[!0-9]*) escalate_exit=1 ;; esac
-    dsm_log_event sync_failed "$(epoch_now)" \
-        || controller_log_event warn alert_unavailable "profile=$escalate_profile channel=system_log" scheduler \
+    escalate_now=$(epoch_now) || escalate_now=0
+    case $escalate_now in ''|*[!0-9]*) escalate_now=0 ;; esac
+    escalate_cooldown=$(setting "$alert_policy_file" cooldown_seconds 3600) || escalate_cooldown=3600
+    case $escalate_cooldown in ''|*[!0-9]*) escalate_cooldown=3600 ;; esac
+    case ${routine_escalated_value:-0} in ''|*[!0-9]*) routine_escalated_value=0 ;; esac
+    if [ "$routine_escalated_value" -gt 0 ] && [ "$escalate_now" -ge "$routine_escalated_value" ] \
+        && [ $((escalate_now - routine_escalated_value)) -lt "$escalate_cooldown" ]; then
+        controller_log_event info routine_escalation_cooldown \
+            "profile=$escalate_profile last=$routine_escalated_value cooldown=$escalate_cooldown" scheduler
+        return 0
+    fi
+    routine_escalated_value=$escalate_now
+    dsm_log_event sync_failed "$escalate_now" \
+        || controller_log_event error alert_unavailable "profile=$escalate_profile channel=system_log" scheduler \
         || echo "system-log escalation for $escalate_profile could not be recorded" >&2
     escalate_enabled=$(setting "$alert_policy_file" enabled true) || escalate_enabled=true
     escalate_failure=$(setting "$alert_policy_file" on_failure true) || escalate_failure=true
     if [ "$escalate_enabled" = true ] && [ "$escalate_failure" = true ]; then
         safe_notify sync_failed "$escalate_profile" "$escalate_exit" \
-            || controller_log_event warn alert_unavailable "profile=$escalate_profile channel=desktop" scheduler \
+            || controller_log_event error alert_unavailable "profile=$escalate_profile channel=desktop" scheduler \
             || echo "desktop escalation for $escalate_profile could not be delivered" >&2
     fi
     return 0
@@ -103,11 +215,20 @@ routine_escalate_alert() {
 #
 # The same rule is what a reader applies at read time:
 #   state=running and run.lock has no live pid+start+boot owner => runner died.
+#
+# MODE cancelled is the controller's own package stop: it killed a runner whose
+# cancel outlasted runner_stop_grace (stop_work_children_bounded), so the run
+# is recorded as the cancellation it was -- not as a dead runner with an error
+# and an alert on the next start.
+#   reconcile_stale_run_state NOW [runner_died|cancelled]
 stale_run_check_after=0
 reconcile_stale_run_state() {
     stale_run_now=$1
-    [ "$stale_run_now" -ge "$stale_run_check_after" ] || return 0
-    stale_run_check_after=$((stale_run_now + 30))
+    stale_run_mode=${2:-runner_died}
+    if [ "$stale_run_mode" != cancelled ]; then
+        [ "$stale_run_now" -ge "$stale_run_check_after" ] || return 0
+        stale_run_check_after=$((stale_run_now + 30))
+    fi
     [ -f "$run_state" ] && [ ! -L "$run_state" ] && [ -r "$run_state" ] || return 0
     stale_run_state=
     IFS= read -r stale_run_first < "$run_state" || stale_run_first=
@@ -118,13 +239,23 @@ reconcile_stale_run_state() {
         0) return 0 ;;
         1) ;;
         *)
-            controller_log_event warn run_state_unverifiable "status=$stale_lock_status" scheduler
+            controller_log_event warn run_state_unverifiable "status=$stale_lock_status phase=liveness" scheduler
             return 0
             ;;
     esac
     stale_acquire_status=0
     acquire_private_process_lock "$run_lock" || stale_acquire_status=$?
-    [ "$stale_acquire_status" -eq 0 ] || return 0
+    case $stale_acquire_status in
+        0) ;;
+        # A runner took the lock between the two checks: it owns run.state now.
+        75) return 0 ;;
+        *)
+            # Anything else (an unsafe lock) leaves `running` unverified, and
+            # used to return here silently, every 30 seconds, forever.
+            controller_log_event warn run_state_unverifiable "status=$stale_acquire_status phase=acquire" scheduler
+            return 0
+            ;;
+    esac
     stale_run_started=0
     stale_run_scope=none
     stale_run_operation=none
@@ -142,19 +273,80 @@ reconcile_stale_run_state() {
     case $stale_run_started in ''|*[!0-9]*) stale_run_started=0 ;; esac
     case $stale_run_scope in all|none) ;; ''|*[!A-Za-z0-9_-]*) stale_run_scope=none ;; esac
     case $stale_run_operation in sync|plan) ;; *) stale_run_operation=none ;; esac
-    if [ "$stale_run_state" = running ]; then
+    if [ "$stale_run_state" = running ] && read_unrecorded_run_outcome "$stale_run_started" "$stale_run_scope"; then
+        # The runner finished and knew its outcome, but could not publish it
+        # (write_unrecorded_run_outcome). Publish that outcome, marked as a
+        # state-write failure; the runner already wrote the Activity record,
+        # the per-profile state and any alert, so none is repeated here.
+        stale_write_status=0
+        run_state_outcome=$unrecorded_outcome
+        run_state_degraded=${unrecorded_degraded:+$unrecorded_degraded,}run_state
+        run_state_degraded_reason=run_state_write_failed
+        write_run_state "$unrecorded_state" "$stale_run_started" "$unrecorded_finished" "$unrecorded_exit" \
+            "$stale_run_scope" "$unrecorded_operation" "$unrecorded_reason" "$unrecorded_detail" \
+            || stale_write_status=$?
+        run_state_degraded=
+        run_state_degraded_reason=
+        if [ "$stale_write_status" -eq 0 ]; then
+            rm -f "$run_unrecorded_marker" \
+                || controller_log_event error run_outcome_marker_unremovable "scope=$stale_run_scope" scheduler \
+                || echo "run outcome marker $run_unrecorded_marker could not be removed" >&2
+            controller_log_event error run_state_recovered \
+                "scope=$stale_run_scope operation=$unrecorded_operation outcome=${unrecorded_outcome:-$unrecorded_state} exit=$unrecorded_exit reason=run_state_write_failed" \
+                scheduler || echo "run state for $stale_run_scope was recovered from the runner's outcome marker" >&2
+        else
+            controller_log_event error run_state_write_failed \
+                "reason=run_state_write_failed status=$stale_write_status" scheduler \
+                || echo "run state for $stale_run_scope could not be written (status $stale_write_status)" >&2
+        fi
+    elif [ "$stale_run_state" = running ] && [ "$stale_run_mode" = cancelled ]; then
+        stale_write_status=0
+        run_state_outcome=cancelled
+        write_run_state failed "$stale_run_started" "$stale_run_now" 137 "$stale_run_scope" \
+            "$stale_run_operation" cancelled \
+            "the package stopped; the run had not finished cancelling after ${runner_stop_grace}s" \
+            || stale_write_status=$?
+        if [ "$stale_write_status" -eq 0 ]; then
+            controller_activity run.failed "$stale_run_scope" failed \
+                "Package action cancelled by a package stop; it had not finished cancelling after ${runner_stop_grace}s and was stopped" \
+                scheduler info
+        else
+            controller_log_event error run_state_write_failed "reason=cancelled status=$stale_write_status" scheduler
+        fi
+    elif [ "$stale_run_state" = running ]; then
         stale_write_status=0
         run_state_outcome=failed
         write_run_state failed "$stale_run_started" "$stale_run_now" -1 "$stale_run_scope" \
             "$stale_run_operation" runner_died "the runner stopped without recording an outcome" \
             || stale_write_status=$?
         if [ "$stale_write_status" -eq 0 ]; then
+            # The profiles the dead sync covered get its verdict too, or their
+            # rows go back to their previous success after this rewrite.
+            if [ "$stale_run_operation" = sync ] && [ "$stale_run_scope" != none ]; then
+                if [ "$stale_run_scope" = all ]; then
+                    stale_profile_scope=all
+                    stale_profiles_glob=*
+                else
+                    stale_profile_scope=profile
+                    stale_profiles_glob=$stale_run_scope
+                fi
+                for stale_fragment in "$profiles_dir"/$stale_profiles_glob.toml; do
+                    [ -f "$stale_fragment" ] && [ ! -L "$stale_fragment" ] || continue
+                    stale_profile=${stale_fragment##*/}
+                    stale_profile=${stale_profile%.toml}
+                    stale_profile_status=0
+                    stamp_dead_run_profile "$stale_profile" "$stale_run_started" "$stale_run_now" \
+                        "$stale_profile_scope" || stale_profile_status=$?
+                    [ "$stale_profile_status" -eq 0 ] || controller_log_event error profile_state_write_failed \
+                        "profile=$stale_profile status=$stale_profile_status reason=runner_died" scheduler
+                done
+            fi
             controller_activity run.failed "$stale_run_scope" failed \
                 "Package action ended without recording an outcome; the runner stopped unexpectedly" \
                 scheduler error
             if [ "$stale_run_operation" = sync ] && [ "$stale_run_scope" != none ]; then
                 handle_alert_result "$stale_run_scope" failed 1 \
-                    || controller_log_event warn alert_unavailable "scope=$stale_run_scope reason=runner_died" scheduler \
+                    || controller_log_event error alert_unavailable "scope=$stale_run_scope reason=runner_died" scheduler \
                     || echo "failure alert for a dead runner could not be processed" >&2
             fi
             controller_log_event error run_runner_died "scope=$stale_run_scope operation=$stale_run_operation" scheduler
@@ -358,9 +550,11 @@ publish_control_failure() {
 
 process_control_queue() {
     interactive_only=${1:-false}
+    # Queued work waits for a reconciled audit outbox; the controller does not
+    # stop for it, and the next turn tries again.
     reconcile_audit_outbox || {
-        controller_log_event error audit_reconcile_failed "phase=queue_turn" controller true >/dev/null 2>&1 || true
-        return 73
+        controller_log_event error audit_reconcile_failed "phase=queue_turn" controller true
+        return 0
     }
     # A nested auxiliary turn runs while a primary child may still own a
     # processing request and secret. Never age-prune that active claim from the
@@ -544,7 +738,7 @@ process_control_queue() {
         if ! launch_admitted_child "$launched_control_slot" control \
             "$api_bridge" --consume-job "$consumer_processing_request" "$consumer_response_final"; then
             [ "$admitted_child_status" != cancelled ] || return 0
-            controller_log_event error child_identity_capture_failed "kind=control"
+            log_child_launch_failure control
             return 73
         fi
         launched_control_pid=$admitted_child_pid
@@ -560,7 +754,7 @@ process_control_queue() {
         fi
         controller_state_child=$launched_control_pid
         [ -z "$active_pid" ] || controller_state_child=$active_pid
-        write_controller_state running "$$" "$next_run" "$controller_state_child"
+        save_controller_state running "$$" "$next_run" "$controller_state_child"
         if [ "$interactive_only" = true ]; then
             wait_for_control_consumer
             control_exit=$control_wait_exit
@@ -662,8 +856,8 @@ process_control_queue() {
         break
     done
     reconcile_audit_outbox || {
-        controller_log_event error audit_reconcile_failed "phase=before_response_prune" controller true >/dev/null 2>&1 || true
-        return 73
+        controller_log_event error audit_reconcile_failed "phase=before_response_prune" controller true
+        return 0
     }
     [ "$interactive_only" = true ] && return 0
     response_count=0
@@ -842,6 +1036,35 @@ record_realtime_watcher_failure() {
     finish_private_file "$failure_path" || return 69
 }
 
+# The failure ladder is what makes a watcher that keeps failing give up after
+# five starts. A ladder file that cannot be written left the count at one
+# forever -- `|| true` -- so the watcher was respawned every turn and the
+# abandonment never fired. It now abandons at once, and says why.
+abandon_realtime_watcher() {
+    abandon_profile=$1
+    abandon_detail=$2
+    controller_log_event error routine_watch_abandoned "profile=$abandon_profile $abandon_detail"
+    controller_activity routine.watch_abandoned "$abandon_profile" unavailable \
+        "Realtime watcher abandoned after $realtime_watcher_failure_consecutive failed starts; changes are seen only by polling until the routine is saved again" \
+        routines error
+    realtime_backend=none
+}
+
+record_realtime_watcher_failure_or_abandon() {
+    ladder_status=0
+    record_realtime_watcher_failure "$1" "$2" || ladder_status=$?
+    if [ "$ladder_status" -ne 0 ]; then
+        controller_log_event error routine_watch_ladder_unwritable \
+            "profile=$1 path=$runtime_root/watch-$1.failed status=$ladder_status"
+        abandon_realtime_watcher "$1" "consecutive=$realtime_watcher_failure_consecutive reason=ladder_unwritable"
+        return 1
+    fi
+    if [ "$realtime_watcher_failure_consecutive" -ge 5 ]; then
+        abandon_realtime_watcher "$1" "consecutive=$realtime_watcher_failure_consecutive"
+    fi
+    return 0
+}
+
 ensure_realtime_watcher() {
     watcher_profile=$1
     watcher_source=$2
@@ -854,8 +1077,15 @@ ensure_realtime_watcher() {
     watcher_failure_path=$runtime_root/watch-$watcher_profile.failed
     watcher_source_path=$runtime_root/watch-$watcher_profile.source
     watcher_stderr_path=$runtime_root/watch-$watcher_profile.stderr
-    [ ! -L "$watcher_pid_path" ] && [ ! -L "$watcher_event_path" ] && [ ! -L "$watcher_failure_path" ] \
-        && [ ! -L "$watcher_source_path" ] && [ ! -L "$watcher_stderr_path" ] || return 73
+    for watcher_checked_path in "$watcher_pid_path" "$watcher_event_path" "$watcher_failure_path" \
+        "$watcher_source_path" "$watcher_stderr_path"; do
+        if [ -L "$watcher_checked_path" ]; then
+            # Refused, as before -- the routine is polled -- but no longer silently.
+            controller_log_event error routine_watch_unsafe "profile=$watcher_profile path=$watcher_checked_path"
+            realtime_watcher_reason=watch_setup_failed
+            return 73
+        fi
+    done
     watcher_existing=$(read_pid "$watcher_pid_path" 2>/dev/null || true)
     if [ -n "$watcher_existing" ] && pid_matches_command "$watcher_existing" "$inotify_command"; then
         # pid_matches_command deliberately never looks at the watched
@@ -908,17 +1138,10 @@ ensure_realtime_watcher() {
                 "$watcher_stderr_path" 2>/dev/null || true)
         fi
         rm -f "$watcher_pid_path" "$watcher_source_path"
-        record_realtime_watcher_failure "$watcher_profile" watch_setup_failed || true
-        controller_log_event warn routine_watch_failed \
-            "profile=$watcher_profile consecutive=$realtime_watcher_failure_consecutive detail=$watcher_dead_detail" || true
         realtime_watcher_reason=watch_setup_failed
-        if [ "$realtime_watcher_failure_consecutive" -ge 5 ]; then
-            controller_log_event error routine_watch_abandoned \
-                "profile=$watcher_profile consecutive=$realtime_watcher_failure_consecutive" || true
-            controller_activity routine.watch_abandoned "$watcher_profile" unavailable \
-                "Realtime watcher abandoned after $realtime_watcher_failure_consecutive failed starts; changes are seen only by polling until the routine is saved again" \
-                routines error
-            realtime_backend=none
+        if record_realtime_watcher_failure_or_abandon "$watcher_profile" watch_setup_failed; then
+            controller_log_event warn routine_watch_failed \
+                "profile=$watcher_profile consecutive=$realtime_watcher_failure_consecutive detail=$watcher_dead_detail"
         fi
         return 0
     fi
@@ -951,9 +1174,14 @@ ensure_realtime_watcher() {
         # here is what would make the ladder never advance past its first rung.
         # Stamping this attempt's epoch is what stops a spawn that fails again
         # from being retried on the very next five-second turn.
-        printf '%s %s %s\n' "$watcher_now" "$watcher_failed_consecutive" "$watcher_failed_reason" \
-            > "$watcher_failure_path" || return 0
-        finish_private_file "$watcher_failure_path" || return 0
+        if ! { printf '%s %s %s\n' "$watcher_now" "$watcher_failed_consecutive" "$watcher_failed_reason" \
+            > "$watcher_failure_path" && finish_private_file "$watcher_failure_path"; }; then
+            realtime_watcher_failure_consecutive=$watcher_failed_consecutive
+            controller_log_event error routine_watch_ladder_unwritable \
+                "profile=$watcher_profile path=$watcher_failure_path phase=retry"
+            abandon_realtime_watcher "$watcher_profile" "consecutive=$watcher_failed_consecutive reason=ladder_unwritable"
+            return 0
+        fi
     fi
     # Refuse before spawning when the source cannot fit in the shared watch
     # budget. inotifywait would otherwise walk the whole tree, fail with
@@ -970,26 +1198,25 @@ ensure_realtime_watcher() {
         if [ -n "$watcher_directory_count" ] \
             && [ "$watcher_directory_count" -gt $((watcher_limit / 10 * 8)) ]; then
             controller_log_event warn routine_watch_limit \
-                "profile=$watcher_profile dirs=$watcher_directory_count limit=$watcher_limit" || true
-            record_realtime_watcher_failure "$watcher_profile" watch_limit || true
+                "profile=$watcher_profile dirs=$watcher_directory_count limit=$watcher_limit"
             realtime_watcher_reason=watch_limit
-            if [ "$realtime_watcher_failure_consecutive" -ge 5 ]; then
-                controller_log_event error routine_watch_abandoned \
-                    "profile=$watcher_profile consecutive=$realtime_watcher_failure_consecutive" || true
-                controller_activity routine.watch_abandoned "$watcher_profile" unavailable \
-                    "Realtime watcher abandoned after $realtime_watcher_failure_consecutive failed starts; changes are seen only by polling until the routine is saved again" \
-                    routines error
-                realtime_backend=none
-            fi
+            record_realtime_watcher_failure_or_abandon "$watcher_profile" watch_limit || true
             return 0
         fi
     fi
-    : > "$watcher_event_path"
-    finish_private_file "$watcher_event_path"
-    : > "$watcher_stderr_path"
-    finish_private_file "$watcher_stderr_path"
-    printf '%s\n' "$watcher_source" > "$watcher_source_path"
-    finish_private_file "$watcher_source_path"
+    # This function runs as an `if` condition, so errexit is off in here: an
+    # unchecked write that failed went on to spawn a watcher reporting into a
+    # file that did not exist, and called the routine natively watched.
+    if ! { : > "$watcher_event_path" && finish_private_file "$watcher_event_path" &&
+        : > "$watcher_stderr_path" && finish_private_file "$watcher_stderr_path" &&
+        printf '%s\n' "$watcher_source" > "$watcher_source_path" &&
+        finish_private_file "$watcher_source_path"; }; then
+        controller_log_event error routine_watch_setup_failed \
+            "profile=$watcher_profile detail=a watcher file in $runtime_root could not be written"
+        realtime_watcher_reason=watch_setup_failed
+        record_realtime_watcher_failure_or_abandon "$watcher_profile" watch_setup_failed || true
+        return 0
+    fi
     # The marker's content is never read: only its size, inode and mtime are.
     # The default output format therefore spends about 29 bytes per event, and
     # more as the watched path lengthens, on text nothing will ever parse, in a
@@ -1014,8 +1241,17 @@ ensure_realtime_watcher() {
     "$inotify_command" -m -q -r --format x -e close_write,create,delete,move "$watcher_source" \
         >> "$watcher_event_path" 2>> "$watcher_stderr_path" &
     watcher_pid=$!
-    printf '%s\n' "$watcher_pid" > "$watcher_pid_path"
-    finish_private_file "$watcher_pid_path"
+    if ! { printf '%s\n' "$watcher_pid" > "$watcher_pid_path" && finish_private_file "$watcher_pid_path"; }; then
+        # Without its pid file the watcher could be neither adopted nor
+        # stopped on the next turn; do not leave it running unrecorded.
+        kill -TERM "$watcher_pid" 2>/dev/null || true
+        realtime_reap_pids="${realtime_reap_pids:-} $watcher_pid"
+        controller_log_event error routine_watch_setup_failed \
+            "profile=$watcher_profile detail=$watcher_pid_path could not be written"
+        realtime_watcher_reason=watch_setup_failed
+        record_realtime_watcher_failure_or_abandon "$watcher_profile" watch_setup_failed || true
+        return 0
+    fi
     realtime_backend=inotify
     realtime_watcher_pid=$watcher_pid
     realtime_watcher_reason=ok
@@ -1135,6 +1371,7 @@ fingerprint_reading() {
     if ! command -v find >/dev/null 2>&1 || ! command -v sort >/dev/null 2>&1 ||
         ! command -v cksum >/dev/null 2>&1 || ! command -v awk >/dev/null 2>&1 ||
         ! command -v stat >/dev/null 2>&1; then
+        echo "polling needs find, sort, cksum, awk and stat; one of them is missing" >&2
         return 69
     fi
 
@@ -1151,8 +1388,8 @@ fingerprint_reading() {
         fi
         fingerprint_attempt=$((fingerprint_attempt + 1))
     done
-    [ -n "$fingerprint_temp_dir" ] || return 73
-    chmod 700 "$fingerprint_temp_dir" || return 73
+    [ -n "$fingerprint_temp_dir" ] || { echo "no poll scratch directory could be created in $runtime_root" >&2; return 73; }
+    chmod 700 "$fingerprint_temp_dir" || { echo "the poll scratch directory $fingerprint_temp_dir could not be made private" >&2; return 73; }
     fingerprint_metadata=$fingerprint_temp_dir/metadata
     fingerprint_stderr=$fingerprint_temp_dir/stderr
     fingerprint_sorted=$fingerprint_temp_dir/sorted
@@ -1204,7 +1441,7 @@ fingerprint_reading() {
         [ "$fingerprint_find_status" -ne 0 ] || break
         # Nothing on stderr means the walk itself could not run, which is a
         # stage failure and not a subtree this poll simply could not read.
-        [ -s "$fingerprint_stderr" ] || return 69
+        [ -s "$fingerprint_stderr" ] || { echo "the find walk of the source failed (status $fingerprint_find_status)" >&2; return 69; }
         if [ "$fingerprint_walk" -ge 2 ]; then
             LC_ALL=C awk 'NR == 1 { gsub(/[^ -~]/, "?"); print substr($0, 1, 120); exit }' \
                 "$fingerprint_stderr" 2>/dev/null || true
@@ -1216,11 +1453,11 @@ fingerprint_reading() {
 
     : > "$fingerprint_sorted" || return 73
     finish_private_file "$fingerprint_sorted" || return 73
-    LC_ALL=C sort "$fingerprint_metadata" > "$fingerprint_sorted" || return 69
+    LC_ALL=C sort "$fingerprint_metadata" > "$fingerprint_sorted" || { echo "the sort stage of the poll failed" >&2; return 69; }
 
     : > "$fingerprint_checksum" || return 73
     finish_private_file "$fingerprint_checksum" || return 73
-    cksum < "$fingerprint_sorted" > "$fingerprint_checksum" || return 69
+    cksum < "$fingerprint_sorted" > "$fingerprint_checksum" || { echo "the cksum stage of the poll failed" >&2; return 69; }
     # One stdout line, retries|reading. The caller routes on the exit status: 0
     # with that shape, 70 with one sanitised stderr line for a walk that could
     # not read part of the tree, 69 for a stage failure, 73 for unsafe runtime
@@ -1281,6 +1518,7 @@ poll_job_profile=
 poll_job_purpose=
 poll_job_result=
 poll_job_output=
+poll_job_errors=
 
 start_poll_job() {
     start_poll_profile=$1
@@ -1289,12 +1527,15 @@ start_poll_job() {
     [ -z "$poll_job_pid" ] || return 75
     poll_job_result=$runtime_root/poll-$start_poll_profile.result
     poll_job_output=$runtime_root/poll-$start_poll_profile.output
-    [ ! -L "$poll_job_result" ] && [ ! -L "$poll_job_output" ] || return 73
-    rm -f "$poll_job_result" "$poll_job_output" "$poll_job_result.tmp" || return 73
+    # The walk's stderr names the stage and the tool that failed; it used to go
+    # to /dev/null, leaving `reason=fingerprint` and nothing else.
+    poll_job_errors=$runtime_root/poll-$start_poll_profile.errors
+    [ ! -L "$poll_job_result" ] && [ ! -L "$poll_job_output" ] && [ ! -L "$poll_job_errors" ] || return 73
+    rm -f "$poll_job_result" "$poll_job_output" "$poll_job_errors" "$poll_job_result.tmp" || return 73
     (
         trap - USR2 ALRM
         poll_job_status=0
-        fingerprint_reading "$start_poll_source" > "$poll_job_output" 2>/dev/null || poll_job_status=$?
+        fingerprint_reading "$start_poll_source" > "$poll_job_output" 2>"$poll_job_errors" || poll_job_status=$?
         printf '%s\n' "$poll_job_status" > "$poll_job_result.tmp" \
             && mv -f "$poll_job_result.tmp" "$poll_job_result"
     ) &
@@ -1304,7 +1545,7 @@ start_poll_job() {
 }
 
 clear_poll_job() {
-    rm -f "$poll_job_result" "$poll_job_output" "$poll_job_result.tmp" 2>/dev/null \
+    rm -f "$poll_job_result" "$poll_job_output" "${poll_job_errors:-}" "$poll_job_result.tmp" 2>/dev/null \
         || controller_log_event warn poll_job_cleanup_failed "profile=$poll_job_profile"
     poll_job_pid=
     poll_job_profile=
@@ -1323,12 +1564,16 @@ collect_poll_job() {
     reap_direct_child_interruption_safe "$poll_job_pid"
     collected_poll_status=69
     collected_poll_output=
+    collected_poll_errors=
     collected_poll_purpose=$poll_job_purpose
     if [ -f "$poll_job_result" ] && [ ! -L "$poll_job_result" ]; then
         IFS= read -r collected_poll_status < "$poll_job_result" || collected_poll_status=69
         case $collected_poll_status in ''|*[!0-9]*) collected_poll_status=69 ;; esac
         if [ -f "$poll_job_output" ] && [ ! -L "$poll_job_output" ]; then
             IFS= read -r collected_poll_output < "$poll_job_output" || collected_poll_output=
+        fi
+        if [ "$collected_poll_status" -ne 0 ] && [ -f "$poll_job_errors" ] && [ ! -L "$poll_job_errors" ]; then
+            collected_poll_errors=$(one_safe_line "$(cat "$poll_job_errors" 2>/dev/null)")
         fi
     else
         # The walk ended without publishing a result: killed, or its shell
@@ -1400,11 +1645,155 @@ write_routine_state() {
             "$routine_event_first_seen_value" "$routine_poll_retries_value" &&
         printf 'defer_reason=%s\nlast_exit_code=%s\nlast_reason=%s\n' \
             "${routine_defer_reason_value:-none}" "${routine_last_exit_value:--1}" \
-            "${routine_last_reason_value:-none}"
+            "${routine_last_reason_value:-none}" &&
+        printf 'partial_streak=%s\nescalated_epoch=%s\n' \
+            "${routine_partial_streak_value:-0}" "${routine_escalated_value:-0}"
     } > "$routine_state_temp" || { rm -f "$routine_state_temp"; return 69; }
     finish_private_file "$routine_state_temp" || { rm -f "$routine_state_temp"; return 69; }
     mv -f "$routine_state_temp" "$routine_state_dir/$routine_state_profile.state" \
         || { rm -f "$routine_state_temp"; return 69; }
+}
+
+# The controller loop's writers. A state file that cannot be written -- EACCES
+# after a restore, ENOSPC, a read-only remount -- used to end the controller
+# under `set -e`, for good: nothing restarts it, and scheduling did not resume
+# when the volume recovered. A failed write is now an error event, once per
+# episode per file, and the turn goes on; the next turn writes again from what
+# it computes, and a success closes the episode.
+state_write_failures=,
+# Sets now. A clock that cannot be read for a turn keeps the last good reading
+# rather than ending the controller, and the gap is logged once per episode.
+controller_last_now=0
+controller_now() {
+    controller_now_value=$(epoch_now) || controller_now_value=
+    case $controller_now_value in
+        ''|*[!0-9]*)
+            note_state_write clock 69 controller_clock_unavailable
+            now=$controller_last_now
+            return 0
+            ;;
+    esac
+    note_state_write clock 0 controller_clock_unavailable
+    now=$controller_now_value
+    controller_last_now=$now
+}
+
+note_state_write() {
+    note_state_key=$1
+    note_state_status=$2
+    note_state_detail=$3
+    note_state_cause=${4:-}
+    if [ "$note_state_status" -eq 0 ]; then
+        case $state_write_failures in
+            *",$note_state_key,"*)
+                note_state_head=${state_write_failures%%",$note_state_key,"*}
+                note_state_rest=${state_write_failures#*",$note_state_key,"}
+                state_write_failures="$note_state_head,$note_state_rest"
+                controller_log_event warn state_write_recovered "file=$note_state_key"
+                ;;
+        esac
+        return 0
+    fi
+    case $state_write_failures in *",$note_state_key,"*) return 0 ;; esac
+    state_write_failures="$state_write_failures$note_state_key,"
+    controller_log_event error "$note_state_detail"         "file=$note_state_key status=$note_state_status${note_state_cause:+ cause=$note_state_cause}"
+    return 0
+}
+
+# The system's own words for why PATH cannot be written -- "Permission denied",
+# "No space left on device" -- from one probe write that is then removed. Only
+# asked when an episode opens, so it costs one pipeline per episode, not per
+# turn. The write goes through the external cat, whose error carries strerror
+# on every shell: a builtin's does not -- printf fails silently on a full disk,
+# and dash's echo says only "I/O error". An open that fails is reported by the
+# shell's redirection, which names the errno everywhere.
+state_write_cause() {
+    state_write_cause_text=$( { printf 'probe\n' | cat > "$1"; } 2>&1 ) || true
+    rm -f "$1" 2>/dev/null || true
+    # "<shell>: line N: can't create <path>: Permission denied" or
+    # "cat: write error: No space left on device" -- the errno text is the last
+    # field, and the path is already named by the caller.
+    state_write_cause_text=${state_write_cause_text##*: }
+    one_safe_line "${state_write_cause_text:-the write failed without a message}"
+}
+
+# Sets routine_state_saved, which the dispatch path reads: a run whose record
+# cannot be written is not started.
+save_routine_state() {
+    save_routine_status=0
+    write_routine_state "$1" || save_routine_status=$?
+    routine_state_saved=true
+    save_routine_cause=
+    if [ "$save_routine_status" -ne 0 ]; then
+        routine_state_saved=false
+        case $state_write_failures in
+            *",routines/$1.state,"*) ;;
+            *) save_routine_cause=$(state_write_cause "$routine_state_temp") || save_routine_cause= ;;
+        esac
+    fi
+    note_state_write "routines/$1.state" "$save_routine_status" routine_state_write_failed "$save_routine_cause"
+    return 0
+}
+
+# A run's outcome is the one routine record the next turn cannot recompute.
+# Unwritten, the routine kept reading running, and the next turn reported a run
+# that had finished as interrupted. It is held here and written before any
+# routine is evaluated again; until it lands no routine is evaluated, because
+# each would fail the same way.
+routine_outcome_held=
+hold_routine_outcome() {
+    routine_outcome_held=$1
+    held_state_value=$routine_state_value
+    held_next_value=$routine_next_value
+    held_last_success_value=$routine_last_success_value
+    held_last_attempt_value=$routine_last_attempt_value
+    held_retry_value=$routine_retry_value
+    held_last_day_value=$routine_last_day_value
+    held_last_poll_value=$routine_last_poll_value
+    held_fingerprint_value=$routine_fingerprint_value
+    held_backend_value=$routine_backend_value
+    held_backend_reason_value=$routine_backend_reason_value
+    held_pending_fingerprint_value=$routine_pending_fingerprint_value
+    held_pending_since_value=$routine_pending_since_value
+    held_event_first_seen_value=$routine_event_first_seen_value
+    held_poll_retries_value=$routine_poll_retries_value
+    held_defer_reason_value=$routine_defer_reason_value
+    held_last_exit_value=$routine_last_exit_value
+    held_last_reason_value=$routine_last_reason_value
+    held_partial_streak_value=$routine_partial_streak_value
+    held_escalated_value=$routine_escalated_value
+}
+flush_routine_outcome() {
+    [ -n "$routine_outcome_held" ] || return 0
+    routine_state_value=$held_state_value
+    routine_next_value=$held_next_value
+    routine_last_success_value=$held_last_success_value
+    routine_last_attempt_value=$held_last_attempt_value
+    routine_retry_value=$held_retry_value
+    routine_last_day_value=$held_last_day_value
+    routine_last_poll_value=$held_last_poll_value
+    routine_fingerprint_value=$held_fingerprint_value
+    routine_backend_value=$held_backend_value
+    routine_backend_reason_value=$held_backend_reason_value
+    routine_pending_fingerprint_value=$held_pending_fingerprint_value
+    routine_pending_since_value=$held_pending_since_value
+    routine_event_first_seen_value=$held_event_first_seen_value
+    routine_poll_retries_value=$held_poll_retries_value
+    routine_defer_reason_value=$held_defer_reason_value
+    routine_last_exit_value=$held_last_exit_value
+    routine_last_reason_value=$held_last_reason_value
+    routine_partial_streak_value=$held_partial_streak_value
+    routine_escalated_value=$held_escalated_value
+    save_routine_state "$routine_outcome_held"
+    [ "$routine_state_saved" = true ] || return 1
+    routine_outcome_held=
+}
+
+save_controller_state() {
+    save_controller_status=0
+    write_controller_state "$@" || save_controller_status=$?
+    note_state_write controller.state "$save_controller_status" controller_state_write_failed
+    return 0
 }
 
 capture_work_child_identity() {
@@ -1822,9 +2211,14 @@ retire_admission_decision() {
         case ${2:-} in
             controller_sleep) ;;
             routine|schedule)
-                controller_activity run.deferred none deferred \
-                    "Scheduled run not started: the controller admission handshake did not complete" \
-                    scheduler warn
+                # One Activity row per busy episode, as for the runner's own
+                # deferral (SDSYNC_RUN_DEFERRAL_EPISODE); the caller sets
+                # admission_deferral_episode.
+                if [ "${admission_deferral_episode:-new}" != continuing ]; then
+                    controller_activity run.deferred none deferred \
+                        "Scheduled run not started: the controller admission handshake did not complete" \
+                        scheduler warn
+                fi
                 controller_log_event warn child_admission_refused "kind=$2 reason=not_admitted" scheduler \
                     || echo "child admission refused (kind=$2 reason=not_admitted)" >&2
                 ;;
@@ -2080,6 +2474,27 @@ stop_runner_wait_guard() {
     return "$runner_guard_stop_result"
 }
 
+# A sync asked to cancel by a package stop finishes its in-flight request
+# first, which can take longer than the three seconds a control consumer gets:
+# a runner killed at three seconds was recorded as a core failure, and on the
+# next start as a runner that died, with an error and an alert, for an
+# ordinary stop. A runner gets this long (seconds), inside the lifecycle's own
+# 120-second stop budget. SDSYNC_DSM_RUNNER_STOP_GRACE overrides it (1-110).
+runner_stop_grace=60
+case ${SDSYNC_DSM_RUNNER_STOP_GRACE:-} in
+    ''|*[!0-9]*) ;;
+    *)
+        if [ "${#SDSYNC_DSM_RUNNER_STOP_GRACE}" -le 3 ] && [ "$SDSYNC_DSM_RUNNER_STOP_GRACE" -ge 1 ] \
+            && [ "$SDSYNC_DSM_RUNNER_STOP_GRACE" -le 110 ]; then
+            runner_stop_grace=$SDSYNC_DSM_RUNNER_STOP_GRACE
+        fi
+        ;;
+esac
+# Set when the grace ran out and the runner was killed; the routine or the
+# schedule then records a cancellation (exit 137), and logs runner_stop_forced
+# from the main flow rather than from the signal handler that set it.
+runner_stop_killed=false
+
 stop_work_children_bounded() {
     # Native consumers and runners receive a cooperative TERM first. Bound the
     # controller's own shutdown responsibility so a blocked network syscall can
@@ -2093,13 +2508,24 @@ stop_work_children_bounded() {
         "$active_pid" "$active_pid_start" "$active_pid_boot"; then
         kill -TERM "$active_pid" 2>/dev/null || true
     fi
-    # Poll bucket B -- the three iterations are the post-TERM grace, not a
-    # sampling rate; shortening turns three seconds into 0.15 s silently.
+    bounded_stop_limit=3
+    if [ -n "$active_pid" ] && [ "$active_control_classification" = runner ]; then
+        bounded_stop_limit=$runner_stop_grace
+    fi
+    # Poll bucket B -- the iterations are the post-TERM grace, not a sampling
+    # rate; shortening turns three seconds into 0.15 s silently. A control
+    # consumer still gets three of them; only a runner gets runner_stop_grace.
     bounded_stop_count=0
-    while [ "$bounded_stop_count" -lt 3 ]; do
+    while [ "$bounded_stop_count" -lt "$bounded_stop_limit" ]; do
         bounded_child_live=false
         if [ -n "$control_pid" ] && work_child_identity_is_running \
-            "$control_pid" "$control_pid_start" "$control_pid_boot"; then bounded_child_live=true; fi
+            "$control_pid" "$control_pid_start" "$control_pid_boot"; then
+            if [ "$bounded_stop_count" -ge 3 ]; then
+                kill -KILL "$control_pid" 2>/dev/null || true
+            else
+                bounded_child_live=true
+            fi
+        fi
         if [ -n "$active_pid" ] && work_child_identity_is_running \
             "$active_pid" "$active_pid_start" "$active_pid_boot"; then bounded_child_live=true; fi
         [ "$bounded_child_live" = true ] || return 0
@@ -2113,6 +2539,7 @@ stop_work_children_bounded() {
     if [ -n "$active_pid" ] && work_child_identity_is_running \
         "$active_pid" "$active_pid_start" "$active_pid_boot"; then
         kill -KILL "$active_pid" 2>/dev/null || true
+        [ "$active_control_classification" != runner ] || runner_stop_killed=true
     fi
 }
 
@@ -2140,8 +2567,98 @@ arm_connection_queue_from_backlog() {
     done
 }
 
+# A run that never ends -- a core blocked on a hung mount, a request with no
+# deadline -- holds this loop in wait_for_runner: no other routine, no realtime
+# poll and no aggregate is evaluated, and queued jobs other than a connection
+# probe wait behind it, with nothing said. The runner's heartbeat
+# (heartbeat_epoch in run.state, moved only while the core shows progress)
+# tells a long run from a stuck one. After 30 minutes without progress the
+# controller records, once per run, what is waiting on it and raises the
+# failure alert. It does not stop the run: a core blocked in the kernel may
+# not be stoppable, and an operator can still cancel it or stop the package.
+stalled_run_wakes=0
+stalled_run_reported=
+check_stalled_run() {
+    [ "$active_control_classification" = runner ] || return 0
+    # The runner-wait guard wakes this loop every second; read run.state on
+    # every fifteenth wake, not every one.
+    stalled_run_wakes=$((stalled_run_wakes + 1))
+    [ "$stalled_run_wakes" -ge 15 ] || return 0
+    stalled_run_wakes=0
+    [ -f "$run_state" ] && [ ! -L "$run_state" ] && [ -r "$run_state" ] || return 0
+    stalled_state=
+    stalled_started=
+    stalled_scope=
+    stalled_heartbeat=
+    stalled_lines=0
+    while IFS= read -r stalled_line || [ -n "$stalled_line" ]; do
+        stalled_lines=$((stalled_lines + 1))
+        [ "$stalled_lines" -le 64 ] || break
+        case $stalled_line in
+            state=*) [ -n "$stalled_state" ] || stalled_state=${stalled_line#state=} ;;
+            started_epoch=*) [ -n "$stalled_started" ] || stalled_started=${stalled_line#started_epoch=} ;;
+            scope=*) [ -n "$stalled_scope" ] || stalled_scope=${stalled_line#scope=} ;;
+            heartbeat_epoch=*) [ -n "$stalled_heartbeat" ] || stalled_heartbeat=${stalled_line#heartbeat_epoch=} ;;
+        esac
+    done < "$run_state"
+    [ "$stalled_state" = running ] || return 0
+    case $stalled_heartbeat:$stalled_started in *[!0-9:]*|:*|*:) return 0 ;; esac
+    case $stalled_scope in all) ;; ''|*[!A-Za-z0-9_-]*) stalled_scope=all ;; esac
+    [ "$stalled_run_reported" != "$stalled_started:$stalled_scope" ] || return 0
+    stalled_now=$(epoch_now) || return 0
+    case $stalled_now in ''|*[!0-9]*) return 0 ;; esac
+    [ "$stalled_now" -ge "$stalled_heartbeat" ] || return 0
+    [ $((stalled_now - stalled_heartbeat)) -gt 1800 ] || return 0
+    stalled_run_reported=$stalled_started:$stalled_scope
+    stalled_queued=0
+    for stalled_request in "$control_requests"/*.json; do
+        [ -e "$stalled_request" ] || [ -L "$stalled_request" ] || continue
+        stalled_queued=$((stalled_queued + 1))
+    done
+    controller_log_event error controller_blocked_by_stalled_run \
+        "scope=$stalled_scope started=$stalled_started progress_epoch=$stalled_heartbeat queued_jobs=$stalled_queued waiting=routines,polls,schedule" \
+        scheduler
+    dsm_log_event sync_failed "$stalled_now" \
+        || controller_log_event error alert_unavailable "scope=$stalled_scope channel=system_log reason=stalled" scheduler
+    stalled_alert_enabled=$(setting "$alert_policy_file" enabled true) || stalled_alert_enabled=true
+    stalled_alert_failure=$(setting "$alert_policy_file" on_failure true) || stalled_alert_failure=true
+    if [ "$stalled_alert_enabled" = true ] && [ "$stalled_alert_failure" = true ]; then
+        safe_notify sync_failed "$stalled_scope" 1 \
+            || controller_log_event error alert_unavailable "scope=$stalled_scope channel=desktop reason=stalled" scheduler
+    fi
+    return 0
+}
+
+# The runner-wait guard is a forked, identity-checked child. A failure to start
+# or retire it -- no process slot, an identity that could not be read -- used
+# to end the controller under errexit, in the middle of a run it was waiting
+# on. It is now an error event, once per episode, and the wait goes on without
+# the guard: the run is polled once a second until it ends, which keeps the
+# stalled-run check and a latched signal at most a second late.
+# One episode per phase: a guard reused while its retirement keeps failing
+# says nothing about the retirement, so only the same phase closes it.
+runner_wait_guard_failing=,
+note_runner_wait_guard() {
+    if [ "$2" -eq 0 ]; then
+        case $runner_wait_guard_failing in *",$1,"*) ;; *) return 0 ;; esac
+        runner_wait_guard_failing=${runner_wait_guard_failing%%",$1,"*},${runner_wait_guard_failing#*",$1,"}
+        controller_log_event warn runner_wait_guard_recovered "phase=$1"
+        return 0
+    fi
+    case $runner_wait_guard_failing in *",$1,"*) return 0 ;; esac
+    runner_wait_guard_failing=$runner_wait_guard_failing$1,
+    controller_log_event error runner_wait_guard_failed "phase=$1 status=$2 pid=${active_pid:-none}"
+}
+retire_runner_wait_guard() {
+    retire_guard_status=0
+    stop_runner_wait_guard || retire_guard_status=$?
+    note_runner_wait_guard stop "$retire_guard_status"
+    return 0
+}
+
 wait_for_runner() {
     previous_wait_status=
+    stalled_run_wakes=0
     arm_connection_queue_from_backlog
     while :; do
         # Reset before inspecting the durable queue latch. A signal delivered
@@ -2154,7 +2671,7 @@ wait_for_runner() {
                     queue_wake_requested=false
                     primary_control_queue_progress=$control_queue_progress
                     control_queue_progress=false
-                    process_control_queue true
+                    run_control_queue_turn true
                     nested_control_queue_progress=$control_queue_progress
                     control_queue_progress=$primary_control_queue_progress
                     # Standard signals can coalesce. After a successful FIFO
@@ -2175,9 +2692,21 @@ wait_for_runner() {
         # interrupts the controller's wait; the primary child keeps running,
         # its real exit status is collected by `wait`, and successful queue
         # turns retain the existing FIFO/barrier rules above.
-        start_runner_wait_guard
+        guard_start_status=0
+        start_runner_wait_guard || guard_start_status=$?
+        if [ "$guard_start_status" -ne 0 ]; then
+            note_runner_wait_guard start "$guard_start_status"
+            if work_child_identity_is_running "$active_pid" "$active_pid_start" "$active_pid_boot"; then
+                /bin/sleep 1 || :
+                check_stalled_run
+                continue
+            fi
+            # The run has ended: the wait below only collects its status.
+        else
+            note_runner_wait_guard start 0
+        fi
         if [ "$wait_interrupted" = true ]; then
-            stop_runner_wait_guard
+            retire_runner_wait_guard
             continue
         fi
         # Guarded runner-wait handoff. Runtime tests instrument this comment in
@@ -2193,12 +2722,16 @@ wait_for_runner() {
         # admission handshake every second for as long as it ran. The guard is
         # retired when the wait actually completes, immediately below, and
         # again after the loop.
-        if [ "$wait_interrupted" = true ]; then previous_wait_status=$current_wait_status; continue; fi
-        stop_runner_wait_guard
+        if [ "$wait_interrupted" = true ]; then
+            previous_wait_status=$current_wait_status
+            check_stalled_run
+            continue
+        fi
+        retire_runner_wait_guard
         if [ "$current_wait_status" -eq 127 ] && [ -n "$previous_wait_status" ]; then scheduled_exit=$previous_wait_status; else scheduled_exit=$current_wait_status; fi
         break
     done
-    stop_runner_wait_guard
+    retire_runner_wait_guard
     active_pid=
     active_pid_start=
     active_pid_boot=
@@ -2337,6 +2870,8 @@ load_routine_state_runtime() {
     routine_defer_reason_value=none
     routine_last_exit_value=-1
     routine_last_reason_value=none
+    routine_partial_streak_value=0
+    routine_escalated_value=0
     [ -f "$1" ] && [ ! -L "$1" ] && [ -r "$1" ] || return 0
     routine_state_seen=,
     routine_state_lines=0
@@ -2366,6 +2901,8 @@ load_routine_state_runtime() {
             defer_reason) routine_defer_reason_value=$routine_state_field ;;
             last_exit_code) routine_last_exit_value=$routine_state_field ;;
             last_reason) routine_last_reason_value=$routine_state_field ;;
+            partial_streak) routine_partial_streak_value=$routine_state_field ;;
+            escalated_epoch) routine_escalated_value=$routine_state_field ;;
             *) continue ;;
         esac
         routine_state_seen=$routine_state_seen$routine_state_key,
@@ -2379,6 +2916,9 @@ load_routine_state_runtime() {
     esac
     case $routine_last_exit_value in -1) ;; ''|*[!0-9]*) routine_last_exit_value=-1 ;; esac
     case $routine_last_reason_value in ''|*[!a-z0-9_]*) routine_last_reason_value=none ;; esac
+    case $routine_partial_streak_value in ''|*[!0-9]*) routine_partial_streak_value=0 ;; esac
+    [ "${#routine_partial_streak_value}" -le 4 ] || routine_partial_streak_value=9999
+    case $routine_escalated_value in ''|*[!0-9]*) routine_escalated_value=0 ;; esac
 }
 
 load_routine_profile_runtime() {
@@ -2444,6 +2984,7 @@ routine_skip() {
 
 process_routines() {
     routine_now=$1
+    flush_routine_outcome || return 0
     # A walk whose routine was removed, disabled or moved off realtime has no
     # collector left; without this it would hold the single walk slot forever.
     if [ -n "$poll_job_pid" ]; then
@@ -2543,6 +3084,27 @@ process_routines() {
             *) valid_source_fingerprint "$routine_pending_fingerprint_value" \
                 || routine_pending_fingerprint_value=0 ;;
         esac
+        # A deadline further ahead than any this controller writes -- an
+        # interval, the realtime cool-down -- or a poll stamped in the future is
+        # a clock that stepped backwards (clamp_clock_step).
+        if [ "$routine_mode" = interval ] && [ "$routine_interval" -gt "$realtime_exhausted_cooldown" ]; then
+            routine_clock_horizon=$routine_interval
+        else
+            routine_clock_horizon=$realtime_exhausted_cooldown
+        fi
+        routine_clock_stepped=false
+        if clamp_clock_step "profile=$routine_profile" next_run_epoch "$routine_next_value" \
+            "$routine_now" "$routine_clock_horizon"; then
+            routine_next_value=$clock_step_value
+            routine_clock_stepped=true
+        fi
+        if clamp_clock_step "profile=$routine_profile" last_poll_epoch "$routine_last_poll_value" \
+            "$routine_now" 0; then
+            # Never polled, as far as the cadence is concerned: poll now.
+            routine_last_poll_value=0
+            routine_clock_stepped=true
+        fi
+        [ "$routine_clock_stepped" = false ] || save_routine_state "$routine_profile"
         # Routines run synchronously in this loop, so a routine still marked
         # running when it is evaluated was interrupted: the controller that
         # launched it stopped -- package stop, reboot, a crash -- before the
@@ -2551,7 +3113,7 @@ process_routines() {
             routine_state_value=failed
             routine_last_reason_value=interrupted
             routine_last_exit_value=-1
-            write_routine_state "$routine_profile"
+            save_routine_state "$routine_profile"
             controller_activity run.failed "$routine_profile" failed \
                 "Routine run was interrupted before its outcome was recorded" routines warn
             controller_log_event warn routine_interrupted "profile=$routine_profile" scheduler
@@ -2575,7 +3137,7 @@ process_routines() {
                 routine_defer_reason_value=delete_bound
                 routine_backend_value=none
                 routine_backend_reason_value=ok
-                write_routine_state "$routine_profile"
+                save_routine_state "$routine_profile"
                 controller_activity routine.deferred "$routine_profile" deferred \
                     "Routine cannot run: its deletion bound is weaker than the profile's max-delete" routines warn
                 controller_log_event warn routine_deferred "profile=$routine_profile reason=delete_bound" scheduler
@@ -2597,7 +3159,7 @@ process_routines() {
                     routine_defer_reason_value=window
                     routine_backend_value=$routine_mode
                     routine_backend_reason_value=ok
-                    write_routine_state "$routine_profile"
+                    save_routine_state "$routine_profile"
                     controller_activity routine.deferred "$routine_profile" deferred \
                         "Routine outside configured window" routines info
                     ;;
@@ -2610,6 +3172,14 @@ process_routines() {
             # dispatched into the same refusal on every five-second turn. A
             # dependency is not gated: it is re-checked every turn, so the
             # routine runs as soon as its dependency succeeds.
+            continue
+        elif [ "$routine_mode" = daily ] && [ "$routine_retry_value" -eq 0 ] \
+            && [ "$routine_next_value" -gt "$routine_now" ]; then
+            # A daily routine has no deadline of its own, so next_run_epoch is
+            # only ever a not-before instant: the 30-second floor after a
+            # cancelled run or a launch that failed. The daily due check never
+            # read it, so a core cancelled from outside was dispatched again on
+            # every five-second turn, starving every routine after it.
             continue
         elif [ "$routine_retry_value" -gt 0 ]; then
             # A pending whole-action retry owns admission until its deadline.
@@ -2631,14 +3201,18 @@ process_routines() {
                     if [ "$routine_next_value" -eq 0 ]; then
                         routine_next_value=$((routine_now + routine_interval))
                         routine_state_value=scheduled
-                        write_routine_state "$routine_profile"
+                        save_routine_state "$routine_profile"
                     elif [ "$routine_now" -ge "$routine_next_value" ]; then due=true; fi
                     ;;
                 daily)
                     routine_backend_value=daily
                     routine_backend_reason_value=ok
-                    routine_today=$(date +%Y-%m-%d)
-                    if [ "$routine_last_day_value" != "$routine_today" ]; then due=true; fi
+                    routine_today=$(routine_window_day "$routine_start" "$routine_end") || routine_today=
+                    if [ -z "$routine_today" ]; then
+                        controller_log_event error routine_clock_unavailable "profile=$routine_profile"
+                    elif [ "$routine_last_day_value" != "$routine_today" ]; then
+                        due=true
+                    fi
                     ;;
                 realtime)
                     # The turn's instant can be arbitrarily old by the time this
@@ -2682,7 +3256,7 @@ process_routines() {
                             stop_poll_job
                         fi
                         if [ "$routine_source_transition" = true ]; then
-                            write_routine_state "$routine_profile"
+                            save_routine_state "$routine_profile"
                             controller_activity routine.deferred "$routine_profile" deferred \
                                 "Routine source is unavailable" routines warn
                             controller_log_event warn routine_source_unavailable \
@@ -2717,7 +3291,7 @@ process_routines() {
                                 # it exists for. One write per pending episode,
                                 # not one per turn, because the test above is
                                 # false once the epoch is on disk.
-                                write_routine_state "$routine_profile"
+                                save_routine_state "$routine_profile"
                             fi
                             watcher_event_status=0
                             realtime_event_due "$watcher_event_path" "$routine_now" "$routine_debounce" || watcher_event_status=$?
@@ -2770,13 +3344,13 @@ process_routines() {
                             # an empty marker is the normal state.
                             if [ "$routine_event_first_seen_value" -ne 0 ]; then
                                 routine_event_first_seen_value=0
-                                write_routine_state "$routine_profile"
+                                save_routine_state "$routine_profile"
                             fi
                         fi
                     else
                         if [ "$routine_event_first_seen_value" -ne 0 ]; then
                             routine_event_first_seen_value=0
-                            write_routine_state "$routine_profile"
+                            save_routine_state "$routine_profile"
                         fi
                     fi
                     # A walk this routine started on an earlier turn. Collected
@@ -2799,7 +3373,7 @@ process_routines() {
                             routine_fingerprint_value=$rebaseline_fingerprint
                             routine_pending_fingerprint_value=0
                             routine_pending_since_value=0
-                            write_routine_state "$routine_profile"
+                            save_routine_state "$routine_profile"
                         else
                             controller_log_event warn routine_poll_unavailable \
                                 "profile=$routine_profile reason=post_event_fingerprint detail=status=$collected_poll_status"
@@ -2818,7 +3392,7 @@ process_routines() {
                         start_poll_job "$routine_profile" "$profile_source" compare || poll_start_status=$?
                         if [ "$poll_start_status" -ne 0 ]; then
                             routine_backend_reason_value=poll_unavailable
-                            write_routine_state "$routine_profile"
+                            save_routine_state "$routine_profile"
                             if [ "$routine_backend_reason_value" != "$routine_backend_reason_previous" ]; then
                                 controller_log_event warn routine_poll_unavailable \
                                     "profile=$routine_profile reason=poll_job detail=status=$poll_start_status"
@@ -2831,7 +3405,7 @@ process_routines() {
                         # permanently failing poll would be re-reported as a
                         # new transition on every collection.
                         routine_backend_reason_value=$routine_backend_reason_previous
-                        write_routine_state "$routine_profile"
+                        save_routine_state "$routine_profile"
                     fi
                     if [ "$routine_poll_collected" = true ]; then
                         routine_poll_status=$collected_poll_status
@@ -2855,7 +3429,10 @@ process_routines() {
                                 fi
                                 ;;
                             70) routine_poll_reason=unreadable_subtree; routine_poll_detail=$routine_poll_output ;;
-                            *) routine_poll_reason=fingerprint ;;
+                            *)
+                                routine_poll_reason=fingerprint
+                                routine_poll_detail="status=$routine_poll_status${collected_poll_errors:+ $collected_poll_errors}"
+                                ;;
                         esac
                         if [ -n "$routine_poll_reason" ]; then
                             if [ "$routine_poll_reason" = unreadable_subtree ]; then
@@ -2863,7 +3440,7 @@ process_routines() {
                             else
                                 routine_backend_reason_value=poll_unavailable
                             fi
-                            write_routine_state "$routine_profile"
+                            save_routine_state "$routine_profile"
                             if [ "$routine_backend_reason_value" != "$routine_backend_reason_previous" ]; then
                                 controller_log_event warn routine_poll_unavailable \
                                     "profile=$routine_profile reason=$routine_poll_reason detail=$routine_poll_detail"
@@ -2890,11 +3467,11 @@ process_routines() {
                             routine_pending_fingerprint_value=0
                             routine_pending_since_value=0
                             routine_state_value=scheduled
-                            write_routine_state "$routine_profile"
+                            save_routine_state "$routine_profile"
                         elif [ "$routine_fingerprint_value" = "$current_fingerprint" ]; then
                             routine_pending_fingerprint_value=0
                             routine_pending_since_value=0
-                            write_routine_state "$routine_profile"
+                            save_routine_state "$routine_profile"
                         elif [ "$routine_pending_fingerprint_value" = "$current_fingerprint" ]; then
                             # One unchanged reading is the cheapest evidence the
                             # source has stopped changing. Dispatching on the
@@ -2936,7 +3513,7 @@ process_routines() {
                                     "profile=$routine_profile pending_seconds=$routine_poll_pending ceiling=$routine_poll_ceiling"
                                 due=true
                             else
-                                write_routine_state "$routine_profile"
+                                save_routine_state "$routine_profile"
                             fi
                         fi
                     fi
@@ -2953,7 +3530,7 @@ process_routines() {
         # as soon as the instant passes.
         if [ "$routine_mode" = realtime ] && [ "$routine_retry_value" -eq 0 ] \
             && [ "$routine_next_value" -gt "$routine_now" ]; then
-            [ "$routine_poll_collected" != true ] || write_routine_state "$routine_profile"
+            [ "$routine_poll_collected" != true ] || save_routine_state "$routine_profile"
             continue
         fi
         if ! dependencies_allow "$routine_dependencies"; then
@@ -2972,9 +3549,9 @@ process_routines() {
             # and the state is rewritten only when something changed.
             if [ "$routine_mode" = interval ]; then
                 routine_next_value=$((routine_now + 30))
-                write_routine_state "$routine_profile"
+                save_routine_state "$routine_profile"
             elif [ "$routine_defer_transition" = true ] || [ "$routine_poll_collected" = true ]; then
-                write_routine_state "$routine_profile"
+                save_routine_state "$routine_profile"
             fi
             if [ "$routine_defer_transition" = true ]; then
                 controller_activity routine.deferred "$routine_profile" deferred \
@@ -3019,29 +3596,73 @@ process_routines() {
                     ;;
             esac
         fi
+        # A routine still deferred because the package was busy is one episode
+        # however many 30-second re-checks it takes, and its Activity row was
+        # written by the attempt that opened it. The runner reads this to write
+        # run.deferred once; it is unset again so no other child -- a queued
+        # manual run among them -- inherits it.
+        case $routine_state_value:$routine_defer_reason_value in
+            deferred:busy) routine_deferral_episode=continuing ;;
+            *) routine_deferral_episode=new ;;
+        esac
+        # The window day this run is for (routine_window_day), recorded as
+        # last_day when it completes, whenever it completes.
+        routine_dispatch_day=
+        if [ "$routine_mode" = daily ]; then
+            routine_dispatch_day=$(routine_window_day "$routine_start" "$routine_end") || routine_dispatch_day=
+        fi
         routine_state_value=running
         routine_last_attempt_value=$routine_now
-        write_routine_state "$routine_profile"
+        save_routine_state "$routine_profile"
+        if [ "$routine_state_saved" != true ]; then
+            # The record of this run cannot be written (save_routine_state said
+            # why, once per episode). Started anyway, nothing on disk would say
+            # it ran, and it would be dispatched again on every turn.
+            break
+        fi
+        SDSYNC_RUN_DEFERRAL_EPISODE=$routine_deferral_episode
+        export SDSYNC_RUN_DEFERRAL_EPISODE
         if ! launch_admitted_child active routine "$runner" "$routine_action" \
             "$routine_profile" "$routine_delete" scheduled -; then
+            unset SDSYNC_RUN_DEFERRAL_EPISODE
             [ "$admitted_child_status" != cancelled ] || return 0
-            controller_log_event error child_identity_capture_failed "kind=routine"
-            return 73
+            log_child_launch_failure routine
+            # A launch that failed -- no process slot, no memory on a small
+            # NAS -- used to end the controller. Nothing ran: it is recorded,
+            # consumes no retry, and is tried again after the 30-second floor.
+            routine_state_value=failed
+            routine_last_reason_value=admission_failed
+            routine_last_exit_value=-1
+            routine_next_value=$((routine_now + 30))
+            save_routine_state "$routine_profile"
+            controller_activity run.failed "$routine_profile" failed \
+                "Scheduled run could not be started (launch status ${admitted_child_status:-unknown}); it is tried again in 30 seconds" \
+                scheduler error
+            return 0
         fi
+        unset SDSYNC_RUN_DEFERRAL_EPISODE
         active_control_classification=runner
         routine_admission_path=$admitted_child_admission_path
         if [ "$shutdown" = true ]; then
             stop_work_children_bounded
         fi
-        write_controller_state running "$$" "$next_run" "$active_pid"
+        save_controller_state running "$$" "$next_run" "$active_pid"
         wait_for_runner
+        admission_deferral_episode=$routine_deferral_episode
         retire_admission_decision "$routine_admission_path" routine
-        routine_finished=$(epoch_now)
+        admission_deferral_episode=new
+        routine_finished=$(epoch_now) || routine_finished=$routine_now
+        case $routine_finished in ''|*[!0-9]*) routine_finished=$routine_now ;; esac
         # 130 is the core's cooperative-cancellation code and 143 a core
         # terminated by the runner's own TERM. Both mean an operator stopped the
-        # package, or DSM rebooted, while this routine was running.
+        # package, or DSM rebooted, while this routine was running. So does 137
+        # when this controller's own stop killed a runner whose cancel outlasted
+        # runner_stop_grace.
         routine_cancelled=false
-        case $scheduled_exit in 130|143) routine_cancelled=true ;; esac
+        case $scheduled_exit in
+            130|143) routine_cancelled=true ;;
+            137) [ "$runner_stop_killed" != true ] || routine_cancelled=true ;;
+        esac
         routine_last_exit_value=$scheduled_exit
         routine_defer_reason_value=none
         if [ "$scheduled_exit" -eq 0 ]; then
@@ -3049,7 +3670,8 @@ process_routines() {
             routine_last_reason_value=ok
             routine_last_success_value=$routine_finished
             routine_retry_value=0
-            case $routine_mode in interval) routine_next_value=$((routine_finished + routine_interval)) ;; daily) routine_last_day_value=$(date +%Y-%m-%d); routine_next_value=0 ;; realtime) routine_next_value=0 ;; esac
+            routine_partial_streak_value=0
+            case $routine_mode in interval) routine_next_value=$((routine_finished + routine_interval)) ;; daily) routine_last_day_value=${routine_dispatch_day:-$(date +%Y-%m-%d)}; routine_next_value=0 ;; realtime) routine_next_value=0 ;; esac
             if [ "$routine_mode" = realtime ]; then
                 if [ -n "$routine_dispatch_fingerprint" ]; then
                     # The reading this run was dispatched for is now synced.
@@ -3085,8 +3707,30 @@ process_routines() {
             routine_retry_value=0
             case $routine_mode in
                 interval) routine_next_value=$((routine_finished + routine_interval)) ;;
-                daily) routine_last_day_value=$(date +%Y-%m-%d); routine_next_value=0 ;;
-                realtime) routine_next_value=$((routine_finished + routine_backoff)) ;;
+                daily) routine_last_day_value=${routine_dispatch_day:-$(date +%Y-%m-%d)}; routine_next_value=0 ;;
+                realtime)
+                    # Paths that keep deferring -- a file held open, a source
+                    # rewritten during every run -- re-dispatched a full sync
+                    # every backoff, forever. Consecutive partial runs now back
+                    # off on the routine's own retry ladder, and past its five
+                    # steps wait out the realtime cool-down, once said.
+                    routine_partial_streak_value=$((routine_partial_streak_value + 1))
+                    if [ "$routine_partial_streak_value" -le 5 ]; then
+                        routine_partial_delay=$(routine_retry_delay "$routine_backoff" \
+                            "$routine_partial_streak_value" "$routine_retry_exponential") \
+                            || routine_partial_delay=$routine_backoff
+                    else
+                        routine_partial_delay=$realtime_exhausted_cooldown
+                    fi
+                    routine_next_value=$((routine_finished + routine_partial_delay))
+                    if [ "$routine_partial_streak_value" -eq 6 ]; then
+                        controller_activity routine.retries_exhausted "$routine_profile" deferred \
+                            "Routine deferred paths 6 runs in a row; it now re-runs every $((realtime_exhausted_cooldown / 60)) minutes until they sync" \
+                            routines warn
+                        controller_log_event warn routine_partial_backoff \
+                            "profile=$routine_profile runs=$routine_partial_streak_value next=$routine_next_value" scheduler
+                    fi
+                    ;;
             esac
         elif [ "$scheduled_exit" -eq 75 ]; then
             # Refused, not failed: another run, a configuration change or a
@@ -3129,7 +3773,25 @@ process_routines() {
             fi
         else
             routine_state_value=failed
-            routine_last_reason_value=$(routine_run_reason "$routine_profile")
+            routine_partial_streak_value=0
+            routine_run_reason "$routine_profile" "$routine_last_attempt_value"
+            routine_last_reason_value=$routine_reason_value
+            # 126 and 127 are the admission wrapper failing to exec the runner:
+            # nothing ran, so nothing wrote the Activity record or counted the
+            # failure toward an alert, and with no retries configured there was
+            # no exhaustion record either. The controller writes both.
+            case $scheduled_exit:$routine_reason_recorded in
+                126:false|127:false)
+                    controller_activity run.failed "$routine_profile" failed \
+                        "Scheduled run did not start: the runner could not be executed (exit $scheduled_exit)" \
+                        scheduler error
+                    if [ "$routine_action" = sync ]; then
+                        handle_alert_result "$routine_profile" failed "$scheduled_exit" \
+                            || controller_log_event error alert_unavailable \
+                                "profile=$routine_profile reason=runner_error" scheduler
+                    fi
+                    ;;
+            esac
             if [ "$routine_retry_value" -lt "$routine_retries" ]; then
                 routine_retry_value=$((routine_retry_value + 1))
                 retry_delay=$(routine_retry_delay "$routine_backoff" "$routine_retry_value" "$routine_retry_exponential") || {
@@ -3142,7 +3804,7 @@ process_routines() {
                 routine_retry_value=0
                 case $routine_mode in
                     interval) routine_next_value=$((routine_finished + routine_interval)) ;;
-                    daily) routine_last_day_value=$(date +%Y-%m-%d); routine_next_value=0 ;;
+                    daily) routine_last_day_value=${routine_dispatch_day:-$(date +%Y-%m-%d)}; routine_next_value=0 ;;
                     # The change stays pending (the baseline was never moved),
                     # and is retried after a cool-down rather than on the very
                     # next poll, which would turn an outage into a sync attempt
@@ -3162,12 +3824,20 @@ process_routines() {
                 fi
             fi
         fi
-        write_routine_state "$routine_profile"
+        save_routine_state "$routine_profile"
+        [ "$routine_state_saved" = true ] || hold_routine_outcome "$routine_profile"
         case $scheduled_exit in
             0|75|130|143) routine_log_level=info ;;
             3) routine_log_level=warn ;;
             *) routine_log_level=error ;;
         esac
+        [ "$routine_cancelled" != true ] || routine_log_level=info
+        if [ "$runner_stop_killed" = true ]; then
+            controller_log_event warn runner_stop_forced \
+                "profile=$routine_profile grace=$runner_stop_grace exit=$scheduled_exit" scheduler
+            reconcile_stale_run_state "$routine_finished" cancelled
+            runner_stop_killed=false
+        fi
         controller_log_event "$routine_log_level" routine_run \
             "profile=$routine_profile action=$routine_action exit=$scheduled_exit next=$routine_next_value backend=$routine_backend_value reason=$routine_last_reason_value" scheduler
         # One routine per turn keeps control-plane latency and shutdown bounded.
@@ -3203,6 +3873,10 @@ reload_requested=false
 queue_wake_requested=false
 
 cleanup_controller() {
+    # The status the controller is exiting with: 0 after a stop, anything else
+    # after a failure under `set -e`. It is recorded below, because an
+    # unexpected exit used to leave state=stopped and nothing else.
+    controller_exit_status=$?
     # EXIT can follow an unexpected shell failure as well as the normal stop
     # path. Disable recursive traps, terminate both direct work children, and
     # reap them before releasing controller ownership.
@@ -3232,6 +3906,11 @@ cleanup_controller() {
     stop_poll_job || true
     stop_realtime_watchers 2>/dev/null || true
     write_controller_state stopped 0 0 0 2>/dev/null || true
+    if [ "$controller_exit_status" -eq 0 ] && [ "$shutdown" = true ]; then
+        controller_log_event info controller_exited "status=0 shutdown=true"
+    else
+        controller_log_event error controller_exited "status=$controller_exit_status shutdown=$shutdown"
+    fi
     remove_own_controller_ready 2>/dev/null || true
     current_pid=$(read_pid "$controller_pid_file" 2>/dev/null || true)
     if [ "$current_pid" = "$$" ]; then
@@ -3283,10 +3962,72 @@ reconcile_audit_outbox || {
     echo "pending mandatory audit records could not be reconciled" >&2
     exit 73
 }
+# Private runtime files are removed by the process that made them, on its
+# normal path or a TERM -- never after a SIGKILL, an OOM kill or a power loss.
+# Core output captures (sizeable on a verbose run), admission decisions, guard
+# stop latches and poll scratch directories then stayed for good. At start,
+# remove each one whose owning process is gone: the pid embedded in its name is
+# not live, or, where the name also carries the owner's start tick, the live
+# process with that pid is a different one. A live owner's files are kept.
+runtime_leftover_owner_is_live() {
+    is_pid "$1" || return 1
+    [ -e "/proc/$1" ] || return 1
+    [ -n "${2:-}" ] || return 0
+    read_process_stat_fields "$1" || return 1
+    [ "$process_stat_start" = "$2" ]
+}
+prune_runtime_leftovers() {
+    pruned_leftovers=0
+    unpruned_leftovers=0
+    for leftover_path in "$runtime_root"/core-stdout.* "$runtime_root"/core-stderr.* \
+        "$runtime_root"/core-result.* "$runtime_root"/.child-admission.* \
+        "$runtime_root"/.runner-wait-guard-admit.* "$runtime_root"/fingerprint.*; do
+        [ -e "$leftover_path" ] || [ -L "$leftover_path" ] || continue
+        leftover_name=${leftover_path##*/}
+        leftover_start=
+        case $leftover_name in
+            core-stdout.*|core-stderr.*|core-result.*) leftover_pid=${leftover_name#*.} ;;
+            fingerprint.*.*) leftover_pid=${leftover_name#fingerprint.}; leftover_pid=${leftover_pid%%.*} ;;
+            .child-admission.*.*.*|.runner-wait-guard-admit.*.*.*)
+                leftover_rest=${leftover_name#.child-admission.}
+                leftover_rest=${leftover_rest#.runner-wait-guard-admit.}
+                leftover_pid=${leftover_rest%%.*}
+                leftover_rest=${leftover_rest#*.}
+                leftover_start=${leftover_rest%%.*}
+                case $leftover_start in ''|*[!0-9]*) continue ;; esac
+                ;;
+            *) continue ;;
+        esac
+        case $leftover_pid in ''|*[!0-9]*) continue ;; esac
+        ! runtime_leftover_owner_is_live "$leftover_pid" "$leftover_start" || continue
+        if [ -L "$leftover_path" ] || [ -f "$leftover_path" ]; then
+            rm -f "$leftover_path" || { unpruned_leftovers=$((unpruned_leftovers + 1)); continue; }
+        elif [ -d "$leftover_path" ]; then
+            # A poll scratch directory holds the walk's four files and nothing
+            # else; a guard latch is empty. Anything more is left alone.
+            for leftover_entry in "$leftover_path"/metadata "$leftover_path"/stderr \
+                "$leftover_path"/sorted "$leftover_path"/checksum; do
+                [ ! -f "$leftover_entry" ] || [ -L "$leftover_entry" ] || rm -f "$leftover_entry" || :
+            done
+            rmdir "$leftover_path" || { unpruned_leftovers=$((unpruned_leftovers + 1)); continue; }
+        else
+            continue
+        fi
+        pruned_leftovers=$((pruned_leftovers + 1))
+    done
+    if [ "$pruned_leftovers" -gt 0 ] || [ "$unpruned_leftovers" -gt 0 ]; then
+        if [ "$unpruned_leftovers" -gt 0 ]; then prune_level=warn; else prune_level=info; fi
+        controller_log_event "$prune_level" runtime_leftovers_pruned \
+            "count=$pruned_leftovers unremovable=$unpruned_leftovers dir=$runtime_root"
+    fi
+    return 0
+}
+
 # Read and validate the complete policy, then inspect/prune the private queue
 # before publishing readiness. A controller PID alone is deliberately not a
 # readiness signal: any failure here must make lifecycle start fail cleanly.
 prune_expired_control_files
+prune_runtime_leftovers
 inotify_watch_limit_path=/proc/sys/fs/inotify/max_user_watches
 resolve_inotify_command
 resolve_fingerprint_exec
@@ -3311,6 +4052,7 @@ controller_start_lease_committed_matches_parent || {
     exit 73
 }
 publish_controller_ready
+retire_pending_controller_reload
 unset SDSYNC_DSM_CONTROLLER_START_PARENT_PID SDSYNC_DSM_CONTROLLER_START_PARENT_TICKS \
     SDSYNC_DSM_CONTROLLER_START_PARENT_BOOT
 while [ "$shutdown" = false ]; do
@@ -3333,10 +4075,11 @@ while [ "$shutdown" = false ]; do
         # schedule, so the dashboard's Save is what applies it rather than a
         # package restart.
         load_performance_policy_runtime
+        retire_pending_controller_reload
         reload_requested=false
     fi
     control_queue_progress=false
-    process_control_queue
+    run_control_queue_turn
     load_schedule_runtime "$schedule_file"
     case $enabled in true|false) ;; *) enabled=false ;; esac
     case $allow_delete in true|false) ;; *) allow_delete=false ;; esac
@@ -3358,8 +4101,7 @@ while [ "$shutdown" = false ]; do
     if [ "$interval" -lt 60 ] || [ "$interval" -gt 2592000 ]; then
         interval=3600
     fi
-
-    now=$(epoch_now)
+    controller_now
     reconcile_stale_run_state "$now"
     if [ "$enabled" != true ]; then
         next_run=0
@@ -3379,45 +4121,83 @@ while [ "$shutdown" = false ]; do
             fi
         fi
         save_schedule_deadline "$next_run"
+    elif clamp_clock_step scope=schedule next_run_epoch "$next_run" "$now" "$interval"; then
+        # The clock stepped backwards past the deadline (clamp_clock_step):
+        # run a minute from now, as after a restart, not when it catches up.
+        next_run=$((now + 60))
+        save_schedule_deadline "$next_run"
     elif [ "$now" -ge "$next_run" ]; then
         # Do not start a scheduled aggregate after TERM/INT was latched. The
         # post-assignment check closes the asynchronous launch window.
         [ "$shutdown" = false ] || break
-        write_controller_state running "$$" "$next_run" 0
+        save_controller_state running "$$" "$next_run" 0
+        schedule_dispatch_epoch=$now
+        # As for a routine: re-checks of one busy episode write no new row.
+        SDSYNC_RUN_DEFERRAL_EPISODE=${schedule_deferral_episode:-new}
+        export SDSYNC_RUN_DEFERRAL_EPISODE
         if ! launch_admitted_child active schedule "$runner" sync all \
             "$allow_delete" scheduled "$maximum_total"; then
+            unset SDSYNC_RUN_DEFERRAL_EPISODE
             [ "$admitted_child_status" != cancelled ] || continue
-            controller_log_event error child_identity_capture_failed "kind=schedule"
-            exit 73
+            log_child_launch_failure schedule
+            # Not fatal any more: nothing ran, so try again after the floor.
+            next_run=$((now + 30))
+            save_schedule_deadline "$next_run"
+            continue
         fi
+        unset SDSYNC_RUN_DEFERRAL_EPISODE
         active_control_classification=runner
         schedule_admission_path=$admitted_child_admission_path
         if [ "$shutdown" = true ]; then
             stop_work_children_bounded
         fi
-        write_controller_state running "$$" "$next_run" "$active_pid"
+        save_controller_state running "$$" "$next_run" "$active_pid"
         wait_for_runner
+        admission_deferral_episode=${schedule_deferral_episode:-new}
         retire_admission_decision "$schedule_admission_path" schedule
+        admission_deferral_episode=new
         run_exit=$scheduled_exit
-        now=$(epoch_now)
+        if [ "$run_exit" -eq 75 ]; then schedule_deferral_episode=continuing; else schedule_deferral_episode=new; fi
+        controller_now
         # Failure is recorded by sdsync-run and does not trigger an immediate
         # retry. A refusal (75: another run or a configuration change held the
         # package) is not a failure and is retried in 30 seconds instead of a
         # whole interval later; the refusal wrote its own Activity record.
+        schedule_cancelled=false
         case $run_exit in
-            0) scheduled_log_level=info; scheduled_reason=ok; next_run=$((now + interval)) ;;
+            130|143) schedule_cancelled=true ;;
+            137) [ "$runner_stop_killed" != true ] || schedule_cancelled=true ;;
+        esac
+        case $schedule_cancelled:$run_exit in
+            false:0) scheduled_log_level=info; scheduled_reason=ok; next_run=$((now + interval)) ;;
             # Partial: finished, some paths deferred to the next run. Not a
             # failure, and the next interval picks the deferred paths up.
-            3) scheduled_log_level=warn; scheduled_reason=deferred_paths; next_run=$((now + interval)) ;;
-            75) scheduled_log_level=info; scheduled_reason=busy; next_run=$((now + 30)) ;;
-            *) scheduled_log_level=error; scheduled_reason=$(routine_run_reason all); next_run=$((now + interval)) ;;
+            false:3) scheduled_log_level=warn; scheduled_reason=deferred_paths; next_run=$((now + interval)) ;;
+            false:75) scheduled_log_level=info; scheduled_reason=busy; next_run=$((now + 30)) ;;
+            # Stopped, not failed: a package stop or a reboot cancelled the
+            # run. It used to be logged as an error and the interrupted run
+            # waited a whole interval -- up to 30 days -- before it was tried
+            # again. It runs a minute later instead, which after a restart is
+            # also when a passed deadline runs.
+            true:*) scheduled_log_level=info; scheduled_reason=cancelled; next_run=$((now + 60)) ;;
+            *)
+                scheduled_log_level=error
+                routine_run_reason all "${schedule_dispatch_epoch:-0}"
+                scheduled_reason=$routine_reason_value
+                next_run=$((now + interval))
+                ;;
         esac
         save_schedule_deadline "$next_run"
         controller_log_event "$scheduled_log_level" scheduled_run "exit=$run_exit next=$next_run reason=$scheduled_reason" scheduler
+        if [ "$runner_stop_killed" = true ]; then
+            controller_log_event warn runner_stop_forced "scope=all grace=$runner_stop_grace exit=$run_exit" scheduler
+            reconcile_stale_run_state "$now" cancelled
+            runner_stop_killed=false
+        fi
     fi
 
     [ "$shutdown" = false ] || break
-    now=$(epoch_now)
+    controller_now
     process_routines "$now"
 
     [ "$shutdown" = false ] || break
@@ -3439,11 +4219,11 @@ while [ "$shutdown" = false ]; do
         break
     done
     if [ "$control_queue_progress" = true ] && [ "$control_backlog" = true ]; then
-        write_controller_state running "$$" "$next_run" 0
+        save_controller_state running "$$" "$next_run" 0
         continue
     fi
 
-    write_controller_state running "$$" "$next_run" 0
+    save_controller_state running "$$" "$next_run" 0
     sleep_for=30
     for wake_routine in "$routines_dir"/*.conf; do
         [ -e "$wake_routine" ] || [ -L "$wake_routine" ] || continue
@@ -3467,8 +4247,12 @@ while [ "$shutdown" = false ]; do
     [ "$sleep_for" -gt 0 ] || sleep_for=1
     if ! launch_admitted_child sleep controller_sleep sleep "$sleep_for"; then
         [ "$admitted_child_status" != cancelled ] || continue
-        controller_log_event error child_identity_capture_failed "kind=controller_sleep"
-        exit 73
+        log_child_launch_failure controller_sleep
+        # The admitted sleep is what keeps a signal from waiting out the whole
+        # nap; without it, nap unadmitted rather than end the controller, or
+        # spin through turns while processes cannot be created.
+        /bin/sleep 1 || :
+        continue
     fi
     sleep_admission_path=$admitted_child_admission_path
     # Close every signal-before-publication race: a handler either stops the
