@@ -80,7 +80,12 @@ upgrade_transition_state=$(package_transition_status) || {
     exit 1
 }
 case $upgrade_transition_state in
-    open) "$api_bridge" --package-transition prepare upgrade ;;
+    open)
+        "$api_bridge" --package-transition prepare upgrade || {
+            package_message "upgrade could not open its transition marker (status $?)"
+            exit 1
+        }
+        ;;
     upgrade) ;;
     *) package_message "cannot complete upgrade during package $upgrade_transition_state"; exit 1 ;;
 esac

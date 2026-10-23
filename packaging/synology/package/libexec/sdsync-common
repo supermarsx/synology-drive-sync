@@ -76,6 +76,11 @@ doctor_inventory_log=$log_root/doctor-inventory.log
 doctor_state=$state_root/doctor.state
 alert_state=$state_root/alerts.state
 dsm_system_log_state=$state_root/system-log.state
+# A saved configuration change the running controller was not told about: the
+# manager writes it when the reload signal could not be delivered, and the
+# controller removes it once it has (re)loaded its configuration. See
+# record_controller_reload_failure.
+controller_reload_marker=$state_root/controller-reload.pending
 package_home_real=$(CDPATH='' cd -- "$package_home" 2>/dev/null && pwd -P || printf '%s' "$package_home")
 package_var_real=$(CDPATH='' cd -- "$package_var" 2>/dev/null && pwd -P || printf '%s' "$package_var")
 controller_pid_file=$runtime_root/controller.pid
@@ -266,17 +271,25 @@ ensure_layout() {
             umask "$old_umask"
             return 73
         fi
-        mkdir -p "$private_dir"
-        chmod 0700 "$private_dir"
-        set_private_owner "$private_dir"
+        # Each step is checked: ensure_layout used to end on `umask`, so a
+        # directory it could not create or make private was reported ready and
+        # a later strict reader refused it with an unrelated error.
+        if ! { mkdir -p "$private_dir" && [ -d "$private_dir" ] && chmod 0700 "$private_dir" \
+            && set_private_owner "$private_dir"; }; then
+            echo "cannot prepare private package directory: $private_dir" >&2
+            umask "$old_umask"
+            return 73
+        fi
     done
     umask "$old_umask"
 }
 
+# Returns the first failure: a chmod that failed used to be masked by the
+# owner step's status for every `finish_private_file ... || ...` caller.
 finish_private_file() {
     private_file=$1
-    chmod 0600 "$private_file"
-    set_private_owner "$private_file"
+    chmod 0600 "$private_file" || return 73
+    set_private_owner "$private_file" || return 73
 }
 
 is_pid() {
@@ -436,10 +449,62 @@ read_controller_pid_reporting() {
         return 0
     fi
     if ! read_pid "$controller_pid_file" 2>/dev/null; then
-        append_controller_log_event warn state_unreadable "file=controller.pid" >/dev/null 2>&1 \
+        append_controller_log_event error state_unreadable "file=controller.pid" >/dev/null 2>&1 \
             || printf 'warning: controller PID file exists but is unreadable\n' >&2
     fi
     return 0
+}
+
+# A configuration save reaches a running controller only through SIGHUP; the
+# controller has no periodic rescan of its policies or watchers. When that
+# signal could not be delivered the change is on disk but not in effect, and
+# that used to be one stderr warning beside an exit status of 0 -- the
+# dashboard said "saved" while the old schedule kept running. The failure is
+# now three records: an error event in controller.log, the private
+# controller-reload.pending file a reader can show until the controller next
+# loads its configuration, and an error line naming the cause. The caller
+# decides the exit status.
+#   record_controller_reload_failure REASON PID OPERATION
+record_controller_reload_failure() {
+    reload_failure_reason=$1
+    reload_failure_pid=${2:-none}
+    reload_failure_operation=${3:-unknown}
+    case $reload_failure_reason in pid_unreadable|identity_refused|identity_changed|signal_failed) ;; *) return 64 ;; esac
+    case $reload_failure_pid in none) ;; *) is_pid "$reload_failure_pid" || reload_failure_pid=none ;; esac
+    case $reload_failure_operation in ''|*[!a-z0-9-]*) reload_failure_operation=unknown ;; esac
+    reload_failure_epoch=$(epoch_now 2>/dev/null) || reload_failure_epoch=0
+    case $reload_failure_epoch in ''|*[!0-9]*) reload_failure_epoch=0 ;; esac
+    reload_marker_status=0
+    reload_marker_temp=$controller_reload_marker.tmp.$$
+    if [ -L "$controller_reload_marker" ] || { [ -e "$controller_reload_marker" ] && [ ! -f "$controller_reload_marker" ]; }; then
+        reload_marker_status=73
+    elif ( umask 077
+        printf 'epoch=%s\nreason=%s\npid=%s\noperation=%s\n' "$reload_failure_epoch" \
+            "$reload_failure_reason" "$reload_failure_pid" "$reload_failure_operation" > "$reload_marker_temp" ) \
+        && finish_private_file "$reload_marker_temp" \
+        && mv -f "$reload_marker_temp" "$controller_reload_marker"; then
+        :
+    else
+        reload_marker_status=69
+        rm -f "$reload_marker_temp" || true
+    fi
+    append_controller_log_event error controller_reload_failed \
+        "reason=$reload_failure_reason pid=$reload_failure_pid operation=$reload_failure_operation marker_status=$reload_marker_status" \
+        || printf 'error: the controller_reload_failed event could not be written to %s\n' "$controller_log" >&2
+    printf 'error: configuration was saved but the running controller was not reloaded (reason=%s pid=%s); it takes effect when the package service restarts or a later save reloads it\n' \
+        "$reload_failure_reason" "$reload_failure_pid" >&2
+    if [ "$reload_marker_status" -ne 0 ]; then
+        printf 'error: the pending-reload marker %s could not be written (status %s)\n' \
+            "$controller_reload_marker" "$reload_marker_status" >&2
+    fi
+    return 0
+}
+
+# Removes the pending-reload marker after the controller has (re)loaded. A
+# symlink is removed as a link, never followed.
+clear_controller_reload_marker() {
+    [ -e "$controller_reload_marker" ] || [ -L "$controller_reload_marker" ] || return 0
+    rm -f "$controller_reload_marker" || return 73
 }
 
 read_pid() {
@@ -939,6 +1004,13 @@ private_event_lock_directory() {
         [ -f "$checked_event_entry" ] && [ ! -L "$checked_event_entry" ] || return 1
         checked_event_entry_mode=$(stat -c '%a' "$checked_event_entry" 2>/dev/null || true)
         checked_event_entry_owner=$(stat -c '%u' "$checked_event_entry" 2>/dev/null || true)
+        # The holder releases by removing this entry, and can do so between
+        # the type test above and the stat here. An entry that is gone now was
+        # a lock released mid-inspection, not a malformed directory; only one
+        # that still exists and fails the check is.
+        if [ -z "$checked_event_entry_mode" ] || [ -z "$checked_event_entry_owner" ]; then
+            [ -e "$checked_event_entry" ] || [ -L "$checked_event_entry" ] || continue
+        fi
         [ "$checked_event_entry_mode" = 600 ] && [ "$checked_event_entry_owner" = "$path_owner" ] || return 1
     done
 }
@@ -1400,10 +1472,22 @@ remove_orphan_event_recovery() {
 }
 
 create_event_log_lock_directory() {
-    if [ ! -e "$event_log_lock" ] && [ ! -L "$event_log_lock" ]; then
-        (umask 077; mkdir "$event_log_lock") 2>/dev/null || true
-    fi
-    private_event_lock_directory "$event_log_lock" || return 1
+    event_directory_attempt=0
+    while :; do
+        if [ ! -e "$event_log_lock" ] && [ ! -L "$event_log_lock" ]; then
+            (umask 077; mkdir "$event_log_lock") 2>/dev/null || true
+        fi
+        private_event_lock_directory "$event_log_lock" && return 0
+        # A releasing holder removes the verified-empty directory with rmdir,
+        # whichever process created it, so it can vanish between the
+        # existence test above and the validation, or right after the mkdir.
+        # Absence is that race, not a malformed lock: make the directory again.
+        # A path that exists and fails validation stays a hard failure, and
+        # the retry is bounded.
+        [ ! -e "$event_log_lock" ] && [ ! -L "$event_log_lock" ] || return 1
+        event_directory_attempt=$((event_directory_attempt + 1))
+        [ "$event_directory_attempt" -lt 5 ] || return 1
+    done
 }
 
 # Poll bucket C -- do not convert the `sleep 1` calls below to poll_wait. The
@@ -1555,6 +1639,26 @@ acquire_event_log_lock() {
                 fi
                 continue
             fi
+            if lock_owner_torn_before_boot "$event_log_lock/pid"; then
+                # Recovered like a dead owner: moved aside, the move proved to
+                # have taken this very record, then removed.
+                torn_identity=$(stat -c '%d:%i' "$event_log_lock/pid" 2>/dev/null || true)
+                torn_recovery=$event_log_lock.torn.$$.$event_claim_start.$event_claim_boot
+                [ -n "$torn_identity" ] && [ ! -e "$torn_recovery" ] && [ ! -L "$torn_recovery" ] \
+                    || { rm -f "$event_claim_path"; return 73; }
+                mv "$event_log_lock/pid" "$torn_recovery" 2>/dev/null || continue
+                torn_moved=$(stat -c '%d:%i' "$torn_recovery" 2>/dev/null || true)
+                if [ "$torn_moved" != "$torn_identity" ]; then
+                    if [ ! -e "$event_log_lock/pid" ] && [ ! -L "$event_log_lock/pid" ]; then
+                        mv "$torn_recovery" "$event_log_lock/pid" 2>/dev/null || true
+                    fi
+                    sleep 1
+                    continue
+                fi
+                rm -f "$torn_recovery" || { rm -f "$event_claim_path"; return 73; }
+                echo "recovered a lock owner record torn before the last boot: $event_log_lock/pid" >&2
+                continue
+            fi
             rm -f "$event_claim_path"
             return 73
         fi
@@ -1655,6 +1759,25 @@ acquire_private_process_lock() {
     return "$process_lock_status"
 }
 
+# An owner record that does not parse and was last written before the current
+# boot. The owner is written without fsync, so a power cut can leave it empty
+# or torn, and such a lock used to fail closed forever: every run exited 73,
+# stop and start refused, or nothing reached the logs. A record from before
+# this boot cannot name a live process, so it is stale; one written in this
+# boot is not provably dead and stays a refusal.
+lock_owner_torn_before_boot() {
+    torn_owner_path=$1
+    [ -f "$torn_owner_path" ] && [ ! -L "$torn_owner_path" ] || return 1
+    case ${path_owner:-} in ''|*[!0-9]*) return 1 ;; esac
+    torn_owner_contract=$(stat -c '%u:%a:%h:%Y' "$torn_owner_path" 2>/dev/null) || return 1
+    torn_owner_mtime=${torn_owner_contract##*:}
+    [ "${torn_owner_contract%:*}" = "$path_owner:600:1" ] || return 1
+    torn_owner_boot=$(awk '$1 == "btime" { print $2; exit }' /proc/stat 2>/dev/null) || return 1
+    case $torn_owner_boot:$torn_owner_mtime in *[!0-9:]*|:*|*:) return 1 ;; esac
+    [ "$torn_owner_mtime" -lt "$torn_owner_boot" ] || return 1
+    ! read_private_lock_owner "$torn_owner_path"
+}
+
 private_process_lock_is_live() {
     checked_process_lock=$1
     saved_event_log_lock=$event_log_lock
@@ -1673,6 +1796,8 @@ private_process_lock_is_live() {
     fi
     if ! read_private_lock_owner "$checked_process_lock/pid"; then
         event_log_lock=$saved_event_log_lock
+        # Not live; acquiring it recovers the record (acquire_event_log_lock).
+        lock_owner_torn_before_boot "$checked_process_lock/pid" && return 1
         return 73
     fi
     process_lock_live_status=0
@@ -1699,6 +1824,16 @@ setting() {
     setting_name=$2
     setting_default=$3
     if [ -L "$setting_file" ] || [ ! -f "$setting_file" ]; then
+        # Absent is the ordinary "use the default"; present but unusable is
+        # not, and says so (the value returned is still the default).
+        if [ -L "$setting_file" ] || [ -e "$setting_file" ]; then
+            printf 'error: %s is not a regular file; %s reads as its default\n' "$setting_file" "$setting_name" >&2
+        fi
+        printf '%s\n' "$setting_default"
+        return
+    fi
+    if [ ! -r "$setting_file" ]; then
+        printf 'error: %s is not readable; %s reads as its default\n' "$setting_file" "$setting_name" >&2
         printf '%s\n' "$setting_default"
         return
     fi
@@ -1978,6 +2113,38 @@ routine_clock_allows() {
     fi
 }
 
+# The calendar day a daily routine's window belongs to: the day it opened.
+# That is today, except in the part of a window that wraps past midnight
+# (23:00-01:00 at 00:30), which belongs to yesterday's window. last_day is
+# recorded as this day, taken when the run is dispatched: recording the day a
+# run FINISHED made a run that crossed midnight consume the next night, and a
+# wrapping window ran twice a night.
+#   routine_window_day START END
+routine_window_day() {
+    window_day_start=$(printf '%s' "$1" | tr -d ':')
+    window_day_end=$(printf '%s' "$2" | tr -d ':')
+    window_day_start=${window_day_start#0}; [ -n "$window_day_start" ] || window_day_start=0
+    window_day_end=${window_day_end#0}; [ -n "$window_day_end" ] || window_day_end=0
+    if [ "$window_day_start" -gt "$window_day_end" ]; then
+        window_day_now=$(date +%H%M) || return 1
+        while :; do
+            case $window_day_now in 0?*) window_day_now=${window_day_now#0} ;; *) break ;; esac
+        done
+        case $window_day_now in ''|*[!0-9]*) return 1 ;; esac
+        if [ "$window_day_now" -le "$window_day_end" ]; then
+            # Step back past midnight by the minutes since it plus an hour, not
+            # by 86400 s: on a 23-hour daylight-saving day that lands two days
+            # back. ($window_day_now has no leading zero, so $(( )) cannot
+            # read it as octal.)
+            window_day_epoch=$(epoch_now) || return 1
+            window_day_back=$(( ((window_day_now / 100) * 60 + window_day_now % 100 + 60) * 60 ))
+            date -d "@$((window_day_epoch - window_day_back))" +%Y-%m-%d
+            return
+        fi
+    fi
+    date +%Y-%m-%d
+}
+
 # Return the whole-action retry delay. Missing retry_exponential fields from
 # pre-toggle routine files preserve the former exponential behavior at their
 # call sites; every fixed or exponential delay is bounded to five minutes.
@@ -2168,6 +2335,16 @@ write_run_state_extras() {
         ''|*[!a-z0-9_]*) ;;
         *) printf 'degraded_reason=%s\n' "$run_state_degraded_reason" || return 1 ;;
     esac
+    # Only on a running document (the runner's heartbeat, C-S7).
+    case ${run_state_heartbeat:-} in
+        ''|*[!0-9]*) ;;
+        *)
+            printf 'heartbeat_epoch=%s\n' "$run_state_heartbeat" || return 1
+            case ${run_state_heartbeat_source:-} in
+                io|progress|liveness) printf 'heartbeat_source=%s\n' "$run_state_heartbeat_source" || return 1 ;;
+            esac
+            ;;
+    esac
     # Result facts (contract v1.5), summed over an aggregate's jobs.
     case ${run_state_listings:-} in ''|*[!0-9]*) ;; *) printf 'incomplete_listings=%s\n' "$run_state_listings" || return 1 ;; esac
     case ${run_state_folders:-} in
@@ -2195,7 +2372,9 @@ write_run_state() {
     case $run_reason in ''|*[!a-z0-9_]*) run_reason=none ;; esac
     case $run_detail in *[![:print:]]*|*'|'*) run_detail= ;; esac
     [ "${#run_detail}" -le 160 ] || run_detail=
-    if [ "$run_record_scope" = all ]; then
+    # The aggregate fields describe the last `all` *sync*; a plan of all
+    # profiles carries them over rather than replacing a sync's outcome.
+    if [ "$run_record_scope" = all ] && [ "$run_operation" != plan ]; then
         run_aggregate_state=$run_status
         run_aggregate_finished=$run_finished
         run_aggregate_exit=$run_exit
@@ -2223,12 +2402,162 @@ write_run_state() {
     mv -f "$run_temp" "$run_state" || { rm -f "$run_temp"; return 69; }
 }
 
+# The per-profile completion record. state keeps its meaning -- the last known
+# completion, read by the routine dependency gate -- and outcome says what this
+# particular run did for this profile. A profile the run never reached keeps
+# its previous completion: an aggregate stopped by another profile's failure is
+# not evidence that this one failed, and is no longer recorded as if it were.
+# Read by the runner before it writes the next record (write_profile_outcome)
+# and by the controller when it reconciles a run whose runner died.
+read_profile_completion_state() {
+    profile_previous_state=never
+    profile_previous_finished=0
+    profile_previous_exit=-1
+    profile_previous_action=none
+    profile_previous_failures=0
+    profile_previous_success=0
+    profile_previous_outcome_epoch=0
+    [ -f "$1" ] && [ ! -L "$1" ] && [ -r "$1" ] || return 0
+    profile_previous_seen=,
+    profile_previous_lines=0
+    while IFS= read -r profile_previous_line || [ -n "$profile_previous_line" ]; do
+        profile_previous_lines=$((profile_previous_lines + 1))
+        [ "$profile_previous_lines" -le 64 ] || break
+        profile_previous_key=${profile_previous_line%%=*}
+        [ "$profile_previous_key" != "$profile_previous_line" ] || continue
+        profile_previous_value=${profile_previous_line#*=}
+        [ -n "$profile_previous_value" ] || continue
+        case $profile_previous_seen in *",$profile_previous_key,"*) continue ;; esac
+        case $profile_previous_key in
+            state) profile_previous_state=$profile_previous_value ;;
+            finished_epoch) profile_previous_finished=$profile_previous_value ;;
+            exit_code) profile_previous_exit=$profile_previous_value ;;
+            action) profile_previous_action=$profile_previous_value ;;
+            consecutive_failures) profile_previous_failures=$profile_previous_value ;;
+            last_success_epoch) profile_previous_success=$profile_previous_value ;;
+            outcome_epoch) profile_previous_outcome_epoch=$profile_previous_value ;;
+            *) continue ;;
+        esac
+        profile_previous_seen=$profile_previous_seen$profile_previous_key,
+    done < "$1"
+    case $profile_previous_state in never|succeeded|failed) ;; *) profile_previous_state=never ;; esac
+    case $profile_previous_finished in ''|*[!0-9]*) profile_previous_finished=0 ;; esac
+    case $profile_previous_exit in -1) ;; ''|*[!0-9]*) profile_previous_exit=-1 ;; esac
+    case $profile_previous_action in sync|plan|none) ;; *) profile_previous_action=none ;; esac
+    case $profile_previous_failures in ''|*[!0-9]*) profile_previous_failures=0 ;; esac
+    [ "$profile_previous_failures" -le 999999 ] || profile_previous_failures=999999
+    case $profile_previous_success in ''|*[!0-9]*) profile_previous_success=0 ;; esac
+    case $profile_previous_outcome_epoch in ''|*[!0-9]*) profile_previous_outcome_epoch=0 ;; esac
+}
+
+# A sync whose runner died leaves the profiles it covered on whatever they
+# recorded before it, so after the controller's reconcile the per-profile rows
+# read their previous success again for a run that died part-way. Each
+# covered profile whose record predates the dead run is stamped the way the
+# runner stamps a profile whose result it could not read: failed, outcome
+# unknown, reason runner_died, one more consecutive failure. A record the run
+# itself wrote (outcome_epoch at or after its start) is that profile's real
+# result and is kept.
+#   stamp_dead_run_profile NAME RUN_STARTED FINISHED SCOPE(all|profile)
+stamp_dead_run_profile() {
+    dead_profile_name=$1
+    dead_profile_started=$2
+    dead_profile_finished=$3
+    dead_profile_scope=$4
+    case $dead_profile_name in ''|*[!A-Za-z0-9_-]*) return 64 ;; esac
+    [ -f "$profiles_dir/$dead_profile_name.toml" ] || return 0
+    dead_profile_path=$profile_state_dir/$dead_profile_name.state
+    [ ! -L "$dead_profile_path" ] || return 73
+    read_profile_completion_state "$dead_profile_path"
+    dead_profile_recorded=$profile_previous_outcome_epoch
+    [ "$dead_profile_recorded" -ne 0 ] || dead_profile_recorded=$profile_previous_finished
+    [ "$dead_profile_recorded" -lt "$dead_profile_started" ] || return 0
+    dead_profile_failures=$((profile_previous_failures + 1))
+    dead_profile_temp=$profile_state_dir/.$dead_profile_name.state.$$
+    if ( umask 077
+        printf 'state=failed\nfinished_epoch=%s\nexit_code=-1\naction=sync\n' "$dead_profile_finished" &&
+        printf 'outcome=unknown\nreason=runner_died\nscope=%s\noutcome_epoch=%s\n' "$dead_profile_scope" "$dead_profile_finished" &&
+        printf 'consecutive_failures=%s\nlast_success_epoch=%s\n' "$dead_profile_failures" "$profile_previous_success"
+    ) > "$dead_profile_temp" \
+        && finish_private_file "$dead_profile_temp" \
+        && mv -f "$dead_profile_temp" "$dead_profile_path"; then
+        return 0
+    fi
+    rm -f "$dead_profile_temp" || true
+    return 69
+}
+
+# A run that finished but could not publish its final run.state -- even after
+# retrying -- leaves `running` beside a released run lock, which is exactly
+# what a dead runner leaves, and the controller used to rewrite it as
+# failed/runner_died and alert, for a run that may have succeeded. The runner
+# writes its known outcome here instead; the controller's stale-run reconcile
+# publishes that outcome (marked degraded=run_state,
+# degraded_reason=run_state_write_failed) rather than inventing a failure.
+run_unrecorded_marker=$state_root/run.unrecorded
+
+#   write_unrecorded_run_outcome STATE OUTCOME STARTED FINISHED EXIT SCOPE OPERATION REASON DETAIL DEGRADED
+write_unrecorded_run_outcome() {
+    [ ! -L "$run_unrecorded_marker" ] || return 73
+    unrecorded_temp=$run_unrecorded_marker.tmp.$$
+    if ( umask 077
+        printf 'state=%s\noutcome=%s\nstarted_epoch=%s\nfinished_epoch=%s\nexit_code=%s\n' "$1" "$2" "$3" "$4" "$5" &&
+        printf 'scope=%s\noperation=%s\nreason=%s\ndetail=%s\ndegraded=%s\n' "$6" "$7" "$8" "$9" "${10}"
+    ) > "$unrecorded_temp" \
+        && finish_private_file "$unrecorded_temp" \
+        && mv -f "$unrecorded_temp" "$run_unrecorded_marker"; then
+        return 0
+    fi
+    rm -f "$unrecorded_temp" || true
+    return 69
+}
+
+# Reads the marker for the run that started at STARTED with scope SCOPE. Any
+# other marker -- an older run's, a malformed one -- is not this run's outcome
+# and returns 1; the caller then treats the run as a dead runner, as before.
+#   read_unrecorded_run_outcome STARTED SCOPE
+read_unrecorded_run_outcome() {
+    [ -f "$run_unrecorded_marker" ] && [ ! -L "$run_unrecorded_marker" ] && [ -r "$run_unrecorded_marker" ] || return 1
+    unrecorded_state= unrecorded_outcome= unrecorded_started= unrecorded_finished= unrecorded_exit=
+    unrecorded_scope= unrecorded_operation= unrecorded_reason= unrecorded_detail= unrecorded_degraded=
+    unrecorded_lines=0
+    while IFS= read -r unrecorded_line || [ -n "$unrecorded_line" ]; do
+        unrecorded_lines=$((unrecorded_lines + 1))
+        [ "$unrecorded_lines" -le 16 ] || return 1
+        case $unrecorded_line in
+            state=*) unrecorded_state=${unrecorded_line#state=} ;;
+            outcome=*) unrecorded_outcome=${unrecorded_line#outcome=} ;;
+            started_epoch=*) unrecorded_started=${unrecorded_line#started_epoch=} ;;
+            finished_epoch=*) unrecorded_finished=${unrecorded_line#finished_epoch=} ;;
+            exit_code=*) unrecorded_exit=${unrecorded_line#exit_code=} ;;
+            scope=*) unrecorded_scope=${unrecorded_line#scope=} ;;
+            operation=*) unrecorded_operation=${unrecorded_line#operation=} ;;
+            reason=*) unrecorded_reason=${unrecorded_line#reason=} ;;
+            detail=*) unrecorded_detail=${unrecorded_line#detail=} ;;
+            degraded=*) unrecorded_degraded=${unrecorded_line#degraded=} ;;
+        esac
+    done < "$run_unrecorded_marker"
+    case $unrecorded_state in succeeded|failed) ;; *) return 1 ;; esac
+    case $unrecorded_outcome in succeeded|partial|failed|busy|cancelled|'') ;; *) return 1 ;; esac
+    case $unrecorded_started in ''|*[!0-9]*) return 1 ;; esac
+    case $unrecorded_finished in ''|*[!0-9]*) return 1 ;; esac
+    case $unrecorded_exit in ''|*[!0-9]*) return 1 ;; esac
+    case $unrecorded_operation in sync|plan) ;; *) return 1 ;; esac
+    case $unrecorded_degraded in *[!a-z_,]*) return 1 ;; esac
+    [ "$unrecorded_started" = "$1" ] && [ "$unrecorded_scope" = "$2" ]
+}
+
 private_log_path_safe_or_absent() {
     private_log_path=$1
     if [ ! -e "$private_log_path" ] && [ ! -L "$private_log_path" ]; then
         return 0
     fi
-    case ${path_owner:-} in ''|*[!0-9]*) return 73 ;; esac
+    case ${path_owner:-} in
+        ''|*[!0-9]*)
+            echo "refusing package log file $private_log_path: the package owner is unknown" >&2
+            return 73
+            ;;
+    esac
     [ ! -L "$private_log_path" ] && [ -f "$private_log_path" ] || {
         echo "refusing unsafe package log file: $private_log_path" >&2
         return 73
@@ -2240,10 +2569,16 @@ private_log_path_safe_or_absent() {
     }
 }
 
+# Returns 0 when nothing needed doing or the set rotated, 73 when the set is
+# not a private package log set (nothing is touched), and 69 when a move
+# failed (rotate_failure names it). A failed move stops the rotation at once,
+# so a later move never overwrites a file the failed one should have moved.
 rotate_log() {
     rotate_path=$1
     rotate_limit=${2:-10485760}
     rotate_keep=${3:-5}
+    rotate_failure=
+    rotate_rotated=false
     case $rotate_limit in ''|*[!0-9]*|0) return 73 ;; esac
     case $rotate_keep in ''|*[!0-9]*|0) return 73 ;; esac
     [ "$rotate_keep" -le 64 ] 2>/dev/null || return 73
@@ -2265,17 +2600,95 @@ rotate_log() {
 
     [ -f "$rotate_path" ] || return 0
     rotate_size=$(wc -c < "$rotate_path" | tr -d ' ')
-    case $rotate_size in ''|*[!0-9]*) return 73 ;; esac
+    case $rotate_size in
+        ''|*[!0-9]*)
+            rotate_failure="the size of $rotate_path could not be read"
+            return 69
+            ;;
+    esac
     [ "$rotate_size" -ge "$rotate_limit" ] || return 0
-    rotate_index=$rotate_keep
+    # Shift only up to the first free slot: after an interrupted rotation the
+    # set has a gap, and shifting past it would drop the oldest file again on
+    # every attempt.
+    rotate_index=1
+    while [ "$rotate_index" -lt "$rotate_keep" ] \
+        && { [ -e "$rotate_path.$rotate_index" ] || [ -L "$rotate_path.$rotate_index" ]; }; do
+        rotate_index=$((rotate_index + 1))
+    done
     while [ "$rotate_index" -gt 1 ]; do
         rotate_previous=$((rotate_index - 1))
         if [ -f "$rotate_path.$rotate_previous" ] && [ ! -L "$rotate_path.$rotate_previous" ]; then
-            mv -f "$rotate_path.$rotate_previous" "$rotate_path.$rotate_index"
+            mv -f "$rotate_path.$rotate_previous" "$rotate_path.$rotate_index" || {
+                rotate_failure="$rotate_path.$rotate_previous could not be moved to $rotate_path.$rotate_index"
+                return 69
+            }
         fi
         rotate_index=$rotate_previous
     done
-    mv -f "$rotate_path" "$rotate_path.1"
+    mv -f "$rotate_path" "$rotate_path.1" || {
+        rotate_failure="$rotate_path could not be moved to $rotate_path.1"
+        return 69
+    }
+    rotate_rotated=true
+}
+
+# A log line is never dropped for a rotation problem. A rotation that failed
+# (a move refused) leaves the line in the still-valid active file, past its
+# size limit, and records the failure once per episode: an error line naming
+# the path and the cause, and the private log-rotation.failed marker a reader
+# can show; the next rotation that succeeds retires it. A set that is not a
+# private package log set is refused outright -- nothing may be written to it
+# -- so the line goes to stderr with the refusal, where the caller's own
+# output goes, instead of vanishing.
+log_rotation_marker=$state_root/log-rotation.failed
+
+record_log_rotation_failure() {
+    rotation_failed_path=$1
+    rotation_failed_cause=$2
+    if [ -f "$log_rotation_marker" ] && [ ! -L "$log_rotation_marker" ]; then
+        rotation_marker_path=
+        while IFS='=' read -r rotation_marker_name rotation_marker_value; do
+            [ "$rotation_marker_name" != path ] || rotation_marker_path=$rotation_marker_value
+        done < "$log_rotation_marker" || rotation_marker_path=
+        # Already recorded for this log: the episode is still open.
+        [ "$rotation_marker_path" != "$rotation_failed_path" ] || return 0
+    fi
+    printf 'error: log rotation failed: %s; new lines are kept in %s past its size limit\n' \
+        "$rotation_failed_cause" "$rotation_failed_path" >&2
+    rotation_marker_epoch=$(epoch_now 2>/dev/null) || rotation_marker_epoch=0
+    rotation_marker_temp=$log_rotation_marker.tmp.$$
+    if [ ! -L "$log_rotation_marker" ] && ( umask 077
+        printf 'epoch=%s\npath=%s\ncause=%s\n' "${rotation_marker_epoch:-0}" "$rotation_failed_path" \
+            "$rotation_failed_cause" > "$rotation_marker_temp" ) \
+        && finish_private_file "$rotation_marker_temp" \
+        && mv -f "$rotation_marker_temp" "$log_rotation_marker"; then
+        return 0
+    fi
+    rm -f "$rotation_marker_temp" || true
+    printf 'error: the log rotation marker %s could not be written\n' "$log_rotation_marker" >&2
+}
+
+retire_log_rotation_failure() {
+    [ -f "$log_rotation_marker" ] && [ ! -L "$log_rotation_marker" ] || return 0
+    rotation_marker_path=
+    while IFS='=' read -r rotation_marker_name rotation_marker_value; do
+        [ "$rotation_marker_name" != path ] || rotation_marker_path=$rotation_marker_value
+    done < "$log_rotation_marker" || return 0
+    [ "$rotation_marker_path" = "$1" ] || return 0
+    rm -f "$log_rotation_marker" \
+        || printf 'error: the log rotation marker %s could not be removed\n' "$log_rotation_marker" >&2
+}
+
+# Rotation outside an append (service start): a failed move is recorded and
+# the oversized log stays in use; an unsafe set is still refused.
+rotate_log_or_record() {
+    rotate_or_record_status=0
+    rotate_log "$@" || rotate_or_record_status=$?
+    case $rotate_or_record_status in
+        0) [ "$rotate_rotated" != true ] || retire_log_rotation_failure "$1" ;;
+        69) record_log_rotation_failure "$1" "$rotate_failure" ;;
+        *) return "$rotate_or_record_status" ;;
+    esac
 }
 
 append_rotating_log() {
@@ -2286,9 +2699,17 @@ append_rotating_log() {
     append_old_umask=$(umask)
     umask 077
     append_status=0
+    append_written=false
     rotate_log "$append_path" "$append_limit" "$append_keep" || append_status=$?
+    case $append_status in
+        0) [ "$rotate_rotated" != true ] || retire_log_rotation_failure "$append_path" ;;
+        69)
+            record_log_rotation_failure "$append_path" "$rotate_failure"
+            append_status=0
+            ;;
+    esac
     if [ "$append_status" -eq 0 ]; then
-        printf '%s\n' "$append_line" >> "$append_path" || append_status=$?
+        printf '%s\n' "$append_line" >> "$append_path" && append_written=true || append_status=$?
     fi
     if [ "$append_status" -eq 0 ]; then
         finish_private_file "$append_path" || append_status=$?
@@ -2297,6 +2718,10 @@ append_rotating_log() {
         private_log_path_safe_or_absent "$append_path" || append_status=$?
     fi
     umask "$append_old_umask"
+    if [ "$append_status" -ne 0 ] && [ "$append_written" != true ]; then
+        printf 'error: a line for %s was not written (status %s): %s\n' \
+            "$append_path" "$append_status" "$append_line" >&2
+    fi
     return "$append_status"
 }
 
@@ -2325,6 +2750,23 @@ json_quote() {
     '
 }
 
+# Sets neutral_markers_result to TEXT with every ` request_id=` written as
+# ` request_id_` (append_activity).
+neutralise_request_markers() {
+    neutral_markers_rest=$1
+    neutral_markers_result=
+    while :; do
+        case $neutral_markers_rest in
+            *" request_id="*)
+                neutral_markers_result=$neutral_markers_result${neutral_markers_rest%%" request_id="*}" request_id_"
+                neutral_markers_rest=${neutral_markers_rest#*" request_id="}
+                ;;
+            *) break ;;
+        esac
+    done
+    neutral_markers_result=$neutral_markers_result$neutral_markers_rest
+}
+
 append_activity() {
     activity_code=$1
     activity_profile=${2:-none}
@@ -2344,10 +2786,11 @@ append_activity() {
         security.policy_changed|security.log_tail_recovered|security.failed|\
         authentication.failed|bridge.failed|\
         service.started|service.stopped|service.restarted|service.start_failed) ;;
-        *) return 64 ;;
+        *) echo "refusing Activity record: unknown code $activity_code" >&2; return 64 ;;
     esac
     case $activity_profile in none|all|''|*[!A-Za-z0-9_-]*)
-        [ "$activity_profile" = none ] || [ "$activity_profile" = all ] || return 64
+        [ "$activity_profile" = none ] || [ "$activity_profile" = all ] \
+            || { echo "refusing Activity record $activity_code: invalid profile name" >&2; return 64; }
         ;;
     esac
     case $activity_state in running|succeeded|failed|deferred|scheduled|changed|unavailable|requested) ;;
@@ -2377,6 +2820,24 @@ append_activity() {
     if printf '%s' "$activity_message" | LC_ALL=C grep '[[:cntrl:]]' >/dev/null 2>&1; then
         return 64
     fi
+    # Readers take the first ` request_id=` in a message as the dashboard
+    # request tag and expect exactly 32 lowercase hex digits after it to the
+    # end. Free text reaches messages -- a core error line naming a file
+    # `meeting request_id=5.txt` -- and such a record made the whole Activity
+    # feed corrupt. Only a genuine trailing tag keeps the marker; every other
+    # occurrence is written as ` request_id_`.
+    case $activity_message in
+        *" request_id="*)
+            activity_tag=${activity_message##*" request_id="}
+            if [ "${#activity_tag}" -eq 32 ] && case $activity_tag in *[!0-9a-f]*) false ;; *) true ;; esac; then
+                neutralise_request_markers "${activity_message%" request_id="*}"
+                activity_message="$neutral_markers_result request_id=$activity_tag"
+            else
+                neutralise_request_markers "$activity_message"
+                activity_message=$neutral_markers_result
+            fi
+            ;;
+    esac
     # An error-level record is written whatever its category's threshold, `off`
     # included. Silencing a noisy category is a reasonable reaction to routine
     # chatter, and it used to make that category's failures vanish with it;
@@ -2399,11 +2860,22 @@ append_activity() {
     if [ "$activity_append_status" -eq 0 ]; then
         case $activity_tail_state in clean|repaired) ;; *) activity_append_status=73 ;; esac
     fi
+    # A record without an epoch made the whole feed read as corrupt; one that
+    # cannot be dated is refused here instead, and said so.
+    if [ "$activity_append_status" -eq 0 ]; then
+        activity_epoch=$(epoch_now 2>/dev/null) || activity_epoch=
+        case $activity_epoch in
+            ''|*[!0-9]*)
+                echo "refusing Activity record $activity_code: the clock could not be read" >&2
+                activity_append_status=69
+                ;;
+        esac
+    fi
     if [ "$activity_append_status" -eq 0 ]; then
         if [ -n "$activity_actor_uid" ]; then
-            activity_record="$(epoch_now)|$activity_code|${activity_profile:-none}|$activity_state|$activity_category|$activity_level|$activity_actor_uid|$activity_actor|$activity_message"
+            activity_record="$activity_epoch|$activity_code|${activity_profile:-none}|$activity_state|$activity_category|$activity_level|$activity_actor_uid|$activity_actor|$activity_message"
         else
-            activity_record="$(epoch_now)|$activity_code|${activity_profile:-none}|$activity_state|$activity_category|$activity_level|$activity_message"
+            activity_record="$activity_epoch|$activity_code|${activity_profile:-none}|$activity_state|$activity_category|$activity_level|$activity_message"
         fi
         append_rotating_log "$activity_log" 1048576 3 "$activity_record" || activity_append_status=$?
     fi
@@ -2439,6 +2911,10 @@ security_category_level() {
 
 # Exit 0 when an optional event meets its persisted category threshold, 1 when
 # it is intentionally suppressed, and preserve strict policy/runtime failures.
+# An error passes every threshold, `off` included, as it does for Activity:
+# turning a noisy category off is a reaction to chatter, and it used to take
+# that category's failure records -- a run.state that could not be written, an
+# alert that could not be raised -- with it.
 security_event_enabled() {
     security_event_category=$1
     security_event_level=$2
@@ -2447,7 +2923,7 @@ security_event_enabled() {
     case $security_event_mandatory in true) return 0 ;; false) ;; *) return 64 ;; esac
     security_event_threshold=$(security_category_level "$security_event_category") || return $?
     case $security_event_threshold in
-        off) return 1 ;;
+        off) [ "$security_event_rank" -eq 4 ] || return 1; return 0 ;;
         trace) security_threshold_rank=0 ;;
         debug) security_threshold_rank=1 ;;
         info) security_threshold_rank=2 ;;
@@ -2645,7 +3121,11 @@ REPAIR_REPORT
     repair_count=0
     repair_status=0
     for repair_target in "$@"; do
-        chmod 0600 "$repair_target" || { repair_status=73; continue; }
+        chmod 0600 "$repair_target" || {
+            echo "cannot restore mode 0600 on $repair_target" >&2
+            repair_status=73
+            continue
+        }
         repair_count=$((repair_count + 1))
     done
     if [ "$repair_count" -gt 0 ]; then
@@ -3028,7 +3508,9 @@ safe_notify() {
     esac
     case $notify_exit in ''|*[!0-9]*) return 64 ;; esac
     notify_status=69
+    notify_error="the DSM notifier is not installed"
     if [ -x /usr/syno/bin/synodsmnotify ] && [ ! -L /usr/syno/bin/synodsmnotify ]; then
+        notify_error="the DSM notifier refused the notification"
         # DSM receives only reviewed application and I18N identifiers. Dynamic
         # profile, exit, log, and secret material never enters notifier argv.
         case $notify_key in
@@ -3055,9 +3537,38 @@ safe_notify() {
                 ;;
         esac
     fi
+    # The Activity text is fixed (the callers log the status). A record that
+    # cannot be written says so on stderr, with the status and which of the two
+    # failures it was, instead of disappearing behind `2>/dev/null || true`.
+    # (The notifier's own stderr stays discarded: validate_spk.py pins its argv
+    # and redirections as the reviewed contract.)
+    notify_cause=$(one_safe_line "$notify_error")
+    notify_record_status=0
     append_activity notification.unavailable "$notify_profile" unavailable \
-        "DSM desktop notification delivery unavailable" notifications warn 2>/dev/null || true
+        "DSM desktop notification delivery unavailable" \
+        notifications warn || notify_record_status=$?
+    if [ "$notify_record_status" -ne 0 ]; then
+        printf 'error: DSM desktop notification failed (status %s%s) and its Activity record could not be written (status %s)\n' \
+            "$notify_status" "${notify_cause:+: $notify_cause}" "$notify_record_status" >&2
+    fi
     return "$notify_status"
+}
+
+# The first non-empty line of TEXT, reduced to printable ASCII without `|`
+# and at most 160 characters: safe for an Activity message or a log detail.
+one_safe_line() {
+    printf '%s\n' "${1:-}" | LC_ALL=C awk '
+        { gsub(/[^ -~]/, ""); gsub(/[|]/, "/"); sub(/^ +/, ""); sub(/ +$/, "") }
+        $0 != "" { printf "%s", substr($0, 1, 160); exit }
+    '
+}
+
+# Prints why an alert handler refused, naming the file and field, and returns
+# 73 for the caller to pass on. A corrupt alerts.state or doctor.state used to
+# turn every failure notification off with nothing said.
+alert_refusal() {
+    printf 'error: alert processing refused: %s\n' "$1" >&2
+    return 73
 }
 
 handle_alert_result() {
@@ -3067,7 +3578,8 @@ handle_alert_result() {
     case $alert_profile in all|*[!A-Za-z0-9_-]*) [ "$alert_profile" = all ] || return 64 ;; esac
     case $alert_result in succeeded|failed) ;; *) return 64 ;; esac
     case $alert_exit in ''|*[!0-9]*) return 64 ;; esac
-    [ ! -L "$alert_policy_file" ] && [ ! -L "$alert_state" ] || return 73
+    [ ! -L "$alert_policy_file" ] || { alert_refusal "$alert_policy_file is a symlink"; return 73; }
+    [ ! -L "$alert_state" ] || { alert_refusal "$alert_state is a symlink"; return 73; }
     policy_enabled=$(setting "$alert_policy_file" enabled true)
     policy_success=$(setting "$alert_policy_file" on_success false)
     policy_failure=$(setting "$alert_policy_file" on_failure true)
@@ -3075,14 +3587,40 @@ handle_alert_result() {
     policy_cooldown=$(setting "$alert_policy_file" cooldown_seconds 3600)
     case $policy_enabled:$policy_success:$policy_failure in
         true:true:true|true:true:false|true:false:true|true:false:false|false:true:true|false:true:false|false:false:true|false:false:false) ;;
-        *) return 73 ;;
+        *) alert_refusal "$alert_policy_file enabled/on_success/on_failure must be true or false"; return 73 ;;
     esac
-    case $policy_threshold:$policy_cooldown in *[!0-9:]*) return 73 ;; esac
-    [ "$policy_threshold" -ge 1 ] && [ "$policy_threshold" -le 100 ] || return 73
-    [ "$policy_cooldown" -ge 60 ] && [ "$policy_cooldown" -le 2592000 ] || return 73
-    failure_count=$(setting "$alert_state" failure_count 0)
-    last_notify=$(setting "$alert_state" last_notify_epoch 0)
-    case $failure_count:$last_notify in *[!0-9:]*) return 73 ;; esac
+    case $policy_threshold:$policy_cooldown in
+        *[!0-9:]*) alert_refusal "$alert_policy_file failure_threshold/cooldown_seconds is not a number"; return 73 ;;
+    esac
+    [ "$policy_threshold" -ge 1 ] && [ "$policy_threshold" -le 100 ] \
+        || { alert_refusal "$alert_policy_file failure_threshold is outside 1..100"; return 73; }
+    [ "$policy_cooldown" -ge 60 ] && [ "$policy_cooldown" -le 2592000 ] \
+        || { alert_refusal "$alert_policy_file cooldown_seconds is outside 60..2592000"; return 73; }
+    # The package-wide record the dashboard reads is still validated and kept,
+    # but the decision is per scope: one counter for the whole package was
+    # reset by any profile's success, so with a threshold above one a profile
+    # that always failed never notified while another one was healthy
+    # (ADV-C-4). alerts-<scope>.state holds that scope's own consecutive
+    # failures and last notification.
+    package_failure_count=$(setting "$alert_state" failure_count 0)
+    package_last_notify=$(setting "$alert_state" last_notify_epoch 0)
+    case $package_failure_count:$package_last_notify in
+        *[!0-9:]*) alert_refusal "$alert_state failure_count/last_notify_epoch is not a number"; return 73 ;;
+    esac
+    scope_alert_state=$state_root/alerts-$alert_profile.state
+    [ ! -L "$scope_alert_state" ] || { alert_refusal "$scope_alert_state is a symlink"; return 73; }
+    # A scope with no record yet (first run, or an upgrade from the single
+    # counter) starts from the package-wide one, so an upgrade keeps a count.
+    if [ -e "$scope_alert_state" ]; then
+        failure_count=$(setting "$scope_alert_state" failure_count 0)
+        last_notify=$(setting "$scope_alert_state" last_notify_epoch 0)
+    else
+        failure_count=$package_failure_count
+        last_notify=$package_last_notify
+    fi
+    case $failure_count:$last_notify in
+        *[!0-9:]*) alert_refusal "$scope_alert_state failure_count/last_notify_epoch is not a number"; return 73 ;;
+    esac
     alert_now=$(epoch_now)
     should_notify=false
     notify_key=sync_failed
@@ -3112,11 +3650,18 @@ handle_alert_result() {
     # ENOSPC printf would otherwise still be chmod'd and renamed over the good
     # alert state, so the write is checked here; no caller-side guard can do it,
     # because the guard is what disabled the check.
-    alert_state_temp=$alert_state.tmp.$$
-    printf 'failure_count=%s\nlast_notify_epoch=%s\n' "$failure_count" "$last_notify" \
-        > "$alert_state_temp" || { rm -f "$alert_state_temp"; return 73; }
-    finish_private_file "$alert_state_temp" || { rm -f "$alert_state_temp"; return 73; }
-    mv -f "$alert_state_temp" "$alert_state" || { rm -f "$alert_state_temp"; return 73; }
+    # The scope's own record first, then the package-wide one the dashboard
+    # reads: the consecutive failures of the scope that just ran, and the
+    # newest notification of any scope.
+    [ "$package_last_notify" -ge "$last_notify" ] || package_last_notify=$last_notify
+    for alert_record in "$scope_alert_state:$last_notify" "$alert_state:$package_last_notify"; do
+        alert_record_path=${alert_record%:*}
+        alert_state_temp=$alert_record_path.tmp.$$
+        printf 'failure_count=%s\nlast_notify_epoch=%s\n' "$failure_count" "${alert_record##*:}" \
+            > "$alert_state_temp" || { rm -f "$alert_state_temp"; alert_refusal "$alert_record_path could not be written"; return 73; }
+        finish_private_file "$alert_state_temp" || { rm -f "$alert_state_temp"; alert_refusal "$alert_record_path could not be made private"; return 73; }
+        mv -f "$alert_state_temp" "$alert_record_path" || { rm -f "$alert_state_temp"; alert_refusal "$alert_record_path could not be replaced"; return 73; }
+    done
 }
 
 handle_doctor_alert() {
@@ -3124,16 +3669,24 @@ handle_doctor_alert() {
     doctor_exit=$2
     case $doctor_profile in all|*[!A-Za-z0-9_-]*) [ "$doctor_profile" = all ] || return 64 ;; esac
     case $doctor_exit in ''|*[!0-9]*) return 64 ;; esac
-    [ ! -L "$alert_policy_file" ] && [ ! -L "$doctor_state" ] || return 73
+    [ ! -L "$alert_policy_file" ] || { alert_refusal "$alert_policy_file is a symlink"; return 73; }
+    [ ! -L "$doctor_state" ] || { alert_refusal "$doctor_state is a symlink"; return 73; }
     doctor_enabled=$(setting "$alert_policy_file" enabled true)
     doctor_failure=$(setting "$alert_policy_file" on_failure true)
     doctor_threshold=$(setting "$alert_policy_file" failure_threshold 1)
     doctor_cooldown=$(setting "$alert_policy_file" cooldown_seconds 3600)
-    case $doctor_enabled:$doctor_failure in true:true|true:false|false:true|false:false) ;; *) return 73 ;; esac
-    case $doctor_threshold:$doctor_cooldown in *[!0-9:]*) return 73 ;; esac
+    case $doctor_enabled:$doctor_failure in
+        true:true|true:false|false:true|false:false) ;;
+        *) alert_refusal "$alert_policy_file enabled/on_failure must be true or false"; return 73 ;;
+    esac
+    case $doctor_threshold:$doctor_cooldown in
+        *[!0-9:]*) alert_refusal "$alert_policy_file failure_threshold/cooldown_seconds is not a number"; return 73 ;;
+    esac
     doctor_failures=$(setting "$doctor_state" failure_count 0)
     doctor_last_notify=$(setting "$doctor_state" last_notify_epoch 0)
-    case $doctor_failures:$doctor_last_notify in *[!0-9:]*) return 73 ;; esac
+    case $doctor_failures:$doctor_last_notify in
+        *[!0-9:]*) alert_refusal "$doctor_state failure_count/last_notify_epoch is not a number"; return 73 ;;
+    esac
     doctor_failures=$((doctor_failures + 1))
     doctor_now=$(epoch_now)
     if [ "$doctor_failures" -ge "$doctor_threshold" ]; then
@@ -3149,9 +3702,9 @@ handle_doctor_alert() {
     # whole body, so the write must be checked before the rename can be trusted.
     doctor_temp=$doctor_state.tmp.$$
     printf 'failure_count=%s\nlast_notify_epoch=%s\n' "$doctor_failures" "$doctor_last_notify" \
-        > "$doctor_temp" || { rm -f "$doctor_temp"; return 73; }
-    finish_private_file "$doctor_temp" || { rm -f "$doctor_temp"; return 73; }
-    mv -f "$doctor_temp" "$doctor_state" || { rm -f "$doctor_temp"; return 73; }
+        > "$doctor_temp" || { rm -f "$doctor_temp"; alert_refusal "$doctor_state could not be written"; return 73; }
+    finish_private_file "$doctor_temp" || { rm -f "$doctor_temp"; alert_refusal "$doctor_state could not be made private"; return 73; }
+    mv -f "$doctor_temp" "$doctor_state" || { rm -f "$doctor_temp"; alert_refusal "$doctor_state could not be replaced"; return 73; }
 }
 
 # ---------------------------------------------------------------------------
@@ -3197,6 +3750,7 @@ dsm_system_log_message_id=
 dsm_system_log_min_rank=2
 dsm_system_log_cooldown=3600
 dsm_system_log_rank_value=2
+dsm_system_log_invalid_field=
 
 # Sets dsm_system_log_rank_value rather than printing it: this sits on the
 # per-event path, and a $( ) here would be a fork per event on an armv7 NAS.
@@ -3216,7 +3770,12 @@ load_dsm_system_log_policy() {
     dsm_system_log_message_id=
     dsm_system_log_min_rank=2
     dsm_system_log_cooldown=3600
-    [ -f "$alert_policy_file" ] && [ ! -L "$alert_policy_file" ] || return 0
+    dsm_system_log_invalid_field=
+    if [ -L "$alert_policy_file" ]; then
+        dsm_system_log_invalid_field=file
+        return 0
+    fi
+    [ -f "$alert_policy_file" ] || return 0
     dsm_policy_enable=false
     dsm_policy_identifier=
     dsm_policy_level=warn
@@ -3233,15 +3792,20 @@ load_dsm_system_log_policy() {
         esac
     done < "$alert_policy_file"
     [ "$dsm_policy_enable" = true ] || return 0
+    # Enabled but unusable is not "disabled": dsm_log_event names the field.
+    dsm_system_log_invalid_field=system_log_level
     set_dsm_system_log_rank "$dsm_policy_level" || return 0
+    dsm_system_log_invalid_field=cooldown_seconds
     case $dsm_policy_cooldown in ''|*[!0-9]*) return 0 ;; esac
     [ "$dsm_policy_cooldown" -ge 60 ] && [ "$dsm_policy_cooldown" -le 2592000 ] || return 0
     # A message identifier belongs to Synology's catalogue, so accept only the
     # shape DSM's own callers use and never substitute a default of our own.
+    dsm_system_log_invalid_field=system_log_message_id
     case $dsm_policy_identifier in 0x*) ;; *) return 0 ;; esac
     dsm_policy_digits=${dsm_policy_identifier#0x}
     case $dsm_policy_digits in ''|*[!0-9A-Fa-f]*) return 0 ;; esac
     [ "${#dsm_policy_digits}" -le 8 ] || return 0
+    dsm_system_log_invalid_field=
     dsm_system_log_message_id=$dsm_policy_identifier
     dsm_system_log_min_rank=$dsm_system_log_rank_value
     dsm_system_log_cooldown=$dsm_policy_cooldown
@@ -3252,13 +3816,17 @@ load_dsm_system_log_policy() {
 # bucket, so one failing routine cannot fill the system log. The ledger is read
 # and rewritten whole because the bucket set is fixed and small; that keeps the
 # read on shell builtins instead of one `sed` subshell per bucket.
+#
+# Returns 0 to deliver, 1 when the cooldown holds the event back, and anything
+# else when the gate itself failed (an unusable state directory or ledger, no
+# clock): that is a failure to record, never a cooldown.
 dsm_system_log_gate() {
     dsm_gate_bucket=$1
     dsm_gate_now=${2:-}
-    [ -d "$state_root" ] || return 1
-    [ ! -L "$dsm_system_log_state" ] || return 1
-    case $dsm_gate_now in ''|*[!0-9]*) dsm_gate_now=$(epoch_now) ;; esac
-    case $dsm_gate_now in ''|*[!0-9]*) return 1 ;; esac
+    [ -d "$state_root" ] || return 73
+    [ ! -L "$dsm_system_log_state" ] || return 73
+    case $dsm_gate_now in ''|*[!0-9]*) dsm_gate_now=$(epoch_now) || dsm_gate_now= ;; esac
+    case $dsm_gate_now in ''|*[!0-9]*) return 69 ;; esac
     dsm_gate_sync=0
     dsm_gate_doctor=0
     dsm_gate_authentication=0
@@ -3288,7 +3856,7 @@ dsm_system_log_gate() {
         bridge) dsm_gate_last=$dsm_gate_bridge ;;
         lifecycle) dsm_gate_last=$dsm_gate_lifecycle ;;
         queue) dsm_gate_last=$dsm_gate_queue ;;
-        *) return 1 ;;
+        *) return 64 ;;
     esac
     # A NAS whose clock is corrected backwards must not silence its own system
     # log until real time catches up, so a stamp in the future opens the gate.
@@ -3313,9 +3881,9 @@ dsm_system_log_gate() {
             "$dsm_gate_sync" "$dsm_gate_doctor" "$dsm_gate_authentication"
         printf 'security_epoch=%s\nbridge_epoch=%s\nlifecycle_epoch=%s\nqueue_epoch=%s\n' \
             "$dsm_gate_security" "$dsm_gate_bridge" "$dsm_gate_lifecycle" "$dsm_gate_queue"
-    } > "$dsm_gate_temp" 2>/dev/null || { rm -f "$dsm_gate_temp"; return 1; }
-    finish_private_file "$dsm_gate_temp" 2>/dev/null || { rm -f "$dsm_gate_temp"; return 1; }
-    mv -f "$dsm_gate_temp" "$dsm_system_log_state" 2>/dev/null || { rm -f "$dsm_gate_temp"; return 1; }
+    } > "$dsm_gate_temp" || { rm -f "$dsm_gate_temp"; return 69; }
+    finish_private_file "$dsm_gate_temp" || { rm -f "$dsm_gate_temp"; return 69; }
+    mv -f "$dsm_gate_temp" "$dsm_system_log_state" || { rm -f "$dsm_gate_temp"; return 69; }
 }
 
 dsm_system_log_emit() {
@@ -3393,10 +3961,33 @@ dsm_log_event() {
         *) return 64 ;;
     esac
     load_dsm_system_log_policy || return 0
-    [ "$dsm_system_log_enabled" = true ] || return 0
+    if [ "$dsm_system_log_enabled" != true ]; then
+        [ -n "$dsm_system_log_invalid_field" ] || return 0
+        # The policy page says Enabled, and nothing can be delivered.
+        append_controller_log_event error dsm_log_policy_invalid \
+            "event=$dsm_event_key file=alerts.conf field=$dsm_system_log_invalid_field" >/dev/null \
+            || printf 'error: DSM system log policy in %s is enabled but its %s is invalid; %s was not delivered\n' \
+                "$alert_policy_file" "$dsm_system_log_invalid_field" "$dsm_event_key" >&2
+        return 0
+    fi
     set_dsm_system_log_rank "$dsm_event_level" || return 0
     [ "$dsm_system_log_rank_value" -ge "$dsm_system_log_min_rank" ] || return 0
-    dsm_system_log_gate "$dsm_event_bucket" "$dsm_event_now" || return 0
+    dsm_event_gate_status=0
+    dsm_system_log_gate "$dsm_event_bucket" "$dsm_event_now" || dsm_event_gate_status=$?
+    case $dsm_event_gate_status in
+        0) ;;
+        1) return 0 ;;
+        *)
+            # Without its ledger the cooldown cannot bound delivery, so the
+            # event is not delivered -- and that is recorded as the failure it
+            # is, rather than read as a cooldown.
+            append_controller_log_event error dsm_log_gate_failed \
+                "event=$dsm_event_key file=system-log.state status=$dsm_event_gate_status" >/dev/null \
+                || printf 'error: DSM system log ledger %s could not be updated (status %s); %s was not delivered\n' \
+                    "$dsm_system_log_state" "$dsm_event_gate_status" "$dsm_event_key" >&2
+            return 0
+            ;;
+    esac
     # Disabled-by-policy and gated returns above are decisions. A delivery
     # that was attempted and failed is not, and it used to be just as silent
     # while the policy page said Enabled. It is reached at most once per
@@ -3404,7 +3995,7 @@ dsm_log_event() {
     dsm_event_emit_status=0
     dsm_system_log_emit "$dsm_event_level" "$dsm_event_key" || dsm_event_emit_status=$?
     if [ "$dsm_event_emit_status" -ne 0 ]; then
-        append_controller_log_event warn dsm_log_emit_failed \
+        append_controller_log_event error dsm_log_emit_failed \
             "event=$dsm_event_key status=$dsm_event_emit_status" >/dev/null 2>&1 \
             || printf 'warning: DSM system log delivery failed for %s (status %s)\n' \
                 "$dsm_event_key" "$dsm_event_emit_status" >&2

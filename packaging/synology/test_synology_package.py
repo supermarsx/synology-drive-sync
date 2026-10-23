@@ -3726,23 +3726,33 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
             *self.security_policy_options(authentication_log_level="off"),
         )
         self.assertEqual(changed.returncode, 0, changed.stderr)
+        # A rejected login (4xx) is a warning the `off` threshold suppresses; a
+        # helper outage (5xx) is an error and, like every error, is kept
+        # whatever the threshold (ADV-S-28).
         suppressed_diagnostic, suppressed_payload = self.api(
+            "cgi-failure",
+            "--stage", "dsm_authentication",
+            "--code", "dsm_authentication_rejected",
+            "--status", "401",
+        )
+        self.assertEqual(suppressed_diagnostic.returncode, 0, suppressed_diagnostic.stderr)
+        self.assertTrue(suppressed_payload["ok"])
+        kept_diagnostic, kept_payload = self.api(
             "cgi-failure",
             "--stage", "dsm_authentication",
             "--code", "dsm_authentication_helper_unsafe",
             "--status", "503",
         )
-        self.assertEqual(suppressed_diagnostic.returncode, 0, suppressed_diagnostic.stderr)
-        self.assertTrue(suppressed_payload["ok"])
+        self.assertEqual(kept_diagnostic.returncode, 0, kept_diagnostic.stderr)
+        self.assertTrue(kept_payload["ok"])
         suppressed_activity, suppressed_activity_payload = self.api("activity", "--lines", "100")
         self.assertEqual(suppressed_activity.returncode, 0, suppressed_activity.stderr)
-        self.assertFalse(
-            any(
-                event["category"] == "authentication"
-                and event["code"] == "authentication.failed"
-                for event in suppressed_activity_payload["events"]
-            )
-        )
+        authentication_rows = [
+            str(event["message"]) for event in suppressed_activity_payload["events"]
+            if event["category"] == "authentication" and event["code"] == "authentication.failed"
+        ]
+        self.assertFalse([row for row in authentication_rows if "status=401" in row], authentication_rows)
+        self.assertTrue([row for row in authentication_rows if "status=503" in row], authentication_rows)
         filtered, filtered_payload = self.api("logs", "--lines", "10")
         self.assertEqual(filtered.returncode, 0, filtered.stderr)
         filtered_api = next(entry for entry in filtered_payload["logs"] if entry["source"] == "api")
@@ -3811,7 +3821,7 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
             any(
                 event["category"] == "authentication"
                 and event["code"] == "authentication.failed"
-                and event["level"] == "warn"
+                and event["level"] == "error"
                 and event["message"]
                 == "Package service synology-drive-sync request failed "
                 "stage=dsm_authentication code=dsm_authentication_helper_unsafe status=503"
@@ -7399,8 +7409,9 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
             event_path.read_text(encoding="utf-8"),
             "a due native event must remain pending while its dependency is deferred",
         )
-        base_plan = self.shell(self.manager, "plan", "base")
-        self.assertEqual(base_plan.returncode, 0, base_plan.stderr)
+        # The dependency is satisfied by a sync of base, never by a plan (ADV-B-1).
+        base_sync = self.shell(self.manager, "run", "base")
+        self.assertEqual(base_sync.returncode, 0, base_sync.stderr)
         deadline = time.monotonic() + 15
         while time.monotonic() < deadline:
             if invocation in self.capture.read_text(encoding="utf-8"):
@@ -10046,8 +10057,10 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
         core.chmod(0o755)
         if os.getuid() == 0:
             os.chown(core, self.drop_uid, self.drop_gid)
-        base_plan = self.shell(self.manager, "plan", "base")
-        self.assertEqual(base_plan.returncode, 0, base_plan.stdout + base_plan.stderr)
+        # A dependency is satisfied by its last *sync*. A plan used to satisfy
+        # it as well (ADV-B-1: a dry run rewrote a failed sync as succeeded).
+        base_sync = self.shell(self.manager, "run", "base")
+        self.assertEqual(base_sync.returncode, 0, base_sync.stdout + base_sync.stderr)
 
         def bounded_diagnostic(path: Path, limit: int = 4096) -> str:
             try:
@@ -13708,12 +13721,15 @@ fi
         self.assertEqual(stopped.returncode, 0, stopped.stderr)
 
     def controller_events(self) -> list[dict[str, object]]:
+        # Levelled events only: raw stderr lines (a child's, or an event the
+        # controller could not log) share the file and are not events.
+        controller_log = self.real_var / "log/controller.log"
+        if not controller_log.exists():
+            return []
         return [
             json.loads(line)
-            for line in (self.real_var / "log/controller.log")
-            .read_text(encoding="utf-8")
-            .splitlines()
-            if line
+            for line in controller_log.read_text(encoding="utf-8").splitlines()
+            if line.startswith("{")
         ]
 
     def wait_for_controller_event(
@@ -14267,8 +14283,9 @@ fi
         )
         before = len(audit_log.read_text(encoding="utf-8").splitlines())
         enabled = self.shell(self.manager, "enable", "--interval", "60")
-        self.assertEqual(enabled.returncode, 0, enabled.stderr)
-        self.assertIn("controller could not be reloaded", enabled.stderr)
+        # ADV-S-1: committed and audited as succeeded, but a save the running
+        # controller did not pick up has its own exit status.
+        self.assertEqual(enabled.returncode, 76, enabled.stderr)
         self.assertIn(
             "enabled=true",
             (self.real_home / "config/schedule.conf").read_text(encoding="utf-8"),
@@ -19334,6 +19351,1848 @@ fi
             self.assertEqual(payload["run"]["state"], "failed")
         finally:
             stopped = self.shell(self.lifecycle, "stop", timeout=15)
+            self.assertEqual(stopped.returncode, 0, stopped.stdout + stopped.stderr)
+
+    def test_a_save_the_running_controller_misses_is_named_not_reported_applied(self) -> None:
+        # ADV-S-1. A save reaches the running controller only through SIGHUP.
+        # When that could not be delivered -- an unverifiable PID, an unreadable
+        # PID file -- the manager printed one warning and exited 0, and the API
+        # answered a plain "saved": the old schedule kept running with nothing
+        # recorded anywhere a dashboard reads.
+        self.configure_with_password("alpha", self.source_one, True)
+        started = self.shell(self.lifecycle, "start", timeout=15)
+        self.assertEqual(started.returncode, 0, started.stdout + started.stderr)
+        pid_file = self.real_var / "run/controller.pid"
+        marker = self.real_var / "state/controller-reload.pending"
+        real_pid = pid_file.read_text(encoding="utf-8")
+        foreign = subprocess.Popen(["/bin/sleep", "60"])
+        try:
+            self.write_private_state(pid_file, f"{foreign.pid}\n")
+            enabled = self.shell(self.manager, "enable", "--interval", "600")
+            self.assertEqual(enabled.returncode, 76, enabled.stdout + enabled.stderr)
+            self.assertIn("reason=identity_refused", enabled.stderr)
+            self.assertIn("was not reloaded", enabled.stderr)
+            self.assertIn(
+                "enabled=true",
+                (self.real_home / "config/schedule.conf").read_text(encoding="utf-8"),
+                "the save itself must still be committed",
+            )
+            fields = self.state_fields(marker)
+            self.assertEqual(fields["reason"], "identity_refused", fields)
+            self.assertEqual(fields["pid"], str(foreign.pid), fields)
+            self.assertEqual(fields["operation"], "enable", fields)
+            self.assertEqual(stat.S_IMODE(marker.stat().st_mode), 0o600)
+            failed = [
+                event for event in self.controller_events()
+                if event.get("event") == "controller_reload_failed"
+            ]
+            self.assertEqual(len(failed), 1, failed)
+            self.assertEqual(failed[0]["level"], "error", failed)
+            self.assertIn("reason=identity_refused", str(failed[0]["detail"]))
+            self.assertIn("operation=enable", str(failed[0]["detail"]))
+
+            # Through the API the save is a success that carries a named
+            # warning (contract C-B1), never a plain success.
+            scheduled, payload = self.api(
+                "schedule", "--enabled", "true", "--interval", "900",
+                "--allow-delete", "false", "--max-total-delete", "100",
+            )
+            self.assertEqual(scheduled.returncode, 0, scheduled.stdout + scheduled.stderr)
+            self.assertIs(payload["ok"], True, payload)
+            self.assertEqual(payload["warning_code"], "controller_reload_failed", payload)
+            self.assertIn("was not reloaded", str(payload["warning"]))
+            self.assertIn(f"PID {foreign.pid}", str(payload["warning"]))
+            self.assertNotIn("\n", str(payload["warning"]))
+
+            # A PID file that exists but holds no PID is a failure as well, not
+            # "the controller is not running".
+            self.write_private_state(pid_file, "not-a-pid\n")
+            performance = self.shell(self.manager, "configure-performance", "--level", "gentle")
+            self.assertEqual(performance.returncode, 76, performance.stdout + performance.stderr)
+            self.assertIn("reason=pid_unreadable", performance.stderr)
+            self.assertEqual(self.state_fields(marker)["reason"], "pid_unreadable")
+        finally:
+            self.write_private_state(pid_file, real_pid)
+            foreign.kill()
+            foreign.wait()
+        try:
+            # A save that reaches the controller: it reloads and retires the marker.
+            applied = self.shell(self.manager, "enable", "--interval", "600")
+            self.assertEqual(applied.returncode, 0, applied.stdout + applied.stderr)
+            self.assertNotIn("was not reloaded", applied.stderr)
+            self.wait_for_absence(
+                marker, "the controller did not retire the pending-reload marker after its reload",
+                timeout=15,
+            )
+        finally:
+            stopped = self.shell(self.lifecycle, "stop", timeout=15)
+            self.assertEqual(stopped.returncode, 0, stopped.stdout + stopped.stderr)
+        # A controller start reads every saved file, so it retires the marker too.
+        self.write_private_state(marker, "epoch=1\nreason=signal_failed\npid=1\noperation=enable\n")
+        started = self.shell(self.lifecycle, "start", timeout=15)
+        self.assertEqual(started.returncode, 0, started.stdout + started.stderr)
+        try:
+            self.wait_for_absence(marker, "a controller start did not retire the pending-reload marker")
+        finally:
+            stopped = self.shell(self.lifecycle, "stop", timeout=15)
+            self.assertEqual(stopped.returncode, 0, stopped.stdout + stopped.stderr)
+
+    def test_off_log_levels_never_hide_controller_or_scheduler_errors(self) -> None:
+        # ADV-S-3. Turning a noisy controller or scheduler category off also
+        # dropped its error events -- a failed run.state write, an unavailable
+        # alert -- and runner_say then neither logged nor printed. Activity
+        # already kept error records whatever the threshold; these two writers
+        # now do the same.
+        self.configure_with_password("alpha", self.source_one, True)
+        policy, _ = self.api(
+            "security-policy",
+            *self.security_policy_options(controller_log_level="off", scheduler_log_level="off"),
+        )
+        self.assertEqual(policy.returncode, 0, policy.stderr)
+        helper = self.root / "off-level-helper.sh"
+        helper.write_text(
+            "#!/bin/sh\nset -eu\n"
+            f'. "{self.real_target / "libexec/sdsync-common"}"\n'
+            "ensure_layout\n"
+            "append_controller_log_event warn off_level_warning 'kept=no'\n"
+            "append_controller_log_event error off_level_error 'kept=yes'\n"
+            "append_controller_log_event error off_level_scheduler_error 'kept=yes' scheduler\n"
+            "append_controller_log_event info off_level_scheduler_info 'kept=no' scheduler\n",
+            encoding="utf-8",
+        )
+        helper.chmod(0o755)
+        if os.getuid() == 0:
+            os.chown(helper, self.drop_uid, self.drop_gid)
+        result = self.shell(helper)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        names = [event.get("event") for event in self.controller_events()]
+        self.assertIn("off_level_error", names)
+        self.assertNotIn("off_level_warning", names)
+        self.assertIn("off_level_scheduler_error", names)
+        self.assertNotIn("off_level_scheduler_info", names)
+
+        # The runner: a scheduled run whose preflight fails names the cause in
+        # controller.log even with both categories off.
+        routine, _ = self.api(
+            "routine", "--profile", "alpha", "--enabled", "true", "--action", "sync",
+            "--mode", "interval", "--interval", "86400", "--weekdays", "1,2,3,4,5,6,7",
+            "--time-window-start", "00:00", "--time-window-end", "23:59",
+            "--debounce-seconds", "1", "--retry-count", "0", "--retry-backoff-seconds", "10",
+            "--poll-seconds", "5", "--allow-delete", "false", "--max-total-delete", "100",
+        )
+        self.assertEqual(routine.returncode, 0, routine.stderr)
+        self.write_private_state(
+            self.real_var / "state/routines/alpha.state",
+            "state=scheduled\nnext_run_epoch=1\nlast_success_epoch=0\nlast_attempt_epoch=0\n"
+            "retry_attempt=0\nlast_day=none\nlast_poll_epoch=0\nfingerprint=none\nbackend=interval\n",
+        )
+        (self.real_home / "secrets/alpha.password").unlink()
+        started = self.shell(
+            self.lifecycle, "start", extra_environment=self.fast_clock_environment(step=31), timeout=15
+        )
+        self.assertEqual(started.returncode, 0, started.stdout + started.stderr)
+        try:
+            preflight = self.wait_for_controller_event("run_preflight_failed")
+            events = self.controller_events()
+            self.assertEqual(len(preflight), 1, events)
+            self.assertEqual(preflight[0]["level"], "error")
+            self.assertIn("reason=password_missing", str(preflight[0]["detail"]))
+            messages = [
+                str(e.get("detail")) for e in events if e.get("event") == "runner_message"
+            ]
+            self.assertTrue(
+                any("no protected password" in message for message in messages), events
+            )
+        finally:
+            stopped = self.shell(self.lifecycle, "stop", timeout=15)
+            self.assertEqual(stopped.returncode, 0, stopped.stdout + stopped.stderr)
+
+    def _fake_mv_bin(self, name: str, rule: str) -> Path:
+        """A PATH directory whose `mv` fails as `rule` (shell, $1/$2 = source/target) says."""
+        fake_bin = self.root / name
+        fake_bin.mkdir()
+        fake_mv = fake_bin / "mv"
+        fake_mv.write_text(
+            "#!/bin/sh\n"
+            'if [ "$1" = -f ]; then shift; fi\n'
+            f"{rule}\n"
+            'exec /bin/mv -f "$@"\n',
+            encoding="utf-8",
+        )
+        fake_mv.chmod(0o755)
+        if os.getuid() == 0:
+            os.chown(fake_bin, self.drop_uid, self.drop_gid)
+            os.chown(fake_mv, self.drop_uid, self.drop_gid)
+        return fake_bin
+
+    def test_a_run_whose_final_state_write_fails_is_not_reconciled_as_a_failure(self) -> None:
+        # ADV-S-4. A sync that succeeded but could not publish its final
+        # run.state left `running` behind; the controller then rewrote it
+        # failed/runner_died, counted a failure and raised an alert, for a good
+        # run. The write is retried, and a run that still cannot record its
+        # outcome leaves it where the controller reconciles it faithfully.
+        self.configure_with_password("alpha", self.source_one, True)
+        started = self.shell(
+            self.lifecycle, "start", extra_environment=self.fast_clock_environment(step=31), timeout=15
+        )
+        self.assertEqual(started.returncode, 0, started.stdout + started.stderr)
+        run_state = self.real_var / "state/run.state"
+        unrecorded = self.real_var / "state/run.unrecorded"
+        runner = self.real_target / "libexec/sdsync-run"
+        try:
+            # One failed attempt: the retry publishes it, nothing else changes.
+            once = self.root / "final-write-failed-once"
+            transient = self._fake_mv_bin(
+                "fake-mv-once",
+                f'case $2 in */state/run.state) if [ ! -e "{once}" ] && grep -q "^state=succeeded" "$1"; '
+                f'then : > "{once}"; exit 1; fi ;; esac',
+            )
+            environment = {
+                "SDSYNC_DSM_AUDIT_WRAPPED": "true",
+                "PATH": f"{transient}:{self.environment['PATH']}",
+            }
+            first = self.shell(runner, "sync", "alpha", "false", "foreground", "-",
+                               extra_environment=environment, timeout=60)
+            self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
+            self.assertTrue(once.exists(), "the fake mv never refused the final write")
+            fields = self.state_fields(run_state)
+            self.assertEqual(fields["state"], "succeeded", fields)
+            self.assertNotIn("degraded", fields)
+            self.assertFalse(unrecorded.exists())
+
+            # Every attempt fails: the run's outcome survives the reconcile.
+            persistent = self._fake_mv_bin(
+                "fake-mv-always",
+                'case $2 in */state/run.state) if grep -q "^state=succeeded" "$1"; then exit 1; fi ;; esac',
+            )
+            environment["PATH"] = f"{persistent}:{self.environment['PATH']}"
+            second = self.shell(runner, "sync", "alpha", "false", "foreground", "-",
+                                extra_environment=environment, timeout=60)
+            self.assertEqual(second.returncode, 0, second.stdout + second.stderr)
+            self.assertIn("run state could not be written", second.stderr)
+            fields = self.wait_for_state(
+                run_state, lambda f: f.get("state") != "running", timeout=30
+            )
+            self.assertEqual(fields["state"], "succeeded", fields)
+            self.assertEqual(fields["exit_code"], "0", fields)
+            self.assertEqual(fields["degraded"], "run_state", fields)
+            self.assertEqual(fields["degraded_reason"], "run_state_write_failed", fields)
+            recovered = self.wait_for_controller_event("run_state_recovered")
+            self.assertEqual(len(recovered), 1, recovered)
+            self.assertFalse(unrecorded.exists(), "the reconciled outcome marker was left behind")
+            events = self.controller_events()
+            self.assertEqual(
+                [e for e in events if e.get("event") == "run_runner_died"], [], events
+            )
+            self.assertIn("outcome=succeeded", str(recovered[0]["detail"]))
+            alerts = self.real_var / "state/alerts.state"
+            if alerts.exists():
+                self.assertIn("failure_count=0\n", alerts.read_text(encoding="utf-8"))
+            self.assertFalse(
+                [e for e in self.activity_records()
+                 if e["code"] == "run.failed" and e["profile"] == "alpha"],
+                "a good run was recorded as failed",
+            )
+            # The reconcile holds the run lock while it rewrites; let it go.
+            self.wait_for_absence(
+                self.real_var / "run/run.lock/pid", "the reconcile kept the run lock", timeout=15
+            )
+        finally:
+            stopped = self.shell(self.lifecycle, "stop", timeout=15)
+            self.assertEqual(stopped.returncode, 0, stopped.stdout + stopped.stderr)
+
+    def test_rotating_append_never_loses_the_line_and_records_a_failed_rotation(self) -> None:
+        # ADV-S-5. A rotation whose mv failed made append_rotating_log return
+        # non-zero after nothing was written, so the newest line -- and every
+        # later one -- was dropped; a failed shift let the next mv overwrite an
+        # older file.
+        log = self.real_var / "log/rotation-probe.log"
+        marker = self.real_var / "state/log-rotation.failed"
+        helper = self.root / "rotation-helper.sh"
+        helper.write_text(
+            "#!/bin/sh\nset -eu\n"
+            f'. "{self.real_target / "libexec/sdsync-common"}"\n'
+            "ensure_layout\n"
+            'status=0\nappend_rotating_log "$1" 64 3 "$2" || status=$?\n'
+            'echo "status=$status"\n',
+            encoding="utf-8",
+        )
+        helper.chmod(0o755)
+        if os.getuid() == 0:
+            os.chown(helper, self.drop_uid, self.drop_gid)
+        for suffix, text in (("", "x" * 80 + "\n"), (".1", "one\n"), (".2", "two\n")):
+            self.write_private_state(Path(f"{log}{suffix}"), text)
+
+        # Rotation fails: the line goes to the active file, the failure is
+        # recorded once, and a later line is kept as well.
+        refuse_all = self._fake_mv_bin(
+            "fake-mv-all", 'case $2 in *rotation-probe.log.*) exit 1 ;; esac'
+        )
+        environment = {"PATH": f"{refuse_all}:{self.environment['PATH']}"}
+        first = self.shell(helper, str(log), "newest-line-1", extra_environment=environment)
+        self.assertEqual(first.returncode, 0, first.stderr)
+        self.assertIn("status=0", first.stdout)
+        self.assertIn("newest-line-1", log.read_text(encoding="utf-8"))
+        self.assertIn("rotation-probe.log", first.stderr)
+        fields = self.state_fields(marker)
+        self.assertEqual(fields["path"], str(log), fields)
+        self.assertEqual(stat.S_IMODE(marker.stat().st_mode), 0o600)
+        second = self.shell(helper, str(log), "newest-line-2", extra_environment=environment)
+        self.assertIn("status=0", second.stdout)
+        self.assertIn("newest-line-2", log.read_text(encoding="utf-8"))
+        self.assertEqual(second.stderr, "", "a failed rotation is reported once per episode")
+        self.assertEqual(Path(f"{log}.1").read_text(encoding="utf-8"), "one\n")
+        self.assertEqual(Path(f"{log}.2").read_text(encoding="utf-8"), "two\n")
+
+        # A failed shift stops the rotation before a later mv overwrites an
+        # older file.
+        refuse_shift = self._fake_mv_bin(
+            "fake-mv-shift", 'case $2 in *rotation-probe.log.3) exit 1 ;; esac'
+        )
+        environment = {"PATH": f"{refuse_shift}:{self.environment['PATH']}"}
+        third = self.shell(helper, str(log), "newest-line-3", extra_environment=environment)
+        self.assertIn("status=0", third.stdout)
+        self.assertIn("newest-line-3", log.read_text(encoding="utf-8"))
+        self.assertEqual(Path(f"{log}.1").read_text(encoding="utf-8"), "one\n")
+        self.assertEqual(Path(f"{log}.2").read_text(encoding="utf-8"), "two\n")
+
+        # Rotation works again: it happens, and the episode marker is retired.
+        fourth = self.shell(helper, str(log), "newest-line-4")
+        self.assertIn("status=0", fourth.stdout)
+        self.assertEqual(log.read_text(encoding="utf-8"), "newest-line-4\n")
+        self.assertIn("newest-line-3", Path(f"{log}.1").read_text(encoding="utf-8"))
+        self.assertEqual(Path(f"{log}.2").read_text(encoding="utf-8"), "one\n")
+        self.assertEqual(Path(f"{log}.3").read_text(encoding="utf-8"), "two\n")
+        self.assertFalse(marker.exists(), "a successful rotation did not retire the marker")
+
+        # An unsafe rotation set is refused, and the line is not lost: it is
+        # printed where the caller's stderr goes.
+        Path(f"{log}.2").unlink()
+        Path(f"{log}.2").symlink_to(self.root / "elsewhere")
+        refused = self.shell(helper, str(log), "newest-line-5")
+        self.assertIn("status=73", refused.stdout)
+        self.assertIn("newest-line-5", refused.stderr)
+
+    def test_dsm_system_log_gate_errors_are_failures_not_cooldown(self) -> None:
+        # ADV-S-6. A ledger that could not be written read as "gated by the
+        # cooldown", so an enabled DSM system log silently received nothing; an
+        # enabled policy with an invalid field was just as silent.
+        helper = self.root / "dsm-gate-helper.sh"
+        helper.write_text(
+            "#!/bin/sh\nset -eu\n"
+            f'. "{self.real_target / "libexec/sdsync-common"}"\n'
+            "ensure_layout\n"
+            'printf "enabled=true\\non_success=false\\non_failure=true\\nfailure_threshold=1\\n'
+            'cooldown_seconds=3600\\nsystem_log=true\\nsystem_log_message_id=%s\\n'
+            'system_log_level=warn\\n" "$1" > "$alert_policy_file"\n'
+            'chmod 0600 "$alert_policy_file"\n'
+            'if [ "$2" = readonly ]; then chmod 0500 "$state_root"; fi\n'
+            "status=0\ndsm_log_event sync_failed 5000 || status=$?\n"
+            'chmod 0700 "$state_root"\n'
+            'echo "status=$status"\n',
+            encoding="utf-8",
+        )
+        helper.chmod(0o755)
+        if os.getuid() == 0:
+            os.chown(helper, self.drop_uid, self.drop_gid)
+        if os.getuid() != 0:
+            ledger = self.shell(helper, "0x11100000", "readonly")
+            self.assertEqual(ledger.returncode, 0, ledger.stderr)
+            gate = [e for e in self.controller_events() if e.get("event") == "dsm_log_gate_failed"]
+            self.assertEqual(len(gate), 1, self.controller_events())
+            self.assertEqual(gate[0]["level"], "error")
+            self.assertIn("file=system-log.state", str(gate[0]["detail"]))
+            self.assertIn("event=sync_failed", str(gate[0]["detail"]))
+        invalid = self.shell(helper, "not-an-identifier", "writable")
+        self.assertEqual(invalid.returncode, 0, invalid.stderr)
+        policy = [e for e in self.controller_events() if e.get("event") == "dsm_log_policy_invalid"]
+        self.assertEqual(len(policy), 1, self.controller_events())
+        self.assertEqual(policy[0]["level"], "error")
+        self.assertIn("field=system_log_message_id", str(policy[0]["detail"]))
+
+    def test_a_busy_deferral_is_one_activity_row_per_episode(self) -> None:
+        # G-6 / ADV-S-15. A routine refused because the package was busy wrote a
+        # run.deferred Activity row on every 30-second re-check, filling the
+        # shared ring with identical rows. One row now marks the episode; the
+        # next busy episode after a run gets its own.
+        self.configure_with_password("alpha", self.source_one, True)
+        routine, _ = self.api(
+            "routine", "--profile", "alpha", "--enabled", "true", "--action", "sync",
+            "--mode", "interval", "--interval", "60", "--weekdays", "1,2,3,4,5,6,7",
+            "--time-window-start", "00:00", "--time-window-end", "23:59",
+            "--debounce-seconds", "1", "--retry-count", "0", "--retry-backoff-seconds", "10",
+            "--poll-seconds", "5", "--allow-delete", "false", "--max-total-delete", "100",
+        )
+        self.assertEqual(routine.returncode, 0, routine.stderr)
+        state_path = self.real_var / "state/routines/alpha.state"
+        self.write_private_state(
+            state_path,
+            "state=scheduled\nnext_run_epoch=1\nlast_success_epoch=0\nlast_attempt_epoch=0\n"
+            "retry_attempt=0\nlast_day=none\nlast_poll_epoch=0\nfingerprint=none\nbackend=interval\n",
+        )
+
+        def busy_rows() -> int:
+            return len([
+                e for e in self.activity_records()
+                if e["code"] == "run.deferred" and e["profile"] == "alpha"
+            ])
+
+        def busy_runs() -> int:
+            return len([d for d in self.event_details("routine_run") if "exit=75 " in d])
+
+        holder = self.root / "run-lock-holder.sh"
+        holder.write_text(
+            "#!/bin/sh\nset -eu\n"
+            f'. "{self.real_target / "libexec/sdsync-common"}"\n'
+            "ensure_layout\n"
+            "while :; do\n"
+            '    status=0; acquire_private_process_lock "$run_lock" || status=$?\n'
+            '    [ "$status" -ne 0 ] || break\n'
+            '    [ "$status" -eq 75 ] || exit "$status"\n'
+            "    /bin/sleep 0.05\n"
+            "done\n"
+            ': > "$1"\n'
+            'while [ ! -e "$2" ]; do /bin/sleep 0.02; done\n'
+            'release_private_process_lock "$run_lock"\n',
+            encoding="utf-8",
+        )
+        holder.chmod(0o755)
+        if os.getuid() == 0:
+            os.chown(holder, self.drop_uid, self.drop_gid)
+
+        def hold_run_lock(label: str) -> tuple[Path, subprocess.Popen[str]]:
+            ready = self.root / f"{label}.ready"
+            release = self.root / f"{label}.release"
+            held = self.shell_process(holder, str(ready), str(release))
+            self.wait_for_path(ready, "the run lock holder did not take the lock", timeout=20)
+            return release, held
+
+        started = self.shell(
+            self.lifecycle, "start", extra_environment=self.fast_clock_environment(step=31), timeout=15
+        )
+        self.assertEqual(started.returncode, 0, started.stdout + started.stderr)
+        release, held = hold_run_lock("busy-one")
+        try:
+            deadline = time.monotonic() + 60
+            while busy_runs() < 4 and time.monotonic() < deadline:
+                time.sleep(0.1)
+            self.assertGreaterEqual(busy_runs(), 4, self.event_details("routine_run"))
+            self.assertEqual(busy_rows(), 1)
+            release.write_text("release\n", encoding="utf-8")
+            held.communicate(timeout=60)
+            self.wait_for_state(state_path, lambda f: f.get("state") == "succeeded", timeout=60)
+
+            # A new busy episode is recorded again, once.
+            before = busy_runs()
+            release, held = hold_run_lock("busy-two")
+            deadline = time.monotonic() + 60
+            while busy_runs() < before + 3 and time.monotonic() < deadline:
+                time.sleep(0.1)
+            self.assertGreaterEqual(busy_runs(), before + 3, self.event_details("routine_run"))
+            self.assertEqual(busy_rows(), 2)
+        finally:
+            release.write_text("release\n", encoding="utf-8")
+            held.communicate(timeout=60)
+            stopped = self.shell(self.lifecycle, "stop", timeout=15)
+            self.assertEqual(stopped.returncode, 0, stopped.stdout + stopped.stderr)
+
+    def test_concurrent_event_writers_never_fail_on_a_lock_released_mid_check(self) -> None:
+        # The root cause of the intermittent
+        # test_controller_leaves_a_dead_serialized_consumer_unresolved_on_purpose:
+        # a writer that found the event-log lock held could watch its holder
+        # release it between two checks -- the pid entry or the directory gone
+        # by the time it was stat'ed -- and read that as a malformed lock. That
+        # returned 73, which killed the controller under `set -e` in the middle
+        # of its queue turn. A released lock is retried, never a failure.
+        # (75, the bounded wait running out under contention, is a different and
+        # legitimate answer; this asserts only that 73 never appears.)
+        helper = self.root / "event-lock-hammer.sh"
+        helper.write_text(
+            "#!/bin/sh\nset -eu\n"
+            f'. "{self.real_target / "libexec/sdsync-common"}"\n'
+            "ensure_layout\n"
+            "written=0\nindex=0\n"
+            'while [ "$index" -lt 80 ]; do\n'
+            "    status=0\n"
+            '    append_controller_log_event info event_lock_hammer "writer=$1 index=$index" || status=$?\n'
+            '    if [ "$status" -eq 0 ]; then written=$((written + 1)); else echo "status=$status" >&2; fi\n'
+            "    index=$((index + 1))\n"
+            "done\n"
+            'echo "written=$written"\n',
+            encoding="utf-8",
+        )
+        helper.chmod(0o755)
+        if os.getuid() == 0:
+            os.chown(helper, self.drop_uid, self.drop_gid)
+        writers = [self.shell_process(helper, str(number)) for number in range(2)]
+        outcomes = [writer.communicate(timeout=600) for writer in writers]
+        total = 0
+        for writer, (stdout, stderr) in zip(writers, outcomes):
+            self.assertEqual(writer.returncode, 0, stderr)
+            self.assertNotIn("status=73", stderr)
+            total += int(stdout.strip().rsplit("=", 1)[1])
+        written = [e for e in self.controller_events() if e.get("event") == "event_lock_hammer"]
+        self.assertEqual(len(written), total)
+
+    def test_a_plan_never_overwrites_a_profiles_sync_record_or_the_aggregate(self) -> None:
+        # ADV-B-1. A successful plan (dry run) rewrote the profile's failed sync
+        # record as succeeded with consecutive_failures=0, opened the dependency
+        # gate, and an `all` plan overwrote the aggregate sync record too.
+        self.configure_with_password("alpha", self.source_one, True)
+        profile_state = self.real_var / "state/profiles/alpha.state"
+        run_state = self.real_var / "state/run.state"
+        self.write_private_state(
+            profile_state,
+            "state=failed\nfinished_epoch=500\nexit_code=1\naction=sync\noutcome=failed\n"
+            "reason=core_failed\nscope=profile\noutcome_epoch=500\nconsecutive_failures=3\n"
+            "last_success_epoch=100\n",
+        )
+        self.write_private_state(
+            run_state,
+            "state=failed\nstarted_epoch=400\nfinished_epoch=500\nexit_code=1\nscope=all\n"
+            "operation=sync\nreason=core_failed\ndetail=\naggregate_state=failed\n"
+            "aggregate_finished_epoch=500\naggregate_exit_code=1\naggregate_reason=core_failed\n",
+        )
+        started = self.shell(self.lifecycle, "start", timeout=15)
+        self.assertEqual(started.returncode, 0, started.stdout + started.stderr)
+        runner = self.real_target / "libexec/sdsync-run"
+        try:
+            for arguments in (("plan", "alpha", "false", "foreground", "-"),
+                              ("plan", "all", "false", "foreground", "100")):
+                planned = self.shell(
+                    runner, *arguments, extra_environment={"SDSYNC_DSM_AUDIT_WRAPPED": "true"},
+                    timeout=60,
+                )
+                self.assertEqual(planned.returncode, 0, planned.stdout + planned.stderr)
+                fields = self.state_fields(profile_state)
+                self.assertEqual(fields["state"], "failed", (arguments, fields))
+                self.assertEqual(fields["action"], "sync", (arguments, fields))
+                self.assertEqual(fields["consecutive_failures"], "3", (arguments, fields))
+                self.assertEqual(fields["last_success_epoch"], "100", (arguments, fields))
+            fields = self.state_fields(run_state)
+            self.assertEqual(fields["operation"], "plan", fields)
+            self.assertEqual(fields["state"], "succeeded", fields)
+            self.assertEqual(fields["aggregate_state"], "failed", fields)
+            self.assertEqual(fields["aggregate_finished_epoch"], "500", fields)
+            self.assertEqual(fields["aggregate_reason"], "core_failed", fields)
+        finally:
+            stopped = self.shell(self.lifecycle, "stop", timeout=15)
+            self.assertEqual(stopped.returncode, 0, stopped.stdout + stopped.stderr)
+
+    def test_logs_never_hide_an_error_and_serve_the_run_stderr_tail(self) -> None:
+        # ADV-B-3. The Logs read filtered by the shell's own rule before the
+        # bridge's ran: an unlevelled line (raw stderr in controller.log, where
+        # a runner's preflight cause lands) counted as info, a human-format
+        # sync ERROR line as info, and `off` dropped JSON errors too.
+        # C-B3 / ADV-S-18: run-stderr.log is now a Logs source of its own.
+        def write_log(name: str, lines: list[str]) -> None:
+            self.write_private_state(self.real_var / "log" / name, "".join(f"{line}\n" for line in lines))
+
+        info_json = '{"epoch":1,"level":"info","category":"controller","event":"quiet_info"}'
+        error_json = '{"epoch":2,"level":"error","category":"controller","event":"loud_error"}'
+        raw_line = f"refusing unsafe package log file: {self.real_var}/log/activity.log"
+        write_log("controller.log", [info_json, error_json, raw_line])
+        write_log("sync.log", ["1700000000000 INFO run started", "1700000000001 ERROR failed to read x"])
+
+        def lines_for(source: str) -> list[str]:
+            result, payload = self.api("logs", "--source", source, "--lines", "50")
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            entries = {entry["source"]: entry["lines"] for entry in payload["logs"]}
+            return list(entries[source])
+
+        for level in ("warn", "off"):
+            policy, _ = self.api(
+                "security-policy",
+                *self.security_policy_options(controller_log_level=level, sync_log_level=level),
+            )
+            self.assertEqual(policy.returncode, 0, policy.stderr)
+            controller = lines_for("controller")
+            self.assertIn(error_json, controller, level)
+            self.assertTrue(
+                any(line.startswith("refusing unsafe package log file: [package-var]") for line in controller),
+                (level, controller),
+            )
+            self.assertNotIn(info_json, controller, level)
+            sync = lines_for("sync")
+            self.assertIn("1700000000001 ERROR failed to read x", sync, level)
+            self.assertNotIn("1700000000000 INFO run started", sync, level)
+
+        write_log("run-stderr.log.1", ["# epoch=100 scope=alpha operation=sync exit=1",
+                                       f"error: cannot read {self.real_var}/state/x"])
+        write_log("run-stderr.log", ["# epoch=200 scope=all operation=sync exit=1", "error: two"])
+        self.assertEqual(
+            lines_for("run-stderr"),
+            [
+                "# epoch=100 scope=alpha operation=sync exit=1",
+                "error: cannot read [package-var]/state/x",
+                "# epoch=200 scope=all operation=sync exit=1",
+                "error: two",
+            ],
+        )
+        everything, payload = self.api("logs", "--lines", "10")
+        self.assertEqual(everything.returncode, 0, everything.stderr)
+        self.assertNotIn("run-stderr", {entry["source"] for entry in payload["logs"]})
+
+    def test_free_text_request_id_is_never_read_as_a_request_tag(self) -> None:
+        # ADV-B-5, writer half. A run's error line naming a file such as
+        # `meeting request_id=5.txt` reached an Activity message, and a
+        # ` request_id=` not followed by a request id made the whole feed
+        # corrupt. The writer now neutralises free-text markers and keeps a
+        # genuine trailing tag.
+        helper = self.root / "activity-marker-helper.sh"
+        helper.write_text(
+            "#!/bin/sh\nset -eu\n"
+            f'. "{self.real_target / "libexec/sdsync-common"}"\n'
+            "ensure_layout\n"
+            'append_activity run.failed alpha failed "error: failed to read meeting request_id=5.txt" sync error\n'
+            'append_activity run.started alpha running '
+            '"Run of request_id=x started request_id=0123456789abcdef0123456789abcdef" sync info\n',
+            encoding="utf-8",
+        )
+        helper.chmod(0o755)
+        if os.getuid() == 0:
+            os.chown(helper, self.drop_uid, self.drop_gid)
+        written = self.shell(helper)
+        self.assertEqual(written.returncode, 0, written.stderr)
+        activity, payload = self.api("activity", "--lines", "10")
+        self.assertEqual(activity.returncode, 0, activity.stdout + activity.stderr)
+        events = {event["code"]: event for event in payload["events"]}
+        self.assertEqual(
+            events["run.failed"]["message"], "error: failed to read meeting request_id_5.txt"
+        )
+        self.assertIsNone(events["run.failed"]["client_request_id"])
+        self.assertEqual(
+            events["run.started"]["client_request_id"], "0123456789abcdef0123456789abcdef"
+        )
+        self.assertIn("Run of request_id_x started", events["run.started"]["message"])
+
+    def test_a_dead_sync_stamps_the_profiles_it_covered_but_not_the_ones_it_finished(self) -> None:
+        # ADV-B-2. After the controller rewrote a dead runner's run.state, the
+        # profiles that run covered read their previous success again, because
+        # no per-profile record was written for the run that died part-way.
+        self.configure_with_password("alpha", self.source_one, True)
+        self.configure_with_password("beta", self.source_two)
+        profiles = self.real_var / "state/profiles"
+        self.write_private_state(
+            profiles / "alpha.state",
+            "state=succeeded\nfinished_epoch=500\nexit_code=0\naction=sync\noutcome=succeeded\n"
+            "reason=ok\nscope=all\noutcome_epoch=500\nconsecutive_failures=0\nlast_success_epoch=500\n",
+        )
+        # beta finished inside the dead run (after its start): its record is real.
+        self.write_private_state(
+            profiles / "beta.state",
+            "state=succeeded\nfinished_epoch=950\nexit_code=0\naction=sync\noutcome=succeeded\n"
+            "reason=ok\nscope=all\noutcome_epoch=950\nconsecutive_failures=0\nlast_success_epoch=950\n",
+        )
+        self.write_private_state(
+            self.real_var / "state/run.state",
+            "state=running\nstarted_epoch=900\nfinished_epoch=0\nexit_code=-1\nscope=all\noperation=sync\n",
+        )
+        started = self.shell(self.lifecycle, "start", timeout=15)
+        self.assertEqual(started.returncode, 0, started.stdout + started.stderr)
+        try:
+            self.wait_for_controller_event("run_runner_died")
+            alpha = self.state_fields(profiles / "alpha.state")
+            self.assertEqual(alpha["state"], "failed", alpha)
+            self.assertEqual(alpha["outcome"], "unknown", alpha)
+            self.assertEqual(alpha["reason"], "runner_died", alpha)
+            self.assertEqual(alpha["exit_code"], "-1", alpha)
+            self.assertEqual(alpha["consecutive_failures"], "1", alpha)
+            self.assertEqual(alpha["last_success_epoch"], "500", alpha)
+            self.assertEqual(stat.S_IMODE((profiles / "alpha.state").stat().st_mode), 0o600)
+            beta = self.state_fields(profiles / "beta.state")
+            self.assertEqual(beta["state"], "succeeded", beta)
+            self.assertEqual(beta["outcome_epoch"], "950", beta)
+            snapshot, payload = self.api("snapshot")
+            self.assertEqual(snapshot.returncode, 0, snapshot.stderr)
+        finally:
+            stopped = self.shell(self.lifecycle, "stop", timeout=15)
+            self.assertEqual(stopped.returncode, 0, stopped.stdout + stopped.stderr)
+
+        # A dead *plan* changes no profile's sync record.
+        self.write_private_state(
+            self.real_var / "state/run.state",
+            "state=running\nstarted_epoch=2000\nfinished_epoch=0\nexit_code=-1\nscope=beta\noperation=plan\n",
+        )
+        started = self.shell(self.lifecycle, "start", timeout=15)
+        self.assertEqual(started.returncode, 0, started.stdout + started.stderr)
+        try:
+            self.wait_for_state(
+                self.real_var / "state/run.state", lambda f: f.get("state") == "failed"
+            )
+            beta = self.state_fields(profiles / "beta.state")
+            self.assertEqual(beta["state"], "succeeded", beta)
+        finally:
+            stopped = self.shell(self.lifecycle, "stop", timeout=15)
+            self.assertEqual(stopped.returncode, 0, stopped.stdout + stopped.stderr)
+
+    def _common_helper(self, name: str, body: str) -> Path:
+        helper = self.root / name
+        helper.write_text(
+            "#!/bin/sh\nset -eu\n"
+            f'. "{self.real_target / "libexec/sdsync-common"}"\n'
+            "ensure_layout\n" + body,
+            encoding="utf-8",
+        )
+        helper.chmod(0o755)
+        if os.getuid() == 0:
+            os.chown(helper, self.drop_uid, self.drop_gid)
+        return helper
+
+    def test_an_undeliverable_notification_and_a_corrupt_alert_state_name_their_cause(self) -> None:
+        # ADV-S-7. The notification.unavailable record carried no status or
+        # cause and was itself written `2>/dev/null || true`; a corrupt
+        # alerts.state or doctor.state made the alert handlers return 73 with
+        # nothing said about which file or field.
+        self.configure_with_password("alpha", self.source_one, True)
+        notify = self._common_helper(
+            "notify-helper.sh",
+            "status=0\nsafe_notify sync_failed alpha 1 || status=$?\necho \"status=$status\"\n",
+        )
+        result = self.shell(notify)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("status=69", result.stdout)
+        unavailable = [e for e in self.activity_records() if e["code"] == "notification.unavailable"]
+        self.assertEqual(len(unavailable), 1, unavailable)
+
+        self.write_private_state(self.real_var / "state/alerts.state", "failure_count=abc\n")
+        self.write_private_state(self.real_var / "state/doctor.state", "failure_count=x\n")
+        alert = self._common_helper(
+            "alert-helper.sh",
+            "status=0\nhandle_alert_result alpha failed 1 || status=$?\necho \"alert=$status\"\n"
+            "status=0\nhandle_doctor_alert alpha 1 || status=$?\necho \"doctor=$status\"\n",
+        )
+        result = self.shell(alert)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("alert=73", result.stdout)
+        self.assertIn("doctor=73", result.stdout)
+        self.assertIn("alerts.state", result.stderr)
+        self.assertIn("failure_count", result.stderr)
+        self.assertIn("doctor.state", result.stderr)
+
+    def test_a_health_cache_write_failure_does_not_abort_doctor_or_its_records(self) -> None:
+        # ADV-S-8. write_health_cache ran bare under `set -e`, so a failed
+        # health-cache write ended Doctor after its output was printed: no
+        # doctor Activity record, no alert, and mv's exit status in place of
+        # Doctor's.
+        self.assertEqual(
+            self.configure("personal", self.source_one, "/home/Drive/Personal", True).returncode, 0
+        )
+        refuse_health = self._fake_mv_bin(
+            "fake-mv-health", "case $2 in */state/health/*) exit 1 ;; esac"
+        )
+        result = self.shell(
+            self.manager, "doctor", "personal",
+            extra_environment={"PATH": f"{refuse_health}:{self.environment['PATH']}"},
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("health", result.stderr)
+        doctor = [e for e in self.activity_records() if e["code"] == "doctor.succeeded"]
+        self.assertEqual(len(doctor), 1, doctor)
+        self.assertIn("health record could not be saved", str(doctor[0]["message"]))
+        failed = [e for e in self.controller_events() if e.get("event") == "health_cache_write_failed"]
+        self.assertEqual(len(failed), 1, self.controller_events())
+        self.assertIn("profile=personal", str(failed[0]["detail"]))
+
+    def test_best_effort_manager_writes_record_their_cause(self) -> None:
+        # ADV-S-16. manager_best_effort discarded the helper's own stderr, so
+        # the controller.log record of a refused Activity write said only
+        # `sink= status=`, never which file or why.
+        self.assertEqual(
+            self.configure("personal", self.source_one, "/home/Drive/Personal", True).returncode, 0
+        )
+        core = self.real_target / "bin/synology-drive-sync"
+        core.write_text(
+            "#!/bin/sh\n"
+            'case " $* " in *" config validate "*) exit 0 ;; *" doctor "*) exit 1 ;; esac\n'
+            "exit 0\n",
+            encoding="utf-8",
+        )
+        core.chmod(0o755)
+        if os.getuid() == 0:
+            os.chown(core, self.drop_uid, self.drop_gid)
+        self.write_private_state(self.real_var / "state/doctor.state", "failure_count=x\n")
+        result = self.shell(self.manager, "doctor", "personal")
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        failed = [
+            e for e in self.controller_events()
+            if e.get("event") == "observability_write_failed" and "sink=alert" in str(e.get("detail"))
+        ]
+        self.assertTrue(failed, self.controller_events())
+        self.assertEqual(failed[0]["level"], "error")
+        self.assertIn("doctor.state", str(failed[0]["detail"]))
+        self.assertIn("failure_count", str(failed[0]["detail"]))
+
+    def test_controller_names_why_it_exited_and_why_a_launch_failed(self) -> None:
+        # ADV-S-12 / ADV-S-13. A stale-run check whose lock could not be taken
+        # for any reason but busy returned silently; every launch failure was
+        # logged as an identity-capture failure whatever its status; and a
+        # controller that died left state=stopped with no cause anywhere.
+        controller = self.real_target / "libexec/sdsync-controller"
+        source = controller.read_text(encoding="utf-8")
+        acquire = '    acquire_private_process_lock "$run_lock" || stale_acquire_status=$?\n'
+        self.assertEqual(source.count(acquire), 1)
+        loop_top = "    queue_wake_requested=false\n    reopen_controller_stderr\n"
+        self.assertEqual(source.count(loop_top), 1)
+        die = self.root / "controller-die"
+        controller.write_text(
+            source.replace(acquire, "    stale_acquire_status=73\n", 1).replace(
+                loop_top,
+                loop_top + f'    if [ -e "{die}" ]; then false; fi\n',
+                1,
+            ),
+            encoding="utf-8",
+        )
+        self.write_private_state(
+            self.real_var / "state/run.state",
+            "state=running\nstarted_epoch=900\nfinished_epoch=0\nexit_code=-1\nscope=all\noperation=sync\n",
+        )
+        started = self.shell(self.lifecycle, "start", timeout=15)
+        self.assertEqual(started.returncode, 0, started.stdout + started.stderr)
+        try:
+            unverifiable = self.wait_for_controller_event("run_state_unverifiable")
+            self.assertIn("status=73", str(unverifiable[0]["detail"]))
+            self.assertIn("phase=acquire", str(unverifiable[0]["detail"]))
+            die.touch()
+            exited = self.wait_for_controller_event("controller_exited")
+            self.assertEqual(exited[0]["level"], "error", exited)
+            self.assertIn("status=1", str(exited[0]["detail"]))
+        finally:
+            self.shell(self.lifecycle, "stop", timeout=15)
+
+    def test_a_configuration_the_core_rejects_names_its_cause_in_the_run_record(self) -> None:
+        # ADV-S-10. `config validate` ran bare and its stderr was not kept, so a
+        # rejected configuration left run.state with the fixed text "the
+        # package configuration did not validate" and nothing saying why.
+        self.configure_with_password("alpha", self.source_one, True)
+        core = self.real_target / "bin/synology-drive-sync"
+        core.write_text(
+            "#!/bin/sh\n"
+            'case " $* " in *" config validate "*) '
+            "echo 'error: profile alpha: url must use https' >&2; exit 2 ;; esac\n"
+            "exit 0\n",
+            encoding="utf-8",
+        )
+        core.chmod(0o755)
+        if os.getuid() == 0:
+            os.chown(core, self.drop_uid, self.drop_gid)
+        started = self.shell(self.lifecycle, "start", timeout=15)
+        self.assertEqual(started.returncode, 0, started.stdout + started.stderr)
+        try:
+            refused = self.shell(
+                self.real_target / "libexec/sdsync-run", "sync", "alpha", "false", "foreground", "-",
+                extra_environment={"SDSYNC_DSM_AUDIT_WRAPPED": "true"},
+            )
+            self.assertEqual(refused.returncode, 2, refused.stdout + refused.stderr)
+            fields = self.state_fields(self.real_var / "state/run.state")
+            self.assertEqual(fields["reason"], "config_invalid", fields)
+            self.assertIn("url must use https", fields["detail"], fields)
+        finally:
+            stopped = self.shell(self.lifecycle, "stop", timeout=15)
+            self.assertEqual(stopped.returncode, 0, stopped.stdout + stopped.stderr)
+
+    def test_a_scheduler_log_write_failure_does_not_stop_a_scheduled_run(self) -> None:
+        # ADV-S-10. After run.state said running, the scheduler-log append was
+        # bare under `set -e`: a scheduler.log problem ended the sync before the
+        # core started, recorded only as "stopped before the core started".
+        self.configure_with_password("alpha", self.source_one, True)
+        routine, _ = self.api(
+            "routine", "--profile", "alpha", "--enabled", "true", "--action", "sync",
+            "--mode", "interval", "--interval", "86400", "--weekdays", "1,2,3,4,5,6,7",
+            "--time-window-start", "00:00", "--time-window-end", "23:59",
+            "--debounce-seconds", "1", "--retry-count", "0", "--retry-backoff-seconds", "10",
+            "--poll-seconds", "5", "--allow-delete", "false", "--max-total-delete", "100",
+        )
+        self.assertEqual(routine.returncode, 0, routine.stderr)
+        self.write_private_state(
+            self.real_var / "state/routines/alpha.state",
+            "state=scheduled\nnext_run_epoch=1\nlast_success_epoch=0\nlast_attempt_epoch=0\n"
+            "retry_attempt=0\nlast_day=none\nlast_poll_epoch=0\nfingerprint=none\nbackend=interval\n",
+        )
+        scheduler_log = self.real_var / "log/scheduler.log.3"
+        scheduler_log.symlink_to(self.root / "elsewhere")
+        self.capture.write_text("", encoding="utf-8")
+        started = self.shell(
+            self.lifecycle, "start", extra_environment=self.fast_clock_environment(step=31), timeout=15
+        )
+        self.assertEqual(started.returncode, 0, started.stdout + started.stderr)
+        try:
+            runs = self.wait_for_controller_event("routine_run")
+            self.assertIn("exit=0 ", str(runs[0]["detail"]), runs)
+            self.assertIn("sync --profile alpha", self.capture.read_text(encoding="utf-8"))
+            fields = self.state_fields(self.real_var / "state/run.state")
+            self.assertEqual(fields["state"], "succeeded", fields)
+            self.assertIn("scheduler_log", fields.get("degraded", ""), fields)
+        finally:
+            stopped = self.shell(self.lifecycle, "stop", timeout=15)
+            self.assertEqual(stopped.returncode, 0, stopped.stdout + stopped.stderr)
+
+    def test_an_invalid_default_profile_is_refused_not_replaced_by_the_first_profile(self) -> None:
+        # ADV-S-9. A default-profile file naming a profile that does not exist
+        # silently fell back to the alphabetically first profile, so a run,
+        # plan or resync without a scope acted on a profile nobody chose.
+        self.configure_with_password("alpha", self.source_one)
+        self.configure_with_password("beta", self.source_two, True)
+        default_file = self.real_home / "config/default-profile"
+        self.write_private_state(default_file, "gone\n")
+        self.capture.write_text("", encoding="utf-8")
+        started = self.shell(self.lifecycle, "start", timeout=15)
+        self.assertEqual(started.returncode, 0, started.stdout + started.stderr)
+        try:
+            planned = self.shell(self.manager, "plan")
+            self.assertNotEqual(planned.returncode, 0, planned.stdout + planned.stderr)
+            self.assertIn("default profile", planned.stderr)
+            self.assertIn("gone", planned.stderr)
+            self.assertNotIn("--profile alpha", self.capture.read_text(encoding="utf-8"))
+            invalid = [e for e in self.controller_events() if e.get("event") == "default_profile_invalid"]
+            self.assertTrue(invalid, self.controller_events())
+            self.assertEqual(invalid[0]["level"], "error")
+        finally:
+            stopped = self.shell(self.lifecycle, "stop", timeout=15)
+            self.assertEqual(stopped.returncode, 0, stopped.stdout + stopped.stderr)
+
+    def test_an_unreadable_alert_policy_is_not_overwritten_with_defaults(self) -> None:
+        # ADV-S-9. configure-alerts carries the three system-log fields over
+        # from the stored policy; an unreadable or symlinked alerts.conf read as
+        # "absent", and the save then persisted the defaults -- system logging
+        # off, the verified message identifier gone.
+        policy = self.real_home / "config/alerts.conf"
+        target = self.root / "policy-target"
+        target.write_text("system_log=true\nsystem_log_message_id=0x11100000\n", encoding="utf-8")
+        policy.unlink(missing_ok=True)
+        policy.symlink_to(target)
+        saved = self.shell(
+            self.manager, "configure-alerts", "--enabled", "true", "--on-success", "false",
+            "--on-failure", "true", "--failure-threshold", "1", "--cooldown", "3600",
+        )
+        self.assertNotEqual(saved.returncode, 0, saved.stdout + saved.stderr)
+        self.assertIn("alerts.conf", saved.stderr)
+        self.assertTrue(policy.is_symlink())
+        self.assertIn("system_log=true", target.read_text(encoding="utf-8"))
+
+    def test_a_failed_poll_stage_names_its_status_and_cause(self) -> None:
+        # ADV-S-11. The polling walk's stderr went to /dev/null and only the
+        # unreadable-subtree status carried a detail, so a missing tool or a
+        # failed sort/cksum stage read `reason=fingerprint` and nothing else.
+        self.assertEqual(
+            self.configure("watch", self.source_two, "/home/Drive/Watch", True).returncode, 0
+        )
+        secret, _ = self.api(
+            "set-secret", "--profile", "watch", "--kind", "password", "--mode", "replace",
+            input_text="test-password\n",
+        )
+        self.assertEqual(secret.returncode, 0, secret.stderr)
+        routine, _ = self.api(
+            "routine", "--profile", "watch", "--enabled", "true", "--action", "sync",
+            "--mode", "realtime", "--interval", "60", "--weekdays", "1,2,3,4,5,6,7",
+            "--time-window-start", "00:00", "--time-window-end", "23:59",
+            "--debounce-seconds", "1", "--retry-count", "1", "--retry-backoff-seconds", "10",
+            "--poll-seconds", "30", "--allow-delete", "false", "--max-total-delete", "100",
+        )
+        self.assertEqual(routine.returncode, 0, routine.stderr)
+        fake_bin = self.root / "fake-cksum-bin"
+        fake_bin.mkdir()
+        fake_cksum = fake_bin / "cksum"
+        fake_cksum.write_text("#!/bin/sh\necho 'cksum: simulated read error' >&2\nexit 1\n", encoding="utf-8")
+        fake_cksum.chmod(0o755)
+        if os.getuid() == 0:
+            os.chown(fake_bin, self.drop_uid, self.drop_gid)
+            os.chown(fake_cksum, self.drop_uid, self.drop_gid)
+        environment = self.fast_clock_environment(step=31)
+        environment["PATH"] = f"{fake_bin}:{environment.get('PATH', self.environment['PATH'])}"
+        started = self.shell(self.lifecycle, "start", extra_environment=environment, timeout=15)
+        self.assertEqual(started.returncode, 0, started.stdout + started.stderr)
+        try:
+            unavailable = self.wait_for_controller_event("routine_poll_unavailable")
+            detail = str(unavailable[0]["detail"])
+            self.assertIn("reason=fingerprint", detail)
+            self.assertIn("status=69", detail)
+            self.assertIn("cksum", detail)
+        finally:
+            stopped = self.shell(self.lifecycle, "stop", timeout=15)
+            self.assertEqual(stopped.returncode, 0, stopped.stdout + stopped.stderr)
+
+    def _realtime_watch_routine(self) -> None:
+        self.assertEqual(
+            self.configure("watch", self.source_two, "/home/Drive/Watch", True).returncode, 0
+        )
+        secret, _ = self.api(
+            "set-secret", "--profile", "watch", "--kind", "password", "--mode", "replace",
+            input_text="test-password\n",
+        )
+        self.assertEqual(secret.returncode, 0, secret.stderr)
+        routine, _ = self.api(
+            "routine", "--profile", "watch", "--enabled", "true", "--action", "sync",
+            "--mode", "realtime", "--interval", "60", "--weekdays", "1,2,3,4,5,6,7",
+            "--time-window-start", "00:00", "--time-window-end", "23:59",
+            "--debounce-seconds", "1", "--retry-count", "1", "--retry-backoff-seconds", "10",
+            "--poll-seconds", "30", "--allow-delete", "false", "--max-total-delete", "100",
+        )
+        self.assertEqual(routine.returncode, 0, routine.stderr)
+
+    def test_an_unwritable_watcher_failure_record_abandons_instead_of_retrying_forever(self) -> None:
+        # ADV-S-14. The watcher failure ladder's writes were `|| true`: a ladder
+        # file that could not be written left `consecutive` at 1, so the
+        # five-strike abandonment never fired and the watcher was respawned
+        # every turn; a symlinked watcher path was swallowed into polling with
+        # no path or status anywhere.
+        self._realtime_watch_routine()
+        ladder = self.real_var / "run/watch-watch.failed"
+        ladder.mkdir(parents=True)
+        started = self.shell(
+            self.lifecycle, "start", extra_environment=self.fast_clock_environment(step=31), timeout=15
+        )
+        self.assertEqual(started.returncode, 0, started.stdout + started.stderr)
+        try:
+            unwritable = self.wait_for_controller_event("routine_watch_ladder_unwritable")
+            self.assertEqual(unwritable[0]["level"], "error")
+            self.assertIn("watch-watch.failed", str(unwritable[0]["detail"]))
+            self.wait_for_controller_event("routine_watch_abandoned")
+            deadline = time.monotonic() + 10
+            abandoned: list[dict[str, object]] = []
+            while not abandoned and time.monotonic() < deadline:
+                abandoned = [e for e in self.activity_records() if e["code"] == "routine.watch_abandoned"]
+                time.sleep(0.1)
+            self.assertTrue(abandoned)
+        finally:
+            stopped = self.shell(self.lifecycle, "stop", timeout=15)
+            self.assertEqual(stopped.returncode, 0, stopped.stdout + stopped.stderr)
+        ladder.rmdir()
+        ladder.symlink_to(self.root / "elsewhere")
+        started = self.shell(
+            self.lifecycle, "start", extra_environment=self.fast_clock_environment(step=32), timeout=15
+        )
+        self.assertEqual(started.returncode, 0, started.stdout + started.stderr)
+        try:
+            unsafe = self.wait_for_controller_event("routine_watch_unsafe")
+            self.assertEqual(unsafe[0]["level"], "error")
+            self.assertIn("watch-watch.failed", str(unsafe[0]["detail"]))
+        finally:
+            stopped = self.shell(self.lifecycle, "stop", timeout=15)
+            self.assertEqual(stopped.returncode, 0, stopped.stdout + stopped.stderr)
+
+    def test_a_post_commit_warning_reaches_the_api_result(self) -> None:
+        # ADV-S-17. A save whose terminal audit was left pending, or whose
+        # Activity echo failed, printed a stderr warning and exited 0; through
+        # the API the success result dropped it, so the dashboard said "saved"
+        # with nothing about the pending audit record.
+        original_manager = self.manager.read_text(encoding="utf-8")
+        needle = (
+            '        audit_outbox_complete "$SDSYNC_DSM_AUDIT_TRANSACTION" "$direct_audit_result" '
+            ">/dev/null 2>&1 || \\\n"
+        )
+        self.assertEqual(original_manager.count(needle), 1)
+        self.manager.write_text(original_manager.replace(needle, "        false || \\\n", 1), encoding="utf-8")
+        self.manager.chmod(0o755)
+        if os.getuid() == 0:
+            os.chown(self.manager, self.drop_uid, self.drop_gid)
+        saved, payload = self.api("performance-policy", "--level", "gentle")
+        self.assertEqual(saved.returncode, 0, saved.stdout + saved.stderr)
+        self.assertIs(payload["ok"], True, payload)
+        self.assertEqual(payload.get("warning_code"), "audit_pending", payload)
+        self.assertIn("terminal audit is pending", str(payload.get("warning")))
+
+    def test_a_doctor_inventory_write_failure_names_the_file_and_status(self) -> None:
+        # ADV-S-17. A failed Doctor inventory persist said only "could not be
+        # recorded", with no path or cause.
+        self.assertEqual(
+            self.configure("personal", self.source_one, "/home/Drive/Personal", True).returncode, 0
+        )
+        target = self.root / "doctor-target.ndjson"
+        document = {
+            "schema": "sdsync.doctor.v1", "level": "standard", "status": "pass",
+            "sections": [{"id": "destination_inventory", "status": "pass", "detail": "bounded discovery"}],
+            "remote_inventory": {
+                "scope": "direct_children", "root_exists": True, "total_entries": 1,
+                "sample_count": 1, "sample_limit": 5, "truncated": False,
+                "sample": [{"relative_path": "/one", "name": "one", "kind": "file",
+                            "size_bytes": 1, "mtime_seconds": 1788200000}],
+            },
+        }
+        target.write_text(json.dumps(document, separators=(",", ":")) + "\n", encoding="utf-8")
+        rotated = self.real_var / "log/doctor-inventory.log.2"
+        rotated.symlink_to(self.root / "elsewhere")
+        result = self.shell(
+            self.manager, "doctor", "personal", "--level", "standard",
+            extra_environment={"SDSYNC_TEST_TARGET_OUTPUT_FILE": str(target)},
+        )
+        self.assertIn("doctor-inventory.log", result.stderr)
+        self.assertIn("status 73", result.stderr)
+
+    def test_private_file_and_directory_preparation_failures_are_not_reported_as_success(self) -> None:
+        # ADV-S-26. ensure_layout's mkdir/chmod/chown were unchecked and it
+        # ended on `umask`, so a directory it could not create was reported
+        # ready; finish_private_file returned the chown step's status, so a
+        # failed chmod read as success to every `|| ...` caller; and the mode
+        # repair on upgrade named none of the files it could not repair.
+        probe = self._common_helper(
+            "private-prep-helper.sh",
+            'status=0\nfinish_private_file "$state_root/no-such-file" 2>/dev/null || status=$?\n'
+            'echo "finish=$status"\n',
+        )
+        result = self.shell(probe)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("finish=0", result.stdout)
+
+        health = self.real_var / "state/health"
+        if health.is_dir():
+            shutil.rmtree(health)
+        self.write_private_state(health, "not a directory\n")
+        layout = self.root / "layout-helper.sh"
+        layout.write_text(
+            "#!/bin/sh\nset -eu\n"
+            f'. "{self.real_target / "libexec/sdsync-common"}"\n'
+            'status=0\nensure_layout || status=$?\necho "layout=$status"\n',
+            encoding="utf-8",
+        )
+        layout.chmod(0o755)
+        if os.getuid() == 0:
+            os.chown(layout, self.drop_uid, self.drop_gid)
+        result = self.shell(layout)
+        self.assertIn("layout=73", result.stdout)
+        self.assertIn("cannot prepare private package directory", result.stderr)
+        self.assertIn("state/health", result.stderr)
+        health.unlink()
+
+        schedule = self.real_home / "config/schedule.conf"
+        self.write_private_state(schedule, "enabled=false\n")
+        schedule.chmod(0o644)
+        refuse = self.root / "fake-chmod-bin"
+        refuse.mkdir()
+        fake_chmod = refuse / "chmod"
+        fake_chmod.write_text(
+            "#!/bin/sh\n"
+            'case "$2" in */config/schedule.conf) echo "chmod: simulated failure" >&2; exit 1 ;; esac\n'
+            'exec /bin/chmod "$@"\n',
+            encoding="utf-8",
+        )
+        fake_chmod.chmod(0o755)
+        if os.getuid() == 0:
+            os.chown(refuse, self.drop_uid, self.drop_gid)
+            os.chown(fake_chmod, self.drop_uid, self.drop_gid)
+        repair = self._common_helper(
+            "repair-helper.sh", 'status=0\nrepair_private_file_modes || status=$?\necho "repair=$status"\n'
+        )
+        result = self.shell(repair, extra_environment={"PATH": f"{refuse}:{self.environment['PATH']}"})
+        self.assertIn("repair=73", result.stdout)
+        self.assertIn("cannot restore mode 0600 on", result.stderr)
+        self.assertIn("config/schedule.conf", result.stderr)
+
+    def test_an_activity_record_without_a_clock_is_refused_with_a_reason(self) -> None:
+        # ADV-S-27. append_activity used `$(epoch_now)` unchecked: a failing
+        # clock wrote a record with an empty epoch, which made the whole
+        # Activity feed read as corrupt; and every validation refusal returned
+        # 64 with nothing said.
+        fake_bin = self.root / "broken-clock-bin"
+        fake_bin.mkdir()
+        fake_date = fake_bin / "date"
+        fake_date.write_text(
+            '#!/bin/sh\ncase "${1:-}" in +%s) exit 1 ;; esac\nexec /bin/date "$@"\n', encoding="utf-8"
+        )
+        fake_date.chmod(0o755)
+        if os.getuid() == 0:
+            os.chown(fake_bin, self.drop_uid, self.drop_gid)
+            os.chown(fake_date, self.drop_uid, self.drop_gid)
+        helper = self._common_helper(
+            "activity-clock-helper.sh",
+            'status=0\nappend_activity run.started alpha running "clockless" sync error || status=$?\n'
+            'echo "clock=$status"\n'
+            'status=0\nappend_activity no.such.code alpha running "bad code" sync info || status=$?\n'
+            'echo "code=$status"\n',
+        )
+        result = self.shell(helper, extra_environment={"PATH": f"{fake_bin}:{self.environment['PATH']}"})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("clock=0", result.stdout)
+        self.assertIn("code=64", result.stdout)
+        self.assertIn("no.such.code", result.stderr)
+        activity, payload = self.api("activity", "--lines", "10")
+        self.assertEqual(activity.returncode, 0, activity.stdout + activity.stderr)
+        self.assertNotIn("clockless", json.dumps(payload))
+
+    def test_manager_reads_name_a_corrupt_pid_a_failed_clear_and_a_service_outage(self) -> None:
+        # ADV-S-28. `status` printed service=stopped for a PID file it could not
+        # read; a failed log clear said "could not be cleared" with no file or
+        # status; and a dashboard request the package could not serve (5xx) was
+        # an Activity warning like a rejected client request (4xx).
+        pid_file = self.real_var / "run/controller.pid"
+        self.write_private_state(pid_file, "not-a-pid\n")
+        status = self.shell(self.manager, "status")
+        self.assertIn("service=unknown", status.stdout)
+        self.assertIn("controller.pid", status.stderr)
+        pid_file.unlink()
+
+        controller_log = self.real_var / "log/controller.log"
+        self.write_private_state(controller_log, '{"epoch":1,"level":"info","event":"x"}\n')
+        refuse = self._fake_mv_bin("fake-mv-clear", "case $2 in */log/controller.log) exit 1 ;; esac")
+        result = self.shell(
+            self.manager, "api", "clear-logs", "--source", "controller",
+            extra_environment={"PATH": f"{refuse}:{self.environment['PATH']}"},
+        )
+        self.assertEqual(result.returncode, 73, result.stdout + result.stderr)
+        payload = json.loads(result.stdout)
+        self.assertIn("controller.log", payload["message"])
+        self.assertIn("status", payload["message"])
+
+        unavailable, _ = self.api(
+            "cgi-failure", "--stage", "bridge_connect", "--code", "service_unavailable", "--status", "503"
+        )
+        self.assertEqual(unavailable.returncode, 0, unavailable.stderr)
+        rejected, _ = self.api(
+            "cgi-failure", "--stage", "request", "--code", "invalid_request", "--status", "400"
+        )
+        self.assertEqual(rejected.returncode, 0, rejected.stderr)
+        events = [e for e in self.activity_records() if e["code"] == "bridge.failed"]
+        levels = {str(e["message"]).rsplit("status=", 1)[1]: e["level"] for e in events}
+        self.assertEqual(levels, {"503": "error", "400": "warn"}, events)
+
+    def test_lifecycle_refusals_name_their_step_and_path(self) -> None:
+        # ADV-S-34. prestart exited 150 for five different causes without a
+        # word, and an uninstall purge that left files behind still said every
+        # package-owned file was removed.
+        core = self.real_target / "bin/synology-drive-sync"
+        core.chmod(0o644)
+        try:
+            refused = self.shell(self.lifecycle, "prestart")
+        finally:
+            core.chmod(0o755)
+        self.assertEqual(refused.returncode, 150)
+        self.assertIn("bin/synology-drive-sync", refused.stdout + refused.stderr)
+
+        self.assertEqual(self.configure("personal", self.source_one, "/home/Drive/Test", True).returncode, 0)
+        refuse = self.root / "fake-rm-bin"
+        refuse.mkdir()
+        fake_rm = refuse / "rm"
+        fake_rm.write_text(
+            "#!/bin/sh\n"
+            'for argument in "$@"; do case $argument in */home/secrets) '
+            "echo 'rm: simulated failure' >&2; exit 1 ;; esac; done\n"
+            'exec /bin/rm "$@"\n',
+            encoding="utf-8",
+        )
+        fake_rm.chmod(0o755)
+        if os.getuid() == 0:
+            os.chown(refuse, self.drop_uid, self.drop_gid)
+            os.chown(fake_rm, self.drop_uid, self.drop_gid)
+        purge = self.shell(
+            self.lifecycle_dir / "postuninst",
+            extra_environment={"SYNOPKG_PKG_STATUS": "UNINSTALL", "PATH": f"{refuse}:{self.environment['PATH']}"},
+        )
+        self.assertNotEqual(purge.returncode, 0, purge.stdout + purge.stderr)
+        self.assertIn("secrets", purge.stdout)
+        self.assertNotIn("Removed package-owned configuration", purge.stdout)
+
+    def test_a_clock_failure_after_the_core_does_not_turn_a_good_run_into_a_preflight_failure(self) -> None:
+        # ADV-S-33 (SH-6). `finished=$(epoch_now)` was bare under `set -e`
+        # right after the core exited: a clock read that failed there ended the
+        # runner, and the exit trap recorded "failed before the core ran" for a
+        # sync the core had completed.
+        self.configure_with_password("alpha", self.source_one, True)
+        broken = self.root / "clock-broken"
+        core = self.real_target / "bin/synology-drive-sync"
+        core.write_text(
+            "#!/bin/sh\n"
+            'case " $* " in *" config validate "*) exit 0 ;; esac\n'
+            f': > "{broken}"\n'
+            "exit 0\n",
+            encoding="utf-8",
+        )
+        core.chmod(0o755)
+        if os.getuid() == 0:
+            os.chown(core, self.drop_uid, self.drop_gid)
+        fake_bin = self.root / "late-broken-clock-bin"
+        fake_bin.mkdir()
+        fake_date = fake_bin / "date"
+        fake_date.write_text(
+            "#!/bin/sh\n"
+            f'case "${{1:-}}" in +%s) [ ! -e "{broken}" ] || exit 1 ;; esac\n'
+            'exec /bin/date "$@"\n',
+            encoding="utf-8",
+        )
+        fake_date.chmod(0o755)
+        if os.getuid() == 0:
+            os.chown(fake_bin, self.drop_uid, self.drop_gid)
+            os.chown(fake_date, self.drop_uid, self.drop_gid)
+        started = self.shell(self.lifecycle, "start", timeout=15)
+        self.assertEqual(started.returncode, 0, started.stdout + started.stderr)
+        try:
+            run = self.shell(
+                self.real_target / "libexec/sdsync-run", "sync", "alpha", "false", "foreground", "-",
+                extra_environment={
+                    "SDSYNC_DSM_AUDIT_WRAPPED": "true",
+                    "PATH": f"{fake_bin}:{self.environment['PATH']}",
+                },
+                timeout=60,
+            )
+            self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
+            fields = self.state_fields(self.real_var / "state/run.state")
+            self.assertEqual(fields["state"], "succeeded", fields)
+            self.assertNotIn("before the core", fields.get("detail", ""), fields)
+        finally:
+            broken.unlink(missing_ok=True)
+            stopped = self.shell(self.lifecycle, "stop", timeout=15)
+            self.assertEqual(stopped.returncode, 0, stopped.stdout + stopped.stderr)
+
+    def test_shell_logs_scan_is_bounded_and_says_when_it_stopped(self) -> None:
+        # ADV-B-4, shell rung. The manager's Logs read ran awk over every
+        # retained byte of every rotation on each poll. Like the in-service
+        # rung, it now reads at most 1 MiB per source, newest first, and marks
+        # a source whose scan stopped there with scan_limited instead of
+        # silently returning fewer matches.
+        error_line = '{"epoch":1,"level":"error","category":"controller","event":"old_error"}'
+        noise = '{"epoch":2,"level":"trace","category":"controller","event":"noise","pad":"' + "x" * 200 + '"}'
+        rotated = self.real_var / "log/controller.log.1"
+        self.write_private_state(rotated, error_line + "\n" + (noise + "\n") * 6000)
+        recent = '{"epoch":3,"level":"error","category":"controller","event":"recent_error"}'
+        self.write_private_state(self.real_var / "log/controller.log", recent + "\n")
+        logs, payload = self.api("logs", "--source", "controller", "--lines", "10")
+        self.assertEqual(logs.returncode, 0, logs.stderr)
+        entry = payload["logs"][0]
+        self.assertEqual(entry["lines"], [recent], entry)
+        self.assertIs(entry.get("scan_limited"), True, entry)
+
+        self.write_private_state(rotated, error_line + "\n")
+        logs, payload = self.api("logs", "--source", "controller", "--lines", "10")
+        self.assertEqual(logs.returncode, 0, logs.stderr)
+        entry = payload["logs"][0]
+        self.assertEqual(entry["lines"], [error_line, recent], entry)
+        self.assertNotIn("scan_limited", entry)
+
+    def test_stop_is_not_refused_while_the_controller_itself_holds_the_run_lock(self) -> None:
+        # Found while testing ADV-S-4: the controller takes the run lock for a
+        # moment to reconcile a stale run.state, and a package stop that came
+        # at that moment refused with "refusing to signal unverified plan/sync
+        # PID <controller>": the run lock's owner is not a runner, so stop read
+        # it as a foreign process. It is the controller being stopped.
+        started = self.shell(self.lifecycle, "start", timeout=15)
+        self.assertEqual(started.returncode, 0, started.stdout + started.stderr)
+        controller_owner = (self.real_var / "run/controller.lock/pid").read_text(encoding="utf-8")
+        run_lock = self.real_var / "run/run.lock"
+        run_lock.mkdir(mode=0o700)
+        self.write_private_state(run_lock / "pid", controller_owner)
+        if os.getuid() == 0:
+            os.chown(run_lock, self.drop_uid, self.drop_gid)
+        stopped = self.shell(self.lifecycle, "stop", timeout=30)
+        self.assertEqual(stopped.returncode, 0, stopped.stdout + stopped.stderr)
+        self.assertFalse((run_lock / "pid").exists(), "the dead controller's run lock was left behind")
+
+    def test_a_scheduled_aggregate_keeps_each_failed_profiles_cause_and_path(self) -> None:
+        # ADV-S-18 (understated in the audit). In a scheduled `all` run each
+        # profile's failure text and path existed only on the core's stdout,
+        # which the runner deleted: a sentinel path ended up in no file, no
+        # Activity row and no snapshot. The cause is now kept per profile
+        # (detail=, failed_path=) and in a per-profile Activity row, from the
+        # result record's error member when the core gives one, else from the
+        # batch-job record's error text.
+        for name, source in (("alpha", self.source_one), ("beta", self.source_two), ("gamma", self.source_one)):
+            self.configure_with_password(name, source, name == "alpha")
+        scheduled, _ = self.api(
+            "schedule", "--enabled", "true", "--interval", "86400",
+            "--allow-delete", "false", "--max-total-delete", "100",
+        )
+        self.assertEqual(scheduled.returncode, 0, scheduled.stderr)
+        self.write_private_state(self.real_var / "state/schedule.state", "next_run_epoch=1\n")
+        beta_record = json.dumps({
+            "schema": "sdsync.result-record.v1", "profile": "beta", "status": "failed", "result": None,
+            "error": {"code": "local_io",
+                      "detail": "listing /volume1/Photos/SENTINEL DIR|x failed: Permission denied (os error 13)",
+                      "path": "/volume1/Photos/SENTINEL DIR"},
+        }, separators=(",", ":"))
+        gamma_record = json.dumps({
+            "schema": "sdsync.result-record.v1", "profile": "gamma", "status": "failed", "result": None,
+        }, separators=(",", ":"))
+        alpha_record = json.dumps({
+            "schema": "sdsync.result-record.v1", "profile": "alpha", "status": "complete",
+            "result": {"outcome": "complete", "deferred": [], "skipped": 0},
+        }, separators=(",", ":"))
+        records = self.root / "records.ndjson"
+        records.write_text("\n".join((alpha_record, beta_record, gamma_record)) + "\n", encoding="utf-8")
+        self.install_test_core(
+            'case " $* " in *" --output ndjson "*) ;; *) exit 0 ;; esac\n'
+            'record=; previous=\n'
+            'for argument in "$@"; do [ "$previous" != --result-record ] || record=$argument; previous=$argument; done\n'
+            f'[ -z "$record" ] || cat "{records}" > "$record"\n'
+            'printf \'%s\\n\' \'{"error":null,"profile":"alpha","result":{"outcome":"complete","deferred":[],"skipped":0},"schema":"sdsync.batch-job.v1","status":"success"}\'\n'
+            'printf \'%s\\n\' \'{"error":"listing /volume1/Photos/SENTINEL DIR failed","profile":"beta","schema":"sdsync.batch-job.v1","status":"failed"}\'\n'
+            'printf \'%s\\n\' \'{"error":"remote \\"Photos\\" refused: GAMMA-SENTINEL","profile":"gamma","schema":"sdsync.batch-job.v1","status":"failed"}\'\n'
+            "echo 'error: one or more batch targets failed; every other target ran and its result was retained' >&2\n"
+            "exit 1\n"
+        )
+        started = self.shell(
+            self.lifecycle, "start", extra_environment=self.fast_clock_environment(step=61), timeout=15
+        )
+        self.assertEqual(started.returncode, 0, started.stdout + started.stderr)
+        try:
+            self.wait_for_controller_event("scheduled_run")
+            profiles = self.real_var / "state/profiles"
+            beta = self.state_fields(profiles / "beta.state")
+            self.assertEqual(beta["state"], "failed", beta)
+            self.assertEqual(
+                beta["detail"],
+                "listing /volume1/Photos/SENTINEL DIR/x failed: Permission denied (os error 13)",
+                beta,
+            )
+            self.assertEqual(beta["failed_path"], "/volume1/Photos/SENTINEL%20DIR", beta)
+            gamma = self.state_fields(profiles / "gamma.state")
+            self.assertEqual(gamma["detail"], 'remote "Photos" refused: GAMMA-SENTINEL', gamma)
+            self.assertNotIn("failed_path", gamma)
+            alpha = self.state_fields(profiles / "alpha.state")
+            self.assertNotIn("detail", alpha)
+            rows = {
+                e["profile"]: str(e["message"]) for e in self.activity_records()
+                if e["code"] == "run.failed" and e["profile"] in ("beta", "gamma")
+            }
+            self.assertIn("SENTINEL DIR", rows.get("beta", ""), rows)
+            self.assertIn("GAMMA-SENTINEL", rows.get("gamma", ""), rows)
+        finally:
+            stopped = self.shell(self.lifecycle, "stop", timeout=15)
+            self.assertEqual(stopped.returncode, 0, stopped.stdout + stopped.stderr)
+
+    def test_a_run_that_stops_progressing_is_flagged_stalled_and_never_killed(self) -> None:
+        # ADV-B-6 / ADV-C-13. A hung core (blocked I/O, a stuck request) read
+        # "running" forever with no signal anywhere. run.state now carries
+        # heartbeat_epoch, advanced only while the core shows progress, and a
+        # run with none for 30 minutes is recorded as stalled -- without the
+        # core being killed.
+        self.configure_with_password("alpha", self.source_one, True)
+        fifo = self.root / "hung-core.fifo"
+        os.mkfifo(fifo)
+        if os.getuid() == 0:
+            os.chown(fifo, self.drop_uid, self.drop_gid)
+        self.install_test_core(f'read line < "{fifo}"\nexit 0\n')
+        started = self.shell(self.lifecycle, "start", timeout=15)
+        self.assertEqual(started.returncode, 0, started.stdout + started.stderr)
+        run_state = self.real_var / "state/run.state"
+        environment = self.fast_clock_environment(step=31)
+        environment["SDSYNC_DSM_AUDIT_WRAPPED"] = "true"
+        run = self.shell_process(
+            self.real_target / "libexec/sdsync-run", "sync", "alpha", "false", "foreground", "-",
+            extra_environment=environment,
+        )
+        try:
+            fields = self.wait_for_state(run_state, lambda f: f.get("state") == "running", timeout=30)
+            self.assertIn("heartbeat_epoch", fields)
+            self.assertEqual(fields["heartbeat_epoch"], fields["started_epoch"], fields)
+            stalled = self.wait_for_controller_event("run_stalled")
+            self.assertEqual(stalled[0]["level"], "error")
+            self.assertIn("scope=alpha", str(stalled[0]["detail"]))
+            fields = self.state_fields(run_state)
+            self.assertEqual(fields["state"], "running", fields)
+            self.assertIn(fields["heartbeat_source"], ("io", "progress"), fields)
+            self.assertIsNone(run.poll(), "the stalled core was killed")
+        finally:
+            with open(fifo, "w", encoding="utf-8") as writer:
+                writer.write("release\n")
+            run.communicate(timeout=60)
+        self.assertEqual(run.returncode, 0)
+        fields = self.state_fields(run_state)
+        self.assertEqual(fields["state"], "succeeded", fields)
+        self.assertNotIn("heartbeat_epoch", fields)
+        stopped = self.shell(self.lifecycle, "stop", timeout=15)
+        self.assertEqual(stopped.returncode, 0, stopped.stdout + stopped.stderr)
+
+    def test_a_legacy_free_text_request_marker_is_untagged_not_a_corrupt_feed(self) -> None:
+        # ADV-B-5, reader half on the shell rung, byte-parity with the
+        # in-service rung: only the first ` request_id=` counts; 32 lowercase
+        # hex digits to the end are the tag, anything else leaves the record
+        # untagged with its text unchanged. A record written before the writer
+        # neutralised free text used to make the whole feed corrupt_state.
+        activity_log = self.real_var / "log/activity.log"
+        tag = "0123456789abcdef0123456789abcdef"
+        self.write_private_state(
+            activity_log,
+            "1700000001|run.failed|alpha|failed|sync|error|error: failed to read meeting request_id=5.txt\n"
+            f"1700000002|run.started|alpha|running|sync|info|Run started request_id={tag}\n",
+        )
+        activity, payload = self.api("activity", "--lines", "10")
+        self.assertEqual(activity.returncode, 0, activity.stdout + activity.stderr)
+        events = {event["code"]: event for event in payload["events"]}
+        self.assertIsNone(events["run.failed"]["client_request_id"])
+        self.assertEqual(events["run.failed"]["message"], "error: failed to read meeting request_id=5.txt")
+        self.assertEqual(events["run.started"]["client_request_id"], tag)
+
+    def test_a_failed_state_write_degrades_a_controller_turn_instead_of_ending_it(self) -> None:
+        # ADV-C-2. Every routine-state write in the controller loop was bare
+        # under `set -e`: one EACCES or ENOSPC ended the controller for good,
+        # and scheduling never resumed when the condition cleared. A failed
+        # write is now a named error and the next turn tries again.
+        self.configure_with_password("alpha", self.source_one, True)
+        routine, _ = self.api(
+            "routine", "--profile", "alpha", "--enabled", "true", "--action", "sync",
+            "--mode", "interval", "--interval", "60", "--weekdays", "1,2,3,4,5,6,7",
+            "--time-window-start", "00:00", "--time-window-end", "23:59",
+            "--debounce-seconds", "1", "--retry-count", "0", "--retry-backoff-seconds", "10",
+            "--poll-seconds", "5", "--allow-delete", "false", "--max-total-delete", "100",
+        )
+        self.assertEqual(routine.returncode, 0, routine.stderr)
+        routines = self.real_var / "state/routines"
+        self.write_private_state(
+            routines / "alpha.state",
+            "state=scheduled\nnext_run_epoch=1\nlast_success_epoch=0\nlast_attempt_epoch=0\n"
+            "retry_attempt=0\nlast_day=none\nlast_poll_epoch=0\nfingerprint=none\nbackend=interval\n",
+        )
+        started = self.shell(
+            self.lifecycle, "start", extra_environment=self.fast_clock_environment(step=31), timeout=15
+        )
+        self.assertEqual(started.returncode, 0, started.stdout + started.stderr)
+        pid = int((self.real_var / "run/controller.pid").read_text(encoding="utf-8"))
+        try:
+            self.wait_for_controller_event("routine_run")
+            routines.chmod(0o500)
+            try:
+                failed = self.wait_for_controller_event("routine_state_write_failed")
+                self.assertEqual(failed[0]["level"], "error")
+                self.assertIn("file=routines/alpha.state", str(failed[0]["detail"]))
+                time.sleep(1.0)
+                os.kill(pid, 0)  # still alive
+            finally:
+                routines.chmod(0o700)
+            before = len(self.event_details("routine_run"))
+            deadline = time.monotonic() + 30
+            while len(self.event_details("routine_run")) <= before and time.monotonic() < deadline:
+                time.sleep(0.1)
+            self.assertGreater(len(self.event_details("routine_run")), before, (self.real_var / "log/controller.log").read_text(encoding="utf-8")[-3000:])
+            os.kill(pid, 0)
+        finally:
+            stopped = self.shell(self.lifecycle, "stop", timeout=15)
+            self.assertEqual(stopped.returncode, 0, stopped.stdout + stopped.stderr)
+
+    def test_a_lock_owner_torn_before_the_last_boot_is_recovered_not_fatal(self) -> None:
+        # ADV-C-3. A lock owner record left empty by a power cut (written with
+        # no fsync) failed closed forever: with run.lock every run exited 73
+        # and stop/start refused; with event-log.lock nothing reached Activity
+        # or controller.log. An owner record that does not parse and predates
+        # the current boot cannot belong to a live process; it is recovered,
+        # and said so.
+        self.configure_with_password("alpha", self.source_one, True)
+        started = self.shell(self.lifecycle, "start", timeout=15)
+        self.assertEqual(started.returncode, 0, started.stdout + started.stderr)
+        try:
+            for name in ("run.lock", "event-log.lock"):
+                lock = self.real_var / "run" / name
+                lock.mkdir(mode=0o700, exist_ok=True)
+                owner = lock / "pid"
+                self.write_private_state(owner, "")
+                os.utime(owner, (1000, 1000))
+            helper = self._common_helper(
+                "torn-lock-helper.sh",
+                'status=0\nappend_controller_log_event info torn_lock_probe "x=1" || status=$?\n'
+                'echo "event=$status"\n',
+            )
+            event = self.shell(helper)
+            self.assertIn("event=0", event.stdout, event.stderr)
+            self.assertIn("torn", event.stderr)
+            run = self.shell(
+                self.real_target / "libexec/sdsync-run", "sync", "alpha", "false", "foreground", "-",
+                extra_environment={"SDSYNC_DSM_AUDIT_WRAPPED": "true"}, timeout=60,
+            )
+            self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
+            fields = self.state_fields(self.real_var / "state/run.state")
+            self.assertEqual(fields["state"], "succeeded", fields)
+        finally:
+            stopped = self.shell(self.lifecycle, "stop", timeout=15)
+            self.assertEqual(stopped.returncode, 0, stopped.stdout + stopped.stderr)
+
+        # A torn owner written in this boot is not provably dead: still refused.
+        lock = self.real_var / "run/run.lock"
+        lock.mkdir(mode=0o700, exist_ok=True)
+        self.write_private_state(lock / "pid", "")
+        probe = self._common_helper(
+            "torn-lock-live-helper.sh",
+            'status=0\nprivate_process_lock_is_live "$run_lock" || status=$?\necho "live=$status"\n',
+        )
+        self.assertIn("live=73", self.shell(probe).stdout)
+        (lock / "pid").unlink()
+
+    def _calendar_clock_bin(self, label: str, clock: Path) -> Path:
+        """A fake date that answers every format from one epoch file, in UTC."""
+        fake_bin = self.root / f"{label}-bin"
+        fake_bin.mkdir(mode=0o700)
+        for name, body in (
+            ("date",
+             "#!/bin/sh\n"
+             f'now=$(/bin/cat "{clock}")\n'
+             'if [ "${1:-}" = -d ]; then shift; exec /bin/date -u -d "$@"; fi\n'
+             'exec /bin/date -u -d "@$now" "$@"\n'),
+            ("sleep", "#!/bin/sh\ncase ${1:-} in 1) exec /bin/sleep 1 ;; *) exec /bin/sleep 0.03 ;; esac\n"),
+            ("inotifywait", "#!/bin/sh\nexit 69\n"),
+        ):
+            (fake_bin / name).write_text(body, encoding="utf-8")
+            (fake_bin / name).chmod(0o755)
+        if os.getuid() == 0:
+            for path in (fake_bin, *fake_bin.iterdir()):
+                os.chown(path, self.drop_uid, self.drop_gid)
+        return fake_bin
+
+    def _nightly_routine(self, start: str, end: str) -> None:
+        self.configure_with_password("nightly", self.source_one, True)
+        routine, _ = self.api(
+            "routine", "--profile", "nightly", "--enabled", "true", "--action", "sync",
+            "--mode", "daily", "--interval", "60", "--weekdays", "1,2,3,4,5,6,7",
+            "--time-window-start", start, "--time-window-end", end,
+            "--debounce-seconds", "1", "--retry-count", "0", "--retry-backoff-seconds", "10",
+            "--poll-seconds", "5", "--allow-delete", "false", "--max-total-delete", "100",
+        )
+        self.assertEqual(routine.returncode, 0, routine.stderr)
+
+    def _nightly_runs(self) -> int:
+        return len(self.event_details("routine_run"))
+
+    def test_a_daily_run_that_ends_after_midnight_does_not_consume_the_next_day(self) -> None:
+        # ADV-C-1. last_day was the day the run FINISHED, so a 23:30 run that
+        # ended at 00:15 marked the next day done and that night's run was
+        # skipped -- a nightly backup that ran every other night.
+        self._nightly_routine("23:30", "23:59")
+        clock = self.root / "c1-clock"
+        write_clock(clock, "1787700600\n")  # 2026-08-25 23:30 UTC
+        # The sync takes 45 minutes: the core moves the clock to 00:15 next day.
+        self.install_test_core(
+            'case " $* " in *" sync "*)\n'
+            f'  printf "1787703300\\n" > "{clock}.t"; mv -f "{clock}.t" "{clock}" ;;\n'
+            "esac\nexit 0\n"
+        )
+        fake_bin = self._calendar_clock_bin("c1", clock)
+        environment = {"PATH": f"{fake_bin}:{self.environment['PATH']}"}
+        started = self.shell(self.lifecycle, "start", extra_environment=environment, timeout=15)
+        self.assertEqual(started.returncode, 0, started.stdout + started.stderr)
+        try:
+            self.wait_for_controller_event("routine_run", timeout=20)
+            state = self.state_fields(self.real_var / "state/routines/nightly.state")
+            self.assertEqual(state["last_day"], "2026-08-25", state)
+            write_clock(clock, "1787787000\n")  # 2026-08-26 23:30, inside the window
+            deadline = time.monotonic() + 20
+            while self._nightly_runs() < 2 and time.monotonic() < deadline:
+                time.sleep(0.2)
+            self.assertEqual(self._nightly_runs(), 2, "the next night's run was skipped")
+        finally:
+            stopped = self.shell(self.lifecycle, "stop", timeout=30)
+            self.assertEqual(stopped.returncode, 0, stopped.stdout + stopped.stderr)
+
+    def test_a_wrapping_daily_window_runs_once_per_night(self) -> None:
+        # ADV-C-1, wrapping window. 23:00-01:00 ran at 23:00 and again after
+        # midnight, because the part after midnight compared against a new
+        # calendar day. The window's day is the day it opened.
+        self._nightly_routine("23:00", "01:00")
+        clock = self.root / "c1w-clock"
+        write_clock(clock, "1787698800\n")  # 2026-08-25 23:00 UTC
+        fake_bin = self._calendar_clock_bin("c1w", clock)
+        environment = {"PATH": f"{fake_bin}:{self.environment['PATH']}"}
+        started = self.shell(self.lifecycle, "start", extra_environment=environment, timeout=15)
+        self.assertEqual(started.returncode, 0, started.stdout + started.stderr)
+        try:
+            self.wait_for_controller_event("routine_run", timeout=20)
+            write_clock(clock, "1787704200\n")  # 2026-08-26 00:30, same night's window
+            time.sleep(4)
+            self.assertEqual(self._nightly_runs(), 1, "the same night ran twice")
+            write_clock(clock, "1787785200\n")  # 2026-08-26 23:00, the next night
+            deadline = time.monotonic() + 20
+            while self._nightly_runs() < 2 and time.monotonic() < deadline:
+                time.sleep(0.2)
+            self.assertEqual(self._nightly_runs(), 2, "the next night did not run")
+        finally:
+            stopped = self.shell(self.lifecycle, "stop", timeout=30)
+            self.assertEqual(stopped.returncode, 0, stopped.stdout + stopped.stderr)
+
+    def test_a_save_that_needs_no_reload_is_not_reported_pending(self) -> None:
+        # ADV-S-1 scoping (verify-silent). The controller re-reads alerts.conf
+        # on every event and the schedule file every turn; a reload matters for
+        # the performance level, the interval-deadline rebase and the watcher
+        # restart. A save that needs none of those -- the alert policy, the
+        # schedule being switched off -- no longer exits 76 or leaves a
+        # pending-reload marker when the signal cannot be delivered; the failed
+        # signal is still logged.
+        self.configure_with_password("alpha", self.source_one, True)
+        started = self.shell(self.lifecycle, "start", timeout=15)
+        self.assertEqual(started.returncode, 0, started.stdout + started.stderr)
+        pid_file = self.real_var / "run/controller.pid"
+        marker = self.real_var / "state/controller-reload.pending"
+        real_pid = pid_file.read_text(encoding="utf-8")
+        foreign = subprocess.Popen(["/bin/sleep", "60"])
+        try:
+            self.write_private_state(pid_file, f"{foreign.pid}\n")
+            alerts = self.shell(
+                self.manager, "configure-alerts", "--enabled", "true", "--on-success", "false",
+                "--on-failure", "true", "--failure-threshold", "1", "--cooldown", "3600",
+            )
+            self.assertEqual(alerts.returncode, 0, alerts.stdout + alerts.stderr)
+            disabled = self.shell(self.manager, "disable")
+            self.assertEqual(disabled.returncode, 0, disabled.stdout + disabled.stderr)
+            self.assertFalse(marker.exists())
+            skipped = [e for e in self.controller_events() if e.get("event") == "controller_reload_skipped"]
+            self.assertEqual(len(skipped), 2, self.controller_events())
+            self.assertEqual(skipped[0]["level"], "warn")
+        finally:
+            self.write_private_state(pid_file, real_pid)
+            foreign.kill()
+            foreign.wait()
+            stopped = self.shell(self.lifecycle, "stop", timeout=15)
+            self.assertEqual(stopped.returncode, 0, stopped.stdout + stopped.stderr)
+
+    def test_a_healthy_profile_does_not_reset_a_failing_profiles_alert_count(self) -> None:
+        # ADV-C-4. alerts.state held one failure counter for the whole package
+        # and any profile's success reset it, so with failure_threshold=2 a
+        # permanently failing profile never notified while another profile was
+        # healthy. Counters are now kept per scope.
+        self.configure_with_password("bad", self.source_one, True)
+        self.configure_with_password("good", self.source_two)
+        policy = self.shell(
+            self.manager, "configure-alerts", "--enabled", "true", "--on-success", "false",
+            "--on-failure", "true", "--failure-threshold", "2", "--cooldown", "3600",
+        )
+        self.assertEqual(policy.returncode, 0, policy.stdout + policy.stderr)
+        helper = self._common_helper(
+            "alert-scope-helper.sh",
+            "for round in 1 2 3 4; do\n"
+            "    handle_alert_result bad failed 1\n"
+            "    handle_alert_result good succeeded 0\n"
+            "done\n"
+            'echo "done"\n',
+        )
+        result = self.shell(helper)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        attempts = [
+            e for e in self.activity_records()
+            if e["code"] == "notification.unavailable" and e["profile"] == "bad"
+        ]
+        # Failures 2, 3 and 4 reach the threshold. No notifier is installed, so
+        # no delivery succeeds and none starts the cooldown.
+        self.assertEqual(len(attempts), 3, attempts)
+        bad = self.state_fields(self.real_var / "state/alerts-bad.state")
+        self.assertEqual(bad["failure_count"], "4", bad)
+        good = self.state_fields(self.real_var / "state/alerts-good.state")
+        self.assertEqual(good["failure_count"], "0", good)
+
+    def test_a_busy_refusal_writes_no_audit_failure(self) -> None:
+        # ADV-C-9. The run audit opened before the run lock was admitted, so
+        # every busy re-check (exit 75) completed it as failed: audit.failed
+        # and module.failed error rows beside the info run.deferred, every
+        # ~40 s per due routine while another run held the lock. The audit now
+        # opens only once the run is admitted.
+        self.configure_with_password("alpha", self.source_one, True)
+        started = self.shell(self.lifecycle, "start", timeout=15)
+        self.assertEqual(started.returncode, 0, started.stdout + started.stderr)
+        holder = self._common_helper(
+            "busy-audit-holder.sh",
+            'acquire_private_process_lock "$run_lock"\n: > "$1"\n'
+            'while [ ! -e "$2" ]; do /bin/sleep 0.02; done\nrelease_private_process_lock "$run_lock"\n',
+        )
+        ready = self.root / "busy-audit.ready"
+        release = self.root / "busy-audit.release"
+        held = self.shell_process(holder, str(ready), str(release))
+        try:
+            self.wait_for_path(ready, "the lock holder did not start", timeout=20)
+            audit_log = self.real_var / "log/audit.log"
+            before = audit_log.read_text(encoding="utf-8") if audit_log.exists() else ""
+            refused = self.shell(
+                self.real_target / "libexec/sdsync-run", "sync", "alpha", "false", "foreground", "-",
+                extra_environment={"SDSYNC_DSM_AUDIT_WRAPPED": "true"},
+            )
+            self.assertEqual(refused.returncode, 75, refused.stdout + refused.stderr)
+            after = audit_log.read_text(encoding="utf-8") if audit_log.exists() else ""
+            self.assertEqual(after, before, "a busy refusal wrote audit records")
+            failed = [
+                e for e in self.activity_records()
+                if e["code"] in ("audit.failed", "module.failed")
+            ]
+            self.assertEqual(failed, [])
+            deferred = [e for e in self.activity_records() if e["code"] == "run.deferred"]
+            self.assertTrue(deferred)
+        finally:
+            release.write_text("release\n", encoding="utf-8")
+            held.communicate(timeout=30)
+            stopped = self.shell(self.lifecycle, "stop", timeout=15)
+            self.assertEqual(stopped.returncode, 0, stopped.stdout + stopped.stderr)
+
+    def test_an_unverifiable_run_lock_is_not_reported_as_another_run(self) -> None:
+        # ADV-C-10 (runner half). When the run lock could not be verified (an
+        # unsafe run.lock directory), a failed run left run.state alone and said
+        # "another run holds the run state" -- false; no run held it.
+        self.configure_with_password("alpha", self.source_one, True)
+        started = self.shell(self.lifecycle, "start", timeout=15)
+        self.assertEqual(started.returncode, 0, started.stdout + started.stderr)
+        run_lock = self.real_var / "run/run.lock"
+        try:
+            run_lock.mkdir(mode=0o755)
+            run_lock.chmod(0o755)
+            refused = self.shell(
+                self.real_target / "libexec/sdsync-run", "sync", "alpha", "false", "foreground", "-",
+                extra_environment={"SDSYNC_DSM_AUDIT_WRAPPED": "true"},
+            )
+            self.assertEqual(refused.returncode, 73, refused.stdout + refused.stderr)
+            preserved = self.wait_for_controller_event("run_state_preserved")
+            detail = str(preserved[-1]["detail"])
+            self.assertNotIn("another run holds", detail)
+            self.assertIn("could not be verified", detail)
+        finally:
+            run_lock.rmdir()
+            stopped = self.shell(self.lifecycle, "stop", timeout=15)
+            self.assertEqual(stopped.returncode, 0, stopped.stdout + stopped.stderr)
+
+    def test_a_killed_runner_leaves_no_heartbeat_behind(self) -> None:
+        # B-6 follow-up. The heartbeat child must not outlive a SIGKILLed
+        # runner: a surviving one held the caller's output pipe open and kept
+        # rewriting run.state, which would hide the stall a stale heartbeat
+        # exists to show. It exits within one tick of losing its runner.
+        self.configure_with_password("alpha", self.source_one, True)
+        fifo = self.root / "killed-runner-core.fifo"
+        os.mkfifo(fifo)
+        if os.getuid() == 0:
+            os.chown(fifo, self.drop_uid, self.drop_gid)
+        self.install_test_core(f'read line < "{fifo}"\nexit 0\n')
+        started = self.shell(self.lifecycle, "start", timeout=15)
+        self.assertEqual(started.returncode, 0, started.stdout + started.stderr)
+        run_state = self.real_var / "state/run.state"
+        # The real clock and sleep: a heartbeat tick is 60 s in 5 s slices.
+        environment = {"SDSYNC_DSM_AUDIT_WRAPPED": "true"}
+        run = self.shell_process(
+            self.real_target / "libexec/sdsync-run", "sync", "alpha", "false", "foreground", "-",
+            extra_environment=environment,
+        )
+
+        def heartbeat_children() -> list[int]:
+            # The heartbeat is the runner subshell that is waiting on its
+            # `sleep 5` slice; other subshells are short-lived $(...) forks.
+            processes: dict[int, tuple[int, bytes]] = {}
+            for entry in Path("/proc").iterdir():
+                if not entry.name.isdigit():
+                    continue
+                try:
+                    stat_text = (entry / "stat").read_text(encoding="ascii")
+                    cmdline = (entry / "cmdline").read_bytes()
+                except OSError:
+                    continue
+                processes[int(entry.name)] = (int(stat_text.rsplit(") ", 1)[1].split()[1]), cmdline)
+            sleepers = {parent for parent, cmdline in processes.values() if cmdline.startswith(b"sleep\x005")}
+            return [
+                pid for pid, (_, cmdline) in processes.items()
+                if pid != run.pid and pid in sleepers and b"sdsync-run" in cmdline
+            ]
+
+        try:
+            self.wait_for_state(run_state, lambda f: f.get("state") == "running", timeout=30)
+            deadline = time.monotonic() + 10
+            while not heartbeat_children() and time.monotonic() < deadline:
+                time.sleep(0.05)
+            self.assertTrue(heartbeat_children(), "no heartbeat child was started")
+            os.kill(run.pid, signal.SIGKILL)
+            stdout, stderr = run.communicate(timeout=10)  # no child may hold the pipe
+            deadline = time.monotonic() + 8  # one 5-second slice, with margin
+            while heartbeat_children() and time.monotonic() < deadline:
+                time.sleep(0.05)
+            self.assertEqual(heartbeat_children(), [], "the heartbeat outlived its runner")
+            settled = run_state.read_bytes()
+            time.sleep(1.0)
+            self.assertEqual(run_state.read_bytes(), settled, "run.state was still being rewritten")
+        finally:
+            if run.poll() is None:
+                run.kill()
+                run.communicate(timeout=10)
+            try:
+                fd = os.open(fifo, os.O_WRONLY | os.O_NONBLOCK)
+                os.write(fd, b"release\n")
+                os.close(fd)
+            except OSError:
+                pass
+            stopped = self.shell(self.lifecycle, "stop", timeout=30)
             self.assertEqual(stopped.returncode, 0, stopped.stdout + stopped.stderr)
 
     def test_aggregate_schedule_deadline_survives_a_restart(self) -> None:

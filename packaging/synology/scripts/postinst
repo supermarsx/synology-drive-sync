@@ -61,7 +61,12 @@ postinst_initial_transition=$(package_transition_status) || {
 }
 if [ "${SYNOPKG_PKG_STATUS:-INSTALL}" = UPGRADE ]; then
     case $postinst_initial_transition in
-        open) "$api_bridge" --package-transition prepare upgrade ;;
+        open)
+            "$api_bridge" --package-transition prepare upgrade || {
+                package_message "upgrade postinst could not open the upgrade transition (status $?)"
+                exit 1
+            }
+            ;;
         upgrade) ;;
         *) package_message "upgrade postinst found conflicting transition $postinst_initial_transition"; exit 1 ;;
     esac
@@ -129,14 +134,20 @@ if [ ! -e "$schedule_file" ] && [ ! -L "$schedule_file" ]; then
     postinst_audit_pending=true
     schedule_temp=$schedule_file.tmp.$$
     umask 077
-    printf 'enabled=false\ninterval_seconds=3600\nallow_delete=false\nmax_total_delete=100\n' > "$schedule_temp"
-    finish_private_file "$schedule_temp"
+    { printf 'enabled=false\ninterval_seconds=3600\nallow_delete=false\nmax_total_delete=100\n' > "$schedule_temp" \
+        && finish_private_file "$schedule_temp"; } || {
+        package_message "initial schedule could not be written to $schedule_temp"
+        exit 1
+    }
     audit_outbox_execute "$SDSYNC_DSM_AUDIT_TRANSACTION" || {
         package_message "initial schedule audit execution phase could not be recorded"
         exit 1
     }
     postinst_commit_started=true
-    mv -f "$schedule_temp" "$schedule_file"
+    mv -f "$schedule_temp" "$schedule_file" || {
+        package_message "initial schedule could not be published to $schedule_file"
+        exit 1
+    }
     audit_outbox_complete "$SDSYNC_DSM_AUDIT_TRANSACTION" succeeded >/dev/null 2>&1 || \
         package_message "warning: initial schedule terminal audit remains pending"
     postinst_audit_pending=false

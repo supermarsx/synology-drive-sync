@@ -983,11 +983,14 @@ finish_start() {
 
 case ${1:-} in
     prestart)
-        [ -x "$package_root/bin/synology-drive-sync" ] || exit 150
-        [ -x "$controller" ] || exit 150
-        [ -x "$api_server" ] || exit 150
-        [ -r "$common_runtime" ] || exit 150
-        api_socket_parent_safe >/dev/null 2>&1 || exit 150
+        # Each refusal names what is missing; DSM shows only "failed to start".
+        [ -x "$package_root/bin/synology-drive-sync" ] \
+            || { package_message "cannot start: $package_root/bin/synology-drive-sync is missing or not executable"; exit 150; }
+        [ -x "$controller" ] || { package_message "cannot start: $controller is missing or not executable"; exit 150; }
+        [ -x "$api_server" ] || { package_message "cannot start: $api_server is missing or not executable"; exit 150; }
+        [ -r "$common_runtime" ] || { package_message "cannot start: $common_runtime is missing or unreadable"; exit 150; }
+        api_socket_parent_safe >/dev/null 2>&1 \
+            || { package_message "cannot start: the API socket directory is not a private package directory"; exit 150; }
         exit 0
         ;;
     start)
@@ -1102,8 +1105,8 @@ case ${1:-} in
             package_message "refusing symlinked API log: $api_log"
             exit 1
         }
-        rotate_log "$api_log" 10485760 5
-        rotate_log "$log_root/controller.log" 10485760 5
+        rotate_log_or_record "$api_log" 10485760 5
+        rotate_log_or_record "$log_root/controller.log" 10485760 5
         stale_controller_start_status=0
         remove_stale_controller_start_lease || stale_controller_start_status=$?
         case $stale_controller_start_status in
@@ -1430,7 +1433,14 @@ case ${1:-} in
             done
         fi
         if [ -n "$run_pid" ] && script_pid_live "$run_pid"; then
-            if ! script_pid_matches "$run_pid" "$runner"; then
+            if [ -n "$saved_pid" ] && [ "$run_pid" = "$saved_pid" ]; then
+                # The controller holds the run lock for a moment to reconcile a
+                # stale run.state. It is not a run: it is verified and stopped
+                # as the controller below, and the lock it leaves is recovered
+                # as stale after it exits. Refusing here failed a stop that
+                # merely coincided with that reconcile.
+                :
+            elif ! script_pid_matches "$run_pid" "$runner"; then
                 if ! script_pid_absent_or_zombie "$run_pid"; then
                     package_message "refusing to signal unverified plan/sync PID $run_pid"
                     exit 1

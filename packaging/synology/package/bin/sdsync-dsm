@@ -120,7 +120,7 @@ cleanup_manager_lock() {
         "${activity_json:-}" "${cache_temp_path:-}" \
         "${source_doctor_output:-}" "${target_doctor_output:-}" \
         "${doctor_inventory_records:-}" \
-        "${query_stdout:-}" "${query_stderr:-}"; do
+        "${query_stdout:-}" "${query_stderr:-}" "${manager_best_effort_errors:-}"; do
         [ -n "$cleanup_path" ] || continue
         case $cleanup_path in
             "$package_home"/*|"$package_var"/*)
@@ -228,7 +228,7 @@ doctor_audit_scope() {
         shift
     done
     if [ "$doctor_scope_seen" = false ]; then
-        doctor_scope=$(current_default 2>/dev/null) || return 1
+        doctor_scope=$(current_default_for_action) || return 1
         valid_name "$doctor_scope" || return 1
     fi
     printf '%s\n' "$doctor_scope"
@@ -519,15 +519,42 @@ end_mutation() {
     fi
     cleanup_manager_lock
     trap - 0 HUP INT TERM
+    # The change is committed and audited as such; what failed is applying it
+    # to the running controller, and that has its own status so no caller can
+    # read the save as in effect. `api` maps it to a result warning.
+    [ "${controller_reload_pending:-false}" != true ] || exit 76
+}
+
+# The controller re-reads the schedule and routine files every turn and the
+# alert policy on every event; a reload is what applies the performance level,
+# rebases the interval deadline and restarts realtime watchers. A save that
+# needs none of those (the alert policy, the schedule being switched off)
+# calls this with `advisory`: a signal that cannot be delivered is logged, but
+# the save is not reported as pending, because it already is in effect.
+reload_controller_advisory() {
+    reload_advisory_status=0
+    reload_controller_if_running advisory || reload_advisory_status=$?
+    return 0
 }
 
 reload_controller_if_running() {
-    running_pid=$(read_controller_pid_reporting)
-    [ -n "$running_pid" ] || return 0
+    reload_mode=${1:-required}
+    # No PID file is the ordinary "not running": the saved files are what the
+    # controller reads when it starts. A PID file that exists but cannot be
+    # read used to read the same way, so the save was reported applied.
+    if [ ! -e "$controller_pid_file" ] && [ ! -L "$controller_pid_file" ]; then
+        return 0
+    fi
+    running_pid=$(read_pid "$controller_pid_file" 2>/dev/null) || running_pid=
+    if [ -z "$running_pid" ]; then
+        reload_failed pid_unreadable none
+        return 76
+    fi
     pid_is_live "$running_pid" || return 0
     if ! controller_persisted_identity_status "$running_pid"; then
         echo "refusing to signal unverified controller PID $running_pid" >&2
-        return 73
+        reload_failed identity_refused "$running_pid"
+        return 76
     fi
     reload_controller_start=$persisted_controller_start
     reload_controller_boot=$persisted_controller_boot
@@ -535,9 +562,23 @@ reload_controller_if_running() {
         && [ "$persisted_controller_start" = "$reload_controller_start" ] \
         && [ "$persisted_controller_boot" = "$reload_controller_boot" ] || {
         echo "controller identity changed immediately before reload" >&2
-        return 73
+        reload_failed identity_changed "$running_pid"
+        return 76
     }
-    kill -HUP "$running_pid"
+    kill -HUP "$running_pid" || {
+        reload_failed signal_failed "$running_pid"
+        return 76
+    }
+}
+
+reload_failed() {
+    if [ "$reload_mode" = advisory ]; then
+        append_controller_log_event warn controller_reload_skipped \
+            "reason=$1 pid=$2 operation=${command_name:-unknown} needed=false" \
+            || echo "warning: the controller could not be signalled (reason=$1); the change needs no reload" >&2
+        return 0
+    fi
+    record_controller_reload_failure "$1" "$2" "${command_name:-unknown}"
 }
 
 # Queue publication must not inherit the controller's idle polling interval.
@@ -579,7 +620,7 @@ write_disabled_schedule() {
     mark_mutation_commit_started || die "mandatory audit execution phase could not be recorded"
     mv -f "$schedule_temp" "$schedule_file"
     schedule_temp=
-    reload_controller_if_running || echo "warning: configuration was saved but the controller could not be reloaded" >&2
+    reload_controller_advisory
 }
 
 validate_toml_text() {
@@ -796,6 +837,27 @@ current_default() {
     [ -n "$first_fragment" ] || return 1
     first_name=${first_fragment##*/}
     printf '%s\n' "${first_name%.toml}"
+}
+
+# The default profile for an action that names no scope. current_default
+# falls back to the first profile when default-profile names none that exists
+# -- the snapshot shows that, and the in-process reader mirrors it -- but an
+# action must not run on a profile nobody chose: a default-profile file that
+# exists and names no existing profile is refused here, and logged.
+current_default_for_action() {
+    if [ -e "$default_profile_file" ] || [ -L "$default_profile_file" ]; then
+        action_default=
+        if [ -f "$default_profile_file" ] && [ ! -L "$default_profile_file" ]; then
+            IFS= read -r action_default < "$default_profile_file" || true
+        fi
+        if ! valid_name "${action_default:-}" || ! profile_exists "$action_default"; then
+            append_controller_log_event error default_profile_invalid "file=default-profile value_valid=false" \
+                || echo "error: the default_profile_invalid event could not be written" >&2
+            echo "error: the configured default profile '${action_default:-?}' in $default_profile_file does not exist; name a profile or set a default" >&2
+            return 66
+        fi
+    fi
+    current_default
 }
 
 configure_profile() {
@@ -1182,7 +1244,7 @@ configure_routine() {
     mark_mutation_commit_started || die "mandatory audit execution phase could not be recorded"
     mv -f "$routine_temp" "$routines_dir/$routine_profile.conf"
     routine_temp=
-    reload_controller_if_running || echo "warning: configuration was saved but the controller could not be reloaded" >&2
+    reload_controller_if_running || controller_reload_pending=true
     echo "configured $routine_mode routine for '$routine_profile'"
 }
 
@@ -1201,6 +1263,13 @@ configure_alert_policy() {
     # it. Read cold this asymmetry looks like an inconsistency worth tidying up;
     # it is load-bearing. test_dsm_system_log_is_opt_in_rate_limited_and_best_effort
     # fails if it is removed.
+    # Carrying them over needs the stored file. One that exists but cannot be
+    # read -- a symlink, a directory, no read permission -- used to read as
+    # absent, and this save then persisted the defaults over it.
+    if [ -e "$alert_policy_file" ] || [ -L "$alert_policy_file" ]; then
+        [ -f "$alert_policy_file" ] && [ ! -L "$alert_policy_file" ] && [ -r "$alert_policy_file" ] \
+            || die "refusing to replace $alert_policy_file: it is not a readable regular file, so its system-log settings cannot be carried over"
+    fi
     alerts_system_log=$(setting "$alert_policy_file" system_log false)
     alerts_system_log_id=$(setting "$alert_policy_file" system_log_message_id '')
     alerts_system_log_level=$(setting "$alert_policy_file" system_log_level warn)
@@ -1257,7 +1326,7 @@ configure_alert_policy() {
     mark_mutation_commit_started || die "mandatory audit execution phase could not be recorded"
     mv -f "$alert_temp" "$alert_policy_file"
     alert_temp=
-    reload_controller_if_running || echo "warning: configuration was saved but the controller could not be reloaded" >&2
+    reload_controller_advisory
     echo "updated DSM alert policy"
 }
 
@@ -1298,7 +1367,7 @@ configure_performance_policy() {
     mark_mutation_commit_started || die "mandatory audit execution phase could not be recorded"
     mv -f "$performance_temp" "$performance_policy_file"
     performance_temp=
-    reload_controller_if_running || echo "warning: configuration was saved but the controller could not be reloaded" >&2
+    reload_controller_if_running || controller_reload_pending=true
     echo "updated DSM performance policy"
 }
 
@@ -1422,10 +1491,16 @@ configure_security_policy() {
     mark_mutation_commit_started || die "mandatory audit execution phase could not be recorded"
     mv -f "$security_temp" "$security_policy_file"
     security_temp=
+    security_activity_status=0
     append_activity security.policy_changed all changed \
         "DSM dashboard security policy changed" security warn false \
-        "$path_owner" package-manager >/dev/null 2>&1 || \
-        echo "warning: security-policy detail could not be added to Activity" >&2
+        "$path_owner" package-manager >/dev/null || security_activity_status=$?
+    if [ "$security_activity_status" -ne 0 ]; then
+        echo "warning: security-policy detail could not be added to Activity (status $security_activity_status)" >&2
+        append_controller_log_event error observability_write_failed \
+            "sink=activity status=$security_activity_status cause=security.policy_changed" >/dev/null \
+            || echo "error: the observability_write_failed event could not be written either" >&2
+    fi
     # A complete policy replacement is the sole recovery path when the prior
     # document is corrupt or unsafe. Unrelated outbox records are deliberately
     # retained until after this atomic publish so their category metadata can
@@ -1474,7 +1549,7 @@ configure_schedule() {
     mark_mutation_commit_started || die "mandatory audit execution phase could not be recorded"
     mv -f "$schedule_temp" "$schedule_file"
     schedule_temp=
-    reload_controller_if_running || echo "warning: configuration was saved but the controller could not be reloaded" >&2
+    reload_controller_if_running || controller_reload_pending=true
     echo "updated global schedule (enabled=$schedule_enabled interval=$schedule_interval)"
 }
 
@@ -1485,17 +1560,32 @@ write_health_cache() {
     health_write_test=$4
     health_level=$5
     case $health_scope in all) health_targets=$(sorted_fragments) ;; *) health_targets=$profiles_dir/$health_scope.toml ;; esac
+    # Each profile's record is checked rather than left to errexit: a failed
+    # write used to end Doctor after its output was printed, so its Activity
+    # record and alert never happened and the exit status was mv's. The caller
+    # reports health_cache_failed (the profiles whose record is stale).
+    health_cache_failed=
+    health_cache_status=0
     for health_fragment in $health_targets; do
         [ -f "$health_fragment" ] || continue
         health_profile=${health_fragment##*/}; health_profile=${health_profile%.toml}
         health_temp=$health_dir/.${health_profile}.state.$$
+        health_checked=$(epoch_now 2>/dev/null) || health_checked=0
+        health_write_status=0
         {
             printf 'state=%s\nchecked_epoch=%s\nexit_code=%s\nwrite_test=%s\nlevel=%s\n' \
-                "$health_status" "$(epoch_now)" "$health_exit" "$health_write_test" "$health_level"
-        } > "$health_temp"
-        finish_private_file "$health_temp"
-        mv -f "$health_temp" "$health_dir/$health_profile.state"
+                "$health_status" "$health_checked" "$health_exit" "$health_write_test" "$health_level"
+        } > "$health_temp" || health_write_status=$?
+        [ "$health_write_status" -ne 0 ] || finish_private_file "$health_temp" || health_write_status=$?
+        [ "$health_write_status" -ne 0 ] || mv -f "$health_temp" "$health_dir/$health_profile.state" \
+            || health_write_status=$?
+        if [ "$health_write_status" -ne 0 ]; then
+            rm -f "$health_temp" || true
+            health_cache_failed="${health_cache_failed:+$health_cache_failed,}$health_profile"
+            health_cache_status=$health_write_status
+        fi
     done
+    return "$health_cache_status"
 }
 
 set_secret() {
@@ -1576,7 +1666,7 @@ selection() {
         shift
     done
     if [ "$scope_seen" = false ]; then
-        selected_scope=$(current_default 2>/dev/null) || die "no configured default profile"
+        selected_scope=$(current_default_for_action) || die "no usable default profile"
     fi
     case $selected_max_total in ''|*[!0-9]*) die "max-total-delete must be non-negative" ;; esac
     decimal_at_most "$selected_max_total" "$dsm_delete_limit" || \
@@ -2119,6 +2209,15 @@ persist_doctor_inventory_records() {
     finish_private_file "$doctor_inventory_records" || { rm -f "$doctor_inventory_records"; doctor_inventory_records=; return 73; }
 
     doctor_inventory_status=0
+    # Under the event-log lock, like every other appender: rotation and
+    # clear-logs take it, and an unlocked append could land in a file being
+    # renamed away.
+    acquire_event_log_lock || {
+        doctor_inventory_status=$?
+        rm -f "$doctor_inventory_records"
+        doctor_inventory_records=
+        return "$doctor_inventory_status"
+    }
     while IFS= read -r doctor_inventory_record; do
         [ -n "$doctor_inventory_record" ] || continue
         [ "${#doctor_inventory_record}" -le 4000 ] || { doctor_inventory_status=73; break; }
@@ -2134,8 +2233,9 @@ persist_doctor_inventory_records() {
         append_rotating_log "$doctor_inventory_log" 1048576 3 "$doctor_inventory_record" || { doctor_inventory_status=$?; break; }
         append_activity doctor.inventory "$doctor_inventory_profile" succeeded \
             "Doctor inventory evidence $doctor_inventory_record" operations info false \
-            >/dev/null 2>&1 || { doctor_inventory_status=$?; break; }
+            >/dev/null || { doctor_inventory_status=$?; break; }
     done < "$doctor_inventory_records"
+    release_event_log_lock || [ "$doctor_inventory_status" -ne 0 ] || doctor_inventory_status=73
     rm -f "$doctor_inventory_records"
     doctor_inventory_records=
     return "$doctor_inventory_status"
@@ -2184,6 +2284,19 @@ api_capture_or_error() {
     api_exact_secret=$1
     shift
     api_capture "$api_exact_secret" "$@"
+    api_warning_code=
+    api_warning=
+    if [ "$api_exit" -eq 76 ] && [ "$api_exact_secret" = false ]; then
+        # Saved and audited, but the running controller was not reloaded
+        # (record_controller_reload_failure). The dashboard contract for that is
+        # a successful result that carries a named warning, never a plain
+        # success and never a failure that would read as "not saved".
+        api_reload_warning
+        return 0
+    fi
+    if [ "$api_exit" -eq 0 ] && [ "$api_exact_secret" = false ]; then
+        api_post_commit_warning
+    fi
     if [ "$api_exit" -ne 0 ]; then
         api_map_exit_code "$api_exit"
         [ -n "$api_output" ] || api_output="operation failed"
@@ -2203,11 +2316,30 @@ manager_best_effort() {
     manager_best_effort_sink=$1
     shift
     manager_best_effort_status=0
-    "$@" 2>/dev/null || manager_best_effort_status=$?
+    # The helper's own stderr names the file and the cause (`refusing unsafe
+    # package log file: PATH`, `alert processing refused: ...`); it is kept,
+    # and its first line goes into the record.
+    manager_best_effort_errors=$runtime_root/.best-effort.$$
+    if [ -L "$manager_best_effort_errors" ] || ! : > "$manager_best_effort_errors"; then
+        manager_best_effort_errors=
+    fi
+    if [ -n "$manager_best_effort_errors" ]; then
+        "$@" 2>"$manager_best_effort_errors" || manager_best_effort_status=$?
+    else
+        "$@" || manager_best_effort_status=$?
+    fi
+    manager_best_effort_cause=
+    if [ -n "$manager_best_effort_errors" ]; then
+        if [ "$manager_best_effort_status" -ne 0 ]; then
+            manager_best_effort_cause=$(one_safe_line "$(cat "$manager_best_effort_errors" 2>/dev/null)")
+        fi
+        rm -f "$manager_best_effort_errors"
+    fi
     if [ "$manager_best_effort_status" -ne 0 ]; then
-        append_controller_log_event warn observability_write_failed \
-            "sink=$manager_best_effort_sink status=$manager_best_effort_status" >/dev/null 2>&1 \
-            || printf 'warning: %s write failed (status %s)\n' "$manager_best_effort_sink" "$manager_best_effort_status" >&2
+        append_controller_log_event error observability_write_failed \
+            "sink=$manager_best_effort_sink status=$manager_best_effort_status${manager_best_effort_cause:+ cause=$manager_best_effort_cause}" >/dev/null \
+            || printf 'error: %s write failed (status %s)%s\n' "$manager_best_effort_sink" "$manager_best_effort_status" \
+                "${manager_best_effort_cause:+: $manager_best_effort_cause}" >&2
     fi
     return 0
 }
@@ -2503,6 +2635,7 @@ api_json_log_lines() {
     json_log_threshold=$4
     json_log_byte_limit=$5
     shift 5
+    json_log_scan_limited=false
     json_log_inputs=
     for json_log_candidate in "$json_log_path" "$@"; do
         [ -e "$json_log_candidate" ] || [ -L "$json_log_candidate" ] || continue
@@ -2516,10 +2649,48 @@ api_json_log_lines() {
     [ -n "$json_log_inputs" ] || { printf '[]'; return; }
     # All paths are fixed package-owned DSM paths and cannot contain spaces.
     set -- $json_log_inputs
+    # At most one MiB per source, read from the newest file back -- the same
+    # budget as the bridge's in-service rung (MAX_LOG_SCAN_BYTES). Scanning
+    # every retained rotation made the default Logs tab cost seconds of awk on
+    # every poll, past the bridge's timeout on a small NAS. A source whose scan
+    # stopped at the budget says so (scan_limited), so fewer matches than asked
+    # for never read as "there are no more".
+    json_log_scan_remaining=1048576
+    json_log_reversed=
+    for json_log_candidate in "$@"; do
+        json_log_reversed="$json_log_candidate $json_log_reversed"
+    done
+    json_log_selected=
+    json_log_tail_file=
+    for json_log_candidate in $json_log_reversed; do
+        if [ "$json_log_scan_remaining" -le 0 ]; then
+            json_log_scan_limited=true
+            break
+        fi
+        json_log_size=$(wc -c < "$json_log_candidate" | tr -d ' ')
+        case $json_log_size in ''|*[!0-9]*) api_error unsafe_state "package log file could not be measured" 73 ;; esac
+        if [ "$json_log_size" -le "$json_log_scan_remaining" ]; then
+            json_log_selected="$json_log_candidate $json_log_selected"
+            json_log_scan_remaining=$((json_log_scan_remaining - json_log_size))
+            continue
+        fi
+        # The newest part of the file that crosses the budget; its first line
+        # is partial and is dropped.
+        json_log_tail_file=$state_root/.logs.$$.tail
+        [ ! -e "$json_log_tail_file" ] && [ ! -L "$json_log_tail_file" ] \
+            || api_error unsafe_state "unsafe log scan path" 73
+        ( umask 077; tail -c "$json_log_scan_remaining" "$json_log_candidate" | sed 1d > "$json_log_tail_file" ) \
+            || { rm -f "$json_log_tail_file"; api_error unsafe_state "package log file could not be read" 73; }
+        json_log_selected="$json_log_tail_file $json_log_selected"
+        json_log_scan_limited=true
+        break
+    done
+    set -- $json_log_selected
     json_log_path_count=$#
-    # Do not put a window over the input here. This was tried -- piping each
-    # rotation through `tail -n "$json_log_lines"` before awk -- and it is a
-    # correctness regression, not an optimisation. The caller asked for the most
+    # Do not put a line-count window over the input here (the byte budget above
+    # is different: it is declared, as scan_limited, never silent). This was
+    # tried -- piping each rotation through `tail -n "$json_log_lines"` before
+    # awk -- and it is a correctness regression, not an optimisation. The caller asked for the most
     # recent N *matching* records; a window returns matches *within* the last N
     # lines, which is a different question. A match sits arbitrarily far back
     # whenever newer records are suppressed by the level threshold, so on a busy
@@ -2550,15 +2721,31 @@ api_json_log_lines() {
             if (level == "error") return 4
             return -1
         }
-        function structured_level(text, marker, rest, ending, level) {
-            if (source != "api" && source != "controller" && source != "scheduler" && source != "sync") return "info"
+        # The bridge rule (dsm_api.rs opaque_line_level), applied here because
+        # this read runs before it and whatever is dropped here never reaches
+        # it: a line carries its JSON "level"; a sync line in the core human
+        # format names its level in the second column; anything else is raw
+        # output from a child process -- in controller.log that is where a
+        # runner names why it failed -- and is an error.
+        function structured_level(text, marker, rest, ending, level, column) {
             marker = index(text, "\"level\":\"")
-            if (marker == 0) return "info"
-            rest = substr(text, marker + 9)
-            ending = index(rest, "\"")
-            if (ending == 0) return "invalid"
-            level = substr(rest, 1, ending - 1)
-            return level_rank(level) >= 0 ? level : "invalid"
+            if (marker != 0) {
+                rest = substr(text, marker + 9)
+                ending = index(rest, "\"")
+                if (ending != 0) {
+                    level = substr(rest, 1, ending - 1)
+                    if (level_rank(level) >= 0) return level
+                }
+            }
+            if (source == "sync") {
+                column = $2
+                if (column == "ERROR") return "error"
+                if (column == "WARN") return "warn"
+                if (column == "INFO") return "info"
+                if (column == "DEBUG") return "debug"
+                if (column == "TRACE") return "trace"
+            }
+            return "error"
         }
         function api_threshold(text, marker, rest, ending, category) {
             marker = index(text, "\"category\":\"")
@@ -2690,9 +2877,12 @@ api_json_log_lines() {
             line = $0
             if (source != "audit") {
                 line_threshold = source == "api" ? api_threshold(line) : threshold
-                if (line_threshold == "off" || line_threshold == "invalid") next
+                if (line_threshold == "invalid") next
+                # An error is shown whatever the threshold, `off` included.
                 event_level = structured_level(line)
-                if (event_level == "invalid" || level_rank(event_level) < level_rank(line_threshold)) next
+                if (event_level != "error") {
+                    if (line_threshold == "off" || level_rank(event_level) < level_rank(line_threshold)) next
+                }
             }
             # Bound the retained line here so the ring cannot grow with an
             # arbitrarily long record. Redaction may lengthen what it rewrites,
@@ -2726,6 +2916,18 @@ api_json_log_lines() {
         }
     ' "$secret_root"/*.password "$secret_root"/*.totp "$secret_root"/*.remote-log-token \
         "$@"
+    [ -z "$json_log_tail_file" ] || rm -f "$json_log_tail_file"
+    json_log_tail_file=
+}
+
+# Closes one source's entry, adding scan_limited when its scan stopped at the
+# byte budget (api_json_log_lines).
+api_json_log_close() {
+    if [ "${json_log_scan_limited:-false}" = true ]; then
+        printf ',"scan_limited":true}%s' "${1:-}"
+    else
+        printf '}%s' "${1:-}"
+    fi
 }
 
 api_logs() {
@@ -2740,7 +2942,7 @@ api_logs() {
     done
     case $log_lines in ''|*[!0-9]*) api_error invalid_request "lines must be an integer" 64 ;; esac
     [ "$log_lines" -ge 1 ] && [ "$log_lines" -le 1000 ] || api_error invalid_request "lines must be 1..1000" 64
-    case $log_source in all|api|doctor|controller|scheduler|sync|audit) ;; *) api_error invalid_request "invalid log source" 64 ;; esac
+    case $log_source in all|api|doctor|controller|scheduler|sync|audit|run-stderr) ;; *) api_error invalid_request "invalid log source" 64 ;; esac
     load_security_policy_runtime || api_error unsafe_state "security policy is unavailable" 73
     case $log_source in
         all) set -- "$log_root/api.log" "$log_root/api.log.1" "$log_root/api.log.2" \
@@ -2765,6 +2967,11 @@ api_logs() {
             "$log_root/sync.log.2" "$log_root/sync.log.3" ;;
         audit) set -- "$audit_log" "$audit_log.1" "$audit_log.2" \
             "$audit_log.3" "$audit_log.4" "$audit_log.5" ;;
+        # The core's stderr tail of the last three runs (sdsync-run), each
+        # block headed `# epoch= scope= operation= exit=`. Not part of `all`:
+        # it is the detail behind one run's failure, read on request.
+        run-stderr) set -- "$log_root/run-stderr.log" "$log_root/run-stderr.log.1" \
+            "$log_root/run-stderr.log.2" "$log_root/run-stderr.log.3" ;;
     esac
     for log_preflight in "$@"; do
         if [ -e "$log_preflight" ] || [ -L "$log_preflight" ]; then
@@ -2781,19 +2988,19 @@ api_logs() {
         log_byte_limit=163840
         printf '{"source":"api","lines":'; api_json_log_lines "$log_root/api.log.5" "$log_lines" api "$security_runtime_bridge_level" "$log_byte_limit" \
             "$log_root/api.log.4" "$log_root/api.log.3" "$log_root/api.log.2" \
-            "$log_root/api.log.1" "$log_root/api.log"; printf '},'
+            "$log_root/api.log.1" "$log_root/api.log"; api_json_log_close ,
         printf '{"source":"doctor","lines":'; api_json_log_lines "$doctor_inventory_log.3" "$log_lines" doctor "$security_runtime_operations_level" "$log_byte_limit" \
-            "$doctor_inventory_log.2" "$doctor_inventory_log.1" "$doctor_inventory_log"; printf '},'
+            "$doctor_inventory_log.2" "$doctor_inventory_log.1" "$doctor_inventory_log"; api_json_log_close ,
         printf '{"source":"controller","lines":'; api_json_log_lines "$log_root/controller.log.5" "$log_lines" controller "$security_runtime_controller_level" "$log_byte_limit" \
             "$log_root/controller.log.4" "$log_root/controller.log.3" "$log_root/controller.log.2" \
-            "$log_root/controller.log.1" "$log_root/controller.log"; printf '},'
+            "$log_root/controller.log.1" "$log_root/controller.log"; api_json_log_close ,
         printf '{"source":"scheduler","lines":'; api_json_log_lines "$log_root/scheduler.log.5" "$log_lines" scheduler "$security_runtime_scheduler_level" "$log_byte_limit" \
             "$log_root/scheduler.log.4" "$log_root/scheduler.log.3" "$log_root/scheduler.log.2" \
-            "$log_root/scheduler.log.1" "$log_root/scheduler.log"; printf '},'
+            "$log_root/scheduler.log.1" "$log_root/scheduler.log"; api_json_log_close ,
         printf '{"source":"sync","lines":'; api_json_log_lines "$log_root/sync.log.3" "$log_lines" sync "$security_runtime_sync_level" "$log_byte_limit" \
-            "$log_root/sync.log.2" "$log_root/sync.log.1" "$log_root/sync.log"; printf '},'
+            "$log_root/sync.log.2" "$log_root/sync.log.1" "$log_root/sync.log"; api_json_log_close ,
         printf '{"source":"audit","lines":'; api_json_log_lines "$audit_log.5" "$log_lines" audit trace "$log_byte_limit" \
-            "$audit_log.4" "$audit_log.3" "$audit_log.2" "$audit_log.1" "$audit_log"; printf '}'
+            "$audit_log.4" "$audit_log.3" "$audit_log.2" "$audit_log.1" "$audit_log"; api_json_log_close
     else
         # A selected source can use most of that ceiling while leaving fixed
         # headroom for its schema and source envelope.
@@ -2802,29 +3009,35 @@ api_logs() {
             api)
                 printf '{"source":"api","lines":'; api_json_log_lines "$log_root/api.log.5" "$log_lines" api "$security_runtime_bridge_level" "$log_byte_limit" \
                     "$log_root/api.log.4" "$log_root/api.log.3" "$log_root/api.log.2" \
-                    "$log_root/api.log.1" "$log_root/api.log"; printf '}'
+                    "$log_root/api.log.1" "$log_root/api.log"; api_json_log_close
                 ;;
             doctor)
                 printf '{"source":"doctor","lines":'; api_json_log_lines "$doctor_inventory_log.3" "$log_lines" doctor "$security_runtime_operations_level" "$log_byte_limit" \
-                    "$doctor_inventory_log.2" "$doctor_inventory_log.1" "$doctor_inventory_log"; printf '}'
+                    "$doctor_inventory_log.2" "$doctor_inventory_log.1" "$doctor_inventory_log"; api_json_log_close
                 ;;
             controller)
                 printf '{"source":"controller","lines":'; api_json_log_lines "$log_root/controller.log.5" "$log_lines" controller "$security_runtime_controller_level" "$log_byte_limit" \
                     "$log_root/controller.log.4" "$log_root/controller.log.3" "$log_root/controller.log.2" \
-                    "$log_root/controller.log.1" "$log_root/controller.log"; printf '}'
+                    "$log_root/controller.log.1" "$log_root/controller.log"; api_json_log_close
                 ;;
             scheduler)
                 printf '{"source":"scheduler","lines":'; api_json_log_lines "$log_root/scheduler.log.5" "$log_lines" scheduler "$security_runtime_scheduler_level" "$log_byte_limit" \
                     "$log_root/scheduler.log.4" "$log_root/scheduler.log.3" "$log_root/scheduler.log.2" \
-                    "$log_root/scheduler.log.1" "$log_root/scheduler.log"; printf '}'
+                    "$log_root/scheduler.log.1" "$log_root/scheduler.log"; api_json_log_close
                 ;;
             sync)
                 printf '{"source":"sync","lines":'; api_json_log_lines "$log_root/sync.log.3" "$log_lines" sync "$security_runtime_sync_level" "$log_byte_limit" \
-                    "$log_root/sync.log.2" "$log_root/sync.log.1" "$log_root/sync.log"; printf '}'
+                    "$log_root/sync.log.2" "$log_root/sync.log.1" "$log_root/sync.log"; api_json_log_close
                 ;;
             audit)
                 printf '{"source":"audit","lines":'; api_json_log_lines "$audit_log.5" "$log_lines" audit trace "$log_byte_limit" \
-                    "$audit_log.4" "$audit_log.3" "$audit_log.2" "$audit_log.1" "$audit_log"; printf '}'
+                    "$audit_log.4" "$audit_log.3" "$audit_log.2" "$audit_log.1" "$audit_log"; api_json_log_close
+                ;;
+            run-stderr)
+                # Opaque text, so every line classes as an error and no
+                # threshold hides it; redacted like every other source.
+                printf '{"source":"run-stderr","lines":'; api_json_log_lines "$log_root/run-stderr.log.3" "$log_lines" run-stderr trace "$log_byte_limit" \
+                    "$log_root/run-stderr.log.2" "$log_root/run-stderr.log.1" "$log_root/run-stderr.log"; api_json_log_close
                 ;;
         esac
     fi
@@ -2905,14 +3118,16 @@ api_clear_logs() {
     acquire_event_log_lock || api_error unsafe_state "package event log is busy" 73
     clear_status=0
     clear_keep=true
+    clear_failed=
     for clear_target in "$@"; do
-        clear_private_log_file "$clear_target" "$clear_keep" || { clear_status=$?; break; }
+        clear_private_log_file "$clear_target" "$clear_keep" || { clear_status=$?; clear_failed=${clear_target##*/}; break; }
         # Only the active file is republished empty; its rotations are removed
         # so the clearing actually returns their bytes to the volume.
         clear_keep=false
     done
-    release_event_log_lock || clear_status=$?
-    [ "$clear_status" -eq 0 ] || api_error unsafe_state "package log could not be cleared" 73
+    release_event_log_lock || { clear_status=$?; clear_failed=${clear_failed:-event-log lock}; }
+    [ "$clear_status" -eq 0 ] \
+        || api_error unsafe_state "package log $clear_failed could not be cleared (status $clear_status)" 73
     api_mutation_result "Cleared the $clear_source log"
 }
 
@@ -3026,8 +3241,11 @@ api_activity() {
             request_offset = index(message, request_marker)
             if (request_offset > 0) {
                 request_value = substr(message, request_offset + length(request_marker))
-                if (length(request_value) != 32 || request_value ~ /[^0-9a-f]/) exit 73
-                client_request_id = quote(request_value)
+                # Only the first marker counts, and only 32 lowercase hex digits to
+                # the end are a tag. Anything else is free text (a file named
+                # `meeting request_id=5.txt`): the record is kept untagged, as
+                # the in-service rung keeps it, instead of failing the feed.
+                if (length(request_value) == 32 && request_value !~ /[^0-9a-f]/) client_request_id = quote(request_value)
             }
             record_count++
             slot = ((record_count - 1) % requested) + 1
@@ -3622,7 +3840,7 @@ api_snapshot() {
                 if : > "$snapshot_cache_marker" 2>/dev/null; then
                     finish_private_file "$snapshot_cache_marker" 2>/dev/null || rm -f "$snapshot_cache_marker"
                 fi
-                append_controller_log_event warn observability_write_failed \
+                append_controller_log_event error observability_write_failed \
                     "sink=snapshot_cache status=$snapshot_cache_status" >/dev/null 2>&1 \
                     || printf 'warning: snapshot cache store failed (status %s)\n' "$snapshot_cache_status" >&2
             fi
@@ -3851,7 +4069,53 @@ api_resync() {
 
 api_mutation_result() {
     mutation_message=$1
+    if [ -n "${api_warning_code:-}" ]; then
+        printf '{"schema":"sdsync.dsm-result.v1","ok":true,"message":%s,"warning_code":%s,"warning":%s}\n' \
+            "$(json_quote "$mutation_message")" "$(json_quote "$api_warning_code")" "$(json_quote "$api_warning")"
+        return 0
+    fi
     api_result "$mutation_message"
+}
+
+# A mutation that committed can still print a `warning:` line -- a terminal
+# audit left pending, an Activity echo that failed -- and through the API a
+# success used to drop it. The first such line becomes the result's warning
+# (C-B1); the code says which kind it is.
+api_post_commit_warning() {
+    api_warning_line=$(printf '%s\n' "$api_output" | LC_ALL=C awk '/^warning: / { print; exit }')
+    [ -n "$api_warning_line" ] || return 0
+    case $api_warning_line in
+        *"audit is pending"*|*"audit records remain pending"*) api_warning_code=audit_pending ;;
+        *Activity*|*activity*) api_warning_code=activity_unavailable ;;
+        *) api_warning_code=operation_warning ;;
+    esac
+    api_warning=$(one_safe_line "${api_warning_line#warning: }")
+}
+
+# The warning for a save the running controller did not pick up. The cause is
+# read back from the marker the manager just wrote; its values are tokens and
+# digits, so nothing private can reach the dashboard through it.
+api_reload_warning() {
+    api_warning_code=controller_reload_failed
+    api_reload_reason=
+    api_reload_pid=
+    if [ -f "$controller_reload_marker" ] && [ ! -L "$controller_reload_marker" ]; then
+        while IFS='=' read -r api_reload_name api_reload_value; do
+            case $api_reload_name in
+                reason) api_reload_reason=$api_reload_value ;;
+                pid) api_reload_pid=$api_reload_value ;;
+            esac
+        done < "$controller_reload_marker" || true
+    fi
+    case $api_reload_pid in ''|*[!0-9]*) api_reload_pid=unknown ;; esac
+    case $api_reload_reason in
+        pid_unreadable) api_reload_cause="the controller PID file exists but cannot be read" ;;
+        identity_refused) api_reload_cause="the running controller's identity could not be verified (PID $api_reload_pid)" ;;
+        identity_changed) api_reload_cause="the controller process changed during the reload (PID $api_reload_pid)" ;;
+        signal_failed) api_reload_cause="the reload signal could not be delivered (PID $api_reload_pid)" ;;
+        *) api_reload_cause="the cause could not be read back; see the controller log" ;;
+    esac
+    api_warning="configuration was saved but the running controller was not reloaded: $api_reload_cause. The previous settings stay in effect until the package service restarts or a later save reloads it."
 }
 
 api_set_secret() {
@@ -3927,9 +4191,12 @@ api_cgi_failure() {
             ;;
         *) api_error invalid_request "unsupported cgi-failure diagnostic" 64 ;;
     esac
+    # A request the package could not serve (5xx) is a service failure; one
+    # it refused (4xx) is the client's.
+    case $cgi_failure_status in 5??) cgi_failure_level=error ;; *) cgi_failure_level=warn ;; esac
     append_activity "$cgi_failure_event" none failed \
         "Package service synology-drive-sync request failed stage=$cgi_failure_stage code=$cgi_failure_code status=$cgi_failure_status" \
-        "$cgi_failure_category" warn false \
+        "$cgi_failure_category" "$cgi_failure_level" false \
         || api_error unavailable "CGI failure activity could not be recorded" 69
     case $cgi_failure_event in
         authentication.failed) dsm_log_event authentication_failed ;;
@@ -4139,7 +4406,7 @@ case $command_name in
         [ ! -L "$routine_target" ] && [ ! -L "$routine_state_target" ] || die "refusing symlinked routine state"
         mark_mutation_commit_started || die "mandatory audit execution phase could not be recorded"
         rm -f "$routine_target" "$routine_state_target"
-        reload_controller_if_running || echo "warning: configuration was saved but the controller could not be reloaded" >&2
+        reload_controller_if_running || controller_reload_pending=true
         echo "removed routine for '$1'"
         end_mutation
         ;;
@@ -4276,8 +4543,15 @@ case $command_name in
         # source detail. Successful source output is intentionally suppressed to keep all-profile
         # target NDJSON inside the bounded authenticated bridge response.
         [ ! -s "$target_doctor_output" ] || cat "$target_doctor_output"
-        persist_doctor_inventory_records "$target_doctor_output" "$selected_scope" || \
-            echo "warning: private Doctor inventory evidence could not be recorded" >&2
+        doctor_inventory_persist_status=0
+        persist_doctor_inventory_records "$target_doctor_output" "$selected_scope" \
+            || doctor_inventory_persist_status=$?
+        if [ "$doctor_inventory_persist_status" -ne 0 ]; then
+            echo "warning: private Doctor inventory evidence could not be recorded in $doctor_inventory_log (status $doctor_inventory_persist_status)" >&2
+            append_controller_log_event error observability_write_failed \
+                "sink=doctor_inventory status=$doctor_inventory_persist_status" >/dev/null \
+                || echo "error: the observability_write_failed event could not be written either" >&2
+        fi
         if [ "$source_doctor_exit" -ne 0 ]; then
             printf '{"schema":"sdsync.dsm-source-check.v1","status":"failed","exit_code":%s,"message":"package-local source diagnostic failed"}\n' "$source_doctor_exit"
             [ ! -s "$source_doctor_output" ] || cat "$source_doctor_output"
@@ -4286,9 +4560,19 @@ case $command_name in
         source_doctor_output= target_doctor_output=
         if [ "$target_doctor_exit" -ne 0 ]; then doctor_exit=$target_doctor_exit; else doctor_exit=$source_doctor_exit; fi
         if [ "$doctor_exit" -eq 0 ]; then doctor_status=succeeded; doctor_code=doctor.succeeded; else doctor_status=failed; doctor_code=doctor.failed; fi
-        write_health_cache "$selected_scope" "$doctor_status" "$doctor_exit" "$write_test" "$diagnostic_level"
+        doctor_health_note=
+        doctor_health_status=0
+        write_health_cache "$selected_scope" "$doctor_status" "$doctor_exit" "$write_test" "$diagnostic_level" \
+            || doctor_health_status=$?
+        if [ "$doctor_health_status" -ne 0 ]; then
+            echo "error: Doctor's health record for ${health_cache_failed:-$selected_scope} could not be saved in $health_dir (status $doctor_health_status); the dashboard keeps showing the previous check" >&2
+            append_controller_log_event error health_cache_write_failed \
+                "profile=${health_cache_failed:-$selected_scope} status=$doctor_health_status" \
+                || echo "error: the health_cache_write_failed event could not be written either" >&2
+            doctor_health_note="; its health record could not be saved"
+        fi
         if [ "$doctor_status" = failed ]; then doctor_level=error; else doctor_level=info; fi
-        manager_best_effort activity append_activity "$doctor_code" "$selected_scope" "$doctor_status" "Target doctor ($diagnostic_level) completed" operations "$doctor_level"
+        manager_best_effort activity append_activity "$doctor_code" "$selected_scope" "$doctor_status" "Target doctor ($diagnostic_level) completed$doctor_health_note" operations "$doctor_level"
         if [ "$doctor_exit" -ne 0 ]; then
             manager_best_effort alert handle_doctor_alert "$selected_scope" "$doctor_exit"
         fi
@@ -4312,7 +4596,7 @@ case $command_name in
             shift
         done
         if [ "$resync_scope_seen" = false ]; then
-            resync_scope_name=$(current_default 2>/dev/null) || die "no configured default profile"
+            resync_scope_name=$(current_default_for_action) || die "no usable default profile"
         fi
         # Resync overwrites one destination tree and can never address --all:
         # an unconditional re-upload of every profile at once is not something
@@ -4398,7 +4682,7 @@ case $command_name in
         finish_private_file "$schedule_temp"
         mark_mutation_commit_started || die "mandatory audit execution phase could not be recorded"
         mv -f "$schedule_temp" "$schedule_file"
-        reload_controller_if_running || echo "warning: configuration was saved but the controller could not be reloaded" >&2
+        reload_controller_if_running || controller_reload_pending=true
         echo "scheduler enabled every $interval seconds (delete=$allow_schedule_delete); next run is not immediate"
         end_mutation
         ;;
@@ -4438,6 +4722,10 @@ case $command_name in
             service=running
         elif [ -n "$pid" ] && pid_is_live "$pid"; then
             service=untrusted
+        elif [ -z "$pid" ] && { [ -e "$controller_pid_file" ] || [ -L "$controller_pid_file" ]; }; then
+            # A PID file that exists and names no PID is not "stopped".
+            service=unknown
+            echo "warning: $controller_pid_file exists but holds no readable PID" >&2
         else
             service=stopped
         fi
