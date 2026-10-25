@@ -524,3 +524,85 @@ fn an_overlapping_pair_of_profiles_withholds_the_combined_total_visibly() {
         "the per-profile rows survive; only their combination is unsound"
     );
 }
+
+/// D3-1: `--status-cache` pointed at a directory that also holds the user's own files must not
+/// evict them. Before the cache claimed its directory it deleted regular files oldest first once
+/// the directory passed 32 MiB, whatever their names. Now the directory is refused with a named
+/// issue, the answer is unchanged, and nothing in it is touched.
+#[test]
+fn a_cache_directory_holding_the_users_files_is_refused_and_their_files_survive() {
+    let fixture = Fixture::new();
+    let shared = fixture.directory.child("shared");
+    fs::create_dir(&shared).expect("create the shared directory");
+    let mut theirs = Vec::new();
+    for name in ["holiday-2019.mp4", "wedding.mp4", "thesis-final.docx"] {
+        let path = shared.join(name);
+        let file = fs::File::create(&path).expect("create a user file");
+        file.set_len(12 * 1024 * 1024).expect("size a user file");
+        file.set_modified(SystemTime::now() - Duration::from_secs(86_400))
+            .expect("age a user file");
+        theirs.push(path);
+    }
+
+    let output = fixture.status(&["--status-cache", text(&shared)]);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let answer: Value =
+        serde_json::from_slice(&output.stdout).expect("status stdout is one JSON document");
+    assert_eq!(answer["cache"]["state"], "unusable", "{answer}");
+    assert_eq!(
+        answer["cache"]["issues"][0]["code"], "cache-directory-unusable",
+        "{answer}"
+    );
+    assert!(
+        answer["cache"]["issues"][0]["cause"]
+            .as_str()
+            .is_some_and(|cause| cause.contains("not a dedicated status-cache directory")),
+        "{answer}"
+    );
+    for path in &theirs {
+        assert!(path.exists(), "{} was deleted", path.display());
+    }
+    let mut left: Vec<String> = fs::read_dir(&shared)
+        .expect("list the shared directory")
+        .map(|entry| {
+            entry
+                .expect("entry")
+                .file_name()
+                .to_string_lossy()
+                .into_owned()
+        })
+        .collect();
+    left.sort();
+    assert_eq!(
+        left,
+        ["holiday-2019.mp4", "thesis-final.docx", "wedding.mp4"],
+        "the refused directory gained or lost entries"
+    );
+}
+
+/// The package's existing cache directory (cache-named files, no marker) keeps working after the
+/// marker rule: it is claimed on first use, not refused, and still serves from the cache.
+#[test]
+fn an_existing_unmarked_cache_directory_is_migrated_and_still_serves() {
+    let fixture = Fixture::new();
+    fixture.cached_status(&[]);
+    let marker = fixture.cache.join(".sdsync-status-cache");
+    assert!(marker.is_file(), "first use marks the cache directory");
+
+    // An installed cache from before the marker existed: same files, no marker.
+    fs::remove_file(&marker).expect("remove the marker");
+    let calls = fixture.md5_calls();
+    let answer = fixture.cached_status(&["--status-cache-canary", "0"]);
+    assert_ne!(answer["cache"]["state"], "unusable", "{answer}");
+    assert!(marker.is_file(), "the directory was migrated");
+    assert_eq!(
+        fixture.md5_calls(),
+        calls,
+        "the migrated cache served the warm answer without asking File Station again"
+    );
+}

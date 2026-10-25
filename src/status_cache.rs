@@ -217,6 +217,9 @@ pub struct CacheIssue {
 impl CacheIssue {
     pub const PROFILE_NAME_UNSAFE: &'static str = "cache-profile-name-unsafe";
     pub const DIRECTORY_UNUSABLE: &'static str = "cache-directory-unusable";
+    /// Informational: a directory written before the marker existed, holding only cache files, was
+    /// adopted and marked.
+    pub const DIRECTORY_ADOPTED: &'static str = "cache-directory-adopted";
     pub const FILE_UNSAFE: &'static str = "cache-file-unsafe";
     pub const FILE_UNREADABLE: &'static str = "cache-file-unreadable";
     pub const FILE_CORRUPT: &'static str = "cache-file-corrupt";
@@ -289,12 +292,28 @@ fn sweep_stale_temporaries(directory: &Path, now: std::time::SystemTime) -> Vec<
         return issues;
     };
     for entry in entries.flatten() {
-        if !entry.file_name().to_string_lossy().starts_with(".tmp.") {
+        // Only a temporary this module could have written. A user's `.tmp.*` file in a shared
+        // directory is not ours to age out.
+        if !entry.file_name().to_str().is_some_and(is_cache_temporary) {
             continue;
         }
-        let stale = entry
-            .metadata()
-            .and_then(|metadata| metadata.modified())
+        let metadata = match entry.metadata() {
+            Ok(metadata) => metadata,
+            Err(error) => {
+                issues.push(CacheIssue::warning(
+                    CacheIssue::CLEANUP_FAILED,
+                    &entry.path(),
+                    format!("temporary could not be examined: {error}"),
+                ));
+                continue;
+            }
+        };
+        // A link or directory with a temporary's name is not something this module wrote.
+        if !metadata.is_file() {
+            continue;
+        }
+        let stale = metadata
+            .modified()
             .ok()
             .and_then(|modified| now.duration_since(modified).ok())
             .is_some_and(|age| age > STALE_TEMPORARY_AGE);
@@ -311,6 +330,189 @@ fn remove_reporting(path: &Path, code: &str) -> Result<(), CacheIssue> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(CacheIssue::warning(code, path, error.to_string())),
     }
+}
+
+/// The file that says "this directory belongs to the status cache". Created on first use; its
+/// presence is what permits the cache to evict files here. See [`claim_directory`].
+const CACHE_MARKER: &str = ".sdsync-status-cache";
+
+/// What every marker starts with, whichever schema version wrote it, so a later format does not
+/// read an earlier marker as somebody else's file.
+const CACHE_MARKER_PREFIX: &str = "sdsync.status-cache.";
+
+const SUFFIX_PROFILE: &str = ".ndjson";
+const SUFFIX_ROLLUP: &str = ".rollup.json";
+
+/// The stem of `name` when it ends in one of the two suffixes this module writes.
+fn cache_stem(name: &str) -> Option<&str> {
+    name.strip_suffix(SUFFIX_PROFILE)
+        .or_else(|| name.strip_suffix(SUFFIX_ROLLUP))
+}
+
+/// Whether `name` is exactly a file this module writes: `<safe>.ndjson` or `<safe>.rollup.json`,
+/// where `<safe>` is a profile name [`name_is_safe`] accepts.
+///
+/// This is the cache's whole claim on a directory entry. Eviction and the byte total see nothing
+/// else, so a file the cache could not have written is never removed by it.
+fn is_cache_file(name: &str) -> bool {
+    cache_stem(name).is_some_and(name_is_safe)
+}
+
+/// Whether `name` is exactly a writer's temporary: `.tmp.<safe>.<pid>.ndjson` or
+/// `.tmp.<safe>.<pid>.rollup.json`, the two shapes `write_merged` and `store_rollup_io` create.
+fn is_cache_temporary(name: &str) -> bool {
+    let Some(stem) = name.strip_prefix(".tmp.").and_then(|rest| cache_stem(rest)) else {
+        return false;
+    };
+    stem.rsplit_once('.').is_some_and(|(profile, pid)| {
+        name_is_safe(profile) && !pid.is_empty() && pid.bytes().all(|byte| byte.is_ascii_digit())
+    })
+}
+
+/// Whether the cache could have written `name`, as a result file or a temporary.
+fn is_cache_owned(name: &std::ffi::OsStr) -> bool {
+    name.to_str()
+        .is_some_and(|name| is_cache_file(name) || is_cache_temporary(name))
+}
+
+/// Decide whether `directory` may be used as the cache directory, claiming it if it may.
+///
+/// The cache removes files from this directory (oldest first, past a byte ceiling), so it must be
+/// sure the directory is its own. A directory carrying the marker is. A directory without one is
+/// accepted only if everything in it is a name this module writes -- which is what an existing
+/// package cache looks like, so it is migrated by writing the marker, not refused -- and is
+/// otherwise refused with the first few offenders named. Refusing is not a failure of the query:
+/// the caller runs it uncached and publishes the returned cause.
+///
+/// `Ok(n)` with the number of cache files a directory written before the marker existed already
+/// held when it was adopted, so the caller can name the adoption; 0 when nothing was adopted.
+fn claim_directory(directory: &Path) -> Result<usize, String> {
+    let marker = directory.join(CACHE_MARKER);
+    let refuse = |why: String| {
+        format!(
+            "not a dedicated status-cache directory: {why}; point --status-cache at a directory \
+             used for nothing else"
+        )
+    };
+    if marker_is_ours(&marker, &refuse)? {
+        return Ok(0);
+    }
+
+    let entries = fs::read_dir(directory).map_err(|error| {
+        format!(
+            "{} could not be listed to check it is dedicated to the cache: {error}",
+            directory.display()
+        )
+    })?;
+    let mut foreign = Vec::new();
+    let mut count = 0_usize;
+    let mut owned = 0_usize;
+    for entry in entries {
+        let entry = entry.map_err(|error| {
+            format!(
+                "{} could not be listed to check it is dedicated to the cache: {error}",
+                directory.display()
+            )
+        })?;
+        if is_cache_owned(&entry.file_name()) {
+            owned += 1;
+        } else {
+            count += 1;
+            if foreign.len() < 3 {
+                foreign.push(entry.file_name().to_string_lossy().into_owned());
+            }
+        }
+    }
+    if count > 0 {
+        let more = if count > foreign.len() {
+            format!(" and {} more", count - foreign.len())
+        } else {
+            String::new()
+        };
+        return Err(refuse(format!(
+            "it has no {CACHE_MARKER} marker and holds {count} entr{} the cache did not write ({}{more})",
+            if count == 1 { "y" } else { "ies" },
+            foreign.join(", ")
+        )));
+    }
+
+    let written = (|| -> std::io::Result<()> {
+        let mut options = fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            options.mode(0o600);
+        }
+        let mut file = options.open(&marker)?;
+        file.write_all(SCHEMA.as_bytes())?;
+        file.write_all(b"\n")?;
+        file.sync_all()
+    })();
+    match written {
+        Ok(()) => Ok(owned),
+        // Another status pass claimed the directory between the check and the write.
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            if marker_is_ours(&marker, &refuse)? {
+                Ok(0)
+            } else {
+                Err(refuse(format!(
+                    "{} appeared with unexpected contents",
+                    marker.display()
+                )))
+            }
+        }
+        Err(error) => Err(format!(
+            "the {CACHE_MARKER} marker could not be written in {}: {error}",
+            directory.display()
+        )),
+    }
+}
+
+/// `Ok(true)` when `marker` is a cache marker, `Ok(false)` when there is none, and an error
+/// (already phrased as a refusal) when something else is sitting at that name.
+fn marker_is_ours(marker: &Path, refuse: &dyn Fn(String) -> String) -> Result<bool, String> {
+    // Another pass may be part-way through writing the marker it just created; give it a moment
+    // rather than call an empty file foreign.
+    for attempt in 0..5 {
+        let metadata = match fs::symlink_metadata(marker) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => {
+                return Err(format!(
+                    "{} could not be examined: {error}",
+                    marker.display()
+                ));
+            }
+        };
+        if !metadata.is_file() {
+            return Err(refuse(format!(
+                "{} is not a regular file",
+                marker.display()
+            )));
+        }
+        let mut head = Vec::new();
+        fs::File::open(marker)
+            .and_then(|file| {
+                std::io::Read::read_to_end(&mut std::io::Read::take(file, 256), &mut head)
+            })
+            .map_err(|error| format!("{} could not be read: {error}", marker.display()))?;
+        if head.starts_with(CACHE_MARKER_PREFIX.as_bytes()) {
+            return Ok(true);
+        }
+        if head.is_empty() && attempt < 4 {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            continue;
+        }
+        return Err(refuse(format!(
+            "{} was not written by this cache",
+            marker.display()
+        )));
+    }
+    Err(refuse(format!(
+        "{} was not written by this cache",
+        marker.display()
+    )))
 }
 
 /// Everything needed to decide whether a stored file describes *this* query.
@@ -456,15 +658,31 @@ impl StatusCache {
         directory_is_private(&options.directory).map_err(|cause| {
             CacheIssue::warning(CacheIssue::DIRECTORY_UNUSABLE, &options.directory, cause)
         })?;
+        let adopted = claim_directory(&options.directory).map_err(|cause| {
+            CacheIssue::warning(CacheIssue::DIRECTORY_UNUSABLE, &options.directory, cause)
+        })?;
         let path = options
             .directory
             .join(format!("{}.ndjson", options.profile));
+        // A cache directory from before the marker existed: kept, and named once, as expected.
+        let issues = if adopted > 0 {
+            vec![CacheIssue::info(
+                CacheIssue::DIRECTORY_ADOPTED,
+                &options.directory,
+                format!(
+                    "the directory holds {adopted} status-cache file(s) written before the \
+                     {CACHE_MARKER} marker existed and nothing else, so it was adopted and marked"
+                ),
+            )]
+        } else {
+            Vec::new()
+        };
         Ok(Self {
             options,
             path,
             now,
             canary_at: std::cell::Cell::new(0),
-            issues: std::cell::RefCell::new(Vec::new()),
+            issues: std::cell::RefCell::new(issues),
         })
     }
 
@@ -1257,7 +1475,9 @@ impl StatusCache {
                     continue;
                 }
             };
-            if !metadata.is_file() {
+            // Only a file this module writes counts, toward the total and as a candidate. The marker,
+            // a temporary and anything the user keeps here are invisible.
+            if !metadata.is_file() || !entry.file_name().to_str().is_some_and(is_cache_file) {
                 continue;
             }
             // Ordering only, so not a condition: a file whose time cannot be read sorts as oldest
@@ -3516,5 +3736,276 @@ mod tests {
         assert_eq!(decode_identity(&encode_identity(identity)), identity);
         assert_eq!(decode_identity("nonsense"), FileIdentity::default());
         assert!(!FileIdentity::default().is_known());
+    }
+
+    /// A file of `length` bytes that occupies no disk (a hole), last modified `age_seconds` ago.
+    fn sparse_file(path: &Path, length: u64, age_seconds: u64) {
+        let file = fs::File::create(path).expect("create a fixture file");
+        file.set_len(length).expect("size a fixture file");
+        file.set_modified(
+            std::time::SystemTime::now() - std::time::Duration::from_secs(age_seconds),
+        )
+        .expect("age a fixture file");
+    }
+
+    const MIB: u64 = 1024 * 1024;
+
+    /// D3-1: `status --status-cache DIR` used to delete whatever regular files DIR held, oldest
+    /// first, once they passed 32 MiB. A directory that also holds somebody's files is not a cache
+    /// directory: it is refused, with a named issue, and nothing in it is touched.
+    #[test]
+    fn a_directory_holding_the_users_files_is_refused_and_nothing_is_deleted() {
+        let scratch = Scratch::new();
+        let mut user_files = Vec::new();
+        for name in ["holiday-2019.mp4", "wedding.mp4", "thesis-final.docx"] {
+            let path = scratch.0.join(name);
+            sparse_file(&path, 12 * MIB, 86_400);
+            user_files.push(path);
+        }
+        let refusal = StatusCache::open(options(&scratch.0), NOW)
+            .expect_err("a directory of the user's files was accepted as a cache");
+        assert_eq!(refusal.code, CacheIssue::DIRECTORY_UNUSABLE);
+        assert!(refusal.is_warning());
+        assert!(
+            refusal
+                .cause
+                .contains("not a dedicated status-cache directory"),
+            "{refusal}"
+        );
+        assert!(
+            refusal.cause.contains("holiday-2019.mp4"),
+            "names the offender: {refusal}"
+        );
+        for path in &user_files {
+            assert!(path.exists(), "{} was deleted", path.display());
+        }
+        assert!(
+            !scratch.0.join(CACHE_MARKER).exists(),
+            "a refused directory must not be claimed with a marker"
+        );
+    }
+
+    /// Any entry the cache does not own keeps an unmarked directory refused, a subdirectory
+    /// included, even when a cache-named file sits beside it.
+    #[test]
+    fn one_foreign_entry_keeps_an_unmarked_directory_refused() {
+        let scratch = Scratch::new();
+        sparse_file(&scratch.0.join("photos.ndjson"), 10, 10);
+        fs::create_dir(scratch.0.join("albums")).expect("subdirectory");
+        let refusal = StatusCache::open(options(&scratch.0), NOW)
+            .expect_err("a directory with a subdirectory was accepted");
+        assert_eq!(refusal.code, CacheIssue::DIRECTORY_UNUSABLE);
+        assert!(refusal.cause.contains("albums"), "{refusal}");
+    }
+
+    /// A dedicated directory is still bounded: past the ceiling the oldest profile file goes.
+    #[test]
+    fn a_dedicated_directory_over_the_limit_still_evicts_the_oldest_profile_file() {
+        let scratch = Scratch::new();
+        let cache = StatusCache::open(options(&scratch.0), NOW).expect("cache opens");
+        assert!(
+            scratch.0.join(CACHE_MARKER).is_file(),
+            "first use marks the directory as this cache's"
+        );
+        sparse_file(&scratch.0.join("older.rollup.json"), 20 * MIB, 3 * 3600);
+        sparse_file(&scratch.0.join("old.ndjson"), 20 * MIB, 2 * 3600);
+        let (mut local, mut remote) = inventories();
+        pair(&mut local, &mut remote, "a.bin", 10, 1_000_000, 11);
+        warm(&cache, &mut local, &mut remote, 0x51);
+        assert!(
+            !scratch.0.join("older.rollup.json").exists(),
+            "the oldest profile file survived a directory over its ceiling"
+        );
+        assert!(
+            scratch.0.join("old.ndjson").exists(),
+            "evicted past what was needed"
+        );
+        assert!(cache.path().exists(), "the file this run wrote was evicted");
+        assert!(
+            scratch.0.join(CACHE_MARKER).is_file(),
+            "the marker is never evicted"
+        );
+        assert!(cache.issues().is_empty(), "{:?}", cache.issues());
+    }
+
+    /// In a marked directory the name filter still holds: only the cache's own names are counted,
+    /// evicted or swept. Everything else is invisible to both.
+    #[test]
+    fn files_outside_the_cache_names_survive_eviction_and_the_sweep_in_a_marked_directory() {
+        let scratch = Scratch::new();
+        let cache = StatusCache::open(options(&scratch.0), NOW).expect("cache opens");
+        let bystanders = [
+            "notes.txt",
+            ".tmp.x",
+            ".tmp.photos.ndjson",
+            ".tmp.photos.abc.ndjson",
+            ".tmp.photos.4242.txt",
+            ".tmp..4242.ndjson",
+            ".hidden.ndjson",
+            "has space.ndjson",
+            "..ndjson",
+            "photos.ndjson.bak",
+            "photos.rollup.json.old",
+            "notes.NDJSON",
+        ];
+        for name in bystanders {
+            sparse_file(&scratch.0.join(name), 6 * MIB, 3 * 86_400);
+        }
+        let stale = scratch.0.join(".tmp.photos.4242.ndjson");
+        sparse_file(&stale, 1, 3600);
+        let stale_rollup = scratch.0.join(".tmp.photos.4243.rollup.json");
+        sparse_file(&stale_rollup, 1, 3600);
+        fs::create_dir(scratch.0.join("albums")).expect("subdirectory");
+        let (mut local, mut remote) = inventories();
+        pair(&mut local, &mut remote, "a.bin", 10, 1_000_000, 11);
+        warm(&cache, &mut local, &mut remote, 0x52);
+        for name in bystanders {
+            assert!(scratch.0.join(name).exists(), "{name} was deleted");
+        }
+        assert!(scratch.0.join("albums").is_dir());
+        assert!(!stale.exists(), "the cache's own stale temporary is swept");
+        assert!(
+            !stale_rollup.exists(),
+            "the cache's own stale rollup temporary is swept"
+        );
+    }
+
+    /// Bystanders must not count toward the byte total either, or they would force the cache's own
+    /// files out to make room for bytes the cache does not own.
+    #[test]
+    fn bystander_bytes_do_not_evict_the_caches_own_files() {
+        let scratch = Scratch::new();
+        let cache = StatusCache::open(options(&scratch.0), NOW).expect("cache opens");
+        sparse_file(&scratch.0.join("video.mp4"), 64 * MIB, 86_400);
+        sparse_file(&scratch.0.join("other.ndjson"), 5 * MIB, 3600);
+        let (mut local, mut remote) = inventories();
+        pair(&mut local, &mut remote, "a.bin", 10, 1_000_000, 11);
+        warm(&cache, &mut local, &mut remote, 0x53);
+        assert!(scratch.0.join("video.mp4").exists());
+        assert!(
+            scratch.0.join("other.ndjson").exists(),
+            "evicted for bytes it does not own"
+        );
+    }
+
+    /// The package's existing cache directory holds only cache-named files and no marker. It is
+    /// migrated in place, not refused: refusing it would turn every installed cache cold.
+    #[test]
+    fn an_existing_cache_directory_without_a_marker_is_migrated_not_refused() {
+        let scratch = Scratch::new();
+        fs::write(scratch.0.join("photos.ndjson"), "old").expect("write");
+        fs::write(scratch.0.join("photos.rollup.json"), "{}").expect("write");
+        fs::write(scratch.0.join("music.ndjson"), "old").expect("write");
+        fs::write(scratch.0.join(".tmp.music.4242.rollup.json"), "").expect("write");
+        let cache =
+            StatusCache::open(options(&scratch.0), NOW).expect("a cache directory was refused");
+        // Adopted, and named once, as information rather than a fault.
+        let issues = cache.issues();
+        assert_eq!(issues.len(), 1, "{issues:?}");
+        assert_eq!(issues[0].code, CacheIssue::DIRECTORY_ADOPTED);
+        assert_eq!(issues[0].severity, "info");
+        assert!(!issues[0].is_warning());
+        assert!(
+            issues[0].cause.contains("4 status-cache file(s)"),
+            "{issues:?}"
+        );
+        let marker = fs::read_to_string(scratch.0.join(CACHE_MARKER)).expect("marker written");
+        assert!(marker.starts_with(SCHEMA), "{marker:?}");
+        assert!(
+            scratch.0.join("music.ndjson").exists(),
+            "migration touched a profile file"
+        );
+        // A second open reads the marker and agrees, with nothing more to say.
+        let again = StatusCache::open(options(&scratch.0), NOW + 1)
+            .expect("a marked directory was refused");
+        assert!(again.issues().is_empty(), "{:?}", again.issues());
+    }
+
+    /// An empty directory (a fresh install) is claimed on first use.
+    #[test]
+    fn an_empty_directory_is_marked_on_first_use() {
+        let scratch = Scratch::new();
+        StatusCache::open(options(&scratch.0), NOW).expect("cache opens");
+        let marker = fs::read_to_string(scratch.0.join(CACHE_MARKER)).expect("marker written");
+        assert!(marker.starts_with(SCHEMA), "{marker:?}");
+    }
+
+    /// A marker that is not ours is somebody else's file: neither trusted nor overwritten.
+    #[test]
+    fn a_marker_that_is_not_a_cache_marker_is_refused_and_left_alone() {
+        let scratch = Scratch::new();
+        let marker = scratch.0.join(CACHE_MARKER);
+        fs::write(&marker, "somebody else's file").expect("write");
+        let refusal = StatusCache::open(options(&scratch.0), NOW)
+            .expect_err("a foreign file at the marker's name was trusted");
+        assert_eq!(refusal.code, CacheIssue::DIRECTORY_UNUSABLE);
+        assert_eq!(
+            fs::read_to_string(&marker).expect("still there"),
+            "somebody else's file"
+        );
+    }
+
+    /// Failing to write the marker is itself a published issue, never a silent uncached success.
+    #[cfg(unix)]
+    #[test]
+    fn a_marker_that_cannot_be_written_is_a_published_refusal() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let scratch = Scratch::new();
+        fs::set_permissions(&scratch.0, fs::Permissions::from_mode(0o500)).expect("chmod");
+        if fs::File::create(scratch.0.join("probe")).is_ok() {
+            fs::set_permissions(&scratch.0, fs::Permissions::from_mode(0o700)).expect("chmod");
+            eprintln!("skipped: the directory stayed writable (running as root)");
+            return;
+        }
+        let result = StatusCache::open(options(&scratch.0), NOW);
+        fs::set_permissions(&scratch.0, fs::Permissions::from_mode(0o700)).expect("chmod");
+        let refusal = result.expect_err("an unmarkable directory was accepted");
+        assert_eq!(refusal.code, CacheIssue::DIRECTORY_UNUSABLE);
+        assert!(refusal.cause.contains("marker"), "{refusal}");
+    }
+
+    /// Exactly the names this module writes, and nothing a user would plausibly have.
+    #[test]
+    fn only_the_names_the_cache_writes_are_its_own() {
+        for name in [
+            "photos.ndjson",
+            "photos.rollup.json",
+            "a.b-c_d.ndjson",
+            "x.rollup.ndjson",
+        ] {
+            assert!(is_cache_file(name), "{name}");
+            assert!(!is_cache_temporary(name), "{name}");
+        }
+        for name in [
+            ".tmp.photos.4242.ndjson",
+            ".tmp.photos.4242.rollup.json",
+            ".tmp.a.b.7.ndjson",
+        ] {
+            assert!(is_cache_temporary(name), "{name}");
+            assert!(!is_cache_file(name), "{name}");
+        }
+        for name in [
+            "",
+            "notes.txt",
+            ".ndjson",
+            ".rollup.json",
+            "..ndjson",
+            ".hidden.ndjson",
+            "has space.ndjson",
+            "photos.ndjson.bak",
+            "photos.NDJSON",
+            CACHE_MARKER,
+            ".tmp.x",
+            ".tmp.photos.ndjson",
+            ".tmp.photos..ndjson",
+            ".tmp.photos.abc.ndjson",
+            ".tmp.photos.4242.txt",
+            ".tmp..4242.ndjson",
+            ".tmp.4242.ndjson",
+            ".tmp.photos.-1.ndjson",
+        ] {
+            assert!(!is_cache_file(name), "{name:?} claimed as a cache file");
+            assert!(!is_cache_temporary(name), "{name:?} claimed as a temporary");
+        }
     }
 }
