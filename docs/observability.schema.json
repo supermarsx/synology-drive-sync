@@ -144,6 +144,7 @@
             "authentication.completed",
             "remote_scan.started",
             "remote_scan.completed",
+            "remote_scan.link_guard_unchecked",
             "plan.ready",
             "api_call.started",
             "api_call.completed",
@@ -215,6 +216,8 @@
         "https_required",
         "scope_not_found",
         "cancelled",
+        "remote_refused_share_wide",
+        "remote_real_path_unusable",
         "unclassified",
         "changed_during_run",
         "delete_bound",
@@ -663,9 +666,13 @@
     "plan": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["summary", "actions", "skipped"],
+      "required": ["summary", "actions", "skipped", "link_guard_unchecked"],
       "properties": {
         "summary": { "$ref": "#/$defs/planSummary" },
+        "link_guard_unchecked": {
+          "description": "NAS folders this run listed, or passed through on the way to its scope, for which the NAS reported no real path, so a NAS link among their entries could not be told from a folder and is synced and deleted through like one. 0 means the link guard ran everywhere it was needed. A lasting, user-fixable warning: it never changes the outcome or the exit code.",
+          "$ref": "#/$defs/nonNegativeInteger"
+        },
         "skipped": {
           "description": "Paths this plan neither carries nor deletes, and why. Each used to fail the whole run; now only its own path is left alone, on both sides. `deferred` entries are named again, with their precise reason, in the result's `deferred`. `type-conflict`: a local file where the NAS has a folder (or the reverse), or a local entry at a NAS mount point, that this run may not replace. `remote-link`: a local entry where the NAS holds a link; nothing is written, deleted or descended at or beneath it. `protected-descendant`: a NAS-only folder a mirror would delete, kept because it holds an excluded or DSM-managed entry. A local entry Synology Drive cannot hold is a `deferred` skip whose detail starts `unsupported-entry:`.",
           "type": "array",
@@ -744,6 +751,7 @@
         "failed",
         "outcome",
         "deferred",
+        "link_guard_unchecked",
         "mtime_not_kept",
         "skipped",
         "incomplete_listings",
@@ -786,6 +794,10 @@
           "description": "Each path this run left for the next run, by name. A deferred path was neither uploaded nor deleted, and nothing else was deleted on its account. Any transient reason makes the outcome `partial`; `unrepresentable-name`, `unsupported-local-entry`, `listing-incomplete`, `remote-unreadable`, `local-permission-denied`, `delete-not-permitted`, `remote-refused`, `remote-skipped`, `unsupported-entry` and `case-rename-pending` recur every run until someone acts, so they are reported without changing the outcome.",
           "type": "array",
           "items": { "$ref": "#/$defs/deferredPath" }
+        },
+        "link_guard_unchecked": {
+          "description": "NAS folders this run listed, or passed through on the way to its scope, for which the NAS reported no real path, so a NAS link among their entries could not be told from a folder and is synced and deleted through like one. 0 means the link guard ran everywhere it was needed. A lasting, user-fixable warning: it never changes the outcome or the exit code.",
+          "$ref": "#/$defs/nonNegativeInteger"
         },
         "mtime_not_kept": {
           "description": "Destinations this run wrote (uploads, server copies) whose modification time the NAS did not keep: the remote second is neither the source's milliseconds floored nor rounded to the nearest second. Their content was verified; a metadata comparison will report them as changed.",
@@ -879,6 +891,10 @@
         "planned_only": { "type": "boolean" },
         "deferred": { "type": "array", "items": { "$ref": "#/$defs/deferredPath" } },
         "skipped": { "$ref": "#/$defs/nonNegativeInteger" },
+        "link_guard_unchecked": {
+          "description": "NAS folders this run listed, or passed through on the way to its scope, for which the NAS reported no real path, so a NAS link among their entries could not be told from a folder and is synced and deleted through like one. 0 means the link guard ran everywhere it was needed. A lasting, user-fixable warning: it never changes the outcome or the exit code.",
+          "$ref": "#/$defs/nonNegativeInteger"
+        },
         "elapsed_ms": { "$ref": "#/$defs/nonNegativeInteger" }
       }
     },
@@ -966,11 +982,16 @@
         "renames",
         "unchanged_files",
         "protected_entries",
-        "changes"
+        "changes",
+        "link_guard_unchecked"
       ],
       "properties": {
         "schema": { "const": "sdsync.plan.v1" },
         "kind": { "const": "summary" },
+        "link_guard_unchecked": {
+          "description": "NAS folders this run listed, or passed through on the way to its scope, for which the NAS reported no real path, so a NAS link among their entries could not be told from a folder and is synced and deleted through like one. 0 means the link guard ran everywhere it was needed. A lasting, user-fixable warning: it never changes the outcome or the exit code.",
+          "$ref": "#/$defs/nonNegativeInteger"
+        },
         "uploads": { "$ref": "#/$defs/nonNegativeInteger" },
         "upload_bytes": { "$ref": "#/$defs/nonNegativeInteger" },
         "server_copy_fallback_bytes": { "$ref": "#/$defs/nonNegativeInteger" },

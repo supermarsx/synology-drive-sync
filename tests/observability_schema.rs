@@ -257,6 +257,7 @@ fn representative_plan() -> Value {
                 "detail": "the NAS holds a link here; nothing is written, deleted or descended",
             },
         ],
+        "link_guard_unchecked": 0,
         "summary": {
             "uploads": 1,
             "upload_bytes": 8192,
@@ -352,6 +353,7 @@ fn strict_schema_accepts_runtime_server_copy_and_guard_shapes() {
                 "failed": false,
                 "outcome": "complete",
                 "deferred": [],
+                "link_guard_unchecked": 0,
                 "mtime_not_kept": 0,
                 "skipped": 0,
                 "incomplete_listings": 0,
@@ -376,6 +378,7 @@ fn strict_schema_accepts_runtime_server_copy_and_guard_shapes() {
             "unchanged_files": 3,
             "protected_entries": 0,
             "changes": true,
+            "link_guard_unchecked": 0,
         }),
         json!({
             "schema": "sdsync.plan-action.v1",
@@ -441,6 +444,7 @@ fn strict_schema_accepts_runtime_server_copy_and_guard_shapes() {
                 "failed": false,
                 "outcome": "complete",
                 "deferred": [],
+                "link_guard_unchecked": 2,
                 "mtime_not_kept": 1,
                 "skipped": 0,
                 "incomplete_listings": 0,
@@ -488,6 +492,7 @@ fn strict_schema_accepts_runtime_server_copy_and_guard_shapes() {
                         "detail": "permission denied",
                     },
                 ],
+                "link_guard_unchecked": 0,
                 "mtime_not_kept": 0,
                 "skipped": 0,
                 "incomplete_listings": 0,
@@ -515,6 +520,7 @@ fn strict_schema_accepts_runtime_server_copy_and_guard_shapes() {
                 "failed": true,
                 "outcome": "failed",
                 "deferred": [],
+                "link_guard_unchecked": 0,
                 "mtime_not_kept": 0,
                 "skipped": 0,
                 "incomplete_listings": 0,
@@ -569,7 +575,7 @@ fn strict_schema_pins_the_deferral_vocabulary() {
             "changed": false, "uploaded": 0, "server_copied": 0, "upload_bytes": 0,
             "directories_created": 0, "deleted": 0, "renamed": 0, "deletes_skipped": 0,
             "kept_deletes_uploaded": 0, "changed_during_run": 0, "failed": false,
-            "outcome": "partial", "deferred": [], "mtime_not_kept": 0, "skipped": 0, "incomplete_listings": 0, "incomplete_listing_folders": [], "recovered": {"retries": 0, "reauthentications": 0, "reauthentication_failures": 0, "keepalive_failures": 0, "server_tasks_not_stopped": 0, "server_copy_fallbacks": 0}, "elapsed_ms": 1,
+            "outcome": "partial", "deferred": [], "link_guard_unchecked": 0, "mtime_not_kept": 0, "skipped": 0, "incomplete_listings": 0, "incomplete_listing_folders": [], "recovered": {"retries": 0, "reauthentications": 0, "reauthentication_failures": 0, "keepalive_failures": 0, "server_tasks_not_stopped": 0, "server_copy_fallbacks": 0}, "elapsed_ms": 1,
         },
     });
     unknown["result"]["deferred"] = json!([{"path": "a", "reason": "flaky", "detail": ""}]);
@@ -642,6 +648,25 @@ fn schema_event_reasons_match_the_core_enum_exactly() {
     let core = EventReason::ALL
         .iter()
         .map(|reason| reason.as_str().to_owned())
+        .collect::<Vec<_>>();
+    assert_eq!(published, core);
+}
+
+/// The published event-code vocabulary and the core's closed enum are one list, in either
+/// direction, so a new event cannot reach a log a schema validator would refuse.
+#[test]
+fn schema_event_codes_match_the_core_enum_exactly() {
+    use synology_drive_sync::observability::EventCode;
+    let schema: Value = serde_json::from_str(SCHEMA_TEXT).expect("schema must be valid JSON");
+    let published = schema["$defs"]["logEvent"]["properties"]["event"]["enum"]
+        .as_array()
+        .expect("event is an enum")
+        .iter()
+        .map(|value| value.as_str().expect("event codes are strings").to_owned())
+        .collect::<Vec<_>>();
+    let core = EventCode::ALL
+        .iter()
+        .map(|code| code.as_str().to_owned())
         .collect::<Vec<_>>();
     assert_eq!(published, core);
 }

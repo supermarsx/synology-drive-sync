@@ -488,6 +488,31 @@ const MANAGER_CONCURRENCY_LIMIT: usize = 3;
 #[cfg(target_os = "linux")]
 const MANAGER_PERMIT_WAIT: Duration = Duration::from_secs(5);
 
+/// How long a dashboard request waits for the enqueue or audit-outbox lock (B-10).
+///
+/// Both are held across a fork of the audit manager, which takes about 1.7 s on a loaded
+/// armv7 and up to `READ_MANAGER_TIMEOUT` when it hangs. A request used to wait for the lock
+/// with no bound, parking its worker, so an autosave burst could fill the pool and starve the
+/// reads. Eight seconds plus one full manager run stays inside `RELAY_IO_TIMEOUT`; a request
+/// that waits it out answers `control_lock_busy`, and a retry is safe because enqueueing is
+/// idempotent by client request id.
+#[cfg(target_os = "linux")]
+const REQUEST_CONTROL_LOCK_WAIT: Duration = Duration::from_secs(8);
+
+/// How long the queue consumer, the lifecycle scripts and the audit CLI wait for the same
+/// locks. Longer than any holder can legitimately keep them (three bounded manager runs), so it
+/// trips only on a holder that is stopped or stuck, and then by name instead of forever.
+#[cfg(target_os = "linux")]
+const BACKGROUND_CONTROL_LOCK_WAIT: Duration = Duration::from_secs(120);
+
+#[cfg(target_os = "linux")]
+#[allow(clippy::assertions_on_constants)]
+const _: () = assert!(
+    REQUEST_CONTROL_LOCK_WAIT.as_secs() + READ_MANAGER_TIMEOUT.as_secs()
+        < RELAY_IO_TIMEOUT.as_secs(),
+    "waiting for a control lock and then running the audit manager must fit the relay deadline"
+);
+
 // The manager-lane relationships, checked at compile time for the same reason the pool's are.
 #[cfg(target_os = "linux")]
 #[allow(clippy::assertions_on_constants)]
@@ -606,6 +631,8 @@ struct ControlPaths<'a> {
     audit_outbox_lock: &'a Path,
     package_transition: &'a Path,
     service_closed: &'a Path,
+    /// How long taking the enqueue or audit-outbox lock may wait (B-10).
+    lock_wait: Duration,
 }
 
 /// The package's own files, as the read path sees them.
@@ -725,6 +752,8 @@ struct AuditOutboxPaths<'a> {
     requests: Option<&'a Path>,
     processing: Option<&'a Path>,
     responses: Option<&'a Path>,
+    /// How long taking `lock` may wait (B-10).
+    lock_wait: Duration,
 }
 
 #[cfg(target_os = "linux")]
@@ -736,6 +765,7 @@ impl AuditOutboxPaths<'static> {
             requests: Some(Path::new(REQUESTS_DIR)),
             processing: Some(Path::new(PROCESSING_DIR)),
             responses: Some(Path::new(RESPONSES_DIR)),
+            lock_wait: BACKGROUND_CONTROL_LOCK_WAIT,
         }
     }
 }
@@ -881,6 +911,16 @@ impl ControlPaths<'static> {
             audit_outbox_lock: Path::new(AUDIT_OUTBOX_LOCK_PATH),
             package_transition: Path::new(PACKAGE_TRANSITION_PATH),
             service_closed: Path::new(SERVICE_CLOSED_PATH),
+            lock_wait: BACKGROUND_CONTROL_LOCK_WAIT,
+        }
+    }
+
+    /// The same paths for a dashboard request, which waits for a control lock only as long
+    /// as `REQUEST_CONTROL_LOCK_WAIT`.
+    fn for_request() -> Self {
+        Self {
+            lock_wait: REQUEST_CONTROL_LOCK_WAIT,
+            ..Self::production()
         }
     }
 }
@@ -894,6 +934,7 @@ impl ControlPaths<'_> {
             requests: Some(self.requests),
             processing: Some(self.processing),
             responses: Some(self.responses),
+            lock_wait: self.lock_wait,
         }
     }
 }
@@ -2772,8 +2813,27 @@ fn package_identity_can_read_and_traverse(path: &Path) -> bool {
     unsafe { libc::access(path.as_ptr(), libc::R_OK | libc::X_OK) == 0 }
 }
 
+/// How long one source-browser listing may spend on its children before it answers with what
+/// it has, `truncated` and `time_limited` (B-14).
+///
+/// Each child costs an lstat, a canonicalize, an access check and an opendir. On a cold disk
+/// that is a seek or more apiece, and 4096 of them on an API worker could pass the relay's
+/// thirty seconds, so the listing would fail outright where a partial one is useful.
+#[cfg(target_os = "linux")]
+const SOURCE_DIRECTORIES_BUDGET: Duration = Duration::from_secs(6);
+
 #[cfg(target_os = "linux")]
 fn source_directories_document(system_root: &Path, parent: &str) -> BridgeResult<Vec<u8>> {
+    source_directories_document_within(system_root, parent, SOURCE_DIRECTORIES_BUDGET)
+}
+
+/// `source_directories_document` with its time budget as a parameter, so a test can reach it.
+#[cfg(target_os = "linux")]
+fn source_directories_document_within(
+    system_root: &Path,
+    parent: &str,
+    budget: Duration,
+) -> BridgeResult<Vec<u8>> {
     const MAX_DIRECTORY_RESULTS: usize = 500;
     const MAX_SCANNED_ENTRIES: usize = 4096;
 
@@ -2800,11 +2860,18 @@ fn source_directories_document(system_root: &Path, parent: &str) -> BridgeResult
 
     let mut directories = Vec::new();
     let mut truncated = false;
+    let mut time_limited = false;
+    let started = Instant::now();
     let entries =
         fs::read_dir(&canonical_parent).map_err(|_| BridgeError::new(ErrorKind::Forbidden))?;
     for (index, entry) in entries.enumerate() {
         if index >= MAX_SCANNED_ENTRIES {
             truncated = true;
+            break;
+        }
+        if started.elapsed() >= budget {
+            truncated = true;
+            time_limited = true;
             break;
         }
         let Ok(entry) = entry else {
@@ -2864,14 +2931,17 @@ fn source_directories_document(system_root: &Path, parent: &str) -> BridgeResult
             .cmp(&right.get("name").and_then(Value::as_str))
     });
     directories.truncate(MAX_DIRECTORY_RESULTS);
-    serde_json::to_vec(&json!({
+    let mut document = json!({
         "schema": "sdsync.dsm-source-directories.v1",
         "current": parent,
         "parent": source_browser_parent(parent),
         "directories": directories,
         "truncated": truncated,
-    }))
-    .map_err(|_| BridgeError::internal())
+    });
+    if time_limited {
+        document["time_limited"] = json!(true);
+    }
+    serde_json::to_vec(&document).map_err(|_| BridgeError::internal())
 }
 
 #[cfg(target_os = "linux")]
@@ -3841,18 +3911,30 @@ fn opaque_line_level(source: &str, line: &str) -> PolicyLogLevel {
     PolicyLogLevel::Error
 }
 
+/// The value of the first `"key":"..."` in `line`, as the manager's awk finds it: how a record
+/// that is not whole JSON (a line read only up to its first 8192 bytes, G-9) is still classed
+/// by its own level and category instead of as raw output.
+fn json_marker_value<'a>(line: &'a str, key: &str) -> Option<&'a str> {
+    let marker = format!("\"{key}\":\"");
+    let start = line.find(&marker)? + marker.len();
+    let rest = &line[start..];
+    rest.find('"').map(|end| &rest[..end])
+}
+
 fn log_line_visible_at_threshold(policy: &SecurityPolicyArgs, source: &str, line: &str) -> bool {
     if source == "audit" {
         // The audit file contains only the non-disableable minimal records.
         return true;
     }
     let parsed = serde_json::from_str::<Value>(line).ok();
+    let field = |key: &str| -> Option<String> {
+        match &parsed {
+            Some(value) => value.get(key).and_then(Value::as_str).map(str::to_owned),
+            None => json_marker_value(line, key).map(str::to_owned),
+        }
+    };
     let threshold = if source == "api" {
-        match parsed
-            .as_ref()
-            .and_then(|value| value.get("category"))
-            .and_then(Value::as_str)
-        {
+        match field("category").as_deref() {
             Some(category) => policy_level_for_category(policy, category),
             // Opaque legacy API-server output is bridge-owned.
             None => Some(policy.bridge_log_level),
@@ -3863,13 +3945,7 @@ fn log_line_visible_at_threshold(policy: &SecurityPolicyArgs, source: &str, line
     let Some(threshold) = threshold else {
         return false;
     };
-    let event_level = parsed
-        .and_then(|value| {
-            value
-                .get("level")
-                .and_then(Value::as_str)
-                .map(str::to_owned)
-        })
+    let event_level = field("level")
         .and_then(|value| PolicyLogLevel::parse(&value))
         .unwrap_or_else(|| opaque_line_level(source, line));
     level_visible(threshold, event_level)
@@ -5268,9 +5344,6 @@ mod linux_socket {
     use std::os::unix::ffi::OsStrExt;
     use std::os::unix::fs::{FileTypeExt, OpenOptionsExt, PermissionsExt};
     use std::os::unix::net::{UnixListener, UnixStream};
-    use std::sync::Mutex;
-
-    static UMASK_LOCK: Mutex<()> = Mutex::new(());
 
     enum ConnectAttemptError {
         Retryable,
@@ -5423,18 +5496,12 @@ mod linux_socket {
     ) -> BridgeResult<(UnixListener, fs::Metadata)> {
         validate_socket_parent(path, package_uid)?;
         remove_stale_socket(path, package_uid, false)?;
-        let listener = {
-            let _lock = UMASK_LOCK
-                .lock()
-                .map_err(|_| BridgeError::unsafe_runtime())?;
-            // DSM executes a package CGI as the owner of its executable. The
-            // daemon and CGI therefore share the package UID, so a package-only
-            // 0600 bind would expose the listener before lifecycle commit.
-            // Bind as 0000 and activate the same inode to 0600 only after the
-            // worker pool and exact readiness identity exist.
-            let _umask = UmaskGuard::replace(0o777);
-            UnixListener::bind(path).map_err(|_| BridgeError::new(ErrorKind::Unavailable))?
-        };
+        // DSM executes a package CGI as the owner of its executable. The
+        // daemon and CGI therefore share the package UID, so a package-only
+        // 0600 bind would expose the listener before lifecycle commit.
+        // Bind as 0000 and activate the same inode to 0600 only after the
+        // worker pool and exact readiness identity exist.
+        let listener = bind_inaccessible(path, package_uid)?;
         let identity = match prepared_socket_metadata(path, package_uid) {
             Ok(identity) => identity,
             Err(error) => {
@@ -6013,30 +6080,56 @@ mod linux_socket {
             && first.st_nlink() == second.st_nlink()
     }
 
+    /// Bind `path` so that the socket is never reachable there with any mode but 0000.
+    ///
+    /// bind(2) takes the inode's mode from the umask, which every thread of the process
+    /// shares. Setting it to 0777 around the bind made any file or directory another thread
+    /// created at that instant unreadable (the parallel test suite's PermissionDenied flake),
+    /// so the umask is not touched at all. Instead the socket is bound under a fresh private
+    /// directory beside `path`, set to 0000 there, and only then linked to `path`; `link`
+    /// refuses an existing name as bind(2) did, and the staging name and directory are removed
+    /// before the caller checks the inode (one link, 0000).
+    fn bind_inaccessible(path: &Path, package_uid: u32) -> BridgeResult<UnixListener> {
+        use std::os::unix::fs::DirBuilderExt;
+        static NEXT_STAGING: AtomicU64 = AtomicU64::new(0);
+        let parent = path.parent().ok_or_else(BridgeError::unsafe_runtime)?;
+        let staging = parent.join(format!(
+            ".sdsync-bind-{}-{}",
+            std::process::id(),
+            NEXT_STAGING.fetch_add(1, AtomicOrdering::Relaxed)
+        ));
+        fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&staging)
+            .map_err(|_| BridgeError::new(ErrorKind::Unavailable))?;
+        let staged = staging.join("s");
+        let bound = UnixListener::bind(&staged)
+            .map_err(|_| BridgeError::new(ErrorKind::Unavailable))
+            .and_then(|listener| {
+                fs::set_permissions(&staged, fs::Permissions::from_mode(0o000))
+                    .map_err(|_| BridgeError::unsafe_runtime())?;
+                fs::hard_link(&staged, path)
+                    .map_err(|_| BridgeError::new(ErrorKind::Unavailable))?;
+                Ok(listener)
+            });
+        // The staging name goes whatever happened; a leftover would be a second link to the
+        // published inode, which `prepared_socket_metadata` refuses, so a failure is an error.
+        let staged_removed = match fs::remove_file(&staged) {
+            Ok(()) => true,
+            Err(error) => error.kind() == io::ErrorKind::NotFound,
+        };
+        let staging_removed = fs::remove_dir(&staging).is_ok();
+        let listener = bound?;
+        if !staged_removed || !staging_removed {
+            drop(listener);
+            remove_new_socket(path, package_uid);
+            return Err(BridgeError::unsafe_runtime());
+        }
+        Ok(listener)
+    }
+
     fn same_inode(first: &fs::Metadata, second: &fs::Metadata) -> bool {
         first.st_dev() == second.st_dev() && first.st_ino() == second.st_ino()
-    }
-
-    struct UmaskGuard {
-        previous: libc::mode_t,
-    }
-
-    impl UmaskGuard {
-        fn replace(mode: libc::mode_t) -> Self {
-            // SAFETY: umask has no pointer arguments. The caller holds the
-            // module lock and production calls this before accepting clients.
-            let previous = unsafe { libc::umask(mode) };
-            Self { previous }
-        }
-    }
-
-    impl Drop for UmaskGuard {
-        fn drop(&mut self) {
-            // SAFETY: restoring the value returned by umask is always valid.
-            unsafe {
-                libc::umask(self.previous);
-            }
-        }
     }
 }
 
@@ -6334,7 +6427,10 @@ mod linux_process {
         }
     }
 
-    /// A queued manager's stderr: the first `MAX_QUEUED_STDERR_BYTES` kept, all of it counted.
+    /// A queued manager's stderr: the last `MAX_QUEUED_STDERR_BYTES` kept, all of it counted.
+    ///
+    /// The last, not the first: a manager names its cause last, and keeping the head made the
+    /// api.log summary quote a line from the start of a long stream (RB-6).
     #[derive(Default)]
     struct QueuedStderr {
         kept: Zeroizing<Vec<u8>>,
@@ -6358,8 +6454,11 @@ mod linux_process {
                     }
                     Ok(length) => {
                         self.total = self.total.saturating_add(length);
-                        let room = MAX_QUEUED_STDERR_BYTES.saturating_sub(self.kept.len());
-                        self.kept.extend_from_slice(&chunk[..length.min(room)]);
+                        self.kept.extend_from_slice(&chunk[..length]);
+                        let excess = self.kept.len().saturating_sub(MAX_QUEUED_STDERR_BYTES);
+                        if excess > 0 {
+                            self.kept.drain(..excess);
+                        }
                     }
                     Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
                     Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Ok(()),
@@ -9598,6 +9697,7 @@ mod linux_files {
                     | "changed"
                     | "unavailable"
                     | "requested"
+                    | "cancelled"
             )
         {
             return Err(BridgeError::unsafe_runtime());
@@ -10824,12 +10924,29 @@ mod linux_files {
         {
             return Err(BridgeError::unsafe_runtime());
         }
-        // SAFETY: flock receives a valid live file descriptor and a fixed
-        // operation.  The descriptor remains open for the full enqueue.
-        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } != 0 {
-            return Err(BridgeError::unsafe_runtime());
-        }
+        // The descriptor remains open for the full enqueue.
+        lock_exclusive_within(&file, paths.lock_wait)?;
         Ok(file)
+    }
+
+    /// Take an exclusive flock, waiting at most `wait` for a holder to let go (B-10): past it
+    /// the request answers `control_lock_busy` rather than parking its worker indefinitely.
+    pub(super) fn lock_exclusive_within(file: &File, wait: Duration) -> BridgeResult<()> {
+        let started = Instant::now();
+        loop {
+            // SAFETY: flock receives a valid live file descriptor and a fixed operation.
+            if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+                return Ok(());
+            }
+            match io::Error::last_os_error().raw_os_error() {
+                Some(libc::EWOULDBLOCK | libc::EINTR) => {}
+                _ => return Err(BridgeError::unsafe_runtime()),
+            }
+            if started.elapsed() >= wait {
+                return Err(BridgeError::unavailable_because("control_lock_busy"));
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
     }
 
     pub(super) fn private_file_metadata_with_companion(
@@ -12569,10 +12686,7 @@ mod linux_files {
         {
             return Err(BridgeError::unsafe_runtime());
         }
-        // SAFETY: flock receives a valid descriptor and a fixed operation.
-        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } != 0 {
-            return Err(BridgeError::unsafe_runtime());
-        }
+        lock_exclusive_within(&file, paths.lock_wait)?;
         Ok(file)
     }
 
@@ -14657,7 +14771,7 @@ fn handle_relay_request_under_policy(
         .map_err(|error| CgiFailure::new(CgiFailureStage::Authentication, error))?;
     let session = validate_relay_authenticated_session(&relay, authentication, resolved_uid)
         .map_err(|error| CgiFailure::new(CgiFailureStage::Authentication, error))?;
-    let control_paths = ControlPaths::production();
+    let control_paths = ControlPaths::for_request();
     linux_files::require_open_runtime_admission(&control_paths, package_uid)
         .map_err(|error| CgiFailure::new(CgiFailureStage::ServiceRequest, error))?;
     let policy = linux_files::load_security_policy(package_uid).map_err(|error| {
@@ -14714,7 +14828,7 @@ fn execute_authenticated_request(
     now: u64,
     policy: &SecurityPolicyArgs,
 ) -> BridgeResult<CgiResponse> {
-    let control_paths = ControlPaths::production();
+    let control_paths = ControlPaths::for_request();
     match request {
         ValidatedHttpRequest::Get { action, .. } => match action {
             ReadAction::Csrf => {
@@ -15772,7 +15886,9 @@ fn render_activity_event(record: &[u8]) -> BridgeResult<ActivityEvent> {
         b"scheduler",
     ];
     const LEVELS: [&[u8]; 5] = [b"trace", b"debug", b"info", b"warn", b"error"];
-    const STATES: [&[u8]; 8] = [
+    // `cancelled` (D3-UI-7) is accepted here, by the tail repair and by the manager's reader
+    // before any writer emits it: a writer ahead of its readers is a 503 on every read.
+    const STATES: [&[u8]; 9] = [
         b"running",
         b"succeeded",
         b"failed",
@@ -15781,6 +15897,7 @@ fn render_activity_event(record: &[u8]) -> BridgeResult<ActivityEvent> {
         b"changed",
         b"unavailable",
         b"requested",
+        b"cancelled",
     ];
 
     let fields: Vec<&[u8]> = if record.is_empty() {
@@ -17169,10 +17286,11 @@ fn run_outcome_value(
         .unwrap_or_else(|| "none".to_owned());
     let mut warnings = entry_warnings(outcome, skipped, deferred);
     let facts = result_facts(&record, &mut warnings, errors);
-    // A live run's age, so a hung one is told apart from a healthy one (ADV-B-6).
-    let running_for = if outcome == "running" {
+    // A live run's age, so a hung one is told apart from a healthy one (ADV-B-6). A start
+    // ahead of the clock by more than the tolerated skew has no age to report (RB-3).
+    let now = if outcome == "running" {
         match current_epoch() {
-            Ok(now) => Some(now.saturating_sub(started)),
+            Ok(now) => Some(now),
             Err(_) => {
                 errors.push("run.state", "clock_unavailable");
                 None
@@ -17181,6 +17299,13 @@ fn run_outcome_value(
     } else {
         None
     };
+    let running_for = now.and_then(|now| match past_age(now, started) {
+        Some(age) => Some(age),
+        None => {
+            errors.push("run.state", "clock_skew");
+            None
+        }
+    });
     let long_running = running_for.is_some_and(|age| age > LONG_RUNNING_SECONDS);
     if long_running {
         warnings.push("long_running");
@@ -17188,16 +17313,37 @@ fn run_outcome_value(
     // `heartbeat_epoch=`: the runner's last sign of core progress. Absent (an older runner, or
     // one that does not publish it) leaves the question open rather than answering "not stalled".
     let heartbeat = record.number("heartbeat_epoch", errors);
-    let stalled = match (outcome, heartbeat, current_epoch()) {
-        ("running", Some(heartbeat), Ok(now)) => {
-            Some(now.saturating_sub(heartbeat) > STALLED_RUN_SECONDS)
-        }
+    let heartbeat_source = optional_token(&record, "heartbeat_source", errors);
+    // G-10: `liveness` means the runner could not read the core's I/O counters, so the
+    // heartbeat says the process exists, not that it progresses. That is "cannot tell", never
+    // "not stalled", and it is said: the dashboard must not stay silent about a hang it cannot
+    // see.
+    let unobservable = heartbeat_source.as_deref() == Some("liveness");
+    if outcome == "running" && unobservable {
+        warnings.push("stall_unobservable");
+    }
+    let stalled = match (heartbeat, now) {
+        _ if unobservable => None,
+        (Some(heartbeat), Some(now)) => match past_age(now, heartbeat) {
+            Some(age) => Some(age > STALLED_RUN_SECONDS),
+            // A heartbeat from the future says nothing about progress (RB-3).
+            None => {
+                errors.push("run.state", "clock_skew");
+                None
+            }
+        },
         _ => None,
     };
     if stalled == Some(true) {
         warnings.push("stalled");
     }
-    let stderr_log = run_stderr_pointer(paths, package_uid, finished, errors);
+    let stderr_log = run_stderr_pointer(
+        paths,
+        package_uid,
+        finished,
+        (&scope, &operation, exit_code),
+        errors,
+    );
     // A dead runner's `running` is not a state anything is in; the stale verdict below is.
     let state = if stale_reason.is_some() {
         "failed".into()
@@ -17230,16 +17376,31 @@ fn run_outcome_value(
         "stalled": stalled,
         "heartbeat_epoch": heartbeat,
         // What the runner last saw advance (`io`, `progress`, `liveness`): a token, passed through.
-        "heartbeat_source": optional_token(&record, "heartbeat_source", errors),
+        "heartbeat_source": heartbeat_source,
     });
     merge_facts(&mut value, facts);
     value
 }
 
+/// How far ahead of the clock a run record's start or heartbeat may be before it is read as
+/// clock skew rather than as an age of zero (RB-3).
+#[cfg(target_os = "linux")]
+const RUN_RECORD_SKEW_SECONDS: u64 = 60;
+
+/// How long ago `epoch` was at `now`: zero for a moment up to `RUN_RECORD_SKEW_SECONDS` ahead,
+/// and `None` for one further ahead, which only a clock stepped back since it was written
+/// produces.
+#[cfg(target_os = "linux")]
+fn past_age(now: u64, epoch: u64) -> Option<u64> {
+    (epoch <= now.saturating_add(RUN_RECORD_SKEW_SECONDS)).then(|| now.saturating_sub(epoch))
+}
+
 /// `stderr_log`: whether run-stderr.log holds the core's stderr for the run this block reports.
 ///
 /// The runner opens each kept tail with `# epoch=<finished> scope=<..> operation=<..> exit=<n>`,
-/// and only a header naming this run's `finished_epoch` makes the tail this run's cause. The
+/// and only a header naming this run's `finished_epoch`, and its scope, operation and exit
+/// where the header names them, makes the tail this run's cause: a same-second failure of
+/// another scope must not be shown as this run's (RB-2). The
 /// lines themselves are served by the `run-stderr` logs source, which the manager redacts like
 /// every other log; the snapshot only says they are there. `null` for no file, no header, or
 /// another run's tail; an unsafe file is named in `errors`.
@@ -17248,6 +17409,7 @@ fn run_stderr_pointer(
     paths: &PackagePaths<'_>,
     package_uid: u32,
     finished: u64,
+    (scope, operation, run_exit): (&str, &str, Option<u64>),
     errors: &mut OutcomeErrors,
 ) -> Value {
     if finished == 0 {
@@ -17280,14 +17442,24 @@ fn run_stderr_pointer(
     };
     let mut epoch = None;
     let mut exit_code = None;
+    let mut header_scope = None;
+    let mut header_operation = None;
     for field in fields.split(|byte| *byte == b' ') {
         if let Some(value) = field.strip_prefix(b"epoch=") {
             epoch = number(value);
         } else if let Some(value) = field.strip_prefix(b"exit=") {
             exit_code = number(value);
+        } else if let Some(value) = field.strip_prefix(b"scope=") {
+            header_scope = Some(value);
+        } else if let Some(value) = field.strip_prefix(b"operation=") {
+            header_operation = Some(value);
         }
     }
-    if epoch != Some(finished) {
+    if epoch != Some(finished)
+        || header_scope.is_some_and(|value| value != scope.as_bytes())
+        || header_operation.is_some_and(|value| value != operation.as_bytes())
+        || matches!((exit_code, run_exit), (Some(header), Some(run)) if header != run)
+    {
         return Value::Null;
     }
     json!({
@@ -17367,6 +17539,13 @@ fn result_facts(
         warnings.push("mtime_not_kept");
     }
     facts.insert("mtime_not_kept".to_owned(), json!(mtime));
+    // G-11: folders the NAS gave no real path for, so links inside them went unchecked. A
+    // lasting warning, not a failure: the run synced through them as folders.
+    let unchecked = record.number("link_guard_unchecked", errors);
+    if unchecked.is_some_and(|count| count > 0) {
+        warnings.push("link_guard_unchecked");
+    }
+    facts.insert("link_guard_unchecked".to_owned(), json!(unchecked));
     let mut recovered = serde_json::Map::new();
     for (key, warning) in [
         ("reauthentication_failures", "reauthentication_failures"),
@@ -17957,11 +18136,86 @@ fn attach_snapshot_outcomes(
         retire_stale_running(root, outcomes["run"]["scope"].as_str().unwrap_or("none"));
     }
     root.insert("outcomes".to_owned(), outcomes);
+    root.insert("nas_clock".to_owned(), nas_clock_value());
     let body = serde_json::to_vec(&document).map_err(|_| BridgeError::internal())?;
     if body.len() > MAX_SNAPSHOT_RESPONSE_BYTES {
         return Err(BridgeError::unavailable_because("manager_output_too_large"));
     }
     Ok(CgiResponse::success(body))
+}
+
+/// The NAS's own clock, so the dashboard can show ages and times in NAS time (D3-UI-5).
+///
+/// A browser in another zone, or with a skewed clock, read NAS epochs against its own clock
+/// and zone: evidence 85 s old read "121 minutes ago", and a routine window entered as 02:00
+/// was shown beside Activity times in a different clock. `now_epoch` is read when the
+/// snapshot is answered; `utc_offset_seconds` and `zone` are what the C library's
+/// `localtime_r` reports for it, the same zone database `date +%z` reads where the controller
+/// evaluates routine windows. A zone the library cannot report is `null` with `error` naming
+/// why, never a guessed UTC.
+#[cfg(target_os = "linux")]
+fn nas_clock_value() -> Value {
+    let now = match current_epoch() {
+        Ok(now) => now,
+        Err(_) => {
+            return json!({
+                "now_epoch": Value::Null,
+                "utc_offset_seconds": Value::Null,
+                "zone": Value::Null,
+                "error": "clock_unavailable",
+            });
+        }
+    };
+    match local_utc_offset(now) {
+        Some((offset, zone)) => json!({
+            "now_epoch": now,
+            "utc_offset_seconds": offset,
+            "zone": zone,
+        }),
+        None => json!({
+            "now_epoch": now,
+            "utc_offset_seconds": Value::Null,
+            "zone": Value::Null,
+            "error": "timezone_unavailable",
+        }),
+    }
+}
+
+/// The UTC offset in seconds, and the zone abbreviation when it is printable, in effect at
+/// `epoch` on this host.
+#[cfg(target_os = "linux")]
+fn local_utc_offset(epoch: u64) -> Option<(i64, Option<String>)> {
+    let time = libc::time_t::try_from(epoch).ok()?;
+    // SAFETY: an all-zero `tm` is a valid value for every field (the zone pointer is null),
+    // and localtime_r only writes through the two pointers it is given.
+    let mut broken_down: libc::tm = unsafe { std::mem::zeroed() };
+    // SAFETY: both pointers are valid for the duration of the call; localtime_r is the
+    // reentrant form and keeps no reference to either.
+    let converted = unsafe { libc::localtime_r(&time, &mut broken_down) };
+    if converted.is_null() {
+        return None;
+    }
+    // `c_long` is 32 bits on armv7, so the conversion is not useless everywhere.
+    #[allow(clippy::useless_conversion)]
+    let offset = i64::from(broken_down.tm_gmtoff);
+    // A zone east or west of UTC by more than a day is not a zone.
+    if offset.abs() > 24 * 60 * 60 {
+        return None;
+    }
+    let zone = if broken_down.tm_zone.is_null() {
+        None
+    } else {
+        // SAFETY: a non-null tm_zone points at a NUL-terminated string the C library keeps
+        // alive for the life of the process (its zone table).
+        let bytes = unsafe { std::ffi::CStr::from_ptr(broken_down.tm_zone) }.to_bytes();
+        (!bytes.is_empty()
+            && bytes.len() <= 16
+            && bytes
+                .iter()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'-')))
+        .then(|| String::from_utf8_lossy(bytes).into_owned())
+    };
+    Some((offset, zone))
 }
 
 /// Make the legacy `run` block say what `outcomes.run` says (ADV-B-11).
@@ -18134,9 +18388,130 @@ const AGGREGATE_LOG_SOURCES: [LogSource; 6] = [
 #[cfg(target_os = "linux")]
 const MAX_LOG_SCAN_BYTES: u64 = 1024 * 1024;
 
-/// The manager's per-line ceiling, applied before the threshold test and again after redaction.
+/// The manager's per-line ceiling, applied once, after redaction, on a character boundary.
+///
+/// It used to be applied first as well, so a secret still open at the cut, or straddling it,
+/// was never seen whole by the redaction and came back in clear (G-9). The level is still read
+/// from a line's first `MAX_LOG_LINE_BYTES`, which are never returned unredacted.
 #[cfg(target_os = "linux")]
 const MAX_LOG_LINE_BYTES: usize = 8192;
+
+/// What a logs read shows instead of a line it cannot vouch for: one that still holds a secret
+/// after every rewrite. The shell rung's awk uses the same text.
+#[cfg(target_os = "linux")]
+const WITHHELD_LOG_LINE: &str = "[line withheld: could not be redacted]";
+
+/// The longest line the reader redacts (G-9). A longer one is withheld whole, never cut: a
+/// secret that straddles a cut leaves its prefix in view, so only a line the redactor saw
+/// whole is shown at all. Four times the display ceiling.
+#[cfg(target_os = "linux")]
+const MAX_REDACT_LINE_BYTES: usize = 32 * 1024;
+
+/// What a line over `MAX_REDACT_LINE_BYTES` is shown as, on both rungs, with its raw length.
+#[cfg(target_os = "linux")]
+fn withheld_line(raw_bytes: usize) -> String {
+    format!("[line too long: {raw_bytes} bytes, withheld]")
+}
+
+/// Every redaction needle, raw and as JSON escapes it, found by its first two bytes.
+///
+/// One pass over a line says which needles occur in it, so a line that holds no secret, which
+/// is nearly every line, costs the same whatever the number of profiles, and a line that holds
+/// one is rewritten only for the needles it holds. Running every needle over every line made a
+/// 1000-line read grow with the profile count (RB-4, SC-5).
+#[cfg(target_os = "linux")]
+struct NeedleIndex {
+    /// In the order given: a needle's id is its position here.
+    needles: Vec<Zeroizing<Vec<u8>>>,
+    /// The ids of the one-byte needles, by that byte.
+    singles: Vec<Vec<usize>>,
+    /// A bit per two-byte prefix that starts some needle.
+    pairs: Vec<u64>,
+    by_pair: BTreeMap<u16, Vec<usize>>,
+}
+
+#[cfg(target_os = "linux")]
+impl NeedleIndex {
+    fn new<'a>(needles: impl IntoIterator<Item = &'a [u8]>) -> Self {
+        let mut index = Self {
+            needles: Vec::new(),
+            singles: vec![Vec::new(); 256],
+            pairs: vec![0; 65536 / 64],
+            by_pair: BTreeMap::new(),
+        };
+        for needle in needles {
+            let id = index.needles.len();
+            match needle {
+                [] => {}
+                [only] => index.singles[usize::from(*only)].push(id),
+                [first, second, ..] => {
+                    let key = u16::from_be_bytes([*first, *second]);
+                    index.pairs[usize::from(key) / 64] |= 1 << (key % 64);
+                    index.by_pair.entry(key).or_default().push(id);
+                }
+            }
+            index.needles.push(Zeroizing::new(needle.to_vec()));
+        }
+        index
+    }
+
+    /// Visit the id of every needle occurrence in `text`, until `visit` returns true.
+    fn scan(&self, text: &[u8], mut visit: impl FnMut(usize) -> bool) {
+        for (at, first) in text.iter().enumerate() {
+            for id in &self.singles[usize::from(*first)] {
+                if visit(*id) {
+                    return;
+                }
+            }
+            let Some(second) = text.get(at + 1) else {
+                break;
+            };
+            let key = u16::from_be_bytes([*first, *second]);
+            if self.pairs[usize::from(key) / 64] & (1 << (key % 64)) == 0 {
+                continue;
+            }
+            for id in self.by_pair.get(&key).into_iter().flatten() {
+                if text[at..].starts_with(&self.needles[*id]) && visit(*id) {
+                    return;
+                }
+            }
+        }
+    }
+
+    /// Whether any needle occurs anywhere in `text`.
+    fn any_in(&self, text: &[u8]) -> bool {
+        let mut found = false;
+        self.scan(text, |_| {
+            found = true;
+            true
+        });
+        found
+    }
+
+    /// Which needles occur in `text`, by id.
+    fn present_in(&self, text: &[u8]) -> Vec<bool> {
+        let mut present = vec![false; self.needles.len()];
+        self.scan(text, |id| {
+            present[id] = true;
+            false
+        });
+        present
+    }
+}
+
+/// Cut `text` to at most `limit` bytes without splitting a UTF-8 sequence: a split character
+/// became U+FFFD here and made the shell rung's whole read invalid (RB-7).
+#[cfg(target_os = "linux")]
+fn truncate_on_character_boundary(text: &mut Vec<u8>, limit: usize) {
+    if text.len() <= limit {
+        return;
+    }
+    let mut cut = limit;
+    while cut > 0 && text[cut] & 0xc0 == 0x80 {
+        cut -= 1;
+    }
+    text.truncate(cut);
+}
 
 /// One source's files, oldest first, as the manager lists them.
 #[cfg(target_os = "linux")]
@@ -18167,6 +18542,8 @@ struct LogRedaction {
     needles: Vec<Zeroizing<Vec<u8>>>,
     /// Each needle as `serde_json` escapes it, for lines that are JSON records.
     encoded_needles: Vec<Zeroizing<Vec<u8>>>,
+    /// Both lists, for the one-pass test of whether a line holds any of them.
+    index: NeedleIndex,
     paths: Vec<(Vec<u8>, &'static [u8])>,
 }
 
@@ -18183,7 +18560,7 @@ impl LogRedaction {
             (canonical(paths.package_home), b"[package-home]".as_slice()),
             (canonical(paths.package_var), b"[package-var]".as_slice()),
         ];
-        let encoded_needles = needles
+        let encoded_needles: Vec<Zeroizing<Vec<u8>>> = needles
             .iter()
             .map(|needle| {
                 let encoded =
@@ -18192,9 +18569,16 @@ impl LogRedaction {
                 Zeroizing::new(encoded[1..encoded.len().saturating_sub(1).max(1)].to_vec())
             })
             .collect();
+        let index = NeedleIndex::new(
+            needles
+                .iter()
+                .chain(&encoded_needles)
+                .map(|needle| needle.as_slice()),
+        );
         Self {
             needles,
             encoded_needles,
+            index,
             paths: label_paths
                 .into_iter()
                 .filter_map(|(path, label)| {
@@ -18205,33 +18589,133 @@ impl LogRedaction {
         }
     }
 
+    /// Redact the whole line, then cut it: never the other way round (G-9).
+    ///
+    /// Terminal escapes are stripped first, so a secret one splits is matched as it will be
+    /// read. A line takes the string-token rule only when it is a whole JSON record; anything
+    /// else, a `[12:00] ...` line included, is text and every needle is replaced everywhere in
+    /// it. A record whose token pass still leaves a needle (one spelled entirely in JSON
+    /// structure characters, outside every string) is redacted by the text rule instead, and
+    /// a line that still holds a needle after every rewrite is withheld, never shown.
     fn apply(&self, line: &[u8]) -> String {
-        let first = line.iter().position(|byte| !matches!(byte, b' ' | b'\t'));
-        let structured = first.is_some_and(|first| matches!(line[first], b'{' | b'['));
+        let line = Zeroizing::new(strip_ansi(line));
+        // The index lists the raw needles, then the encoded ones; only the needles this line
+        // holds are run, in the manager's order.
+        let present = self.index.present_in(&line);
         let mut text = Zeroizing::new(line.to_vec());
-        if structured {
-            // Only inside string tokens, so a secret that happens to spell a JSON literal can
-            // never break the record's structure.
-            text = Zeroizing::new(redact_json_string_tokens(&text, &self.encoded_needles));
-        } else {
-            for (encoded, raw) in self.encoded_needles.iter().zip(&self.needles) {
-                text = Zeroizing::new(replace_all(&text, encoded, b"[redacted]"));
-                text = Zeroizing::new(replace_all(&text, raw, b"[redacted]"));
+        if present.contains(&true) {
+            let record = json_record_shape(&line);
+            if record {
+                let raw_count = self.needles.len();
+                let held = self
+                    .encoded_needles
+                    .iter()
+                    .enumerate()
+                    .filter(|(position, _)| present[raw_count + position])
+                    .map(|(_, needle)| needle.as_slice())
+                    .collect::<Vec<_>>();
+                // Only inside string tokens, so a secret that happens to spell a JSON literal
+                // can never break the record's structure.
+                text = Zeroizing::new(redact_json_string_tokens(&line, &held));
+            }
+            if !record || self.index.any_in(&text) {
+                text = Zeroizing::new(self.redact_as_text(&line, &present));
             }
         }
-        let mut text = strip_ansi(&text);
         for (path, label) in &self.paths {
-            text = replace_all(&text, path, label);
+            text = Zeroizing::new(replace_all(&text, path, label));
         }
-        let mut text = redact_secret_paths(&text);
-        text.truncate(MAX_LOG_LINE_BYTES);
-        for byte in &mut text {
+        let mut text = Zeroizing::new(redact_secret_paths(&text));
+        if self.index.any_in(&text) {
+            return WITHHELD_LOG_LINE.to_owned();
+        }
+        for byte in text.iter_mut() {
             if matches!(byte, 0 | 1..=8 | 0x0b | 0x0c | 0x0e..=0x1f) {
                 *byte = b'?';
             }
         }
+        truncate_on_character_boundary(&mut text, MAX_LOG_LINE_BYTES);
         String::from_utf8_lossy(&text).into_owned()
     }
+
+    /// The text rule: each needle the line holds, encoded then raw, replaced everywhere.
+    fn redact_as_text(&self, line: &[u8], present: &[bool]) -> Vec<u8> {
+        let raw_count = self.needles.len();
+        let mut text = Zeroizing::new(line.to_vec());
+        for (position, (encoded, raw)) in self.encoded_needles.iter().zip(&self.needles).enumerate()
+        {
+            if present[raw_count + position] {
+                text = Zeroizing::new(replace_all(&text, encoded, b"[redacted]"));
+            }
+            if present[position] {
+                text = Zeroizing::new(replace_all(&text, raw, b"[redacted]"));
+            }
+        }
+        text.to_vec()
+    }
+}
+
+/// Whether a line is a single JSON record: it opens with `{` or `[`, closes with the matching
+/// bracket, and outside its string tokens holds only what JSON puts there (G-9). Anything else
+/// is text, and text is redacted everywhere; a bracket at the start of a line used to be
+/// enough for the token-only rule, which never looked outside the quotes.
+#[cfg(target_os = "linux")]
+fn json_record_shape(line: &[u8]) -> bool {
+    let trimmed = line.trim_ascii();
+    let (Some(&open), Some(&close)) = (trimmed.first(), trimmed.last()) else {
+        return false;
+    };
+    if !matches!((open, close), (b'{', b'}') | (b'[', b']')) {
+        return false;
+    }
+    let mut index = 0;
+    while index < trimmed.len() {
+        match trimmed[index] {
+            b'"' => {
+                index += 1;
+                let mut escaped = false;
+                loop {
+                    let Some(&byte) = trimmed.get(index) else {
+                        return false;
+                    };
+                    index += 1;
+                    if escaped {
+                        escaped = false;
+                    } else if byte == b'\\' {
+                        escaped = true;
+                    } else if byte == b'"' {
+                        break;
+                    }
+                }
+            }
+            b' '
+            | b'\t'
+            | b'{'
+            | b'}'
+            | b'['
+            | b']'
+            | b','
+            | b':'
+            | b'0'..=b'9'
+            | b'+'
+            | b'-'
+            | b'.'
+            | b'e'
+            | b'E'
+            | b't'
+            | b'r'
+            | b'u'
+            | b'f'
+            | b'a'
+            | b'l'
+            | b's'
+            | b'n' => {
+                index += 1;
+            }
+            _ => return false,
+        }
+    }
+    true
 }
 
 #[cfg(target_os = "linux")]
@@ -18255,7 +18739,7 @@ fn replace_all(text: &[u8], needle: &[u8], replacement: &[u8]) -> Vec<u8> {
 
 /// Replace `needles` only inside the JSON string tokens of `line`.
 #[cfg(target_os = "linux")]
-fn redact_json_string_tokens(line: &[u8], needles: &[Zeroizing<Vec<u8>>]) -> Vec<u8> {
+fn redact_json_string_tokens(line: &[u8], needles: &[&[u8]]) -> Vec<u8> {
     let mut result = Vec::with_capacity(line.len());
     let mut index = 0;
     while index < line.len() {
@@ -18276,11 +18760,9 @@ fn redact_json_string_tokens(line: &[u8], needles: &[Zeroizing<Vec<u8>>]) -> Vec
             }
             index += 1;
         }
-        if index >= line.len() {
-            result.extend_from_slice(&line[start..]);
-            return result;
-        }
-        let mut token = line[start..=index].to_vec();
+        // A string still open at the end of the line is a token too: returning it unredacted
+        // let a secret through whenever the line ended inside one (G-9).
+        let mut token = line[start..=index.min(line.len() - 1)].to_vec();
         for needle in needles {
             token = replace_all(&token, needle, b"[redacted]");
         }
@@ -18395,9 +18877,31 @@ fn visit_lines_newest_first(
     }
 }
 
-/// The newest `requested` lines of one source that the policy shows, redacted, oldest first,
-/// within `byte_limit` encoded bytes; and whether the scan stopped at its byte budget.
+/// How long one logs read may work before it answers with what it has found (SC-5).
+///
+/// The dashboard gives a read ten seconds and then abandons it, and an abandoned read used to
+/// run on in its worker while the next poll started another, so a slow NAS could fill the pool
+/// with reads nobody would receive. Four seconds keeps a read well inside the dashboard's
+/// window; a source the deadline cut says so (`scan_limited` plus `deadline_reached`), and
+/// api.log names it.
 #[cfg(target_os = "linux")]
+const LOGS_READ_DEADLINE: Duration = Duration::from_secs(4);
+
+/// One source's answer: its newest visible lines, oldest first, and why the scan stopped short
+/// if it did.
+#[cfg(target_os = "linux")]
+struct SourceTail {
+    lines: Vec<String>,
+    /// The byte budget, not the start of the history, ended the scan.
+    scan_limited: bool,
+    /// The read's deadline ended the scan.
+    deadline_reached: bool,
+}
+
+/// The newest `requested` lines of one source that the policy shows, redacted, oldest first,
+/// within `byte_limit` encoded bytes; scanning stops at the byte budget or at `deadline`.
+#[cfg(target_os = "linux")]
+#[allow(clippy::too_many_arguments)]
 fn tail_log_source(
     log_root: &Path,
     package_uid: u32,
@@ -18406,8 +18910,17 @@ fn tail_log_source(
     byte_limit: usize,
     policy: &SecurityPolicyArgs,
     redaction: &LogRedaction,
-) -> BridgeResult<(Vec<String>, bool)> {
+    deadline: Instant,
+) -> BridgeResult<SourceTail> {
     use std::ops::ControlFlow;
+    if Instant::now() >= deadline {
+        // Nothing of this source was read, so nothing of it is claimed either way.
+        return Ok(SourceTail {
+            lines: Vec::new(),
+            scan_limited: true,
+            deadline_reached: true,
+        });
+    }
     // Every file is checked before any is read, as the manager's preflight does.
     let mut opened = Vec::new();
     for path in log_source_files(log_root, source) {
@@ -18420,14 +18933,25 @@ fn tail_log_source(
     let mut selected_bytes = 2_usize;
     let mut budget = MAX_LOG_SCAN_BYTES;
     let mut limited = false;
+    let mut deadline_reached = false;
     for (file, length) in opened.iter().rev() {
         let mut done = false;
         limited = visit_lines_newest_first(file, *length, &mut budget, |line| {
-            let line = &line[..line.len().min(MAX_LOG_LINE_BYTES)];
-            if !log_line_visible_at_threshold(policy, name, &String::from_utf8_lossy(line)) {
+            if Instant::now() >= deadline {
+                deadline_reached = true;
+                return ControlFlow::Break(());
+            }
+            // The level is read from the head of the line only; the head is never returned.
+            let head = &line[..line.len().min(MAX_LOG_LINE_BYTES)];
+            if !log_line_visible_at_threshold(policy, name, &String::from_utf8_lossy(head)) {
                 return ControlFlow::Continue(());
             }
-            let shown = redaction.apply(line);
+            // Redacted whole, or withheld whole: never cut first (G-9).
+            let shown = if line.len() > MAX_REDACT_LINE_BYTES {
+                withheld_line(line.len())
+            } else {
+                redaction.apply(line)
+            };
             let cost = serde_json::to_string(&shown).map_or(usize::MAX, |encoded| encoded.len())
                 + usize::from(!selected.is_empty());
             if selected_bytes.saturating_add(cost) > byte_limit {
@@ -18442,12 +18966,16 @@ fn tail_log_source(
             }
             ControlFlow::Continue(())
         })?;
-        if done || limited {
+        if done || limited || deadline_reached {
             break;
         }
     }
     selected.reverse();
-    Ok((selected, limited))
+    Ok(SourceTail {
+        lines: selected,
+        scan_limited: limited || deadline_reached,
+        deadline_reached,
+    })
 }
 
 /// Rung A for `logs`: read each source's newest lines backwards, bounded, instead of having the
@@ -18465,9 +18993,26 @@ fn logs_document(
     action: &ReadAction,
     policy: &SecurityPolicyArgs,
 ) -> BridgeResult<Vec<u8>> {
+    logs_document_within(paths, package_uid, action, policy, LOGS_READ_DEADLINE)
+}
+
+/// `logs_document` with its deadline as a parameter, so a test can reach it.
+///
+/// Each source gets an even share of what is left when its turn comes, so a slow first source
+/// cannot leave the others nothing, and time a fast source did not use passes to the next.
+#[cfg(target_os = "linux")]
+fn logs_document_within(
+    paths: &PackagePaths<'_>,
+    package_uid: u32,
+    action: &ReadAction,
+    policy: &SecurityPolicyArgs,
+    allowed: Duration,
+) -> BridgeResult<Vec<u8>> {
     let ReadAction::Logs { lines, source } = action else {
         return Err(BridgeError::internal());
     };
+    let started = Instant::now();
+    let deadline = started + allowed;
     let needles = linux_files::log_redaction_needles(paths.secrets_dir, package_uid)?;
     let redaction = LogRedaction::new(paths, needles);
     let (sources, byte_limit): (&[LogSource], usize) = if *source == LogSource::All {
@@ -18476,8 +19021,12 @@ fn logs_document(
         (std::slice::from_ref(source), 786_432)
     };
     let mut logs = Vec::with_capacity(sources.len());
-    for source in sources {
-        let (lines, limited) = tail_log_source(
+    let mut cut = Vec::new();
+    for (turn, source) in sources.iter().enumerate() {
+        let now = Instant::now();
+        let left = u32::try_from(sources.len() - turn).unwrap_or(1);
+        let share = now + deadline.saturating_duration_since(now) / left;
+        let tail = tail_log_source(
             paths.log_root,
             package_uid,
             *source,
@@ -18485,12 +19034,20 @@ fn logs_document(
             byte_limit,
             policy,
             &redaction,
+            share,
         )?;
-        let mut entry = json!({ "source": source.as_str(), "lines": lines });
-        if limited {
+        let mut entry = json!({ "source": source.as_str(), "lines": tail.lines });
+        if tail.scan_limited {
             entry["scan_limited"] = json!(true);
         }
+        if tail.deadline_reached {
+            entry["deadline_reached"] = json!(true);
+            cut.push(source.as_str());
+        }
         logs.push(entry);
+    }
+    if !cut.is_empty() {
+        note_logs_read_deadline(paths, package_uid, policy, &cut, started.elapsed());
     }
     let document = serde_json::to_vec(&json!({
         "schema": "sdsync.dsm-logs.v1",
@@ -18498,6 +19055,53 @@ fn logs_document(
     }))
     .map_err(|_| BridgeError::internal())?;
     parse_and_sanitize_manager_json(&document, action, None, Some(policy))
+}
+
+/// Say in api.log that a logs read stopped at its deadline (SC-5), naming the sources it cut.
+///
+/// At most once per five minutes per service, like `note_malformed_request_markers`: an open
+/// Logs tab repeats the read every few seconds. A record that could not be written leaves the
+/// window open so the next read retries.
+#[cfg(target_os = "linux")]
+fn note_logs_read_deadline(
+    paths: &PackagePaths<'_>,
+    package_uid: u32,
+    policy: &SecurityPolicyArgs,
+    sources: &[&str],
+    elapsed: Duration,
+) {
+    static LAST_NOTED: AtomicU64 = AtomicU64::new(0);
+    let Ok(now) = current_epoch() else {
+        return;
+    };
+    let last = LAST_NOTED.load(AtomicOrdering::Relaxed);
+    if last != 0 && now.saturating_sub(last) < 300 {
+        return;
+    }
+    if LAST_NOTED
+        .compare_exchange(last, now, AtomicOrdering::Relaxed, AtomicOrdering::Relaxed)
+        .is_err()
+    {
+        return;
+    }
+    let mut members = serde_json::Map::new();
+    members.insert("sources".to_owned(), json!(sources));
+    members.insert(
+        "elapsed_ms".to_owned(),
+        json!(u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX)),
+    );
+    let written = linux_files::record_bridge_warning_at(
+        paths.log_root,
+        &paths.log_root.join("api.log"),
+        package_uid,
+        now,
+        policy,
+        "logs_read_deadline",
+        &members,
+    );
+    if written.is_err() {
+        LAST_NOTED.store(last, AtomicOrdering::Relaxed);
+    }
 }
 
 /// Rung A: answer from the package's own files.
@@ -18535,12 +19139,137 @@ fn run_shell_rung_read(
     policy: &SecurityPolicyArgs,
 ) -> BridgeResult<CgiResponse> {
     let arguments = read_manager_arguments(action)?;
+    if matches!(action, ReadAction::Snapshot) {
+        let stdout = shell_snapshot_read(
+            paths.manager,
+            &arguments,
+            SHELL_SNAPSHOT_WAIT,
+            SHELL_SNAPSHOT_BUILD_TIMEOUT,
+        )?;
+        let body = parse_and_sanitize_manager_json(&stdout, action, None, Some(policy))?;
+        return Ok(CgiResponse::success(body));
+    }
     let output = run_read_manager(paths.manager, &arguments)?;
     if !output.status_success {
         return Err(BridgeError::unavailable_because("manager_exit_status"));
     }
     let body = parse_and_sanitize_manager_json(&output.stdout, action, None, Some(policy))?;
     Ok(CgiResponse::success(body))
+}
+
+/// How long a forced-shell snapshot read waits for the manager before it answers
+/// `shell_snapshot_building` (SC-10, B-13).
+///
+/// The manager's snapshot keeps its own cache, and a cold one (the first read after the switch,
+/// or after any profile's state changed) took 35.8 s at 256 profiles on x86, past
+/// `READ_MANAGER_TIMEOUT`. The manager was killed at the timeout, its cache was never written,
+/// and every later read timed out the same way: the escape hatch could not open. Eight seconds
+/// keeps the request inside the dashboard's ten-second read window.
+#[cfg(target_os = "linux")]
+const SHELL_SNAPSHOT_WAIT: Duration = Duration::from_secs(8);
+
+/// How long the manager's snapshot build may run in the background once a read started it.
+#[cfg(target_os = "linux")]
+const SHELL_SNAPSHOT_BUILD_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// A finished forced-shell snapshot build: the manager's stdout, or why there is none.
+#[cfg(target_os = "linux")]
+type ShellSnapshotOutcome = Result<std::sync::Arc<Zeroizing<Vec<u8>>>, BridgeError>;
+
+/// The forced-shell snapshot builds, one per manager path: the newest build's generation, and
+/// its outcome once it has finished.
+///
+/// This is not a cache of answers. An outcome is handed only to the reads that were waiting
+/// for that build; a read that arrives after it finished starts a new build, which the
+/// manager's own cache now makes fast. The build outlives the read that started it, so a cold
+/// cache is filled once instead of being killed at every read's deadline.
+#[cfg(target_os = "linux")]
+struct ShellSnapshotBuilds {
+    builds: Mutex<BTreeMap<PathBuf, (u64, Option<ShellSnapshotOutcome>)>>,
+    finished: Condvar,
+}
+
+#[cfg(target_os = "linux")]
+static SHELL_SNAPSHOT_BUILDS: ShellSnapshotBuilds = ShellSnapshotBuilds {
+    builds: Mutex::new(BTreeMap::new()),
+    finished: Condvar::new(),
+};
+
+/// The forced-shell snapshot: join the build in progress or start one, and wait at most `wait`
+/// for it. A build still running at that point answers the named `shell_snapshot_building`
+/// and goes on, bounded by `build_timeout`, so a later read finds the manager's cache filled.
+#[cfg(target_os = "linux")]
+fn shell_snapshot_read(
+    manager: &Path,
+    arguments: &[OsString],
+    wait: Duration,
+    build_timeout: Duration,
+) -> ShellSnapshotOutcome {
+    let poisoned = || BridgeError::unsafe_because("manager_lane_poisoned");
+    let deadline = Instant::now() + wait;
+    let mut builds = SHELL_SNAPSHOT_BUILDS
+        .builds
+        .lock()
+        .map_err(|_| poisoned())?;
+    let mut generation = match builds.get(manager) {
+        Some((generation, None)) => *generation,
+        previous => {
+            let generation = previous.map_or(1, |(generation, _)| generation + 1);
+            // Built and validated here, so an untrusted manager is refused to this read.
+            let mut command = manager_command_at(manager, arguments, false)?;
+            let key = manager.to_path_buf();
+            let spawned = std::thread::Builder::new()
+                .name("sdsync-shell-snapshot".to_owned())
+                .spawn({
+                    let key = key.clone();
+                    move || {
+                        let outcome = ManagerPermit::acquire().and_then(|_permit| {
+                            let output = capture_bounded_command(
+                                &mut command,
+                                MAX_MANAGER_OUTPUT_BYTES,
+                                MAX_HELPER_STDERR_BYTES,
+                                build_timeout,
+                                None,
+                            )?;
+                            if output.status_success {
+                                Ok(std::sync::Arc::new(output.stdout))
+                            } else {
+                                Err(BridgeError::unavailable_because("manager_exit_status"))
+                            }
+                        });
+                        if let Ok(mut builds) = SHELL_SNAPSHOT_BUILDS.builds.lock()
+                            && let Some(entry) = builds.get_mut(&key)
+                            && entry.0 == generation
+                        {
+                            entry.1 = Some(outcome);
+                        }
+                        SHELL_SNAPSHOT_BUILDS.finished.notify_all();
+                    }
+                });
+            if spawned.is_err() {
+                return Err(BridgeError::unavailable_because("manager_spawn_failed"));
+            }
+            builds.insert(key, (generation, None));
+            generation
+        }
+    };
+    loop {
+        match builds.get(manager) {
+            Some((current, Some(outcome))) if *current == generation => return outcome.clone(),
+            // A newer build started after this one finished and before this read woke: its
+            // answer is at least as fresh, so this read waits for that one instead.
+            Some((current, _)) if *current != generation => generation = *current,
+            _ => {}
+        }
+        let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+            return Err(BridgeError::unavailable_because("shell_snapshot_building"));
+        };
+        builds = SHELL_SNAPSHOT_BUILDS
+            .finished
+            .wait_timeout(builds, remaining)
+            .map_err(|_| poisoned())?
+            .0;
+    }
 }
 
 fn run_consumer(request: &Path, response: &Path) -> BridgeResult<()> {
@@ -19395,11 +20124,12 @@ fn queued_stderr_summary(
     secret: Option<&[u8]>,
 ) -> Option<serde_json::Map<String, Value>> {
     let truncated = total > kept.len();
-    // When the bound cut the stream mid-line, that last fragment is not a line anyone wrote.
-    let complete = if truncated && !kept.ends_with(b"\n") {
+    // `kept` is the stream's tail. When the bound cut it, its first fragment is the end of a
+    // line whose start was dropped, not a line anyone wrote.
+    let complete = if truncated {
         kept.iter()
-            .rposition(|byte| *byte == b'\n')
-            .map_or(&kept[..0], |end| &kept[..end])
+            .position(|byte| *byte == b'\n')
+            .map_or(&kept[..0], |start| &kept[start + 1..])
     } else {
         kept
     };
@@ -22259,6 +22989,317 @@ mod tests {
         assert!(text.contains("[secret] here"), "{text}");
     }
 
+    /// Log lines that hold the profile password where the old reader could not see it (G-9, the
+    /// verifier's case list): open at the 8192-byte ceiling, straddling it, early in a 30 KB
+    /// string, in a `[ts]` line, after a JSON record, in a short unterminated string, split by a
+    /// terminal escape, and in a line too long to redact; plus a real record, a multibyte
+    /// character at the ceiling and invalid UTF-8. Oldest first; `expected_lines` says what each
+    /// one must come back as.
+    #[cfg(target_os = "linux")]
+    fn write_secret_edge_logs(fixture: &TestShellPackageFixture) {
+        fs::create_dir_all(&fixture.secrets_dir).unwrap();
+        fs::set_permissions(&fixture.secrets_dir, fs::Permissions::from_mode(0o700)).unwrap();
+        fixture.write_config(
+            &fixture.secrets_dir.join("alpha.password"),
+            "hunter2-secret\n",
+        );
+        let pad = |line: &mut Vec<u8>, to: usize, byte: u8| {
+            while line.len() < to {
+                line.push(byte);
+            }
+        };
+        let mut lines: Vec<Vec<u8>> = Vec::new();
+        // json-long-unterminated: an error record whose string is open at the old cut.
+        let mut line = b"{\"epoch\":1,\"level\":\"error\",\"event\":\"a\",\"note\":\"".to_vec();
+        pad(&mut line, 8180, b'a');
+        line.extend_from_slice(b"hunter2-secret tail");
+        lines.push(line);
+        // json-30k-secret-early: the secret near the start of a 30 KB string.
+        let mut line = b"{\"level\":\"error\",\"note\":\"x hunter2-secret ".to_vec();
+        pad(&mut line, 30_000, b'n');
+        line.extend_from_slice(b"\"}");
+        lines.push(line);
+        // plain-straddle: a raw line whose secret straddles byte 8192.
+        let mut line = Vec::new();
+        pad(&mut line, 8185, b'b');
+        line.extend_from_slice(b"hunter2-secret after");
+        lines.push(line);
+        // bracket-plain, json-trailing, json-unterminated-short, ansi-split.
+        lines.push(b"[12:00:00] error: login failed password=hunter2-secret end".to_vec());
+        lines.push(b"{\"level\":\"error\",\"event\":\"x\"} trailing hunter2-secret".to_vec());
+        lines.push(b"{\"level\":\"error\",\"note\":\"abc hunter2-secret".to_vec());
+        lines.push(b"x hunt\x1b[0mer2-secret y".to_vec());
+        // json-70k: too long to redact, withheld whole.
+        let mut line = b"{\"level\":\"error\",\"note\":\"hunter2-secret ".to_vec();
+        pad(&mut line, 70_000, b'z');
+        line.extend_from_slice(b"\"}");
+        lines.push(line);
+        // json-record-ok: a real record keeps its structure, the secret replaced in its string.
+        lines.push(b"{\"level\":\"error\",\"event\":\"y\",\"note\":\"hunter2-secret\"}".to_vec());
+        // multibyte-cut: 8191 ASCII then a two-byte character across the ceiling.
+        let mut line = Vec::new();
+        pad(&mut line, 8191, b'c');
+        line.extend_from_slice("\u{e9} end".as_bytes());
+        lines.push(line);
+        let mut controller = Vec::new();
+        for line in lines {
+            controller.extend_from_slice(&line);
+            controller.push(b'\n');
+        }
+        fixture.write_log("controller.log", &controller);
+    }
+
+    /// G-9: no logs read returns any part of a secret, whatever the line's length or shape, on
+    /// either rung, and the two rungs agree line for line.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn logs_never_return_a_secret_cut_at_the_line_ceiling_on_either_rung() {
+        let fixture = TestShellPackageFixture::new("logs-secret-edges");
+        let policy = SecurityPolicyArgs::default();
+        write_secret_edge_logs(&fixture);
+        let action = ReadAction::Logs {
+            lines: 50,
+            source: LogSource::Controller,
+        };
+        let check = |rung: &str, body: &[u8]| {
+            let document: Value = serde_json::from_slice(body).unwrap();
+            let lines = document["logs"][0]["lines"].as_array().unwrap().clone();
+            assert_eq!(lines.len(), 10, "{rung}: {} lines", lines.len());
+            let text = Value::Array(lines.clone()).to_string();
+            for prefix in ["hunter2", "hunt"] {
+                if let Some(at) = text.find(prefix) {
+                    let context = &text[at.saturating_sub(40)..(at + 40).min(text.len())];
+                    panic!("{rung}: {prefix} in ...{context}...");
+                }
+            }
+            let lines = lines
+                .iter()
+                .map(|line| line.as_str().unwrap().to_owned())
+                .collect::<Vec<_>>();
+            for line in &lines {
+                assert!(line.len() <= MAX_LOG_LINE_BYTES, "{rung}: {}", line.len());
+                assert!(!line.contains('\u{fffd}'), "{rung}: split character");
+            }
+            assert!(
+                lines[0].ends_with("aaaa[redacted] t"),
+                "{rung}: {}",
+                &lines[0][8150..]
+            );
+            assert!(lines[1].contains("x [redacted] nnn"), "{rung}");
+            assert!(
+                lines[2].starts_with("bbbb") && lines[2].ends_with("[redact"),
+                "{rung}"
+            );
+            assert_eq!(
+                lines[3],
+                "[12:00:00] error: login failed password=[redacted] end"
+            );
+            assert_eq!(
+                lines[4],
+                r#"{"level":"error","event":"x"} trailing [redacted]"#
+            );
+            assert_eq!(lines[5], r#"{"level":"error","note":"abc [redacted]"#);
+            assert_eq!(lines[6], "x [redacted] y");
+            assert_eq!(lines[7], "[line too long: 70002 bytes, withheld]");
+            assert_eq!(
+                lines[8],
+                r#"{"level":"error","event":"y","note":"[redacted]"}"#
+            );
+            assert!(serde_json::from_str::<Value>(&lines[8]).is_ok());
+            assert_eq!(lines[9], "c".repeat(8191), "{rung}");
+        };
+        let right =
+            logs_document(&fixture.paths(), fixture.package_uid(), &action, &policy).unwrap();
+        check("service", &right);
+
+        let arguments = read_manager_arguments(&action).unwrap();
+        let arguments = arguments
+            .iter()
+            .map(|argument| argument.to_str().unwrap())
+            .collect::<Vec<_>>();
+        let shell = fixture.run_manager(&arguments);
+        assert!(
+            shell.status.success(),
+            "shell rung failed ({}):\nstderr: {}",
+            shell.status,
+            String::from_utf8_lossy(&shell.stderr)
+        );
+        let left =
+            parse_and_sanitize_manager_json(&shell.stdout, &action, None, Some(&policy)).unwrap();
+        check("shell", &left);
+        assert_eq!(
+            String::from_utf8_lossy(&left),
+            String::from_utf8_lossy(&right)
+        );
+    }
+
+    /// The shape rule (G-9): only a whole JSON record takes the string-token rule.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn only_a_whole_json_record_takes_the_string_token_rule() {
+        for (line, record) in [
+            (r#"{"a":1,"b":[true,false,null],"c":"x\"}y"}"#, true),
+            (r#"  [1, -2.5e3, "s"]  "#, true),
+            (r#"{"a":1} trailing"#, false),
+            (r#"[12:00:00] error: message"#, false),
+            (r#"{"a":"unterminated"#, false),
+            (r#"{"a":"esc\\"}"#, true),
+            (r#"{"a":hunter2}"#, false),
+            ("", false),
+            ("{", false),
+        ] {
+            assert_eq!(json_record_shape(line.as_bytes()), record, "{line}");
+        }
+        assert_eq!(withheld_line(0), "[line too long: 0 bytes, withheld]");
+    }
+
+    /// A line that still holds a needle after every rewrite is withheld (G-9's last guard):
+    /// here a "secret" that the package-path labels themselves spell out.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_line_that_still_holds_a_secret_after_redaction_is_withheld() {
+        let fixture = TestShellPackageFixture::new("logs-withheld-guard");
+        let redaction = LogRedaction::new(
+            &fixture.paths(),
+            vec![Zeroizing::new(b"[package-home]/x".to_vec())],
+        );
+        let home = fixture.home.display().to_string();
+        assert_eq!(
+            redaction.apply(format!("seen at {home}/x now").as_bytes()),
+            WITHHELD_LOG_LINE
+        );
+        assert_eq!(redaction.apply(b"nothing to hide"), "nothing to hide");
+    }
+
+    /// A debug line over the redaction bound is hidden by an error threshold like any other:
+    /// the level is read from its head, which is never returned.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_threshold_still_applies_to_a_line_too_long_to_redact() {
+        let fixture = TestShellPackageFixture::new("logs-withheld-threshold");
+        let mut line = b"{\"level\":\"debug\",\"note\":\"".to_vec();
+        while line.len() < 40_000 {
+            line.push(b'q');
+        }
+        line.extend_from_slice(b"\"}\n");
+        fixture.write_log("controller.log", &line);
+        fixture.hand_over();
+        let strict = SecurityPolicyArgs {
+            controller_log_level: PolicyLogLevel::Error,
+            ..SecurityPolicyArgs::default()
+        };
+        let action = ReadAction::Logs {
+            lines: 10,
+            source: LogSource::Controller,
+        };
+        let document: Value = serde_json::from_slice(
+            &logs_document(&fixture.paths(), fixture.package_uid(), &action, &strict).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(document["logs"][0]["lines"], json!([]));
+        let document: Value = serde_json::from_slice(
+            &logs_document(
+                &fixture.paths(),
+                fixture.package_uid(),
+                &action,
+                &SecurityPolicyArgs {
+                    controller_log_level: PolicyLogLevel::Debug,
+                    ..SecurityPolicyArgs::default()
+                },
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            document["logs"][0]["lines"],
+            json!(["[line too long: 40002 bytes, withheld]"])
+        );
+    }
+
+    /// SC-5: a logs read that runs out of time answers with what it has, says which sources it
+    /// cut, and leaves a record in api.log, instead of running on after the dashboard gave up.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_logs_read_stops_at_its_deadline_and_says_so() {
+        let fixture = TestPackageFixture::new("logs-deadline");
+        let uid = TestPackageFixture::package_uid();
+        for name in ["api.log", "controller.log", "sync.log"] {
+            fixture.write_private(
+                &fixture.log_root.join(name),
+                b"{\"epoch\":1,\"level\":\"error\",\"category\":\"bridge\",\"event\":\"a\"}
+",
+            );
+        }
+        let policy = SecurityPolicyArgs::default();
+        let action = ReadAction::Logs {
+            lines: 50,
+            source: LogSource::All,
+        };
+        let document: Value = serde_json::from_slice(
+            &logs_document_within(&fixture.paths(), uid, &action, &policy, Duration::ZERO).unwrap(),
+        )
+        .unwrap();
+        let logs = document["logs"].as_array().unwrap();
+        assert_eq!(logs.len(), AGGREGATE_LOG_SOURCES.len());
+        for entry in logs {
+            assert_eq!(entry["lines"], json!([]), "{entry}");
+            assert_eq!(entry["scan_limited"], true, "{entry}");
+            assert_eq!(entry["deadline_reached"], true, "{entry}");
+        }
+        let api_log = fs::read_to_string(fixture.log_root.join("api.log")).unwrap();
+        let record = api_log
+            .lines()
+            .find(|line| line.contains("\"logs_read_deadline\""))
+            .unwrap_or_else(|| panic!("no deadline record in {api_log}"));
+        let record: Value = serde_json::from_str(record).unwrap();
+        assert_eq!(record["level"], "warn");
+        assert_eq!(record["sources"][0], "api");
+
+        // With the production deadline the same history is read whole and nothing is cut.
+        let document: Value = serde_json::from_slice(
+            &logs_document(&fixture.paths(), uid, &action, &policy).unwrap(),
+        )
+        .unwrap();
+        for entry in document["logs"].as_array().unwrap() {
+            assert!(entry.get("deadline_reached").is_none(), "{entry}");
+        }
+        // The api line, and the deadline record the first read wrote beside it.
+        assert_eq!(document["logs"][0]["lines"].as_array().unwrap().len(), 2);
+    }
+
+    /// The one-pass needle test agrees with a plain search on every needle, including needles
+    /// of one byte and needles that share a prefix.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_needle_index_finds_exactly_what_a_plain_search_finds() {
+        let needles: [&[u8]; 5] = [b"q", b"hunter2", b"hun", b"\\u0007x", b"zz"];
+        let index = NeedleIndex::new(needles);
+        let plain = |text: &[u8]| {
+            needles
+                .iter()
+                .any(|needle| text.windows(needle.len()).any(|window| window == *needle))
+        };
+        let alphabet = b"hunter2qz\\u0007x ";
+        let mut state = 0x2545_f491_u32;
+        for _ in 0..20_000 {
+            let length = (state % 12) as usize;
+            let mut text = Vec::with_capacity(length);
+            for _ in 0..length {
+                state ^= state << 13;
+                state ^= state >> 17;
+                state ^= state << 5;
+                text.push(alphabet[(state as usize) % alphabet.len()]);
+            }
+            assert_eq!(index.any_in(&text), plain(&text), "{text:?}");
+            let present = index.present_in(&text);
+            for (id, needle) in needles.iter().enumerate() {
+                let found = text.windows(needle.len()).any(|window| window == *needle);
+                assert_eq!(present[id], found, "{text:?} {needle:?}");
+            }
+        }
+        assert!(!NeedleIndex::new([] as [&[u8]; 0]).any_in(b"anything"));
+    }
+
     /// ADV-B-3: an error is never hidden by a threshold, and raw stderr counts as an error. The
     /// manager's own threshold used to drop these lines before the bridge's rule could see them.
     #[cfg(target_os = "linux")]
@@ -22453,6 +23494,48 @@ mod tests {
     /// They refuse with different codes, deliberately: the manager exits
     /// non-zero and the service reports `manager_exit_status` for it, while the
     /// in-service reader names what it actually found. Neither serves the file.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_cancelled_run_reads_as_cancelled_on_both_rungs_and_in_the_tail_repair() {
+        // D3-UI-7: a cancel was written as run.failed/failed because no reader accepted
+        // anything else. Every reader takes run.cancelled/cancelled before the writer emits it.
+        let fixture = TestShellPackageFixture::new("activity-cancelled");
+        let policy = SecurityPolicyArgs::default();
+        let record = b"1700000001|run.cancelled|alpha|cancelled|sync|info|Package action cancelled before completion";
+        assert!(linux_files::validate_activity_log_line(record).is_ok());
+        assert!(render_activity_event(record).is_ok());
+        let mut log = record.to_vec();
+        log.push(b'\n');
+        fixture.write_log("activity.log", &log);
+        let action = ReadAction::Activity { lines: 10 };
+        fixture.hand_over();
+        let right = activity_document(
+            &fixture.paths(),
+            fixture.package_uid(),
+            &action,
+            10,
+            &policy,
+        )
+        .unwrap();
+        let document: Value = serde_json::from_slice(&right).unwrap();
+        assert_eq!(document["events"][0]["code"], "run.cancelled");
+        assert_eq!(document["events"][0]["state"], "cancelled");
+        assert_eq!(document["events"][0]["level"], "info");
+        let shell = fixture.run_manager(&["api", "activity", "--lines", "10"]);
+        assert!(
+            shell.status.success(),
+            "shell rung refused a cancelled record ({}):\nstdout: {}",
+            shell.status,
+            String::from_utf8_lossy(&shell.stdout)
+        );
+        let left =
+            parse_and_sanitize_manager_json(&shell.stdout, &action, None, Some(&policy)).unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(&left),
+            String::from_utf8_lossy(&right)
+        );
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn a_corrupt_or_unsafe_activity_log_is_refused_by_both_rungs() {
@@ -23421,7 +24504,8 @@ mod tests {
         fixture.write_private(&fixture.profiles_dir.join("alpha.toml"), b"");
         let facts = "incomplete_listings=7\n\
                      incomplete_listing_folders=.|docs|photos/2026|a?b|c|d|e\n\
-                     mtime_not_kept=3\nrecovered_reauthentication_failures=0\n\
+                     mtime_not_kept=3\nlink_guard_unchecked=2\n\
+                     recovered_reauthentication_failures=0\n\
                      recovered_server_tasks_not_stopped=0\nrecovered_keepalive_failures=1\n";
         fixture.write_private(
             &fixture.state_dir.join("run.state"),
@@ -23453,6 +24537,7 @@ mod tests {
                 json!([".", "docs", "photos/2026", "a?b", "c"])
             );
             assert_eq!(block["mtime_not_kept"], 3);
+            assert_eq!(block["link_guard_unchecked"], 2);
             assert_eq!(
                 block["recovered"],
                 json!({
@@ -23467,6 +24552,7 @@ mod tests {
                     "deferred_entries",
                     "incomplete_listings",
                     "mtime_not_kept",
+                    "link_guard_unchecked",
                     "keepalive_failures",
                 ])
             );
@@ -23483,6 +24569,7 @@ mod tests {
         assert_eq!(alpha["incomplete_listings"], Value::Null);
         assert_eq!(alpha["incomplete_listing_folders"], Value::Null);
         assert_eq!(alpha["mtime_not_kept"], Value::Null);
+        assert_eq!(alpha["link_guard_unchecked"], Value::Null);
         assert_eq!(alpha["recovered"], Value::Null);
         assert_eq!(alpha["warnings"], json!([]));
         assert_eq!(alpha["status_cache"], "trusted");
@@ -23743,6 +24830,45 @@ mod tests {
         );
     }
 
+    /// D3-UI-5: a snapshot carries the NAS's clock and the zone its `date +%z` reports, the
+    /// one the controller evaluates routine windows in, so the dashboard can label NAS time.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_snapshot_carries_the_nas_clock_and_zone() {
+        let fixture = TestPackageFixture::new("nas-clock");
+        let uid = TestPackageFixture::package_uid();
+        let before = current_epoch().unwrap();
+        let snapshot = CgiResponse::success(br#"{"schema":"sdsync.dsm-api.v1","run":{}}"#.to_vec());
+        let attached = attach_snapshot_outcomes(snapshot, &fixture.paths(), uid).unwrap();
+        let after = current_epoch().unwrap();
+        let document: Value = serde_json::from_slice(&attached.body).unwrap();
+        let clock = &document["nas_clock"];
+        let now = clock["now_epoch"].as_u64().unwrap();
+        assert!((before..=after).contains(&now), "{clock}");
+        assert!(clock.get("error").is_none(), "{clock}");
+        let date = Command::new("date").arg("+%z").output().unwrap();
+        let printed = String::from_utf8(date.stdout).unwrap();
+        let printed = printed.trim();
+        let sign = if printed.starts_with('-') { -1 } else { 1 };
+        let hours: i64 = printed[1..3].parse().unwrap();
+        let minutes: i64 = printed[3..5].parse().unwrap();
+        assert_eq!(
+            clock["utc_offset_seconds"].as_i64().unwrap(),
+            sign * (hours * 3600 + minutes * 60),
+            "{clock} vs date +%z {printed}"
+        );
+        let zone = Command::new("date").arg("+%Z").output().unwrap();
+        assert_eq!(
+            clock["zone"],
+            String::from_utf8(zone.stdout).unwrap().trim(),
+            "{clock}"
+        );
+        assert_eq!(
+            local_utc_offset(0).map(|(offset, _)| offset.abs() <= 86_400),
+            Some(true)
+        );
+    }
+
     /// The member rides on a successful snapshot from either rung and leaves a failure alone.
     #[cfg(target_os = "linux")]
     #[test]
@@ -23995,6 +25121,115 @@ mod tests {
         assert_eq!(run_state(None)["heartbeat_source"], Value::Null);
     }
 
+    /// G-10: a heartbeat whose source is only liveness (the runner cannot read the core's I/O
+    /// counters) proves nothing about progress. It reads `stalled: null` with the warning
+    /// `stall_unobservable`, never `stalled: false`; `io`, and `progress` from an older runner,
+    /// still decide.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_liveness_only_heartbeat_reads_as_unobservable_not_healthy() {
+        let fixture = TestPackageFixture::new("outcomes-liveness");
+        let uid = TestPackageFixture::package_uid();
+        let now = current_epoch().unwrap();
+        let _lock = write_run_lock(&fixture, &own_lock_identity(0));
+        let run_state = |extra: &str| {
+            fixture.write_private(
+                &fixture.state_dir.join("run.state"),
+                format!(
+                    "state=running\nstarted_epoch={}\nfinished_epoch=0\nexit_code=-1\nscope=all\n\
+                     operation=sync\n{extra}",
+                    now - 4000
+                )
+                .as_bytes(),
+            );
+            outcomes_value(&fixture.paths(), uid)["run"].clone()
+        };
+        let warnings = |run: &Value| run["warnings"].as_array().unwrap().clone();
+        // The writer's form: a liveness source and no epoch.
+        let liveness = run_state("heartbeat_source=liveness\n");
+        assert_eq!(liveness["stalled"], Value::Null, "{liveness}");
+        assert!(warnings(&liveness).contains(&json!("stall_unobservable")));
+        // An older runner or a hand-written state with an epoch beside it: still unknown.
+        let with_epoch = run_state(&format!(
+            "heartbeat_epoch={}\nheartbeat_source=liveness\n",
+            now - 10
+        ));
+        assert_eq!(with_epoch["stalled"], Value::Null, "{with_epoch}");
+        assert!(warnings(&with_epoch).contains(&json!("stall_unobservable")));
+        // A real source still decides, and adds no such warning.
+        for source in ["io", "progress"] {
+            let fresh = run_state(&format!(
+                "heartbeat_epoch={}\nheartbeat_source={source}\n",
+                now - 10
+            ));
+            assert_eq!(fresh["stalled"], false, "{fresh}");
+            assert!(!warnings(&fresh).contains(&json!("stall_unobservable")));
+        }
+        // A finished run has nothing to observe.
+        fixture.write_private(
+            &fixture.state_dir.join("run.state"),
+            b"state=succeeded\nstarted_epoch=1\nfinished_epoch=2\nexit_code=0\nscope=all\n\
+              operation=sync\nheartbeat_source=liveness\n",
+        );
+        let done = outcomes_value(&fixture.paths(), uid)["run"].clone();
+        assert!(
+            !warnings(&done).contains(&json!("stall_unobservable")),
+            "{done}"
+        );
+    }
+
+    /// RB-3: a heartbeat or a start time ahead of the NAS clock (a clock stepped back during
+    /// the run) is not evidence of health: the verdict is `null` and `clock_skew` is named,
+    /// where it used to read `stalled: false` and `running_for_seconds: 0`.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_run_record_from_the_future_reads_as_unknown_with_clock_skew_named() {
+        let fixture = TestPackageFixture::new("outcomes-clock-skew");
+        let uid = TestPackageFixture::package_uid();
+        let now = current_epoch().unwrap();
+        let _lock = write_run_lock(&fixture, &own_lock_identity(0));
+        fixture.write_private(
+            &fixture.state_dir.join("run.state"),
+            format!(
+                "state=running\nstarted_epoch={}\nfinished_epoch=0\nexit_code=-1\nscope=all\n\
+                 operation=sync\nheartbeat_epoch={}\nheartbeat_source=io\n",
+                now + 3600,
+                now + 3600
+            )
+            .as_bytes(),
+        );
+        let outcomes = outcomes_value(&fixture.paths(), uid);
+        let run = &outcomes["run"];
+        assert_eq!(run["outcome"], "running");
+        assert_eq!(run["running_for_seconds"], Value::Null, "{run}");
+        assert_eq!(run["stalled"], Value::Null, "{run}");
+        assert_eq!(
+            outcomes["errors"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|error| **error == json!({"source": "run.state", "code": "clock_skew"}))
+                .count(),
+            2,
+            "{outcomes}"
+        );
+        // Within the tolerated skew a record is read as it is.
+        fixture.write_private(
+            &fixture.state_dir.join("run.state"),
+            format!(
+                "state=running\nstarted_epoch={}\nfinished_epoch=0\nexit_code=-1\nscope=all\n\
+                 operation=sync\nheartbeat_epoch={}\nheartbeat_source=io\n",
+                now + 5,
+                now + 5
+            )
+            .as_bytes(),
+        );
+        let outcomes = outcomes_value(&fixture.paths(), uid);
+        assert_eq!(outcomes["run"]["running_for_seconds"], 0);
+        assert_eq!(outcomes["run"]["stalled"], false);
+        assert_eq!(outcomes["errors"], json!([]));
+    }
+
     /// ADV-B-6: a live run had no age, so a hung one read `running` forever with nothing to
     /// tell it from a healthy one. `outcomes.run` says how long it has been running and flags a
     /// run past the long-running bound; neither is set when nothing runs.
@@ -24232,6 +25467,19 @@ mod tests {
         );
         assert_eq!(outcomes["errors"], json!([]));
 
+        // RB-2: a same-second tail of another scope or operation is not this run's cause.
+        for header in [
+            b"# epoch=200 scope=alpha operation=sync exit=1\nerror: alpha's\n".as_slice(),
+            b"# epoch=200 scope=all operation=plan exit=1\nerror: a plan's\n".as_slice(),
+            b"# epoch=200 scope=all operation=sync exit=3\nerror: another exit\n".as_slice(),
+        ] {
+            fixture.write_private(&log, header);
+            assert_eq!(
+                outcomes_value(&paths, uid)["run"]["stderr_log"],
+                Value::Null
+            );
+        }
+
         // The tail of an older run is not this run's cause.
         fixture.write_private(
             &log,
@@ -24334,6 +25582,106 @@ mod tests {
             execute_read_action(&fixture.paths(), &shell_rung_read(), &policy, uid).unwrap();
         let document: Value = serde_json::from_slice(&served.body).unwrap();
         assert_eq!(document["schema"], "sdsync.dsm-logs.v1");
+    }
+
+    /// SC-10 / B-13: a forced-shell snapshot whose manager is slower than the read's wait
+    /// answers the named `shell_snapshot_building` in bounded time, and the build goes on
+    /// instead of being killed, so the read after it finishes is answered. Reads that arrive
+    /// while it runs join it; none starts a second manager.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_slow_forced_shell_snapshot_is_built_once_and_named_while_it_builds() {
+        let _serialised = CONTROL_FIXTURE_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let fixture = TestPackageFixture::new("shell-snapshot-build");
+        let runs = fixture.root.join("runs");
+        let warm = fixture.root.join("warm");
+        // A cold manager cache costs 1.5 s; a warm one answers at once, as the real one does.
+        fixture.write_manager(&format!(
+            "echo run >> '{runs}'\n\
+             if [ -e '{warm}' ]; then printf second; exit 0; fi\n\
+             sleep 1.5; : > '{warm}'; printf first",
+            runs = runs.display(),
+            warm = warm.display()
+        ));
+        let arguments = read_manager_arguments(&ReadAction::Snapshot).unwrap();
+        let wait = Duration::from_millis(300);
+        let timeout = Duration::from_secs(30);
+
+        let started = Instant::now();
+        let first = shell_snapshot_read(&fixture.manager, &arguments, wait, timeout).unwrap_err();
+        assert_eq!(first.code, Some("shell_snapshot_building"));
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "{:?}",
+            started.elapsed()
+        );
+        // Still building: this read joins the same build.
+        let second = shell_snapshot_read(&fixture.manager, &arguments, wait, timeout).unwrap_err();
+        assert_eq!(second.code, Some("shell_snapshot_building"));
+        // A read that can wait long enough gets that build's answer.
+        let joined = shell_snapshot_read(
+            &fixture.manager,
+            &arguments,
+            Duration::from_secs(10),
+            timeout,
+        )
+        .unwrap();
+        assert_eq!(joined.as_slice(), b"first");
+        // The next read starts a new build, which the warm cache answers at once.
+        let fresh = shell_snapshot_read(&fixture.manager, &arguments, wait, timeout).unwrap();
+        assert_eq!(fresh.as_slice(), b"second");
+        assert_eq!(fs::read_to_string(&runs).unwrap().lines().count(), 2);
+
+        // A build that fails is reported by name to the reads that waited for it.
+        fixture.write_manager("exit 3");
+        let failed = shell_snapshot_read(
+            &fixture.manager,
+            &arguments,
+            Duration::from_secs(10),
+            timeout,
+        )
+        .unwrap_err();
+        assert_eq!(failed.code, Some("manager_exit_status"));
+        // And one past its own ceiling is a timeout, never a hang.
+        fixture.write_manager("sleep 30");
+        let hung = shell_snapshot_read(
+            &fixture.manager,
+            &arguments,
+            Duration::from_secs(10),
+            Duration::from_millis(300),
+        )
+        .unwrap_err();
+        assert_eq!(hung.code, Some("manager_timeout"));
+
+        // Through the ladder, the forced lane carries the code to the read's caller.
+        fixture.write_manager("sleep 9; printf late");
+        fixture.write_private(&fixture.read_lane, b"shell\n");
+        let started = Instant::now();
+        let error = execute_read_action(
+            &fixture.paths(),
+            &ReadAction::Snapshot,
+            &SecurityPolicyArgs::default(),
+            TestPackageFixture::package_uid(),
+        )
+        .unwrap_err();
+        assert_eq!(error.code, Some("shell_snapshot_building"));
+        assert!(
+            started.elapsed() < SHELL_SNAPSHOT_WAIT + Duration::from_secs(1),
+            "{:?}",
+            started.elapsed()
+        );
+        // Join that build before the fixture goes, so no manager slot outlives this test.
+        let late = shell_snapshot_read(
+            &fixture.manager,
+            &arguments,
+            Duration::from_secs(20),
+            timeout,
+        )
+        .unwrap();
+        assert_eq!(late.as_slice(), b"late");
+        assert_eq!(*MANAGER_LANE.occupancy.lock().unwrap(), 0);
     }
 
     /// The forced lane announces itself in api.log, as a notice rather than a
@@ -24449,10 +25797,10 @@ mod tests {
     #[cfg(target_os = "linux")]
     impl TestControlFixture {
         fn new(label: &str) -> Self {
-            // bind_prepared deliberately changes the process-global umask while
-            // atomically creating an inaccessible socket. Serialize fixtures
-            // that also create mode-sensitive private files so parallel tests
-            // cannot observe that production startup-only transition.
+            // Control fixtures share process-global state (the manager lane, the
+            // queue paths' locks, lifecycle markers), so they run one at a time.
+            // The 0000 socket bind no longer changes the umask, which other
+            // fixtures used to observe as unreadable files.
             let process_global_guard = CONTROL_FIXTURE_LOCK
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -24512,6 +25860,7 @@ mod tests {
                 audit_outbox_lock: &self.audit_outbox_lock,
                 package_transition: &self.package_transition,
                 service_closed: &self.service_closed,
+                lock_wait: REQUEST_CONTROL_LOCK_WAIT,
             }
         }
 
@@ -25501,6 +26850,8 @@ mod tests {
             BridgeError::unsafe_because("manager_unsafe"),
             BridgeError::unavailable_because("manager_spawn_failed"),
             BridgeError::unavailable_because("manager_timeout"),
+            BridgeError::unavailable_because("shell_snapshot_building"),
+            BridgeError::unavailable_because("control_lock_busy"),
             BridgeError::unavailable_because("manager_output_too_large"),
             BridgeError::unavailable_because("manager_exit_status"),
             MANAGER_OUTPUT_INVALID,
@@ -26643,6 +27994,23 @@ mod tests {
         assert_eq!(output.stdout.as_slice(), b"done\n");
         assert_eq!(output.stderr.len(), MAX_QUEUED_STDERR_BYTES);
         assert_eq!(output.stderr_bytes, 204_800);
+
+        // RB-6: the cause a manager names last survives however much it wrote before it; the
+        // first 16 KiB used to be kept, so the summary named a line from the start.
+        let mut verbose = Command::new("/bin/sh");
+        verbose.args([
+            "-c",
+            "head -c 204800 /dev/zero | tr '\\0' e >&2; printf '\\nerror: the real cause\\n' >&2; printf 'done\\n'",
+        ]);
+        let output =
+            capture_queued_mutation_command(&mut verbose, 128, None, &termination_requested)
+                .unwrap();
+        assert_eq!(output.stderr.len(), MAX_QUEUED_STDERR_BYTES);
+        assert_eq!(output.stderr_bytes, 204_800 + 23);
+        assert!(output.stderr.ends_with(b"error: the real cause\n"));
+        let summary = queued_stderr_summary(&output.stderr, output.stderr_bytes, None).unwrap();
+        assert_eq!(summary["line"], "error: the real cause");
+        assert_eq!(summary["truncated"], true);
     }
 
     /// The api.log record for a queued manager's stderr names its last line, reduced to safe
@@ -26872,6 +28240,54 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
+    fn binding_the_socket_never_changes_the_umask_other_threads_see() {
+        // The 0000 bind used to set the process-wide umask to 0777 for the length of bind(2),
+        // so any thread creating a file or directory at that instant created it unreadable:
+        // the parallel suite's PermissionDenied flake. The umask is now changed only in a
+        // thread with its own filesystem context.
+        fn thread_umask() -> u32 {
+            let status = fs::read_to_string("/proc/thread-self/status").unwrap();
+            let line = status
+                .lines()
+                .find(|line| line.starts_with("Umask:"))
+                .expect("this kernel reports Umask");
+            u32::from_str_radix(line["Umask:".len()..].trim(), 8).unwrap()
+        }
+        // SAFETY: geteuid has no pointer arguments or preconditions.
+        let uid = unsafe { libc::geteuid() };
+        let fixture = TestControlFixture::new("socket-umask");
+        let before = thread_umask();
+        let stop = AtomicBool::new(false);
+        let observed = AtomicU64::new(0);
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                while !stop.load(Ordering::Relaxed) {
+                    if thread_umask() == 0o777 {
+                        observed.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+            });
+            for round in 0..300 {
+                let socket = fixture.root.join(format!("umask-{round}.sock"));
+                let (listener, _) = linux_socket::bind_prepared(&socket, uid).unwrap();
+                // The socket itself is still created inaccessible.
+                let metadata = fs::symlink_metadata(&socket).unwrap();
+                assert_eq!(metadata.permissions().mode() & 0o7777, 0);
+                drop(listener);
+                fs::remove_file(&socket).unwrap();
+            }
+            stop.store(true, Ordering::Relaxed);
+        });
+        assert_eq!(
+            observed.load(Ordering::Relaxed),
+            0,
+            "another thread saw umask 0777"
+        );
+        assert_eq!(thread_umask(), before);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
     fn unix_socket_bind_recovers_only_verified_stale_sockets_and_rejects_symlinks() {
         // SAFETY: these identity calls have no pointer arguments or preconditions.
         let uid = unsafe { libc::geteuid() };
@@ -26903,7 +28319,7 @@ mod tests {
         assert_eq!(shutdown_status, 0);
         drop(listener);
 
-        // This is the safe crash window after bind(2) under umask 0777 but
+        // This is the safe crash window after the 0000 bind but
         // before the final package-only mode contract has been applied. An
         // ordinary bind must never interpret EACCES as stale without a
         // validated dead service PID.
@@ -27777,6 +29193,92 @@ mod tests {
             .kind,
             ErrorKind::UnsafeRuntime
         );
+    }
+
+    /// B-10: a request that finds the enqueue or audit-outbox lock held -- here by a holder
+    /// that is "forking the audit manager" inside it -- waits a bounded time and answers the
+    /// named `control_lock_busy`, instead of parking its worker until the holder lets go.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_held_control_lock_is_waited_for_a_bounded_time_and_named() {
+        let fixture = TestControlFixture::new("control-lock-busy");
+        let package_uid = TestControlFixture::package_uid();
+        let wait = Duration::from_millis(300);
+        let (held_send, held) = std::sync::mpsc::channel();
+        let (release, released) = std::sync::mpsc::channel::<()>();
+        let fixture = &fixture;
+        std::thread::scope(|scope| {
+            let holder = scope.spawn(move || {
+                let paths = fixture.paths();
+                let audit = paths.audit_outbox();
+                let (owner_pid, owner_start, owner_boot) =
+                    linux_files::current_process_identity().unwrap();
+                let record = AuditOutboxRecord {
+                    schema: "sdsync.dsm-audit-outbox.v1".to_owned(),
+                    transaction: format!("bridge-{JOB_ID}"),
+                    operation: "set-password".to_owned(),
+                    profile: "archive".to_owned(),
+                    actor: "admin".to_owned(),
+                    actor_uid: package_uid.max(1),
+                    origin: "bridge".to_owned(),
+                    client_request_id: Some(REQUEST_ID.to_owned()),
+                    job_id: Some(JOB_ID.to_owned()),
+                    owner_pid,
+                    owner_start,
+                    owner_boot,
+                    phase: AuditOutboxPhase::Prepared,
+                };
+                // The enqueue lock and, inside it, the audit-outbox lock, held while the
+                // "audit manager" runs: the shape of a POST that forks under both.
+                linux_files::close_service_admission_with_hook(&paths, package_uid, || {
+                    linux_files::audit_transaction_begin(
+                        &audit,
+                        package_uid,
+                        record,
+                        AuditOutboxPhase::Publishing,
+                        |_, _| {
+                            held_send.send(()).unwrap();
+                            released.recv().unwrap();
+                            Ok(())
+                        },
+                    )
+                    .unwrap();
+                })
+                .unwrap();
+            });
+            held.recv_timeout(Duration::from_secs(10)).unwrap();
+            let (done_send, done) = std::sync::mpsc::channel();
+            scope.spawn(move || {
+                let paths = ControlPaths {
+                    lock_wait: wait,
+                    ..fixture.paths()
+                };
+                let started = Instant::now();
+                let audit = linux_files::reconcile_audit_transactions(
+                    &paths.audit_outbox(),
+                    package_uid,
+                    |_, _| Ok(()),
+                )
+                .map(|_| ())
+                .unwrap_err();
+                let enqueue = linux_files::open_service_admission(&paths, package_uid).unwrap_err();
+                done_send.send((audit, enqueue, started.elapsed())).unwrap();
+            });
+            let outcome = done.recv_timeout(Duration::from_secs(5));
+            release.send(()).unwrap();
+            holder.join().unwrap();
+            let (audit, enqueue, elapsed) =
+                outcome.expect("a waiter blocked on a held control lock past its bound");
+            assert_eq!(audit.code, Some("control_lock_busy"));
+            assert_eq!(enqueue.code, Some("control_lock_busy"));
+            assert!(elapsed < Duration::from_secs(2), "{elapsed:?}");
+        });
+        // Once released, the same calls go through.
+        let paths = ControlPaths {
+            lock_wait: wait,
+            ..fixture.paths()
+        };
+        linux_files::open_service_admission(&paths, package_uid).unwrap();
     }
 
     #[cfg(target_os = "linux")]
@@ -30959,6 +32461,39 @@ mod tests {
         assert!(source_path_document(&fixture.root, "/volumeSATA2").is_ok());
         assert!(source_directories_document(&fixture.root, "/etc").is_err());
         assert!(source_directories_document(&fixture.root, "/volume1/../volume2").is_err());
+        // Within its budget the listing is whole and says nothing about time.
+        assert_eq!(children["truncated"], false);
+        assert!(children.get("time_limited").is_none());
+    }
+
+    /// B-14: a listing that runs out of time answers with what it has, `truncated` and
+    /// `time_limited`, instead of running on past the relay deadline on a cold disk.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_source_browser_answers_within_its_time_budget() {
+        let fixture = TestControlFixture::new("source-browser-budget");
+        let volume = fixture.root.join("volume1");
+        for name in ["alpha", "beta", "gamma"] {
+            fs::create_dir_all(volume.join(name)).unwrap();
+        }
+        let cut: Value = serde_json::from_slice(
+            &source_directories_document_within(&fixture.root, "/volume1", Duration::ZERO).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(cut["directories"], json!([]));
+        assert_eq!(cut["truncated"], true);
+        assert_eq!(cut["time_limited"], true);
+        let whole: Value = serde_json::from_slice(
+            &source_directories_document_within(
+                &fixture.root,
+                "/volume1",
+                SOURCE_DIRECTORIES_BUDGET,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(whole["directories"].as_array().unwrap().len(), 3);
+        assert_eq!(whole["truncated"], false);
     }
 
     #[test]

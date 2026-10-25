@@ -2167,6 +2167,36 @@ struct RemoteStatus {
     first_failure: Mutex<Option<RemoteFailure>>,
     dropped: AtomicU64,
     failures: AtomicU64,
+    /// Events the channel accepted (`try_send` Ok, or about to be).
+    accepted: AtomicU64,
+    /// Events the worker finished sending, delivered or failed.
+    handled: AtomicU64,
+    /// Set by the worker's exit guard, on a normal stop and on a panic.
+    worker_exited: AtomicBool,
+}
+
+impl RemoteStatus {
+    /// Explicit losses plus, once the worker is gone, every accepted event it
+    /// never finished: the one it died sending and every one still queued,
+    /// which the channel discards with its receiver.
+    fn dropped(&self) -> u64 {
+        let explicit = self.dropped.load(Ordering::Acquire);
+        if !self.worker_exited.load(Ordering::Acquire) {
+            return explicit;
+        }
+        let handled = self.handled.load(Ordering::Acquire);
+        let accepted = self.accepted.load(Ordering::Acquire);
+        explicit.saturating_add(accepted.saturating_sub(handled))
+    }
+}
+
+/// Marks the worker as gone however it ends, including by unwinding.
+struct WorkerExitGuard(std::sync::Arc<RemoteStatus>);
+
+impl Drop for WorkerExitGuard {
+    fn drop(&mut self) {
+        self.0.worker_exited.store(true, Ordering::Release);
+    }
 }
 
 struct RemoteSink {
@@ -2248,7 +2278,14 @@ impl RemoteSink {
             return Err(ObservabilityError::RemoteFailure(failure));
         }
         let sender = self.sender()?;
-        match sender.try_send(RemoteCommand::Event(body)) {
+        // Counted as accepted before the send so the worker can never finish
+        // an event that is not yet counted; a refused send takes it back.
+        self.status.accepted.fetch_add(1, Ordering::AcqRel);
+        let sent = sender.try_send(RemoteCommand::Event(body));
+        if sent.is_err() {
+            self.status.accepted.fetch_sub(1, Ordering::AcqRel);
+        }
+        match sent {
             Ok(()) => Ok(()),
             Err(TrySendError::Full(_)) => {
                 self.status.dropped.fetch_add(1, Ordering::Relaxed);
@@ -2347,7 +2384,7 @@ impl RemoteSink {
 
     fn report(&self) -> ShutdownReport {
         ShutdownReport {
-            remote_events_dropped: self.status.dropped.load(Ordering::Relaxed),
+            remote_events_dropped: self.status.dropped(),
             remote_delivery_failures: self.status.failures.load(Ordering::Relaxed),
         }
     }
@@ -2400,10 +2437,13 @@ fn remote_worker(
     mut transport: Box<dyn RemoteTransport>,
     status: std::sync::Arc<RemoteStatus>,
 ) {
+    let _exit = WorkerExitGuard(std::sync::Arc::clone(&status));
     while let Ok(command) = receiver.recv() {
         match command {
             RemoteCommand::Event(body) => {
-                if let Err(failure) = transport.send(&body) {
+                let sent = transport.send(&body);
+                status.handled.fetch_add(1, Ordering::AcqRel);
+                if let Err(failure) = sent {
                     status.failures.fetch_add(1, Ordering::Relaxed);
                     let mut first = status
                         .first_failure
@@ -3517,16 +3557,88 @@ mod tests {
         )
         .unwrap();
         remote.enqueue("crashes-the-worker".to_owned()).unwrap();
-        // The worker has dequeued the event and is inside transport.send,
-        // about to panic.
         started_receive
             .recv_timeout(Duration::from_secs(1))
             .unwrap();
-        // Give the unwind -- one stack frame, no complex drop glue -- a wide
-        // margin to finish dropping the receiver before the probe below.
-        thread::sleep(Duration::from_millis(50));
-        assert!(remote.enqueue("probe".to_owned()).is_ok());
+        // Wait for the unwind to finish instead of sleeping (a 50 ms sleep
+        // was not enough on a loaded CI runner).
+        join_worker(&remote).expect_err("the worker panicked");
+        // The event the worker died on was never delivered: it counts.
         assert_eq!(remote.report().remote_events_dropped, 1);
+        assert!(remote.enqueue("probe".to_owned()).is_ok());
+        assert_eq!(remote.report().remote_events_dropped, 2);
+    }
+
+    /// An event that was accepted into the queue while the worker was still
+    /// alive, and that the worker never took because it died first, is lost
+    /// when the receiver drops. It must be counted as dropped too.
+    #[test]
+    fn events_queued_when_the_worker_dies_are_counted_as_dropped() {
+        let (started_send, started_receive) = mpsc::channel();
+        let (release_send, release_receive) = mpsc::channel();
+        let remote = RemoteSink::spawn(
+            Box::new(BlockThenPanicTransport {
+                started: started_send,
+                release: release_receive,
+            }),
+            2,
+            RemoteDelivery::BestEffort,
+        )
+        .unwrap();
+        remote.enqueue("in-flight".to_owned()).unwrap();
+        started_receive
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap();
+        remote.enqueue("queued-1".to_owned()).unwrap();
+        remote.enqueue("queued-2".to_owned()).unwrap();
+        assert_eq!(remote.report().remote_events_dropped, 0);
+        release_send.send(()).unwrap();
+        join_worker(&remote).expect_err("the worker panicked");
+        assert_eq!(remote.report().remote_events_dropped, 3);
+    }
+
+    /// Events still queued behind the Shutdown command are never sent: the
+    /// worker stops at Shutdown. They count as dropped.
+    #[test]
+    fn events_left_behind_a_shutdown_command_are_counted_as_dropped() {
+        let (started_send, started_receive) = mpsc::channel();
+        let (release_send, release_receive) = mpsc::channel();
+        let remote = RemoteSink::spawn(
+            Box::new(BlockingTransport {
+                started: started_send,
+                release: release_receive,
+            }),
+            4,
+            RemoteDelivery::BestEffort,
+        )
+        .unwrap();
+        remote.enqueue("first".to_owned()).unwrap();
+        started_receive
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap();
+        let sender = remote.sender().unwrap();
+        let (acknowledge, acknowledged) = mpsc::channel();
+        sender
+            .try_send(RemoteCommand::Shutdown(acknowledge))
+            .unwrap();
+        remote.enqueue("behind-shutdown".to_owned()).unwrap();
+        release_send.send(()).unwrap();
+        acknowledged
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap()
+            .unwrap();
+        join_worker(&remote).unwrap();
+        assert_eq!(remote.report().remote_events_dropped, 1);
+    }
+
+    fn join_worker(remote: &RemoteSink) -> thread::Result<()> {
+        remote
+            .join
+            .lock()
+            .unwrap()
+            .take()
+            .expect("worker handle present")
+            .join()
     }
 
     #[test]
@@ -3907,6 +4019,21 @@ mod tests {
     impl RemoteTransport for PanickingTransport {
         fn send(&mut self, _body: &str) -> std::result::Result<(), RemoteFailure> {
             let _ = self.started.send(());
+            panic!("simulated worker crash");
+        }
+    }
+
+    /// Blocks inside send until released, then panics, so a test can queue
+    /// events behind the in-flight one before the worker dies.
+    struct BlockThenPanicTransport {
+        started: mpsc::Sender<()>,
+        release: Receiver<()>,
+    }
+
+    impl RemoteTransport for BlockThenPanicTransport {
+        fn send(&mut self, _body: &str) -> std::result::Result<(), RemoteFailure> {
+            let _ = self.started.send(());
+            let _ = self.release.recv();
             panic!("simulated worker crash");
         }
     }
