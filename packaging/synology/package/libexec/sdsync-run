@@ -198,13 +198,15 @@ profile_counts_lines() {
         esac
     fi
     write_result_facts "${profile_fact_listings:-}" "${profile_fact_folders:-}" "${profile_fact_mtime:-}" \
-        "${profile_fact_reauth:-}" "${profile_fact_tasks:-}" "${profile_fact_keepalive:-}"
+        "${profile_fact_reauth:-}" "${profile_fact_tasks:-}" "${profile_fact_keepalive:-}" \
+        "${profile_fact_unchecked:-}"
 }
 
 # The core result's lasting facts (contract v1.5), each written only when the
 # result carried it: listings DSM returned short and the first five such
-# folders, destinations whose mtime DSM did not keep, and the recovery
-# counters that mean something went wrong underneath a successful run.
+# folders, destinations whose mtime DSM did not keep, the recovery counters
+# that mean something went wrong underneath a successful run, and the NAS
+# folders DSM gave no real path for, so links inside them went unchecked.
 write_result_facts() {
     case ${1:-} in ''|*[!0-9]*) ;; *) printf 'incomplete_listings=%s\n' "$1" || return 1 ;; esac
     case ${2:-} in
@@ -215,6 +217,7 @@ write_result_facts() {
     case ${4:-} in ''|*[!0-9]*) ;; *) printf 'recovered_reauthentication_failures=%s\n' "$4" || return 1 ;; esac
     case ${5:-} in ''|*[!0-9]*) ;; *) printf 'recovered_server_tasks_not_stopped=%s\n' "$5" || return 1 ;; esac
     case ${6:-} in ''|*[!0-9]*) ;; *) printf 'recovered_keepalive_failures=%s\n' "$6" || return 1 ;; esac
+    case ${7:-} in ''|*[!0-9]*) ;; *) printf 'link_guard_unchecked=%s\n' "$7" || return 1 ;; esac
     return 0
 }
 
@@ -337,7 +340,7 @@ record_runner_exit() {
         130|143)
             # Stopped before the core was started: there was no run to record,
             # and a cancellation is not a failure.
-            runner_activity run.failed "$run_label" failed \
+            runner_activity run.cancelled "$run_label" cancelled \
                 "Package action cancelled before it started" "$run_activity_category" info
             return 0
             ;;
@@ -348,9 +351,16 @@ record_runner_exit() {
     if [ -z "$run_failure_profiles" ] && [ "$run_scope" != all ]; then
         run_failure_profiles=$run_scope
     fi
+    # Each profile's own record carries the cause too, up to the bridge's 240
+    # bytes; a configuration the core refused used to read only
+    # "configuration invalid" on the profile's card.
+    profile_cause_detail=$(printf '%s' "${run_failure_profile_detail:-$run_failure_detail}" | LC_ALL=C awk '
+        NR == 1 { line = $0 } END { gsub(/[^ -~]/, "?", line); gsub(/[|]/, "/", line); printf "%s", substr(line, 1, 240) }')
+    profile_cause_path=
     for record_profile in $run_failure_profiles; do
         runner_profile_outcome "$record_profile" failed "$record_status" "$run_failure_reason" "$record_finished"
     done
+    profile_cause_detail=
     runner_activity run.failed "$run_label" failed \
         "Package action failed before the core ran: ${record_detail:-$run_failure_reason}" \
         "$run_activity_category" error
@@ -442,8 +452,6 @@ runner_exit() {
     [ -z "$core_stderr_capture" ] || rm -f "$core_stderr_capture"
     [ -z "$core_result_record" ] || rm -f "$core_result_record"
     stop_runner_heartbeat
-    [ -z "${heartbeat_progress_path:-}" ] || [ "$heartbeat_progress_path" = "${progress_record:-}" ] \
-        || rm -f "$heartbeat_progress_path"
     exit "$runner_exit_status"
 }
 trap 'runner_exit $?' 0
@@ -526,7 +534,7 @@ acquire_private_process_lock "$lifecycle_lock" || runner_lifecycle_status=$?
 case $runner_lifecycle_status in
     0) runner_lifecycle_lock_held=true ;;
     75) runner_fail busy "package lifecycle is changing; retry the plan/sync later"; exit 75 ;;
-    *) runner_fail admission_failed "cannot validate package lifecycle admission"; exit 73 ;;
+    *) runner_fail admission_failed "cannot validate package lifecycle admission${process_identity_cause:+ (lock owner: $process_identity_cause)}"; exit 73 ;;
 esac
 runner_admission_status=0
 admission_state_status || runner_admission_status=$?
@@ -615,6 +623,25 @@ if [ "$run_output" = foreground ] && [ "$security_runtime_allow_operational_acti
     exit 77
 fi
 
+# The kernel's out-of-memory kill counter for this process's own cgroup, or
+# nothing when it cannot be read: cgroup v2's memory.events, else v1's
+# memory.oom_control (oom_kill is there from Linux 4.13). Read around the core
+# so a SIGKILL can be attributed to the OOM killer when the counter moved.
+runner_oom_kill_count() {
+    runner_oom_cgroup=$(LC_ALL=C awk -F: '
+        $1 == "0" && $2 == "" { print "v2:" $3; exit }
+        $2 ~ /(^|,)memory(,|$)/ { print "v1:" $3; exit }
+    ' /proc/self/cgroup 2>/dev/null) || runner_oom_cgroup=
+    case $runner_oom_cgroup in
+        v2:/*) runner_oom_events=/sys/fs/cgroup${runner_oom_cgroup#v2:}/memory.events ;;
+        v1:/*) runner_oom_events=/sys/fs/cgroup/memory${runner_oom_cgroup#v1:}/memory.oom_control ;;
+        *) return 0 ;;
+    esac
+    [ -f "$runner_oom_events" ] && [ -r "$runner_oom_events" ] || return 0
+    LC_ALL=C awk '$1 == "oom_kill" && $2 ~ /^[0-9]+$/ { print $2; exit }' "$runner_oom_events" 2>/dev/null || :
+}
+runner_oom_before=$(runner_oom_kill_count)
+
 core_pid=
 termination_requested=false
 wait_interrupted=false
@@ -632,11 +659,25 @@ trap forward_term TERM INT HUP
 # A core that stops making progress -- I/O blocked on a hung mount, a request
 # with no deadline -- used to read "running" forever. While the core runs, this
 # child refreshes run.state every 60 seconds with heartbeat_epoch, the last
-# time the core showed progress: its I/O counters (/proc/<pid>/io) moved, or,
-# when they cannot be read, its progress record changed. If neither can be
-# observed the epoch follows liveness alone and heartbeat_source says so. After
+# time the core showed progress: its I/O counters (/proc/<pid>/io, rchar plus
+# wchar) grew by at least heartbeat_floor bytes since the previous tick. After
 # 30 minutes without progress it records the stall once (run_stalled) and,
 # should progress resume, that it cleared. It never stops the core.
+#
+# Progress is data that moved, not a counter that ticked: a core blocked on a
+# hung mount still makes a few hundred bytes of rchar/wchar a minute -- the
+# session keepalive's wake-ups, a DNS read, a retry's log line -- and the
+# former "changed at all" test read that as progress for ever. The floor is
+# 16 KiB a minute, far above that noise and far below any real transfer, or
+# the profile's whole --max-rate budget for a minute when that is lower.
+# read_bytes/write_bytes are not used: they count block devices only, and a
+# hung NAS, NFS or CIFS source is exactly what they cannot see. The progress
+# record is not used either: batch runs have none, and its mtime moves on a
+# refresh as well as on work.
+#
+# When the counters cannot be read the source is liveness and NO epoch is
+# published, so no reader can take "recent" for "not stalled"; the bridge
+# reports stalled:null with stall_unobservable instead.
 #   runner_heartbeat CORE_PID
 runner_heartbeat() {
     trap - 0 INT HUP
@@ -644,7 +685,7 @@ runner_heartbeat() {
     trap '[ -z "$heartbeat_sleep" ] || kill "$heartbeat_sleep" 2>/dev/null; exit 0' TERM
     heartbeat_core=$1
     heartbeat_last_io=
-    heartbeat_last_progress=
+    heartbeat_io_lost=false
     heartbeat_value=$started
     heartbeat_stalled=false
     heartbeat_write_failed=false
@@ -664,22 +705,33 @@ runner_heartbeat() {
             heartbeat_slice=$((heartbeat_slice + 1))
         done
         pid_is_live "$heartbeat_core" || exit 0
-        heartbeat_io=$(LC_ALL=C awk '/^(rchar|wchar):/ { sum += $2; seen = 1 } END { if (seen) print sum }' \
+        # %.0f, not print: mawk prints a sum past 2^31 as %.6g, so two
+        # different totals read alike and slow progress looked like a stall.
+        heartbeat_io=$(LC_ALL=C awk '/^(rchar|wchar):/ { sum += $2; seen = 1 } END { if (seen) printf "%.0f\n", sum }' \
             "/proc/$heartbeat_core/io" 2>/dev/null) || heartbeat_io=
-        heartbeat_progress=
-        if [ -n "${heartbeat_progress_path:-}" ] && [ -f "$heartbeat_progress_path" ]; then
-            heartbeat_progress=$(stat -c '%Y:%s:%i' "$heartbeat_progress_path" 2>/dev/null) || heartbeat_progress=
-        fi
+        case $heartbeat_io in *[!0-9]*) heartbeat_io= ;; esac
         heartbeat_moved=false
         if [ -n "$heartbeat_io" ]; then
             heartbeat_source=io
-            [ "$heartbeat_io" = "$heartbeat_last_io" ] || heartbeat_moved=true
+            if [ -z "$heartbeat_last_io" ]; then
+                heartbeat_moved=true
+            else
+                # In awk: the sums pass 2^31 on a busy run, beyond 32-bit
+                # shell arithmetic on an armv7 BusyBox.
+                heartbeat_grew=$(LC_ALL=C awk -v now="$heartbeat_io" -v last="$heartbeat_last_io" \
+                    -v floor="$heartbeat_floor" 'BEGIN { grew = "no"; if (now - last >= floor) grew = "yes"; print grew }') \
+                    || heartbeat_grew=no
+                [ "$heartbeat_grew" != yes ] || heartbeat_moved=true
+            fi
             heartbeat_last_io=$heartbeat_io
-        elif [ -n "$heartbeat_progress" ]; then
-            heartbeat_source=progress
-            [ "$heartbeat_progress" = "$heartbeat_last_progress" ] || heartbeat_moved=true
-            heartbeat_last_progress=$heartbeat_progress
         else
+            if [ -n "$heartbeat_last_io" ] && [ "$heartbeat_io_lost" = false ]; then
+                # The counters were readable and are not any more: say so once,
+                # rather than flip the source in silence.
+                heartbeat_io_lost=true
+                runner_controller_event warn run_stall_detection_unavailable \
+                    "scope=$run_label pid=$heartbeat_core cause=/proc/$heartbeat_core/io became unreadable" scheduler
+            fi
             heartbeat_source=liveness
             heartbeat_moved=true
         fi
@@ -695,7 +747,11 @@ runner_heartbeat() {
             runner_controller_event error run_stalled \
                 "scope=$run_label since=$heartbeat_value source=$heartbeat_source pid=$heartbeat_core" scheduler
         fi
-        run_state_heartbeat=$heartbeat_value
+        if [ "$heartbeat_source" = liveness ]; then
+            run_state_heartbeat=
+        else
+            run_state_heartbeat=$heartbeat_value
+        fi
         run_state_heartbeat_source=$heartbeat_source
         if write_run_state running "$started" 0 -1 "$run_label" "$run_mode" none ""; then
             heartbeat_write_failed=false
@@ -917,11 +973,26 @@ run_failure_profiles=$covered_profiles
 # The core's own first line says what it rejected; it used to go nowhere a
 # reader of run.state or Activity could see.
 config_validate_status=0
-config_validate_errors=$("$binary" --config "$config_file" --quiet config validate 2>&1 >/dev/null) \
-    || config_validate_status=$?
+# A profile's run validates the configuration as that profile sees it: an
+# overlapping pair of two OTHER profiles that delete is their refusal, not a
+# reason to stop this one. The aggregate validates every pair, as
+# --all-profiles does, and must not inherit a scope from the environment.
+if [ "$run_scope" = all ]; then
+    config_validate_errors=$(unset SDSYNC_PROFILE; "$binary" --config "$config_file" --quiet config validate 2>&1 >/dev/null) \
+        || config_validate_status=$?
+else
+    config_validate_errors=$("$binary" --config "$config_file" --profile "$run_scope" --quiet config validate 2>&1 >/dev/null) \
+        || config_validate_status=$?
+fi
 if [ "$config_validate_status" -ne 0 ]; then
     config_validate_cause=$(one_safe_line "$config_validate_errors")
     run_failure_detail="the package configuration did not validate${config_validate_cause:+: $config_validate_cause}"
+    # The profile's record keeps more of the core's line than run.state's 160
+    # bytes: an overlap refusal names its remedy and both profiles' roots.
+    config_validate_line=$(printf '%s\n' "$config_validate_errors" | LC_ALL=C awk '
+        { gsub(/[^ -~]/, ""); gsub(/[|]/, "/"); sub(/^ +/, ""); sub(/ +$/, "") }
+        $0 != "" { printf "%s", substr($0, 1, 240); exit }')
+    run_failure_profile_detail="configuration did not validate${config_validate_line:+: $config_validate_line}"
     runner_say "$run_failure_detail" error
     exit "$config_validate_status"
 fi
@@ -971,16 +1042,18 @@ fi
 # exact shape its identity check depends on. A plan or a sync is per-file work
 # that runs for minutes; this is the path that lets it say which file.
 load_progress_record_runtime
-# Every run publishes a progress record: a dashboard request's own, else a
-# private one the heartbeat watches when the core's I/O counters cannot be read.
-heartbeat_progress_path=$progress_record
-if [ -z "$heartbeat_progress_path" ]; then
-    heartbeat_progress_path=$runtime_root/core-progress.$$.json
-    if [ -e "$heartbeat_progress_path" ] || [ -L "$heartbeat_progress_path" ]; then
-        rm -f "$heartbeat_progress_path" || heartbeat_progress_path=
-    fi
-fi
-[ -z "$heartbeat_progress_path" ] || set -- "$@" --progress-record "$heartbeat_progress_path"
+# A dashboard request publishes its own progress record; nothing else does.
+[ -z "$progress_record" ] || set -- "$@" --progress-record "$progress_record"
+# The heartbeat's progress floor: 16 KiB a minute, or the slowest covered
+# profile's whole --max-rate budget for a minute when that is lower.
+heartbeat_floor=16384
+for heartbeat_floor_profile in ${covered_profiles:-$run_scope}; do
+    heartbeat_floor_rate=$(sed -n 's/^max-rate = \([0-9][0-9]*\)$/\1/p' \
+        "$profiles_dir/$heartbeat_floor_profile.toml" 2>/dev/null | sed -n 1p)
+    case $heartbeat_floor_rate in ''|*[!0-9]*) continue ;; esac
+    decimal_at_most "$heartbeat_floor_rate" 273 || continue
+    [ $((heartbeat_floor_rate * 60)) -ge "$heartbeat_floor" ] || heartbeat_floor=$((heartbeat_floor_rate * 60))
+done
 runner_supervisor_start=$(process_start_time "$$" 2>/dev/null || true)
 case $runner_supervisor_start in ''|*[!0-9]*|0)
     runner_fail identity_failed "cannot capture runner identity before core launch"
@@ -1025,8 +1098,16 @@ if [ -e "$run_unrecorded_marker" ] || [ -L "$run_unrecorded_marker" ]; then
     rm -f "$run_unrecorded_marker" \
         || runner_controller_event error run_outcome_marker_unremovable "scope=$run_label"
 fi
-run_state_heartbeat=$started
-run_state_heartbeat_source=liveness
+# The run has just begun, which is progress, when this kernel shows a process
+# its I/O counters (the core, same uid, will be read the same way). Where it
+# does not, nothing about progress can be said: no epoch, source liveness.
+if [ -r "/proc/$$/io" ]; then
+    run_state_heartbeat=$started
+    run_state_heartbeat_source=io
+else
+    run_state_heartbeat=
+    run_state_heartbeat_source=liveness
+fi
 write_run_state running "$started" 0 -1 "$run_label" "$run_mode" none "" || {
     runner_fail state_unwritable "run state could not be published before the core started"
     exit 69
@@ -1165,20 +1246,26 @@ case $exit_code in
     *) final_state=failed; run_reason=core_failed; run_state_outcome=failed ;;
 esac
 
-# The core's last error line is the cause; keep it, bounded and private.
+# The core's last error line is the cause; keep it, bounded and private. The
+# profile's own state carries up to 240 bytes of it (the bridge's bound), which
+# is what keeps the end of a long configuration refusal -- the overlap message
+# names both profiles, their roots and the endpoint before it says which one
+# deletes -- and run.state and Activity the first 160.
 run_remote_log_dropped=false
+run_cause_line=
 if [ -n "$core_stderr_capture" ]; then
     if [ "$final_state" = failed ] && [ "$run_cancelled" = false ] && [ -s "$core_stderr_capture" ]; then
-        run_detail=$(LC_ALL=C awk '
+        run_cause_line=$(LC_ALL=C awk '
             /^(error|Error): |^sdsync-dsm-api: supervised core refused: / { chosen = $0 }
             NF { last = $0 }
             END {
                 line = chosen != "" ? chosen : last
                 gsub(/[^ -~]/, "?", line)
                 gsub(/\|/, "/", line)
-                printf "%s", substr(line, 1, 160)
+                printf "%s", substr(line, 1, 240)
             }
-        ' "$core_stderr_capture") || run_detail=
+        ' "$core_stderr_capture") || run_cause_line=
+        run_detail=$(runner_sanitize_detail "$run_cause_line")
     fi
     # Remote-log delivery is best effort inside the core and reported only on
     # stderr; a dropped batch must not stay there unseen.
@@ -1204,13 +1291,42 @@ if [ -n "$core_stderr_capture" ]; then
     fi
 fi
 
+# A core killed with SIGKILL prints nothing and writes no result, so the run
+# read "failed, exit 137" with an empty detail and the retry ladder repeated it
+# every interval. Nothing in this package sends the core SIGKILL (the runner
+# forwards TERM; the controller's forced stop kills the runner, which then
+# records nothing here), so the sender is the kernel's out-of-memory killer or
+# an operator. Name it, and say which when this cgroup's OOM counter moved.
+if [ "$exit_code" -eq 137 ] && [ "$final_state" = failed ] && [ "$run_cancelled" = false ]; then
+    runner_oom_after=$(runner_oom_kill_count)
+    case $runner_oom_before:$runner_oom_after in
+        *[!0-9:]*|:*|*:) runner_oom_proven=false ;;
+        *) if [ "$runner_oom_after" -gt "$runner_oom_before" ]; then runner_oom_proven=true; else runner_oom_proven=false; fi ;;
+    esac
+    if [ "$runner_oom_proven" = true ]; then
+        run_killed_cause="the sync core was killed by the out-of-memory killer (exit 137); the source may hold more entries than this NAS has memory for"
+    else
+        run_killed_cause="the sync core was killed (SIGKILL, exit 137) without reporting an error; out of memory? check the DSM system log for the OOM killer"
+    fi
+    case $run_cause_line in
+        error:*|Error:*) ;;
+        *)
+            run_cause_line=$run_killed_cause
+            run_detail=$(runner_sanitize_detail "$run_killed_cause")
+            ;;
+    esac
+    runner_controller_event error core_killed \
+        "scope=$run_label exit=137 oom_kill=${runner_oom_before:-unknown}->${runner_oom_after:-unknown} proven=$runner_oom_proven" scheduler
+fi
+
 # Counts, result facts and per-job verdicts from the core's own records: the
 # result record the core wrote for this run when there is one, else the NDJSON
 # a scheduled run printed (a batch-job record per profile for an aggregate, one
 # completion record for a single profile). Each record becomes one line
 #   <kind> <profile|-> <status|-> <outcome|-> <deferred|-> <skipped|->
 #   <incomplete_listings|-> <mtime_not_kept|-> <reauthentication_failures|->
-#   <server_tasks_not_stopped|-> <keepalive_failures|-> <folders...>
+#   <server_tasks_not_stopped|-> <keepalive_failures|-> <link_guard_unchecked|->
+#   <folders...>
 # with the folders last (they may hold spaces): the first five
 # incomplete_listing_folders, raw JSON string text with every byte outside
 # printable ASCII and every `|` turned into `?`, each cut to 120 bytes, joined
@@ -1276,7 +1392,7 @@ if [ -n "$run_records_source" ]; then
             completion = index($0, "\"kind\":\"completion\"") > 0
             if (!job && !completion) next
             profile = "-"; status = "-"; outcome = "-"; deferred = "-"; skipped = "-"
-            listings = "-"; mtime = "-"; reauth = "-"; tasks = "-"; keepalive = "-"; listed = "-"
+            listings = "-"; mtime = "-"; reauth = "-"; tasks = "-"; keepalive = "-"; unchecked = "-"; listed = "-"
             if (job) {
                 if (match($0, /"profile":"[A-Za-z0-9_-]+"/)) profile = substr($0, RSTART + 11, RLENGTH - 12)
                 if (match($0, /"status":"[a-z-]+"/)) status = substr($0, RSTART + 10, RLENGTH - 11)
@@ -1299,10 +1415,11 @@ if [ -n "$run_records_source" ]; then
                 reauth = number(result, "reauthentication_failures")
                 tasks = number(result, "server_tasks_not_stopped")
                 keepalive = number(result, "keepalive_failures")
+                unchecked = number(result, "link_guard_unchecked")
                 listed = folders(array_body(result, "incomplete_listing_folders"))
             }
             print (job ? "job" : "run"), profile, status, outcome, deferred, skipped, \
-                listings, mtime, reauth, tasks, keepalive, listed
+                listings, mtime, reauth, tasks, keepalive, unchecked, listed
         }
     ' "$run_records_source") || run_records_status=$?
     [ "$run_records_status" -eq 0 ] || run_records=
@@ -1439,7 +1556,8 @@ take_record_facts() {
     profile_fact_reauth=$3
     profile_fact_tasks=$4
     profile_fact_keepalive=$5
-    profile_fact_folders=$6
+    profile_fact_unchecked=$6
+    profile_fact_folders=$7
     # One explicit branch per fact: a value that is not a count is dropped from
     # this profile's record, and a count is added to the run's total and
     # marks that total as known.
@@ -1463,6 +1581,10 @@ take_record_facts() {
         ''|*[!0-9]*) profile_fact_keepalive= ;;
         *) run_fact_keepalive=$((run_fact_keepalive + profile_fact_keepalive)); run_fact_keepalive_known=true ;;
     esac
+    case $profile_fact_unchecked in
+        ''|*[!0-9]*) profile_fact_unchecked= ;;
+        *) run_fact_unchecked=$((run_fact_unchecked + profile_fact_unchecked)); run_fact_unchecked_known=true ;;
+    esac
     case $profile_fact_folders in
         ''|-) profile_fact_folders= ;;
         *)
@@ -1472,11 +1594,12 @@ take_record_facts() {
 }
 clear_record_facts() {
     profile_fact_listings= profile_fact_mtime= profile_fact_reauth= profile_fact_tasks=
-    profile_fact_keepalive= profile_fact_folders=
+    profile_fact_keepalive= profile_fact_unchecked= profile_fact_folders=
 }
 run_fact_listings=0 run_fact_mtime=0 run_fact_reauth=0 run_fact_tasks=0 run_fact_keepalive=0
+run_fact_unchecked=0
 run_fact_listings_known=false run_fact_mtime_known=false run_fact_reauth_known=false
-run_fact_tasks_known=false run_fact_keepalive_known=false run_fact_folders=
+run_fact_tasks_known=false run_fact_keepalive_known=false run_fact_unchecked_known=false run_fact_folders=
 clear_record_facts
 
 # A profile the preflight refused makes the aggregate a failure even when every
@@ -1532,13 +1655,14 @@ RUN_RECORDS
         esac
         clear_record_facts
         if [ -n "$covered_facts" ]; then
-            # shellcheck disable=SC2086 -- five numbers, then the folder text
+            # shellcheck disable=SC2086 -- six numbers, then the folder text
             set -f
-            read -r fact_listings fact_mtime fact_reauth fact_tasks fact_keepalive fact_folders <<RECORD_FACTS
+            read -r fact_listings fact_mtime fact_reauth fact_tasks fact_keepalive fact_unchecked fact_folders <<RECORD_FACTS
 $covered_facts
 RECORD_FACTS
             set +f
-            take_record_facts "$fact_listings" "$fact_mtime" "$fact_reauth" "$fact_tasks" "$fact_keepalive" "$fact_folders"
+            take_record_facts "$fact_listings" "$fact_mtime" "$fact_reauth" "$fact_tasks" "$fact_keepalive" \
+                "$fact_unchecked" "$fact_folders"
         fi
         take_profile_cause "$covered_profile"
         case $covered_status in
@@ -1596,13 +1720,14 @@ RUN_RECORDS
     clear_record_facts
     if [ -n "$single_facts" ]; then
         set -f
-        read -r fact_listings fact_mtime fact_reauth fact_tasks fact_keepalive fact_folders <<RECORD_FACTS
+        read -r fact_listings fact_mtime fact_reauth fact_tasks fact_keepalive fact_unchecked fact_folders <<RECORD_FACTS
 $single_facts
 RECORD_FACTS
         set +f
-        take_record_facts "$fact_listings" "$fact_mtime" "$fact_reauth" "$fact_tasks" "$fact_keepalive" "$fact_folders"
+        take_record_facts "$fact_listings" "$fact_mtime" "$fact_reauth" "$fact_tasks" "$fact_keepalive" \
+            "$fact_unchecked" "$fact_folders"
     fi
-    take_profile_cause "$run_scope" "$run_detail"
+    take_profile_cause "$run_scope" "${run_cause_line:-$run_detail}"
     case $final_state:$run_partial in
         succeeded:true) runner_profile_outcome "$run_scope" partial "$exit_code" "$run_reason" "$finished" "$single_deferred" "$single_skipped" ;;
         *) runner_profile_outcome "$run_scope" "$final_state" "$exit_code" "$run_reason" "$finished" "$single_deferred" "$single_skipped" ;;
@@ -1622,6 +1747,7 @@ fi
 [ "$run_fact_reauth_known" != true ] || run_state_reauth=$run_fact_reauth
 [ "$run_fact_tasks_known" != true ] || run_state_tasks=$run_fact_tasks
 [ "$run_fact_keepalive_known" != true ] || run_state_keepalive=$run_fact_keepalive
+[ "$run_fact_unchecked_known" != true ] || run_state_unchecked=$run_fact_unchecked
 # Five folders in all, across profiles, as the contract bounds them.
 if [ -n "$run_fact_folders" ]; then
     run_state_folders=$(printf '%s' "$run_fact_folders" | LC_ALL=C awk -F'|' '
@@ -1629,10 +1755,10 @@ if [ -n "$run_fact_folders" ]; then
     ') || run_state_folders=
 fi
 
-# run.cancelled is not an accepted activity code and cancelled is not an
-# accepted activity state, so the cancellation is carried by the level and the
-# message rather than by widening either validator.
+# A cancellation has its own code and state, run.cancelled/cancelled, at info:
+# not a failure, and not shown as one.
 activity_message="Package action completed"
+activity_state=$final_state
 if [ "$final_state" = succeeded ] && [ "$run_partial" = true ]; then
     activity_code=run.succeeded; activity_level=warn
     if [ "$run_counts_known" = true ]; then
@@ -1647,7 +1773,7 @@ elif [ "$final_state" = succeeded ]; then
         activity_message="Package action completed; $run_total_skipped entr(y/ies) skipped and will not sync until fixed (see the sync log)"
     fi
 elif [ "$run_cancelled" = true ]; then
-    activity_code=run.failed; activity_level=info
+    activity_code=run.cancelled; activity_level=info; activity_state=cancelled
     activity_message="Package action cancelled before completion"
 else
     activity_code=run.failed; activity_level=error
@@ -1659,7 +1785,7 @@ else
         activity_message="Package action failed (exit $run_exit_code)"
     fi
 fi
-runner_activity "$activity_code" "$run_label" "$final_state" "$activity_message" "$run_activity_category" "$activity_level"
+runner_activity "$activity_code" "$run_label" "$activity_state" "$activity_message" "$run_activity_category" "$activity_level"
 if [ "$run_remote_log_dropped" = true ]; then
     runner_degrade remote_log
     runner_activity notification.unavailable "$run_label" unavailable \

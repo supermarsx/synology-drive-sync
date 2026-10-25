@@ -3,6 +3,8 @@ set -eu
 . "$(dirname "$0")/common"
 umask 077
 status_allow_closed_admission=false
+# The dead-controller repair in start runs this same script for its stop.
+lifecycle_script=$0
 
 lifecycle_lock_held=false
 lifecycle_lock=
@@ -310,7 +312,7 @@ signal_exact_controller_identity() {
             return 1
             ;;
         *)
-            package_message "refusing unsafe controller identity before signal"
+            package_message "refusing unsafe controller identity before signal${process_identity_cause:+ (cause=$process_identity_cause)}"
             return 1
             ;;
     esac
@@ -777,6 +779,77 @@ status_code() {
     return 3
 }
 
+# 0 only when the controller is provably gone -- no live PID, no live lock
+# owner, no live readiness record or startup lease -- while the exact API
+# service is live and ready. Nothing restarts a dead controller (the API execs
+# it once), so start refused this state as inconsistent for good and only an
+# explicit stop recovered it, while DSM offered only Run. Of every inconsistent
+# lifecycle state it is the one whose repair is known: the ordinary stop
+# teardown, then an ordinary start. Anything unprovable -- a live but
+# unverifiable PID or lock owner, a startup lease, a pre-commit API -- is 1, and
+# start goes on refusing it.
+controller_dead_with_live_api() {
+    dead_failed_status=0
+    failed_start_markers_status || dead_failed_status=$?
+    case $dead_failed_status in 1|2) ;; *) return 1 ;; esac
+    dead_controller_pid=none
+    if api_path_exists "$controller_pid_file"; then
+        controller_pid_file_safe || return 1
+        [ -n "$controller_pid_value" ] || return 1
+        ! script_pid_live "$controller_pid_value" || return 1
+        dead_controller_pid=$controller_pid_value
+    fi
+    if [ -e "$controller_ready_file" ] || [ -L "$controller_ready_file" ]; then
+        dead_ready_status=0
+        controller_ready_status || dead_ready_status=$?
+        [ "$dead_ready_status" -eq 1 ] || return 1
+    fi
+    if api_path_exists "$controller_lock"; then
+        [ -d "$controller_lock" ] && [ ! -L "$controller_lock" ] || return 1
+        dead_lock_status=0
+        private_process_lock_is_live "$controller_lock" || dead_lock_status=$?
+        [ "$dead_lock_status" -eq 1 ] || return 1
+    fi
+    if api_path_exists "$controller_start_file"; then
+        dead_lease_status=0
+        controller_start_lease_status || dead_lease_status=$?
+        [ "$dead_lease_status" -eq 1 ] || return 1
+    fi
+    ! api_path_exists "$api_bound_file" || return 1
+    api_path_exists "$api_pid_file" && api_pid_file_safe || return 1
+    dead_api_pid=$(api_pid 2>/dev/null || true)
+    [ -n "$dead_api_pid" ] && script_pid_live "$dead_api_pid" || return 1
+    api_pid_matches "$dead_api_pid" && api_ready_matches "$dead_api_pid" || return 1
+    api_socket_safe >/dev/null 2>&1 || return 1
+    dead_api_start=$api_ready_start
+}
+
+# A controller killed outright -- SIGKILL, the OOM killer -- writes nothing on
+# its way out. The first lifecycle call that proves it gone writes the record
+# instead: once per dead controller and API instance however often DSM polls
+# status, and always for the start that repairs it.
+record_controller_found_dead() {
+    found_dead_phase=$1
+    found_dead_key=$dead_controller_pid:$dead_api_pid:$dead_api_start
+    found_dead_marker=$runtime_root/controller.found-dead
+    if [ "$found_dead_phase" = status ] && [ -f "$found_dead_marker" ] && [ ! -L "$found_dead_marker" ]; then
+        found_dead_seen=
+        IFS= read -r found_dead_seen < "$found_dead_marker" || found_dead_seen=
+        [ "$found_dead_seen" != "$found_dead_key" ] || return 0
+    fi
+    append_controller_log_event warn controller_found_dead \
+        "phase=$found_dead_phase pid=$dead_controller_pid api_pid=$dead_api_pid" controller false \
+        "$path_owner" package-service \
+        || package_message "warning: the dead controller (PID $dead_controller_pid) could not be recorded in controller.log"
+    if [ ! -L "$found_dead_marker" ]; then
+        { printf '%s\n' "$found_dead_key" > "$found_dead_marker.tmp.$$" \
+            && finish_private_file "$found_dead_marker.tmp.$$" \
+            && mv -f "$found_dead_marker.tmp.$$" "$found_dead_marker"; } \
+            || { rm -f "$found_dead_marker.tmp.$$"
+                package_message "warning: $found_dead_marker could not be written; the dead controller may be logged again"; }
+    fi
+}
+
 prepare_api_start() {
     api_socket_parent_safe || return 1
 
@@ -1067,6 +1140,25 @@ case ${1:-} in
                     trap - 0 HUP INT TERM
                     package_message "API service and controller admission restored"
                     exit 0
+                fi
+                if [ "${SDSYNC_DSM_DEAD_CONTROLLER_RECOVERY:-}" != stopped ] && controller_dead_with_live_api; then
+                    record_controller_found_dead start
+                    package_message "the controller (PID $dead_controller_pid) was found dead while the API service (PID $dead_api_pid) was running; stopping the API service before starting"
+                    append_activity service.restarted none succeeded \
+                        "The package controller had stopped while its API service was still running; Run stopped the API service and started both again" \
+                        controller warn false "$path_owner" package-service \
+                        || package_message "warning: the controller recovery could not be recorded in package Activity"
+                    release_lifecycle_serialization || exit 1
+                    trap - 0 HUP INT TERM
+                    recovery_stop_status=0
+                    SYNOPKG_PKG_STATUS= /bin/sh "$lifecycle_script" stop || recovery_stop_status=$?
+                    if [ "$recovery_stop_status" -ne 0 ]; then
+                        package_message "the API service of the dead controller could not be stopped (status $recovery_stop_status); start refused"
+                        exit 1
+                    fi
+                    SDSYNC_DSM_DEAD_CONTROLLER_RECOVERY=stopped
+                    export SDSYNC_DSM_DEAD_CONTROLLER_RECOVERY
+                    exec /bin/sh "$lifecycle_script" start
                 fi
                 package_message "refusing to start from an inconsistent lifecycle state"
                 exit 1
@@ -1819,6 +1911,9 @@ case ${1:-} in
         status_code
         result=$?
         set -e
+        if [ "$result" -eq 2 ] && controller_dead_with_live_api; then
+            record_controller_found_dead status
+        fi
         release_lifecycle_serialization || result=2
         trap - 0 HUP INT TERM
         exit "$result"

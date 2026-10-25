@@ -552,7 +552,7 @@ reload_controller_if_running() {
     fi
     pid_is_live "$running_pid" || return 0
     if ! controller_persisted_identity_status "$running_pid"; then
-        echo "refusing to signal unverified controller PID $running_pid" >&2
+        echo "refusing to signal unverified controller PID $running_pid${process_identity_cause:+ (cause=$process_identity_cause)}" >&2
         reload_failed identity_refused "$running_pid"
         return 76
     fi
@@ -589,7 +589,7 @@ wake_controller_for_queue() {
     [ -n "$running_pid" ] || return 0
     pid_is_live "$running_pid" || return 0
     if ! controller_persisted_identity_status "$running_pid"; then
-        echo "refusing to wake unverified controller PID $running_pid" >&2
+        echo "refusing to wake unverified controller PID $running_pid${process_identity_cause:+ (cause=$process_identity_cause)}" >&2
         return 73
     fi
     wake_controller_start=$persisted_controller_start
@@ -860,6 +860,81 @@ current_default_for_action() {
     current_default
 }
 
+# The endpoint as the core's overlap check compares it (batch.rs
+# normalize_endpoint, which is Url::to_string): scheme and host lowercased, the
+# scheme's default port dropped, a trailing slash. The path is left as typed.
+overlap_endpoint() {
+    overlap_url=$1
+    overlap_scheme=${overlap_url%%://*}
+    overlap_rest=${overlap_url#*://}
+    overlap_authority=${overlap_rest%%/*}
+    if [ "$overlap_authority" = "$overlap_rest" ]; then overlap_path=/; else overlap_path=/${overlap_rest#*/}; fi
+    overlap_scheme=$(printf '%s' "$overlap_scheme" | tr '[:upper:]' '[:lower:]')
+    overlap_authority=$(printf '%s' "$overlap_authority" | tr '[:upper:]' '[:lower:]')
+    case $overlap_scheme:$overlap_authority in
+        https:*:443) overlap_authority=${overlap_authority%:443} ;;
+        http:*:80) overlap_authority=${overlap_authority%:80} ;;
+    esac
+    case $overlap_path in */) ;; *) overlap_path=$overlap_path/ ;; esac
+    printf '%s://%s%s\n' "$overlap_scheme" "$overlap_authority" "$overlap_path"
+}
+
+# A profile whose remote equals, contains or lies inside another profile's on
+# the same endpoint, where either one deletes, is the configuration the core
+# refuses (exit 2) for every run of either profile: a mirror run of one would
+# delete the other's content. Refused here, with the core's own sentence, so
+# the dashboard says so on Save rather than on the first failed run. A pair
+# where neither deletes is valid and only warned about, as the core does.
+check_profile_overlap() {
+    overlap_name=$1
+    overlap_remote=$2
+    overlap_own_endpoint=$(overlap_endpoint "$3")
+    overlap_own_delete=$4
+    for overlap_fragment in "$profiles_dir"/*.toml; do
+        [ -e "$overlap_fragment" ] || [ -L "$overlap_fragment" ] || continue
+        overlap_other=${overlap_fragment##*/}
+        overlap_other=${overlap_other%.toml}
+        [ "$overlap_other" != "$overlap_name" ] || continue
+        valid_name "$overlap_other" || continue
+        [ -f "$overlap_fragment" ] && [ ! -L "$overlap_fragment" ] && [ -r "$overlap_fragment" ] \
+            || die "profile '$overlap_other' cannot be read to check it against '$overlap_name' for overlapping destinations"
+        overlap_other_remote=
+        overlap_other_url=
+        overlap_other_delete=false
+        while IFS= read -r overlap_line || [ -n "$overlap_line" ]; do
+            case $overlap_line in
+                'remote = "'*'"') [ -n "$overlap_other_remote" ] || { overlap_other_remote=${overlap_line#remote = \"}; overlap_other_remote=${overlap_other_remote%\"}; } ;;
+                'url = "'*'"') [ -n "$overlap_other_url" ] || { overlap_other_url=${overlap_line#url = \"}; overlap_other_url=${overlap_other_url%\"}; } ;;
+                'delete = true') overlap_other_delete=true ;;
+            esac
+        done < "$overlap_fragment"
+        [ -n "$overlap_other_remote" ] && [ -n "$overlap_other_url" ] || continue
+        [ "$(overlap_endpoint "$overlap_other_url")" = "$overlap_own_endpoint" ] || continue
+        case $overlap_other_remote in
+            "$overlap_remote"|"$overlap_remote"/*) ;;
+            *) case $overlap_remote in "$overlap_other_remote"/*) ;; *) continue ;; esac ;;
+        esac
+        # The core's batch check names the pair in name order (sort_jobs).
+        if [ "$(printf '%s\n%s\n' "$overlap_name" "$overlap_other" | LC_ALL=C sort | sed -n '1p')" = "$overlap_name" ]; then
+            overlap_pair="batch jobs \"$overlap_name\" ($overlap_remote) and \"$overlap_other\" ($overlap_other_remote)"
+        else
+            overlap_pair="batch jobs \"$overlap_other\" ($overlap_other_remote) and \"$overlap_name\" ($overlap_remote)"
+        fi
+        overlap_pair="$overlap_pair have equal or nested roots on endpoint $overlap_own_endpoint"
+        overlap_names="profiles \"$overlap_name\" and \"$overlap_other\" have overlapping NAS destinations"
+        case $overlap_own_delete:$overlap_other_delete in
+            true:true) overlap_who="both delete" ;;
+            true:false) overlap_who="\"$overlap_name\" deletes" ;;
+            false:true) overlap_who="\"$overlap_other\" deletes" ;;
+            *)
+                echo "warning: $overlap_names; neither deletes, so nothing is lost, but each one's runs also carry the other's files ($overlap_pair)" >&2
+                continue
+                ;;
+        esac
+        die "$overlap_names and $overlap_who: give them separate destinations, or a mirror run of one deletes the other's files ($overlap_pair)"
+    done
+}
+
 configure_profile() {
     profile_name=
     source_path=
@@ -991,6 +1066,7 @@ configure_profile() {
     [ "$security_runtime_allow_empty_source" = true ] || [ "$allow_empty_source" != true ] || \
         policy_denied "security policy blocks empty-source synchronization"
     ensure_layout
+    check_profile_overlap "$profile_name" "$remote_path" "$base_url" "$delete"
     fragment_temp=$profiles_dir/.${profile_name}.toml.$$
     umask 077
     {
@@ -1785,6 +1861,91 @@ api_redact_file() {
             }
             return result
         }
+        # A line is a JSON record only when it opens and closes with matching
+        # brackets and holds nothing outside its string tokens but JSON
+        # structure. Anything else is text, and every spelling of a secret is
+        # replaced in it. A "[ts] message" line used to take the token path and
+        # keep a secret that sat outside any string.
+        function json_record_shape(text, first, last, opener, closer, cursor, character, escaped) {
+            first = 1
+            while (first <= length(text) && substr(text, first, 1) ~ /[ \t]/) first++
+            last = length(text)
+            while (last > first && substr(text, last, 1) ~ /[ \t]/) last--
+            if (last <= first) return 0
+            opener = substr(text, first, 1)
+            closer = substr(text, last, 1)
+            if (!((opener == "{" && closer == "}") || (opener == "[" && closer == "]"))) return 0
+            for (cursor = first; cursor <= last; cursor++) {
+                character = substr(text, cursor, 1)
+                if (character == "\"") {
+                    escaped = 0
+                    for (cursor++; cursor <= last; cursor++) {
+                        character = substr(text, cursor, 1)
+                        if (escaped) escaped = 0
+                        else if (character == slash) escaped = 1
+                        else if (character == "\"") break
+                    }
+                    if (cursor > last) return 0
+                } else if (index(" \t{}[],:0123456789+.eEtrufalsn-", character) == 0) return 0
+            }
+            return 1
+        }
+        # Drop a multibyte sequence a byte cut left incomplete at the end.
+        function utf8_trim_tail(text, n, k, c, need) {
+            n = length(text)
+            for (k = n; k >= 1 && k >= n - 3; k--) {
+                c = substr(text, k, 1)
+                if (c ~ /[\200-\277]/) continue
+                if (c ~ /[\300-\337]/) need = 2
+                else if (c ~ /[\340-\357]/) need = 3
+                else if (c ~ /[\360-\367]/) need = 4
+                else return text
+                if (n - k + 1 < need) return substr(text, 1, k - 1)
+                return text
+            }
+            return text
+        }
+        # Every byte that is not part of a well-formed UTF-8 sequence becomes
+        # U+FFFD, so the document is always valid UTF-8 for the bridge.
+        function utf8_scrub(text, n, i, c, need, j, good, out, second) {
+            if (text !~ /[\200-\377]/) return text
+            n = length(text)
+            out = ""
+            i = 1
+            while (i <= n) {
+                c = substr(text, i, 1)
+                if (c !~ /[\200-\377]/) { out = out c; i++; continue }
+                need = 0
+                if (c ~ /[\302-\337]/) need = 2
+                else if (c ~ /[\340-\357]/) need = 3
+                else if (c ~ /[\360-\364]/) need = 4
+                good = (need > 0 && i + need - 1 <= n)
+                if (good && need > 2) {
+                    second = substr(text, i + 1, 1)
+                    if (c == "\340" && second !~ /[\240-\277]/) good = 0
+                    else if (c == "\355" && second !~ /[\200-\237]/) good = 0
+                    else if (c == "\360" && second !~ /[\220-\277]/) good = 0
+                    else if (c == "\364" && second !~ /[\200-\217]/) good = 0
+                }
+                for (j = 1; good && j < need; j++)
+                    if (substr(text, i + j, 1) !~ /[\200-\277]/) good = 0
+                if (good) { out = out substr(text, i, need); i += need }
+                else { out = out "\357\277\275"; i++ }
+            }
+            return out
+        }
+        function redact_text(text, needle_index) {
+            for (needle_index = 1; needle_index <= needle_count; needle_index++) {
+                text = replace_literal(text, encoded_needles[needle_index], "[redacted]")
+                text = replace_literal(text, needles[needle_index], "[redacted]")
+            }
+            return text
+        }
+        function holds_secret(text, needle_index) {
+            for (needle_index = 1; needle_index <= needle_count; needle_index++)
+                if (index(text, needles[needle_index]) != 0 || index(text, encoded_needles[needle_index]) != 0) return 1
+            return 0
+        }
         function redact_json_strings(text, result, cursor, start, escaped, character, token, needle_index) {
             result = ""
             cursor = 1
@@ -1803,7 +1964,12 @@ api_redact_file() {
                     else if (character == "\"") break
                     cursor++
                 }
-                if (cursor > length(text)) return result substr(text, start)
+                if (cursor > length(text)) {
+                    token = substr(text, start)
+                    for (needle_index = 1; needle_index <= needle_count; needle_index++)
+                        token = replace_literal(token, encoded_needles[needle_index], "[redacted]")
+                    return result token
+                }
                 token = substr(text, start, cursor - start + 1)
                 for (needle_index = 1; needle_index <= needle_count; needle_index++)
                     token = replace_literal(token, encoded_needles[needle_index], "[redacted]")
@@ -1828,20 +1994,20 @@ api_redact_file() {
         }
         {
             line = $0
-            first = 1
-            while (first <= length(line) && substr(line, first, 1) ~ /[ \t]/) first++
-            if (substr(line, first, 1) == "{" || substr(line, first, 1) == "[") {
+            # Terminal escapes go before redaction: stripped afterwards they
+            # could join the two halves of a split secret back together.
+            gsub(/\033\[[0-9;?]*[ -\/]*[@-~]/, "", line)
+            if (!holds_secret(line)) {
+            } else if (json_record_shape(line)) {
                 # Structured output must stay syntactically valid even when a
                 # credential contains JSON punctuation. Redact only serialized
-                # string tokens, using the exact encoding emitted by serde_json.
-                line = redact_json_strings(line)
+                # string tokens, using the exact encoding emitted by serde_json;
+                # whatever that leaves takes the text rule.
+                redacted = redact_json_strings(line)
+                line = holds_secret(redacted) ? redact_text(line) : redacted
             } else {
-                for (needle_index = 1; needle_index <= needle_count; needle_index++) {
-                    line = replace_literal(line, encoded_needles[needle_index], "[redacted]")
-                    line = replace_literal(line, needles[needle_index], "[redacted]")
-                }
+                line = redact_text(line)
             }
-            gsub(/\033\[[0-9;?]*[ -\/]*[@-~]/, "", line)
             line = replace_literal(line, home, "[package-home]")
             line = replace_literal(line, var, "[package-var]")
             line = replace_literal(line, real_home, "[package-home]")
@@ -2707,7 +2873,7 @@ api_json_log_lines() {
     # before, 1.25 s now, with byte-identical output.
     LC_ALL=C awk -v home="$package_home" -v var="$package_var" \
         -v real_home="$package_home_real" -v real_var="$package_var_real" \
-        -v requested="$json_log_lines" -v byte_limit="$json_log_byte_limit" -v line_limit=8192 \
+        -v requested="$json_log_lines" -v byte_limit="$json_log_byte_limit" -v line_limit=8192 -v redact_limit=32768 \
         -v source="$json_log_source" -v threshold="$json_log_threshold" \
         -v bridge_threshold="$security_runtime_bridge_level" \
         -v authentication_threshold="$security_runtime_authentication_level" \
@@ -2794,6 +2960,91 @@ api_json_log_lines() {
             }
             return result
         }
+        # A line is a JSON record only when it opens and closes with matching
+        # brackets and holds nothing outside its string tokens but JSON
+        # structure. Anything else is text, and every spelling of a secret is
+        # replaced in it. A "[ts] message" line used to take the token path and
+        # keep a secret that sat outside any string.
+        function json_record_shape(text, first, last, opener, closer, cursor, character, escaped) {
+            first = 1
+            while (first <= length(text) && substr(text, first, 1) ~ /[ \t]/) first++
+            last = length(text)
+            while (last > first && substr(text, last, 1) ~ /[ \t]/) last--
+            if (last <= first) return 0
+            opener = substr(text, first, 1)
+            closer = substr(text, last, 1)
+            if (!((opener == "{" && closer == "}") || (opener == "[" && closer == "]"))) return 0
+            for (cursor = first; cursor <= last; cursor++) {
+                character = substr(text, cursor, 1)
+                if (character == "\"") {
+                    escaped = 0
+                    for (cursor++; cursor <= last; cursor++) {
+                        character = substr(text, cursor, 1)
+                        if (escaped) escaped = 0
+                        else if (character == slash) escaped = 1
+                        else if (character == "\"") break
+                    }
+                    if (cursor > last) return 0
+                } else if (index(" \t{}[],:0123456789+.eEtrufalsn-", character) == 0) return 0
+            }
+            return 1
+        }
+        # Drop a multibyte sequence a byte cut left incomplete at the end.
+        function utf8_trim_tail(text, n, k, c, need) {
+            n = length(text)
+            for (k = n; k >= 1 && k >= n - 3; k--) {
+                c = substr(text, k, 1)
+                if (c ~ /[\200-\277]/) continue
+                if (c ~ /[\300-\337]/) need = 2
+                else if (c ~ /[\340-\357]/) need = 3
+                else if (c ~ /[\360-\367]/) need = 4
+                else return text
+                if (n - k + 1 < need) return substr(text, 1, k - 1)
+                return text
+            }
+            return text
+        }
+        # Every byte that is not part of a well-formed UTF-8 sequence becomes
+        # U+FFFD, so the document is always valid UTF-8 for the bridge.
+        function utf8_scrub(text, n, i, c, need, j, good, out, second) {
+            if (text !~ /[\200-\377]/) return text
+            n = length(text)
+            out = ""
+            i = 1
+            while (i <= n) {
+                c = substr(text, i, 1)
+                if (c !~ /[\200-\377]/) { out = out c; i++; continue }
+                need = 0
+                if (c ~ /[\302-\337]/) need = 2
+                else if (c ~ /[\340-\357]/) need = 3
+                else if (c ~ /[\360-\364]/) need = 4
+                good = (need > 0 && i + need - 1 <= n)
+                if (good && need > 2) {
+                    second = substr(text, i + 1, 1)
+                    if (c == "\340" && second !~ /[\240-\277]/) good = 0
+                    else if (c == "\355" && second !~ /[\200-\237]/) good = 0
+                    else if (c == "\360" && second !~ /[\220-\277]/) good = 0
+                    else if (c == "\364" && second !~ /[\200-\217]/) good = 0
+                }
+                for (j = 1; good && j < need; j++)
+                    if (substr(text, i + j, 1) !~ /[\200-\277]/) good = 0
+                if (good) { out = out substr(text, i, need); i += need }
+                else { out = out "\357\277\275"; i++ }
+            }
+            return out
+        }
+        function redact_text(text, needle_index) {
+            for (needle_index = 1; needle_index <= needle_count; needle_index++) {
+                text = replace_literal(text, encoded_needles[needle_index], "[redacted]")
+                text = replace_literal(text, needles[needle_index], "[redacted]")
+            }
+            return text
+        }
+        function holds_secret(text, needle_index) {
+            for (needle_index = 1; needle_index <= needle_count; needle_index++)
+                if (index(text, needles[needle_index]) != 0 || index(text, encoded_needles[needle_index]) != 0) return 1
+            return 0
+        }
         function redact_json_strings(text, result, cursor, start, escaped, character, token, needle_index) {
             result = ""
             cursor = 1
@@ -2812,7 +3063,12 @@ api_json_log_lines() {
                     else if (character == "\"") break
                     cursor++
                 }
-                if (cursor > length(text)) return result substr(text, start)
+                if (cursor > length(text)) {
+                    token = substr(text, start)
+                    for (needle_index = 1; needle_index <= needle_count; needle_index++)
+                        token = replace_literal(token, encoded_needles[needle_index], "[redacted]")
+                    return result token
+                }
                 token = substr(text, start, cursor - start + 1)
                 for (needle_index = 1; needle_index <= needle_count; needle_index++)
                     token = replace_literal(token, encoded_needles[needle_index], "[redacted]")
@@ -2854,15 +3110,24 @@ api_json_log_lines() {
                 ARGV[argument] = ""
             }
         }
-        function sanitize(line, first, needle_index) {
-            first = 1
-            while (first <= length(line) && substr(line, first, 1) ~ /[ \t]/) first++
-            if (substr(line, first, 1) == "{" || substr(line, first, 1) == "[") {
-                line = redact_json_strings(line)
-            } else {
-                for (needle_index = 1; needle_index <= needle_count; needle_index++) {
-                    line = replace_literal(line, encoded_needles[needle_index], "[redacted]")
-                    line = replace_literal(line, needles[needle_index], "[redacted]")
+        # The whole line is redacted before anything is cut from it: a line cut
+        # first kept the start of a secret that straddled the cut (G-9). In
+        # order: terminal escapes, which could otherwise join a split secret;
+        # the secrets, on the token path for a real JSON record and the text
+        # rule for anything else or anything the token path left; the path
+        # labels; a last check, which withholds a line that still holds a
+        # secret; then the display ceiling, cut on a character boundary. A line
+        # with no spelling of any secret skips the character walks entirely,
+        # which is what keeps a log of long lines inside the manager timeout.
+        function sanitize(line, original) {
+            gsub(/\033\[[0-9;?]*[ -\/]*[@-~]/, "", line)
+            if (holds_secret(line)) {
+                original = line
+                if (json_record_shape(line)) {
+                    line = redact_json_strings(line)
+                    if (holds_secret(line)) line = redact_text(original)
+                } else {
+                    line = redact_text(line)
                 }
             }
             line = replace_literal(line, home, "[package-home]")
@@ -2870,24 +3135,31 @@ api_json_log_lines() {
             line = replace_literal(line, real_home, "[package-home]")
             line = replace_literal(line, real_var, "[package-var]")
             gsub(/\[package-home\]\/secrets\/[^ ]+/, "[secret]", line)
-            if (length(line) > line_limit) line = substr(line, 1, line_limit)
-            return line
+            if (holds_secret(line)) return "[line withheld: could not be redacted]"
+            if (length(line) > line_limit) line = utf8_trim_tail(substr(line, 1, line_limit))
+            return utf8_scrub(line)
         }
         {
             line = $0
             if (source != "audit") {
-                line_threshold = source == "api" ? api_threshold(line) : threshold
+                # The level and category come from the first line_limit bytes of
+                # the line, as on the in-service lane; they are never shown
+                # unless the whole line passes redaction.
+                line_head = substr(line, 1, line_limit)
+                line_threshold = source == "api" ? api_threshold(line_head) : threshold
                 if (line_threshold == "invalid") next
                 # An error is shown whatever the threshold, `off` included.
-                event_level = structured_level(line)
+                event_level = structured_level(line_head)
                 if (event_level != "error") {
                     if (line_threshold == "off" || level_rank(event_level) < level_rank(line_threshold)) next
                 }
             }
-            # Bound the retained line here so the ring cannot grow with an
-            # arbitrarily long record. Redaction may lengthen what it rewrites,
-            # so sanitize() applies the same ceiling again on the way out.
-            if (length(line) > line_limit) line = substr(line, 1, line_limit)
+            # A line longer than the redactor takes is withheld whole, here,
+            # never cut: a secret straddling a cut would leave its start in
+            # view. Shorter lines are kept whole and cut after redaction, so a
+            # ring slot holds up to redact_limit bytes: at most 32 MB for 1000
+            # lines that are all just under it, on this fallback lane only.
+            if (length(line) > redact_limit) line = "[line too long: " length(line) " bytes, withheld]"
             record_count++
             ring[((record_count - 1) % requested) + 1] = line
         }
@@ -3225,7 +3497,7 @@ api_activity() {
         {
             if ((NF != 5 && NF != 7 && NF != 9) || $1 !~ /^[0-9]+$/ || $2 !~ /^[a-z_]+\.[a-z_]+$/ ||
                 $3 !~ /^(none|all|[A-Za-z0-9_-]+)$/ ||
-                $4 !~ /^(running|succeeded|failed|deferred|scheduled|changed|unavailable|requested)$/ ||
+                $4 !~ /^(running|succeeded|failed|deferred|scheduled|changed|unavailable|requested|cancelled)$/ ||
                 (NF >= 7 && ($5 !~ /^(audit|bridge|authentication|security|configuration|secrets|routines|operations|notifications|sync|controller|scheduler)$/ ||
                     $6 !~ /^(trace|debug|info|warn|error)$/)) ||
                 (NF == 9 && ($7 !~ /^[1-9][0-9]*$/ || $7 > 4294967295 ||
@@ -4070,6 +4342,10 @@ api_resync() {
 api_mutation_result() {
     mutation_message=$1
     if [ -n "${api_warning_code:-}" ]; then
+        # The bridge refuses an empty warning, which would turn a committed save
+        # into a failed job (RB-5): a warning line that sanitised to nothing
+        # still says that there was one.
+        [ -n "${api_warning:-}" ] || api_warning="The change was saved, but its warning could not be shown; see the package logs"
         printf '{"schema":"sdsync.dsm-result.v1","ok":true,"message":%s,"warning_code":%s,"warning":%s}\n' \
             "$(json_quote "$mutation_message")" "$(json_quote "$api_warning_code")" "$(json_quote "$api_warning")"
         return 0

@@ -1053,36 +1053,89 @@ read_process_stat_fields() {
     [ -n "$process_stat_state" ] && [ -n "$process_stat_start" ]
 }
 
-# One builtin pass over /proc/<pid>/status. The first Uid:/PPid: line wins,
-# which is what the `sed -n '1p'` on the end of the replaced pipelines did, and
-# the scan stops as soon as both are known so the remaining fifty-odd lines are
-# never parsed.
+# One consistent snapshot of /proc/<pid>/status, parsed with builtins. The
+# first Uid:/PPid: line wins, which is what the `sed -n '1p'` on the end of the
+# replaced pipelines did.
+#
+# /proc/<pid>/status is a seq_file: a read at a new offset after an lseek
+# renders the whole text again. bash's read builtin, on a seekable file, reads a
+# buffer and then lseeks back to just past the line it returned, so a per-line
+# loop under bash -- DSM's /bin/sh -- stitched each line from a different
+# rendering. A State: line that flipped between "R (running)" and
+# "S (sleeping)" between two renderings shifts every later line by a byte, the
+# Uid: or PPid: prefix is lost, and a live process read as unprovable: about one
+# check in 100 to 2000 of a busy process, and every caller fails closed on that.
+#
+# With -d '' bash reads one byte at a time and never seeks, so the whole text
+# comes from one rendering. dash and BusyBox ash always read a byte at a time,
+# so their per-line loop already does. A torn pass can only lose a field, never
+# yield a wrong number; a pass that lacks either is retried while the process
+# exists, a bounded number of times, and a failure is named in
+# process_status_failure for the caller's message.
+process_status_newline='
+'
+
+read_process_status_snapshot() {
+    process_status_text=
+    if [ -n "${BASH_VERSION:-}" ]; then
+        # read returns 1 at end of file when no NUL delimiter was seen; the
+        # text is complete then, and its content is what is checked.
+        IFS= read -r -d '' process_status_text 2>/dev/null < "/proc/$1/status" || :
+    else
+        # Uid: follows PPid:, so the rest of the file is never read.
+        while IFS= read -r process_status_line; do
+            process_status_text=$process_status_text$process_status_newline$process_status_line
+            case $process_status_line in Uid:*) break ;; esac
+        done 2>/dev/null < "/proc/$1/status"
+    fi
+}
+
+# The first decimal token of the text after a "Key:" prefix, up to its newline.
+process_status_number() {
+    process_status_field=${1%%"$process_status_newline"*}
+    while :; do
+        case $process_status_field in
+            [[:space:]]*) process_status_field=${process_status_field#?} ;;
+            *) break ;;
+        esac
+    done
+    process_status_field=${process_status_field%%[[:space:]]*}
+    case $process_status_field in ''|*[!0-9]*) process_status_field= ;; esac
+}
+
 read_process_status_ids() {
     process_status_uid=
     process_status_ppid=
-    while IFS= read -r process_status_line; do
-        case $process_status_line in
-            Uid:*) [ -z "$process_status_uid" ] || continue
-                process_status_field=${process_status_line#Uid:} ;;
-            PPid:*) [ -z "$process_status_ppid" ] || continue
-                process_status_field=${process_status_line#PPid:} ;;
-            *) continue ;;
+    process_status_failure=
+    process_status_pass=0
+    while [ "$process_status_pass" -lt 3 ]; do
+        process_status_pass=$((process_status_pass + 1))
+        read_process_status_snapshot "$1"
+        process_status_all=$process_status_newline$process_status_text
+        process_status_uid=
+        process_status_ppid=
+        case $process_status_all in
+            *"${process_status_newline}Uid:"*)
+                process_status_number "${process_status_all#*"${process_status_newline}Uid:"}"
+                process_status_uid=$process_status_field ;;
         esac
-        while :; do
-            case $process_status_field in
-                [[:space:]]*) process_status_field=${process_status_field#?} ;;
-                *) break ;;
-            esac
-        done
-        process_status_field=${process_status_field%%[[:space:]]*}
-        case $process_status_field in ''|*[!0-9]*) process_status_field= ;; esac
-        case $process_status_line in
-            Uid:*) process_status_uid=$process_status_field ;;
-            *) process_status_ppid=$process_status_field ;;
+        case $process_status_all in
+            *"${process_status_newline}PPid:"*)
+                process_status_number "${process_status_all#*"${process_status_newline}PPid:"}"
+                process_status_ppid=$process_status_field ;;
         esac
-        [ -z "$process_status_uid" ] || [ -z "$process_status_ppid" ] || break
-    done 2>/dev/null < "/proc/$1/status"
-    [ -n "$process_status_uid" ] && [ -n "$process_status_ppid" ]
+        [ -z "$process_status_uid" ] || [ -z "$process_status_ppid" ] || return 0
+        if [ ! -e "/proc/$1" ]; then
+            process_status_failure=process_exited
+            return 1
+        fi
+        if [ -z "$process_status_text" ]; then
+            process_status_failure=status_unreadable
+        else
+            process_status_failure=status_fields_missing
+        fi
+    done
+    return 1
 }
 
 # The lifecycle entry point measures once per transition whether this DSM
@@ -1174,16 +1227,22 @@ boot_identity() {
     printf '%s\n' "$boot_identity_value"
 }
 
+# 0 live, 1 provably gone, 73 unprovable. Every 73 names its cause in
+# process_identity_cause, so a refusal can say why rather than only "unsafe".
 process_identity_is_live() {
     process_identity_pid=$1
     process_identity_start=$2
     process_identity_boot=$3
-    process_identity_current_boot=$(boot_identity) || return 73
+    process_identity_cause=
+    process_identity_current_boot=$(boot_identity) || {
+        process_identity_cause=boot_identity_unreadable
+        return 73
+    }
     [ "$process_identity_current_boot" = "$process_identity_boot" ] || return 1
-    is_pid "$process_identity_pid" || return 73
-    case $process_identity_start in ''|*[!0-9]*|0) return 73 ;; esac
+    is_pid "$process_identity_pid" || { process_identity_cause=invalid_pid; return 73; }
+    case $process_identity_start in ''|*[!0-9]*|0) process_identity_cause=invalid_start; return 73 ;; esac
     [ -e "/proc/$process_identity_pid" ] || return 1
-    case ${path_owner:-} in ''|*[!0-9]*) return 73 ;; esac
+    case ${path_owner:-} in ''|*[!0-9]*) process_identity_cause=package_owner_unknown; return 73 ;; esac
 
     process_identity_actual_start=
     process_identity_state=
@@ -1198,10 +1257,15 @@ process_identity_is_live() {
     if [ -z "$process_identity_actual_start" ] || [ -z "$process_identity_uid" ] || \
         [ -z "$process_identity_state" ]; then
         [ -e "/proc/$process_identity_pid" ] || return 1
+        process_identity_cause=stat_unreadable
+        [ -n "$process_identity_uid" ] || process_identity_cause=${process_status_failure:-status_unreadable}
         return 73
     fi
-    [ "$process_identity_actual_start" = "$process_identity_start" ] && \
-        [ "$process_identity_uid" = "$path_owner" ] || return 73
+    [ "$process_identity_actual_start" = "$process_identity_start" ] || {
+        process_identity_cause=start_mismatch
+        return 73
+    }
+    [ "$process_identity_uid" = "$path_owner" ] || { process_identity_cause=uid_mismatch; return 73; }
 
     # Recheck the exact tuple immediately before classifying it. A stale lock
     # may be recovered only after this process is absent or terminal; a reused,
@@ -1219,14 +1283,19 @@ process_identity_is_live() {
     if [ -z "$process_identity_start_recheck" ] || [ -z "$process_identity_uid_recheck" ] || \
         [ -z "$process_identity_state_recheck" ]; then
         [ -e "/proc/$process_identity_pid" ] || return 1
+        process_identity_cause=stat_unreadable
+        [ -n "$process_identity_uid_recheck" ] || process_identity_cause=${process_status_failure:-status_unreadable}
         return 73
     fi
-    [ "$process_identity_start_recheck" = "$process_identity_start" ] && \
-        [ "$process_identity_uid_recheck" = "$path_owner" ] || return 73
+    [ "$process_identity_start_recheck" = "$process_identity_start" ] || {
+        process_identity_cause=start_mismatch
+        return 73
+    }
+    [ "$process_identity_uid_recheck" = "$path_owner" ] || { process_identity_cause=uid_mismatch; return 73; }
     case $process_identity_state_recheck in
         Z|X|x) return 1 ;;
         R|S|D|T|t|K|W|P|I) return 0 ;;
-        *) return 73 ;;
+        *) process_identity_cause=state_unknown; return 73 ;;
     esac
 }
 
@@ -1462,14 +1531,113 @@ remove_orphan_event_recovery() {
     loaded_lock_owner_is_live || orphan_owner_status=$?
     if [ "$orphan_owner_status" -eq 0 ]; then
         # A recovery process can die after moving a newly-published live owner.
-        # Restore that exact owner if no replacement exists; never discard it.
-        [ ! -e "$event_log_lock/pid" ] && [ ! -L "$event_log_lock/pid" ] || return 75
-        mv "$orphan_recovery_path" "$event_log_lock/pid" 2>/dev/null || return 73
+        # Restore that exact owner, never over a newer record; never discard it.
+        ln "$orphan_recovery_path" "$event_log_lock/pid" 2>/dev/null || return 75
+        rm -f "$orphan_recovery_path" || return 73
         return 75
     fi
     [ "$orphan_owner_status" -eq 1 ] || return 73
     rm -f "$orphan_recovery_path"
 }
+
+# Put a moved-aside owner record back without ever replacing a newer one:
+# link(2) fails with EEXIST where a check-then-mv would overwrite whatever a
+# contender published in between. A contender that linked its own record
+# meanwhile sees the claim as an active recovery and withdraws, so the link is
+# retried a bounded number of times. A record that still cannot be put back is
+# kept on disk under its claim name, named on stderr, and 75 returned; the
+# orphan handling restores or reaps it on a later acquire.
+restore_lock_owner_record() {
+    restore_owner_attempt=0
+    until ln "$1" "$event_log_lock/pid" 2>/dev/null; do
+        restore_owner_attempt=$((restore_owner_attempt + 1))
+        if [ "$restore_owner_attempt" -ge 10 ]; then
+            echo "lock_owner_restore_failed path=$event_log_lock/pid kept=$1 cause=record_exists" >&2
+            return 75
+        fi
+        sleep 1
+    done
+    rm -f "$1" || {
+        echo "lock_owner_restore_failed path=$1 cause=the claim name could not be removed after the restore" >&2
+        return 73
+    }
+}
+
+# A torn-record claim, named torn.PID.START.BOOT after its claimant, is an
+# active recovery while that claimant lives. Its content is never parsed for
+# that: it is the record that was judged torn.
+event_torn_claim_owner_is_live() {
+    checked_torn_suffix=${1#"$event_log_lock".torn.}
+    checked_torn_pid=${checked_torn_suffix%%.*}
+    checked_torn_rest=${checked_torn_suffix#*.}
+    checked_torn_start=${checked_torn_rest%%.*}
+    checked_torn_boot=${checked_torn_rest#*.}
+    if [ "$checked_torn_suffix" = "$1" ] || [ "$checked_torn_rest" = "$checked_torn_suffix" ] \
+        || [ "$checked_torn_boot" = "$checked_torn_rest" ] || ! is_pid "$checked_torn_pid" \
+        || ! valid_boot_identity "$checked_torn_boot"; then
+        echo "refusing a torn lock owner claim with an unparseable name: $1" >&2
+        return 73
+    fi
+    case $checked_torn_start in ''|*[!0-9]*|0)
+        echo "refusing a torn lock owner claim with an unparseable name: $1" >&2
+        return 73
+        ;;
+    esac
+    process_identity_is_live "$checked_torn_pid" "$checked_torn_start" "$checked_torn_boot"
+}
+
+# The claim of a recovery whose claimant died. Still torn from before the boot:
+# removed. A record that parses is what the claimant took by mistake, exactly
+# like an orphaned stale-owner recovery: a live owner's is put back (never over
+# a newer record, 75), a dead owner's removed. Anything else stays and is 73.
+remove_orphan_torn_claim() {
+    if lock_owner_torn_before_boot "$1"; then
+        rm -f "$1" && return 0
+        echo "a torn lock owner claim could not be removed: $1" >&2
+        return 73
+    fi
+    if ! read_private_lock_owner "$1"; then
+        [ ! -e "$1" ] && [ ! -L "$1" ] && return 0
+        echo "refusing a torn lock owner claim that neither parses nor predates the boot: $1" >&2
+        return 73
+    fi
+    orphan_torn_status=0
+    loaded_lock_owner_is_live || orphan_torn_status=$?
+    case $orphan_torn_status in
+        0)
+            restore_lock_owner_record "$1" || return $?
+            echo "lock_owner_torn_race: restored a record a dead recovery had moved aside: $event_log_lock/pid" >&2
+            return 75
+            ;;
+        1) rm -f "$1" && return 0; echo "a torn lock owner claim could not be removed: $1" >&2; return 73 ;;
+        *) return 73 ;;
+    esac
+}
+
+# Scans the torn-record claims beside this lock: event_torn_active=true while
+# another contender's claimant lives; orphans are reaped or restored. Returns
+# 0, or 73/75 from an orphan that could not be handled.
+scan_torn_owner_claims() {
+    event_torn_active=false
+    for event_torn_path in "$event_log_lock".torn.*; do
+        [ -e "$event_torn_path" ] || [ -L "$event_torn_path" ] || continue
+        [ "$event_torn_path" != "$event_log_lock.torn.$$.$event_claim_start.$event_claim_boot" ] || continue
+        torn_claimant_status=0
+        event_torn_claim_owner_is_live "$event_torn_path" || torn_claimant_status=$?
+        case $torn_claimant_status in
+            0) event_torn_active=true; return 0 ;;
+            1) ;;
+            *) [ ! -e "$event_torn_path" ] && [ ! -L "$event_torn_path" ] && continue; return 73 ;;
+        esac
+        remove_orphan_torn_claim "$event_torn_path" || return $?
+    done
+    return 0
+}
+
+# No-op hooks around the torn-record judgement and claim. They cost nothing in
+# production; the package tests redefine them to widen the race windows.
+torn_owner_judged() { :; }
+torn_owner_claimed() { :; }
 
 create_event_log_lock_directory() {
     event_directory_attempt=0
@@ -1564,6 +1732,15 @@ acquire_event_log_lock() {
                     ;;
             esac
         done
+        if [ "$event_recovery_active" != true ]; then
+            torn_scan_status=0
+            scan_torn_owner_claims || torn_scan_status=$?
+            case $torn_scan_status in
+                0) [ "$event_torn_active" != true ] || event_recovery_active=true ;;
+                75) event_recovery_active=true ;;
+                *) rm -f "$event_claim_path"; return 73 ;;
+            esac
+        fi
         if [ "$event_recovery_active" = true ]; then
             event_lock_attempt=$((event_lock_attempt + 1))
             [ "$event_lock_attempt" -lt 10 ] || { rm -f "$event_claim_path"; return 75; }
@@ -1602,6 +1779,20 @@ acquire_event_log_lock() {
                         ;;
                 esac
             done
+            if [ "$event_recovery_active" != true ]; then
+                torn_scan_status=0
+                scan_torn_owner_claims || torn_scan_status=$?
+                case $torn_scan_status in
+                    0) [ "$event_torn_active" != true ] || event_recovery_active=true ;;
+                    75) event_recovery_active=true ;;
+                    *)
+                        current_published_identity=$(stat -c '%d:%i' "$event_log_lock/pid" 2>/dev/null || true)
+                        [ "$current_published_identity" != "$event_claim_identity" ] || rm -f "$event_log_lock/pid"
+                        rm -f "$event_claim_path"
+                        return 73
+                        ;;
+                esac
+            fi
             if [ "$event_recovery_active" = true ]; then
                 current_published_identity=$(stat -c '%d:%i' "$event_log_lock/pid" 2>/dev/null || true)
                 if [ "$current_published_identity" = "$event_claim_identity" ]; then
@@ -1626,9 +1817,11 @@ acquire_event_log_lock() {
             rm -f "$event_claim_path"
             return 73
         fi
-        event_observed_owner_identity=$(stat -c '%d:%i' "$event_log_lock/pid" 2>/dev/null || true)
+        # Device, inode, size and mtime: an inode number alone can be handed to
+        # a record published after the old one was freed.
+        event_observed_owner_identity=$(stat -c '%d:%i:%s:%Y' "$event_log_lock/pid" 2>/dev/null || true)
         if ! read_private_lock_owner "$event_log_lock/pid"; then
-            event_current_owner_identity=$(stat -c '%d:%i' "$event_log_lock/pid" 2>/dev/null || true)
+            event_current_owner_identity=$(stat -c '%d:%i:%s:%Y' "$event_log_lock/pid" 2>/dev/null || true)
             if [ -z "$event_current_owner_identity" ] || [ "$event_current_owner_identity" != "$event_observed_owner_identity" ]; then
                 event_lock_attempt=$((event_lock_attempt + 1))
                 [ "$event_lock_attempt" -lt 10 ] || { rm -f "$event_claim_path"; return 75; }
@@ -1640,23 +1833,56 @@ acquire_event_log_lock() {
                 continue
             fi
             if lock_owner_torn_before_boot "$event_log_lock/pid"; then
-                # Recovered like a dead owner: moved aside, the move proved to
-                # have taken this very record, then removed.
-                torn_identity=$(stat -c '%d:%i' "$event_log_lock/pid" 2>/dev/null || true)
+                # Recovered like a dead owner, by rename to this contender's own
+                # claim name: rename(2) is atomic, so one contender takes any one
+                # record, and the claim name is an active recovery to the others
+                # (scan_torn_owner_claims). The identity judged torn is the one
+                # stat-ed before the content read; the claimed copy is removed
+                # only when it is that identity and is still torn. Anything else
+                # is a record published after the judgement -- a live owner's --
+                # and is put back without overwriting, never deleted.
+                torn_owner_judged
                 torn_recovery=$event_log_lock.torn.$$.$event_claim_start.$event_claim_boot
-                [ -n "$torn_identity" ] && [ ! -e "$torn_recovery" ] && [ ! -L "$torn_recovery" ] \
-                    || { rm -f "$event_claim_path"; return 73; }
-                mv "$event_log_lock/pid" "$torn_recovery" 2>/dev/null || continue
-                torn_moved=$(stat -c '%d:%i' "$torn_recovery" 2>/dev/null || true)
-                if [ "$torn_moved" != "$torn_identity" ]; then
-                    if [ ! -e "$event_log_lock/pid" ] && [ ! -L "$event_log_lock/pid" ]; then
-                        mv "$torn_recovery" "$event_log_lock/pid" 2>/dev/null || true
-                    fi
-                    sleep 1
+                [ ! -e "$torn_recovery" ] && [ ! -L "$torn_recovery" ] || {
+                    echo "refusing to recover a torn lock owner over an existing claim: $torn_recovery" >&2
+                    rm -f "$event_claim_path"
+                    return 73
+                }
+                if ! mv "$event_log_lock/pid" "$torn_recovery" 2>/dev/null; then
+                    event_lock_attempt=$((event_lock_attempt + 1))
+                    [ "$event_lock_attempt" -lt 10 ] || { rm -f "$event_claim_path"; return 75; }
                     continue
                 fi
-                rm -f "$torn_recovery" || { rm -f "$event_claim_path"; return 73; }
-                echo "recovered a lock owner record torn before the last boot: $event_log_lock/pid" >&2
+                torn_owner_claimed
+                torn_moved=$(stat -c '%d:%i:%s:%Y' "$torn_recovery" 2>/dev/null || true)
+                if [ -n "$torn_moved" ] && [ "$torn_moved" = "$event_current_owner_identity" ] \
+                    && lock_owner_torn_before_boot "$torn_recovery"; then
+                    rm -f "$torn_recovery" || {
+                        echo "a torn lock owner record was claimed but could not be removed: $torn_recovery" >&2
+                        rm -f "$event_claim_path"
+                        return 73
+                    }
+                    echo "recovered a lock owner record torn before the last boot: $event_log_lock/pid" >&2
+                    continue
+                fi
+                torn_restore_status=0
+                restore_lock_owner_record "$torn_recovery" || torn_restore_status=$?
+                if [ "$torn_restore_status" -ne 0 ]; then
+                    rm -f "$event_claim_path"
+                    return "$torn_restore_status"
+                fi
+                echo "lock_owner_torn_race: restored a record published during recovery: $event_log_lock/pid" >&2
+                event_lock_attempt=$((event_lock_attempt + 1))
+                [ "$event_lock_attempt" -lt 10 ] || { rm -f "$event_claim_path"; return 75; }
+                sleep 1
+                continue
+            fi
+            # A record replaced while it was judged is a race, not a refusal.
+            # An unchanged unparseable record from this boot stays 73.
+            event_rejudged_identity=$(stat -c '%d:%i:%s:%Y' "$event_log_lock/pid" 2>/dev/null || true)
+            if [ "$event_rejudged_identity" != "$event_current_owner_identity" ]; then
+                event_lock_attempt=$((event_lock_attempt + 1))
+                [ "$event_lock_attempt" -lt 10 ] || { rm -f "$event_claim_path"; return 75; }
                 continue
             fi
             rm -f "$event_claim_path"
@@ -1718,8 +1944,11 @@ acquire_event_log_lock() {
         loaded_lock_owner_is_live || recovered_owner_status=$?
         [ "$recovered_owner_status" -ne 73 ] || { rm -f "$event_claim_path"; return 73; }
         if [ "$recovered_identity" != "$event_lock_identity" ] || [ "$recovered_owner_status" -eq 0 ]; then
-            if [ ! -e "$event_log_lock/pid" ] && [ ! -L "$event_log_lock/pid" ]; then
-                mv "$event_recovery_path" "$event_log_lock/pid" 2>/dev/null || true
+            stale_restore_status=0
+            restore_lock_owner_record "$event_recovery_path" || stale_restore_status=$?
+            if [ "$stale_restore_status" -ne 0 ]; then
+                rm -f "$event_claim_path"
+                return "$stale_restore_status"
             fi
             sleep 1
             continue
@@ -2087,62 +2316,152 @@ epoch_now() {
 
 # Interval and realtime routines are deliberately independent of the NAS
 # calendar. Only daily routines are admitted through the configured weekday
-# and local-clock window.
+# and local-clock window (routine_window_state); NOW defaults to the clock.
 routine_clock_allows() {
-    routine_clock_mode=$1
-    routine_clock_weekdays=$2
-    routine_clock_start=$3
-    routine_clock_end=$4
-    case $routine_clock_mode in
+    case $1 in
         interval|realtime) return 0 ;;
         daily) ;;
         *) return 1 ;;
     esac
-    routine_clock_weekday=$(date +%u)
-    case ,$routine_clock_weekdays, in *,$routine_clock_weekday,*) ;; *) return 1 ;; esac
-    routine_clock_now=$(date +%H%M)
-    routine_clock_start_number=$(printf '%s' "$routine_clock_start" | tr -d ':')
-    routine_clock_end_number=$(printf '%s' "$routine_clock_end" | tr -d ':')
-    routine_clock_now=${routine_clock_now#0}; [ -n "$routine_clock_now" ] || routine_clock_now=0
-    routine_clock_start_number=${routine_clock_start_number#0}; [ -n "$routine_clock_start_number" ] || routine_clock_start_number=0
-    routine_clock_end_number=${routine_clock_end_number#0}; [ -n "$routine_clock_end_number" ] || routine_clock_end_number=0
-    if [ "$routine_clock_start_number" -le "$routine_clock_end_number" ]; then
-        [ "$routine_clock_now" -ge "$routine_clock_start_number" ] && [ "$routine_clock_now" -le "$routine_clock_end_number" ]
-    else
-        [ "$routine_clock_now" -ge "$routine_clock_start_number" ] || [ "$routine_clock_now" -le "$routine_clock_end_number" ]
-    fi
+    routine_clock_now=${5:-}
+    [ -n "$routine_clock_now" ] || routine_clock_now=$(epoch_now) || return 1
+    routine_window_state "$2" "$3" "$4" "$routine_clock_now" '' || return 1
+    [ "$rw_open" = true ]
 }
 
-# The calendar day a daily routine's window belongs to: the day it opened.
-# That is today, except in the part of a window that wraps past midnight
-# (23:00-01:00 at 00:30), which belongs to yesterday's window. last_day is
-# recorded as this day, taken when the run is dispatched: recording the day a
-# run FINISHED made a run that crossed midnight consume the next night, and a
-# wrapping window ran twice a night.
-#   routine_window_day START END
-routine_window_day() {
-    window_day_start=$(printf '%s' "$1" | tr -d ':')
-    window_day_end=$(printf '%s' "$2" | tr -d ':')
-    window_day_start=${window_day_start#0}; [ -n "$window_day_start" ] || window_day_start=0
-    window_day_end=${window_day_end#0}; [ -n "$window_day_end" ] || window_day_end=0
-    if [ "$window_day_start" -gt "$window_day_end" ]; then
-        window_day_now=$(date +%H%M) || return 1
-        while :; do
-            case $window_day_now in 0?*) window_day_now=${window_day_now#0} ;; *) break ;; esac
-        done
-        case $window_day_now in ''|*[!0-9]*) return 1 ;; esac
-        if [ "$window_day_now" -le "$window_day_end" ]; then
-            # Step back past midnight by the minutes since it plus an hour, not
-            # by 86400 s: on a 23-hour daylight-saving day that lands two days
-            # back. ($window_day_now has no leading zero, so $(( )) cannot
-            # read it as octal.)
-            window_day_epoch=$(epoch_now) || return 1
-            window_day_back=$(( ((window_day_now / 100) * 60 + window_day_now % 100 + 60) * 60 ))
-            date -d "@$((window_day_epoch - window_day_back))" +%Y-%m-%d
-            return
+# A daily window belongs to the calendar day its START lies on, and every
+# question about it -- is it open, is it due, which day does a run record --
+# is answered by one evaluation from one instant.
+#
+#   routine_window_state WEEKDAYS START END NOW_EPOCH LAST_DAY
+#
+# sets rw_open and rw_due (true|false), rw_day (YYYY-MM-DD, the window's day),
+# rw_weekday (1..7, that day's) and rw_note ('' or dst_gap), and returns 0, 64
+# for a START or END that is not HH:MM, or 73 when the clock cannot be read.
+#   - START <= END: open while the wall time is in [START, END]; the day is
+#     today.
+#   - START > END (it wraps past midnight): open from START to midnight as
+#     today's window, and from midnight to END as yesterday's. The weekday
+#     filter is applied to that day: a Saturday 23:00-01:00 window is not
+#     Sunday's, and an unselected Sunday's tail does not run on Monday.
+#   - Due when open, its day's weekday is selected and LAST_DAY is not its day.
+#
+# Daylight saving:
+#   - Yesterday is the date of an instant about noon yesterday, the wall
+#     minutes since midnight plus twelve hours back. Stepping back only to
+#     midnight landed on today in the repeated hour of a fall-back night: the
+#     window ran twice that night and not at all the next.
+#   - On that night the wall clock can re-enter yesterday's tail after today's
+#     window opened (01:30-01:00); a later window that has run closes it.
+#   - A start that occurs twice has one day, so it dispatches once.
+#   - A window with no wall minute on a spring-forward day (02:00-02:30 in a
+#     02:00-03:00 gap) opens at the first instant after the gap, with
+#     rw_note=dst_gap so the dispatch can say so; it used to be skipped for
+#     the year in silence.
+# Dates come only from `date -d @EPOCH`, never from parsing a wall-clock
+# string: GNU rejects a time inside the gap and BusyBox moves it.
+rw_minutes() {
+    case $1 in [0-2][0-9]:[0-5][0-9]) ;; *) return 64 ;; esac
+    rw_h=${1%%:*}
+    rw_m=${1#*:}
+    rw_h=${rw_h#0}
+    rw_m=${rw_m#0}
+    [ "${rw_h:-0}" -le 23 ] || return 64
+    rw_minutes_value=$(( ${rw_h:-0} * 60 + ${rw_m:-0} ))
+}
+
+# The wall fields of an instant: rw_f_day, rw_f_wd, rw_f_min (minutes since
+# midnight) and rw_f_off (minutes east of UTC). One date process.
+rw_fields() {
+    rw_f=$(date -d "@$1" '+%Y-%m-%d %u %H %M %z') || return 73
+    case $rw_f in
+        [0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]\ [1-7]\ [0-2][0-9]\ [0-5][0-9]\ [+-][0-9][0-9][0-9][0-9]) ;;
+        *) return 73 ;;
+    esac
+    rw_f_day=${rw_f%% *}; rw_f=${rw_f#* }
+    rw_f_wd=${rw_f%% *}; rw_f=${rw_f#* }
+    rw_fh=${rw_f%% *}; rw_f=${rw_f#* }
+    rw_fm=${rw_f%% *}; rw_fz=${rw_f#* }
+    rw_fh=${rw_fh#0}
+    rw_fm=${rw_fm#0}
+    rw_f_min=$(( ${rw_fh:-0} * 60 + ${rw_fm:-0} ))
+    rw_zs=${rw_fz%????}
+    rw_zh=${rw_fz#?}
+    rw_zm=${rw_zh#??}
+    rw_zh=${rw_zh%??}
+    rw_zh=${rw_zh#0}
+    rw_zm=${rw_zm#0}
+    rw_f_off=$(( ${rw_zh:-0} * 60 + ${rw_zm:-0} ))
+    [ "$rw_zs" = + ] || rw_f_off=$(( -rw_f_off ))
+}
+
+# Whether wall minute M exists on DAY, the day of NOW, whose wall minute is T:
+# the candidate instant NOW - (T - M) minutes, corrected once by the offset
+# difference, must round-trip to M on DAY.
+#   rw_minute_exists NOW T M DAY
+rw_minute_exists() {
+    rw_c=$(( $1 - ($2 - $3) * 60 ))
+    rw_fields "$rw_c" || return 73
+    [ "$rw_f_min" -eq "$3" ] && [ "$rw_f_day" = "$4" ] && return 0
+    rw_c=$(( rw_c + (rw_now_off - rw_f_off) * 60 ))
+    rw_fields "$rw_c" || return 73
+    [ "$rw_f_min" -eq "$3" ] && [ "$rw_f_day" = "$4" ]
+}
+
+routine_window_state() {
+    rw_weekdays=$1
+    rw_now=$4
+    rw_last=$5
+    rw_open=false
+    rw_due=false
+    rw_day=
+    rw_weekday=
+    rw_note=
+    rw_minutes "$2" || return 64
+    rw_s=$rw_minutes_value
+    rw_minutes "$3" || return 64
+    rw_e=$rw_minutes_value
+    case $rw_now in ''|*[!0-9]*) return 73 ;; esac
+    rw_fields "$rw_now" || return 73
+    rw_day=$rw_f_day
+    rw_weekday=$rw_f_wd
+    rw_t=$rw_f_min
+    rw_now_off=$rw_f_off
+    if [ "$rw_s" -le "$rw_e" ]; then
+        [ "$rw_t" -ge "$rw_s" ] || return 0
+        if [ "$rw_t" -gt "$rw_e" ]; then
+            # Closed, unless no wall minute of [START, END] existed today: a
+            # window wholly inside a spring-forward gap. Asked only while
+            # today's window is still owed and the offset grew in the last day.
+            [ "$rw_last" != "$rw_day" ] || return 0
+            rw_fields "$((rw_now - 86400))" || return 73
+            [ "$rw_f_off" -lt "$rw_now_off" ] || return 0
+            rw_exists=0
+            rw_minute_exists "$rw_now" "$rw_t" "$rw_e" "$rw_day" || rw_exists=$?
+            [ "$rw_exists" -ne 73 ] || return 73
+            [ "$rw_exists" -ne 0 ] || return 0
+            rw_exists=0
+            rw_minute_exists "$rw_now" "$rw_t" "$rw_s" "$rw_day" || rw_exists=$?
+            [ "$rw_exists" -ne 73 ] || return 73
+            [ "$rw_exists" -ne 0 ] || return 0
+            rw_note=dst_gap
         fi
+    elif [ "$rw_t" -ge "$rw_s" ]; then
+        :
+    elif [ "$rw_t" -le "$rw_e" ]; then
+        # Today's window has already run: a later window that has run closes
+        # every earlier one.
+        [ "$rw_last" != "$rw_day" ] || return 0
+        rw_fields "$((rw_now - (rw_t + 720) * 60))" || return 73
+        rw_day=$rw_f_day
+        rw_weekday=$rw_f_wd
+    else
+        return 0
     fi
-    date +%Y-%m-%d
+    case ,$rw_weekdays, in *,"$rw_weekday",*) ;; *) return 0 ;; esac
+    rw_open=true
+    [ "$rw_last" = "$rw_day" ] || rw_due=true
+    return 0
 }
 
 # Return the whole-action retry delay. Missing retry_exponential fields from
@@ -2320,6 +2639,7 @@ run_state_mtime=
 run_state_reauth=
 run_state_tasks=
 run_state_keepalive=
+run_state_unchecked=
 write_run_state_extras() {
     case ${run_state_outcome:-} in
         succeeded|partial|failed|busy|cancelled) printf 'outcome=%s\n' "$run_state_outcome" || return 1 ;;
@@ -2338,12 +2658,12 @@ write_run_state_extras() {
     # Only on a running document (the runner's heartbeat, C-S7).
     case ${run_state_heartbeat:-} in
         ''|*[!0-9]*) ;;
-        *)
-            printf 'heartbeat_epoch=%s\n' "$run_state_heartbeat" || return 1
-            case ${run_state_heartbeat_source:-} in
-                io|progress|liveness) printf 'heartbeat_source=%s\n' "$run_state_heartbeat_source" || return 1 ;;
-            esac
-            ;;
+        *) printf 'heartbeat_epoch=%s\n' "$run_state_heartbeat" || return 1 ;;
+    esac
+    # The source is published on its own: a liveness-only heartbeat has no
+    # epoch, and the reader must still be told why (stall_unobservable).
+    case ${run_state_heartbeat_source:-} in
+        io|liveness) printf 'heartbeat_source=%s\n' "$run_state_heartbeat_source" || return 1 ;;
     esac
     # Result facts (contract v1.5), summed over an aggregate's jobs.
     case ${run_state_listings:-} in ''|*[!0-9]*) ;; *) printf 'incomplete_listings=%s\n' "$run_state_listings" || return 1 ;; esac
@@ -2355,6 +2675,7 @@ write_run_state_extras() {
     case ${run_state_reauth:-} in ''|*[!0-9]*) ;; *) printf 'recovered_reauthentication_failures=%s\n' "$run_state_reauth" || return 1 ;; esac
     case ${run_state_tasks:-} in ''|*[!0-9]*) ;; *) printf 'recovered_server_tasks_not_stopped=%s\n' "$run_state_tasks" || return 1 ;; esac
     case ${run_state_keepalive:-} in ''|*[!0-9]*) ;; *) printf 'recovered_keepalive_failures=%s\n' "$run_state_keepalive" || return 1 ;; esac
+    case ${run_state_unchecked:-} in ''|*[!0-9]*) ;; *) printf 'link_guard_unchecked=%s\n' "$run_state_unchecked" || return 1 ;; esac
     return 0
 }
 
@@ -2547,8 +2868,11 @@ read_unrecorded_run_outcome() {
     [ "$unrecorded_started" = "$1" ] && [ "$unrecorded_scope" = "$2" ]
 }
 
+# Also leaves the file's size in private_log_size (empty when absent), from the
+# same stat, so rotation needs no second look at the file.
 private_log_path_safe_or_absent() {
     private_log_path=$1
+    private_log_size=
     if [ ! -e "$private_log_path" ] && [ ! -L "$private_log_path" ]; then
         return 0
     fi
@@ -2562,11 +2886,14 @@ private_log_path_safe_or_absent() {
         echo "refusing unsafe package log file: $private_log_path" >&2
         return 73
     }
-    private_log_contract=$(stat -c '%u:%a:%h' "$private_log_path" 2>/dev/null || true)
-    [ "$private_log_contract" = "$path_owner:600:1" ] || {
-        echo "refusing unsafe package log ownership, mode, or link count: $private_log_path" >&2
-        return 73
-    }
+    private_log_contract=$(stat -c '%u:%a:%h:%s' "$private_log_path" 2>/dev/null || true)
+    case $private_log_contract in
+        "$path_owner:600:1:"*) private_log_size=${private_log_contract##*:} ;;
+        *)
+            echo "refusing unsafe package log ownership, mode, or link count: $private_log_path" >&2
+            return 73
+            ;;
+    esac
 }
 
 # Returns 0 when nothing needed doing or the set rotated, 73 when the set is
@@ -2587,6 +2914,11 @@ rotate_log() {
     # pathname. Package logs are private regular files; silently repairing an
     # existing hard link, symlink, foreign owner, or permissive mode could
     # modify or replace a different file.
+    #
+    # The active file's size comes from the same stat that checks it. It used
+    # to be `wc -c < file`, which BusyBox answers by reading the whole file --
+    # every 10 MiB controller.log line cost a 10 MiB read -- and GNU by fstat.
+    rotate_size=
     rotate_contract_index=0
     while [ "$rotate_contract_index" -le "$rotate_keep" ]; do
         if [ "$rotate_contract_index" -eq 0 ]; then
@@ -2595,11 +2927,11 @@ rotate_log() {
             rotate_contract_path=$rotate_path.$rotate_contract_index
         fi
         private_log_path_safe_or_absent "$rotate_contract_path" || return $?
+        [ "$rotate_contract_index" -ne 0 ] || rotate_size=$private_log_size
         rotate_contract_index=$((rotate_contract_index + 1))
     done
 
     [ -f "$rotate_path" ] || return 0
-    rotate_size=$(wc -c < "$rotate_path" | tr -d ' ')
     case $rotate_size in
         ''|*[!0-9]*)
             rotate_failure="the size of $rotate_path could not be read"
@@ -2778,7 +3110,7 @@ append_activity() {
     activity_actor_uid=${8:-}
     activity_actor=${9:-}
     case $activity_code in
-        run.started|run.succeeded|run.failed|run.deferred|routine.deferred|routine.retry_scheduled|\
+        run.started|run.succeeded|run.failed|run.deferred|run.cancelled|routine.deferred|routine.retry_scheduled|\
         routine.retries_exhausted|routine.watch_abandoned|\
         doctor.succeeded|doctor.failed|doctor.inventory|configuration.changed|notification.unavailable|\
         audit.requested|audit.succeeded|audit.failed|audit.outcome_unknown|\
@@ -2793,7 +3125,7 @@ append_activity() {
             || { echo "refusing Activity record $activity_code: invalid profile name" >&2; return 64; }
         ;;
     esac
-    case $activity_state in running|succeeded|failed|deferred|scheduled|changed|unavailable|requested) ;;
+    case $activity_state in running|succeeded|failed|deferred|scheduled|changed|unavailable|requested|cancelled) ;;
         *) return 64 ;;
     esac
     case $activity_category in

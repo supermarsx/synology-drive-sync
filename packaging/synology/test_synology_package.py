@@ -358,6 +358,28 @@ class BuilderTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.temporary.cleanup()
 
+    def test_suite_shards_partition_every_test_exactly_once(self) -> None:
+        # CI splits the suite over parallel jobs with SDSYNC_TEST_SHARD. Every
+        # test must run in exactly one of them -- none skipped in silence, none
+        # twice -- for every shard count CI uses or might, and every weight
+        # must name a test that exists.
+        tests = list(iter_tests(unittest.TestLoader().loadTestsFromModule(sys.modules[__name__])))
+        ids = sorted(test.id() for test in tests)
+        self.assertEqual(len(ids), len(set(ids)))
+        for count in (1, 2, 3, 4):
+            shards = [select_shard(tests, f"{k}/{count}") for k in range(count)]
+            seen = [test.id() for shard in shards for test in shard]
+            self.assertEqual(sorted(seen), ids, count)
+            self.assertEqual(len(seen), len(set(seen)), count)
+            loads = [sum(shard_weight(test) for test in shard) for shard in shards]
+            # Greedy balance: no shard more than its heaviest test above another.
+            self.assertLessEqual(max(loads) - min(loads), max(SHARD_WEIGHTS.values()), (count, loads))
+        known = {".".join(test_id.split(".")[-2:]) for test_id in ids}
+        self.assertEqual(sorted(set(SHARD_WEIGHTS) - known), [])
+        for bad in ("3/3", "1/0", "x", "-1/2"):
+            with self.assertRaises(SystemExit):
+                select_shard(tests, bad)
+
     def test_validator_binary_override_is_authoritative_over_newer_fallbacks(self) -> None:
         override = self.root / "explicit-validator"
         fallback = self.root / "newer-fallback"
@@ -5405,7 +5427,12 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
 
         controller_log = self.real_var / "log/controller.log"
         scheduler_log = self.real_var / "log/scheduler.log"
-        for _ in range(300):
+        # A whole scheduled aggregate has to run first. Six seconds held under
+        # dash and ran out under bash -- DSM's sh -- on a loaded runner with
+        # nothing lost (run.state still running); the budget is a ceiling,
+        # not a pace.
+        deadline = time.monotonic() + 30
+        while time.monotonic() < deadline:
             if controller_log.is_file() and scheduler_log.is_file():
                 if "scheduled_run" in controller_log.read_text(encoding="utf-8"):
                     break
@@ -6952,16 +6979,19 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
         fake_bin = self.root / "routine-policy-bin"
         fake_bin.mkdir(mode=0o700)
         fake_date = fake_bin / "date"
+        # Monday 2026-08-24 12:00 UTC. The window is evaluated from one epoch
+        # (routine_window_state), so the clock is an instant, not separate
+        # answers for the weekday and the time.
         fake_date.write_text(
             "#!/bin/sh\n"
-            'case "${1:-}" in +%u) echo 1 ;; +%H%M) echo 1200 ;; *) exec /bin/date "$@" ;; esac\n',
+            'case "${1:-}" in +%s) echo 1787572800 ;; *) exec /bin/date "$@" ;; esac\n',
             encoding="utf-8",
         )
         fake_date.chmod(0o755)
         if os.getuid() == 0:
             os.chown(fake_bin, self.drop_uid, self.drop_gid)
             os.chown(fake_date, self.drop_uid, self.drop_gid)
-        clock_environment = {"PATH": f"{fake_bin}:{self.environment['PATH']}"}
+        clock_environment = {"PATH": f"{fake_bin}:{self.environment['PATH']}", "TZ": "UTC"}
 
         for mode in ("interval", "realtime"):
             result = self.shell(
@@ -7707,8 +7737,11 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
         fake_find.write_text(
             "#!/bin/sh\n"
             # The controller's one-file -exec probe passes straight through;
-            # only walks of the source are counted.
+            # only poll walks of the source are counted. The watch-limit
+            # directory count walks the source too (find SOURCE -type d, no
+            # -exec), and must neither consume the one failure nor be failed.
             f'case "$1" in "{self.source_two}") ;; *) exec {real_find} "$@" ;; esac\n'
+            f'case " $* " in *" -exec "*) ;; *) exec {real_find} "$@" ;; esac\n'
             f'counter="{counter}"\n'
             'IFS= read -r count < "$counter"\n'
             'count=$((count + 1))\n'
@@ -8286,10 +8319,13 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
             syslogged = syslog_capture.read_text(encoding="utf-8") if syslog_capture.exists() else ""
             self.assertEqual(syslogged, "", syslogged)
 
-            # 4. activity: run.failed at info, message names the cancellation.
-            cancelled = activity_events("cancelstop", "run.failed")
-            self.assertTrue(cancelled, "no run.failed activity record for the cancelled run")
+            # 4. activity: run.cancelled/cancelled at info (D3-UI-7), message
+            # names the cancellation, and no run.failed row at all.
+            cancelled = activity_events("cancelstop", "run.cancelled")
+            self.assertTrue(cancelled, "no run.cancelled activity record for the cancelled run")
             self.assertEqual(cancelled[-1]["level"], "info", cancelled)
+            self.assertEqual(cancelled[-1]["state"], "cancelled", cancelled)
+            self.assertEqual(activity_events("cancelstop", "run.failed"), [])
             self.assertIn("cancelled", cancelled[-1]["message"], cancelled)
 
             # 5. scheduler.log run_finished at info, exit 130.
@@ -8780,7 +8816,10 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
         self.assertEqual(started.returncode, 0, started.stderr)
         matches = self.wait_for_controller_event("routine_watch_limit")
         details = [str(m.get("detail", "")) for m in matches]
-        self.assertTrue(any("dirs=11" in d and "limit=8" in d for d in details), details)
+        # The count is bounded: it stops one directory past the budget
+        # (limit / 10 * 8, here 0), so a tree far over budget costs no more
+        # to refuse than one just over it.
+        self.assertTrue(any("dirs=1 " in d and "budget=0 " in d and "limit=8" in d for d in details), details)
         # A single refusal (consecutive=1) never sets realtime_backend=none
         # explicitly -- that only happens at the five-strikes give-up
         # threshold. Below that the function's own default of "polling"
@@ -9319,21 +9358,34 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
             os.kill(controller_pid, signal.SIGHUP)
             time.sleep(0.2)
 
-        zombies = []
-        task_children = Path(f"/proc/{controller_pid}/task")
-        if task_children.is_dir():
-            for task in task_children.iterdir():
-                children_file = task / "children"
-                if not children_file.is_file():
-                    continue
-                for child_pid in children_file.read_text(encoding="utf-8").split():
-                    stat_path = Path(f"/proc/{child_pid}/stat")
-                    if not stat_path.is_file():
+        def controller_zombies() -> list[str]:
+            zombies = []
+            task_children = Path(f"/proc/{controller_pid}/task")
+            if task_children.is_dir():
+                for task in task_children.iterdir():
+                    children_file = task / "children"
+                    if not children_file.is_file():
                         continue
-                    fields = stat_path.read_text(encoding="utf-8").rsplit(") ", 1)
-                    if len(fields) == 2 and fields[1].split()[0] == "Z":
-                        zombies.append(child_pid)
-        self.assertEqual(zombies, [])
+                    for child_pid in children_file.read_text(encoding="utf-8").split():
+                        stat_path = Path(f"/proc/{child_pid}/stat")
+                        try:
+                            fields = stat_path.read_text(encoding="utf-8").rsplit(") ", 1)
+                        except OSError:
+                            continue
+                        if len(fields) == 2 and fields[1].split()[0] == "Z":
+                            zombies.append(child_pid)
+            return zombies
+
+        # A zombie that is reaped moments later is the reap working, not a
+        # leak: bash reaps asynchronously, so one snapshot can catch a child
+        # in the instant between its exit and its collection. A leaked one
+        # stays, so only a zombie that outlives three seconds fails.
+        lingering = controller_zombies()
+        deadline = time.monotonic() + 3
+        while lingering and time.monotonic() < deadline:
+            time.sleep(0.1)
+            lingering = [pid for pid in controller_zombies() if pid in lingering]
+        self.assertEqual(lingering, [])
         stopped = self.shell(self.lifecycle, "stop", timeout=15)
         self.assertEqual(stopped.returncode, 0, stopped.stdout + stopped.stderr)
 
@@ -9564,28 +9616,31 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
         stopped = self.shell(self.lifecycle, "stop", timeout=15)
         self.assertEqual(stopped.returncode, 0, stopped.stdout + stopped.stderr)
 
-    def test_realtime_fingerprint_pipeline_matches_legacy_stat_loop_byte_for_byte(self) -> None:
-        # Row 28, revised for the v2: fingerprint tag. Pins the restated
-        # no-re-baseline claim: on a tree with no pruned directories, the
-        # cksum pair inside the current v2:<cksum>:<bytes> reading must equal
-        # the old per-file `sh -c` loop's pair exactly.
+    def test_realtime_fingerprint_pipeline_matches_a_per_entry_stat_loop_byte_for_byte(self) -> None:
+        # Row 28, revised for the v3: fingerprint tag (C-15). On a tree with
+        # no pruned directories, the cksum pair inside the current
+        # v3:<cksum>:<bytes> reading must equal an independent per-entry
+        # `sh -c` loop's pair exactly: every file as name|size|mtime and
+        # every directory, the root and an empty one included, as name|d.
         fixture = self.root / "fingerprint-oracle-tree"
         fixture.mkdir()
+        (fixture / "empty-folder").mkdir()
+        (fixture / "nested" / "deeper").mkdir(parents=True)
         if os.getuid() == 0:
-            os.chown(fixture, self.drop_uid, self.drop_gid)
+            for path in (fixture, fixture / "empty-folder", fixture / "nested", fixture / "nested" / "deeper"):
+                os.chown(path, self.drop_uid, self.drop_gid)
         for index in range(200):
-            path = fixture / f"file-{index:04d}.txt"
+            path = fixture / ("nested" if index % 3 else ".") / f"file-{index:04d}.txt"
             path.write_text(f"content {index}\n", encoding="utf-8")
             if os.getuid() == 0:
                 os.chown(path, self.drop_uid, self.drop_gid)
 
-        # The oracle is the pre-batching per-file loop, with no prune list of
-        # its own -- deliberately, since this fixture holds none of the
-        # pruned names and the point is the cksum arithmetic, not the walk.
-        # It formats its own reading as "value:bytes", the same shape
-        # source_fingerprint's has once both its "<retries>|" and "v2:"
-        # prefixes are stripped, so the two sides compare with no further
-        # massaging on either one.
+        # The oracle is a per-entry loop, with no prune list of its own --
+        # deliberately, since this fixture holds none of the pruned names and
+        # the point is the cksum arithmetic, not the walk. It formats its own
+        # reading as "value:bytes", the same shape source_fingerprint's has
+        # once both its "<retries>|" and "v3:" prefixes are stripped, so the
+        # two sides compare with no further massaging on either one.
         #
         # source_fingerprint lives in sdsync-controller, not sdsync-common,
         # and is defined with a subshell body (`() (` ... `)`, not `{` ...
@@ -9599,6 +9654,11 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
         function_end = controller_source.index("\n)\n", function_end) + 2
         function_text = controller_source[function_start:function_end]
         self.assertIn("fingerprint_source=$1", function_text)
+        # The walk proves find's identity before it signals it.
+        for helper_name in ("own_job_start", "own_job_is_running"):
+            helper_start = controller_source.index(f"{helper_name}() {{\n")
+            helper_end = controller_source.index("\n}\n", helper_start) + 3
+            function_text = controller_source[helper_start:helper_end] + function_text
 
         helper = self.root / "fingerprint-oracle-helper.sh"
         helper.write_text(
@@ -9609,12 +9669,14 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
             f'tree="{fixture}"\n'
             'new_output=$(source_fingerprint "$tree")\n'
             'new_reading=${new_output#*|}\n'
-            'case $new_reading in v2:*) ;; *) echo "reading missing v2: prefix: $new_reading" >&2; exit 1 ;; esac\n'
-            'new_fingerprint=${new_reading#v2:}\n'
+            'case $new_reading in v3:*) ;; *) echo "reading missing v3: prefix: $new_reading" >&2; exit 1 ;; esac\n'
+            'new_fingerprint=${new_reading#v3:}\n'
             'old_metadata=$(mktemp)\n'
-            'find "$tree" -type f -print | while IFS= read -r entry; do\n'
+            '{ find "$tree" -type f -print | while IFS= read -r entry; do\n'
             '  sh -c \'stat -c "%n|%s|%Y" "$1"\' sh "$entry"\n'
-            'done > "$old_metadata"\n'
+            'done; find "$tree" -type d -print | while IFS= read -r entry; do\n'
+            '  printf \'%s|d\\n\' "$entry"\n'
+            'done; } > "$old_metadata"\n'
             'old_fingerprint=$(LC_ALL=C sort "$old_metadata" | cksum | awk \'{print $1 ":" $2}\')\n'
             'rm -f "$old_metadata"\n'
             'printf \'%s\\n%s\\n\' "$new_fingerprint" "$old_fingerprint"\n',
@@ -9630,13 +9692,13 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
         new_fingerprint, old_fingerprint = lines
         self.assertEqual(new_fingerprint, old_fingerprint)
 
-    def test_realtime_fingerprint_rebases_an_untagged_baseline_without_dispatch(self) -> None:
-        # New, at the shell agent's suggestion (Step 8). An untagged
-        # pre-upgrade fingerprint (or any value failing
-        # valid_source_fingerprint) must be treated like a routine that has
-        # never been polled: adopt the current v2: reading as the baseline,
-        # log routine_fingerprint_rebased once, and never dispatch on the
-        # rebase itself.
+    def test_realtime_fingerprint_of_an_older_format_syncs_once_and_says_why(self) -> None:
+        # C-15. An untagged or files-only (v2) baseline was measured over a
+        # different metadata set. It used to be adopted in silence, which hid
+        # whatever changed during the upgrade -- an empty folder created then
+        # was never synced. It is now unknown: logged once as
+        # routine_fingerprint_format_changed, settled like any change, synced
+        # exactly once, and the v3: reading becomes the baseline.
         self.assertEqual(
             self.configure("watch", self.source_two, "/home/Drive/Watch", True).returncode, 0
         )
@@ -9670,20 +9732,24 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
         fast_environment = self.fast_clock_environment(step=31)
         started = self.shell(self.lifecycle, "start", extra_environment=fast_environment, timeout=15)
         self.assertEqual(started.returncode, 0, started.stderr)
-        rebased = self.wait_for_controller_event("routine_fingerprint_rebased")
-        self.assertTrue(any(str(m.get("detail", "")) == "profile=watch" for m in rebased), rebased)
-        deadline = time.monotonic() + 15
-        while time.monotonic() < deadline:
-            state_text = state_path.read_text(encoding="utf-8")
-            if "fingerprint=v2:" in state_text:
-                break
-            time.sleep(0.03)
-        else:
-            self.fail("the rebased baseline was never written back with the v2: prefix")
-        self.assertNotIn("sync --profile watch --no-delete", self.capture.read_text(encoding="utf-8"))
-        # The rebase must fire exactly once, not on every subsequent poll.
-        time.sleep(0.5)
-        matches = [r for r in self.controller_events() if r.get("event") == "routine_fingerprint_rebased"]
+        changed = self.wait_for_controller_event("routine_fingerprint_format_changed")
+        self.assertEqual(len(changed), 1, changed)
+        self.assertIn("profile=watch from=2193023732 to=v3 ", str(changed[0].get("detail")))
+        # The baseline field itself: pending_fingerprint=v3:... appears first.
+        self.wait_for_state(
+            state_path, lambda f: f.get("fingerprint", "none").startswith("v3:"), timeout=20
+        )
+        invocation = "sync --profile watch --no-delete"
+        self.assertEqual(self.capture.read_text(encoding="utf-8").count(invocation), 1)
+        # Once synced, the next polls match the v3 baseline: no second sync,
+        # no second record.
+        poll_state = self.state_fields(state_path)
+        self.wait_for_state(
+            state_path,
+            lambda f: int(f.get("last_poll_epoch", "0")) > int(poll_state.get("last_poll_epoch", "0")) + 31 * 2,
+        )
+        self.assertEqual(self.capture.read_text(encoding="utf-8").count(invocation), 1)
+        matches = [r for r in self.controller_events() if r.get("event") == "routine_fingerprint_format_changed"]
         self.assertEqual(len(matches), 1, matches)
         stopped = self.shell(self.lifecycle, "stop", timeout=15)
         self.assertEqual(stopped.returncode, 0, stopped.stdout + stopped.stderr)
@@ -10539,23 +10605,39 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
             request.chmod(0o600)
             if os.getuid() == 0:
                 os.chown(request, self.drop_uid, self.drop_gid)
+        # The tax is a controller nap between the two dispatches. Prove its
+        # absence by recording every nap, not by timing the gap: a loaded
+        # runner (or bash, DSM's sh) can spend most of a second on one turn's
+        # own work without any nap at all.
+        naps = self.root / "fast-queue-naps"
+        fake_sleep = self.fake_system_bin / "sleep"
+        fake_sleep.write_text(
+            "#!/bin/sh\n"
+            f'printf \'%s %s\\n\' "$(date +%s%N)" "$*" >> {shlex.quote(str(naps))}\n'
+            'exec /bin/sleep "$@"\n',
+            encoding="utf-8",
+        )
+        fake_sleep.chmod(0o755)
+        if os.getuid() == 0:
+            os.chown(fake_sleep, self.drop_uid, self.drop_gid)
 
         started = self.shell(self.lifecycle, "start", timeout=15)
         self.assertEqual(started.returncode, 0, started.stderr)
-        for _ in range(300):
-            if all((responses / f"{job_id}.json").is_file() for job_id in job_ids):
-                break
+        deadline = time.monotonic() + 20
+        while not all((responses / f"{job_id}.json").is_file() for job_id in job_ids):
+            if time.monotonic() > deadline:
+                self.fail("controller did not drain the existing two-job queue")
             time.sleep(0.02)
-        else:
-            self.fail("controller did not drain the existing two-job queue")
 
         records = [line.split() for line in bridge_capture.read_text(encoding="utf-8").splitlines()]
         self.assertEqual([record[0] for record in records], job_ids)
-        dispatch_gap_ns = int(records[1][1]) - int(records[0][1])
+        first, second = int(records[0][1]), int(records[1][1])
+        dispatch_gap_ns = second - first
         self.assertGreaterEqual(dispatch_gap_ns, 80_000_000)
-        self.assertLess(
-            dispatch_gap_ns,
-            900_000_000,
+        nap_lines = naps.read_text(encoding="utf-8").splitlines() if naps.exists() else []
+        between = [line for line in nap_lines if first < int(line.split()[0]) < second]
+        self.assertEqual(
+            between, [],
             "a queued successor inherited the controller's fixed one-second poll tax",
         )
 
@@ -12762,7 +12844,13 @@ fi
                 process.terminate()
                 process.communicate(timeout=5)
 
-    def test_runner_guard_identity_verification_reentry_fails_closed(self) -> None:
+    def test_runner_guard_identity_verification_is_never_reentered_by_term(self) -> None:
+        # TERM used to re-enter the shared identity verifier from inside the
+        # handler while the main flow's guard check was mid-flight, and a
+        # wrapper rejected the resumed result. The handlers now only latch
+        # (gate3 F1), so the paused outer check is never re-entered at all:
+        # with the wrapper or without it, the guard is never signalled on a
+        # tuple that does not match.
         controller = self.real_target / "libexec/sdsync-controller"
         controller_source = controller.read_text(encoding="utf-8")
         common = self.real_target / "libexec/sdsync-common"
@@ -12851,7 +12939,7 @@ if [ "${SDSYNC_TEST_GUARD_REENTRY:-false}" = true ]; then
     [ "$guard_reentry_stop_rc" -eq 0 ] || exit 234
     guard_reentry_term_seen=false
     [ ! -e "$SDSYNC_TEST_GUARD_REENTRY_TERM" ] || guard_reentry_term_seen=true
-    [ -f "$SDSYNC_TEST_GUARD_REENTRY_NESTED" ] || exit 236
+    [ ! -f "$SDSYNC_TEST_GUARD_REENTRY_NESTED" ] || exit 236
     [ -z "$runner_wait_guard_pid" ] \
         && [ -z "$runner_wait_guard_stop_path" ] || exit 237
     if [ -n "$sleep_pid" ]; then
@@ -12932,25 +13020,15 @@ fi
                     paths["verify-ready"], "outer guard identity check did not pause"
                 )
                 os.kill(process.pid, signal.SIGTERM)
-                self.wait_for_path(
-                    paths["nested"], "TERM did not re-enter the shared identity verifier"
+                # Time for a handler to run while the outer check is paused.
+                time.sleep(0.5)
+                self.assertFalse(
+                    paths["nested"].exists(), "TERM re-entered the shared identity verifier"
                 )
                 paths["verify-release"].write_text("release\n", encoding="ascii")
                 self.wait_for_path(
                     paths["reap-ready"], "guard stop did not reach latch-authorized reap"
                 )
-                if expect_term:
-                    self.wait_for_path(
-                        paths["term"],
-                        "raw re-entered verifier did not authorize guard TERM",
-                        timeout=2.0,
-                    )
-                else:
-                    time.sleep(0.2)
-                    self.assertFalse(
-                        paths["term"].exists(),
-                        "trap-safe wrapper authorized guard TERM",
-                    )
                 paths["sleep-release"].write_text("release\n", encoding="ascii")
                 stdout, stderr = process.communicate(timeout=5)
                 self.assertEqual(process.returncode, expected_rc, stdout + stderr)
@@ -12995,7 +13073,7 @@ fi
         controller.chmod(0o755)
         if os.getuid() == 0:
             os.chown(controller, self.drop_uid, self.drop_gid)
-        run_reentry_probe("raw-control", 235, True)
+        run_reentry_probe("raw-control", 0, False)
 
     def test_runner_guard_stop_channel_tamper_fails_closed(self) -> None:
         controller = self.real_target / "libexec/sdsync-controller"
@@ -20777,7 +20855,7 @@ fi
             self.assertIn("scope=alpha", str(stalled[0]["detail"]))
             fields = self.state_fields(run_state)
             self.assertEqual(fields["state"], "running", fields)
-            self.assertIn(fields["heartbeat_source"], ("io", "progress"), fields)
+            self.assertEqual(fields["heartbeat_source"], "io", fields)
             self.assertIsNone(run.poll(), "the stalled core was killed")
         finally:
             with open(fifo, "w", encoding="utf-8") as writer:
@@ -21336,7 +21414,7 @@ fi
         self.assertEqual(started.returncode, 0, started.stdout + started.stderr)
         try:
             baseline = self.wait_for_state(
-                state_path, lambda f: f.get("fingerprint", "none").startswith("v2:")
+                state_path, lambda f: f.get("fingerprint", "none").startswith("v3:")
             )["fingerprint"]
             (self.source_two / "watched.txt").write_text("two, longer\n", encoding="utf-8")
             deferred = self.wait_for_state(
@@ -21345,7 +21423,7 @@ fi
             self.assertEqual(deferred["state"], "deferred", deferred)
             self.assertEqual(deferred["fingerprint"], baseline, deferred)
             pending = deferred["pending_fingerprint"]
-            self.assertTrue(pending.startswith("v2:") and pending != baseline, deferred)
+            self.assertTrue(pending.startswith("v3:") and pending != baseline, deferred)
             self.assertNotIn("sync --profile watch", self.capture.read_text(encoding="utf-8"))
             # The dependency succeeds; the still-pending change is dispatched
             # and only then becomes the baseline.
@@ -21387,10 +21465,12 @@ fi
         self.assertIsNotNone(real_find)
         slow_find = fake_bin / "find"
         # The controller's one-file probe passes straight through; only the
-        # source walk is slowed.
+        # source's poll walk (the one with -exec) is slowed, not the
+        # watch-limit directory count.
         slow_find.write_text(
             "#!/bin/sh\n"
-            f'case "$1" in "{self.source_two}") : > "{walk_started}"; /bin/sleep 30 ;; esac\n'
+            f'case "$1" in "{self.source_two}") case " $* " in *" -exec "*)'
+            f' : > "{walk_started}"; /bin/sleep 30 ;; esac ;; esac\n'
             f'exec "{real_find}" "$@"\n',
             encoding="utf-8",
         )
@@ -21459,7 +21539,7 @@ fi
             self.assertTrue(self.wait_for_controller_event("fingerprint_batch_unsupported"))
             fields = self.wait_for_state(
                 self.real_var / "state/routines/watch.state",
-                lambda f: f.get("fingerprint", "none").startswith("v2:"),
+                lambda f: f.get("fingerprint", "none").startswith("v3:"),
             )
             # The fixture's inotifywait always fails, so the watcher reason is
             # expected; what must not appear is a failed poll.
@@ -21536,7 +21616,8 @@ fi
             'printf \'%s\\n\' \'{"kind":"completion","result":{"changed":true,"deferred":['
             '{"detail":null,"path":"one.txt","reason":"source-changed"},'
             '{"detail":"x","path":"two.txt","reason":"remote-changed"}],"deletes_skipped":0,'
-            '"incomplete_listing_folders":["dir one","we|ird"],"incomplete_listings":2,"mtime_not_kept":4,'
+            '"incomplete_listing_folders":["dir one","we|ird"],"incomplete_listings":2,'
+            '"link_guard_unchecked":5,"mtime_not_kept":4,'
             '"outcome":"partial","recovered":{"keepalive_failures":0,"reauthentication_failures":1,'
             '"reauthentications":7,"server_tasks_not_stopped":0},"skipped":3},"schema":"sdsync.output.v1"}\'\n'
             "exit 3\n"
@@ -21564,6 +21645,8 @@ fi
                 self.assertEqual(document["incomplete_listings"], "2", document)
                 self.assertEqual(document["incomplete_listing_folders"], "dir one|we?ird", document)
                 self.assertEqual(document["mtime_not_kept"], "4", document)
+                # G-11: NAS folders DSM gave no real path for.
+                self.assertEqual(document["link_guard_unchecked"], "5", document)
                 self.assertEqual(document["recovered_reauthentication_failures"], "1", document)
                 self.assertEqual(document["recovered_server_tasks_not_stopped"], "0", document)
                 self.assertEqual(document["recovered_keepalive_failures"], "0", document)
@@ -22430,6 +22513,1315 @@ fi
     def test_a_runner_wait_guard_that_cannot_stop_never_ends_the_controller(self) -> None:
         self.ctl_guard_failure_survives("c2gt", "stop")
 
+    # ------------------------------------------------------------------
+    # Round 3, DSM shell runtime (fix3-shell). DSM's /bin/sh is bash in POSIX
+    # mode, while CI's is dash; every probe here runs under each POSIX shell
+    # the host has, bash among them, rather than only under /bin/sh.
+    # ------------------------------------------------------------------
+
+    def f3_shells(self) -> list[list[str]]:
+        shells = [["/bin/sh"]]
+        bash = shutil.which("bash")
+        if bash:
+            shells.append([bash, "--posix"])
+        for name, prefix in (("dash", []), ("busybox", ["sh"])):
+            found = shutil.which(name)
+            if found and Path(found).resolve() != Path("/bin/sh").resolve():
+                shells.append([found, *prefix])
+        return shells
+
+    def f3_run(
+        self, shell: list[str], script: Path, *arguments: str,
+        extra_environment: dict[str, str] | None = None, timeout: int = 120,
+    ) -> subprocess.CompletedProcess[str]:
+        environment = self.environment.copy()
+        if extra_environment:
+            environment.update(extra_environment)
+        return subprocess.run(
+            [*shell, str(script), *arguments], capture_output=True, text=True,
+            env=environment, timeout=timeout, check=False,
+            preexec_fn=(
+                (lambda: (os.setgroups([]), os.setgid(self.drop_gid), os.setuid(self.drop_uid)))
+                if os.getuid() == 0 else None
+            ),
+        )
+
+    def f3_script(self, name: str, body: str) -> Path:
+        path = self.root / name
+        path.write_text(body, encoding="utf-8")
+        path.chmod(0o755)
+        if os.getuid() == 0:
+            os.chown(path, self.drop_uid, self.drop_gid)
+        return path
+
+    # ------------------------------------------------------------- D3-1
+    def test_a_busy_live_process_is_never_read_as_unprovable_under_any_shell(self) -> None:
+        # bash's read builtin seeks back after every line, and /proc/PID/status
+        # re-renders on each seek, so the per-line walk lost Uid:/PPid: about
+        # once in a hundred checks of a busy process: runs refused as
+        # admission_failed, stops refused, "controller_pid=missing". The probe
+        # is the auditor's: a same-uid process flipping between R and S, and
+        # the package's own process_identity_is_live, 1000 times per shell.
+        probe = self.f3_script(
+            "d31-identity-rate.sh",
+            '. "$SYNOPKG_PKGDEST/libexec/sdsync-common"\n'
+            "( while :; do i=0; while [ $i -lt 3000 ]; do i=$((i+1)); done; /bin/sleep 0.002; done ) &\n"
+            "target=$!\n"
+            "/bin/sleep 0.3\n"
+            'start=$(process_start_time "$target"); boot=$(boot_identity)\n'
+            "live=0; gone=0; unsafe=0; causes=; n=0\n"
+            'while [ "$n" -lt "$1" ]; do\n'
+            '    rc=0; process_identity_is_live "$target" "$start" "$boot" || rc=$?\n'
+            "    case $rc in 0) live=$((live+1)) ;; 1) gone=$((gone+1)) ;;\n"
+            '        *) unsafe=$((unsafe+1)); causes="$causes ${process_identity_cause:-unnamed}" ;; esac\n'
+            "    n=$((n+1))\n"
+            "done\n"
+            'kill "$target"\n'
+            'echo "live=$live gone=$gone unsafe=$unsafe causes=$causes"\n',
+        )
+        for shell in self.f3_shells():
+            with self.subTest(shell=shell):
+                result = self.f3_run(shell, probe, "1000", timeout=300)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertIn("live=1000 gone=0 unsafe=0 ", result.stdout + " ", result.stdout + result.stderr)
+
+    def test_a_status_read_that_cannot_find_its_fields_fails_closed_with_a_named_cause(self) -> None:
+        # Fail closed, never silently: a status document without Uid: (a
+        # kernel or LSM that hides it) is 73 with the cause in
+        # process_identity_cause, after a bounded number of passes.
+        probe = self.f3_script(
+            "d31-identity-cause.sh",
+            '. "$SYNOPKG_PKGDEST/libexec/sdsync-common"\n'
+            "read_process_status_snapshot() { process_status_text='Name:\tx\n"
+            "PPid:\t1'; passes=$((passes + 1)); }\n"
+            "passes=0\n"
+            '/bin/sleep 30 & target=$!\n'
+            'start=$(process_start_time "$target"); boot=$(boot_identity)\n'
+            'rc=0; process_identity_is_live "$target" "$start" "$boot" || rc=$?\n'
+            'kill "$target"\n'
+            'echo "rc=$rc cause=$process_identity_cause passes=$passes"\n',
+        )
+        for shell in self.f3_shells():
+            with self.subTest(shell=shell):
+                result = self.f3_run(shell, probe)
+                self.assertEqual(
+                    result.stdout.strip(), "rc=73 cause=status_fields_missing passes=3",
+                    result.stdout + result.stderr,
+                )
+
+    def test_only_the_snapshot_reader_reads_proc_status_with_shell_builtins(self) -> None:
+        # The static half of D3-1: the one snapshot reader is the only builtin
+        # read of /proc/*/status, so a new per-line loop cannot bring the tear
+        # back. External readers (sed, awk) read a whole buffer at once.
+        roots = [HERE / "package/libexec", HERE / "package/bin", HERE / "scripts"]
+        offenders = []
+        for root in roots:
+            for path in sorted(root.iterdir()):
+                if not path.is_file():
+                    continue
+                text = path.read_text(encoding="utf-8", errors="replace")
+                for number, line in enumerate(text.splitlines(), 1):
+                    if re.search(r'^\s*done\b.*<\s*"/proc/[^"]*/status"', line) or re.search(
+                        r'\bread\b[^|]*<\s*"/proc/[^"]*/status"', line
+                    ):
+                        offenders.append(f"{path.relative_to(HERE)}:{number}: {line.strip()}")
+        common = (HERE / "package/libexec/sdsync-common").read_text(encoding="utf-8")
+        snapshot = common[common.index("read_process_status_snapshot() {\n"):]
+        snapshot = snapshot[:snapshot.index("\n}\n")]
+        allowed = {
+            entry for entry in offenders
+            if entry.startswith("package/libexec/sdsync-common:")
+            and entry.split(": ", 1)[1] in snapshot
+        }
+        self.assertEqual(sorted(set(offenders) - allowed), [])
+        self.assertEqual(len(allowed), 2, offenders)
+        self.assertIn("IFS= read -r -d '' process_status_text", snapshot)
+
+    # ------------------------------------------------------------- D3-3
+    def f3_wait_gone(self, pid: int, timeout: float = 20.0) -> None:
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            try:
+                state = Path(f"/proc/{pid}/stat").read_text(encoding="ascii").rsplit(") ", 1)[1][0]
+            except (FileNotFoundError, ProcessLookupError, IndexError):
+                return
+            if state in "ZX":
+                return
+            time.sleep(0.05)
+        self.fail(f"process {pid} did not exit")
+
+    def f3_pid(self, relative: str) -> int:
+        return int((self.real_var / relative).read_text(encoding="utf-8").split()[0])
+
+    def f3_found_dead(self) -> list[dict[str, object]]:
+        return [record for record in self.controller_events() if record.get("event") == "controller_found_dead"]
+
+    def test_a_controller_that_exited_under_a_live_api_is_restarted_by_start(self) -> None:
+        # Nothing restarts the controller, so a controller that exited while
+        # the API lived (TERM, a crash) left status 2 and every Run refused
+        # "from an inconsistent lifecycle state" until an explicit stop.
+        started = self.shell(self.lifecycle, "start", timeout=30)
+        self.assertEqual(started.returncode, 0, started.stdout + started.stderr)
+        controller = self.f3_pid("run/controller.pid")
+        api = self.f3_pid("run/api.pid")
+        os.kill(controller, signal.SIGTERM)
+        self.f3_wait_gone(controller)
+        status = self.shell(self.lifecycle, "status", timeout=30)
+        self.assertEqual(status.returncode, 2, status.stdout + status.stderr)
+        # A TERMed controller removes its own PID file on the way out, so
+        # the record has no PID to name; a SIGKILLed one leaves it (below).
+        self.assertEqual([r.get("detail") for r in self.f3_found_dead()],
+                         [f"phase=status pid=none api_pid={api}"])
+        restarted = self.shell(self.lifecycle, "start", timeout=60)
+        self.assertEqual(restarted.returncode, 0, restarted.stdout + restarted.stderr)
+        self.assertIn("was found dead while the API service", restarted.stdout)
+        new_controller = self.f3_pid("run/controller.pid")
+        self.assertNotEqual(new_controller, controller)
+        os.kill(new_controller, 0)
+        self.f3_wait_gone(api)
+        self.assertEqual(self.shell(self.lifecycle, "status", timeout=30).returncode, 0)
+        self.assertEqual(
+            [r.get("detail") for r in self.f3_found_dead()],
+            [f"phase=status pid=none api_pid={api}", f"phase=start pid=none api_pid={api}"],
+        )
+        activity = (self.real_var / "log/activity.log").read_text(encoding="utf-8")
+        self.assertIn("|service.restarted|", activity)
+        self.assertIn("controller had stopped while its API service was still running", activity)
+
+    def test_a_sigkilled_controller_is_recorded_once_and_its_orphan_run_is_stopped_by_start(self) -> None:
+        # SIGKILL writes nothing: no controller_exited, no Activity. The next
+        # status names it, once however often DSM polls; the next start stops
+        # the orphaned run through the ordinary teardown, so there is never a
+        # second concurrent run, and starts both services again.
+        password = self.root / "pw"
+        password.write_text("test-password\n", encoding="utf-8")
+        self.assertEqual(self.configure("personal", self.source_one, "/home/Drive/personal", True).returncode, 0)
+        self.assertEqual(self.shell(self.manager, "set-password", "personal", "--from-file", str(password)).returncode, 0)
+        self.assertEqual(self.shell(self.manager, "enable", "--interval", "60").returncode, 0)
+        core_pid_file = self.root / "core.pid"
+        env = self.fast_clock_environment(step=61)
+        env.update({"SDSYNC_TEST_HOLD": "true", "SDSYNC_TEST_CORE_PID_FILE": str(core_pid_file)})
+        started = self.shell(self.lifecycle, "start", extra_environment=env, timeout=30)
+        self.assertEqual(started.returncode, 0, started.stdout + started.stderr)
+        self.wait_for_path(core_pid_file, "held core never started", timeout=20)
+        orphan_core = int(core_pid_file.read_text(encoding="utf-8").strip())
+        controller = self.f3_pid("run/controller.pid")
+        os.kill(controller, signal.SIGKILL)
+        self.f3_wait_gone(controller)
+        for _ in range(3):
+            status = self.shell(self.lifecycle, "status", extra_environment=env, timeout=30)
+            self.assertEqual(status.returncode, 2, status.stdout + status.stderr)
+        found = self.f3_found_dead()
+        self.assertEqual(len(found), 1, found)
+        self.assertIn(f"phase=status pid={controller} ", str(found[0].get("detail")))
+        self.assertEqual(found[0].get("level"), "warn")
+        core_pid_file.unlink()
+        restarted = self.shell(self.lifecycle, "start", extra_environment=env, timeout=90)
+        self.assertEqual(restarted.returncode, 0, restarted.stdout + restarted.stderr)
+        # The orphan was stopped by the teardown before the new controller ran.
+        self.f3_wait_gone(orphan_core, timeout=5)
+        self.assertNotEqual(self.f3_pid("run/controller.pid"), controller)
+        self.assertEqual(self.shell(self.lifecycle, "status", extra_environment=env, timeout=30).returncode, 0)
+
+    # ------------------------------------------------------------- G-6, G-7
+    # One model: a daily window belongs to the day its START lies on, and the
+    # gate, the due check and the recorded day come from one evaluation of one
+    # instant (routine_window_state). The driver below steps a fake instant
+    # through real tzdata under every POSIX shell the host has.
+    F3_WINDOW_DRIVER = (
+        '. "$SYNOPKG_PKGDEST/libexec/sdsync-common"\n'
+        "while read -r tz weekdays start end from to step; do\n"
+        '    TZ=$tz; export TZ\n'
+        '    echo "SCENARIO $tz $weekdays $start $end"\n'
+        "    last=none; now=$from\n"
+        '    while [ "$now" -le "$to" ]; do\n'
+        "        rc=0\n"
+        '        routine_window_state "$weekdays" "$start" "$end" "$now" "$last" || rc=$?\n'
+        '        if [ "$rc" -ne 0 ]; then echo "EVAL $rc $now"; break; fi\n'
+        '        if [ "$rw_due" = true ]; then echo "RUN $now $rw_day ${rw_note:-none}"; last=$rw_day; fi\n'
+        "        now=$((now + step))\n"
+        "    done\n"
+        "done\n"
+    )
+
+    def f3_window_runs(self, scenarios: list[tuple[str, str, str, str, str, str, int]]):
+        """Per scenario, the (epoch, window_day, note) dispatches; identical under every shell."""
+        import zoneinfo
+        from datetime import datetime
+
+        lines = []
+        for tz, weekdays, start, end, first, last, step in scenarios:
+            zone = zoneinfo.ZoneInfo(tz)
+            begin = int(datetime.fromisoformat(first).replace(tzinfo=zone).timestamp())
+            finish = int(datetime.fromisoformat(last).replace(tzinfo=zone).timestamp())
+            lines.append(f"{tz} {weekdays} {start} {end} {begin} {finish} {step}\n")
+        driver = self.f3_script("f3-window-driver.sh", self.F3_WINDOW_DRIVER)
+        results = {}
+        for shell in self.f3_shells():
+            completed = subprocess.run(
+                [*shell, str(driver)], input="".join(lines), capture_output=True, text=True,
+                env=self.environment.copy(), timeout=600, check=False,
+                preexec_fn=(
+                    (lambda: (os.setgroups([]), os.setgid(self.drop_gid), os.setuid(self.drop_uid)))
+                    if os.getuid() == 0 else None
+                ),
+            )
+            self.assertEqual(completed.returncode, 0, completed.stdout + completed.stderr)
+            self.assertNotIn("EVAL ", completed.stdout, completed.stdout)
+            per_scenario: list[list[tuple[int, str, str]]] = []
+            for line in completed.stdout.splitlines():
+                if line.startswith("SCENARIO "):
+                    per_scenario.append([])
+                elif line.startswith("RUN "):
+                    _, epoch, day, note = line.split()
+                    per_scenario[-1].append((int(epoch), day, note))
+            self.assertEqual(len(per_scenario), len(scenarios), completed.stdout)
+            results[" ".join(shell)] = per_scenario
+        outputs = list(results.values())
+        for other in outputs[1:]:
+            self.assertEqual(other, outputs[0], "the window model differs between shells")
+        return outputs[0]
+
+    @staticmethod
+    def f3_local(epoch: int, tz: str) -> str:
+        import zoneinfo
+        from datetime import datetime
+
+        return datetime.fromtimestamp(epoch, zoneinfo.ZoneInfo(tz)).strftime("%a %Y-%m-%d %H:%M %Z")
+
+    def test_a_wrapping_window_runs_on_its_own_days_weekday_only(self) -> None:
+        # G-6. The weekday was today's, so a Sunday-only 23:00-01:00 window
+        # also ran in Saturday's tail at Sunday 00:00, and a Monday-to-Friday
+        # one ran Sunday night's unselected window every Monday at 00:00.
+        sunday, weekdays = self.f3_window_runs([
+            ("UTC", "7", "23:00", "01:00", "2026-09-28T02:00", "2026-10-19T02:00", 900),
+            ("UTC", "1,2,3,4,5", "23:00", "01:00", "2026-09-28T02:00", "2026-10-12T02:00", 900),
+        ])
+        self.assertEqual(
+            [self.f3_local(epoch, "UTC") for epoch, _, _ in sunday],
+            ["Sun 2026-10-04 23:00 UTC", "Sun 2026-10-11 23:00 UTC", "Sun 2026-10-18 23:00 UTC"],
+        )
+        self.assertEqual([day for _, day, _ in sunday], ["2026-10-04", "2026-10-11", "2026-10-18"])
+        local = [self.f3_local(epoch, "UTC") for epoch, _, _ in weekdays]
+        self.assertEqual(len(local), 10, local)
+        for entry in local:
+            self.assertTrue(entry.endswith(" 23:00 UTC"), local)
+            self.assertNotIn(entry[:3], ("Sat", "Sun"), local)
+
+    def test_daylight_saving_never_repeats_or_skips_a_window_day(self) -> None:
+        # G-7. The step back to yesterday was minutes-since-midnight plus an
+        # hour, which in the repeated hour of a fall-back night lands on
+        # today: a second run that night, then none the next.
+        from datetime import date, timedelta
+
+        scenarios = []
+        for tz, spans in (
+            ("America/New_York", (("2026-10-30T12:00", "2026-11-03T12:00"), ("2026-03-06T12:00", "2026-03-10T12:00"))),
+            ("Europe/Berlin", (("2026-10-23T12:00", "2026-10-27T12:00"), ("2026-03-27T12:00", "2026-03-31T12:00"))),
+        ):
+            for first, last in spans:
+                for start, end in (("23:00", "02:30"), ("01:00", "03:00")):
+                    scenarios.append((tz, "1,2,3,4,5,6,7", start, end, first, last, 900))
+        runs = self.f3_window_runs(scenarios)
+        for (tz, _, start, end, first, _, _), dispatched in zip(scenarios, runs):
+            with self.subTest(tz=tz, start=start, end=end, first=first):
+                shown = [self.f3_local(e, tz) for e, _, _ in dispatched]
+                days = [day for _, day, _ in dispatched]
+                self.assertEqual(len(days), 4, shown)
+                self.assertEqual(len(set(days)), len(days), shown)
+                parsed = [date.fromisoformat(day) for day in days]
+                for earlier, later in zip(parsed, parsed[1:]):
+                    self.assertEqual(later - earlier, timedelta(days=1), shown)
+                for (epoch, day, note), local in zip(dispatched, shown):
+                    self.assertEqual(note, "none", shown)
+                    if start > end:
+                        next_day = (date.fromisoformat(day) + timedelta(days=1)).isoformat()
+                        self.assertIn(local[4:14], (day, next_day), shown)
+                    else:
+                        self.assertEqual(local[4:14], day, shown)
+
+    def test_a_near_whole_day_window_runs_once_on_a_fall_back_night(self) -> None:
+        # The tail of yesterday's 01:30-01:00 window is re-entered at 01:00 EST
+        # after today's window opened at 01:30 EDT: a later window that has
+        # run closes every earlier one. And a window wholly inside the
+        # repeated hour runs once, at its first occurrence.
+        wide, inside = self.f3_window_runs([
+            ("America/New_York", "1,2,3,4,5,6,7", "01:30", "01:00", "2026-10-31T12:00", "2026-11-02T12:00", 300),
+            ("America/New_York", "1,2,3,4,5,6,7", "01:00", "01:30", "2026-10-31T12:00", "2026-11-02T00:00", 300),
+        ])
+        tz = "America/New_York"
+        self.assertEqual(
+            [self.f3_local(epoch, tz) for epoch, _, _ in wide],
+            ["Sat 2026-10-31 12:00 EDT", "Sun 2026-11-01 01:30 EDT", "Mon 2026-11-02 01:30 EST"],
+        )
+        self.assertEqual([self.f3_local(epoch, tz) for epoch, _, _ in inside], ["Sun 2026-11-01 01:00 EDT"])
+
+    def test_a_window_inside_a_spring_forward_gap_runs_once_after_it_and_says_so(self) -> None:
+        # Every wall minute of the window was skipped that day, so it never
+        # opened and the routine missed that night in silence. It now opens at
+        # the first instant after the gap, noted dst_gap; a window with a
+        # surviving minute simply opens at that minute.
+        new_york, berlin_gap, lord_howe, berlin_part = self.f3_window_runs([
+            ("America/New_York", "1,2,3,4,5,6,7", "02:00", "02:30", "2026-03-07T12:00", "2026-03-09T12:00", 300),
+            ("Europe/Berlin", "1,2,3,4,5,6,7", "02:00", "02:30", "2026-03-28T12:00", "2026-03-30T12:00", 300),
+            ("Australia/Lord_Howe", "1,2,3,4,5,6,7", "02:00", "02:20", "2026-10-03T12:00", "2026-10-05T12:00", 300),
+            ("Europe/Berlin", "1,2,3,4,5,6,7", "02:15", "03:15", "2026-03-28T12:00", "2026-03-30T12:00", 300),
+        ])
+        self.assertEqual(
+            [(self.f3_local(e, "America/New_York"), d, n) for e, d, n in new_york],
+            [("Sun 2026-03-08 03:00 EDT", "2026-03-08", "dst_gap"), ("Mon 2026-03-09 02:00 EDT", "2026-03-09", "none")],
+        )
+        self.assertEqual(
+            [(self.f3_local(e, "Europe/Berlin"), n) for e, _, n in berlin_gap],
+            [("Sun 2026-03-29 03:00 CEST", "dst_gap"), ("Mon 2026-03-30 02:00 CEST", "none")],
+        )
+        self.assertEqual([n for _, _, n in lord_howe], ["dst_gap", "none"])
+        self.assertEqual(
+            [(self.f3_local(e, "Europe/Berlin"), n) for e, _, n in berlin_part],
+            [("Sun 2026-03-29 03:00 CEST", "none"), ("Mon 2026-03-30 02:15 CEST", "none")],
+        )
+
+    def test_a_daily_dispatch_records_the_day_its_gate_saw(self) -> None:
+        # The gate, the due check and the dispatch read the wall clock three
+        # times. A turn that straddled 01:00 -> 01:01, the end of a 23:00-01:00
+        # window, admitted the run as yesterday's window and recorded today, so
+        # tonight's run was never due. This fake date moves a second forward on
+        # every wall-clock read the old code made.
+        self.ctl_profile("nightly", self.source_one)
+        self.ctl_routine("nightly", "daily", start="23:00", end="01:00")
+        env, clock = self.ctl_world("g67s", 1787792459)  # 2026-08-27 01:00:59 UTC
+        fake_date = Path(env["PATH"].split(":", 1)[0]) / "date"
+        fake_date.write_text(
+            "#!/bin/sh\n"
+            ': "${SDSYNC_TEST_CLOCK:?}"\n'
+            'case "${1:-}" in\n'
+            '  +%s) printf x >> "$SDSYNC_TEST_CLOCK.reads"; exec /bin/cat "$SDSYNC_TEST_CLOCK" ;;\n'
+            '  +%H%M|+%u|+%Y-%m-%d) IFS= read -r now < "$SDSYNC_TEST_CLOCK";'
+            ' printf "%s\\n" $((now + 1)) > "$SDSYNC_TEST_CLOCK.t"; mv -f "$SDSYNC_TEST_CLOCK.t" "$SDSYNC_TEST_CLOCK";'
+            ' exec /bin/date -u -d "@$now" "$1" ;;\n'
+            '  +*) IFS= read -r now < "$SDSYNC_TEST_CLOCK"; exec /bin/date -u -d "@$now" "$1" ;;\n'
+            '  -d) exec /bin/date -u "$@" ;;\n'
+            '  *) exec /bin/date "$@" ;;\n'
+            "esac\n",
+            encoding="utf-8",
+        )
+        self.install_test_core("exit 0\n")
+        self.capture.write_text("", encoding="utf-8")
+        self.ctl_start(env)
+        self.ctl_wait_runs("nightly", 1)
+        self.assertEqual(self.ctl_state("nightly").get("last_day"), "2026-08-26", self.ctl_dump())
+        write_clock(clock, "1787871600\n")  # 2026-08-27 23:00 UTC
+        self.ctl_wait_runs("nightly", 2)
+        self.assertEqual(self.ctl_state("nightly").get("last_day"), "2026-08-27", self.ctl_dump())
+
+    # ------------------------------------------------------------- D3-4
+    def f3_realtime_world(
+        self, label: str, *, inotify: bool, limit_path: str | None = None, static_clock: bool = False,
+    ):
+        """A realtime routine on source_two under a fake clock, with a fake inotifywait.
+
+        The fast clock moves 31 s on every read; the static one stays put, for
+        tests that must not cross a TTL while the controller turns."""
+        if limit_path is not None:
+            controller = self.real_target / "libexec/sdsync-controller"
+            text = controller.read_text(encoding="utf-8")
+            needle = "inotify_watch_limit_path=/proc/sys/fs/inotify/max_user_watches\n"
+            self.assertEqual(text.count(needle), 1)
+            controller.write_text(
+                text.replace(needle, f"inotify_watch_limit_path={shlex.quote(limit_path)}\n", 1),
+                encoding="utf-8",
+            )
+        self.configure_with_password("watch", self.source_two, True)
+        (self.source_two / "watched.txt").write_text("one\n", encoding="utf-8")
+        routine, _ = self.api(
+            "routine", "--profile", "watch", "--enabled", "true", "--action", "sync",
+            "--mode", "realtime", "--debounce-seconds", "1", "--poll-seconds", "5",
+            "--retry-count", "0", "--retry-backoff-seconds", "10", "--retry-exponential", "true",
+            "--allow-delete", "false", "--max-total-delete", "100",
+        )
+        self.assertEqual(routine.returncode, 0, routine.stderr)
+        if static_clock:
+            environment, _ = self.ctl_world(label, 1700000000)
+        else:
+            environment = self.fast_clock_environment(step=31)
+        fake_bin = Path(environment["PATH"].split(":", 1)[0])
+        spawned = self.root / f"{label}-inotify-spawned"
+        watcher = fake_bin / "inotifywait"
+        if inotify:
+            watcher.write_text(
+                "#!/bin/sh\n"
+                f'printf x >> "{spawned}"\n'
+                "trap 'exit 0' TERM INT\nwhile :; do /bin/sleep 1; done\n",
+                encoding="utf-8",
+            )
+        else:
+            watcher.write_text("#!/bin/sh\nexit 69\n", encoding="utf-8")
+        watcher.chmod(0o755)
+        if os.getuid() == 0:
+            os.chown(watcher, self.drop_uid, self.drop_gid)
+        return environment, fake_bin, spawned
+
+    def test_the_watch_limit_is_read_whole_and_enforced_under_every_shell(self) -> None:
+        # dash and BusyBox read a builtin `read` a byte at a time, and
+        # proc_dointvec answers end-of-file to any read past offset 0, so the
+        # limit read as its first digit, read returned 1 and the check never
+        # ran at all -- in silence. A real procfs integer stands in for the
+        # watch limit here: vm.overcommit_ratio, multi-digit by default.
+        limit_path = "/proc/sys/vm/overcommit_ratio"
+        limit = int(Path(limit_path).read_text(encoding="ascii").strip())
+        if limit < 10:
+            self.skipTest(f"{limit_path} is {limit}; a multi-digit procfs integer is needed")
+        for index in range(limit // 10 * 8 + 5):
+            (self.source_two / f"dir-{index:03d}").mkdir()
+            if os.getuid() == 0:
+                os.chown(self.source_two / f"dir-{index:03d}", self.drop_uid, self.drop_gid)
+        environment, _, spawned = self.f3_realtime_world("d34r", inotify=True, limit_path=limit_path)
+        started = self.shell(self.lifecycle, "start", extra_environment=environment, timeout=15)
+        self.assertEqual(started.returncode, 0, started.stdout + started.stderr)
+        refused = self.wait_for_controller_event("routine_watch_limit", timeout=20)
+        self.assertIn(f"limit={limit}", str(refused[0].get("detail")))
+        self.wait_for_state(
+            self.real_var / "state/routines/watch.state",
+            lambda f: f.get("backend_reason") == "watch_limit",
+        )
+        self.assertFalse(spawned.exists(), "inotifywait was spawned over the watch limit")
+
+    def test_the_watch_limit_count_never_holds_the_controller_turn(self) -> None:
+        # The directory count was $(find SOURCE -type d | wc -l) inside the
+        # controller's own turn, on every spawn and every reload: on a large
+        # share the queue, the schedule and TERM all waited for it.
+        environment, fake_bin, spawned = self.f3_realtime_world("d34t", inotify=True)
+        count_started = self.root / "d34t-count-started"
+        real_find = shutil.which("find")
+        self.assertIsNotNone(real_find)
+        slow = fake_bin / "find"
+        slow.write_text(
+            "#!/bin/sh\n"
+            f'case "$1:$2:$3" in "{self.source_two}:-type:d") : > "{count_started}"; /bin/sleep 20 ;; esac\n'
+            f'exec "{real_find}" "$@"\n',
+            encoding="utf-8",
+        )
+        slow.chmod(0o755)
+        if os.getuid() == 0:
+            os.chown(slow, self.drop_uid, self.drop_gid)
+        started = self.shell(self.lifecycle, "start", extra_environment=environment, timeout=15)
+        self.assertEqual(started.returncode, 0, started.stdout + started.stderr)
+        self.wait_for_path(count_started, "the watch-limit count never started", timeout=15)
+        controller_state = self.real_var / "state/controller.state"
+        first = int(self.state_fields(controller_state)["updated_epoch"])
+        self.wait_for_state(
+            controller_state, lambda f: int(f.get("updated_epoch", "0")) >= first + 31 * 3, timeout=10,
+        )
+        self.assertFalse(spawned.exists(), "the watcher was spawned before its count landed")
+        stop_started = time.monotonic()
+        stopped = self.shell(self.lifecycle, "stop", timeout=30)
+        self.assertEqual(stopped.returncode, 0, stopped.stdout + stopped.stderr)
+        self.assertLess(time.monotonic() - stop_started, 10, "the count outlived the stop")
+
+    def test_a_reload_reuses_the_watch_limit_count(self) -> None:
+        # HUP stops and respawns every watcher, so every dashboard Save used to
+        # walk every realtime source again. The count is kept for an hour.
+        environment, fake_bin, spawned = self.f3_realtime_world("d34c", inotify=True, static_clock=True)
+        counts = self.root / "d34c-counts"
+        real_find = shutil.which("find")
+        self.assertIsNotNone(real_find)
+        counting = fake_bin / "find"
+        counting.write_text(
+            "#!/bin/sh\n"
+            f'case "$1:$2:$3" in "{self.source_two}:-type:d") printf x >> "{counts}" ;; esac\n'
+            f'exec "{real_find}" "$@"\n',
+            encoding="utf-8",
+        )
+        counting.chmod(0o755)
+        if os.getuid() == 0:
+            os.chown(counting, self.drop_uid, self.drop_gid)
+        started = self.shell(self.lifecycle, "start", extra_environment=environment, timeout=15)
+        self.assertEqual(started.returncode, 0, started.stdout + started.stderr)
+        self.wait_for_path(spawned, "the watcher was never spawned", timeout=20)
+        for save in range(2):
+            before = spawned.stat().st_size
+            saved, _ = self.api(
+                "routine", "--profile", "watch", "--enabled", "true", "--action", "sync",
+                "--mode", "realtime", "--debounce-seconds", str(2 + save), "--poll-seconds", "5",
+                "--retry-count", "0", "--retry-backoff-seconds", "10", "--retry-exponential", "true",
+                "--allow-delete", "false", "--max-total-delete", "100",
+            )
+            self.assertEqual(saved.returncode, 0, saved.stdout + saved.stderr)
+            deadline = time.monotonic() + 20
+            while spawned.stat().st_size <= before:
+                self.assertLess(time.monotonic(), deadline, "the reload never respawned the watcher")
+                time.sleep(0.05)
+        self.assertEqual(counts.read_text(encoding="utf-8"), "x", "a reload walked the source again")
+
+    def test_a_watch_limit_that_cannot_be_read_is_said_once(self) -> None:
+        environment, _, spawned = self.f3_realtime_world(
+            "d34u", inotify=True, limit_path=str(self.root / "no-such-watch-limit")
+        )
+        started = self.shell(self.lifecycle, "start", extra_environment=environment, timeout=15)
+        self.assertEqual(started.returncode, 0, started.stdout + started.stderr)
+        unchecked = self.wait_for_controller_event("routine_watch_limit_unchecked", timeout=20)
+        self.assertIn("cause=absent", str(unchecked[0].get("detail")))
+        # Unchecked is not refused: the watcher still runs, and inotifywait's
+        # own ENOSPC would reach the watch-failure ladder.
+        self.wait_for_path(spawned, "the watcher was not spawned without a limit check", timeout=20)
+        time.sleep(1)
+        self.assertEqual(
+            len([r for r in self.controller_events() if r.get("event") == "routine_watch_limit_unchecked"]), 1
+        )
+
+    # ------------------------------------------------------------- D3-5
+    def test_an_in_flight_poll_walk_is_watched_without_full_turns(self) -> None:
+        # While a walk was in flight the loop slept one second and then
+        # re-evaluated every routine -- with many realtime routines a walk is
+        # almost always in flight, which held a large share of a core. The
+        # one-second looks now only ask whether the walk ended; a full turn,
+        # recognisable by its clock read, still comes every five seconds.
+        environment, fake_bin, _ = self.f3_realtime_world("d35", inotify=False)
+        walk_started = self.root / "d35-walk-started"
+        trace = self.root / "d35-trace"
+        real_find = shutil.which("find")
+        self.assertIsNotNone(real_find)
+        slow = fake_bin / "find"
+        slow.write_text(
+            "#!/bin/sh\n"
+            f'case "$1" in "{self.source_two}") case " $* " in *" -exec "*)'
+            f' : > "{walk_started}"; /bin/sleep 12 ;; esac ;; esac\n'
+            f'exec "{real_find}" "$@"\n',
+            encoding="utf-8",
+        )
+        date_path = fake_bin / "date"
+        date_text = date_path.read_text(encoding="utf-8")
+        date_path.write_text(
+            date_text.replace('  +%s) ', f'  +%s) [ ! -e "{walk_started}" ] || printf "clock\\n" >> "{trace}"; ', 1),
+            encoding="utf-8",
+        )
+        nap = fake_bin / "sleep"
+        nap.write_text(
+            "#!/bin/sh\n"
+            f'[ ! -e "{walk_started}" ] || printf "nap %s\\n" "$1" >> "{trace}"\n'
+            "case ${1:-} in 1) exec /bin/sleep 1 ;; *) exec /bin/sleep 0.03 ;; esac\n",
+            encoding="utf-8",
+        )
+        for path in (slow, date_path, nap):
+            path.chmod(0o755)
+            if os.getuid() == 0:
+                os.chown(path, self.drop_uid, self.drop_gid)
+        self.assertIn('printf "clock', date_path.read_text(encoding="utf-8"))
+        started = self.shell(self.lifecycle, "start", extra_environment=environment, timeout=15)
+        self.assertEqual(started.returncode, 0, started.stdout + started.stderr)
+        self.wait_for_path(walk_started, "the poll walk never started", timeout=20)
+        time.sleep(10)
+        events = trace.read_text(encoding="utf-8").splitlines()
+        naps = [line for line in events if line == "nap 1"]
+        turns = sum(1 for index, line in enumerate(events) if line == "clock" and (index == 0 or events[index - 1] != "clock"))
+        self.assertGreaterEqual(len(naps), 6, events)
+        self.assertLessEqual(turns, len(naps) // 4 + 2, events)
+
+    # ------------------------------------------------------------- D3-7
+    def test_a_poll_job_is_signalled_only_while_its_pid_still_names_it(self) -> None:
+        # stop_poll_job sent TERM to the recorded PID alone. bash reaps an
+        # exited child at once, so by a reload or stop the PID could name
+        # another process of this uid. It now needs the start tick and parent
+        # captured at spawn.
+        controller_source = (self.real_target / "libexec/sdsync-controller").read_text(encoding="utf-8")
+        functions = []
+        for name in ("own_job_start", "own_job_is_running", "reap_own_job", "clear_poll_job", "stop_poll_job"):
+            start = controller_source.index(f"{name}() {{\n")
+            functions.append(controller_source[start:controller_source.index("\n}\n", start) + 3])
+        probe = self.f3_script(
+            "d37-stop-poll.sh",
+            '. "$SYNOPKG_PKGDEST/libexec/sdsync-common"\n'
+            "controller_log_event() { :; }\n"
+            'reap_direct_child_interruption_safe() { wait "$1" 2>/dev/null || :; }\n'
+            + "".join(functions)
+            # The victim is not this shell's child: the PID a reaped job left
+            # behind, given to an unrelated process of the same uid.
+            + "victim=$( (/bin/sleep 30 >/dev/null 2>&1 & echo $!) )\n"
+            'poll_job_result=$SYNOPKG_PKGVAR/poll.result; poll_job_output=$SYNOPKG_PKGVAR/poll.output\n'
+            "poll_job_errors=\n"
+            "poll_job_pid=$victim\n"
+            "poll_job_start=1\n"
+            "stop_poll_job\n"
+            'if kill -0 "$victim" 2>/dev/null; then echo spared; else echo signalled; fi\n'
+            '/bin/sleep 30 & own=$!\n'
+            'own_job_start "$own" "$$"\n'
+            "poll_job_pid=$own; poll_job_start=$own_job_start_value\n"
+            "stop_poll_job\n"
+            'if kill -0 "$own" 2>/dev/null; then echo own-spared; else echo own-signalled; fi\n'
+            'kill "$victim" "$own" 2>/dev/null || :\n',
+        )
+        for shell in self.f3_shells():
+            with self.subTest(shell=shell):
+                result = self.f3_run(shell, probe)
+                self.assertEqual(result.stdout.split(), ["spared", "own-signalled"], result.stdout + result.stderr)
+
+    # ------------------------------------------------------------- C-15
+    def test_an_empty_folder_created_in_a_polled_source_is_synced(self) -> None:
+        # The v2 reading listed files only, so creating, removing or renaming
+        # an empty folder changed nothing the poll could see.
+        environment, _, _ = self.f3_realtime_world("c15", inotify=False)
+        state_path = self.real_var / "state/routines/watch.state"
+        self.capture.write_text("", encoding="utf-8")
+        started = self.shell(self.lifecycle, "start", extra_environment=environment, timeout=15)
+        self.assertEqual(started.returncode, 0, started.stdout + started.stderr)
+        baseline = self.wait_for_state(
+            state_path, lambda f: f.get("fingerprint", "none").startswith("v3:"), timeout=20
+        )["fingerprint"]
+        invocation = "sync --profile watch --no-delete"
+        self.assertNotIn(invocation, self.capture.read_text(encoding="utf-8"))
+        empty = self.source_two / "New Folder"
+        empty.mkdir()
+        if os.getuid() == 0:
+            os.chown(empty, self.drop_uid, self.drop_gid)
+        deadline = time.monotonic() + 30
+        while invocation not in self.capture.read_text(encoding="utf-8"):
+            self.assertLess(time.monotonic(), deadline, self.ctl_dump())
+            time.sleep(0.1)
+        synced = self.wait_for_state(
+            state_path, lambda f: f.get("fingerprint", baseline) not in (baseline, "none"), timeout=20
+        )
+        self.assertTrue(synced["fingerprint"].startswith("v3:"), synced)
+
+    # ------------------------------------------------------------- SC-8
+    def test_appending_a_log_line_never_reads_the_log(self) -> None:
+        # rotate_log took the size with `wc -c < file`, which BusyBox answers
+        # by reading the whole file: every controller.log line cost a read of
+        # up to 10 MiB. The size now comes from the stat that checks the file.
+        log = self.real_var / "log/f3-size.log"
+        log.write_bytes(b"x" * (2 * 1024 * 1024) + b"\n")
+        log.chmod(0o600)
+        if os.getuid() == 0:
+            os.chown(log, self.drop_uid, self.drop_gid)
+        calls = self.root / "sc8-wc-calls"
+        real_wc = shutil.which("wc")
+        self.assertIsNotNone(real_wc)
+        fake_wc = self.fake_system_bin / "wc"
+        fake_wc.write_text(
+            "#!/bin/sh\n"
+            f'printf \'%s\\n\' "$*" >> {shlex.quote(str(calls))}\n'
+            f'exec {shlex.quote(str(real_wc))} "$@"\n',
+            encoding="utf-8",
+        )
+        fake_wc.chmod(0o755)
+        if os.getuid() == 0:
+            os.chown(fake_wc, self.drop_uid, self.drop_gid)
+        probe = self.f3_script(
+            "sc8-append.sh",
+            '. "$SYNOPKG_PKGDEST/libexec/sdsync-common"\n'
+            f"log={shlex.quote(str(log))}\n"
+            'append_rotating_log "$log" 10485760 5 "one" || exit 1\n'
+            'append_rotating_log "$log" 10485760 5 "two" || exit 1\n'
+            '[ ! -e "$log.1" ] || { echo "rotated below the limit"; exit 1; }\n'
+            'append_rotating_log "$log" 1048576 5 "three" || exit 1\n'
+            '[ -f "$log.1" ] || { echo "not rotated past the limit"; exit 1; }\n'
+            'echo ok\n',
+        )
+        for shell in self.f3_shells():
+            with self.subTest(shell=shell):
+                for path in (log.with_name(log.name + ".1"), calls):
+                    if path.exists():
+                        path.unlink()
+                if not log.exists() or log.stat().st_size < 1048576:
+                    log.write_bytes(b"x" * (2 * 1024 * 1024) + b"\n")
+                    log.chmod(0o600)
+                    if os.getuid() == 0:
+                        os.chown(log, self.drop_uid, self.drop_gid)
+                result = self.f3_run(shell, probe)
+                self.assertEqual(result.stdout.strip(), "ok", result.stdout + result.stderr)
+                self.assertEqual(log.read_text(encoding="utf-8"), "three\n")
+                self.assertFalse(calls.exists() and calls.read_text(encoding="utf-8").strip(),
+                                 calls.read_text(encoding="utf-8") if calls.exists() else "")
+
+    # ------------------------------------------------------------- G-8
+    # Recovering a torn owner record judged it by its content, then moved and
+    # removed whatever the name held by then: a contender that published its
+    # live record in between lost it, and two holders ran at once. The judged
+    # pause is injected into this test's own copy of the library, right after
+    # the torn judgement, so the race is the same on the old code and the new.
+    def f3_torn_lock(self) -> tuple[Path, Path, Path]:
+        common = self.real_target / "libexec/sdsync-common"
+        text = common.read_text(encoding="utf-8")
+        needle = '            if lock_owner_torn_before_boot "$event_log_lock/pid"; then\n'
+        self.assertEqual(text.count(needle), 1)
+        common.write_text(
+            text.replace(
+                needle,
+                needle + '                [ -z "${SDSYNC_TEST_JUDGED_PAUSE:-}" ] || /bin/sleep "$SDSYNC_TEST_JUDGED_PAUSE"\n',
+                1,
+            ),
+            encoding="utf-8",
+        )
+        lock = self.real_var / "run/g8.lock"
+        lock.mkdir(mode=0o700)
+        self.write_private_state(lock / "pid", "")
+        os.utime(lock / "pid", (1000, 1000))
+        trace = self.root / "g8-trace"
+        trace.write_text("", encoding="utf-8")
+        holder = self.f3_script(
+            "g8-holder.sh",
+            "set -eu\n"
+            '. "$SYNOPKG_PKGDEST/libexec/sdsync-common"\n'
+            'if [ -n "${SDSYNC_TEST_CLAIMED_PAUSE:-}" ]; then torn_owner_claimed() { /bin/sleep "$SDSYNC_TEST_CLAIMED_PAUSE"; }; fi\n'
+            f"lock={shlex.quote(str(lock))}; trace={shlex.quote(str(trace))}\n"
+            'name=$1; hold=$2\n'
+            "status=0; acquire_private_process_lock \"$lock\" || status=$?\n"
+            'if [ "$status" -ne 0 ]; then printf "%s %s %s\\n" REFUSED "$name" "$status" >> "$trace"; exit 0; fi\n'
+            'printf "%s %s %s\\n" ACQ "$name" "$(date +%s%N)" >> "$trace"\n'
+            '/bin/sleep "$hold"\n'
+            'owner=$(sed -n 1p "$lock/pid" 2>/dev/null || echo absent)\n'
+            'if [ "$owner" = "$$" ]; then printf "%s %s\\n" OWNED "$name" >> "$trace"; else printf "%s %s %s\\n" LOST "$name" "$owner" >> "$trace"; fi\n'
+            'printf "%s %s %s\\n" REL "$name" "$(date +%s%N)" >> "$trace"\n'
+            "released=0; release_private_process_lock \"$lock\" || released=$?\n"
+            'printf "%s %s %s\\n" RELEASED "$name" "$released" >> "$trace"\n',
+        )
+        return lock, trace, holder
+
+    def f3_torn_contend(self, holder: Path, plan: list[tuple[float, str, str, dict[str, str]]]) -> None:
+        processes = []
+        started = time.monotonic()
+        for delay, name, hold, environment in plan:
+            time.sleep(max(0.0, started + delay - time.monotonic()))
+            processes.append(self.shell_process(holder, name, hold, extra_environment=environment))
+        for process in processes:
+            process.wait(timeout=90)
+
+    def f3_assert_exclusive(self, lock: Path, trace: Path, names: list[str]) -> None:
+        lines = [line.split() for line in trace.read_text(encoding="utf-8").splitlines()]
+        self.assertFalse([line for line in lines if line[0] == "LOST"], lines)
+        intervals = {}
+        for line in lines:
+            if line[0] in ("ACQ", "REL"):
+                intervals.setdefault(line[1], {})[line[0]] = int(line[2])
+        for line in lines:
+            if line[0] == "RELEASED":
+                self.assertEqual(line[2], "0", lines)
+            if line[0] == "REFUSED":
+                self.assertEqual(line[2], "75", lines)
+        ordered = sorted((span["ACQ"], span["REL"], name) for name, span in intervals.items())
+        for (_, first_end, first), (second_start, _, second) in zip(ordered, ordered[1:]):
+            self.assertLess(first_end, second_start, f"{first} and {second} held the lock at once: {lines}")
+        self.assertIn(names[0], intervals, lines)
+        leftovers = sorted(path.name for path in lock.parent.iterdir() if path.name.startswith("g8.lock."))
+        self.assertEqual(leftovers, [])
+
+    def test_torn_owner_recovery_never_removes_a_record_published_during_judgement(self) -> None:
+        lock, trace, holder = self.f3_torn_lock()
+        self.f3_torn_contend(holder, [
+            (0.0, "A", "2", {"SDSYNC_TEST_JUDGED_PAUSE": "2"}),
+            (0.5, "B", "6", {}),
+        ])
+        self.f3_assert_exclusive(lock, trace, ["B", "A"])
+        self.assertIn(["OWNED", "B"], [line.split() for line in trace.read_text(encoding="utf-8").splitlines()])
+
+    def test_a_torn_owner_claim_blocks_a_third_contender(self) -> None:
+        lock, trace, holder = self.f3_torn_lock()
+        self.f3_torn_contend(holder, [
+            (0.0, "A", "2", {"SDSYNC_TEST_JUDGED_PAUSE": "2", "SDSYNC_TEST_CLAIMED_PAUSE": "2"}),
+            (0.5, "B", "8", {}),
+            (2.6, "C", "2", {}),
+        ])
+        self.f3_assert_exclusive(lock, trace, ["B", "A", "C"])
+
+    def test_an_orphaned_torn_owner_claim_is_reaped_or_restored(self) -> None:
+        boot = Path("/proc/sys/kernel/random/boot_id").read_text(encoding="utf-8").strip()
+        lock = self.real_var / "run/g8o.lock"
+        lock.mkdir(mode=0o700)
+        probe = self.f3_script(
+            "g8-orphan.sh",
+            '. "$SYNOPKG_PKGDEST/libexec/sdsync-common"\n'
+            f"lock={shlex.quote(str(lock))}\n"
+            'status=0; acquire_private_process_lock "$lock" || status=$?\n'
+            'echo "status=$status"\n'
+            '[ "$status" -ne 0 ] || release_private_process_lock "$lock"\n',
+        )
+        # (a) The claimant died holding a record still torn from before the
+        # boot: removed, and the lock is free.
+        orphan = Path(f"{lock}.torn.99999999.1.{boot}")
+        self.write_private_state(orphan, "")
+        os.utime(orphan, (1000, 1000))
+        result = self.shell(probe, timeout=60)
+        self.assertIn("status=0", result.stdout, result.stdout + result.stderr)
+        self.assertFalse(orphan.exists())
+        # (b) The claimant died holding a live owner's record it took by
+        # mistake: put back as the owner, never deleted, and the lock is busy.
+        live = subprocess.Popen(
+            ["/bin/sleep", "60"],
+            preexec_fn=(
+                (lambda: (os.setgroups([]), os.setgid(self.drop_gid), os.setuid(self.drop_uid)))
+                if os.getuid() == 0 else None
+            ),
+        )
+        try:
+            start = Path(f"/proc/{live.pid}/stat").read_text(encoding="ascii").rsplit(") ", 1)[1].split()[19]
+            record = f"{live.pid}\n{start}\n{boot}\n"
+            self.write_private_state(orphan, record)
+            result = self.shell(probe, timeout=60)
+            self.assertIn("status=75", result.stdout, result.stdout + result.stderr)
+            self.assertFalse(orphan.exists())
+            self.assertEqual((lock / "pid").read_text(encoding="utf-8"), record)
+            self.assertIn("lock_owner_torn_race", result.stderr)
+        finally:
+            live.kill()
+            live.wait()
+
+    # ------------------------------------------------------------- G-10
+    # A heartbeat moves only on data: rchar+wchar growing by 16 KiB a minute
+    # (or the profile's whole --max-rate minute when that is lower). The old
+    # "changed at all" test read a hung core's keepalive noise as progress.
+    def f3_heartbeat_run(self, core_body: str, scope: str = "alpha", *, extra_profiles=(),
+                         profile_options: tuple[str, ...] = (), path_prefix: Path | None = None):
+        self.configure_with_password("alpha", self.source_one, True)
+        if profile_options:
+            configured = self.shell(
+                self.manager, "configure-profile", "--name", "alpha", "--source", str(self.source_one),
+                "--url", "https://files.example.test/proxy/", "--username", "alpha-bot",
+                "--remote", "/home/Drive/alpha", "--default", *profile_options,
+            )
+            self.assertEqual(configured.returncode, 0, configured.stdout + configured.stderr)
+        for name in extra_profiles:
+            self.configure_with_password(name, self.source_two)
+        self.install_test_core(core_body)
+        started = self.shell(self.lifecycle, "start", timeout=15)
+        self.assertEqual(started.returncode, 0, started.stdout + started.stderr)
+        environment = self.fast_clock_environment(step=31)
+        environment["SDSYNC_DSM_AUDIT_WRAPPED"] = "true"
+        if path_prefix is not None:
+            environment["PATH"] = f"{path_prefix}:{environment['PATH']}"
+        return self.shell_process(
+            self.real_target / "libexec/sdsync-run", "sync", scope, "false", "foreground",
+            "100" if scope == "all" else "-",
+            extra_environment=environment,
+        )
+
+    def f3_heartbeat_finish(self, run, stop: Path) -> None:
+        stop.write_text("x", encoding="utf-8")
+        run.communicate(timeout=60)
+        stopped = self.shell(self.lifecycle, "stop", timeout=15)
+        self.assertEqual(stopped.returncode, 0, stopped.stdout + stopped.stderr)
+
+    def test_a_core_that_only_makes_noise_is_flagged_stalled(self) -> None:
+        stop = self.root / "noisy-core.stop"
+        run = self.f3_heartbeat_run(
+            f'while [ ! -e "{stop}" ]; do /bin/sleep 0.2; printf x > /dev/null; done\nexit 0\n'
+        )
+        run_state = self.real_var / "state/run.state"
+        try:
+            self.wait_for_state(run_state, lambda f: f.get("state") == "running", timeout=30)
+            stalled = self.wait_for_controller_event("run_stalled", timeout=60)
+            self.assertEqual(stalled[0]["level"], "error")
+            self.assertIn("source=io", str(stalled[0]["detail"]))
+            self.assertEqual(self.state_fields(run_state)["state"], "running")
+            self.assertIsNone(run.poll(), "the stalled core was killed")
+        finally:
+            self.f3_heartbeat_finish(run, stop)
+
+    def test_a_batch_run_that_moves_real_data_is_never_flagged_stalled(self) -> None:
+        # Batch (scheduled, `all`) runs have no progress record at all; their
+        # heartbeat rests on the I/O floor alone.
+        stop = self.root / "busy-core.stop"
+        run = self.f3_heartbeat_run(
+            'big=$(/bin/dd if=/dev/zero bs=65536 count=1 2>/dev/null | /usr/bin/tr "\\0" x)\n'
+            f'while [ ! -e "{stop}" ]; do /bin/sleep 0.2; printf "%s" "$big" > /dev/null; done\nexit 0\n',
+            scope="all", extra_profiles=("beta",),
+        )
+        run_state = self.real_var / "state/run.state"
+        try:
+            self.wait_for_state(run_state, lambda f: f.get("state") == "running", timeout=30)
+            fields = self.wait_for_state(
+                run_state,
+                lambda f: f.get("heartbeat_epoch", "0").isdigit()
+                and int(f.get("heartbeat_epoch", "0")) > int(f.get("started_epoch", "0")) + 1800,
+                timeout=90,
+            )
+            self.assertEqual(fields.get("heartbeat_source"), "io", fields)
+            self.assertEqual([r for r in self.controller_events() if r.get("event") == "run_stalled"], [])
+        finally:
+            self.f3_heartbeat_finish(run, stop)
+
+    def test_a_slow_max_rate_lowers_the_progress_floor(self) -> None:
+        # About 4 KiB a tick is under 16 KiB, but over a 10 B/s profile's whole
+        # minute (600 bytes): that run is progressing, not stalled.
+        stop = self.root / "slow-core.stop"
+        run = self.f3_heartbeat_run(
+            'chunk=$(/bin/dd if=/dev/zero bs=2048 count=1 2>/dev/null | /usr/bin/tr "\\0" x)\n'
+            f'while [ ! -e "{stop}" ]; do /bin/sleep 0.2; printf "%s" "$chunk" > /dev/null; done\nexit 0\n',
+            profile_options=("--max-rate", "10"),
+        )
+        run_state = self.real_var / "state/run.state"
+        try:
+            fields = self.wait_for_state(
+                run_state,
+                lambda f: f.get("heartbeat_epoch", "0").isdigit()
+                and int(f.get("heartbeat_epoch", "0")) > int(f.get("started_epoch", "0")) + 1800,
+                timeout=90,
+            )
+            self.assertEqual(fields.get("heartbeat_source"), "io", fields)
+            self.assertEqual([r for r in self.controller_events() if r.get("event") == "run_stalled"], [])
+        finally:
+            self.f3_heartbeat_finish(run, stop)
+
+    def test_a_heartbeat_that_cannot_see_the_cores_io_publishes_no_epoch(self) -> None:
+        # Liveness proves nothing about progress. With /proc/<pid>/io
+        # unreadable (here: an awk shim that refuses that one file) run.state
+        # says heartbeat_source=liveness and carries no heartbeat_epoch, so the
+        # bridge reports stalled:null and stall_unobservable, never "fine".
+        real_awk = shutil.which("awk")
+        self.assertIsNotNone(real_awk)
+        shim = self.root / "io-blind-bin"
+        shim.mkdir(mode=0o700)
+        (shim / "awk").write_text(
+            "#!/bin/sh\n"
+            'for argument do case $argument in /proc/*/io) exit 1 ;; esac; done\n'
+            f'exec {shlex.quote(str(real_awk))} "$@"\n',
+            encoding="utf-8",
+        )
+        (shim / "awk").chmod(0o755)
+        if os.getuid() == 0:
+            for path in (shim, shim / "awk"):
+                os.chown(path, self.drop_uid, self.drop_gid)
+        stop = self.root / "blind-core.stop"
+        run = self.f3_heartbeat_run(
+            f'while [ ! -e "{stop}" ]; do /bin/sleep 0.2; done\nexit 0\n',
+            path_prefix=shim,
+        )
+        run_state = self.real_var / "state/run.state"
+        try:
+            fields = self.wait_for_state(
+                run_state,
+                lambda f: f.get("state") == "running" and f.get("heartbeat_source") == "liveness",
+                timeout=60,
+            )
+            self.assertNotIn("heartbeat_epoch", fields)
+            time.sleep(3)
+            self.assertNotIn("heartbeat_epoch", self.state_fields(run_state))
+            self.assertEqual([r for r in self.controller_events() if r.get("event") == "run_stalled"], [])
+        finally:
+            self.f3_heartbeat_finish(run, stop)
+
+    # --------------------------------------------- D3-3 overlap (manager, runner)
+    # The core's refusal (fix3-engine, main.rs ProfileDestination::overlap):
+    # the names and the remedy first, then the batch check's own sentence,
+    # which names the pair in name order.
+    F3_OVERLAP = (
+        'error: profiles "inner" and "outer" have overlapping NAS destinations '
+        'and "outer" deletes: give them separate destinations, or a mirror run of one deletes the '
+        "other's files (batch jobs \"inner\" (/home/Drive/team/inner) and \"outer\" (/home/Drive/team) "
+        "have equal or nested roots on endpoint https://files.example.test/proxy/)"
+    )
+
+    def f3_configure(self, name: str, remote: str, *extra: str, url: str = "https://files.example.test/proxy/"):
+        return self.shell(
+            self.manager, "configure-profile", "--name", name, "--source", str(self.source_one),
+            "--url", url, "--username", f"{name}-bot", "--remote", remote, *extra,
+        )
+
+    def test_configure_profile_refuses_an_overlapping_pair_when_either_deletes(self) -> None:
+        # The core now refuses every run of either profile (exit 2) when their
+        # roots are equal or nested on one endpoint and either deletes. Saving
+        # that configuration is refused up front with the same sentence.
+        self.assertEqual(self.f3_configure("outer", "/home/Drive/team", "--delete", "--max-delete", "5").returncode, 0)
+        refused = self.f3_configure("inner", "/home/Drive/team/inner")
+        self.assertEqual(refused.returncode, 64, refused.stdout + refused.stderr)
+        self.assertEqual(refused.stderr.strip(), self.F3_OVERLAP.removeprefix("error: "))
+        self.assertNotIn("inner", self.shell(self.manager, "list-profiles").stdout)
+        # The same roots on another endpoint, or roots that only share a name
+        # prefix, do not overlap.
+        self.assertEqual(
+            self.f3_configure("elsewhere", "/home/Drive/team", url="https://other.example.test/").returncode, 0
+        )
+        self.assertEqual(self.f3_configure("sibling", "/home/Drive/teammate").returncode, 0)
+        # The default port and the host's case are the same endpoint.
+        same = self.f3_configure("inner2", "/home/Drive/team", url="https://FILES.example.test:443/proxy/")
+        self.assertEqual(same.returncode, 64, same.stdout + same.stderr)
+        self.assertIn('and "outer" deletes', same.stderr)
+        # Saving the deleting profile itself over a non-deleting nested one.
+        self.assertEqual(self.f3_configure("leaf", "/home/Drive/other/leaf").returncode, 0)
+        both = self.f3_configure("trunk", "/home/Drive/other", "--delete", "--max-delete", "5")
+        self.assertEqual(both.returncode, 64, both.stdout + both.stderr)
+        self.assertIn('profiles "trunk" and "leaf" have overlapping NAS destinations and "trunk" deletes', both.stderr)
+        # The batch sentence keeps the core's name order, whichever is saved.
+        self.assertIn('(batch jobs "leaf" (/home/Drive/other/leaf) and "trunk" (/home/Drive/other)', both.stderr)
+
+    def test_configure_profile_warns_about_an_overlapping_pair_where_neither_deletes(self) -> None:
+        self.assertEqual(self.f3_configure("outer", "/home/Drive/team").returncode, 0)
+        warned = self.f3_configure("inner", "/home/Drive/team/inner")
+        self.assertEqual(warned.returncode, 0, warned.stdout + warned.stderr)
+        self.assertEqual(
+            warned.stderr.strip(),
+            'warning: profiles "inner" and "outer" have overlapping NAS destinations; neither deletes, '
+            "so nothing is lost, but each one's runs also carry the other's files (batch jobs \"inner\" "
+            '(/home/Drive/team/inner) and "outer" (/home/Drive/team) have equal or nested roots on '
+            "endpoint https://files.example.test/proxy/)",
+        )
+
+    def test_a_single_profile_overlap_refusal_is_kept_whole_in_the_profile_state(self) -> None:
+        # The runner kept the core's last error line cut to 160 bytes. The
+        # profile's own state now carries the bridge's 240 -- the remedy and
+        # the batch check's names -- run.state and Activity keep 160, and
+        # run-stderr.log the whole line.
+        self.ctl_profile("inner", self.source_one)
+        self.ctl_routine("inner", "interval", interval="60")
+        env, clock = self.ctl_world("f3ov", 700000)
+        message = self.F3_OVERLAP
+        self.assertGreater(len(message), 240)
+        self.assertGreater(message.index("(batch jobs"), 160)
+        self.install_test_core(
+            'case " $* " in *" sync "*) printf \'%s\\n\' ' + shlex.quote(message) + " >&2; exit 2 ;; esac\nexit 0\n"
+        )
+        self.capture.write_text("", encoding="utf-8")
+        self.ctl_start(env)
+        self.ctl_settle(clock, 700061, turns=2)
+        self.ctl_wait_runs("inner", 1)
+        state = self.wait_for_state(
+            self.real_var / "state/profiles/inner.state", lambda f: f.get("detail", "") != ""
+        )
+        self.assertEqual(state.get("detail"), message[:240], state)
+        self.assertEqual(state.get("exit_code"), "2", state)
+        run_state = self.state_fields(self.real_var / "state/run.state")
+        self.assertEqual(run_state.get("detail"), message[:160], run_state)
+        self.assertIn(message, (self.real_var / "log/run-stderr.log").read_text(encoding="utf-8"))
+
+    def test_an_overlapping_deleting_pair_blocks_only_its_own_profiles(self) -> None:
+        # The runner validated the whole configuration before every run, so
+        # one overlapping pair that deletes refused every routine of every
+        # profile. A profile's run now validates with --profile: a and b are
+        # refused with the cause in their detail, c runs. The fake core
+        # answers config validate the way the engine does.
+        message = (
+            'error: profiles "a" and "b" have overlapping NAS destinations and "b" deletes: give them '
+            "separate destinations, or a mirror run of one deletes the other's files (batch jobs \"a\" "
+            '(/home/Drive/a) and "b" (/home/Drive/a/b) have equal or nested roots on endpoint '
+            "https://files.example.test/proxy/)"
+        )
+        for name in ("a", "b", "c"):
+            self.ctl_profile(name, self.source_one)
+            self.ctl_routine(name, "interval", interval="60")
+        env, clock = self.ctl_world("f3br", 720000)
+        core = self.real_target / "bin/synology-drive-sync"
+        core.write_text(
+            "#!/bin/sh\n"
+            ': "${SDSYNC_TEST_CAPTURE:?}"\n'
+            'printf \'%s\\n\' "$*" >> "$SDSYNC_TEST_CAPTURE"\n'
+            'case " $* " in\n'
+            '  *" --profile c "*" config validate "*) exit 0 ;;\n'
+            '  *" config validate "*) printf \'%s\\n\' ' + shlex.quote(message) + ' >&2; exit 2 ;;\n'
+            "esac\n"
+            "exit 0\n",
+            encoding="utf-8",
+        )
+        core.chmod(0o755)
+        if os.getuid() == 0:
+            os.chown(core, self.drop_uid, self.drop_gid)
+        self.capture.write_text("", encoding="utf-8")
+        self.ctl_start(env)
+        epoch = 720061
+        deadline = time.monotonic() + 60
+        while len(self.ctl_events("routine_run")) < 3 and time.monotonic() < deadline:
+            epoch = self.ctl_settle(clock, epoch + 1, turns=2)
+        for name in ("a", "b"):
+            state = self.state_fields(self.real_var / f"state/profiles/{name}.state")
+            self.assertEqual((state.get("state"), state.get("reason")), ("failed", "config_invalid"), state)
+            self.assertIn('profiles "a" and "b" have overlapping NAS destinations', state.get("detail", ""), state)
+        self.assertTrue(self.ctl_syncs(" sync --profile c "), self.capture.read_text(encoding="utf-8"))
+        self.assertFalse(self.ctl_syncs(" sync --profile a "))
+        state = self.state_fields(self.real_var / "state/profiles/c.state")
+        self.assertEqual(state.get("state"), "succeeded", state)
+
+    # ------------------------------------------------------------- G-9
+    def test_the_shell_log_lane_never_returns_any_part_of_a_secret(self) -> None:
+        # Lines were cut to 8192 bytes before redaction and an unterminated
+        # JSON string was returned unredacted, so a secret open at the cut was
+        # shown whole; a "[ts] message" line took the JSON token path and kept
+        # a secret outside any string; an ANSI escape inside a secret was
+        # stripped only after redaction, joining it back. The cases are
+        # fix3-bridge's, so both lanes are held to the same vectors.
+        secret = "hunter2-secret"
+        self.assertEqual(self.configure("logprofile", self.source_one, "/home/Drive/Logs", True).returncode, 0)
+        saved, _ = self.api(
+            "set-secret", "--profile", "logprofile", "--kind", "password", "--mode", "replace",
+            input_text=f"{secret}\n",
+        )
+        self.assertEqual(saved.returncode, 0, saved.stderr)
+        error = '{"epoch":1,"level":"error","category":"controller","event":"x","detail":"'
+        cases = {
+            "json-long-unterminated": error + "a" * (8192 - len(error) - 4) + secret + " tail",
+            "json-30k-secret-early": error + secret + "b" * 30000 + '"}',
+            "plain-straddle": "c" * (8192 - 5) + secret + " after",
+            "bracket-plain": f"[2026-10-25 01:02:03] login failed for {secret}",
+            "json-trailing": error + 'ok"} ' + secret,
+            "json-unterminated-short": error + secret,
+            "ansi-split": "plain " + secret[:5] + "\x1b[31m" + secret[5:] + " end",
+            "json-70k": error + "d" * 70000 + '"}',
+            "json-record-ok": error + "the password " + secret + ' was refused"}',
+            "multibyte-cut": "e" * 8191 + "é",
+        }
+        controller_log = self.real_var / "log/controller.log"
+        controller_log.write_text("".join(text + "\n" for text in cases.values()), encoding="utf-8")
+        controller_log.chmod(0o600)
+        if os.getuid() == 0:
+            os.chown(controller_log, self.drop_uid, self.drop_gid)
+        logs, payload = self.api("logs", "--source", "controller", "--lines", "50")
+        self.assertEqual(logs.returncode, 0, logs.stdout + logs.stderr)
+        lines = next(entry for entry in payload["logs"] if entry["source"] == "controller")["lines"]
+        self.assertEqual(len(lines), len(cases), lines)
+        shown = dict(zip(cases, lines))
+        for name, line in shown.items():
+            with self.subTest(case=name):
+                for size in range(4, len(secret) + 1):
+                    self.assertNotIn(secret[:size], line)
+                self.assertLessEqual(len(line.encode("utf-8")), 8192)
+                self.assertNotIn("�", line)
+        self.assertEqual(shown["json-70k"], f"[line too long: {len(cases['json-70k'])} bytes, withheld]")
+        self.assertIn("[redacted]", shown["json-30k-secret-early"])
+        record = json.loads(shown["json-record-ok"])
+        self.assertEqual(record["detail"], "the password [redacted] was refused")
+        self.assertEqual(shown["multibyte-cut"], "e" * 8191)
+
+    # ------------------------------------------------------------- gate3 F1
+    F3_IDENTITY_HELPERS = (
+        "process_identity_is_live", "work_child_identity_is_running", "read_process_stat_fields",
+        "read_process_status_ids", "stop_work_children_bounded", "signal_controller_sleep",
+        "stop_runner_guard_sleep", "capture_work_child_identity", "boot_identity",
+    )
+
+    def f3_function(self, source: str, name: str, indent: str = "") -> str:
+        start = source.index(f"{indent}{name}() {{\n")
+        return source[start:source.index(f"\n{indent}}}\n", start) + len(indent) + 3]
+
+    def test_no_signal_handler_runs_a_shared_identity_check(self) -> None:
+        # A handler runs between any two commands of the controller's main
+        # flow, which once a second is an exact-identity check of the runner
+        # wait guard; the identity helpers keep their state in globals. The
+        # TERM handler ran its own checks, read the interrupted one's half-set
+        # values, judged the live control consumer gone and sent it nothing,
+        # so a stop waited out its budget (gate3 F1, about 1 stop in 25).
+        controller = (self.real_target / "libexec/sdsync-controller").read_text(encoding="utf-8")
+        handlers = [
+            self.f3_function(controller, name)
+            for name in ("request_shutdown", "request_reload", "request_queue_wake",
+                         "request_runner_wait_poll", "handler_child_signal")
+        ]
+        handlers.append(self.f3_function(controller, "request_runner_guard_shutdown", "        "))
+        for body in handlers:
+            for helper in self.F3_IDENTITY_HELPERS:
+                self.assertNotRegex(body, rf"\b{helper}\b", body)
+            # No command substitution in a handler (arithmetic $(( )) is fine).
+            self.assertNotRegex(body, r"\$\((?!\()", body)
+
+    def test_a_signal_storm_never_breaks_a_main_flow_identity_check(self) -> None:
+        # The handler the controller installs, driven at a storm rate while
+        # the main flow checks a live child's exact identity in a loop: no
+        # check may come back anything but live.
+        controller = (self.real_target / "libexec/sdsync-controller").read_text(encoding="utf-8")
+        probe = self.f3_script(
+            "f1-storm.sh",
+            '. "$SYNOPKG_PKGDEST/libexec/sdsync-common"\n'
+            + self.f3_function(controller, "handler_child_signal")
+            + "/bin/sleep 300 & target=$!\n"
+            '/bin/sleep 300 & other=$!\n'
+            'start=$(process_start_time "$target"); boot=$(boot_identity)\n'
+            "storm_handler() { handler_child_signal \"$other\" 1; }\n"
+            "trap storm_handler USR2\n"
+            '( while kill -USR2 $$ 2>/dev/null; do /bin/sleep 0.005; done ) & storm=$!\n'
+            "bad=0; n=0\n"
+            'while [ "$n" -lt 1500 ]; do\n'
+            '    st=0; process_identity_is_live "$target" "$start" "$boot" || st=$?\n'
+            '    [ "$st" -eq 0 ] || bad=$((bad + 1))\n'
+            "    n=$((n + 1))\n"
+            "done\n"
+            'kill "$storm" "$target" "$other" 2>/dev/null\n'
+            'echo "bad=$bad"\n',
+        )
+        for shell in self.f3_shells():
+            with self.subTest(shell=shell):
+                result = self.f3_run(shell, probe, timeout=600)
+                self.assertEqual(result.stdout.strip(), "bad=0", result.stdout + result.stderr)
+
+    # ------------------------------------------------------------- RB-5
+    def test_a_committed_save_with_a_warning_that_sanitises_to_nothing_still_names_one(self) -> None:
+        # The bridge refuses an empty "warning", so a save whose warning: line
+        # held only control bytes read as a failed job although it committed.
+        manager_source = self.manager.read_text(encoding="utf-8")
+        functions = []
+        for name in ("api_post_commit_warning", "api_mutation_result"):
+            start = manager_source.index(f"{name}() {{\n")
+            functions.append(manager_source[start:manager_source.index("\n}\n", start) + 3])
+        probe = self.f3_script(
+            "rb5-warning.sh",
+            '. "$SYNOPKG_PKGDEST/libexec/sdsync-common"\n'
+            + "".join(functions)
+            + "api_warning_code=; api_warning=\n"
+            "api_output=$(printf 'saved\\nwarning: \\001\\002\\n')\n"
+            "api_post_commit_warning\n"
+            'api_mutation_result "configured"\n',
+        )
+        result = self.shell(probe)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        document = json.loads(result.stdout)
+        self.assertTrue(document["ok"], document)
+        self.assertEqual(document["warning_code"], "operation_warning", document)
+        self.assertTrue(document["warning"], document)
+
+    # ------------------------------------------------------------- SC-2
+    def test_a_core_killed_without_a_word_is_recorded_with_a_named_cause(self) -> None:
+        # A SIGKILLed core (the OOM killer on a share too large for the unit)
+        # prints nothing, so the run read "failed, exit 137" with no detail.
+        self.ctl_profile("big", self.source_one)
+        self.ctl_routine("big", "interval", interval="60")
+        env, clock = self.ctl_world("f3oom", 710000)
+        self.install_test_core('case " $* " in *" sync "*) kill -KILL $$ ;; esac\nexit 0\n')
+        self.capture.write_text("", encoding="utf-8")
+        self.ctl_start(env)
+        self.ctl_settle(clock, 710061, turns=2)
+        runs = self.ctl_wait_runs("big", 1)
+        self.assertIn("exit=137 ", str(runs[0].get("detail")))
+        state = self.wait_for_state(
+            self.real_var / "state/profiles/big.state", lambda f: f.get("detail", "") != ""
+        )
+        self.assertIn("the sync core was killed", state["detail"])
+        self.assertIn("exit 137", state["detail"])
+        self.assertTrue(
+            "out of memory?" in state["detail"] or "out-of-memory killer" in state["detail"], state
+        )
+        run_state = self.state_fields(self.real_var / "state/run.state")
+        self.assertIn("the sync core was killed", run_state.get("detail", ""), run_state)
+        killed = self.ctl_events("core_killed", "scope=big ")
+        self.assertEqual(len(killed), 1, self.ctl_dump())
+        self.assertEqual(killed[0].get("level"), "error")
+        self.assertTrue(
+            any("|run.failed|" in line and "the sync core was killed" in line for line in self.ctl_activity()),
+            self.ctl_dump(),
+        )
+
+    def test_start_still_refuses_a_controller_pid_that_is_live_but_unverifiable(self) -> None:
+        # The repair needs proof of death. A PID file naming a live process
+        # that is not the recorded controller is not that proof.
+        started = self.shell(self.lifecycle, "start", timeout=30)
+        self.assertEqual(started.returncode, 0, started.stdout + started.stderr)
+        controller = self.f3_pid("run/controller.pid")
+        api = self.f3_pid("run/api.pid")
+        os.kill(controller, signal.SIGTERM)
+        self.f3_wait_gone(controller)
+        impostor = subprocess.Popen(
+            ["/bin/sleep", "60"],
+            preexec_fn=(
+                (lambda: (os.setgroups([]), os.setgid(self.drop_gid), os.setuid(self.drop_uid)))
+                if os.getuid() == 0 else None
+            ),
+        )
+        try:
+            pid_file = self.real_var / "run/controller.pid"
+            pid_file.write_text(f"{impostor.pid}\n", encoding="utf-8")
+            refused = self.shell(self.lifecycle, "start", timeout=30)
+            self.assertEqual(refused.returncode, 1, refused.stdout + refused.stderr)
+            self.assertIn("refusing to start from an inconsistent lifecycle state", refused.stdout)
+            self.assertIsNone(impostor.poll())
+            os.kill(api, 0)
+            self.assertEqual(self.f3_found_dead(), [])
+        finally:
+            impostor.kill()
+            impostor.wait()
+
 
 # ---------------------------------------------------------------------------
 # Wait profiling (measurement only)
@@ -22588,6 +23980,87 @@ def resolve_worker_count(parallel_test_count: int) -> int:
     return max(1, min(requested, parallel_test_count))
 
 
+#: Seconds each of the slowest tests took (full suite, 4 shard containers),
+#: and the weight of every other test. Only the balance of the CI shards
+#: depends on these: a missing or stale entry moves a test between shards, it
+#: never drops one, and test_suite_shards_partition_every_test_exactly_once
+#: keeps every entry naming a real test.
+SHARD_WEIGHTS = {
+    "BuilderTests.test_archive_and_privilege_manifest_are_never_setid": 64,
+    "BuilderTests.test_armv7_info_has_family_and_required_platform_aliases": 29,
+    "BuilderTests.test_builder_omits_and_validator_rejects_reserved_resource_manifest": 36,
+    "BuilderTests.test_builds_and_validates_every_supported_architecture": 231,
+    "BuilderTests.test_dsm_ui_notices_are_exact_and_tampering_fails_closed": 59,
+    "BuilderTests.test_info_checksum_is_exact_package_tgz_md5_and_rejects_tamper": 124,
+    "BuilderTests.test_native_appwindow_module_is_content_addressed_across_upgrades": 58,
+    "BuilderTests.test_output_is_reproducible_and_extractsize_is_uncompressed_content": 60,
+    "BuilderTests.test_validator_binds_filename_info_version_modes_types_and_binary_bytes": 54,
+    "BuilderTests.test_validator_rejects_malformed_zero_and_inexact_extractsize": 63,
+    "BuilderTests.test_validator_rejects_outer_and_inner_pax_privilege_metadata": 95,
+    "BuilderTests.test_validator_rejects_unreviewed_outer_and_inner_members": 50,
+    "BuilderTests.test_validator_requires_thirdparty_and_exact_info_schema": 40,
+    "RuntimeTests.test_a_backwards_clock_step_is_clamped_and_recorded": 34,
+    "RuntimeTests.test_a_batch_run_that_moves_real_data_is_never_flagged_stalled": 40,
+    "RuntimeTests.test_a_busy_deferral_is_one_activity_row_per_episode": 93,
+    "RuntimeTests.test_a_busy_deferral_writes_no_failed_audit_rows": 44,
+    "RuntimeTests.test_a_busy_live_process_is_never_read_as_unprovable_under_any_shell": 35,
+    "RuntimeTests.test_a_busy_refusal_writes_no_audit_failure": 20,
+    "RuntimeTests.test_a_core_that_only_makes_noise_is_flagged_stalled": 37,
+    "RuntimeTests.test_a_healthy_profile_does_not_mask_a_failing_profiles_alert": 30,
+    "RuntimeTests.test_a_package_stop_waits_for_a_slow_cooperative_cancel": 26,
+    "RuntimeTests.test_a_realtime_routine_that_keeps_deferring_paths_backs_off": 135,
+    "RuntimeTests.test_a_run_that_stops_progressing_is_flagged_stalled_and_never_killed": 48,
+    "RuntimeTests.test_a_runner_killed_by_a_package_stop_is_recorded_as_cancelled": 24,
+    "RuntimeTests.test_a_sigkilled_controller_is_recorded_once_and_its_orphan_run_is_stopped_by_start": 31,
+    "RuntimeTests.test_a_slow_max_rate_lowers_the_progress_floor": 38,
+    "RuntimeTests.test_a_stalled_run_is_reported_and_alerted_without_being_killed": 27,
+    "RuntimeTests.test_a_window_inside_a_spring_forward_gap_runs_once_after_it_and_says_so": 26,
+    "RuntimeTests.test_a_wrapping_window_runs_on_its_own_days_weekday_only": 35,
+    "RuntimeTests.test_all_security_categories_emit_real_safe_events_and_off_keeps_minimum_audit": 38,
+    "RuntimeTests.test_an_in_flight_poll_walk_is_watched_without_full_turns": 22,
+    "RuntimeTests.test_an_overlapping_deleting_pair_blocks_only_its_own_profiles": 22,
+    "RuntimeTests.test_an_unwritable_watcher_failure_record_abandons_instead_of_retrying_forever": 21,
+    "RuntimeTests.test_controller_dependency_deferral_then_success_and_retry_backoff": 21,
+    "RuntimeTests.test_controller_interval_and_realtime_polling_fallback_trigger": 31,
+    "RuntimeTests.test_controller_names_why_it_exited_and_why_a_launch_failed": 37,
+    "RuntimeTests.test_daylight_saving_never_repeats_or_skips_a_window_day": 30,
+    "RuntimeTests.test_ladder_exhaustion_escalation_honours_the_alert_cooldown": 40,
+    "RuntimeTests.test_realtime_change_stays_pending_until_a_sync_of_it_succeeds": 22,
+    "RuntimeTests.test_realtime_watch_setup_failure_backoff_is_exponential": 27,
+    "RuntimeTests.test_realtime_watch_setup_failure_gives_up_after_five": 29,
+    "RuntimeTests.test_routine_cancelled_run_does_not_consume_a_retry_attempt": 20,
+    "RuntimeTests.test_runner_enforces_saved_risk_ceilings_and_rejects_dangling_policy": 21,
+    "RuntimeTests.test_runner_records_an_operator_stop_without_alerting_or_counting_a_failure": 35,
+    "RuntimeTests.test_saved_security_policy_applies_to_direct_cli_with_recovery_exception": 31,
+    "RuntimeTests.test_stopped_service_allows_only_complete_security_policy_recovery": 27,
+}
+DEFAULT_SHARD_WEIGHT = 9
+
+
+def shard_weight(test) -> int:
+    return SHARD_WEIGHTS.get(".".join(test.id().split(".")[-2:]), DEFAULT_SHARD_WEIGHT)
+
+
+def select_shard(tests: list, shard: str) -> list:
+    """The tests of shard K of N ("K/N", 0-based), balanced by weight.
+
+    The heaviest test goes to the lightest shard, ties broken by id, so the
+    split is deterministic and every test lands in exactly one shard. A split
+    by sorted id left one bash shard twelve minutes longer than the other.
+    """
+    match = re.fullmatch(r"(\d+)/(\d+)", shard)
+    if not match or int(match.group(2)) < 1 or int(match.group(1)) >= int(match.group(2)):
+        raise SystemExit(f"SDSYNC_TEST_SHARD must be K/N with 0 <= K < N, got {shard!r}")
+    index, count = int(match.group(1)), int(match.group(2))
+    loads = [0] * count
+    assigned: list[list] = [[] for _ in range(count)]
+    for test in sorted(tests, key=lambda test: (-shard_weight(test), test.id())):
+        lightest = min(range(count), key=lambda candidate: (loads[candidate], candidate))
+        loads[lightest] += shard_weight(test)
+        assigned[lightest].append(test)
+    return sorted(assigned[index], key=lambda test: test.id())
+
+
 def run_suite_in_parallel(module=None, stream=None) -> int:
     """Run a module's tests, parallel lane first, and return an exit status."""
     stream = stream or sys.stderr
@@ -22595,6 +24068,10 @@ def run_suite_in_parallel(module=None, stream=None) -> int:
     all_tests = list(
         iter_tests(loader.loadTestsFromModule(module or sys.modules[__name__]))
     )
+    shard = os.environ.get("SDSYNC_TEST_SHARD", "").strip()
+    if shard:
+        all_tests = select_shard(all_tests, shard)
+        print(f"shard {shard}: {len(all_tests)} tests", file=stream, flush=True)
     parallel = [test for test in all_tests if runs_in_parallel(test)]
     serial = [test for test in all_tests if not runs_in_parallel(test)]
     workers = resolve_worker_count(len(parallel)) if parallel else 1

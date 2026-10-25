@@ -307,7 +307,7 @@ reconcile_stale_run_state() {
             "the package stopped; the run had not finished cancelling after ${runner_stop_grace}s" \
             || stale_write_status=$?
         if [ "$stale_write_status" -eq 0 ]; then
-            controller_activity run.failed "$stale_run_scope" failed \
+            controller_activity run.cancelled "$stale_run_scope" cancelled \
                 "Package action cancelled by a package stop; it had not finished cancelling after ${runner_stop_grace}s and was stopped" \
                 scheduler info
         else
@@ -1065,6 +1065,142 @@ record_realtime_watcher_failure_or_abandon() {
     return 0
 }
 
+# The per-user inotify watch budget, in watcher_limit. One read(2) of the
+# whole value: a byte-at-a-time read -- dash's and BusyBox's builtin read --
+# got only the first digit, because proc_dointvec answers end-of-file to any
+# read at a non-zero offset, and the check then never ran on those shells. A
+# limit that cannot be read is named in watcher_limit_cause, never skipped
+# silently: the caller logs it once and spawns, and inotifywait's own ENOSPC
+# still reaches the watch-failure ladder.
+read_inotify_watch_limit() {
+    watcher_limit=
+    watcher_limit_cause=
+    if [ ! -e "$inotify_watch_limit_path" ]; then
+        watcher_limit_cause=absent
+        return 1
+    fi
+    if [ ! -f "$inotify_watch_limit_path" ] || [ -L "$inotify_watch_limit_path" ]; then
+        watcher_limit_cause=not_a_file
+        return 1
+    fi
+    watcher_limit=$(cat "$inotify_watch_limit_path" 2>/dev/null) || {
+        watcher_limit=
+        watcher_limit_cause=unreadable
+        return 1
+    }
+    case $watcher_limit in
+        ''|*[!0-9]*|0) watcher_limit=; watcher_limit_cause=malformed; return 1 ;;
+    esac
+    [ "${#watcher_limit}" -le 9 ] || watcher_limit=999999999
+}
+
+# A condition worth one line per controller lifetime -- a reload starts the
+# count again -- rather than one per spawn attempt.
+watch_notes_seen=,
+watch_note_once() {
+    case $watch_notes_seen in *",$1,"*) return 0 ;; esac
+    watch_notes_seen=$watch_notes_seen$1,
+    controller_log_event "$2" "$3" "$4"
+}
+
+# The directory count runs as one background job at a time, bounded: find
+# stops at the first directory past the limit's 80 %, because head closes the
+# pipe, so a share far larger than the budget costs no more than one that just
+# fits. Its result is kept per profile for an hour with the source and the
+# limit it was taken against, which is what keeps a reload's respawn of every
+# watcher from re-walking every tree.
+#   0  the source fits; spawn
+#   1  it does not (watch_count_dirs is the count)
+#   2  counting; ask again on a later turn
+#   3  the count could not be taken (watch_count_failure names why)
+watch_count_pid=
+watch_count_start=
+watch_count_profile=
+watch_count_ttl=3600
+
+realtime_watch_count_ready() {
+    count_profile=$1
+    count_source=$2
+    count_limit=$3
+    count_max=$((count_limit / 10 * 8))
+    count_cache=$runtime_root/watch-$count_profile.dircount
+    watch_count_dirs=
+    watch_count_failure=
+    if [ -n "$watch_count_pid" ] && [ "$watch_count_profile" = "$count_profile" ]; then
+        if own_job_is_running "$watch_count_pid" "$watch_count_start" "$$"; then
+            return 2
+        fi
+        reap_own_job "$watch_count_pid" "$watch_count_start"
+        watch_count_pid=
+        watch_count_start=
+        watch_count_profile=
+        # The job ended without a result: find could not run, or the cache
+        # could not be written. Spawn unchecked rather than count again on
+        # every turn; the next spawn attempt counts afresh.
+        if [ ! -f "$count_cache" ] || [ -L "$count_cache" ]; then
+            watch_count_failure=count_failed
+            return 3
+        fi
+    fi
+    if [ -L "$count_cache" ]; then
+        watch_count_failure=cache_unsafe
+        return 3
+    fi
+    if [ -f "$count_cache" ]; then
+        count_cached_epoch=
+        count_cached_dirs=
+        count_cached_limit=
+        count_cached_source=
+        {
+            IFS=' ' read -r count_cached_epoch count_cached_dirs count_cached_limit || :
+            IFS= read -r count_cached_source || :
+        } < "$count_cache"
+        case $count_cached_epoch:$count_cached_dirs:$count_cached_limit in
+            *[!0-9:]*|:*|*::*|*:) ;;
+            *)
+                if [ "$count_cached_source" = "$count_source" ] && [ "$count_cached_limit" = "$count_limit" ] \
+                    && [ "$count_cached_epoch" -le "$routine_now" ] \
+                    && [ $((routine_now - count_cached_epoch)) -lt "$watch_count_ttl" ]; then
+                    watch_count_dirs=$count_cached_dirs
+                    [ "$count_cached_dirs" -gt "$count_max" ] && return 1
+                    return 0
+                fi
+                ;;
+        esac
+    fi
+    # Another routine's count is in flight; this one counts after it.
+    [ -z "$watch_count_pid" ] || return 2
+    rm -f "$count_cache" "$count_cache.tmp" || {
+        watch_count_failure=cache_unwritable
+        return 3
+    }
+    (
+        trap - USR2 ALRM
+        count_dirs=$(find "$count_source" -type d 2>/dev/null | head -n $((count_max + 1)) | wc -l) || exit 1
+        count_dirs=$(printf '%s' "$count_dirs" | tr -d ' ')
+        case $count_dirs in ''|*[!0-9]*) exit 1 ;; esac
+        { printf '%s %s %s\n%s\n' "$routine_now" "$count_dirs" "$count_limit" "$count_source" \
+            > "$count_cache.tmp" && finish_private_file "$count_cache.tmp" \
+            && mv -f "$count_cache.tmp" "$count_cache"; } || { rm -f "$count_cache.tmp"; exit 1; }
+    ) </dev/null >/dev/null 2>&1 &
+    watch_count_pid=$!
+    own_job_start "$watch_count_pid" "$$"
+    watch_count_start=$own_job_start_value
+    watch_count_profile=$count_profile
+    return 2
+}
+
+stop_watch_count_job() {
+    [ -n "$watch_count_pid" ] || return 0
+    if own_job_is_running "$watch_count_pid" "$watch_count_start" "$$"; then
+        kill -TERM "$watch_count_pid" 2>/dev/null || true
+    fi
+    reap_own_job "$watch_count_pid" "$watch_count_start"
+    watch_count_pid=
+    watch_count_start=
+    watch_count_profile=
+}
+
 ensure_realtime_watcher() {
     watcher_profile=$1
     watcher_source=$2
@@ -1163,44 +1299,72 @@ ensure_realtime_watcher() {
             if [ "$watcher_cooldown" -ge 3600 ]; then watcher_cooldown=3600; break; fi
             watcher_cooldown_index=$((watcher_cooldown_index + 1))
         done
-        watcher_now=$(epoch_now)
+        watcher_now=${routine_now:-}
+        case $watcher_now in ''|*[!0-9]*) watcher_now=$(epoch_now) || watcher_now= ;; esac
         case $watcher_now in ''|*[!0-9]*) return 0 ;; esac
         if [ "$watcher_failed_epoch" -le "$watcher_now" ] \
             && [ $((watcher_now - watcher_failed_epoch)) -lt "$watcher_cooldown" ]; then
             return 0
         fi
-        # The cooldown has expired, so retry -- but keep the attempt count,
-        # because it is what the give-up threshold counts. Removing the record
-        # here is what would make the ladder never advance past its first rung.
-        # Stamping this attempt's epoch is what stops a spawn that fails again
-        # from being retried on the very next five-second turn.
+        # The cooldown has expired, so retry: stamped below, once the
+        # watch-limit gate lets the spawn go ahead.
+        watcher_retry_due=true
+    else
+        watcher_retry_due=false
+    fi
+    # Refuse before spawning when the source cannot fit in the shared watch
+    # budget. inotifywait would otherwise walk the whole tree, fail with
+    # ENOSPC, and be retried on every cooldown. The 80 % margin leaves room
+    # for the watches DSM's own services hold against the same per-user limit.
+    # The directory count runs in the background (realtime_watch_count_ready)
+    # and is kept for an hour, so neither a spawn nor a dashboard Save -- which
+    # stops and respawns every watcher -- walks the tree inside this turn.
+    watch_limit_status=0
+    read_inotify_watch_limit || watch_limit_status=$?
+    if [ "$watch_limit_status" -eq 0 ]; then
+        watch_count_status=0
+        realtime_watch_count_ready "$watcher_profile" "$watcher_source" "$watcher_limit" \
+            || watch_count_status=$?
+        case $watch_count_status in
+            0) ;;
+            1)
+                # The count stops one past the budget, so dirs reads "more
+                # than budget", not the size of the tree.
+                watch_note_once "$watcher_profile:limit:$watch_count_dirs:$watcher_limit" warn routine_watch_limit \
+                    "profile=$watcher_profile dirs=$watch_count_dirs budget=$((watcher_limit / 10 * 8)) limit=$watcher_limit"
+                realtime_watcher_reason=watch_limit
+                record_realtime_watcher_failure_or_abandon "$watcher_profile" watch_limit || true
+                return 0
+                ;;
+            2)
+                # Counting: the source is polled, which it is either way, and
+                # the watcher is spawned on the turn the count lands. A retry
+                # keeps the reason its failure history gave it.
+                [ "$watcher_retry_due" = true ] || realtime_watcher_reason=ok
+                return 0
+                ;;
+            *)
+                watch_note_once "$watcher_profile:count:$watch_count_failure" warn routine_watch_limit_unchecked \
+                    "profile=$watcher_profile cause=$watch_count_failure"
+                ;;
+        esac
+    else
+        watch_note_once "$watcher_profile:limit_unreadable:$watcher_limit_cause" warn routine_watch_limit_unchecked \
+            "profile=$watcher_profile cause=$watcher_limit_cause path=$inotify_watch_limit_path"
+    fi
+    if [ "$watcher_retry_due" = true ]; then
+        # A retry keeps the attempt count, because it is what the give-up
+        # threshold counts; removing the record here is what would make the
+        # ladder never advance past its first rung. Stamping this attempt's
+        # epoch is what stops a spawn that fails again from being retried on
+        # the very next five-second turn. It is stamped only now, past the
+        # watch-limit gate: a count still in flight is not an attempt.
         if ! { printf '%s %s %s\n' "$watcher_now" "$watcher_failed_consecutive" "$watcher_failed_reason" \
             > "$watcher_failure_path" && finish_private_file "$watcher_failure_path"; }; then
             realtime_watcher_failure_consecutive=$watcher_failed_consecutive
             controller_log_event error routine_watch_ladder_unwritable \
                 "profile=$watcher_profile path=$watcher_failure_path phase=retry"
             abandon_realtime_watcher "$watcher_profile" "consecutive=$watcher_failed_consecutive reason=ladder_unwritable"
-            return 0
-        fi
-    fi
-    # Refuse before spawning when the source cannot fit in the shared watch
-    # budget. inotifywait would otherwise walk the whole tree, fail with
-    # ENOSPC, and be retried on every cooldown. The 80 % margin leaves room
-    # for the watches DSM's own services hold against the same per-user limit.
-    watcher_limit=
-    if [ -f "$inotify_watch_limit_path" ] && [ ! -L "$inotify_watch_limit_path" ]; then
-        IFS= read -r watcher_limit < "$inotify_watch_limit_path" || watcher_limit=
-        case ${watcher_limit:-} in ''|*[!0-9]*|0) watcher_limit= ;; esac
-    fi
-    if [ -n "$watcher_limit" ]; then
-        watcher_directory_count=$(find "$watcher_source" -type d 2>/dev/null | wc -l | tr -d ' ')
-        case ${watcher_directory_count:-} in ''|*[!0-9]*) watcher_directory_count= ;; esac
-        if [ -n "$watcher_directory_count" ] \
-            && [ "$watcher_directory_count" -gt $((watcher_limit / 10 * 8)) ]; then
-            controller_log_event warn routine_watch_limit \
-                "profile=$watcher_profile dirs=$watcher_directory_count limit=$watcher_limit"
-            realtime_watcher_reason=watch_limit
-            record_realtime_watcher_failure_or_abandon "$watcher_profile" watch_limit || true
             return 0
         fi
     fi
@@ -1395,21 +1559,31 @@ fingerprint_reading() {
     fingerprint_sorted=$fingerprint_temp_dir/sorted
     fingerprint_checksum=$fingerprint_temp_dir/checksum
     fingerprint_find_pid=
+    fingerprint_find_start=
+    fingerprint_self_pid=
+    IFS=' ' read -r fingerprint_self_pid _fingerprint_self_rest < /proc/self/stat || fingerprint_self_pid=
     fingerprint_cleanup() {
         rm -f "$fingerprint_metadata" "$fingerprint_stderr" \
             "$fingerprint_sorted" "$fingerprint_checksum" 2>/dev/null || true
         rmdir "$fingerprint_temp_dir" 2>/dev/null || true
     }
     fingerprint_interrupted() {
-        [ -z "$fingerprint_find_pid" ] || kill -TERM "$fingerprint_find_pid" 2>/dev/null || true
+        if [ -n "$fingerprint_find_pid" ] && own_job_is_running "$fingerprint_find_pid" \
+            "$fingerprint_find_start" "$fingerprint_self_pid"; then
+            kill -TERM "$fingerprint_find_pid" 2>/dev/null || true
+        fi
         exit 143
     }
     trap fingerprint_cleanup 0
     trap fingerprint_interrupted HUP INT TERM
 
-    # One stat for the whole batch instead of one per file. The metadata is
-    # byte-identical to the former per-file loop, so an upgrade keeps the
-    # existing baseline instead of dispatching once on every realtime routine.
+    # One stat for the whole batch instead of one per file. Files are read as
+    # name, size and mtime; directories as their name alone (v3). A files-only
+    # reading (v2) could not see an empty directory created, removed or
+    # renamed, and the core does create empty directories, so such a change
+    # was never synced until some file changed too. A directory's mtime and
+    # ctime stay out: they move with every entry added or removed, which the
+    # file entries already record, and add nothing but noise.
     # The prune list is the profile default exclude set: the walk used to spend
     # its forks on DSM thumbnail trees no sync can copy, and to fail outright
     # the moment one of them was mode 0000.
@@ -1433,11 +1607,15 @@ fingerprint_reading() {
         # every poll fail as an unreadable tree.
         find "$fingerprint_source" \
             \( -name '@eaDir' -o -name '#recycle' -o -name '#snapshot' -o -name '@tmp' \) -prune -o \
-            -type f -exec stat -c '%n|%s|%Y' {} "${fingerprint_exec_terminator:-+}" \
+            -type f -exec stat -c '%n|%s|%Y' {} "${fingerprint_exec_terminator:-+}" -o \
+            -type d -exec stat -c '%n|d' {} "${fingerprint_exec_terminator:-+}" \
             > "$fingerprint_metadata" 2> "$fingerprint_stderr" &
         fingerprint_find_pid=$!
+        own_job_start "$fingerprint_find_pid" "$fingerprint_self_pid"
+        fingerprint_find_start=$own_job_start_value
         wait "$fingerprint_find_pid" || fingerprint_find_status=$?
         fingerprint_find_pid=
+        fingerprint_find_start=
         [ "$fingerprint_find_status" -ne 0 ] || break
         # Nothing on stderr means the walk itself could not run, which is a
         # stage failure and not a subtree this poll simply could not read.
@@ -1463,15 +1641,14 @@ fingerprint_reading() {
     # not read part of the tree, 69 for a stage failure, 73 for unsafe runtime
     # state.
     #
-    # The reading carries the format that produced it. v2 is the pruned,
-    # batched walk; without the tag, a baseline written by the former pipeline
-    # would be compared against a reading taken over a different metadata set,
-    # and every realtime routine whose source holds DSM's own excluded
-    # directories would dispatch one sync on upgrade.
+    # The reading carries the format that produced it: v3 is the pruned,
+    # batched walk of files and directories. A baseline in any other format was
+    # taken over a different metadata set, so it is not compared; the poll
+    # treats it as unknown (see the baseline check in process_routines).
     awk -v fingerprint_walk_retries="$fingerprint_retries" '
         NR != 1 || NF != 2 || $1 !~ /^[0-9]+$/ || $2 !~ /^[0-9]+$/ { exit 1 }
         { fingerprint = $1 ":" $2 }
-        END { if (NR != 1) exit 1; print fingerprint_walk_retries "|v2:" fingerprint }
+        END { if (NR != 1) exit 1; print fingerprint_walk_retries "|v3:" fingerprint }
     ' "$fingerprint_checksum"
 }
 
@@ -1514,11 +1691,42 @@ resolve_fingerprint_exec() {
 # after a successful native-event dispatch: it becomes the baseline outright,
 # because inotify, not the poll, is what observed the change that was synced.
 poll_job_pid=
+poll_job_start=
 poll_job_profile=
 poll_job_purpose=
 poll_job_result=
 poll_job_output=
 poll_job_errors=
+
+# A background job is signalled only while its PID still names it: the start
+# tick and parent read when it was spawned. dash keeps an exited child a zombie
+# until it is waited for, so its PID cannot be reused before then; bash reaps it
+# at once in its SIGCHLD handler, so between a walk's exit and its collection a
+# reload or stop could signal whatever process of this uid was given the PID
+# next. Both reads are builtins; neither forks.
+own_job_start() {
+    own_job_start_value=
+    read_process_stat_fields "$1" || return 0
+    [ -z "${2:-}" ] || [ "$process_stat_ppid" = "$2" ] || return 0
+    own_job_start_value=$process_stat_start
+}
+
+own_job_is_running() {
+    [ -n "${2:-}" ] && [ -n "${3:-}" ] || return 1
+    read_process_stat_fields "$1" || return 1
+    case $process_stat_state in Z|X|x) return 1 ;; esac
+    [ "$process_stat_start" = "$2" ] && [ "$process_stat_ppid" = "$3" ]
+}
+
+# Wait for a job that has ended, unless its PID already names another
+# process: bash may have reaped the job and handed the PID to a new child of
+# this shell, and a wait on that one would block until it exits.
+reap_own_job() {
+    if read_process_stat_fields "$1" && [ "$process_stat_start" != "${2:-}" ]; then
+        return 0
+    fi
+    reap_direct_child_interruption_safe "$1"
+}
 
 start_poll_job() {
     start_poll_profile=$1
@@ -1540,6 +1748,8 @@ start_poll_job() {
             && mv -f "$poll_job_result.tmp" "$poll_job_result"
     ) &
     poll_job_pid=$!
+    own_job_start "$poll_job_pid" "$$"
+    poll_job_start=$own_job_start_value
     poll_job_profile=$start_poll_profile
     poll_job_purpose=$start_poll_purpose
 }
@@ -1548,6 +1758,7 @@ clear_poll_job() {
     rm -f "$poll_job_result" "$poll_job_output" "${poll_job_errors:-}" "$poll_job_result.tmp" 2>/dev/null \
         || controller_log_event warn poll_job_cleanup_failed "profile=$poll_job_profile"
     poll_job_pid=
+    poll_job_start=
     poll_job_profile=
     poll_job_purpose=
 }
@@ -1561,7 +1772,7 @@ collect_poll_job() {
         read_process_stat_fields "$poll_job_pid" && collect_poll_state=$process_stat_state
         case $collect_poll_state in ''|Z|X|x) ;; *) return 1 ;; esac
     fi
-    reap_direct_child_interruption_safe "$poll_job_pid"
+    reap_own_job "$poll_job_pid" "$poll_job_start"
     collected_poll_status=69
     collected_poll_output=
     collected_poll_errors=
@@ -1586,8 +1797,10 @@ collect_poll_job() {
 
 stop_poll_job() {
     [ -n "$poll_job_pid" ] || return 0
-    kill -TERM "$poll_job_pid" 2>/dev/null || true
-    reap_direct_child_interruption_safe "$poll_job_pid"
+    if own_job_is_running "$poll_job_pid" "$poll_job_start" "$$"; then
+        kill -TERM "$poll_job_pid" 2>/dev/null || true
+    fi
+    reap_own_job "$poll_job_pid" "$poll_job_start"
     clear_poll_job
 }
 
@@ -1598,10 +1811,10 @@ stop_poll_job() {
 # marker, and neither is accepted here.
 valid_source_fingerprint() {
     case ${1:-} in
-        v2:*) ;;
+        v3:*) ;;
         *) return 1 ;;
     esac
-    valid_fingerprint_body=${1#v2:}
+    valid_fingerprint_body=${1#v3:}
     case $valid_fingerprint_body in
         ''|*[!0-9:]*) return 1 ;;
     esac
@@ -1664,7 +1877,17 @@ state_write_failures=,
 # Sets now. A clock that cannot be read for a turn keeps the last good reading
 # rather than ending the controller, and the gap is logged once per episode.
 controller_last_now=0
+# Whole seconds since boot, from one builtin read of /proc/uptime.
+read_uptime_seconds() {
+    uptime_seconds=
+    IFS=' ' read -r uptime_seconds _uptime_idle 2>/dev/null < /proc/uptime || return 1
+    uptime_seconds=${uptime_seconds%%.*}
+    case $uptime_seconds in ''|*[!0-9]*) uptime_seconds=; return 1 ;; esac
+}
+
 controller_now() {
+    controller_now_uptime=
+    read_uptime_seconds && controller_now_uptime=$uptime_seconds
     controller_now_value=$(epoch_now) || controller_now_value=
     case $controller_now_value in
         ''|*[!0-9]*)
@@ -2289,10 +2512,12 @@ start_runner_wait_guard() {
         runner_guard_sleep_start=
         runner_guard_sleep_boot=
         runner_guard_shutdown=false
+        # Latch only, as the controller's own handlers do: the guard's loop
+        # checks the controller's identity every second, and a handler that
+        # ran identity checks of its own would interleave with it.
         request_runner_guard_shutdown() {
             child_wait_interrupt_epoch=$((child_wait_interrupt_epoch + 1))
             runner_guard_shutdown=true
-            stop_runner_guard_sleep
         }
         runner_guard_stop_requested() {
             runner_guard_child_stop_status=0
@@ -2345,7 +2570,12 @@ start_runner_wait_guard() {
                 stop_runner_guard_sleep
                 exit 0
             fi
-            wait "$runner_guard_sleep_pid" || exit 0
+            if ! wait "$runner_guard_sleep_pid"; then
+                # Interrupted by the shutdown latch, or the sleep was stopped:
+                # stop it if it still runs, collect it, and end.
+                stop_runner_guard_sleep
+                exit 0
+            fi
             runner_guard_sleep_pid=
             runner_guard_sleep_start=
             runner_guard_sleep_boot=
@@ -2724,6 +2954,7 @@ wait_for_runner() {
         # again after the loop.
         if [ "$wait_interrupted" = true ]; then
             previous_wait_status=$current_wait_status
+            act_on_latched_signals
             check_stalled_run
             continue
         fi
@@ -2748,6 +2979,7 @@ wait_for_control_consumer() {
         set -e
         if [ "$wait_interrupted" = true ]; then
             previous_control_wait_status=$current_control_wait_status
+            act_on_latched_signals
             continue
         fi
         if [ "$current_control_wait_status" -eq 127 ] && [ -n "$previous_control_wait_status" ]; then
@@ -2968,6 +3200,8 @@ load_routine_profile_runtime() {
 # controller lifetime -- a reload starts the count again, so a fix that does
 # not take is reported again -- in controller.log and in Activity.
 routine_skip_seen=,
+# Daily routines whose clock could not be read, logged once per episode.
+routine_clock_episodes=,
 routine_skip() {
     routine_skip_key=$1:$2
     case $routine_skip_seen in *",$routine_skip_key,"*) return 0 ;; esac
@@ -2984,6 +3218,7 @@ routine_skip() {
 
 process_routines() {
     routine_now=$1
+    poll_due_seen=
     flush_routine_outcome || return 0
     # A walk whose routine was removed, disabled or moved off realtime has no
     # collector left; without this it would hold the single walk slot forever.
@@ -3002,6 +3237,10 @@ process_routines() {
         fi
         routine_profile=${routine_config##*/}; routine_profile=${routine_profile%.conf}
         case $routine_profile in ''|*[!A-Za-z0-9_-]*) controller_log_event warn routine_name_rejected; continue ;; esac
+        # A poll turn (run_poll_turn) evaluates only the routines it names.
+        if [ -n "$routine_turn_filter" ]; then
+            case " $routine_turn_filter " in *" $routine_profile "*) ;; *) continue ;; esac
+        fi
         profile_exists "$routine_profile" || { routine_skip "$routine_profile" profile_missing; continue; }
         load_routine_config_runtime "$routine_config"
         case $routine_enabled:$routine_delete:$routine_retry_exponential in
@@ -3119,6 +3358,25 @@ process_routines() {
             controller_log_event warn routine_interrupted "profile=$routine_profile" scheduler
         fi
         due=false
+        # A daily routine's window is evaluated once, from this turn's
+        # instant, and the gate, the due check and the day the dispatch
+        # records all read that one evaluation (routine_window_state). Three
+        # separate clock reads let a run that straddled the window's last
+        # minute record today and skip tonight.
+        routine_window_status=0
+        rw_open=true
+        if [ "$routine_mode" = daily ]; then
+            routine_window_state "$routine_weekdays" "$routine_start" "$routine_end" \
+                "$routine_now" "$routine_last_day_value" || routine_window_status=$?
+        fi
+        if [ "$routine_window_status" -eq 0 ]; then
+            case $routine_clock_episodes in
+                *",$routine_profile,"*)
+                    routine_clock_episodes=${routine_clock_episodes%%",$routine_profile,"*},${routine_clock_episodes#*",$routine_profile,"}
+                    controller_log_event info routine_clock_recovered "profile=$routine_profile"
+                    ;;
+            esac
+        fi
         if [ "$routine_delete_bound" = true ]; then
             # The routine's own deletion bound is weaker than its profile's, so
             # it can never be admitted. This test used to sit above the state
@@ -3143,7 +3401,22 @@ process_routines() {
                 controller_log_event warn routine_deferred "profile=$routine_profile reason=delete_bound" scheduler
             fi
             continue
-        elif ! routine_clock_allows "$routine_mode" "$routine_weekdays" "$routine_start" "$routine_end"; then
+        elif [ "$routine_window_status" -eq 64 ]; then
+            routine_skip "$routine_profile" time_window
+            continue
+        elif [ "$routine_window_status" -ne 0 ]; then
+            # Fail closed -- never a dispatch without its window day -- and
+            # say so once per episode, not on every five-second turn.
+            case $routine_clock_episodes in
+                *",$routine_profile,"*) ;;
+                *)
+                    routine_clock_episodes=$routine_clock_episodes$routine_profile,
+                    controller_log_event error routine_clock_unavailable \
+                        "profile=$routine_profile cause=the local date and time could not be read (status $routine_window_status)"
+                    ;;
+            esac
+            continue
+        elif [ "$rw_open" != true ]; then
             # Outside the window is a daily routine's normal resting state for
             # most of the day. This used to rewrite the state and append an
             # Activity line on every five-second turn -- about 17 000 records a
@@ -3207,12 +3480,7 @@ process_routines() {
                 daily)
                     routine_backend_value=daily
                     routine_backend_reason_value=ok
-                    routine_today=$(routine_window_day "$routine_start" "$routine_end") || routine_today=
-                    if [ -z "$routine_today" ]; then
-                        controller_log_event error routine_clock_unavailable "profile=$routine_profile"
-                    elif [ "$routine_last_day_value" != "$routine_today" ]; then
-                        due=true
-                    fi
+                    [ "$rw_due" != true ] || due=true
                     ;;
                 realtime)
                     # The turn's instant can be arbitrarily old by the time this
@@ -3225,11 +3493,19 @@ process_routines() {
                     # from before the window makes an ordinary event unreadable.
                     # Re-read the clock so the comparison is contemporaneous, and
                     # only ever move it forward.
-                    routine_now_fresh=$(epoch_now)
-                    case $routine_now_fresh in
-                        ''|*[!0-9]*) ;;
-                        *) [ "$routine_now_fresh" -le "$routine_now" ] || routine_now=$routine_now_fresh ;;
-                    esac
+                    # /proc/uptime moves with the clock and is a builtin read,
+                    # so a turn that is still within the second its instant was
+                    # taken in keeps that instant instead of forking date for
+                    # every realtime routine.
+                    routine_uptime_now=
+                    read_uptime_seconds && routine_uptime_now=$uptime_seconds
+                    if [ -z "$routine_uptime_now" ] || [ "$routine_uptime_now" != "${controller_now_uptime:-}" ]; then
+                        routine_now_fresh=$(epoch_now)
+                        case $routine_now_fresh in
+                            ''|*[!0-9]*) ;;
+                            *) [ "$routine_now_fresh" -le "$routine_now" ] || routine_now=$routine_now_fresh ;;
+                        esac
+                    fi
                     # A source that is gone, replaced by a symlink, or missing
                     # from the profile used to continue here before anything was
                     # written: no state, no log line, no dashboard signal, and a
@@ -3407,6 +3683,7 @@ process_routines() {
                         routine_backend_reason_value=$routine_backend_reason_previous
                         save_routine_state "$routine_profile"
                     fi
+                    poll_due_seen="$poll_due_seen $routine_profile:$((routine_last_poll_value + routine_poll))"
                     if [ "$routine_poll_collected" = true ]; then
                         routine_poll_status=$collected_poll_status
                         routine_poll_output=$collected_poll_output
@@ -3451,24 +3728,31 @@ process_routines() {
                             routine_poll_retries_value=$((routine_poll_retries_value + routine_poll_walks))
                             [ "$routine_poll_retries_value" -le 999999999 ] || routine_poll_retries_value=999999999
                         fi
-                        if [ "$routine_fingerprint_value" = none ] \
-                            || ! valid_source_fingerprint "$routine_fingerprint_value"; then
-                            # A baseline whose format this build does not
-                            # recognise is adopted, not compared. That is what
-                            # makes the first poll after an upgrade re-baseline in
-                            # silence instead of dispatching one sync for every
-                            # realtime routine whose source holds a pruned
-                            # directory.
-                            if [ "$routine_fingerprint_value" != none ]; then
-                                controller_log_event info routine_fingerprint_rebased \
-                                    "profile=$routine_profile"
+                        # A baseline in a format this build does not take
+                        # (a files-only v2 reading from before an upgrade) was
+                        # measured over a different metadata set. Adopting it in
+                        # silence would hide whatever changed while the package
+                        # was being upgraded -- an empty directory created then
+                        # would never be synced -- so it counts as unknown: the
+                        # source is treated as changed, settles over one more
+                        # poll like any change, and syncs once.
+                        routine_baseline_known=true
+                        if [ "$routine_fingerprint_value" != none ] \
+                            && ! valid_source_fingerprint "$routine_fingerprint_value"; then
+                            routine_baseline_known=false
+                            if [ "$routine_pending_fingerprint_value" = 0 ]; then
+                                controller_log_event info routine_fingerprint_format_changed \
+                                    "profile=$routine_profile from=${routine_fingerprint_value%%:*} to=${current_fingerprint%%:*} action=one comparison sync"
                             fi
+                        fi
+                        if [ "$routine_fingerprint_value" = none ]; then
                             routine_fingerprint_value=$current_fingerprint
                             routine_pending_fingerprint_value=0
                             routine_pending_since_value=0
                             routine_state_value=scheduled
                             save_routine_state "$routine_profile"
-                        elif [ "$routine_fingerprint_value" = "$current_fingerprint" ]; then
+                        elif [ "$routine_baseline_known" = true ] \
+                            && [ "$routine_fingerprint_value" = "$current_fingerprint" ]; then
                             routine_pending_fingerprint_value=0
                             routine_pending_since_value=0
                             save_routine_state "$routine_profile"
@@ -3605,11 +3889,16 @@ process_routines() {
             deferred:busy) routine_deferral_episode=continuing ;;
             *) routine_deferral_episode=new ;;
         esac
-        # The window day this run is for (routine_window_day), recorded as
-        # last_day when it completes, whenever it completes.
+        # The window day this run is for, from the evaluation that admitted
+        # it -- never recomputed here -- recorded as last_day when it
+        # completes, whenever it completes.
         routine_dispatch_day=
         if [ "$routine_mode" = daily ]; then
-            routine_dispatch_day=$(routine_window_day "$routine_start" "$routine_end") || routine_dispatch_day=
+            routine_dispatch_day=$rw_day
+            if [ "$rw_note" = dst_gap ]; then
+                controller_log_event warn routine_window_dst_gap \
+                    "profile=$routine_profile window_day=$rw_day start=$routine_start end=$routine_end" scheduler
+            fi
         fi
         routine_state_value=running
         routine_last_attempt_value=$routine_now
@@ -3845,6 +4134,111 @@ process_routines() {
     done
 }
 
+# One admitted sleep. The admitted child is what keeps a signal from waiting
+# out the whole nap; without it, nap unadmitted rather than end the
+# controller, or spin through turns while processes cannot be created.
+controller_nap() {
+    sleep_for=$1
+    if ! launch_admitted_child sleep controller_sleep sleep "$sleep_for"; then
+        [ "$admitted_child_status" != cancelled ] || return 0
+        log_child_launch_failure controller_sleep
+        /bin/sleep 1 || :
+        return 0
+    fi
+    sleep_admission_path=$admitted_child_admission_path
+    # Close every signal-before-publication race: a handler either stops the
+    # fully published sleep tuple or leaves its latch set for this exact recheck.
+    if [ "$shutdown" = true ] || [ "$reload_requested" = true ] || \
+        [ "$queue_wake_requested" = true ]; then
+        signal_controller_sleep
+    fi
+    # The handlers only latch, so a signal that interrupts this wait ends the
+    # nap from here, and the loop collects the sleep it stopped.
+    while :; do
+        nap_wait_epoch=$child_wait_interrupt_epoch
+        set +e
+        wait "$sleep_pid" 2>/dev/null
+        set -e
+        [ "$child_wait_interrupt_epoch" != "$nap_wait_epoch" ] || break
+        act_on_latched_signals
+    done
+    retire_admission_decision "$sleep_admission_path" controller_sleep
+    sleep_pid=
+    sleep_pid_start=
+    sleep_pid_boot=
+}
+
+# The in-flight walk has neither published its result nor ended. Builtin
+# reads only, so a tick that finds it still running costs no process.
+poll_job_running() {
+    [ -n "$poll_job_pid" ] || return 1
+    [ ! -f "$poll_job_result" ] || return 1
+    own_job_is_running "$poll_job_pid" "$poll_job_start" "$$"
+}
+
+# How long the next look sleeps, at most WINDOW seconds: one second while a
+# walk is in flight (its result is collected on the look after it lands),
+# otherwise until the soonest realtime poll comes due, at least one second.
+# Sleeping a second at a time with nothing to collect or start cost a nap and
+# a clock read per second for nothing. Sets poll_nap_seconds; builtins only.
+poll_tick_nap_seconds() {
+    poll_nap_window=$1
+    if poll_job_running; then
+        poll_nap_seconds=1
+        return 0
+    fi
+    poll_nap_seconds=$poll_nap_window
+    for poll_nap_entry in $poll_due_list; do
+        poll_nap_epoch=${poll_nap_entry##*:}
+        case $poll_nap_epoch in ''|*[!0-9]*) continue ;; esac
+        poll_nap_gap=$((poll_nap_epoch - now))
+        [ "$poll_nap_gap" -ge 1 ] || poll_nap_gap=1
+        [ "$poll_nap_gap" -ge "$poll_nap_seconds" ] || poll_nap_seconds=$poll_nap_gap
+    done
+}
+
+# Realtime routines' next poll instants, profile:epoch, from their last
+# evaluation. A full turn rebuilds the list; a poll turn replaces the entries
+# of the routines it evaluated.
+poll_due_list=
+poll_due_seen=
+routine_turn_filter=
+
+# One second between full turns, while realtime polls are coming due. With
+# many realtime routines a walk is collected and another started on almost
+# every one-second look, and each look used to be a full turn that read and
+# evaluated every routine -- about half a core for forty routines on x86.
+# A poll turn evaluates only the routine whose finished walk is waiting and
+# the one whose poll is due soonest, so walks keep their cadence; everything
+# else -- native events, windows, the queue, the schedule -- keeps the full
+# turn's five-second cadence, as it does whenever no walk is in flight.
+run_poll_turn() {
+    poll_turn_now=$1
+    routine_turn_filter=
+    [ -z "$poll_job_pid" ] || routine_turn_filter=$poll_job_profile
+    poll_turn_due=
+    poll_turn_due_epoch=
+    for poll_turn_entry in $poll_due_list; do
+        poll_turn_epoch=${poll_turn_entry##*:}
+        case $poll_turn_epoch in ''|*[!0-9]*) continue ;; esac
+        [ "$poll_turn_epoch" -le "$poll_turn_now" ] || continue
+        if [ -z "$poll_turn_due_epoch" ] || [ "$poll_turn_epoch" -lt "$poll_turn_due_epoch" ]; then
+            poll_turn_due_epoch=$poll_turn_epoch
+            poll_turn_due=${poll_turn_entry%:*}
+        fi
+    done
+    [ -z "$poll_turn_due" ] || routine_turn_filter="$routine_turn_filter $poll_turn_due"
+    [ -n "$routine_turn_filter" ] || return 0
+    process_routines "$poll_turn_now"
+    poll_turn_kept=
+    for poll_turn_entry in $poll_due_list; do
+        case " $routine_turn_filter " in *" ${poll_turn_entry%:*} "*) continue ;; esac
+        poll_turn_kept="$poll_turn_kept $poll_turn_entry"
+    done
+    poll_due_list="$poll_turn_kept $poll_due_seen"
+    routine_turn_filter=
+}
+
 shutdown=false
 active_pid=
 active_pid_start=
@@ -3904,6 +4298,7 @@ cleanup_controller() {
         active_pid_boot=
     fi
     stop_poll_job || true
+    stop_watch_count_job || true
     stop_realtime_watchers 2>/dev/null || true
     write_controller_state stopped 0 0 0 2>/dev/null || true
     if [ "$controller_exit_status" -eq 0 ] && [ "$shutdown" = true ]; then
@@ -3918,25 +4313,75 @@ cleanup_controller() {
     fi
     release_private_process_lock "$controller_lock" 2>/dev/null || true
 }
+# The signal handlers only latch; act_on_latched_signals does their work from
+# the main flow. A handler runs between any two commands of whatever the
+# controller was doing -- once a second, while it waits for a child, that is an
+# exact-identity check of the runner wait guard -- and the identity helpers keep
+# their state in globals. A handler that ran its own identity checks could read
+# the interrupted check's half-set values, and leave its own behind: a TERM
+# then judged the live control consumer gone, sent it nothing, and the stop
+# waited out its whole budget while the controller went on waiting for the
+# consumer (gate3 F1). Measured on a signal storm: identity checks done in a
+# handler failed 15 times in 1500 calls under dash; with latch-only handlers,
+# 0 in 3000 under dash and BusyBox ash.
+#
+# One thing a handler still does itself, because a latch alone can be set just
+# before the main flow enters a `wait` it will not leave: it sends a direct
+# child its cooperative TERM. It proves the child with handler_child_signal,
+# which keeps every value in variables of its own and forks nothing, so it
+# shares no state with the check it interrupted. The bounded wait and the KILL
+# that follow stay in the main flow.
+handler_child_signal() {
+    handler_child_pid=$1
+    handler_child_start=$2
+    [ -n "$handler_child_pid" ] && [ -n "$handler_child_start" ] || return 0
+    handler_child_line=
+    IFS= read -r handler_child_line 2>/dev/null < "/proc/$handler_child_pid/stat" || return 0
+    handler_child_rest=${handler_child_line##*') '}
+    [ "$handler_child_rest" != "$handler_child_line" ] || return 0
+    handler_child_ifs=$IFS
+    IFS=' '
+    set -- $handler_child_rest
+    IFS=$handler_child_ifs
+    [ "$#" -ge 20 ] || return 0
+    case $1 in Z|X|x) return 0 ;; esac
+    [ "$2" = "$$" ] && [ "${20}" = "$handler_child_start" ] || return 0
+    kill -TERM "$handler_child_pid" 2>/dev/null || :
+}
 request_shutdown() {
     child_wait_interrupt_epoch=$((child_wait_interrupt_epoch + 1))
     [ "$shutdown" = false ] || return 0
     shutdown=true
     wait_interrupted=true
-    signal_controller_sleep
-    stop_work_children_bounded
+    handler_child_signal "$sleep_pid" "$sleep_pid_start"
+    handler_child_signal "$control_pid" "$control_pid_start"
+    handler_child_signal "$active_pid" "$active_pid_start"
 }
 request_reload() {
     child_wait_interrupt_epoch=$((child_wait_interrupt_epoch + 1))
     reload_requested=true
     wait_interrupted=true
-    signal_controller_sleep
+    handler_child_signal "$sleep_pid" "$sleep_pid_start"
 }
 request_queue_wake() {
     child_wait_interrupt_epoch=$((child_wait_interrupt_epoch + 1))
     queue_wake_requested=true
     wait_interrupted=true
-    signal_controller_sleep
+    handler_child_signal "$sleep_pid" "$sleep_pid_start"
+}
+# Called from the main flow after a wait a signal interrupted, and before the
+# loop waits again: a shutdown stops the work children (once, bounded, as the
+# handler used to), and any latch ends the controller's nap.
+shutdown_children_stopped=false
+act_on_latched_signals() {
+    if [ "$shutdown" = true ] && [ "$shutdown_children_stopped" = false ]; then
+        shutdown_children_stopped=true
+        stop_work_children_bounded
+    fi
+    if [ "$shutdown" = true ] || [ "$reload_requested" = true ] || \
+        [ "$queue_wake_requested" = true ]; then
+        signal_controller_sleep
+    fi
 }
 request_runner_wait_poll() {
     child_wait_interrupt_epoch=$((child_wait_interrupt_epoch + 1))
@@ -4055,7 +4500,25 @@ publish_controller_ready
 retire_pending_controller_reload
 unset SDSYNC_DSM_CONTROLLER_START_PARENT_PID SDSYNC_DSM_CONTROLLER_START_PARENT_TICKS \
     SDSYNC_DSM_CONTROLLER_START_PARENT_BOOT
+poll_ticks_left=0
 while [ "$shutdown" = false ]; do
+    # A look between full turns, at an in-flight poll walk or a poll coming
+    # due. Until the full turn's own cadence comes round nothing else is
+    # evaluated: no control queue scan, no schedule or routine files read. A
+    # signal (a reload, a queue wake) makes it a full turn at once.
+    if [ "$poll_ticks_left" -gt 0 ] && [ "$reload_requested" = false ] \
+        && [ "$queue_wake_requested" = false ]; then
+        if ! poll_job_running; then
+            controller_now
+            run_poll_turn "$now"
+            [ "$shutdown" = false ] || break
+        fi
+        poll_tick_nap_seconds "$poll_ticks_left"
+        poll_ticks_left=$((poll_ticks_left - poll_nap_seconds))
+        controller_nap "$poll_nap_seconds"
+        continue
+    fi
+    poll_ticks_left=0
     # A signal received just before this reset is already followed by an
     # immediate queue turn. Signals received during the turn remain latched so
     # the sleep handoff below cannot lose them.
@@ -4199,6 +4662,7 @@ while [ "$shutdown" = false ]; do
     [ "$shutdown" = false ] || break
     controller_now
     process_routines "$now"
+    poll_due_list=$poll_due_seen
 
     [ "$shutdown" = false ] || break
 
@@ -4231,11 +4695,28 @@ while [ "$shutdown" = false ]; do
         break
     done
     # A background poll walk is collected by the routine that started it, on a
-    # turn of its own; look again in a second rather than five.
-    [ -z "$poll_job_pid" ] || sleep_for=1
+    # turn of its own; look again in a second rather than five. Those one-second
+    # looks only ask whether the walk has ended (poll_job_tick below): with many
+    # realtime routines a walk is in flight almost all the time, and a full
+    # evaluation of every routine every second held a large share of a core.
+    poll_ticks_left=0
+    poll_ticks_wanted=false
+    [ -z "$poll_job_pid" ] || poll_ticks_wanted=true
+    for poll_turn_entry in $poll_due_list; do
+        poll_turn_epoch=${poll_turn_entry##*:}
+        case $poll_turn_epoch in ''|*[!0-9]*) continue ;; esac
+        [ "$poll_turn_epoch" -ge $((now + sleep_for)) ] || { poll_ticks_wanted=true; break; }
+    done
+    if [ "$poll_ticks_wanted" = true ] && [ "$sleep_for" -gt 1 ]; then
+        poll_ticks_window=$sleep_for
+        poll_tick_nap_seconds "$poll_ticks_window"
+        sleep_for=$poll_nap_seconds
+        poll_ticks_left=$((poll_ticks_window - sleep_for))
+    fi
     for wake_request in "$control_requests"/*.json; do
         [ -e "$wake_request" ] || [ -L "$wake_request" ] || continue
         sleep_for=1
+        poll_ticks_left=0
         break
     done
     if [ "$enabled" = true ] && [ "$next_run" -gt "$now" ]; then
@@ -4245,27 +4726,7 @@ while [ "$shutdown" = false ]; do
         fi
     fi
     [ "$sleep_for" -gt 0 ] || sleep_for=1
-    if ! launch_admitted_child sleep controller_sleep sleep "$sleep_for"; then
-        [ "$admitted_child_status" != cancelled ] || continue
-        log_child_launch_failure controller_sleep
-        # The admitted sleep is what keeps a signal from waiting out the whole
-        # nap; without it, nap unadmitted rather than end the controller, or
-        # spin through turns while processes cannot be created.
-        /bin/sleep 1 || :
-        continue
-    fi
-    sleep_admission_path=$admitted_child_admission_path
-    # Close every signal-before-publication race: a handler either stops the
-    # fully published sleep tuple or leaves its latch set for this exact recheck.
-    if [ "$shutdown" = true ] || [ "$reload_requested" = true ] || \
-        [ "$queue_wake_requested" = true ]; then
-        signal_controller_sleep
-    fi
-    reap_direct_child_interruption_safe "$sleep_pid"
-    retire_admission_decision "$sleep_admission_path" controller_sleep
-    sleep_pid=
-    sleep_pid_start=
-    sleep_pid_boot=
+    controller_nap "$sleep_for"
 done
 
 exit 0
