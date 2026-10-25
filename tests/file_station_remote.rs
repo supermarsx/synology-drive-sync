@@ -484,7 +484,7 @@ fn a_folder_without_a_real_path_is_never_descended_once_real_paths_are_reported(
         )
         .unwrap();
 
-    assert!(scanned.real_paths_reported);
+    assert_eq!(scanned.link_guard_unchecked, 0);
     assert_eq!(
         scanned.inventory.entries["opaque"]
             .mount_point_type
@@ -519,7 +519,11 @@ fn a_destination_without_real_paths_reports_that_the_link_guard_could_not_run() 
         )
         .unwrap();
 
-    assert!(!scanned.real_paths_reported);
+    assert!(
+        scanned.link_guard_unchecked >= 1,
+        "{}",
+        scanned.link_guard_unchecked
+    );
 }
 
 /// DSM volumes are case-sensitive: `Photos` and `photos` side by side are two ordinary folders,
@@ -545,7 +549,7 @@ fn sibling_folders_differing_only_in_case_are_both_walked() {
         )
         .unwrap();
 
-    assert!(scanned.real_paths_reported);
+    assert_eq!(scanned.link_guard_unchecked, 0);
     assert!(scanned.skipped.is_empty(), "{:?}", scanned.skipped);
     for folder in ["Photos", "photos"] {
         assert_eq!(
@@ -586,7 +590,10 @@ fn misreported_real_paths_mark_folders_as_links_for_the_breaker_to_catch() {
         .unwrap();
 
     assert_eq!(scanned.skipped.len(), 4, "{:?}", scanned.skipped);
-    assert!(synology_drive_sync::sync::check_link_boundaries(&scanned.inventory).is_err());
+    assert!(
+        synology_drive_sync::sync::check_link_boundaries(&scanned.inventory, &scanned.link_checks)
+            .is_err()
+    );
 }
 
 #[test]
@@ -653,8 +660,10 @@ fn a_mirror_never_deletes_through_a_folder_link() {
 // ADV-R-3: a CopyMove failure DSM reports as an envelope code defers the copy.
 // ---------------------------------------------------------------------------------------------
 
+/// G-4: the failed copy's file is uploaded instead, in the same run, and the ended task is not
+/// stopped.
 #[test]
-fn a_copy_dsm_fails_with_an_envelope_code_is_deferred_and_not_stopped() {
+fn a_copy_dsm_fails_with_an_envelope_code_is_uploaded_instead_and_not_stopped() {
     let fixture = TestDir::new("r3-copy");
     let source = fixture.child("source");
     fs::create_dir_all(source.join("new")).unwrap();
@@ -690,13 +699,21 @@ fn a_copy_dsm_fails_with_an_envelope_code_is_deferred_and_not_stopped() {
         "a task DSM reported ended is not stopped"
     );
     let document = result_document(&output);
+    assert_eq!(output.status.code(), Some(0), "{}", describe(&output));
+    assert_eq!(
+        server.file_contents("/team/copy/new/item.bin"),
+        Some(b"copy-me-on-nas".to_vec()),
+        "uploaded via the fallback: {}",
+        describe(&output)
+    );
+    assert_eq!(document["result"]["recovered"]["server_copy_fallbacks"], 1);
     assert!(
-        document["result"]["deferred"]
+        !document["result"]["deferred"]
             .as_array()
             .is_some_and(|records| records
                 .iter()
                 .any(|record| record["reason"] == "server-copy-failed")),
-        "{}",
+        "no deferral when the fallback landed: {}",
         describe(&output)
     );
 }

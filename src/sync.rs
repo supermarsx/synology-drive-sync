@@ -324,32 +324,24 @@ fn record_worker_error(first_error: &mut Option<Error>, error: Error) {
     }
 }
 
-/// Whether a remote-only path is present locally, spelled exactly as the remote spells it.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+/// Whether a remote-only path is present locally, at the spelling the plan paired it with.
+#[derive(Clone, Debug, Eq, PartialEq)]
 enum LocalPresence {
     Absent,
-    Present,
+    /// Present, with the bytes of the local spelling found. Each component is the paired one
+    /// exactly, or the one local name equal to it under Unicode normalisation.
+    Present {
+        spelling: String,
+    },
+    /// More than one local name in one folder is equal to a component under Unicode normalisation,
+    /// so which of them stands for the remote entry cannot be told.
+    Ambiguous {
+        path: String,
+    },
     /// The remote name cannot exist on this host's filesystem at all: a Windows host cannot hold
     /// `notes.` or `notes ` (Win32 strips the trailing dot or space and finds `notes` instead),
     /// nor a reserved device name or a character NTFS refuses.
     Unrepresentable,
-}
-
-/// The local spelling of a remote path, through the plan's case-only renames.
-///
-/// A remote path beneath a folder a rename pairs is spelled the NAS way (`Photos/gone.jpg`) while
-/// the file it stands for, if it is back, is spelled the local way (`photos/gone.jpg`). Asked by
-/// its remote spelling, the exact-spelling presence check could not see a file recreated there.
-fn local_spelling<'a>(plan: &SyncPlan, relative: &'a str) -> std::borrow::Cow<'a, str> {
-    // Deepest first, so the most specific rename wins.
-    for rename in &plan.renames {
-        if let Some(rest) = relative.strip_prefix(rename.from_relative.as_str())
-            && (rest.is_empty() || rest.starts_with('/'))
-        {
-            return std::borrow::Cow::Owned(format!("{}{rest}", rename.relative));
-        }
-    }
-    std::borrow::Cow::Borrowed(relative)
 }
 
 /// Re-establish the precondition that made a remote entry a deletion candidate.
@@ -362,15 +354,20 @@ fn local_spelling<'a>(plan: &SyncPlan, relative: &'a str) -> std::borrow::Cow<'a
 /// instant the scan reads that directory, and the remote copy — with every revision DSM holds of
 /// it — is then deleted while a live local file sits next to it.
 ///
-/// The lookup must be by exact spelling. Windows and macOS resolve a path case-insensitively, APFS
-/// and HFS+ normalisation-insensitively, and Win32 strips a trailing dot or space, so a plain stat
-/// of the remote spelling finds a *different* local file: the delete was kept, the kept-delete
-/// upload wrote that file's bytes under the remote spelling, reconciliation found the remote-only
-/// entry again, and every run repeated it. So a stat that succeeds is confirmed by reading each
-/// parent directory and comparing the name byte for byte; a name the host cannot represent is
-/// reported as such rather than resolved to its alias.
+/// `relative` is the deletion's recorded local spelling ([`crate::plan::DeleteAction::local_relative`]):
+/// beneath a case-renamed or a normalisation-paired folder, the folder is spelled the local way.
 ///
-/// Reported as absent only on a definite `NotFound` or a different spelling. Any other error means
+/// Each component is matched by its exact bytes or, failing that, by the single local name equal to
+/// it under Unicode normalisation: the planner pairs NFC and NFD spellings of one name, and a file
+/// recreated as `naïve.txt` decomposed beneath a paired folder is the file the remote composed
+/// `naïve.txt` stands for. The bytes found are returned, so a kept deletion uploads that file.
+/// Never by case: Windows and macOS resolve a path case-insensitively and Win32 strips a trailing
+/// dot or space, so a plain stat of the remote spelling finds a *different* local file, and its
+/// bytes were uploaded under the remote spelling on every run. So a stat is never taken as the
+/// answer; each parent directory is read and every name compared. A name the host cannot represent
+/// is reported as such rather than resolved to its alias.
+///
+/// Reported as absent only on a definite `NotFound` or no matching name. Any other error means
 /// absence was not established, and a delete may not proceed on a precondition nobody could read:
 /// the caller sees the filesystem error instead.
 fn local_presence(source_root: &std::path::Path, relative: &str) -> Result<LocalPresence> {
@@ -379,43 +376,89 @@ fn local_presence(source_root: &std::path::Path, relative: &str) -> Result<Local
     }
     let path = source_root.join(relative);
     match std::fs::symlink_metadata(&path) {
-        Ok(_) if spelled_exactly(source_root, relative)? => Ok(LocalPresence::Present),
-        Ok(_) => Ok(LocalPresence::Absent),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(LocalPresence::Absent),
-        Err(error) if error.kind() == std::io::ErrorKind::InvalidFilename => {
-            Ok(LocalPresence::Unrepresentable)
+        Ok(_) => {}
+        // No other spelling of this path is equal to it under normalisation, so a stat that finds
+        // nothing settles it without reading a directory.
+        Err(error)
+            if error.kind() == std::io::ErrorKind::NotFound
+                && has_a_single_normal_form(relative) =>
+        {
+            return Ok(LocalPresence::Absent);
         }
-        Err(source) => Err(Error::FileIo { path, source }),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) if error.kind() == std::io::ErrorKind::InvalidFilename => {
+            return Ok(LocalPresence::Unrepresentable);
+        }
+        Err(source) => return Err(Error::FileIo { path, source }),
     }
+    find_local_spelling(source_root, relative)
 }
 
-/// Whether every component of `relative` exists under `source_root` with exactly that spelling.
-fn spelled_exactly(source_root: &std::path::Path, relative: &str) -> Result<bool> {
+/// Whether no other string is equal to `relative` under Unicode normalisation.
+///
+/// True of ASCII, except the three characters a compatibility singleton composes to: KELVIN SIGN to
+/// `K`, GREEK QUESTION MARK to `;`, and GREEK VARIA to a backtick.
+fn has_a_single_normal_form(relative: &str) -> bool {
+    relative
+        .bytes()
+        .all(|byte| byte.is_ascii() && !matches!(byte, b'K' | b';' | b'`'))
+}
+
+/// Walk `relative` down from `source_root`, one directory listing per component.
+fn find_local_spelling(source_root: &std::path::Path, relative: &str) -> Result<LocalPresence> {
     let mut parent = source_root.to_path_buf();
+    let mut spelling = String::with_capacity(relative.len());
     for component in relative.split('/') {
-        let entries = std::fs::read_dir(&parent).map_err(|source| Error::FileIo {
-            path: parent.clone(),
-            source,
-        })?;
-        let mut found = false;
+        let wanted = crate::path::nfc(component);
+        let entries = match std::fs::read_dir(&parent) {
+            Ok(entries) => entries,
+            // A folder found a moment ago is gone again: absent.
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(LocalPresence::Absent);
+            }
+            Err(source) => {
+                return Err(Error::FileIo {
+                    path: parent,
+                    source,
+                });
+            }
+        };
+        let mut exact = false;
+        let mut equivalent: Vec<String> = Vec::new();
         for entry in entries {
             let entry = entry.map_err(|source| Error::FileIo {
                 path: parent.clone(),
                 source,
             })?;
-            if entry.file_name() == std::ffi::OsStr::new(component) {
-                found = true;
-                break;
+            let name = entry.file_name();
+            if name == std::ffi::OsStr::new(component) {
+                exact = true;
+            } else if let Some(text) = name.to_str()
+                && crate::path::nfc(text) == wanted
+            {
+                equivalent.push(text.to_owned());
             }
         }
-        if !found {
-            return Ok(false);
+        let found = match (exact, equivalent.len()) {
+            (true, 0) => component.to_owned(),
+            (false, 1) => equivalent.remove(0),
+            (false, 0) => return Ok(LocalPresence::Absent),
+            _ => {
+                if !spelling.is_empty() {
+                    spelling.push('/');
+                }
+                spelling.push_str(component);
+                return Ok(LocalPresence::Ambiguous { path: spelling });
+            }
+        };
+        if !spelling.is_empty() {
+            spelling.push('/');
         }
-        parent.push(component);
+        spelling.push_str(&found);
+        parent.push(&found);
     }
-    Ok(true)
+    Ok(LocalPresence::Present { spelling })
 }
-
 /// Whether this host's filesystem can hold a path spelled `relative` at all.
 #[cfg(windows)]
 fn representable_on_this_host(relative: &str) -> bool {
@@ -639,7 +682,9 @@ pub enum DeferReason {
     /// DSM's listing of the containing directory did not return every entry it counted, so absence
     /// from the listing proves nothing and no deletion there is made.
     ListingIncomplete,
-    /// DSM finished a server-side copy and reported that it failed.
+    /// DSM finished a server-side copy and reported that it failed, and the destination then held
+    /// an entry the copy did not prove, so nothing was uploaded over it. Without an entry there,
+    /// the file is uploaded instead in the same run and nothing is deferred.
     ServerCopyFailed,
     /// DSM refused the deletion.
     DeleteFailed,
@@ -717,7 +762,9 @@ impl DeferReason {
             Self::ListingIncomplete => {
                 "is in a NAS folder whose listing was incomplete; no deletion was made there"
             }
-            Self::ServerCopyFailed => "the NAS-side copy failed; uploaded next run",
+            Self::ServerCopyFailed => {
+                "the NAS-side copy failed and left an entry at the destination; the next run replaces it with an upload"
+            }
             Self::DeleteFailed => "the NAS refused the deletion; retried next run",
             Self::RemoteRefused => {
                 "the NAS refuses this name or this account's access to it; named on every run until it is renamed or its permissions change"
@@ -1246,52 +1293,159 @@ fn execute_with<O: SyncOperations>(
 /// What one upload worker settled for one file.
 enum UploadOutcome {
     Uploaded,
-    /// The reason, the detail, and DSM's refusal cause when DSM refused the path.
-    Deferred(DeferReason, String, Option<String>),
+    /// The reason, the detail, and the refusal when DSM refused the path.
+    Deferred(DeferReason, String, Option<Refusal>),
     Failed(Error),
 }
 
 /// Fails the run when DSM's per-path refusals are really one refusal of the share.
 ///
-/// A refusal of one path is that path's deferral and the run goes on. But the same cause behind
-/// most of what the run tried (an account that may not write the share, a destination volume that
-/// rejects every name of some kind) would otherwise end as hundreds of deferrals and a run that
-/// merely reads partial. Once at least three refusals share one cause and they are more than half
-/// of the folders and files the run attempted, it fails, once, naming the cause and the paths.
-#[derive(Debug, Default)]
+/// A refusal of one path is that path's deferral and the run goes on. But one class of cause
+/// behind most of what the run handles (an account that may not write the share, a destination
+/// volume that rejects every name of some kind) would otherwise end as hundreds of deferrals and a
+/// run that merely reads amber. So the run fails, naming the class, what DSM answered and a sample
+/// of the paths, once at least three refusals share one class and they are more than half of what
+/// the run considered.
+///
+/// What the run considered (`D`) is every planned folder create, server copy and upload that DSM
+/// adjudicated or may still adjudicate, plus the files the plan found already in sync. Each planned
+/// write settles exactly once, as accepted, refused, or excluded (left out for a reason of its own:
+/// a deferral covering it, a refused folder above it, a local file that changed). An exclusion
+/// takes it out of `D`, so `D` only ever shrinks and each refusal count only grows: checked after
+/// every settlement, the breaker trips mid-run exactly when the end of the run would have, and
+/// stops sending writes it already knows will be refused (G-2).
+///
+/// Writes beneath a refused folder are excluded, neither attempts nor refusals: counted as
+/// attempts they diluted a share-wide refusal of every new folder below the threshold, and counted
+/// as refusals they would convict the share from paths DSM never saw.
+///
+/// The files already in sync are in `D` because lasting refusals are retried on every run while
+/// files in sync leave the plan (BK-1): three names the volume rejects were, by the second quiet
+/// run, three refusals of three writes, and every later run failed, blaming the share. The price:
+/// on a share already in sync, a refusal that newly covers most of what changed reads amber with
+/// every path named, not red, unless it is also most of the share.
+#[derive(Debug)]
 struct RefusalBreaker {
-    attempted: usize,
-    by_cause: BTreeMap<String, Vec<String>>,
+    /// Planned writes not yet settled.
+    pending: usize,
+    /// Planned writes DSM accepted or refused.
+    adjudicated: usize,
+    /// Files the plan found already in sync.
+    in_sync: usize,
+    by_class: BTreeMap<crate::error::RefusalClass, RefusalTally>,
+}
+
+/// The refusals of one class.
+#[derive(Debug, Default)]
+struct RefusalTally {
+    refused: usize,
+    /// The first ten refused paths.
+    sample: Vec<String>,
+    /// How many refusals answered each `operation:code`.
+    codes: BTreeMap<String, usize>,
+}
+
+/// How many refused paths a share-wide failure names; the rest are in the result's deferrals.
+const REFUSAL_SAMPLE: usize = 10;
+
+/// A refusal of one path: its class, and what DSM answered (`operation:code`).
+type Refusal = (crate::error::RefusalClass, String);
+
+fn refusal_of(error: &Error) -> Option<Refusal> {
+    let class = error.refusal_class()?;
+    let code = error
+        .refusal_cause_key()
+        .unwrap_or_else(|| class.as_str().to_owned());
+    Some((class, code))
 }
 
 impl RefusalBreaker {
-    fn attempt(&mut self) {
-        self.attempted += 1;
+    fn new(pending: usize, in_sync: usize) -> Self {
+        Self {
+            pending,
+            adjudicated: 0,
+            in_sync,
+            by_class: BTreeMap::new(),
+        }
     }
 
-    fn refused(&mut self, cause: Option<String>, relative: &str) {
-        if let Some(cause) = cause {
-            self.by_cause
-                .entry(cause)
-                .or_default()
-                .push(relative.to_owned());
+    fn settle(&mut self) {
+        debug_assert!(self.pending > 0, "a planned write settled twice");
+        self.pending = self.pending.saturating_sub(1);
+    }
+
+    /// A planned write left out without DSM adjudicating it.
+    fn excluded(&mut self) {
+        self.settle();
+    }
+
+    fn accepted(&mut self) {
+        self.settle();
+        self.adjudicated += 1;
+    }
+
+    /// A planned write DSM refused. An error that is not a refusal of the path settles it as
+    /// excluded: it is that path's own problem (a local file that changed), not DSM's verdict.
+    fn settled_by(&mut self, error: &Error, relative: &str) {
+        self.settled_as(refusal_of(error), relative);
+    }
+
+    /// [`Self::settled_by`], for a refusal already reduced to its class and `operation:code`.
+    fn settled_as(&mut self, refusal: Option<Refusal>, relative: &str) {
+        let Some((class, code)) = refusal else {
+            self.excluded();
+            return;
+        };
+        self.settle();
+        self.adjudicated += 1;
+        let tally = self.by_class.entry(class).or_default();
+        tally.refused += 1;
+        if tally.sample.len() < REFUSAL_SAMPLE {
+            tally.sample.push(relative.to_owned());
         }
+        *tally.codes.entry(code).or_default() += 1;
+    }
+
+    fn considered(&self) -> usize {
+        self.adjudicated + self.pending + self.in_sync
     }
 
     fn check(&self) -> Result<()> {
-        for (cause, paths) in &self.by_cause {
-            if paths.len() >= 3 && paths.len() * 2 > self.attempted {
-                return Err(Error::Message(format!(
-                    "the NAS refused {} of the {} folders and files this run wrote, all for one \
-                     cause ({cause}), so the share or the account rather than these paths is the \
-                     likely problem: {}",
-                    paths.len(),
-                    self.attempted,
-                    paths.join(", ")
-                )));
+        let considered = self.considered();
+        for (class, tally) in &self.by_class {
+            if tally.refused >= 3 && tally.refused * 2 > considered {
+                return Err(Error::RemoteRefusalsShareWide {
+                    class: *class,
+                    refused: tally.refused,
+                    considered,
+                    in_sync: self.in_sync,
+                    not_attempted: self.pending,
+                    codes: tally
+                        .codes
+                        .iter()
+                        .map(|(code, count)| (code.clone(), *count))
+                        .collect(),
+                    sample: tally.sample.clone(),
+                    more: tally.refused - tally.sample.len(),
+                });
             }
         }
         Ok(())
+    }
+}
+
+/// Settle, as excluded, every still-open planned write that a deferral now covers.
+fn exclude_covered<'a>(
+    breaker: &mut RefusalBreaker,
+    open: &mut [bool],
+    relatives: impl Iterator<Item = &'a str>,
+    deferrals: &DeferralIndex,
+) {
+    for (open, relative) in open.iter_mut().zip(relatives) {
+        if *open && deferrals.covering(relative).is_some() {
+            *open = false;
+            breaker.excluded();
+        }
     }
 }
 
@@ -1381,15 +1535,44 @@ fn execute_with_observer<O: SyncOperations>(
             remote_path: action.remote_path.clone(),
         });
     }
-    let mut breaker = RefusalBreaker::default();
-    for action in &plan.creates {
+    // Every planned write is counted once, as the breaker settles it. One a deferral already
+    // covers (a local preflight, a kept type-conflict deletion) was never going to be written.
+    let open_creates: Vec<bool> = plan
+        .creates
+        .iter()
+        .map(|action| deferrals.covering(&action.relative).is_none())
+        .collect();
+    let mut open_copies: Vec<bool> = plan
+        .copies
+        .iter()
+        .map(|action| deferrals.covering(&action.to_relative).is_none())
+        .collect();
+    let mut open_uploads: Vec<bool> = plan
+        .uploads
+        .iter()
+        .map(|action| deferrals.covering(&action.local.relative).is_none())
+        .collect();
+    let mut breaker = RefusalBreaker::new(
+        [&open_creates, &open_copies, &open_uploads]
+            .iter()
+            .map(|open| open.iter().filter(|open| **open).count())
+            .sum(),
+        plan.unchanged_files,
+    );
+    for (action, open) in plan.creates.iter().zip(&open_creates) {
         cancellation.check()?;
-        if deferrals.covering(&action.relative).is_some() {
+        if !open {
             continue;
         }
-        breaker.attempt();
+        // Beneath a folder DSM refused a moment ago.
+        if deferrals.covering(&action.relative).is_some() {
+            breaker.excluded();
+            breaker.check()?;
+            continue;
+        }
         match client.create_folder(&action.remote_path) {
             Ok(()) => {
+                breaker.accepted();
                 completed.created += 1;
                 report(ExecutionEvent::DirectoryCreated {
                     remote_path: action.remote_path.clone(),
@@ -1399,7 +1582,7 @@ fn execute_with_observer<O: SyncOperations>(
             // subtree is covered by the deferral and left out; every other folder and upload
             // proceeds. It used to fail the run before a single upload.
             Err(error @ Error::RemoteRefused { .. }) => {
-                breaker.refused(error.refusal_cause_key(), &action.relative);
+                breaker.settled_by(&error, &action.relative);
                 completed.defer(
                     &mut deferrals,
                     &action.relative,
@@ -1407,16 +1590,35 @@ fn execute_with_observer<O: SyncOperations>(
                     error.to_string(),
                     &mut report,
                 );
+                breaker.check()?;
             }
             Err(error) => return Err(error),
         }
     }
+    // Everything beneath a refused folder is covered now, and left out before any copy or upload is
+    // sent: a refusal of every new folder trips here, with nothing transferred.
+    exclude_covered(
+        &mut breaker,
+        &mut open_copies,
+        plan.copies.iter().map(|action| action.to_relative.as_str()),
+        &deferrals,
+    );
+    exclude_covered(
+        &mut breaker,
+        &mut open_uploads,
+        plan.uploads
+            .iter()
+            .map(|action| action.local.relative.as_str()),
+        &deferrals,
+    );
     breaker.check()?;
 
     let copies = plan
         .copies
         .iter()
-        .filter(|action| deferrals.covering(&action.to_relative).is_none())
+        .zip(&open_copies)
+        .filter(|(_, open)| **open)
+        .map(|(action, _)| action)
         .collect::<Vec<_>>();
     let copy_source_checks = copies
         .iter()
@@ -1441,6 +1643,7 @@ fn execute_with_observer<O: SyncOperations>(
     for ((action, check), verdict) in copies.iter().zip(&copy_source_checks).zip(verdicts) {
         cancellation.check()?;
         if verdict == SnapshotVerdict::Changed {
+            breaker.excluded();
             completed.defer(
                 &mut deferrals,
                 &action.to_relative,
@@ -1448,14 +1651,18 @@ fn execute_with_observer<O: SyncOperations>(
                 remote_changed_detail(&action.from_remote_path),
                 &mut report,
             );
+            breaker.check()?;
             continue;
         }
         if let Err(error) = client.preflight_upload_source(&action.local, &cancellation) {
+            breaker.excluded();
             completed.defer_local(&mut deferrals, &action.to_relative, error, &mut report)?;
+            breaker.check()?;
             continue;
         }
         match verify_live_snapshot(client, check, &cancellation) {
             Err(Error::RemoteSnapshotChanged(_)) => {
+                breaker.excluded();
                 completed.defer(
                     &mut deferrals,
                     &action.to_relative,
@@ -1463,12 +1670,14 @@ fn execute_with_observer<O: SyncOperations>(
                     remote_changed_detail(&action.from_remote_path),
                     &mut report,
                 );
+                breaker.check()?;
                 continue;
             }
             result => result?,
         }
         match client.copy_file_verified(root, action, &cancellation) {
             Ok(()) => {
+                breaker.accepted();
                 completed.copied += 1;
                 copied.push(*action);
                 cancellation.tick();
@@ -1489,15 +1698,39 @@ fn execute_with_observer<O: SyncOperations>(
                     )?;
                 }
             }
-            Err(Error::ServerCopyNotStarted) => {
+            // A copy that never started, or one DSM says ended in failure, is uploaded instead, in
+            // this run. `ServerCopyFailed` is only ever built from DSM's report that the task
+            // ended (every other outcome of the status poll stops the task and fails the run), so
+            // no copy can still be writing here; and the upload happens only while the
+            // destination is still absent. Deferred instead, a copy that failed the same way every
+            // run was partial forever (G-4).
+            Err(copy_error @ (Error::ServerCopyNotStarted | Error::ServerCopyFailed { .. })) => {
                 if !upload_precondition_holds(client, &action.to_remote_path, None)? {
+                    breaker.excluded();
+                    let (reason, detail) = match &copy_error {
+                        // The failed copy left something behind, or someone wrote there since.
+                        // Now that the destination holds an entry, the next run plans an upload
+                        // over it rather than this copy, so this does not repeat.
+                        Error::ServerCopyFailed { .. } => (
+                            DeferReason::ServerCopyFailed,
+                            format!(
+                                "{copy_error}; the destination now holds an entry, which the \
+                                 next run replaces with an upload"
+                            ),
+                        ),
+                        _ => (
+                            DeferReason::RemoteChanged,
+                            remote_changed_detail(&action.to_remote_path),
+                        ),
+                    };
                     completed.defer(
                         &mut deferrals,
                         &action.to_relative,
-                        DeferReason::RemoteChanged,
-                        remote_changed_detail(&action.to_remote_path),
+                        reason,
+                        detail,
                         &mut report,
                     );
+                    breaker.check()?;
                     continue;
                 }
                 // Observed like any other upload. A DSM without `CopyMove` v3, or one that rejects
@@ -1511,14 +1744,20 @@ fn execute_with_observer<O: SyncOperations>(
                     observer_factory(&action.local),
                     &cancellation,
                 ) {
+                    // A refusal of the fallback is a refusal like any other upload's, and counts
+                    // towards the share-wide verdict; anything that is not about this path (a
+                    // full volume, 415/416) fails the run here.
+                    breaker.settled_by(&error, &action.to_relative);
                     completed.defer_local(
                         &mut deferrals,
                         &action.to_relative,
                         error,
                         &mut report,
                     )?;
+                    breaker.check()?;
                     continue;
                 }
+                breaker.accepted();
                 completed.uploaded += 1;
                 completed.uploaded_bytes = completed
                     .uploaded_bytes
@@ -1530,15 +1769,6 @@ fn execute_with_observer<O: SyncOperations>(
                     relative: action.local.relative.clone(),
                     bytes: action.expected_size,
                 });
-            }
-            Err(error @ Error::ServerCopyFailed { .. }) => {
-                completed.defer(
-                    &mut deferrals,
-                    &action.to_relative,
-                    DeferReason::ServerCopyFailed,
-                    error.to_string(),
-                    &mut report,
-                );
             }
             Err(error) => return Err(error),
         }
@@ -1563,15 +1793,22 @@ fn execute_with_observer<O: SyncOperations>(
         verify_live_snapshot(client, check, &cancellation)?;
     }
 
+    exclude_covered(
+        &mut breaker,
+        &mut open_uploads,
+        plan.uploads
+            .iter()
+            .map(|action| action.local.relative.as_str()),
+        &deferrals,
+    );
+    breaker.check()?;
     let uploads = plan
         .uploads
         .iter()
-        .filter(|action| deferrals.covering(&action.local.relative).is_none())
-        .cloned()
+        .zip(&open_uploads)
+        .filter(|(_, open)| **open)
+        .map(|(action, _)| action.clone())
         .collect::<VecDeque<_>>();
-    for _ in &uploads {
-        breaker.attempt();
-    }
     if !uploads.is_empty() {
         let worker_count = options.jobs.clamp(1, 16).min(uploads.len());
         let queue = Arc::new(Mutex::new(uploads));
@@ -1654,7 +1891,7 @@ fn execute_with_observer<O: SyncOperations>(
                                         Some(reason) => UploadOutcome::Deferred(
                                             reason,
                                             error.to_string(),
-                                            error.refusal_cause_key(),
+                                            refusal_of(&error),
                                         ),
                                         None => UploadOutcome::Failed(error),
                                     },
@@ -1676,6 +1913,7 @@ fn execute_with_observer<O: SyncOperations>(
             for (relative, size, outcome) in receiver {
                 match outcome {
                     UploadOutcome::Uploaded => {
+                        breaker.accepted();
                         completed.uploaded += 1;
                         completed.uploaded_bytes = completed.uploaded_bytes.saturating_add(size);
                         // Counted on completion, in the collector, rather than in each worker:
@@ -1687,9 +1925,15 @@ fn execute_with_observer<O: SyncOperations>(
                             bytes: size,
                         });
                     }
-                    UploadOutcome::Deferred(reason, detail, cause) => {
-                        breaker.refused(cause, &relative);
+                    UploadOutcome::Deferred(reason, detail, refusal) => {
+                        breaker.settled_as(refusal, &relative);
                         completed.defer(&mut deferrals, &relative, reason, detail, &mut report);
+                        // Known now: stop sending writes the share will refuse. Interrupted peers
+                        // answer `Cancelled`, which never replaces this as the run's error.
+                        if let Err(error) = breaker.check() {
+                            stop.store(true, Ordering::Release);
+                            record_worker_error(&mut first_error, error);
+                        }
                     }
                     UploadOutcome::Failed(error) => record_worker_error(&mut first_error, error),
                 }
@@ -1700,6 +1944,9 @@ fn execute_with_observer<O: SyncOperations>(
             breaker.check()
         })?;
     }
+    // Once more, whatever the run held: a run of only folders or only copies is judged too, and
+    // always before a single mirror deletion.
+    breaker.check()?;
 
     cancellation.check()?;
 
@@ -1793,8 +2040,9 @@ fn execute_with_observer<O: SyncOperations>(
     // deepest-first, so every descendant is decided before the directory that holds it and this
     // set is complete by the time an ancestor is considered.
     let mut kept_relatives: BTreeSet<String> = BTreeSet::new();
-    // The subset kept because the local file is back, which this run then uploads.
-    let mut reappeared: BTreeSet<String> = BTreeSet::new();
+    // The subset kept because the local file is back, which this run then uploads: the deletion's
+    // relative, and the local spelling it was found at.
+    let mut reappeared: BTreeMap<String, String> = BTreeMap::new();
     for (index, action) in plan.post_deletes.iter().enumerate() {
         cancellation.check()?;
         // A kept child leaves its parent non-empty, and `Delete.delete` is issued non-recursively.
@@ -1827,31 +2075,41 @@ fn execute_with_observer<O: SyncOperations>(
             );
             continue;
         }
-        // Under a folder a case-only rename pairs, the local file is spelled the local way.
-        let deferral =
-            match local_presence(&plan.source_root, &local_spelling(plan, &action.relative)) {
-                Ok(LocalPresence::Absent) => None,
-                Ok(LocalPresence::Present) => {
-                    kept_relatives.insert(action.relative.clone());
-                    reappeared.insert(action.relative.clone());
-                    completed.deletes_skipped += 1;
-                    report(ExecutionEvent::RemoteExtraDeleteSkipped {
-                        remote_path: action.remote_path.clone(),
-                        relative: action.relative.clone(),
-                        reason: DeleteKeptReason::LocalPathExists,
-                    });
-                    continue;
-                }
-                Ok(LocalPresence::Unrepresentable) => Some((
-                    DeferReason::UnrepresentableName,
-                    format!(
-                        "{:?} cannot be spelled on this host's filesystem",
-                        action.relative
-                    ),
-                )),
-                // Absence was not established, so the remote copy stays.
-                Err(error) => Some((DeferReason::SourceUnreadable, error.to_string())),
-            };
+        // Asked at the local spelling the plan paired the entry with: under a case-renamed or a
+        // normalisation-paired folder, the local file is spelled the local way.
+        let deferral = match local_presence(&plan.source_root, &action.local_relative) {
+            Ok(LocalPresence::Absent) => None,
+            Ok(LocalPresence::Present { spelling }) => {
+                kept_relatives.insert(action.relative.clone());
+                reappeared.insert(action.relative.clone(), spelling);
+                completed.deletes_skipped += 1;
+                report(ExecutionEvent::RemoteExtraDeleteSkipped {
+                    remote_path: action.remote_path.clone(),
+                    relative: action.relative.clone(),
+                    reason: DeleteKeptReason::LocalPathExists,
+                });
+                continue;
+            }
+            // Present, but as more than one name: kept, and nothing is uploaded on a guess.
+            Ok(LocalPresence::Ambiguous { path }) => Some((
+                DeferReason::SourceChanged,
+                format!(
+                    "{path:?} is spelled more than one way locally, differing only by Unicode \
+                     normalisation, so whether {:?} is back cannot be told; the NAS copy is kept \
+                     and nothing is uploaded",
+                    action.relative
+                ),
+            )),
+            Ok(LocalPresence::Unrepresentable) => Some((
+                DeferReason::UnrepresentableName,
+                format!(
+                    "{:?} cannot be spelled on this host's filesystem",
+                    action.relative
+                ),
+            )),
+            // Absence was not established, so the remote copy stays.
+            Err(error) => Some((DeferReason::SourceUnreadable, error.to_string())),
+        };
         let deferral = deferral.or_else(|| {
             delete_changed[index].then(|| {
                 (
@@ -1962,13 +2220,52 @@ fn execute_with_observer<O: SyncOperations>(
     //
     // Same preflight, same transfer, same post-condition as any other upload. Only the plan's
     // knowledge of it differs, which is why it is a separate event.
-    for relative in &reappeared {
+    for (relative, spelling) in &reappeared {
         cancellation.check()?;
-        let mut local = match crate::local::entry_at(&plan.source_root, relative) {
+        // Read at the spelling the presence check found, which beneath a renamed or a
+        // normalisation-paired folder is not the NAS spelling. Asked by the NAS spelling, a kept
+        // deletion under a renamed folder found nothing and was silently never uploaded (D3-7).
+        let mut local = match crate::local::entry_at(&plan.source_root, spelling) {
             Ok(Some(local)) => local,
-            // Gone again, or DSM-managed after all. Either way there is nothing to upload, and the
-            // next run's plan is the right place to decide what the destination should hold.
-            Ok(None) => continue,
+            // Back a moment ago, not now. The deletion stays kept, nothing is uploaded, and the
+            // path is named: the NAS still holds the content its deletion was planned on.
+            Ok(None) => {
+                let (reason, detail) = match std::fs::symlink_metadata(
+                    plan.source_root.join(spelling),
+                ) {
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => (
+                        DeferReason::SourceVanished,
+                        format!(
+                            "{spelling:?} was back when the deletion of {relative:?} was checked \
+                             and is gone again; the NAS copy is kept"
+                        ),
+                    ),
+                    Err(error) => {
+                        completed.defer_local(
+                            &mut deferrals,
+                            relative,
+                            Error::FileIo {
+                                path: plan.source_root.join(spelling),
+                                source: error,
+                            },
+                            &mut report,
+                        )?;
+                        continue;
+                    }
+                    // A link, a reparse point or an entry with attributes the walk never carries:
+                    // the path exists but is not payload.
+                    Ok(_) => (
+                        DeferReason::UnsupportedLocalEntry,
+                        format!(
+                            "{spelling:?} came back as an entry the sync does not carry (a link, \
+                             a reparse point or a system file); the NAS copy of {relative:?} is \
+                             kept"
+                        ),
+                    ),
+                };
+                completed.defer(&mut deferrals, relative, reason, detail, &mut report);
+                continue;
+            }
             Err(error) => {
                 completed.defer_local(&mut deferrals, relative, error, &mut report)?;
                 continue;
@@ -1978,6 +2275,22 @@ fn execute_with_observer<O: SyncOperations>(
         // is a directory too, so the two already agree. A kind flip between them is a genuine
         // divergence and is left for reconciliation to report rather than resolved by guesswork.
         if local.kind != crate::local::EntryKind::File {
+            continue;
+        }
+        // `entry_at` applies no ignore rules. The planner never pairs a deletion candidate with an
+        // excluded local spelling (`plan::is_protected` asks both spellings), so this does not
+        // fire; if it ever did, an excluded file is not uploaded, and the deletion stays kept.
+        if plan.rules.is_ignored(spelling, false) {
+            completed.defer(
+                &mut deferrals,
+                relative,
+                DeferReason::SourceChanged,
+                format!(
+                    "{spelling:?} is excluded, so it is not uploaded in place of {relative:?}; the \
+                     NAS copy is kept"
+                ),
+                &mut report,
+            );
             continue;
         }
         let Some(target) = kept_upload_target(plan, relative) else {
@@ -2472,10 +2785,23 @@ pub fn protect_skipped_remote_entries(
     if skipped.is_empty() {
         return deferred;
     }
+    // A folder the account may not list, where the source holds content too, is named by the plan
+    // as the more specific `remote-unreadable`: that content is not uploaded either.
+    let unreadable: HashSet<String> = plan
+        .skipped
+        .iter()
+        .filter(|skip| {
+            matches!(&skip.reason, crate::local::SkipReason::Deferred { detail }
+                if detail.starts_with("remote-unreadable:"))
+        })
+        .map(|skip| skip.relative.clone())
+        .collect();
     // Every folder that holds one, and every folder above those.
     let mut kept: BTreeMap<String, String> = BTreeMap::new();
     for entry in skipped {
-        if !entry.excluded {
+        let named_by_plan = matches!(entry.reason, crate::api::RemoteSkipReason::UnlistableFolder)
+            && unreadable.contains(&entry.display());
+        if !entry.excluded && !named_by_plan {
             deferred.push(DeferredPath {
                 relative: entry.display(),
                 reason: DeferReason::RemoteSkipped,
@@ -2644,42 +2970,285 @@ pub fn withhold_scope_spelling_conflicts(
     Ok(())
 }
 
-/// Fail the run when the remote walk found link boundaries almost everywhere.
+/// The deferrals for remote folders that disappeared while the walk listed them (ADV3-P-7).
+///
+/// The folder was in its parent's listing and answered "no such folder" when listed itself: it
+/// was deleted on the NAS during the walk. That clears by itself, so it is a transient
+/// `remote-changed`, not a failed run. The walk has already dropped the folder from the inventory
+/// and marked its parent's listing incomplete, so nothing there is deleted on the strength of it.
+pub fn vanished_remote_folder_deferrals(vanished: &[String]) -> Vec<DeferredPath> {
+    vanished
+        .iter()
+        .map(|relative| DeferredPath {
+            relative: relative.clone(),
+            reason: DeferReason::RemoteChanged,
+            detail: "the NAS folder was deleted while it was being listed; nothing in the folder \
+                     above it was deleted on the strength of that listing"
+                .to_owned(),
+        })
+        .collect()
+}
+
+/// What [`withhold_comma_ambiguous_mutations`] asks the NAS about a path the run's inventory does
+/// not hold.
+pub trait RemoteEntryLookup {
+    /// Whether an entry exists at `remote_path`, by a self-checking read.
+    fn remote_entry_exists(&self, remote_path: &str) -> Result<bool>;
+}
+
+impl RemoteEntryLookup for ApiClient {
+    fn remote_entry_exists(&self, remote_path: &str) -> Result<bool> {
+        ApiClient::remote_entry_exists(self, remote_path)
+    }
+}
+
+/// Withhold every deletion, rename and server copy whose NAS path could address another entry if
+/// DSM split a path list at commas (NAS question N1).
+///
+/// File Station takes each path as a one-element JSON list, `["/team/t/a,b.txt"]`. Whether DSM
+/// ever splits that at the comma is not known. If it did, the only path it could address besides
+/// the intended one is the part before the first comma, so a mutation is withheld exactly when
+/// that part names an existing entry: one the run's inventory holds, or, outside it, one a
+/// self-checking read finds. Each is the lasting `remote-skipped`, named on every run until it is
+/// known how DSM parses commas; a comma path with no such entry before it is carried as usual.
+///
+/// A withheld deletion keeps every folder above it, which a non-recursive delete could not remove
+/// anyway, and a withheld type replacement keeps the content that was to replace it. A withheld
+/// server copy is uploaded instead.
+pub fn withhold_comma_ambiguous_mutations(
+    client: &impl RemoteEntryLookup,
+    plan: &mut SyncPlan,
+    remote: &RemoteInventory,
+) -> Result<Vec<DeferredPath>> {
+    let listed: HashSet<&str> = remote
+        .entries
+        .values()
+        .map(|entry| entry.remote_path.as_str())
+        .collect();
+    let mut probed: BTreeMap<String, bool> = BTreeMap::new();
+    let mut addressable = |remote_path: &str| -> Result<Option<String>> {
+        let Some(prefix) = crate::api::comma_split_prefix(remote_path) else {
+            return Ok(None);
+        };
+        let exists = if listed.contains(prefix) {
+            true
+        } else if let Some(exists) = probed.get(prefix) {
+            *exists
+        } else {
+            let exists = client.remote_entry_exists(prefix)?;
+            probed.insert(prefix.to_owned(), exists);
+            exists
+        };
+        Ok(exists.then(|| prefix.to_owned()))
+    };
+    let detail = |remote_path: &str, prefix: &str, what: &str| {
+        format!(
+            "{remote_path:?} is not {what}: the part before its first comma, {prefix:?}, is an \
+             existing NAS entry, and until it is known how DSM parses a comma in a path list the \
+             request could address that entry instead"
+        )
+    };
+    let mut deferred = Vec::new();
+
+    // Deletions that could address another entry, and every folder above one, with the deletion
+    // that keeps it.
+    let mut ambiguous: BTreeSet<String> = BTreeSet::new();
+    let mut above: BTreeMap<String, String> = BTreeMap::new();
+    for action in plan.pre_deletes.iter().chain(&plan.post_deletes) {
+        if let Some(prefix) = addressable(&action.remote_path)? {
+            deferred.push(DeferredPath {
+                relative: action.relative.clone(),
+                reason: DeferReason::RemoteSkipped,
+                detail: detail(&action.remote_path, &prefix, "deleted"),
+            });
+            ambiguous.insert(action.relative.clone());
+            let mut folder = action.relative.as_str();
+            while let Some((parent, _)) = folder.rsplit_once('/') {
+                above
+                    .entry(parent.to_owned())
+                    .or_insert_with(|| action.relative.clone());
+                folder = parent;
+            }
+        }
+    }
+    if !ambiguous.is_empty() {
+        let mut withhold = |action: &crate::plan::DeleteAction| -> bool {
+            if ambiguous.contains(&action.relative) {
+                return false;
+            }
+            let Some(beneath) = above.get(&action.relative) else {
+                return true;
+            };
+            deferred.push(DeferredPath {
+                relative: action.relative.clone(),
+                reason: DeferReason::RemoteSkipped,
+                detail: format!(
+                    "kept because {beneath:?} beneath it is not deleted until it is known how DSM \
+                     parses a comma in a path list"
+                ),
+            });
+            false
+        };
+        plan.post_deletes.retain(&mut withhold);
+        let mut withheld_replacements = Vec::new();
+        plan.pre_deletes.retain(|action| {
+            let keep = withhold(action);
+            if !keep {
+                withheld_replacements.push(action.relative.clone());
+            }
+            keep
+        });
+        if !withheld_replacements.is_empty() {
+            // The replacement cannot land where the entry it was to replace still stands.
+            let replaced = |relative: &str| {
+                withheld_replacements.iter().any(|path| {
+                    relative == path
+                        || relative
+                            .strip_prefix(path.as_str())
+                            .is_some_and(|rest| rest.starts_with('/'))
+                })
+            };
+            plan.uploads.retain(|action| {
+                let keep = !replaced(&action.local.relative);
+                if !keep {
+                    plan.upload_bytes = plan.upload_bytes.saturating_sub(action.local.size);
+                }
+                keep
+            });
+            plan.copies.retain(|action| !replaced(&action.to_relative));
+            plan.creates.retain(|action| !replaced(&action.relative));
+            plan.pre_deletes
+                .retain(|action| !replaced(&action.relative));
+        }
+    }
+
+    let mut renames = Vec::with_capacity(plan.renames.len());
+    for action in std::mem::take(&mut plan.renames) {
+        match addressable(&action.from_remote_path)? {
+            Some(prefix) => deferred.push(DeferredPath {
+                relative: action.relative.clone(),
+                reason: DeferReason::RemoteSkipped,
+                detail: detail(&action.from_remote_path, &prefix, "renamed"),
+            }),
+            None => renames.push(action),
+        }
+    }
+    plan.renames = renames;
+
+    let mut copies = Vec::with_capacity(plan.copies.len());
+    for action in std::mem::take(&mut plan.copies) {
+        if addressable(&action.from_remote_path)?.is_some() {
+            // Not named: the file still lands, by an upload that names nothing but itself.
+            plan.upload_bytes = plan.upload_bytes.saturating_add(action.local.size);
+            plan.uploads.push(crate::plan::UploadAction {
+                local: action.local,
+                remote_path: action.to_remote_path,
+                reason: crate::plan::ChangeReason::MissingRemote,
+                expected_remote: None,
+            });
+        } else {
+            copies.push(action);
+        }
+    }
+    plan.copies = copies;
+    Ok(deferred)
+}
+
+/// Fail the run when the remote walk found link boundaries, or folders it may not list, almost
+/// everywhere.
 ///
 /// A link is recognised by DSM reporting, for a folder, a real path that is not where the listing
 /// put it. Genuine links are rare. Most or all folders looking like links says instead that this
 /// DSM's real paths do not have the shape the walk expects -- a different volume prefix, a lexical
 /// rather than resolved path -- and acting on that would skip the whole tree folder by folder,
-/// thousands of warnings and nothing synced. So once at least three folders are link boundaries and
-/// they are more than half of the folders listed, the run fails with that cause, by name.
-pub fn check_link_boundaries(remote: &RemoteInventory) -> Result<()> {
+/// thousands of warnings and nothing synced. So once at least three folders, or three files, are
+/// link boundaries and they are more than half of the folders, or files, the guard checked, the
+/// run fails with that cause, by name.
+///
+/// The same holds for folders DSM refuses to list to this account. One is that folder's lasting
+/// `remote-unreadable`, and the run syncs everything else. An account that lost its rights across
+/// the share, but may still list the destination itself, would instead end every run amber
+/// with nothing synced; so the same threshold fails the run, naming the folders.
+pub fn check_link_boundaries(
+    remote: &RemoteInventory,
+    links: &crate::api::LinkCheckCounts,
+) -> Result<()> {
     let mut folders = 0_usize;
-    let mut links = Vec::new();
+    let mut unlistable = Vec::new();
+    let mut linked_folders = Vec::new();
+    let mut linked_files = Vec::new();
     for entry in remote.entries.values() {
-        if entry.kind != crate::local::EntryKind::Directory {
-            continue;
-        }
-        folders += 1;
-        if entry.mount_point_type.as_deref() == Some(crate::api::LINKED_ENTRY_MOUNT_TYPE) {
-            links.push(entry.relative.as_str());
+        let is_dir = entry.kind == crate::local::EntryKind::Directory;
+        folders += usize::from(is_dir);
+        match entry.mount_point_type.as_deref() {
+            Some(crate::api::LINKED_ENTRY_MOUNT_TYPE) if is_dir => {
+                linked_folders.push(entry.relative.as_str());
+            }
+            Some(crate::api::LINKED_ENTRY_MOUNT_TYPE) => linked_files.push(entry.relative.as_str()),
+            Some(crate::api::UNLISTABLE_ENTRY_MOUNT_TYPE) if is_dir => {
+                unlistable.push(entry.relative.as_str());
+            }
+            _ => {}
         }
     }
-    if links.len() >= 3 && links.len() * 2 > folders {
-        let shown = links
-            .iter()
-            .take(10)
-            .copied()
-            .collect::<Vec<_>>()
-            .join(", ");
+    if unlistable.len() >= 3 && unlistable.len() * 2 > folders {
         return Err(Error::Message(format!(
-            "{REMOTE_REAL_PATH_UNUSABLE}: {} of the {folders} NAS folders listed look like links to \
-             somewhere else, which points to DSM reporting real paths in a shape this tool does not \
-             expect rather than to real links; nothing was synced. Folders: {shown}{}",
-            links.len(),
-            if links.len() > 10 { ", ..." } else { "" }
+            "the NAS refuses to list {} of the {folders} folders found to this account, so its \
+             rights on the share rather than these folders are the likely problem; nothing was \
+             synced. Folders: {}",
+            unlistable.len(),
+            shown_folders(&unlistable)
         )));
     }
+    // Per kind, over what the guard actually evaluated: a destination of files whose real paths
+    // all look wrong has few folders, or none, and judged by folders alone it withheld every
+    // edited file, run after run, with exit 0 (G-3). Scoped-chain ancestors and excluded entries
+    // are not evaluations and do not dilute either count.
+    for (kind, linked, checked, sample) in [
+        (
+            "folders",
+            links.folders_linked,
+            links.folders_checked,
+            &linked_folders,
+        ),
+        (
+            "files",
+            links.files_linked,
+            links.files_checked,
+            &linked_files,
+        ),
+    ] {
+        if linked >= 3 && linked * 2 > checked {
+            let shown: Vec<String> = sample
+                .iter()
+                .take(REFUSAL_SAMPLE)
+                .map(|relative| (*relative).to_owned())
+                .collect();
+            return Err(Error::RemoteRealPathUnusable {
+                kind,
+                linked,
+                checked,
+                more: linked.saturating_sub(shown.len()),
+                sample: shown,
+            });
+        }
+    }
     Ok(())
+}
+
+/// The first ten of `folders`, comma-separated, with an ellipsis when there are more.
+fn shown_folders(folders: &[&str]) -> String {
+    let shown = folders
+        .iter()
+        .take(10)
+        .copied()
+        .collect::<Vec<_>>()
+        .join(", ");
+    if folders.len() > 10 {
+        format!("{shown}, ...")
+    } else {
+        shown
+    }
 }
 
 /// The named cause [`check_link_boundaries`] fails a run with.
@@ -3008,6 +3577,9 @@ mod tests {
         mtime_not_kept_path: Option<String>,
         /// The DSM code a rename fails with.
         fail_rename: Option<i64>,
+        /// A local path removed when the remote path is deleted: a source changing again between
+        /// a deletion's presence check and the kept deletion's upload.
+        remove_on_delete: Option<(String, PathBuf)>,
     }
 
     /// The one entry a streaming [`MockOperations`] fails immediately.
@@ -3051,6 +3623,11 @@ mod tests {
 
         fn delete_non_recursive(&self, _root: &RemoteRoot, remote_path: &str) -> Result<()> {
             self.event(format!("delete:{remote_path}"));
+            if let Some((trigger, local)) = &self.remove_on_delete
+                && trigger == remote_path
+            {
+                std::fs::remove_file(local).unwrap();
+            }
             Ok(())
         }
 
@@ -3289,6 +3866,7 @@ mod tests {
             rules: crate::local::IgnoreRules::none(),
             pre_deletes: vec![DeleteAction {
                 relative: "conflict".to_owned(),
+                local_relative: "conflict".to_owned(),
                 remote_path: "/share/root/conflict".to_owned(),
                 kind: EntryKind::File,
                 type_conflict: true,
@@ -3309,6 +3887,7 @@ mod tests {
             }],
             post_deletes: vec![DeleteAction {
                 relative: "extra".to_owned(),
+                local_relative: "extra".to_owned(),
                 remote_path: "/share/root/extra".to_owned(),
                 kind: EntryKind::File,
                 type_conflict: false,
@@ -3320,6 +3899,7 @@ mod tests {
             protected_entries: 0,
             upload_bytes: 1,
             skipped: Vec::new(),
+            link_guard_unchecked: 0,
         }
     }
 
@@ -3773,6 +4353,7 @@ mod tests {
         plan.post_deletes = vec![
             DeleteAction {
                 relative: "old/report.md".to_owned(),
+                local_relative: "old/report.md".to_owned(),
                 remote_path: "/share/root/old/report.md".to_owned(),
                 kind: EntryKind::File,
                 type_conflict: false,
@@ -3781,6 +4362,7 @@ mod tests {
             },
             DeleteAction {
                 relative: "old".to_owned(),
+                local_relative: "old".to_owned(),
                 remote_path: "/share/root/old".to_owned(),
                 kind: EntryKind::Directory,
                 type_conflict: false,
@@ -3866,6 +4448,7 @@ mod tests {
         plan.post_deletes = vec![
             DeleteAction {
                 relative: "kept.txt".to_owned(),
+                local_relative: "kept.txt".to_owned(),
                 remote_path: "/share/root/kept.txt".to_owned(),
                 kind: EntryKind::File,
                 type_conflict: false,
@@ -3874,6 +4457,7 @@ mod tests {
             },
             DeleteAction {
                 relative: "empty".to_owned(),
+                local_relative: "empty".to_owned(),
                 remote_path: "/share/root/empty".to_owned(),
                 kind: EntryKind::Directory,
                 type_conflict: false,
@@ -3987,6 +4571,7 @@ mod tests {
         plan.copies.clear();
         plan.post_deletes = vec![DeleteAction {
             relative: "blocked/extra".to_owned(),
+            local_relative: "blocked/extra".to_owned(),
             remote_path: "/share/root/blocked/extra".to_owned(),
             kind: EntryKind::File,
             type_conflict: false,
@@ -4418,10 +5003,11 @@ mod tests {
         );
     }
 
-    /// S2-B11: a copy DSM finished with an error is named as such and deferred, and the source
-    /// it was to prove is not deleted.
+    /// G-4: a copy DSM reports as ended in failure is uploaded instead, in the same run, while the
+    /// destination is still absent. Deferred instead, a copy that failed the same way every run
+    /// left the run partial forever.
     #[test]
-    fn a_server_copy_that_finished_with_an_error_is_deferred() {
+    fn a_server_copy_that_finished_with_an_error_falls_back_to_an_upload() {
         let client = FailingCopy(MockOperations::default());
         let mut plan = populated_plan();
         plan.pre_deletes.clear();
@@ -4442,9 +5028,153 @@ mod tests {
         )
         .unwrap();
         assert_eq!(report.copied, 0);
+        assert_eq!(report.copy_fallbacks, 1);
+        assert_eq!(report.uploaded, 1);
+        assert!(report.deferred.is_empty(), "{:?}", report.deferred);
+        let events = client.0.events.lock().unwrap().clone();
+        assert!(
+            events.iter().any(|event| event == "upload:new/file.txt"),
+            "{events:?}"
+        );
+    }
+
+    /// G-4: when the failed copy left an entry at the destination (or someone wrote there), nothing
+    /// is uploaded over it in this run. It is the transient `server-copy-failed`, which converges
+    /// next run: the destination now has a NAS counterpart, so that run uploads rather than copies.
+    #[test]
+    fn a_failed_server_copy_that_left_an_entry_is_deferred_for_one_run() {
+        let client = FailingCopy(MockOperations {
+            remote_occupied: Some((
+                "/share/root/new/file.txt".to_owned(),
+                RemotePathState::File {
+                    size: 3,
+                    mtime_seconds: Some(5),
+                },
+            )),
+            ..MockOperations::default()
+        });
+        let mut plan = populated_plan();
+        plan.pre_deletes.clear();
+        plan.creates.clear();
+        plan.uploads.clear();
+        plan.post_deletes.clear();
+        plan.copies.push(copy_action());
+
+        let report = execute_with(
+            &client,
+            &RemoteRoot::parse("/share/root").unwrap(),
+            &plan,
+            ExecuteOptions {
+                jobs: 1,
+                dry_run: false,
+            },
+            |_| {},
+        )
+        .unwrap();
+        assert_eq!(report.copied + report.uploaded, 0);
         let deferred = only_deferral(&report);
         assert_eq!(deferred.relative, "new/file.txt");
         assert_eq!(deferred.reason, DeferReason::ServerCopyFailed);
+        assert!(!deferred.reason.is_lasting());
+        assert!(
+            deferred
+                .detail
+                .contains("the destination now holds an entry"),
+            "{}",
+            deferred.detail
+        );
+    }
+
+    /// G-2 property: checked after every settlement, the breaker trips exactly when the end of the
+    /// run would have, whatever the order of acceptances, refusals and exclusions.
+    #[test]
+    fn the_running_breaker_verdict_equals_the_end_of_run_verdict() {
+        let refusal = |code: i64| Error::RemoteRefused {
+            path: "/share/root/x".to_owned(),
+            operation: "SYNO.FileStation.Upload.upload".to_owned(),
+            code,
+            description: "refused".to_owned(),
+        };
+        let mut seed = 0x2545_f491_4f6c_dd1d_u64;
+        let mut next = move |bound: u64| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed % bound
+        };
+        for _ in 0..2_000 {
+            let items = 1 + next(40) as usize;
+            let in_sync = next(10) as usize;
+            let outcomes: Vec<u64> = (0..items).map(|_| next(5)).collect();
+            let mut running = RefusalBreaker::new(items, in_sync);
+            let mut tripped_at = None;
+            for (index, outcome) in outcomes.iter().enumerate() {
+                match outcome {
+                    0 => running.accepted(),
+                    1 => running.excluded(),
+                    2 => running.settled_by(&refusal(407), "p"),
+                    3 => running.settled_by(&refusal(418), "n"),
+                    _ => running.settled_by(&Error::SourceChanged("x".into()), "local"),
+                }
+                if tripped_at.is_none() && running.check().is_err() {
+                    tripped_at = Some(index);
+                }
+            }
+            assert_eq!(running.pending, 0, "every item settled exactly once");
+            let end = running.check();
+            assert_eq!(
+                tripped_at.is_some(),
+                end.is_err(),
+                "{outcomes:?} in_sync={in_sync}"
+            );
+            if let Some(index) = tripped_at {
+                // Once tripped, it stays tripped: nothing after can lift it.
+                let mut replay = RefusalBreaker::new(items, in_sync);
+                for outcome in &outcomes[..=index] {
+                    match outcome {
+                        0 => replay.accepted(),
+                        1 => replay.excluded(),
+                        2 => replay.settled_by(&refusal(407), "p"),
+                        3 => replay.settled_by(&refusal(418), "n"),
+                        _ => replay.settled_by(&Error::SourceChanged("x".into()), "local"),
+                    }
+                }
+                let Err(Error::RemoteRefusalsShareWide { not_attempted, .. }) = replay.check()
+                else {
+                    panic!("the replay tripped at the same point");
+                };
+                assert_eq!(not_attempted, items - index - 1);
+            }
+        }
+    }
+
+    /// BK-1: three lasting refusals among files already in sync are not a share-wide refusal; the
+    /// same three on a run that found nothing in sync are.
+    #[test]
+    fn files_already_in_sync_count_towards_what_the_breaker_considered() {
+        let refusal = Error::RemoteRefused {
+            path: "/share/root/averylongname.txt".to_owned(),
+            operation: "SYNO.FileStation.Upload.upload".to_owned(),
+            code: 418,
+            description: "refused".to_owned(),
+        };
+        let mut steady = RefusalBreaker::new(3, 30);
+        let mut first = RefusalBreaker::new(3, 0);
+        for index in 0..3 {
+            steady.settled_by(&refusal, &format!("averylongname{index}.txt"));
+            first.settled_by(&refusal, &format!("averylongname{index}.txt"));
+        }
+        assert!(steady.check().is_ok());
+        let error = first.check().unwrap_err().to_string();
+        assert!(
+            error.starts_with("remote-refused-share-wide: name"),
+            "{error}"
+        );
+        assert!(error.contains("for one cause"), "{error}");
+        assert!(
+            error.contains("SYNO.FileStation.Upload.upload:418 x3"),
+            "{error}"
+        );
     }
 
     /// A DSM refusal of one deletion keeps that entry, and its ancestors, and names it.
@@ -4461,6 +5191,7 @@ mod tests {
         plan.post_deletes = vec![
             DeleteAction {
                 relative: "a/refused".to_owned(),
+                local_relative: "a/refused".to_owned(),
                 remote_path: "/share/root/a/refused".to_owned(),
                 kind: EntryKind::File,
                 type_conflict: false,
@@ -4469,6 +5200,7 @@ mod tests {
             },
             DeleteAction {
                 relative: "extra".to_owned(),
+                local_relative: "extra".to_owned(),
                 remote_path: "/share/root/extra".to_owned(),
                 kind: EntryKind::File,
                 type_conflict: false,
@@ -4477,6 +5209,7 @@ mod tests {
             },
             DeleteAction {
                 relative: "a".to_owned(),
+                local_relative: "a".to_owned(),
                 remote_path: "/share/root/a".to_owned(),
                 kind: EntryKind::Directory,
                 type_conflict: false,
@@ -4833,6 +5566,7 @@ mod tests {
         plan.copies.clear();
         plan.post_deletes = vec![DeleteAction {
             relative: "old/file.txt".to_owned(),
+            local_relative: "old/file.txt".to_owned(),
             remote_path: "/share/root/old/file.txt".to_owned(),
             kind: EntryKind::File,
             type_conflict: false,
@@ -5154,6 +5888,7 @@ mod tests {
             protected_entries: 0,
             upload_bytes: 0,
             skipped: Vec::new(),
+            link_guard_unchecked: 0,
         };
         let mut reported = Vec::new();
         // `execute` (unlike `execute_with`, used by every other test in this module) is the
@@ -5191,11 +5926,14 @@ mod tests {
         root
     }
 
-    /// N1/N2: the delete-keep lookup is by exact spelling. A stat that succeeds through case
-    /// folding (Windows, macOS) or Unicode normalisation (APFS, HFS+) found a *different* file,
-    /// kept the deletion and uploaded that file under the remote spelling, every run.
+    /// N1/N2: the delete-keep lookup never resolves a name by case. A stat that succeeds through
+    /// case folding (Windows, macOS) found a *different* file, kept the deletion and uploaded that
+    /// file under the remote spelling, every run.
+    ///
+    /// F-5: it does resolve a name by Unicode normalisation, as the planner pairs names, and says
+    /// which bytes it found. The NFC spelling of a local NFD name is that file.
     #[test]
-    fn local_presence_requires_the_exact_spelling() {
+    fn local_presence_matches_by_normalisation_and_never_by_case() {
         let root = scratch_root("presence");
         std::fs::create_dir_all(root.join("Docs")).unwrap();
         std::fs::write(root.join("Docs/report.pdf"), b"r").unwrap();
@@ -5203,7 +5941,9 @@ mod tests {
 
         assert_eq!(
             local_presence(&root, "Docs/report.pdf").unwrap(),
-            LocalPresence::Present
+            LocalPresence::Present {
+                spelling: "Docs/report.pdf".to_owned()
+            }
         );
         assert_eq!(
             local_presence(&root, "Docs/Report.pdf").unwrap(),
@@ -5215,12 +5955,44 @@ mod tests {
         );
         assert_eq!(
             local_presence(&root, "caf\u{00e9}.txt").unwrap(),
-            LocalPresence::Absent,
-            "the NFC spelling of a local NFD name is a different name"
+            LocalPresence::Present {
+                spelling: "caf\u{0065}\u{0301}.txt".to_owned()
+            },
+            "the NFC spelling of a local NFD name is that file, at its own bytes"
         );
         assert_eq!(
             local_presence(&root, "missing.txt").unwrap(),
             LocalPresence::Absent
+        );
+        assert_eq!(
+            local_presence(&root, "Docs/missing-caf\u{00e9}.txt").unwrap(),
+            LocalPresence::Absent
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// F-5: two local names equal under normalisation cannot both be the remote entry. Present, so
+    /// the deletion is kept, but which one is cannot be told, so nothing is uploaded. An ASCII name a
+    /// compatibility singleton composes to is still looked for under its other spellings.
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn local_presence_names_an_ambiguous_normalisation() {
+        let root = scratch_root("presence-ambiguous");
+        std::fs::create_dir_all(root.join("d")).unwrap();
+        std::fs::write(root.join("d/caf\u{00e9}.txt"), b"nfc").unwrap();
+        std::fs::write(root.join("d/caf\u{0065}\u{0301}.txt"), b"nfd").unwrap();
+        std::fs::write(root.join("\u{212a}elvin.txt"), b"kelvin sign").unwrap();
+        assert_eq!(
+            local_presence(&root, "d/caf\u{00e9}.txt").unwrap(),
+            LocalPresence::Ambiguous {
+                path: "d/caf\u{00e9}.txt".to_owned()
+            }
+        );
+        assert_eq!(
+            local_presence(&root, "Kelvin.txt").unwrap(),
+            LocalPresence::Present {
+                spelling: "\u{212a}elvin.txt".to_owned()
+            }
         );
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -5242,7 +6014,9 @@ mod tests {
         }
         assert_eq!(
             local_presence(&root, "notes").unwrap(),
-            LocalPresence::Present
+            LocalPresence::Present {
+                spelling: "notes".to_owned()
+            }
         );
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -5264,6 +6038,7 @@ mod tests {
             0,
             DeleteAction {
                 relative: "notes.".to_owned(),
+                local_relative: "notes.".to_owned(),
                 remote_path: "/share/root/notes.".to_owned(),
                 kind: EntryKind::File,
                 type_conflict: false,
@@ -5360,6 +6135,7 @@ mod tests {
         plan.pre_deletes[0].relative = "file.txt".to_owned();
         plan.post_deletes.push(DeleteAction {
             relative: "old/file.txt".to_owned(),
+            local_relative: "old/file.txt".to_owned(),
             remote_path: "/share/root/old/file.txt".to_owned(),
             kind: EntryKind::File,
             type_conflict: false,
@@ -5403,6 +6179,7 @@ mod tests {
         plan.post_deletes = vec![
             DeleteAction {
                 relative: "Report.pdf".to_owned(),
+                local_relative: "Report.pdf".to_owned(),
                 remote_path: "/share/root/Report.pdf".to_owned(),
                 kind: EntryKind::File,
                 type_conflict: false,
@@ -5411,6 +6188,7 @@ mod tests {
             },
             DeleteAction {
                 relative: "extra".to_owned(),
+                local_relative: "extra".to_owned(),
                 remote_path: "/share/root/extra".to_owned(),
                 kind: EntryKind::File,
                 type_conflict: false,
@@ -5457,6 +6235,7 @@ mod tests {
         let mut plan = case_rename_plan();
         plan.post_deletes.push(DeleteAction {
             relative: "Photos".to_owned(),
+            local_relative: "Photos".to_owned(),
             remote_path: "/share/root/Photos".to_owned(),
             kind: EntryKind::Directory,
             type_conflict: false,
@@ -5493,6 +6272,7 @@ mod tests {
     fn deletions_in_an_incomplete_listing_are_withheld_by_name() {
         let delete = |relative: &str, kind: EntryKind| DeleteAction {
             relative: relative.to_owned(),
+            local_relative: relative.to_owned(),
             remote_path: format!("/share/root/{relative}"),
             kind,
             type_conflict: false,
@@ -5574,6 +6354,7 @@ mod tests {
             .iter()
             .map(|relative| DeleteAction {
                 relative: (*relative).to_owned(),
+                local_relative: (*relative).to_owned(),
                 remote_path: format!("/share/root/{relative}"),
                 kind: EntryKind::File,
                 type_conflict: false,
@@ -5674,6 +6455,8 @@ mod tests {
 
     fn rename_plan() -> SyncPlan {
         let mut plan = deletion_only_plan(&["Photos/gone.jpg"]);
+        // As the planner records it: the rename pairs `Photos` with the local `photos`.
+        plan.post_deletes[0].local_relative = "photos/gone.jpg".to_owned();
         plan.renames.push(crate::plan::RenameAction {
             relative: "photos".to_owned(),
             from_relative: "Photos".to_owned(),
@@ -5940,6 +6723,215 @@ mod tests {
         );
     }
 
+    /// D3-6: a deletion beneath a normalisation-paired folder is checked at its recorded local
+    /// spelling, and a recreated leaf is found under either normalisation of its own name. The NAS
+    /// copy is kept, and the kept deletion uploads the file found, under the NAS spelling.
+    #[test]
+    fn a_deletion_beneath_a_normalisation_paired_folder_checks_the_recorded_spelling() {
+        let source = scratch_root("nfd-presence");
+        std::fs::create_dir_all(source.join("cafe\u{301}")).unwrap();
+        std::fs::write(source.join("cafe\u{301}/nai\u{308}ve.txt"), b"back again").unwrap();
+        let mut plan = deletion_only_plan(&["caf\u{e9}/na\u{ef}ve.txt"]);
+        plan.post_deletes[0].local_relative = "cafe\u{301}/na\u{ef}ve.txt".to_owned();
+        plan.source_root = source.clone();
+        let client = MockOperations::default();
+        let report = execute_with(
+            &client,
+            &RemoteRoot::parse("/share/root").unwrap(),
+            &plan,
+            ExecuteOptions {
+                jobs: 1,
+                dry_run: false,
+            },
+            |_| {},
+        );
+        std::fs::remove_dir_all(&source).unwrap();
+        let report = report.unwrap();
+        assert_eq!(report.deleted, 0, "{report:?}");
+        assert_eq!(report.deletes_skipped, 1);
+        assert_eq!(report.kept_deletes_uploaded, 1, "{report:?}");
+        let events = client.events.lock().unwrap().clone();
+        assert!(
+            !events.iter().any(|event| event.starts_with("delete:")),
+            "{events:?}"
+        );
+        // The file found, at its own bytes.
+        assert!(
+            events
+                .iter()
+                .any(|event| event == "upload:cafe\u{301}/nai\u{308}ve.txt"),
+            "{events:?}"
+        );
+    }
+
+    /// D3-7 / no silent failures: a file found back at its deletion's presence check and gone
+    /// again before the kept deletion's upload is named `source-vanished`, its NAS copy kept, and
+    /// the run is not complete. It used to be skipped with nothing recorded.
+    #[test]
+    fn a_reappeared_file_gone_again_before_its_upload_is_named() {
+        let source = scratch_root("present-then-gone");
+        std::fs::create_dir_all(source.join("a")).unwrap();
+        std::fs::write(source.join("a/gone.txt"), b"back for a moment").unwrap();
+        let mut plan = deletion_only_plan(&["a/gone.txt", "z.txt"]);
+        plan.source_root = source.clone();
+        let client = MockOperations {
+            remove_on_delete: Some(("/share/root/z.txt".to_owned(), source.join("a/gone.txt"))),
+            ..MockOperations::default()
+        };
+        let report = execute_with(
+            &client,
+            &RemoteRoot::parse("/share/root").unwrap(),
+            &plan,
+            ExecuteOptions {
+                jobs: 1,
+                dry_run: false,
+            },
+            |_| {},
+        );
+        std::fs::remove_dir_all(&source).unwrap();
+        let report = report.unwrap();
+        assert_eq!(report.deleted, 1, "only z.txt: {report:?}");
+        assert_eq!(report.kept_deletes_uploaded, 0);
+        let deferred: Vec<(&str, DeferReason)> = report
+            .deferred
+            .iter()
+            .map(|record| (record.relative.as_str(), record.reason))
+            .collect();
+        assert_eq!(deferred, [("a/gone.txt", DeferReason::SourceVanished)]);
+        assert!(
+            !DeferReason::SourceVanished.is_lasting(),
+            "the run is partial"
+        );
+        let events = client.events.lock().unwrap().clone();
+        assert!(
+            !events
+                .iter()
+                .any(|event| event == "delete:/share/root/a/gone.txt"),
+            "{events:?}"
+        );
+    }
+
+    /// Answers the comma guard's reads from a fixed set, and counts them.
+    #[derive(Default)]
+    struct KnownEntries {
+        existing: Vec<&'static str>,
+        asked: Mutex<Vec<String>>,
+    }
+
+    impl RemoteEntryLookup for KnownEntries {
+        fn remote_entry_exists(&self, remote_path: &str) -> Result<bool> {
+            self.asked.lock().unwrap().push(remote_path.to_owned());
+            Ok(self.existing.contains(&remote_path))
+        }
+    }
+
+    fn named(deferred: &[DeferredPath]) -> Vec<(&str, DeferReason)> {
+        deferred
+            .iter()
+            .map(|record| (record.relative.as_str(), record.reason))
+            .collect()
+    }
+
+    /// N1: a deletion of a comma path whose part before the comma is an entry the inventory holds
+    /// is withheld, by name, as the lasting `remote-skipped`, with every folder above it; one whose
+    /// prefix is nothing is carried. Nothing is asked of the NAS for a prefix the inventory holds.
+    #[test]
+    fn a_deletion_that_could_address_another_entry_is_withheld_with_its_folders() {
+        let mut plan = deletion_only_plan(&["d/a,b.txt", "d", "x,y.txt", "plain.txt"]);
+        plan.post_deletes[1].kind = EntryKind::Directory;
+        let remote = scoped_remote(&["d", "d/a"]);
+        let lookup = KnownEntries::default();
+        let deferred = withhold_comma_ambiguous_mutations(&lookup, &mut plan, &remote).unwrap();
+        assert_eq!(
+            named(&deferred),
+            [
+                ("d/a,b.txt", DeferReason::RemoteSkipped),
+                ("d", DeferReason::RemoteSkipped)
+            ]
+        );
+        assert!(DeferReason::RemoteSkipped.is_lasting());
+        assert!(
+            deferred[0].detail.contains("\"/share/root/d/a\""),
+            "{deferred:?}"
+        );
+        assert_eq!(
+            plan.post_deletes
+                .iter()
+                .map(|action| action.relative.as_str())
+                .collect::<Vec<_>>(),
+            ["x,y.txt", "plain.txt"]
+        );
+        // `/share/root/x` is not in the inventory, so the NAS was asked, once.
+        assert_eq!(*lookup.asked.lock().unwrap(), ["/share/root/x"]);
+    }
+
+    /// N1: a prefix outside the inventory is read from the NAS; an existing one withholds the
+    /// mutation. A withheld type replacement keeps the content that was to replace it, a withheld
+    /// rename stays pending, and a withheld server copy is uploaded instead.
+    #[test]
+    fn a_comma_path_whose_prefix_the_nas_holds_is_not_mutated() {
+        let mut plan = populated_plan();
+        plan.pre_deletes[0].relative = "n,1".to_owned();
+        plan.pre_deletes[0].remote_path = "/share/root/n,1".to_owned();
+        plan.uploads[0].local = local("n,1");
+        plan.uploads[0].remote_path = "/share/root/n,1".to_owned();
+        plan.renames.push(crate::plan::RenameAction {
+            relative: "r,1".to_owned(),
+            from_relative: "R,1".to_owned(),
+            from_remote_path: "/share/root/R,1".to_owned(),
+            new_name: "r,1".to_owned(),
+            to_remote_path: "/share/root/r,1".to_owned(),
+            kind: EntryKind::File,
+        });
+        let digest = crate::integrity::ContentMd5::from_digests([7; 16], 7, [7; 32]);
+        plan.copies.push(crate::plan::CopyAction {
+            from_relative: "old/c,1".to_owned(),
+            from_remote_path: "/share/root/old/c,1".to_owned(),
+            to_relative: "new/c,1".to_owned(),
+            to_remote_path: "/share/root/new/c,1".to_owned(),
+            local: local("new/c,1"),
+            expected_size: 1,
+            content_md5: digest,
+            source_snapshot: file_snapshot(1, Some(digest)),
+        });
+        let lookup = KnownEntries {
+            existing: vec!["/share/root/n", "/share/root/R", "/share/root/old/c"],
+            ..KnownEntries::default()
+        };
+        let deferred =
+            withhold_comma_ambiguous_mutations(&lookup, &mut plan, &scoped_remote(&[])).unwrap();
+        assert_eq!(
+            named(&deferred),
+            [
+                ("n,1", DeferReason::RemoteSkipped),
+                ("r,1", DeferReason::RemoteSkipped)
+            ]
+        );
+        assert!(plan.pre_deletes.is_empty());
+        assert!(plan.renames.is_empty());
+        assert!(plan.copies.is_empty());
+        assert_eq!(
+            plan.uploads
+                .iter()
+                .map(|action| action.remote_path.as_str())
+                .collect::<Vec<_>>(),
+            ["/share/root/new/c,1"],
+            "the replacement is withheld and the copy is uploaded instead"
+        );
+        assert_eq!(plan.upload_bytes, 1);
+        // The plain deletion is untouched.
+        assert_eq!(plan.post_deletes.len(), 1);
+    }
+
+    /// P-7: a folder deleted while the walk listed it is a transient `remote-changed`, by name.
+    #[test]
+    fn a_vanished_remote_folder_is_a_transient_named_deferral() {
+        let deferred = vanished_remote_folder_deferrals(&["tmp-123".to_owned()]);
+        assert_eq!(named(&deferred), [("tmp-123", DeferReason::RemoteChanged)]);
+        assert!(!DeferReason::RemoteChanged.is_lasting());
+        assert!(vanished_remote_folder_deferrals(&[]).is_empty());
+    }
+
     fn scoped_local(relatives: &[(&str, EntryKind)]) -> LocalInventory {
         LocalInventory {
             root: absent_source_root(),
@@ -6063,13 +7055,22 @@ mod tests {
     /// the named cause. A few real links among many folders are per-path skips.
     #[test]
     fn link_boundaries_almost_everywhere_fail_the_run() {
+        let counts = |folders_checked, folders_linked| crate::api::LinkCheckCounts {
+            folders_checked,
+            folders_linked,
+            ..Default::default()
+        };
         let mut remote = scoped_remote(&["a", "b", "c", "d"]);
         for entry in remote.entries.values_mut().take(3) {
             entry.mount_point_type = Some(crate::api::LINKED_ENTRY_MOUNT_TYPE.to_owned());
         }
-        let error = check_link_boundaries(&remote).unwrap_err();
+        let error = check_link_boundaries(&remote, &counts(4, 3)).unwrap_err();
         assert!(
             error.to_string().starts_with(REMOTE_REAL_PATH_UNUSABLE),
+            "{error}"
+        );
+        assert!(
+            error.to_string().contains("Exclude the links by name"),
             "{error}"
         );
 
@@ -6077,12 +7078,73 @@ mod tests {
         for entry in mostly_folders.entries.values_mut().take(3) {
             entry.mount_point_type = Some(crate::api::LINKED_ENTRY_MOUNT_TYPE.to_owned());
         }
-        assert!(check_link_boundaries(&mostly_folders).is_ok());
+        assert!(check_link_boundaries(&mostly_folders, &counts(7, 3)).is_ok());
         // A real mount point is not a link.
         let mut mounts = scoped_remote(&["a", "b", "c"]);
         for entry in mounts.entries.values_mut() {
             entry.mount_point_type = Some("cifs".to_owned());
         }
-        assert!(check_link_boundaries(&mounts).is_ok());
+        assert!(check_link_boundaries(&mounts, &counts(3, 0)).is_ok());
+    }
+
+    /// G-3: the shape breaker counts files on their own, so a destination of files whose real
+    /// paths all look wrong fails by name instead of withholding every edit with exit 0. Only what
+    /// the guard evaluated counts: entries it could not check, or excluded, never dilute it.
+    #[test]
+    fn link_boundaries_count_files_and_folders_separately() {
+        let remote = scoped_remote(&["a", "b"]);
+        let files = crate::api::LinkCheckCounts {
+            folders_checked: 2,
+            folders_linked: 0,
+            files_checked: 7,
+            files_linked: 5,
+        };
+        let error = check_link_boundaries(&remote, &files)
+            .unwrap_err()
+            .to_string();
+        assert!(error.starts_with(REMOTE_REAL_PATH_UNUSABLE), "{error}");
+        assert!(error.contains("5 of the 7 NAS files"), "{error}");
+        // Two of a kind are named skips, never a failed run.
+        let two = crate::api::LinkCheckCounts {
+            files_checked: 2,
+            files_linked: 2,
+            folders_checked: 2,
+            folders_linked: 2,
+        };
+        assert!(check_link_boundaries(&remote, &two).is_ok());
+        // Three genuine links among many files are their own skips.
+        let few = crate::api::LinkCheckCounts {
+            files_checked: 40,
+            files_linked: 3,
+            ..Default::default()
+        };
+        assert!(check_link_boundaries(&remote, &few).is_ok());
+    }
+
+    /// ADV3-P-3 breaker: one folder the account may not list is that folder's lasting warning,
+    /// but most of the share refused (at least three, more than half the folders) is the
+    /// account's rights, and fails the run naming them rather than ending amber with nothing done.
+    #[test]
+    fn unlistable_folders_almost_everywhere_fail_the_run() {
+        let mark = |remote: &mut RemoteInventory, count: usize| {
+            for entry in remote.entries.values_mut().take(count) {
+                entry.mount_point_type = Some(crate::api::UNLISTABLE_ENTRY_MOUNT_TYPE.to_owned());
+            }
+        };
+        let mut refused = scoped_remote(&["a", "b", "c", "d"]);
+        mark(&mut refused, 3);
+        let error = check_link_boundaries(&refused, &Default::default())
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("3 of the 4 folders"), "{error}");
+        assert!(error.contains("a, b, c"), "{error}");
+
+        let mut some = scoped_remote(&["a", "b", "c", "d", "e", "f", "g"]);
+        mark(&mut some, 3);
+        assert!(check_link_boundaries(&some, &Default::default()).is_ok());
+        // Two are never enough, however few folders there are.
+        let mut two = scoped_remote(&["a", "b"]);
+        mark(&mut two, 2);
+        assert!(check_link_boundaries(&two, &Default::default()).is_ok());
     }
 }

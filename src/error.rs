@@ -39,7 +39,10 @@ pub enum Error {
         source: reqwest::Error,
     },
 
-    #[error("HTTP response body failed during {operation}: {source}")]
+    /// A body failed in transit: a response body that could not be read, or an upload attempt
+    /// one of its bounds ended (a stall, the ceiling, no answer after the last byte), named in
+    /// `source`.
+    #[error("HTTP transfer failed during {operation}: {source}")]
     HttpBody {
         operation: String,
         #[source]
@@ -85,6 +88,68 @@ pub enum Error {
         path: String,
         code: i64,
         description: String,
+    },
+
+    /// A folder on the requested scope, between the destination and the scope or the scope
+    /// itself, is a NAS link: DSM reports a real path for it that is not where it is listed. A
+    /// scoped run, plan or resync of it would write and delete wherever the link points, though an
+    /// unscoped run refuses to follow it (G-1). Refused by name before anything is planned; a link
+    /// strictly beneath the scope is protected by the walk as in an unscoped run.
+    #[error(
+        "remote path {path:?} on the requested scope is a NAS link ({cause}); a scoped run never \
+         writes or deletes through a link: run without --scope, or replace the link with a folder"
+    )]
+    RemoteLinkInScope { path: String, cause: String },
+
+    /// Most of what a run planned to write was refused by DSM for one class of cause, so the
+    /// cause is the share or the account rather than the paths. Every refused path is still named
+    /// as its own deferral; this names the class, what DSM answered, and a sample.
+    #[error(
+        "remote-refused-share-wide: {}: {refused} of the {considered} folders and files this run \
+         wrote or found in sync (including {in_sync} already in sync) were refused for one cause \
+         ({}); {not_attempted} planned writes were not attempted; the share or this account's \
+         rights on it are the likely problem; paths: {}{}",
+        .class.as_str(),
+        join_refusal_codes(.codes),
+        .sample.join(", "),
+        and_more(*.more)
+    )]
+    RemoteRefusalsShareWide {
+        class: RefusalClass,
+        refused: usize,
+        considered: usize,
+        /// Entries already in sync, counted in `considered` (BK-1).
+        in_sync: usize,
+        not_attempted: usize,
+        /// `operation:code` with how many refusals answered it, e.g. `SYNO.FileStation.Upload.upload:418`.
+        codes: Vec<(String, usize)>,
+        /// At most ten of the refused paths.
+        sample: Vec<String>,
+        /// How many refused paths `sample` leaves out.
+        more: usize,
+    },
+
+    /// Most entries of one kind that the link guard checked look like links to somewhere else,
+    /// which says DSM reports real paths in a shape this tool does not expect rather than that
+    /// they are real links (G-3). Nothing was synced; acting on it would skip the tree entry by
+    /// entry.
+    #[error(
+        "remote-real-path-unusable: {linked} of the {checked} NAS {kind} checked look like links \
+         to somewhere else, which points to DSM reporting real paths in a shape this tool does not \
+         expect rather than to real links; nothing was synced. Exclude the links by name if they \
+         are real; {kind}: {}{}",
+        .sample.join(", "),
+        and_more(*.more)
+    )]
+    RemoteRealPathUnusable {
+        /// `"folders"` or `"files"`.
+        kind: &'static str,
+        linked: usize,
+        checked: usize,
+        /// At most ten of the entries that look like links.
+        sample: Vec<String>,
+        /// How many `sample` leaves out.
+        more: usize,
     },
 
     #[error("required Synology API {0} was not reported by API discovery")]
@@ -219,9 +284,22 @@ impl Error {
         }
     }
 
-    /// For a refusal of one path, what it shares with other refusals of the same kind: the
-    /// operation and DSM's code (`"SYNO.FileStation.Upload.upload:418"`). A run that sees many
-    /// refusals with one key is looking at one cause, not many paths, and can say so once.
+    /// For a refusal of one path, the class of cause it shares with other refusals, whatever the
+    /// operation: a permission refusal of a folder create and of an upload are one cause (G-5).
+    ///
+    /// Every refusal has a class. A code with no class of its own is `CreateFailed`, which can
+    /// trip the share-wide breaker like any other: a refusal that counted towards nothing would
+    /// let a share-wide condition end a run green.
+    pub fn refusal_class(&self) -> Option<RefusalClass> {
+        match self {
+            Self::RemoteRefused { code, .. } => Some(RefusalClass::of_code(*code)),
+            _ => None,
+        }
+    }
+
+    /// For a refusal of one path, the operation and DSM's code
+    /// (`"SYNO.FileStation.Upload.upload:418"`): what a share-wide failure reports DSM answered.
+    /// Refusals are counted by [`Self::refusal_class`]; this only says what they were.
     pub fn refusal_cause_key(&self) -> Option<String> {
         match self {
             Self::RemoteRefused {
@@ -240,6 +318,64 @@ impl Error {
                 api == "SYNO.API.Auth" || matches!(*code, 106 | 107 | 119)
             }
             _ => false,
+        }
+    }
+}
+
+fn join_refusal_codes(codes: &[(String, usize)]) -> String {
+    codes
+        .iter()
+        .map(|(code, count)| format!("{code} x{count}"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn and_more(more: usize) -> String {
+    if more > 0 {
+        format!(", and {more} more")
+    } else {
+        String::new()
+    }
+}
+
+/// The class of cause a refusal of one path belongs to. See [`Error::refusal_class`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
+pub enum RefusalClass {
+    /// This account may not do it: 407, or 105 once the session was proven alive.
+    Permission,
+    /// The name or path: 400, 418, 412, 413 (inside a 1100) and 1802.
+    Name,
+    /// Too large for the destination filesystem: 1804.
+    Size,
+    /// Something is already there: 414.
+    Clash,
+    /// The parent folder holds as many items as DSM allows: 1101.
+    FolderLimit,
+    /// Folder creation failed for no recognised reason (1100), or any per-path code without a
+    /// class of its own.
+    CreateFailed,
+}
+
+impl RefusalClass {
+    pub fn of_code(code: i64) -> Self {
+        match code {
+            105 | 407 => Self::Permission,
+            400 | 412 | 413 | 418 | 1802 => Self::Name,
+            1804 => Self::Size,
+            414 => Self::Clash,
+            1101 => Self::FolderLimit,
+            _ => Self::CreateFailed,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Permission => "permission",
+            Self::Name => "name",
+            Self::Size => "size",
+            Self::Clash => "clash",
+            Self::FolderLimit => "folder-limit",
+            Self::CreateFailed => "create-failed",
         }
     }
 }
@@ -297,5 +433,96 @@ mod tests {
             Some("SYNO.FileStation.Upload.upload:418")
         );
         assert_eq!(Error::Cancelled.refusal_cause_key(), None);
+        assert_eq!(error.refusal_class(), Some(RefusalClass::Name));
+        assert_eq!(Error::Cancelled.refusal_class(), None);
+    }
+
+    /// G-5: refusals count by class, whatever the operation, and every code has one.
+    #[test]
+    fn refusals_are_classed_by_cause_not_by_operation() {
+        let refused = |operation: &str, code| Error::RemoteRefused {
+            operation: operation.to_owned(),
+            path: "/share/x".to_owned(),
+            code,
+            description: String::new(),
+        };
+        assert_eq!(
+            refused("SYNO.FileStation.CreateFolder.create", 407).refusal_class(),
+            refused("SYNO.FileStation.Upload.upload", 105).refusal_class()
+        );
+        for (code, class) in [
+            (407, RefusalClass::Permission),
+            (105, RefusalClass::Permission),
+            (400, RefusalClass::Name),
+            (418, RefusalClass::Name),
+            (1802, RefusalClass::Name),
+            (1804, RefusalClass::Size),
+            (414, RefusalClass::Clash),
+            (1101, RefusalClass::FolderLimit),
+            (1100, RefusalClass::CreateFailed),
+            (1999, RefusalClass::CreateFailed),
+        ] {
+            assert_eq!(RefusalClass::of_code(code), class, "{code}");
+        }
+    }
+
+    #[test]
+    fn a_share_wide_refusal_leads_with_its_token_and_names_the_cause() {
+        let error = Error::RemoteRefusalsShareWide {
+            class: RefusalClass::Name,
+            refused: 4,
+            considered: 5,
+            in_sync: 0,
+            not_attempted: 1,
+            codes: vec![("SYNO.FileStation.Upload.upload:418".to_owned(), 4)],
+            sample: vec!["a".to_owned(), "b".to_owned()],
+            more: 2,
+        };
+        let text = error.to_string();
+        assert!(
+            text.starts_with("remote-refused-share-wide: name: "),
+            "{text}"
+        );
+        assert!(text.contains("for one cause"), "{text}");
+        assert!(
+            text.contains("found in sync (including 0 already in sync)"),
+            "{text}"
+        );
+        assert!(text.contains(":418 x4"), "{text}");
+        assert!(text.ends_with("paths: a, b, and 2 more"), "{text}");
+        assert!(!text.contains("  "), "{text}");
+    }
+
+    #[test]
+    fn an_unusable_real_path_shape_leads_with_its_token() {
+        let text = Error::RemoteRealPathUnusable {
+            kind: "files",
+            linked: 5,
+            checked: 5,
+            sample: vec!["a.txt".to_owned()],
+            more: 4,
+        }
+        .to_string();
+        assert!(
+            text.starts_with("remote-real-path-unusable: 5 of the 5 NAS files"),
+            "{text}"
+        );
+        assert!(text.contains("nothing was synced"), "{text}");
+        assert!(text.ends_with("files: a.txt, and 4 more"), "{text}");
+        assert!(!text.contains("  "), "{text}");
+    }
+
+    #[test]
+    fn a_link_on_the_scope_names_the_path_and_the_way_out() {
+        let text = Error::RemoteLinkInScope {
+            path: "/team/r5/backup-link".to_owned(),
+            cause: "listed under the destination, but its real path is \"/volume1/team/x\""
+                .to_owned(),
+        }
+        .to_string();
+        assert!(text.contains("\"/team/r5/backup-link\""), "{text}");
+        assert!(text.contains("NAS link"), "{text}");
+        assert!(text.contains("run without --scope"), "{text}");
+        assert!(!text.contains("  "), "{text}");
     }
 }

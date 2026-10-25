@@ -274,8 +274,25 @@ impl LocalInventory {
 /// two walks disagree about which entries exist.
 #[derive(Clone)]
 pub struct IgnoreRules {
-    matcher: Gitignore,
-    /// Whether patterns match regardless of case and Unicode normalisation.
+    /// Patterns and paths compared NFC-composed, on every source, and regardless of case where the
+    /// source folds names.
+    ///
+    /// The planner pairs an NFC and an NFD spelling of one name on every platform, so the rules
+    /// treat them as one name too. Composed only on folding sources, an exclude typed `café/` on a
+    /// Linux (or DSM) source did not exclude the macOS-written NFD folder: its content was uploaded
+    /// into the folder the remote walk excluded, and every later run was partial (D3-4). The same
+    /// exclude typed NFD left the NAS's NFC folder deletable (V3-2). Both walks, every comparison
+    /// and every upload use this matcher, so the two sides agree about what exists.
+    composed: Gitignore,
+    /// The patterns as typed, matched against paths as spelled: the matcher earlier versions used
+    /// on a case-sensitive source.
+    ///
+    /// Kept for deletion only, where it is ORed with [`Self::composed`]: composing a negation
+    /// (`!café.txt`, typed NFC) can newly re-include an NFD NAS name the typed rules excluded, and
+    /// a change to how rules match must never turn a protected entry into a deletion candidate.
+    /// `None` on a folding source, where the typed rules were already matched composed.
+    exact: Option<Gitignore>,
+    /// Whether patterns match regardless of case.
     ///
     /// True when the source resolves names that way (Windows, macOS, most SMB shares). There
     /// `report.pdf` and `Report.pdf` are one file, so an exclude written for one spelling has to
@@ -291,7 +308,7 @@ impl std::fmt::Debug for IgnoreRules {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("IgnoreRules")
-            .field("patterns", &self.matcher.num_ignores())
+            .field("patterns", &self.composed.num_ignores())
             .finish()
     }
 }
@@ -316,14 +333,85 @@ impl IgnoreRules {
         })?;
         reject_filesystem_root(&source_root)?;
         let fold = resolves_names_case_insensitively(&source_root);
-        let mut builder = GitignoreBuilder::new(&source_root);
+        let default_file = source_root.join(DEFAULT_IGNORE_FILE);
+        let ignore_file = match fs::symlink_metadata(&default_file) {
+            Ok(metadata) => {
+                if is_link_or_reparse(&default_file, &metadata) || !metadata.is_file() {
+                    return Err(Error::UnsupportedLocalEntry {
+                        path: default_file,
+                        reason: ".sdsyncignore must be a regular file, not a link, reparse point, or directory"
+                            .to_owned(),
+                    });
+                }
+                // Read once, so both matchers are built from the same lines.
+                let text = fs::read_to_string(&default_file).map_err(|error| {
+                    Error::Message(format!(
+                        "invalid ignore file {}: {error}",
+                        default_file.display()
+                    ))
+                })?;
+                Some(text)
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(source) => {
+                return Err(Error::FileIo {
+                    path: default_file,
+                    source,
+                });
+            }
+        };
+        Self::compile(
+            &source_root,
+            fold,
+            ignore_file
+                .as_deref()
+                .map(|text| (default_file.as_path(), text)),
+            extra_patterns,
+        )
+    }
+
+    /// Both matchers from one set of lines: the built-in defaults, then the ignore file's, then the
+    /// command line's.
+    fn compile(
+        root: &Path,
+        fold: bool,
+        ignore_file: Option<(&Path, &str)>,
+        extra_patterns: &[String],
+    ) -> Result<Self> {
+        let composed = Self::matcher(root, fold, true, ignore_file, extra_patterns)?;
+        let exact = if fold {
+            None
+        } else {
+            Some(Self::matcher(
+                root,
+                false,
+                false,
+                ignore_file,
+                extra_patterns,
+            )?)
+        };
+        Ok(Self {
+            composed,
+            exact,
+            fold,
+        })
+    }
+
+    fn matcher(
+        root: &Path,
+        case_insensitive: bool,
+        compose: bool,
+        ignore_file: Option<(&Path, &str)>,
+        extra_patterns: &[String],
+    ) -> Result<Gitignore> {
+        let mut builder = GitignoreBuilder::new(root);
         builder
-            .case_insensitive(fold)
+            .case_insensitive(case_insensitive)
             .map_err(|error| Error::Message(format!("failed to build ignore rules: {error}")))?;
-        // Patterns are matched against composed (NFC) paths when names fold, so a pattern is
-        // composed too: macOS writes names decomposed, and either side may hold either form.
+        // macOS writes names decomposed, and either side may hold either form, so a composed
+        // matcher composes its patterns as well as the paths it is asked about.
         let pattern_form = |pattern: &str| -> String {
-            if fold {
+            if compose {
                 crate::path::nfc(pattern).into_owned()
             } else {
                 pattern.to_owned()
@@ -336,52 +424,20 @@ impl IgnoreRules {
                 Error::Message(format!("invalid built-in exclude {pattern:?}: {error}"))
             })?;
         }
-        let default_file = source_root.join(DEFAULT_IGNORE_FILE);
-        match fs::symlink_metadata(&default_file) {
-            Ok(metadata) => {
-                if is_link_or_reparse(&default_file, &metadata) || !metadata.is_file() {
-                    return Err(Error::UnsupportedLocalEntry {
-                        path: default_file,
-                        reason: ".sdsyncignore must be a regular file, not a link, reparse point, or directory"
-                            .to_owned(),
-                    });
-                }
-                let composed = if fold {
-                    fs::read_to_string(&default_file).ok()
+        if let Some((path, text)) = ignore_file {
+            // Line by line, as `GitignoreBuilder::add` reads the file, a leading byte-order mark
+            // included.
+            for (index, line) in text.lines().enumerate() {
+                let line = if index == 0 {
+                    line.trim_start_matches('\u{feff}')
                 } else {
-                    None
+                    line
                 };
-                match composed {
-                    // Line by line, exactly as `GitignoreBuilder::add` reads the file, with each
-                    // line composed.
-                    Some(text) => {
-                        for line in text.lines() {
-                            builder
-                                .add_line(Some(default_file.clone()), &pattern_form(line))
-                                .map_err(|error| {
-                                    Error::Message(format!(
-                                        "invalid ignore file {}: {error}",
-                                        default_file.display()
-                                    ))
-                                })?;
-                        }
-                    }
-                    None => {
-                        if let Some(error) = builder.add(&default_file) {
-                            return Err(Error::Message(format!(
-                                "invalid ignore file {}: {error}",
-                                default_file.display()
-                            )));
-                        }
-                    }
-                }
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(source) => {
-                return Err(Error::FileIo {
-                    path: default_file,
-                    source,
-                });
+                builder
+                    .add_line(Some(path.to_owned()), &pattern_form(line))
+                    .map_err(|error| {
+                        Error::Message(format!("invalid ignore file {}: {error}", path.display()))
+                    })?;
             }
         }
         for pattern in extra_patterns {
@@ -391,10 +447,17 @@ impl IgnoreRules {
                     Error::Message(format!("invalid --exclude pattern {pattern:?}: {error}"))
                 })?;
         }
-        let matcher = builder
+        builder
             .build()
-            .map_err(|error| Error::Message(format!("failed to build ignore rules: {error}")))?;
-        Ok(Self { matcher, fold })
+            .map_err(|error| Error::Message(format!("failed to build ignore rules: {error}")))
+    }
+
+    /// Rules built from `patterns` as if the source did (`fold`) or did not resolve names
+    /// regardless of case, whatever the host's own filesystem does.
+    #[cfg(test)]
+    pub(crate) fn for_source(fold: bool, patterns: &[&str]) -> Self {
+        let patterns: Vec<String> = patterns.iter().map(|value| (*value).to_owned()).collect();
+        Self::compile(&std::env::temp_dir(), fold, None, &patterns).expect("test patterns compile")
     }
 
     /// Rules that exclude nothing.
@@ -404,11 +467,14 @@ impl IgnoreRules {
     /// name and not of any pattern.
     pub fn none() -> Self {
         Self {
-            matcher: Gitignore::empty(),
+            composed: Gitignore::empty(),
+            exact: None,
             fold: false,
         }
     }
 
+    /// Whether the rules exclude `relative`: what both walks prune, and what every comparison and
+    /// upload leaves alone. Matched composed (NFC) on every source.
     pub fn is_ignored(&self, relative: &str, is_dir: bool) -> bool {
         if relative.is_empty() {
             return false;
@@ -418,18 +484,31 @@ impl IgnoreRules {
         if relative == DEFAULT_IGNORE_FILE {
             return true;
         }
-        if self.fold {
-            return self
-                .matcher
-                .matched_path_or_any_parents(path_for_match(&crate::path::nfc(relative)), is_dir)
-                .is_ignore();
-        }
-        self.matcher
-            .matched_path_or_any_parents(path_for_match(relative), is_dir)
+        self.composed
+            .matched_path_or_any_parents(path_for_match(&crate::path::nfc(relative)), is_dir)
             .is_ignore()
     }
 
-    /// Whether these rules match regardless of case and Unicode normalisation.
+    /// Whether the rules forbid deleting `relative`: [`Self::is_ignored`], or the patterns as typed
+    /// matching the path as spelled.
+    ///
+    /// Never narrower than [`Self::is_ignored`], and for deletion only. An entry only the typed
+    /// rules exclude is still walked, compared and uploaded to as the composed rules say; it is
+    /// never deleted, exactly as before the rules were composed.
+    pub fn excludes_for_deletion(&self, relative: &str, is_dir: bool) -> bool {
+        if self.is_ignored(relative, is_dir) {
+            return true;
+        }
+        !relative.is_empty()
+            && self.exact.as_ref().is_some_and(|exact| {
+                exact
+                    .matched_path_or_any_parents(path_for_match(relative), is_dir)
+                    .is_ignore()
+            })
+    }
+
+    /// Whether these rules match regardless of case. They always match regardless of Unicode
+    /// normalisation.
     pub fn folds_names(&self) -> bool {
         self.fold
     }
@@ -438,14 +517,33 @@ impl IgnoreRules {
 /// Whether the filesystem holding `root` resolves names regardless of case.
 ///
 /// Asked of the filesystem rather than assumed from the platform: a Linux host can mount an SMB
-/// share that folds, and a macOS volume can be case-sensitive. The root's own name is looked up
-/// with its letters' case swapped; the same directory answering means names fold. A root whose name
-/// has no cased letter cannot be asked, and the platform's usual answer stands.
+/// share that folds, and a macOS volume can be case-sensitive. Asked first inside the root, of one
+/// of its own entries, because the root may be a mount point whose parent is another filesystem: a
+/// USB exFAT `/volumeUSB1/usbshare` beneath a case-sensitive `/volumeUSB1`, or a CIFS mount, was
+/// answered by its parent and got case-sensitive excludes (D3-8). Only a root with nothing inside
+/// it to ask is answered by its own name in its parent, and only a root neither can ask takes the
+/// platform's usual answer.
 fn resolves_names_case_insensitively(root: &Path) -> bool {
-    let platform_default = cfg!(any(windows, target_os = "macos"));
-    let Some(name) = root.file_name().and_then(|name| name.to_str()) else {
-        return platform_default;
-    };
+    case_folding_verdict(
+        names_fold_inside(root),
+        || names_fold_beside(root),
+        cfg!(any(windows, target_os = "macos")),
+    )
+}
+
+/// The first probe that answers decides. The probes are never combined: a case-sensitive APFS
+/// volume beneath the case-insensitive `/Volumes` would then fold its rules, and an exclude of
+/// `report.pdf` would silently leave a distinct `Report.pdf` out of every run.
+fn case_folding_verdict(
+    inside: Option<bool>,
+    beside: impl FnOnce() -> Option<bool>,
+    platform_default: bool,
+) -> bool {
+    inside.or_else(beside).unwrap_or(platform_default)
+}
+
+/// `name` with the case of every ASCII letter swapped, or `None` when it has no ASCII letter.
+fn swap_ascii_case(name: &str) -> Option<String> {
     let swapped: String = name
         .chars()
         .map(|character| {
@@ -456,14 +554,84 @@ fn resolves_names_case_insensitively(root: &Path) -> bool {
             }
         })
         .collect();
-    if swapped == name {
-        return platform_default;
+    (swapped != name).then_some(swapped)
+}
+
+/// Ask the root's own filesystem: look up its first entry with a cased letter under the other case.
+///
+/// Absent under the other case, names are kept apart. Present, it is either the same entry (names
+/// fold) or a second entry spelled the other way (they do not), which [`same_entry`] tells apart.
+/// `None` when the root holds no such entry or could not be read; the next probe then answers.
+fn names_fold_inside(root: &Path) -> Option<bool> {
+    let entries = match fs::read_dir(root) {
+        Ok(entries) => entries,
+        // The walk reads the root next and reports this itself; here it only means this probe
+        // cannot answer.
+        Err(_) => return None,
+    };
+    let mut probe = None;
+    for entry in entries {
+        let Ok(entry) = entry else {
+            return None;
+        };
+        let name = entry.file_name();
+        if let Some(swapped) = name.to_str().and_then(swap_ascii_case) {
+            probe = Some((name, swapped));
+            break;
+        }
     }
+    let (name, swapped) = probe?;
+    match fs::symlink_metadata(root.join(&swapped)) {
+        Ok(_) => same_entry(root, &name, &swapped),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Some(false),
+        Err(_) => None,
+    }
+}
+
+/// Whether `name` and its case-swapped spelling `swapped`, both found in `root`, are one entry.
+#[cfg(unix)]
+fn same_entry(root: &Path, name: &std::ffi::OsStr, swapped: &str) -> Option<bool> {
+    use std::os::unix::fs::MetadataExt;
+    let (Ok(listed), Ok(looked_up)) = (
+        fs::symlink_metadata(root.join(name)),
+        fs::symlink_metadata(root.join(swapped)),
+    ) else {
+        return None;
+    };
+    Some(listed.dev() == looked_up.dev() && listed.ino() == looked_up.ino())
+}
+
+/// Whether `name` and its case-swapped spelling `swapped`, both found in `root`, are one entry.
+///
+/// No file identity is exposed here, so the listing decides: a second entry spelled the other way
+/// would be listed under that spelling.
+#[cfg(not(unix))]
+fn same_entry(root: &Path, _name: &std::ffi::OsStr, swapped: &str) -> Option<bool> {
+    let Ok(entries) = fs::read_dir(root) else {
+        return None;
+    };
+    for entry in entries {
+        let Ok(entry) = entry else {
+            return None;
+        };
+        if entry.file_name() == std::ffi::OsStr::new(swapped) {
+            return Some(false);
+        }
+    }
+    Some(true)
+}
+
+/// Ask the root's parent: look up the root's own name with its letters' case swapped; the same
+/// directory answering means names fold there. `None` when the name has no cased letter or the
+/// lookup failed for another reason than absence.
+fn names_fold_beside(root: &Path) -> Option<bool> {
+    let name = root.file_name().and_then(|name| name.to_str())?;
+    let swapped = swap_ascii_case(name)?;
     match fs::canonicalize(root.with_file_name(&swapped)) {
-        Ok(resolved) => resolved == root || same_directory(&resolved, root),
+        Ok(resolved) => Some(resolved == root || same_directory(&resolved, root)),
         // Absent under the other case: names are kept apart.
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
-        Err(_) => platform_default,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Some(false),
+        Err(_) => None,
     }
 }
 
@@ -1406,6 +1574,11 @@ fn is_administrative_share(share: &str) -> bool {
 /// carried -- but that used to fail the whole scan, so one such pair anywhere stopped every file
 /// from syncing. Both spellings are dropped here and nothing else is touched: the skip records make
 /// the planner treat both, and every remote spelling of them, as protected.
+///
+/// A spelling the walk already skipped (a link, an unreadable file, a refused name) is one side of
+/// such a pair too. Its sibling used to stay in the inventory, where the skip's fold shielded it
+/// from planning with nothing naming it: a `Notes.txt` beside a skipped `notes.txt` was never
+/// uploaded again, silently (D3-5). The sibling is now that pair's named collision.
 fn skip_portable_case_collisions(output: &mut ScanOutput) {
     let mut by_fold: BTreeMap<String, Vec<&String>> = BTreeMap::new();
     for relative in output.entries.keys() {
@@ -1414,10 +1587,18 @@ fn skip_portable_case_collisions(output: &mut ScanOutput) {
             .or_default()
             .push(relative);
     }
+    let skipped_by_fold: BTreeMap<String, &String> = output
+        .skipped
+        .iter()
+        .map(|skip| (crate::path::portable_fold(&skip.relative), &skip.relative))
+        .collect();
     let mut colliding: Vec<(String, String)> = Vec::new();
     let mut dropped_folds: BTreeSet<String> = BTreeSet::new();
     for (fold, spellings) in &by_fold {
-        if spellings.len() < 2 {
+        let skipped_spelling = skipped_by_fold
+            .get(fold)
+            .filter(|skipped| !spellings.contains(skipped));
+        if spellings.len() < 2 && skipped_spelling.is_none() {
             continue;
         }
         // Beneath a pair already dropped: its subtree goes with it, and one report is enough.
@@ -1425,12 +1606,20 @@ fn skip_portable_case_collisions(output: &mut ScanOutput) {
             continue;
         }
         dropped_folds.insert(fold.clone());
+        if let Some(skipped) = skipped_spelling {
+            // The skipped spelling is reported already, under its own reason.
+            for spelling in spellings {
+                colliding.push(((*spelling).clone(), (*skipped).clone()));
+            }
+            continue;
+        }
         for (index, spelling) in spellings.iter().enumerate() {
             let other = spellings[(index + 1) % spellings.len()];
             colliding.push(((*spelling).clone(), other.clone()));
         }
     }
     drop(by_fold);
+    drop(skipped_by_fold);
     for (relative, other) in colliding {
         let prefix = format!("{relative}/");
         let beneath: Vec<String> = output
@@ -2033,6 +2222,134 @@ mod tests {
             );
         }
         output
+    }
+
+    /// D3-5: a spelling the walk already skipped is one side of a case pair too. Its sibling is
+    /// that pair's named `local-case-collision`, with its subtree, rather than an entry the skip's
+    /// fold silently shields from every run.
+    #[test]
+    fn a_skipped_spelling_makes_its_case_variant_sibling_a_named_collision() {
+        let mut output = output_of(&[
+            ("Notes.txt", EntryKind::File),
+            ("Docs", EntryKind::Directory),
+            ("Docs/a.txt", EntryKind::File),
+            ("keep.txt", EntryKind::File),
+        ]);
+        output.skipped.push(SkippedEntry {
+            relative: "notes.txt".to_owned(),
+            reason: SkipReason::LinkOrReparsePoint,
+        });
+        output.skipped.push(SkippedEntry {
+            relative: "docs".to_owned(),
+            reason: SkipReason::Deferred {
+                detail: "local-permission-denied: unreadable".to_owned(),
+            },
+        });
+        skip_portable_case_collisions(&mut output);
+        assert_eq!(output.entries.keys().collect::<Vec<_>>(), ["keep.txt"]);
+        let named: Vec<(&str, &SkipReason)> = output
+            .skipped
+            .iter()
+            .map(|skip| (skip.relative.as_str(), &skip.reason))
+            .collect();
+        assert!(
+            named.contains(&(
+                "Notes.txt",
+                &SkipReason::LocalCaseCollision {
+                    other: "notes.txt".to_owned()
+                }
+            )),
+            "{named:?}"
+        );
+        assert!(
+            named.contains(&(
+                "Docs",
+                &SkipReason::LocalCaseCollision {
+                    other: "docs".to_owned()
+                }
+            )),
+            "{named:?}"
+        );
+        // The skipped spellings keep their own reasons, reported once.
+        assert_eq!(output.skipped.len(), 4, "{named:?}");
+    }
+
+    /// D3-4 / V3-2: the rules match regardless of Unicode normalisation on every source, not only
+    /// on one that folds case: a composed exclude covers a decomposed path and a decomposed exclude
+    /// a composed one. Case still folds only where the source folds it.
+    #[test]
+    fn excludes_match_either_normalisation_on_a_case_sensitive_source() {
+        let composed = IgnoreRules::for_source(false, &["caf\u{e9}/secret/"]);
+        assert!(composed.is_ignored("cafe\u{301}/secret/passwords.txt", false));
+        assert!(composed.is_ignored("caf\u{e9}/secret", true));
+        assert!(!composed.is_ignored("Caf\u{e9}/secret/passwords.txt", false));
+        let decomposed = IgnoreRules::for_source(false, &["cafe\u{301}/archive/"]);
+        assert!(decomposed.is_ignored("caf\u{e9}/archive", true));
+        assert!(decomposed.excludes_for_deletion("caf\u{e9}/archive/only.txt", false));
+        let folding = IgnoreRules::for_source(true, &["caf\u{e9}/secret/"]);
+        assert!(folding.is_ignored("cafe\u{301}/SECRET/x", false));
+    }
+
+    /// I-1: deletion is protected by the rules as typed as well as composed, so composing the
+    /// patterns never makes an entry deletable that the typed rules excluded. Everything the walks
+    /// exclude is protected too.
+    #[test]
+    fn deletion_protection_is_the_union_of_the_typed_and_composed_rules() {
+        let rules = IgnoreRules::for_source(false, &["*.txt", "!caf\u{e9}.txt"]);
+        assert!(!rules.is_ignored("cafe\u{301}.txt", false));
+        assert!(rules.excludes_for_deletion("cafe\u{301}.txt", false));
+        assert!(!rules.excludes_for_deletion("caf\u{e9}.txt", false));
+        assert!(rules.excludes_for_deletion("notes.txt", false));
+        assert!(!rules.excludes_for_deletion("notes.bin", false));
+        assert!(!rules.excludes_for_deletion("", true));
+        // A folding source matched composed before and still does: one matcher.
+        let folding = IgnoreRules::for_source(true, &["*.txt", "!caf\u{e9}.txt"]);
+        assert!(!folding.excludes_for_deletion("cafe\u{301}.txt", false));
+    }
+
+    /// D3-8: the first probe that answers decides whether names fold, and the probes are never
+    /// combined. A case-sensitive volume beneath a folding parent keeps case-sensitive rules.
+    #[test]
+    fn the_probe_inside_the_root_decides_before_the_one_beside_it() {
+        assert!(!case_folding_verdict(Some(false), || Some(true), true));
+        assert!(case_folding_verdict(Some(true), || Some(false), false));
+        assert!(case_folding_verdict(None, || Some(true), false));
+        assert!(!case_folding_verdict(None, || Some(false), true));
+        assert!(case_folding_verdict(None, || None, true));
+        assert!(!case_folding_verdict(None, || None, false));
+        let mut asked = false;
+        case_folding_verdict(
+            Some(false),
+            || {
+                asked = true;
+                None
+            },
+            true,
+        );
+        assert!(!asked, "an answer from inside the root is final");
+    }
+
+    /// D3-8: the probe inside the root asks the root's own filesystem about one of its entries.
+    #[test]
+    fn the_probe_inside_the_root_asks_its_own_entries() {
+        let root = temp_dir("case-probe-inside");
+        assert_eq!(names_fold_inside(&root), None, "nothing to ask");
+        fs::write(root.join("2024"), b"").unwrap();
+        assert_eq!(
+            names_fold_inside(&root),
+            None,
+            "no cased letter to ask with"
+        );
+        fs::write(root.join("Report.pdf"), b"r").unwrap();
+        let folds = names_fold_inside(&root).expect("a cased entry answers");
+        // Whatever the host's filesystem says, it is what a lookup of the other spelling says.
+        assert_eq!(folds, root.join("rEPORT.PDF").exists());
+        if !folds {
+            // Both spellings listed: two entries, kept apart.
+            fs::write(root.join("rEPORT.PDF"), b"other").unwrap();
+            assert_eq!(names_fold_inside(&root), Some(false));
+        }
+        fs::remove_dir_all(&root).unwrap();
     }
 
     /// A colliding pair is dropped with everything beneath it and reported once per spelling, and

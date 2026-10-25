@@ -1945,12 +1945,14 @@ name = "synology-drive-sync"
 version = "0.1.0"
 dependencies = [
  "apple-native-keyring-store",
+ "bytes",
  "clap",
  "clap_complete",
  "clap_mangen",
  "crc32fast",
  "ctrlc",
  "hmac",
+ "http-body",
  "icu_normalizer",
  "ignore",
  "keyring-core",

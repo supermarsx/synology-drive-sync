@@ -258,6 +258,15 @@ pub struct RemoteSnapshot {
 #[derive(Clone, Debug)]
 pub struct DeleteAction {
     pub relative: String,
+    /// Where the entry's local counterpart would be: [`Self::relative`] through the plan's
+    /// pairing, so spelled the local way under a case-renamed or a normalisation-paired folder.
+    ///
+    /// Recorded at plan time, from the one pairing the plan used to decide that the entry is
+    /// absent locally, so execution re-checks the path the planner checked. Derived again at
+    /// execution from the renames alone, a file recreated under an NFD folder paired with the NAS's
+    /// NFC one read as absent, and its NAS copy was deleted beside it (D3-6); a kept deletion under
+    /// a renamed folder was looked up by its NAS spelling and never uploaded (D3-7).
+    pub local_relative: String,
     pub remote_path: String,
     pub kind: EntryKind,
     pub type_conflict: bool,
@@ -326,6 +335,13 @@ pub struct SyncPlan {
     /// used to fail the whole run; now only its own path is left alone, on both sides, and the run
     /// reports it.
     pub skipped: Vec<SkippedEntry>,
+    /// NAS folders the remote walk listed, or passed through on the way to the scope, without a
+    /// real path to check their entries against, so a link there was walked like a folder (G-11).
+    ///
+    /// Not the planner's to know: the caller sets it from the walk the plan was built on
+    /// ([`crate::api::ScopedRemoteInventory::link_guard_unchecked`]). Zero means the link guard ran
+    /// everywhere it was needed; more is a lasting, named warning.
+    pub link_guard_unchecked: usize,
 }
 
 impl SyncPlan {
@@ -403,7 +419,7 @@ fn deletion_guard_candidates(
         // size alone. See `deletion_snapshot`.
         if entry.kind != EntryKind::File
             || entry.size == 0
-            || is_protected(entry, rules)
+            || is_protected(entry, rules, &resolution.pairs)
             || resolution.shield.covers(&entry.relative)
             || resolution.is_leftover(&entry.relative)
         {
@@ -513,7 +529,7 @@ fn comparison_candidates(
         };
         if remote_entry.kind == EntryKind::File
             && remote_entry.size == local_entry.size
-            && !is_protected(remote_entry, rules)
+            && !is_excluded_from_comparison(remote_entry, rules, &resolution.pairs)
         {
             selected.insert(remote_entry.relative.clone());
         }
@@ -606,7 +622,7 @@ fn strong_candidates(
         if entry.kind != EntryKind::File
             || entry.size == 0
             || pairs.local_of(local, &entry.relative).is_some()
-            || is_protected(entry, rules)
+            || is_protected(entry, rules, pairs)
             || resolution.shield.covers(&entry.relative)
             || resolution.is_leftover(&entry.relative)
             || has_local_file_ancestor(&entry.relative, local)
@@ -734,6 +750,7 @@ pub fn build_plan(
         protected_entries: 0,
         upload_bytes: 0,
         skipped,
+        link_guard_unchecked: 0,
     };
     let pairs = &resolution.pairs;
     let shield = &resolution.shield;
@@ -810,6 +827,7 @@ pub fn build_plan(
             (EntryKind::Directory, EntryKind::File) => {
                 push_predelete(
                     &mut plan,
+                    pairs,
                     remote_entry,
                     &remote.entries,
                     options.compare,
@@ -826,13 +844,14 @@ pub fn build_plan(
             (EntryKind::File, EntryKind::Directory) => {
                 let subtree = remote_subtree(&remote.entries, &remote_entry.relative);
                 if subtree.iter().any(|candidate| {
-                    is_protected(candidate, rules) || shield.covers(&candidate.relative)
+                    is_protected(candidate, rules, pairs) || shield.covers(&candidate.relative)
                 }) {
                     return Err(Error::ProtectedConflict(remote_entry.remote_path.clone()));
                 }
                 for candidate in subtree {
                     push_predelete(
                         &mut plan,
+                        pairs,
                         candidate,
                         &remote.entries,
                         options.compare,
@@ -871,7 +890,9 @@ pub fn build_plan(
         // finished, a warning on every run until someone renames it in File Station.
         if let Some(kept) = remote_subtree(&remote.entries, remote_spelling)
             .into_iter()
-            .find(|candidate| is_protected(candidate, rules) || shield.covers(&candidate.relative))
+            .find(|candidate| {
+                is_protected(candidate, rules, pairs) || shield.covers(&candidate.relative)
+            })
         {
             plan.skipped.push(SkippedEntry {
                 relative: local_spelling.clone(),
@@ -906,7 +927,7 @@ pub fn build_plan(
     let mut protected_by: HashMap<String, String> = HashMap::new();
     let mut protected_dirs = HashSet::new();
     for entry in remote.entries.values().filter(|_| options.delete) {
-        if is_protected(entry, rules) {
+        if is_protected(entry, rules, pairs) {
             plan.protected_entries += 1;
             add_ancestor_directories(&entry.relative, &mut protected_dirs);
             let mut current = entry.relative.as_str();
@@ -957,7 +978,7 @@ pub fn build_plan(
             if !options.scope.matches(&entry.relative) {
                 continue;
             }
-            if is_protected(entry, rules) {
+            if is_protected(entry, rules, pairs) {
                 continue;
             }
             // A path the local walk skipped, or whose spelling the plan could not resolve, is
@@ -989,6 +1010,7 @@ pub fn build_plan(
             }
             plan.post_deletes.push(DeleteAction {
                 relative: entry.relative.clone(),
+                local_relative: pairs.local_relative(&entry.relative).into_owned(),
                 remote_path: entry.remote_path.clone(),
                 kind: entry.kind,
                 type_conflict: false,
@@ -1168,33 +1190,42 @@ impl Correspondence {
             .get(self.remote_relative(local_relative).as_ref())
     }
 
-    /// The local counterpart of a remote path, through the same pairing in reverse.
+    /// The local spelling of a remote path, through the same pairing in reverse.
     ///
-    /// A path inside a paired directory is looked up under the directory's local spelling. For a
-    /// case-only rename the directory is the only pair there is: `Photos/a.jpg` on the NAS is
-    /// `photos/a.jpg` locally, and looked up by its own spelling it read as remote-only -- a
-    /// deletion candidate.
+    /// A path inside a paired directory takes the directory's local spelling. For a case-only
+    /// rename the directory is the only pair there is: `Photos/a.jpg` on the NAS is `photos/a.jpg`
+    /// locally, and asked by its own spelling it read as remote-only -- a deletion candidate. The
+    /// part of the path beneath the paired directory keeps the NAS bytes, because no other local
+    /// spelling of it is known.
+    pub(crate) fn local_relative<'a>(&self, remote_relative: &'a str) -> Cow<'a, str> {
+        if self.to_local.is_empty() {
+            return Cow::Borrowed(remote_relative);
+        }
+        if let Some(local_relative) = self.to_local.get(remote_relative) {
+            return Cow::Owned(local_relative.clone());
+        }
+        let mut current = remote_relative;
+        while let Some((parent, _)) = current.rsplit_once('/') {
+            if let Some(local_parent) = self.to_local.get(parent) {
+                return Cow::Owned(format!(
+                    "{local_parent}{}",
+                    &remote_relative[parent.len()..]
+                ));
+            }
+            current = parent;
+        }
+        Cow::Borrowed(remote_relative)
+    }
+
+    /// The local counterpart of a remote path, at its [`Self::local_relative`] spelling.
     pub(crate) fn local_of<'l>(
         &self,
         local: &'l LocalInventory,
         remote_relative: &str,
     ) -> Option<&'l LocalEntry> {
-        if let Some(local_relative) = self.to_local.get(remote_relative) {
-            return local.entries.get(local_relative);
-        }
-        if !self.to_local.is_empty() {
-            let mut current = remote_relative;
-            while let Some((parent, _)) = current.rsplit_once('/') {
-                if let Some(local_parent) = self.to_local.get(parent) {
-                    return local.entries.get(&format!(
-                        "{local_parent}{}",
-                        &remote_relative[parent.len()..]
-                    ));
-                }
-                current = parent;
-            }
-        }
-        local.entries.get(remote_relative)
+        local
+            .entries
+            .get(self.local_relative(remote_relative).as_ref())
     }
 
     /// True for a remote spelling that is the partner of a differently spelled local entry.
@@ -1300,8 +1331,46 @@ pub(crate) fn resolve(
         pairs.insert(local_spelling, remote_spelling);
     }
     resolution.pairs = pairs;
+    shield_paired_exclusions(local, rules, &mut resolution);
     shield_type_conflicts(local, remote, rules, delete, &mut resolution);
     resolution
+}
+
+/// Keep out of the plan every local entry whose paired NAS spelling the rules exclude.
+///
+/// The rules exclude an entry under either spelling of its pair, on both sides. A case-only rename
+/// pairs the local `photos/raw/x` with the NAS `Photos/raw/x`. An exclude of `Photos/raw/` kept the
+/// remote walk out of the NAS folder, but the local walk, matching the local spelling, carried the
+/// local content, and the plan uploaded it into the excluded NAS folder; the upload's precondition
+/// refused it as `remote-changed`, on every run (V3-1). The entry is now shielded, so it is neither
+/// uploaded, compared nor counted as present or absent, and is not reported, as excluded content
+/// never is. The rename above it waits as the named `case-rename-pending`, because the excluded NAS
+/// entry beneath the old spelling is protected.
+fn shield_paired_exclusions(
+    local: &LocalInventory,
+    rules: &IgnoreRules,
+    resolution: &mut Resolution,
+) {
+    if resolution.pairs.to_remote.is_empty() {
+        return;
+    }
+    for entry in local.entries.values() {
+        if resolution.shield.covers(&entry.relative) {
+            continue;
+        }
+        let remote_relative = resolution.pairs.remote_relative(&entry.relative);
+        if remote_relative == entry.relative.as_str() {
+            continue;
+        }
+        if is_dsm_managed(&remote_relative)
+            || rules.is_ignored(&remote_relative, entry.kind == EntryKind::Directory)
+        {
+            resolution
+                .shield
+                .folds
+                .insert(portable_fold(&entry.relative));
+        }
+    }
 }
 
 /// Skip, and shield, every local/remote kind conflict this run cannot carry.
@@ -1338,6 +1407,18 @@ fn shield_type_conflicts(
                 SkipReason::RemoteLink {
                     remote_path: remote_entry.remote_path.clone(),
                 }
+            } else if mount_type == crate::api::UNLISTABLE_ENTRY_MOUNT_TYPE {
+                // Its contents are unknown, not absent: planned as new files, the local content
+                // would be uploaded over whatever the account may not see (ADV3-P-3). A lasting
+                // `remote-unreadable`, named on every run until someone changes the rights.
+                SkipReason::Deferred {
+                    detail: format!(
+                        "remote-unreadable: {:?} cannot be listed by this account; nothing is \
+                         uploaded, compared or deleted beneath it; grant this account list \
+                         permission on it or exclude it",
+                        remote_entry.remote_path
+                    ),
+                }
             } else {
                 SkipReason::TypeConflict {
                     detail: format!(
@@ -1368,7 +1449,8 @@ fn shield_type_conflicts(
             remote_subtree(&remote.entries, &remote_entry.relative)
                 .into_iter()
                 .find(|candidate| {
-                    is_protected(candidate, rules) || resolution.shield.covers(&candidate.relative)
+                    is_protected(candidate, rules, &resolution.pairs)
+                        || resolution.shield.covers(&candidate.relative)
                 })
                 .map(|kept| {
                     format!(
@@ -1449,7 +1531,7 @@ fn resolve_spellings(
             remote
                 .entries
                 .values()
-                .filter(|entry| !is_protected(entry, rules))
+                .filter(|entry| !is_protected_as_spelled(entry, rules))
                 .map(|entry| (entry.relative.as_str(), false)),
         );
     for (relative, is_local) in considered {
@@ -1668,6 +1750,7 @@ fn overwritten_snapshot(remote: &RemoteEntry) -> RemoteSnapshot {
 
 fn push_predelete(
     plan: &mut SyncPlan,
+    pairs: &Correspondence,
     remote: &RemoteEntry,
     remote_entries: &BTreeMap<String, RemoteEntry>,
     compare: CompareMode,
@@ -1676,6 +1759,7 @@ fn push_predelete(
     if predeleted.insert(remote.relative.clone()) {
         plan.pre_deletes.push(DeleteAction {
             relative: remote.relative.clone(),
+            local_relative: pairs.local_relative(&remote.relative).into_owned(),
             remote_path: remote.remote_path.clone(),
             kind: remote.kind,
             type_conflict: true,
@@ -1790,7 +1874,7 @@ fn replace_uploads_with_server_copies(
         if entry.kind != EntryKind::File
             || entry.size == 0
             || pairs.local_of(local, &entry.relative).is_some()
-            || is_protected(entry, rules)
+            || is_protected(entry, rules, pairs)
             || predeleted.contains(entry.relative.as_str())
             || shield.covers(&entry.relative)
             || resolution.is_leftover(&entry.relative)
@@ -1892,10 +1976,66 @@ fn remote_subtree<'a>(
         .collect()
 }
 
-fn is_protected(entry: &RemoteEntry, rules: &IgnoreRules) -> bool {
+/// Whether the plan must leave `entry` as it is: never delete it, replace it, or rename what holds
+/// it. The one predicate every deletion, replacement and rename decision asks.
+///
+/// A mount point or link, a DSM-managed entry, or one the rules exclude under either spelling of
+/// its pair: its NAS spelling, or the local spelling a case-only rename or a Unicode normalisation
+/// pair gives it. Asked of the NAS spelling alone, an exclude written the way the source now spells
+/// a renamed folder (`photos/raw/`) did not cover the folder's NAS spelling (`Photos/raw/`), and
+/// the run that renamed the folder first deleted its NAS-only content (D3-2). The rules answer as
+/// they do for deletion ([`IgnoreRules::excludes_for_deletion`]), so no entry protected before the
+/// rules were composed became deletable.
+fn is_protected(entry: &RemoteEntry, rules: &IgnoreRules, pairs: &Correspondence) -> bool {
+    if is_protected_as_spelled(entry, rules) {
+        return true;
+    }
+    let local = pairs.local_relative(&entry.relative);
+    local != entry.relative.as_str()
+        && (is_dsm_managed(&local)
+            || rules.excludes_for_deletion(&local, entry.kind == EntryKind::Directory))
+}
+
+/// [`is_protected`] by the NAS spelling alone: for the spelling resolution, which decides the
+/// pairing and so cannot consult it. Every later decision asks [`is_protected`].
+fn is_protected_as_spelled(entry: &RemoteEntry, rules: &IgnoreRules) -> bool {
     entry.mount_point_type.is_some()
         || is_dsm_managed(&entry.relative)
-        || rules.is_ignored(&entry.relative, entry.kind == EntryKind::Directory)
+        || rules.excludes_for_deletion(&entry.relative, entry.kind == EntryKind::Directory)
+}
+
+/// Whether a comparison or a status row treats `entry` as excluded: [`is_protected`], with the
+/// rules as both walks apply them ([`IgnoreRules::is_ignored`]).
+///
+/// Narrower than [`is_protected`] on purpose. An entry only the rules as typed exclude is walked,
+/// compared and written as payload, and never deleted; comparing it as excluded while its local
+/// partner is payload would upload into a path this side calls excluded, on every run.
+fn is_excluded_from_comparison(
+    entry: &RemoteEntry,
+    rules: &IgnoreRules,
+    pairs: &Correspondence,
+) -> bool {
+    let is_dir = entry.kind == EntryKind::Directory;
+    if entry.mount_point_type.is_some()
+        || is_dsm_managed(&entry.relative)
+        || rules.is_ignored(&entry.relative, is_dir)
+    {
+        return true;
+    }
+    let local = pairs.local_relative(&entry.relative);
+    local != entry.relative.as_str() && (is_dsm_managed(&local) || rules.is_ignored(&local, is_dir))
+}
+
+/// Whether a folder in `folders` holds `relative`, at any depth.
+fn is_beneath_any(relative: &str, folders: &HashSet<&str>) -> bool {
+    let mut current = relative;
+    while let Some((parent, _)) = current.rsplit_once('/') {
+        if folders.contains(parent) {
+            return true;
+        }
+        current = parent;
+    }
+    false
 }
 
 fn local_mtime_seconds(local: &LocalEntry) -> i64 {
@@ -2401,18 +2541,31 @@ pub fn build_status_page(
     let mut next_cursor = None;
     let after = query.cursor.map(StatusCursor::as_str);
 
+    // NAS mount points and links. What the source holds beneath one is never compared or written
+    // (`resolve` shields it in a plan), so a status row must not call it missing on the NAS and
+    // offer to upload it there (L-1).
+    let mounts: HashSet<&str> = remote
+        .entries
+        .values()
+        .filter(|entry| entry.mount_point_type.is_some())
+        .map(|entry| entry.relative.as_str())
+        .collect();
     for relative in keys {
         let local_entry = local.entries.get(relative);
         let remote_entry = match local_entry {
             Some(_) => pairs.remote_of(remote, relative),
             None => remote.entries.get(relative),
         };
+        let beneath_mount =
+            !mounts.is_empty() && is_beneath_any(&pairs.remote_relative(relative), &mounts);
         let entry = classify(
             root,
             local_entry,
             remote_entry,
             excluded,
             rules,
+            &pairs,
+            beneath_mount,
             query,
             relative,
         )?;
@@ -2588,12 +2741,15 @@ fn accumulate(stats: &mut StatusStats, entry: &StatusEntry) {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn classify(
     root: &RemoteRoot,
     local_entry: Option<&LocalEntry>,
     remote_entry: Option<&RemoteEntry>,
     excluded: &BTreeSet<String>,
     rules: &IgnoreRules,
+    pairs: &Correspondence,
+    beneath_mount: bool,
     query: &StatusQuery<'_>,
     relative: &str,
 ) -> Result<StatusEntry> {
@@ -2609,7 +2765,11 @@ fn classify(
         None => root.join(relative)?,
     };
 
-    let state = if let Some(entry) = remote_entry.filter(|entry| is_protected(entry, rules)) {
+    let state = if beneath_mount {
+        StatusState::Excluded(ExclusionCause::MountBoundary)
+    } else if let Some(entry) =
+        remote_entry.filter(|entry| is_excluded_from_comparison(entry, rules, pairs))
+    {
         StatusState::Excluded(if entry.mount_point_type.is_some() {
             ExclusionCause::MountBoundary
         } else if is_dsm_managed(&entry.relative) {
@@ -3502,6 +3662,292 @@ mod tests {
                 ["Build/out.o", "Build", "Report.pdf", "stale.txt"]
             );
         }
+    }
+
+    /// The case-rename-pending deferrals a plan names, by path.
+    fn renames_pending(plan: &SyncPlan) -> Vec<&str> {
+        plan.skipped
+            .iter()
+            .filter(|skip| {
+                matches!(&skip.reason, SkipReason::Deferred { detail }
+                    if detail.starts_with("case-rename-pending"))
+            })
+            .map(|skip| skip.relative.as_str())
+            .collect()
+    }
+
+    /// D3-2 (S1): an exclude spelled the way the source now spells a case-renamed folder protects
+    /// the NAS-only content beneath the folder's old NAS spelling, on either kind of source. Nothing
+    /// there is deleted, and the rename waits, named, because it would move excluded content.
+    #[test]
+    fn an_exclude_on_the_local_spelling_protects_the_nas_spelling_of_a_renamed_folder() {
+        let root = RemoteRoot::parse("/share/root").unwrap();
+        for fold in [false, true] {
+            let plan = build_plan(
+                &root,
+                &local(&[
+                    ("photos", EntryKind::Directory, 0, 0),
+                    ("photos/keep.jpg", EntryKind::File, 1, 1_000),
+                ]),
+                &remote(&[
+                    ("Photos", EntryKind::Directory, 0, 0),
+                    ("Photos/keep.jpg", EntryKind::File, 1, 1),
+                    ("Photos/raw", EntryKind::Directory, 0, 0),
+                    ("Photos/raw/IMG_0001.CR2", EntryKind::File, 9, 1),
+                ]),
+                &IgnoreRules::for_source(fold, &["photos/raw/"]),
+                &options(true),
+            )
+            .unwrap();
+            assert!(
+                deleted(&plan).is_empty(),
+                "fold={fold}: {:?}",
+                deleted(&plan)
+            );
+            assert!(plan.renames.is_empty(), "fold={fold}");
+            assert_eq!(renames_pending(&plan), ["photos"], "fold={fold}");
+            assert_eq!(plan.protected_entries, 2, "fold={fold}");
+        }
+    }
+
+    /// V3-1: the inverse. The exclude names the NAS spelling; the local content under the new
+    /// spelling is excluded with it, so the plan writes nothing into the NAS folder the remote walk
+    /// excluded, deletes nothing, and names the rename as waiting.
+    #[test]
+    fn an_exclude_on_the_nas_spelling_excludes_the_local_content_of_a_renamed_folder() {
+        let root = RemoteRoot::parse("/share/root").unwrap();
+        let plan = build_plan(
+            &root,
+            &local(&[
+                ("photos", EntryKind::Directory, 0, 0),
+                ("photos/keep.jpg", EntryKind::File, 1, 1_000),
+                ("photos/raw", EntryKind::Directory, 0, 0),
+                ("photos/raw/IMG_0001.CR2", EntryKind::File, 5, 1_000),
+                ("photos/raw/new", EntryKind::Directory, 0, 0),
+            ]),
+            // The remote walk records the excluded folder and does not descend into it.
+            &remote(&[
+                ("Photos", EntryKind::Directory, 0, 0),
+                ("Photos/keep.jpg", EntryKind::File, 1, 1),
+                ("Photos/raw", EntryKind::Directory, 0, 0),
+            ]),
+            &IgnoreRules::for_source(false, &["Photos/raw/"]),
+            &options(true),
+        )
+        .unwrap();
+        assert!(uploaded(&plan).is_empty(), "{:?}", uploaded(&plan));
+        assert!(plan.creates.is_empty(), "{:?}", plan.creates);
+        assert!(deleted(&plan).is_empty(), "{:?}", deleted(&plan));
+        assert!(plan.renames.is_empty());
+        assert_eq!(renames_pending(&plan), ["photos"]);
+        // Excluded, not skipped: nothing else is reported about it.
+        assert_eq!(plan.skipped.len(), 1, "{:?}", plan.skipped);
+    }
+
+    /// F-3: a local file where the NAS holds a folder whose child is excluded only under its local
+    /// spelling is that path's `type-conflict` skip, with nothing deleted. With the type-conflict
+    /// shield and the planner's own backstop asking different questions, the backstop failed the
+    /// whole run instead (`ProtectedConflict`).
+    #[test]
+    fn a_folder_protected_under_its_local_spelling_is_a_type_conflict_skip() {
+        let root = RemoteRoot::parse("/share/root").unwrap();
+        let plan = build_plan(
+            &root,
+            &local(&[
+                ("photos", EntryKind::Directory, 0, 0),
+                ("photos/raw", EntryKind::File, 1, 1_000),
+            ]),
+            &remote(&[
+                ("Photos", EntryKind::Directory, 0, 0),
+                ("Photos/raw", EntryKind::Directory, 0, 0),
+                ("Photos/raw/x.CR2", EntryKind::File, 9, 1),
+            ]),
+            &IgnoreRules::for_source(false, &["photos/raw/x.CR2"]),
+            &options(true),
+        )
+        .expect("a type conflict over protected content is a skip, never a run failure");
+        assert!(
+            skips(&plan).contains(&("photos/raw", "type-conflict")),
+            "{:?}",
+            plan.skipped
+        );
+        assert!(deleted(&plan).is_empty(), "{:?}", deleted(&plan));
+        assert!(uploaded(&plan).is_empty());
+        assert_eq!(renames_pending(&plan), ["photos"]);
+    }
+
+    /// I-1, monotone: composing the patterns must not let a composed negation expose a decomposed
+    /// NAS-only name the rules as typed excluded. `*.txt` with `!café.txt` typed composed, against
+    /// a NAS-only decomposed `café.txt` on a case-sensitive source: still protected, as before.
+    #[test]
+    fn a_composed_negation_never_makes_a_protected_entry_deletable() {
+        let root = RemoteRoot::parse("/share/root").unwrap();
+        let rules = IgnoreRules::for_source(false, &["*.txt", "!caf\u{e9}.txt"]);
+        assert!(
+            !rules.is_ignored("cafe\u{301}.txt", false),
+            "composed, the negation re-includes it for the walks"
+        );
+        assert!(rules.excludes_for_deletion("cafe\u{301}.txt", false));
+        let plan = build_plan(
+            &root,
+            &local(&[("keep.bin", EntryKind::File, 1, 1_000)]),
+            &remote(&[
+                ("keep.bin", EntryKind::File, 1, 1),
+                ("cafe\u{301}.txt", EntryKind::File, 9, 1),
+                ("stale.bin", EntryKind::File, 1, 1),
+            ]),
+            &rules,
+            &options(true),
+        )
+        .unwrap();
+        assert_eq!(deleted(&plan), ["stale.bin"]);
+        assert_eq!(plan.protected_entries, 1);
+    }
+
+    /// F-5: every deletion carries the local spelling the plan checked for absence, under a
+    /// case-renamed and under a normalisation-paired folder alike.
+    #[test]
+    fn a_deletion_records_the_local_spelling_it_was_planned_on() {
+        let root = RemoteRoot::parse("/share/root").unwrap();
+        let plan = build_plan(
+            &root,
+            &local(&[
+                ("cafe\u{301}", EntryKind::Directory, 0, 0),
+                ("cafe\u{301}/keep.txt", EntryKind::File, 1, 1_000),
+                ("photos", EntryKind::Directory, 0, 0),
+                ("photos/keep.jpg", EntryKind::File, 1, 1_000),
+                ("plain", EntryKind::Directory, 0, 0),
+            ]),
+            &remote(&[
+                ("caf\u{e9}", EntryKind::Directory, 0, 0),
+                ("caf\u{e9}/keep.txt", EntryKind::File, 1, 1),
+                ("caf\u{e9}/gone.txt", EntryKind::File, 1, 1),
+                ("Photos", EntryKind::Directory, 0, 0),
+                ("Photos/keep.jpg", EntryKind::File, 1, 1),
+                ("Photos/gone.jpg", EntryKind::File, 1, 1),
+                ("plain", EntryKind::Directory, 0, 0),
+                ("plain/gone.bin", EntryKind::File, 1, 1),
+            ]),
+            &rules(&[]),
+            &options(true),
+        )
+        .unwrap();
+        let recorded: BTreeMap<&str, &str> = plan
+            .post_deletes
+            .iter()
+            .map(|action| (action.relative.as_str(), action.local_relative.as_str()))
+            .collect();
+        assert_eq!(
+            recorded.get("caf\u{e9}/gone.txt").copied(),
+            Some("cafe\u{301}/gone.txt")
+        );
+        assert_eq!(
+            recorded.get("Photos/gone.jpg").copied(),
+            Some("photos/gone.jpg")
+        );
+        assert_eq!(
+            recorded.get("plain/gone.bin").copied(),
+            Some("plain/gone.bin")
+        );
+    }
+
+    /// A remote inventory whose folder `relative` DSM refused to list to this account, as the
+    /// remote walk records it: kept, marked, and with nothing beneath it.
+    fn with_unlistable(mut remote: RemoteInventory, relative: &str) -> RemoteInventory {
+        remote
+            .entries
+            .get_mut(relative)
+            .expect("the unlistable folder is in its parent's listing")
+            .mount_point_type = Some(crate::api::UNLISTABLE_ENTRY_MOUNT_TYPE.to_owned());
+        remote
+    }
+
+    /// ADV3-P-3: a refusal is never absence. Local content at or beneath a NAS folder the account
+    /// may not list is not uploaded as new files over whatever is there; it is the lasting
+    /// `remote-unreadable`, named. Everything else syncs.
+    #[test]
+    fn local_content_beneath_an_unlistable_nas_folder_is_named_and_never_planned() {
+        let root = RemoteRoot::parse("/share/root").unwrap();
+        let plan = build_plan(
+            &root,
+            &local(&[
+                ("new.txt", EntryKind::File, 1, 1_000),
+                ("secret", EntryKind::Directory, 0, 0),
+                ("secret/x.txt", EntryKind::File, 1, 1_000),
+                ("secret/sub", EntryKind::Directory, 0, 0),
+            ]),
+            &with_unlistable(
+                remote(&[
+                    ("secret", EntryKind::Directory, 0, 0),
+                    ("stale.txt", EntryKind::File, 1, 1),
+                ]),
+                "secret",
+            ),
+            &rules(&[]),
+            &options(true),
+        )
+        .unwrap();
+        assert_eq!(uploaded(&plan), [("new.txt", "/share/root/new.txt")]);
+        assert!(plan.creates.is_empty(), "{:?}", plan.creates);
+        assert_eq!(deleted(&plan), ["stale.txt"]);
+        let named: Vec<&SkippedEntry> = plan
+            .skipped
+            .iter()
+            .filter(|skip| skip.relative == "secret")
+            .collect();
+        assert!(
+            matches!(named.as_slice(), [SkippedEntry { reason: SkipReason::Deferred { detail }, .. }]
+                if detail.starts_with("remote-unreadable: ")),
+            "{:?}",
+            plan.skipped
+        );
+        assert!(!crate::sync::skip_is_transient_deferral(named[0]));
+    }
+
+    /// ADV3-P-3: a NAS folder the account may not list, absent locally, is kept under `--delete`
+    /// with its ancestors, and a case-only rename above it waits, named, rather than moving it.
+    #[test]
+    fn an_unlistable_nas_folder_is_never_deleted_or_moved() {
+        let root = RemoteRoot::parse("/share/root").unwrap();
+        let plan = build_plan(
+            &root,
+            &local(&[("keep.txt", EntryKind::File, 1, 1_000)]),
+            &with_unlistable(
+                remote(&[
+                    ("keep.txt", EntryKind::File, 1, 1),
+                    ("a", EntryKind::Directory, 0, 0),
+                    ("a/locked", EntryKind::Directory, 0, 0),
+                ]),
+                "a/locked",
+            ),
+            &rules(&[]),
+            &options(true),
+        )
+        .unwrap();
+        assert!(deleted(&plan).is_empty(), "{:?}", deleted(&plan));
+        assert_eq!(plan.protected_entries, 1);
+
+        let plan = build_plan(
+            &root,
+            &local(&[
+                ("photos", EntryKind::Directory, 0, 0),
+                ("photos/keep.jpg", EntryKind::File, 1, 1_000),
+            ]),
+            &with_unlistable(
+                remote(&[
+                    ("Photos", EntryKind::Directory, 0, 0),
+                    ("Photos/keep.jpg", EntryKind::File, 1, 1),
+                    ("Photos/locked", EntryKind::Directory, 0, 0),
+                ]),
+                "Photos/locked",
+            ),
+            &rules(&[]),
+            &options(true),
+        )
+        .unwrap();
+        assert!(plan.renames.is_empty());
+        assert_eq!(renames_pending(&plan), ["photos"]);
+        assert!(deleted(&plan).is_empty(), "{:?}", deleted(&plan));
     }
 
     /// ADV-E-3: a path the destination cannot hold once its prefix is prepended is that path's
@@ -5121,6 +5567,42 @@ mod status_tests {
         assert_eq!(page.stats.excluded_entries, 1);
     }
 
+    /// L-1: a local file beneath a NAS link or mount point is never compared or written, so its
+    /// row says so (`mount-boundary`) rather than `missing-remote`, which offered a Re-upload
+    /// through the link.
+    #[test]
+    fn a_local_entry_beneath_a_nas_link_is_excluded_not_missing() {
+        let local = local(&[
+            ("backup-link", EntryKind::Directory, 0, 0),
+            ("backup-link/sub", EntryKind::Directory, 0, 0),
+            ("backup-link/sub/file.txt", EntryKind::File, 1, 1_000),
+            ("plain.txt", EntryKind::File, 1, 1_000),
+        ]);
+        let mut remote = remote(&[("backup-link", EntryKind::Directory, 0, 0)]);
+        remote
+            .entries
+            .get_mut("backup-link")
+            .unwrap()
+            .mount_point_type = Some(crate::api::LINKED_ENTRY_MOUNT_TYPE.to_owned());
+        let scope = Scope::root();
+        let page = page(&local, &remote, &query(&scope));
+        assert_eq!(
+            states(&page),
+            [
+                ("backup-link", StateKind::Excluded),
+                ("backup-link/sub", StateKind::Excluded),
+                ("backup-link/sub/file.txt", StateKind::Excluded),
+                ("plain.txt", StateKind::MissingRemote),
+            ]
+        );
+        assert!(
+            page.entries[..3]
+                .iter()
+                .all(|entry| entry.state == StatusState::Excluded(ExclusionCause::MountBoundary))
+        );
+        assert_eq!(page.stats.missing_remote_files, 1);
+    }
+
     #[test]
     fn requested_excluded_paths_are_listed_with_their_cause() {
         let excluded: BTreeSet<String> = ["cache/big.tmp".to_owned(), "@eaDir".to_owned()]
@@ -5808,6 +6290,7 @@ mod resync_ticket_tests {
             protected_entries: 0,
             upload_bytes,
             skipped: Vec::new(),
+            link_guard_unchecked: 0,
         }
     }
 

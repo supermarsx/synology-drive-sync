@@ -133,6 +133,9 @@ pub enum EventCode {
     AuthenticationCompleted,
     RemoteScanStarted,
     RemoteScanCompleted,
+    /// The NAS reported no real path for folders the run listed, so links inside them could
+    /// not be told from folders (G-11). `operations` carries how many folders.
+    RemoteScanLinkGuardUnchecked,
     PlanReady,
     ApiCallStarted,
     ApiCallCompleted,
@@ -162,7 +165,7 @@ impl EventCode {
     /// Exhaustive by construction: a new variant that is not listed here fails
     /// `every_event_code_has_a_stable_machine_and_human_name`, so no code can ship without a
     /// stable machine name and human message.
-    pub const ALL: [Self; 31] = [
+    pub const ALL: [Self; 32] = [
         Self::RunBuild,
         Self::RunStarted,
         Self::RunCompleted,
@@ -177,6 +180,7 @@ impl EventCode {
         Self::AuthenticationCompleted,
         Self::RemoteScanStarted,
         Self::RemoteScanCompleted,
+        Self::RemoteScanLinkGuardUnchecked,
         Self::PlanReady,
         Self::ApiCallStarted,
         Self::ApiCallCompleted,
@@ -196,7 +200,8 @@ impl EventCode {
         Self::ResultRecordFailed,
     ];
 
-    fn as_str(self) -> &'static str {
+    /// The stable machine name, as `docs/observability.schema.json` publishes it.
+    pub fn as_str(self) -> &'static str {
         match self {
             Self::RunBuild => "run.build",
             Self::RunStarted => "run.started",
@@ -212,6 +217,7 @@ impl EventCode {
             Self::AuthenticationCompleted => "authentication.completed",
             Self::RemoteScanStarted => "remote_scan.started",
             Self::RemoteScanCompleted => "remote_scan.completed",
+            Self::RemoteScanLinkGuardUnchecked => "remote_scan.link_guard_unchecked",
             Self::PlanReady => "plan.ready",
             Self::ApiCallStarted => "api_call.started",
             Self::ApiCallCompleted => "api_call.completed",
@@ -248,6 +254,9 @@ impl EventCode {
             Self::AuthenticationCompleted => "authentication completed",
             Self::RemoteScanStarted => "remote scan started",
             Self::RemoteScanCompleted => "remote scan completed",
+            Self::RemoteScanLinkGuardUnchecked => {
+                "the NAS reported no real path, so links inside the destination could not be checked"
+            }
             Self::PlanReady => "sync plan ready",
             Self::ApiCallStarted => "API call started",
             Self::ApiCallCompleted => "API call completed",
@@ -305,6 +314,10 @@ pub enum EventReason {
     HttpsRequired,
     ScopeNotFound,
     Cancelled,
+    /// The share-wide refusal breaker: most planned writes were refused for one cause (G-2).
+    RemoteRefusedShareWide,
+    /// The link breaker: too many NAS entries' real paths look like links (G-3).
+    RemoteRealPathUnusable,
     Unclassified,
     // Skip and deferral classes, for `entry.skipped` and `entry.deferred`.
     ChangedDuringRun,
@@ -316,7 +329,7 @@ pub enum EventReason {
 
 impl EventReason {
     /// Every reason, so the published vocabulary can be checked against this enum.
-    pub const ALL: [Self; 34] = [
+    pub const ALL: [Self; 36] = [
         Self::Authentication,
         Self::Network,
         Self::HttpStatus,
@@ -345,6 +358,8 @@ impl EventReason {
         Self::HttpsRequired,
         Self::ScopeNotFound,
         Self::Cancelled,
+        Self::RemoteRefusedShareWide,
+        Self::RemoteRealPathUnusable,
         Self::Unclassified,
         Self::ChangedDuringRun,
         Self::DeleteBound,
@@ -383,6 +398,8 @@ impl EventReason {
             Self::HttpsRequired => "https_required",
             Self::ScopeNotFound => "scope_not_found",
             Self::Cancelled => "cancelled",
+            Self::RemoteRefusedShareWide => "remote_refused_share_wide",
+            Self::RemoteRealPathUnusable => "remote_real_path_unusable",
             Self::Unclassified => "unclassified",
             Self::ChangedDuringRun => "changed_during_run",
             Self::DeleteBound => "delete_bound",
@@ -404,7 +421,8 @@ impl EventReason {
             Error::UnsafeRemotePath { .. }
             | Error::RemoteEscape(_)
             | Error::RemoteMountRoot { .. }
-            | Error::RemoteRefused { .. } => Self::RemotePathRefused,
+            | Error::RemoteRefused { .. }
+            | Error::RemoteLinkInScope { .. } => Self::RemotePathRefused,
             Error::InvalidSource(_) => Self::SourceInvalid,
             Error::UnsupportedLocalEntry { .. } => Self::LocalEntryUnsupported,
             Error::FileIo { .. } => Self::LocalIo,
@@ -435,6 +453,9 @@ impl EventReason {
             Error::ReconciliationPending { .. } => Self::ReconciliationPending,
             Error::Cancelled => Self::Cancelled,
             Error::Vault { .. } => Self::CredentialUnavailable,
+            // The two breakers were `Error::Message`, so `unclassified`, until each was named.
+            Error::RemoteRefusalsShareWide { .. } => Self::RemoteRefusedShareWide,
+            Error::RemoteRealPathUnusable { .. } => Self::RemoteRealPathUnusable,
             Error::Message(_) => Self::Unclassified,
         }
     }
@@ -465,6 +486,7 @@ pub fn failure_path(error: &crate::error::Error, source: Option<&Path>) -> Optio
         Error::UnsafeRemotePath { path, .. }
         | Error::RemoteMountRoot { path, .. }
         | Error::RemoteRefused { path, .. }
+        | Error::RemoteLinkInScope { path, .. }
         | Error::TypeConflict { path, .. }
         | Error::RemoteEscape(path)
         | Error::ProtectedConflict(path)
@@ -496,6 +518,8 @@ pub fn failure_path(error: &crate::error::Error, source: Option<&Path>) -> Optio
         | Error::ReconciliationPending { .. }
         | Error::Cancelled
         | Error::Vault { .. }
+        | Error::RemoteRefusalsShareWide { .. }
+        | Error::RemoteRealPathUnusable { .. }
         | Error::Message(_) => None,
     }
 }
@@ -3076,6 +3100,32 @@ mod tests {
             EventReason::ReconciliationPending
         );
         assert_eq!(EventReason::of(&Error::Cancelled), EventReason::Cancelled);
+        // The two breakers name themselves rather than reading as `unclassified`.
+        let share_wide = Error::RemoteRefusalsShareWide {
+            class: crate::error::RefusalClass::Permission,
+            refused: 4,
+            considered: 5,
+            in_sync: 0,
+            not_attempted: 1,
+            codes: Vec::new(),
+            sample: Vec::new(),
+            more: 0,
+        };
+        assert_eq!(
+            EventReason::of(&share_wide).as_str(),
+            "remote_refused_share_wide"
+        );
+        let real_paths = Error::RemoteRealPathUnusable {
+            kind: "folders",
+            linked: 3,
+            checked: 4,
+            sample: Vec::new(),
+            more: 0,
+        };
+        assert_eq!(
+            EventReason::of(&real_paths).as_str(),
+            "remote_real_path_unusable"
+        );
         assert_eq!(
             EventReason::of(&Error::Message("x".to_owned())),
             EventReason::Unclassified

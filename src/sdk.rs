@@ -16,7 +16,7 @@ use serde::Serialize;
 use zeroize::Zeroizing;
 
 use crate::Error;
-use crate::api::{ApiClient, ClientOptions};
+use crate::api::{ApiClient, ClientOptions, SESSION_KEEPALIVE_INTERVAL};
 use crate::cancel::CancellationToken;
 use crate::local::{self, IgnoreRules};
 use crate::path::RemoteRoot;
@@ -127,6 +127,7 @@ pub struct SdkError {
 struct PartialExecution {
     completed: ExecutionSummary,
     deferred: Vec<DeferredPath>,
+    link_guard_unchecked: usize,
 }
 
 impl SdkError {
@@ -153,6 +154,14 @@ impl SdkError {
             .map_or(&[], |partial| partial.deferred.as_slice())
     }
 
+    /// For a run that failed part-way through execution, the NAS folders it listed without a
+    /// real path to check links against. See [`PlanSummary::link_guard_unchecked`].
+    pub fn link_guard_unchecked(&self) -> usize {
+        self.partial
+            .as_ref()
+            .map_or(0, |partial| partial.link_guard_unchecked)
+    }
+
     fn new(code: ErrorCode, message: impl Into<String>) -> Self {
         Self {
             code,
@@ -165,10 +174,12 @@ impl SdkError {
         mut self,
         completed: ExecutionSummary,
         deferred: Vec<DeferredPath>,
+        link_guard_unchecked: usize,
     ) -> Self {
         self.partial = Some(Box::new(PartialExecution {
             completed,
             deferred,
+            link_guard_unchecked,
         }));
         self
     }
@@ -192,13 +203,16 @@ impl SdkError {
             | Error::EmptySourceDeletion
             | Error::DeleteLimit { .. }
             | Error::ResyncTicketStale { .. }
-            | Error::RemoteSnapshotChanged(_) => ErrorCode::Safety,
+            | Error::RemoteSnapshotChanged(_)
+            | Error::RemoteLinkInScope { .. } => ErrorCode::Safety,
             Error::Cancelled => ErrorCode::Cancelled,
             Error::ReconciliationPending { .. } => ErrorCode::Reconciliation,
             Error::Message(_) => ErrorCode::Internal,
             Error::InvalidResponse { .. }
             | Error::Api { .. }
             | Error::RemoteRefused { .. }
+            | Error::RemoteRefusalsShareWide { .. }
+            | Error::RemoteRealPathUnusable { .. }
             | Error::UnsupportedApiVersion { .. }
             | Error::MissingApi(_)
             | Error::ShareNotWritable(_)
@@ -586,6 +600,8 @@ pub struct PlanSummary {
     upload_bytes: u64,
     renames: usize,
     skipped: Vec<SkippedPath>,
+    /// See [`Self::link_guard_unchecked`].
+    link_guard_unchecked: usize,
 }
 
 /// A path the plan neither carries nor deletes, and why.
@@ -664,6 +680,15 @@ impl PlanSummary {
     /// Case-only renames this plan carries out on the NAS. Each is also in [`Self::changes`].
     pub fn renames(&self) -> usize {
         self.renames
+    }
+
+    /// How many NAS folders this run listed without a real path to check their entries against,
+    /// so links inside them could not be detected: a NAS link there is synced and deleted
+    /// through like a folder (G-11). Zero means the link guard ran everywhere it was needed. A
+    /// lasting condition, for the caller to show as a warning: available here, before the plan is
+    /// applied, because `on_plan` is where an application decides.
+    pub fn link_guard_unchecked(&self) -> usize {
+        self.link_guard_unchecked
     }
 
     pub fn is_empty(&self) -> bool {
@@ -1038,6 +1063,8 @@ pub struct SyncOutcome {
     /// Root-relative NAS folders whose listing DSM returned incomplete (`""` is the destination
     /// itself). No deletion is made inside them; reported even when none was planned there.
     incomplete_listings: Vec<String>,
+    /// See [`PlanSummary::link_guard_unchecked`].
+    link_guard_unchecked: usize,
 }
 
 impl SyncOutcome {
@@ -1082,6 +1109,12 @@ impl SyncOutcome {
     /// NAS folders whose listing was incomplete, so nothing in them was deleted. See the field.
     pub fn incomplete_listings(&self) -> &[String] {
         &self.incomplete_listings
+    }
+
+    /// NAS folders listed without a real path to check links against. See
+    /// [`PlanSummary::link_guard_unchecked`].
+    pub fn link_guard_unchecked(&self) -> usize {
+        self.link_guard_unchecked
     }
 }
 
@@ -1203,11 +1236,16 @@ impl Engine {
                 .map_err(SdkError::from_core)?;
             let incomplete_directories = scanned.incomplete_directories;
             let skipped_remote = scanned.skipped;
+            let link_guard_unchecked = scanned.link_guard_unchecked;
+            // A folder deleted on the NAS while the walk listed it clears by itself: a transient
+            // deferral, exactly as on the command line (ADV3-P-7).
+            let vanished = sync::vanished_remote_folder_deferrals(&scanned.vanished_directories);
+            let link_checks = scanned.link_checks;
             let mut remote = scanned.inventory;
             // The command line's breaker: link boundaries on most folders mean DSM's real paths
             // are not what the link guard assumes, and the run fails by name rather than
             // skipping the tree folder by folder.
-            sync::check_link_boundaries(&remote).map_err(SdkError::from_core)?;
+            sync::check_link_boundaries(&remote, &link_checks).map_err(SdkError::from_core)?;
             emit(
                 cancellation,
                 &mut on_event,
@@ -1248,6 +1286,7 @@ impl Engine {
                 cancellation,
             )
             .map_err(SdkError::from_core)?;
+            merge_deferred(&mut deferred, vanished);
             if content {
                 emit(
                     cancellation,
@@ -1267,6 +1306,7 @@ impl Engine {
             )?;
             let mut plan = plan::build_plan(&root, &local, &remote, &rules, &options)
                 .map_err(SdkError::from_core)?;
+            plan.link_guard_unchecked = link_guard_unchecked;
             merge_deferred(
                 &mut deferred,
                 sync::withhold_deletions_in_incomplete_listings(&mut plan, &incomplete_directories),
@@ -1276,6 +1316,13 @@ impl Engine {
             merge_deferred(
                 &mut deferred,
                 sync::protect_skipped_remote_entries(&mut plan, &skipped_remote),
+            );
+            // A deletion, rename or server copy of a path whose part before a comma is another NAS
+            // entry waits until it is known how DSM parses commas (NAS question N1).
+            merge_deferred(
+                &mut deferred,
+                sync::withhold_comma_ambiguous_mutations(&client, &mut plan, &remote)
+                    .map_err(SdkError::from_core)?,
             );
             let named_in_plan = sync::deferrals_in_plan_skips(&plan, &deferred);
             merge_deferred(&mut deferred, named_in_plan);
@@ -1315,6 +1362,7 @@ impl Engine {
                     deferred: sdk_deferred(&deferred),
                     recovered: client.transport_counters(),
                     incomplete_listings: incomplete_directories.clone(),
+                    link_guard_unchecked,
                 });
             }
             check_cancellation(cancellation)?;
@@ -1333,32 +1381,37 @@ impl Engine {
                 client.touch_session();
                 let observer_factory: UploadObserverFactory = Arc::new(|_| None);
                 // Reporting what completed even when the run then fails: a mid-run failure used
-                // to lose every deferral and count collected so far from the outcome.
-                let executed = sync::execute_observed_reporting_partial(
-                    &client,
-                    &root,
-                    &plan,
-                    ExecuteOptions {
-                        jobs: request.jobs,
-                        dry_run: false,
-                    },
-                    cancellation.clone(),
-                    observer_factory,
-                    &mut report,
-                    |event| {
-                        if on_event(&SdkEvent::Mutation {
-                            mutation: mutation_event(event),
-                        }) == EventControl::Cancel
-                        {
-                            cancellation.cancel();
-                        }
-                    },
-                );
+                // to lose every deferral and count collected so far from the outcome. The session
+                // is kept alive throughout, as it is during hashing: a run of uploads that each
+                // outlast DSM's idle timer otherwise spent one re-login per batch (ADV3-P-6).
+                let executed = client.keep_session_alive_while(SESSION_KEEPALIVE_INTERVAL, || {
+                    sync::execute_observed_reporting_partial(
+                        &client,
+                        &root,
+                        &plan,
+                        ExecuteOptions {
+                            jobs: request.jobs,
+                            dry_run: false,
+                        },
+                        cancellation.clone(),
+                        observer_factory,
+                        &mut report,
+                        |event| {
+                            if on_event(&SdkEvent::Mutation {
+                                mutation: mutation_event(event),
+                            }) == EventControl::Cancel
+                            {
+                                cancellation.cancel();
+                            }
+                        },
+                    )
+                });
                 if let Err(error) = executed {
                     merge_deferred(&mut deferred, report.deferred.clone());
                     return Err(SdkError::from_core(error).with_partial_execution(
                         ExecutionSummary::from_report(&report, &client),
                         sdk_deferred(&deferred),
+                        link_guard_unchecked,
                     ));
                 }
             }
@@ -1409,6 +1462,7 @@ impl Engine {
                 deferred: sdk_deferred(&deferred),
                 recovered: client.transport_counters(),
                 incomplete_listings: incomplete_directories,
+                link_guard_unchecked,
             })
         }));
         let operation = match operation {
@@ -1573,6 +1627,8 @@ fn reconciliation_plan(
         .remote_inventory_scoped(root, &plan::Scope::root(), rules, usize::MAX, cancellation)
         .map_err(SdkError::from_core)?;
     let mut remote = scanned.inventory;
+    // The same shape check as the run's own walk (G-3).
+    sync::check_link_boundaries(&remote, &scanned.link_checks).map_err(SdkError::from_core)?;
     check_cancellation(cancellation)?;
     // No promotion: a reconciliation plan is inspected for emptiness, never executed, so nothing
     // consumes an upload's digest here.
@@ -1588,6 +1644,9 @@ fn reconciliation_plan(
         cancellation,
     )
     .map_err(SdkError::from_core)?;
+    deferred.extend(sync::vanished_remote_folder_deferrals(
+        &scanned.vanished_directories,
+    ));
     let mut plan = plan::build_plan(
         root,
         &local,
@@ -1596,6 +1655,7 @@ fn reconciliation_plan(
         &sync::reconciliation_options(run_options, run_options.compare),
     )
     .map_err(SdkError::from_core)?;
+    plan.link_guard_unchecked = scanned.link_guard_unchecked;
     deferred.extend(sync::withhold_deletions_in_incomplete_listings(
         &mut plan,
         &scanned.incomplete_directories,
@@ -1604,6 +1664,12 @@ fn reconciliation_plan(
         &mut plan,
         &scanned.skipped,
     ));
+    // A mutation the run withheld because of a comma is withheld here too, rather than found
+    // still pending and failing reconciliation.
+    deferred.extend(
+        sync::withhold_comma_ambiguous_mutations(client, &mut plan, &remote)
+            .map_err(SdkError::from_core)?,
+    );
     let named_in_plan = sync::deferrals_in_plan_skips(&plan, &deferred);
     deferred.extend(named_in_plan);
     Ok((plan, deferred))
@@ -1674,6 +1740,7 @@ fn summarize_plan(plan: &SyncPlan) -> PlanSummary {
                 detail: entry.reason.detail(),
             })
             .collect(),
+        link_guard_unchecked: plan.link_guard_unchecked,
     }
 }
 

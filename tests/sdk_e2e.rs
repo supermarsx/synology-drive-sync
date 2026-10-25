@@ -713,3 +713,67 @@ fn a_case_only_rename_is_visible_in_the_previewed_plan() {
         "a preview renames nothing"
     );
 }
+
+/// G-11: a DSM that reports no real path leaves the link guard unable to run. The SDK says so,
+/// as a count, both to `on_plan`, where an application decides, and in the outcome.
+#[test]
+fn the_sdk_reports_folders_the_link_guard_could_not_check() {
+    let server = MockFileStation::start();
+    server.add_directory("/team/sdk");
+    server.add_directory("/team/sdk/sub");
+    server.withhold_real_path("/team/sdk");
+    server.withhold_real_path("/team/sdk/sub");
+    let source = TestDir::new("sdk-unchecked");
+    source.write("sub/a.txt", b"a");
+    let request = request(&server, &source);
+    let mut secrets = FixedSecrets::new();
+    let seen_on_plan = Arc::new(AtomicUsize::new(usize::MAX));
+    let seen = Arc::clone(&seen_on_plan);
+
+    let outcome = Engine
+        .run(
+            &request,
+            &mut secrets,
+            &CancellationToken::default(),
+            move |plan| {
+                seen.store(plan.link_guard_unchecked(), Ordering::SeqCst);
+                PlanDecision::Apply
+            },
+            |_| EventControl::Continue,
+        )
+        .expect("an unchecked guard is a warning, not a failure");
+
+    assert!(seen_on_plan.load(Ordering::SeqCst) >= 1);
+    assert!(outcome.link_guard_unchecked() >= 1);
+    assert_eq!(
+        outcome.plan().link_guard_unchecked(),
+        outcome.link_guard_unchecked()
+    );
+    let serialized = serde_json::to_value(&outcome).unwrap();
+    assert!(
+        serialized["link_guard_unchecked"].as_u64() >= Some(1),
+        "{serialized}"
+    );
+}
+
+#[test]
+fn the_sdk_reports_no_unchecked_folders_when_real_paths_are_reported() {
+    let server = MockFileStation::start();
+    let source = TestDir::new("sdk-checked");
+    source.write("sub/a.txt", b"a");
+    let request = request(&server, &source);
+    let mut secrets = FixedSecrets::new();
+
+    let outcome = Engine
+        .run(
+            &request,
+            &mut secrets,
+            &CancellationToken::default(),
+            |_| PlanDecision::Apply,
+            |_| EventControl::Continue,
+        )
+        .expect("sync succeeds");
+
+    assert_eq!(outcome.link_guard_unchecked(), 0);
+    assert_eq!(outcome.plan().link_guard_unchecked(), 0);
+}

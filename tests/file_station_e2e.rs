@@ -4760,10 +4760,10 @@ fn a_server_copy_stamped_with_the_copy_time_is_a_warning_not_a_failure() {
     );
 }
 
-/// S2-B11: a copy task DSM finishes with an error is deferred by name, not reported as content
-/// corruption, and the next run completes it.
+/// S2-B11 / G-4: a copy task DSM finishes with an error is not reported as content corruption;
+/// the file is uploaded instead in the same run, and the next run has nothing left to do.
 #[test]
-fn a_server_copy_that_finishes_with_an_error_is_deferred_and_completed_next_run() {
+fn a_server_copy_that_finishes_with_an_error_is_uploaded_in_the_same_run() {
     let fixture = TestDir::new("copy-error");
     let source = fixture.child("source");
     fs::create_dir_all(source.join("new")).expect("create renamed source directory");
@@ -4787,23 +4787,17 @@ fn a_server_copy_that_finishes_with_an_error_is_deferred_and_completed_next_run(
         &[],
     );
     let first = run(&arguments);
-    assert_eq!(
-        first.status.code(),
-        Some(3),
-        "stderr: {}",
-        String::from_utf8_lossy(&first.stderr)
-    );
+    assert_success(&first);
     let document = stdout_json(&first);
-    let deferred = only_deferred(&document);
-    assert_eq!(deferred["path"], "new/item.bin");
-    assert_eq!(deferred["reason"], "server-copy-failed");
-
-    let second = run(&arguments);
-    assert_success(&second);
+    assert_eq!(document["result"]["recovered"]["server_copy_fallbacks"], 1);
     assert_eq!(
         server.file_contents("/team/copy/new/item.bin"),
         Some(b"copy-me-on-nas".to_vec())
     );
+
+    let second = run(&arguments);
+    assert_success(&second);
+    assert_eq!(stdout_json(&second)["result"]["changed"], false);
 }
 
 /// A DSM that rounds the uploaded milliseconds rather than flooring them must not stop a mirror

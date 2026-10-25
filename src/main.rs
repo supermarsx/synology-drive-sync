@@ -187,6 +187,7 @@ fn dispatch(arguments: &cli::Cli) -> Result<ExitCode> {
                 )
             } else {
                 let job = resolved.remove(0);
+                refuse_overlapping_profiles(loaded.as_ref(), &job, selected[0].values)?;
                 run_sync(
                     &job.name,
                     job.settings,
@@ -232,6 +233,7 @@ fn dispatch(arguments: &cli::Cli) -> Result<ExitCode> {
                 )
             } else {
                 let job = resolved.remove(0);
+                refuse_overlapping_profiles(loaded.as_ref(), &job, selected[0].values)?;
                 run_sync(
                     &job.name,
                     job.settings,
@@ -1095,6 +1097,189 @@ fn validate_sync_batch(jobs: &[NamedSyncSettings]) -> Result<ValidatedBatch> {
     ValidatedBatch::new(batch_jobs).map_err(batch_configuration_error)
 }
 
+/// Refuse a single-profile run whose destination is another profile's, or nested with it, on the
+/// same endpoint, when either of the two deletes (D3-3).
+///
+/// `--all-profiles` has always refused that configuration, because one profile's mirror deletes
+/// the other's content. A single-profile run checked nothing, and that is the run every DSM routine,
+/// realtime trigger and "Sync now" makes: the outer profile's mirror deleted the inner profile's
+/// backup on every run. Decided from the configuration alone, so a NAS that is down cannot let a
+/// run past it. The other profile's `delete` is its configured one, because its own routine runs
+/// with it whatever this run was asked; this profile's is this run's or its configured one.
+/// Without a deletion on either side nothing can be lost, and the overlap is only named.
+fn refuse_overlapping_profiles(
+    loaded: Option<&config::LoadedConfig>,
+    job: &NamedSyncSettings,
+    configured: Option<&config::Profile>,
+) -> Result<()> {
+    let Some(loaded) = loaded else {
+        return Ok(());
+    };
+    let settings = &job.settings;
+    // Named, never silent, when a destination cannot be compared at all: a malformed profile
+    // beside this one is `config validate`'s to refuse, not a reason to stop this run, and one
+    // that cannot be parsed cannot run either.
+    let uncomparable = |name: &str, error: &Error| {
+        if !settings.output.quiet {
+            eprintln!(
+                "warning: profile {name:?} could not be checked for a destination overlapping \
+                 another profile's: {error}"
+            );
+        }
+    };
+    let this = match BatchJob::parse(
+        job.name.clone(),
+        &settings.connection.url,
+        OVERLAP_CHECK_ACCOUNT,
+        &settings.remote,
+        settings.safety.delete,
+        settings.safety.max_delete,
+    ) {
+        Ok(parsed) => ProfileDestination {
+            job: parsed,
+            deletes: settings.safety.delete
+                || configured.is_some_and(|profile| profile.delete == Some(true)),
+        },
+        Err(error) => {
+            uncomparable(&job.name, &batch_configuration_error(error));
+            return Ok(());
+        }
+    };
+    for (name, profile) in &loaded.values.profiles {
+        if *name == job.name {
+            continue;
+        }
+        // A profile that names no endpoint takes one as this run does: from the environment or
+        // the command line its routine is started with.
+        let other = match ProfileDestination::of(name, profile, &settings.connection.url) {
+            Ok(Some(other)) => other,
+            Ok(None) => continue,
+            Err(error) => {
+                uncomparable(name, &error);
+                continue;
+            }
+        };
+        match this.overlap(&other)? {
+            Some(ProfileOverlap::Refused(error)) => return Err(error),
+            Some(ProfileOverlap::Named(warning)) if !settings.output.quiet => {
+                eprintln!("warning: {warning}");
+            }
+            Some(ProfileOverlap::Named(_)) | None => {}
+        }
+    }
+    Ok(())
+}
+
+/// Every pair of profiles in a configuration whose destinations overlap: a configuration error
+/// when either deletes, otherwise a warning, as a single-profile run treats them. Pairs whose
+/// endpoint only the environment can tell are compared only when both take it from there.
+///
+/// With `only` (`config validate --profile NAME`), only the pairs NAME belongs to are judged. The
+/// package validates before every run with the run's profile, and one overlapping pair must stop
+/// only that pair's runs, not every other profile's.
+fn validate_profile_overlaps(
+    loaded: &config::LoadedConfig,
+    only: Option<&str>,
+) -> Result<Vec<String>> {
+    // Stands for "the endpoint the environment gives", the same for every profile that names none.
+    const UNNAMED_ENDPOINT: &str = "https://endpoint-from-the-environment.invalid";
+    let mut destinations = Vec::new();
+    for (name, profile) in &loaded.values.profiles {
+        if let Some(destination) = ProfileDestination::of(name, profile, UNNAMED_ENDPOINT)? {
+            destinations.push((profile.url.is_some(), destination));
+        }
+    }
+    let mut warnings = Vec::new();
+    for (index, (named, this)) in destinations.iter().enumerate() {
+        for (other_named, other) in destinations.iter().skip(index + 1) {
+            if named != other_named {
+                continue;
+            }
+            if only.is_some_and(|only| only != this.job.name() && only != other.job.name()) {
+                continue;
+            }
+            match this.overlap(other)? {
+                Some(ProfileOverlap::Refused(error)) => return Err(error),
+                Some(ProfileOverlap::Named(warning)) => warnings.push(warning),
+                None => {}
+            }
+        }
+    }
+    Ok(warnings)
+}
+
+/// The account an overlap check's jobs carry. Overlap is a property of the endpoint and the remote
+/// folder alone, so a profile's own account (or its absence, when the environment supplies it)
+/// must neither decide nor block the comparison.
+const OVERLAP_CHECK_ACCOUNT: &str = "overlap-check";
+
+/// One profile's destination, as the overlap check compares it.
+struct ProfileDestination {
+    job: BatchJob,
+    deletes: bool,
+}
+
+/// What one pair of profiles with overlapping destinations means for a run.
+enum ProfileOverlap {
+    /// One of them deletes: the run is refused with this configuration error.
+    Refused(Error),
+    /// Neither deletes: the overlap is named and the run proceeds.
+    Named(String),
+}
+
+impl ProfileDestination {
+    /// A configured profile's destination, or `None` for a profile with no remote of its own,
+    /// which cannot run as a routine. The account takes no part in the comparison.
+    fn of(name: &str, profile: &config::Profile, fallback_url: &str) -> Result<Option<Self>> {
+        let Some(remote) = profile.remote.as_deref() else {
+            return Ok(None);
+        };
+        let deletes = profile.delete == Some(true);
+        let job = BatchJob::parse(
+            name.to_owned(),
+            profile.url.as_deref().unwrap_or(fallback_url),
+            OVERLAP_CHECK_ACCOUNT,
+            remote,
+            deletes,
+            profile.max_delete.unwrap_or(0),
+        )
+        .map_err(batch_configuration_error)?;
+        Ok(Some(Self { job, deletes }))
+    }
+
+    fn overlap(&self, other: &Self) -> Result<Option<ProfileOverlap>> {
+        let overlap = match ValidatedBatch::new([self.job.clone(), other.job.clone()]) {
+            Ok(_) => return Ok(None),
+            Err(
+                overlap @ synology_drive_sync::batch::BatchError::OverlappingRemoteRoots { .. },
+            ) => overlap,
+            Err(error) => return Err(batch_configuration_error(error)),
+        };
+        let (this, that) = (self.job.name(), other.job.name());
+        let deleting = match (self.deletes, other.deletes) {
+            (false, false) => {
+                return Ok(Some(ProfileOverlap::Named(format!(
+                    "profiles {this:?} and {that:?} have overlapping NAS destinations; neither \
+                     deletes, so nothing is lost, but each one's runs also carry the other's \
+                     files ({overlap})"
+                ))));
+            }
+            (true, true) => "both delete".to_owned(),
+            (true, false) => format!("{this:?} deletes"),
+            (false, true) => format!("{that:?} deletes"),
+        };
+        // The names and the remedy first: the package keeps the first 160 bytes of this line as
+        // the profile's failure detail.
+        Ok(Some(ProfileOverlap::Refused(Error::Configuration(
+            format!(
+                "profiles {this:?} and {that:?} have overlapping NAS destinations and {deleting}: \
+                 give them separate destinations, or a mirror run of one deletes the other's \
+                 files ({overlap})"
+            ),
+        ))))
+    }
+}
+
 fn batch_configuration_error(error: impl std::fmt::Display) -> Error {
     Error::Configuration(format!("invalid batch configuration: {error}"))
 }
@@ -1583,6 +1768,8 @@ struct SyncCompletion {
     /// Remote folders (root-relative, `.` for the root) whose listing returned a different number
     /// of entries than DSM counted. Deletions inside them were withheld.
     incomplete_listings: Vec<String>,
+    /// NAS folders listed without a real path, so the link guard could not run there (G-11).
+    link_guard_unchecked: usize,
 }
 
 impl SyncCompletion {
@@ -2513,15 +2700,25 @@ fn warn_forward_proxy(
     );
 }
 
-/// Say so when DSM reported no real paths, so the walk could not tell a link from a folder.
-fn warn_unchecked_links(output: &config::ResolvedOutput, real_paths_reported: bool) {
-    if output.quiet || real_paths_reported {
+/// Say so when DSM reported no real path for some folders, so the walk could not tell a link
+/// from a folder there. `--quiet` silences only this line: the count is in the result, the plan,
+/// the log and the package's state whatever the output settings.
+fn warn_unchecked_links(output: &config::ResolvedOutput, link_guard_unchecked: usize) {
+    if output.quiet || link_guard_unchecked == 0 {
         return;
     }
     eprintln!(
-        "warning: DSM reported no real path for the destination's folders, so this run could not \
-         check for symbolic links inside it; a link there is walked like a folder"
+        "warning: {}",
+        link_guard_unchecked_text(link_guard_unchecked)
     );
+}
+
+/// The one sentence naming folders the link guard could not check.
+fn link_guard_unchecked_text(folders: usize) -> String {
+    format!(
+        "DSM reported no real path for {folders} NAS folder(s) this run listed, so it could not \
+         check for symbolic links inside them; a link there is walked like a folder"
+    )
 }
 
 /// Warn once per run when the destination did not keep the modification time an upload sent.
@@ -2721,11 +2918,31 @@ fn prepare_and_run_sync_reporting(
             client.remote_inventory_scoped(&root, &scope, &rules, usize::MAX, cancellation)?;
         let incomplete_directories = scanned.incomplete_directories;
         let skipped_remote = scanned.skipped;
-        warn_unchecked_links(&settings.output, scanned.real_paths_reported);
+        // A folder deleted on the NAS while the walk listed it clears by itself: named as a
+        // transient deferral, never a failed run (ADV3-P-7).
+        let vanished = sync::vanished_remote_folder_deferrals(&scanned.vanished_directories);
+        let link_guard_unchecked = scanned.link_guard_unchecked;
+        warn_unchecked_links(&settings.output, link_guard_unchecked);
         let mut remote = scanned.inventory;
-        sync::check_link_boundaries(&remote)?;
+        sync::check_link_boundaries(&remote, &scanned.link_checks)?;
+        if link_guard_unchecked > 0 {
+            log_event(
+                logger.as_ref(),
+                LogEvent::new(EventLogLevel::Warn, EventCode::RemoteScanLinkGuardUnchecked)
+                    .metrics(EventMetrics {
+                        operations: link_guard_unchecked as u64,
+                        ..EventMetrics::default()
+                    }),
+            )?;
+        }
         if !settings.output.quiet {
             for directory in &incomplete_directories {
+                // A folder this account may not list is named as such, not as a short listing.
+                if remote.entries.get(directory).is_some_and(|entry| {
+                    entry.mount_point_type.as_deref() == Some(api::UNLISTABLE_ENTRY_MOUNT_TYPE)
+                }) {
+                    continue;
+                }
                 eprintln!("{}", incomplete_listing_warning(directory));
             }
         }
@@ -2765,9 +2982,11 @@ fn prepare_and_run_sync_reporting(
             &incomplete_directories,
             cancellation,
         )?;
+        deferred.extend(vanished);
 
         cancellation.phase("build_plan");
         let mut plan = plan::build_plan(&root, &local, &remote, &rules, &run_options)?;
+        plan.link_guard_unchecked = link_guard_unchecked;
         deferred.extend(sync::withhold_deletions_in_incomplete_listings(
             &mut plan,
             &incomplete_directories,
@@ -2776,6 +2995,11 @@ fn prepare_and_run_sync_reporting(
             &mut plan,
             &skipped_remote,
         ));
+        // A deletion, rename or server copy of a path with a comma whose part before the comma is
+        // another NAS entry waits until it is known how DSM parses commas (NAS question N1).
+        deferred.extend(sync::withhold_comma_ambiguous_mutations(
+            &client, &mut plan, &remote,
+        )?);
         // A folder the walk could not read, and a case-only rename planning could not finish, are
         // deferrals the plan names among its skips.
         let named_in_plan = sync::deferrals_in_plan_skips(&plan, &deferred);
@@ -2818,9 +3042,14 @@ fn prepare_and_run_sync_reporting(
             // Nothing to execute, but a path planning had to leave out is still a path that did
             // not converge, and the result must say so by name.
             let skipped = lasting_skips(plan);
-            if !deferred.is_empty() || skipped > 0 || !incomplete_directories.is_empty() {
+            if !deferred.is_empty()
+                || skipped > 0
+                || !incomplete_directories.is_empty()
+                || plan.link_guard_unchecked > 0
+            {
                 let mut completion = SyncCompletion::deferred_only(deferred, skipped);
                 completion.incomplete_listings = listing_names(&incomplete_directories);
+                completion.link_guard_unchecked = plan.link_guard_unchecked;
                 *completion_out = Some(completion);
             }
             // Nothing was executed, so there is no convergence to verify. Reconciliation exists to
@@ -2853,50 +3082,65 @@ fn prepare_and_run_sync_reporting(
         let execution_logger = logger.clone();
         let cancellation_for_report = cancellation.clone();
         let mut completed = ExecutionReport::default();
-        let execution = sync::execute_observed_reporting_partial(
-            &client,
-            &root,
-            plan,
-            ExecuteOptions {
-                jobs: usize::from(settings.behavior.jobs),
-                dry_run: false,
-            },
-            cancellation.clone(),
-            progress.observer_factory(),
-            &mut completed,
-            |event| {
-                progress.record_execution_event(&event);
-                let code = match event {
-                    ExecutionEvent::DirectoryCreated { .. } => Some(EventCode::DirectoryCreated),
-                    ExecutionEvent::TypeConflictDeleted { .. }
-                    | ExecutionEvent::RemoteExtraDeleted { .. } => Some(EventCode::EntryDeleted),
-                    ExecutionEvent::RemoteContentCopied { .. }
-                    | ExecutionEvent::CopyFallbackUploaded { .. }
-                    | ExecutionEvent::KeptDeleteUploaded { .. }
-                    | ExecutionEvent::Uploaded { .. } => None,
-                    // `EntryDeleted` would be a lie and there is no code for a refusal, so this
-                    // reaches the operator through the report's own count and the `-v` line below.
-                    ExecutionEvent::RemoteExtraDeleteSkipped { .. } => None,
-                    // Named in the result's `deferred` list and on the `-v` line below.
-                    ExecutionEvent::PathDeferred { .. } => None,
-                    // Counted in the result's `renamed`, and named on the `-v` line below.
-                    ExecutionEvent::Renamed { .. } => None,
-                };
-                if let Some(code) = code
-                    && let Some(logger) = &execution_logger
-                    && let Err(error) = logger.emit(
-                        LogEvent::new(EventLogLevel::Debug, code).metrics(EventMetrics {
-                            operations: 1,
-                            ..EventMetrics::default()
-                        }),
-                    )
-                {
-                    record_progress_failure(&execution_log_failure_for_report, error.to_string());
-                    cancellation_for_report.cancel();
-                }
-                if settings.output.verbosity > 0 && !settings.output.quiet {
-                    eprintln!("  {event}");
-                }
+        // Kept alive between requests too: an execution that spends minutes on one large
+        // upload or server copy otherwise leaves the session idle long enough for DSM to end it,
+        // and each re-login spends the bounded budget for sessions DSM ends (ADV3-P-6).
+        let execution = client.keep_session_alive_while(
+            synology_drive_sync::api::SESSION_KEEPALIVE_INTERVAL,
+            || {
+                sync::execute_observed_reporting_partial(
+                    &client,
+                    &root,
+                    plan,
+                    ExecuteOptions {
+                        jobs: usize::from(settings.behavior.jobs),
+                        dry_run: false,
+                    },
+                    cancellation.clone(),
+                    progress.observer_factory(),
+                    &mut completed,
+                    |event| {
+                        progress.record_execution_event(&event);
+                        let code = match event {
+                            ExecutionEvent::DirectoryCreated { .. } => {
+                                Some(EventCode::DirectoryCreated)
+                            }
+                            ExecutionEvent::TypeConflictDeleted { .. }
+                            | ExecutionEvent::RemoteExtraDeleted { .. } => {
+                                Some(EventCode::EntryDeleted)
+                            }
+                            ExecutionEvent::RemoteContentCopied { .. }
+                            | ExecutionEvent::CopyFallbackUploaded { .. }
+                            | ExecutionEvent::KeptDeleteUploaded { .. }
+                            | ExecutionEvent::Uploaded { .. } => None,
+                            // `EntryDeleted` would be a lie and there is no code for a refusal, so this
+                            // reaches the operator through the report's own count and the `-v` line below.
+                            ExecutionEvent::RemoteExtraDeleteSkipped { .. } => None,
+                            // Named in the result's `deferred` list and on the `-v` line below.
+                            ExecutionEvent::PathDeferred { .. } => None,
+                            // Counted in the result's `renamed`, and named on the `-v` line below.
+                            ExecutionEvent::Renamed { .. } => None,
+                        };
+                        if let Some(code) = code
+                            && let Some(logger) = &execution_logger
+                            && let Err(error) = logger.emit(
+                                LogEvent::new(EventLogLevel::Debug, code).metrics(EventMetrics {
+                                    operations: 1,
+                                    ..EventMetrics::default()
+                                }),
+                            )
+                        {
+                            record_progress_failure(
+                                &execution_log_failure_for_report,
+                                error.to_string(),
+                            );
+                            cancellation_for_report.cancel();
+                        }
+                        if settings.output.verbosity > 0 && !settings.output.quiet {
+                            eprintln!("  {event}");
+                        }
+                    },
+                )
             },
         );
         let progress_result = progress.finish();
@@ -2906,6 +3150,7 @@ fn prepare_and_run_sync_reporting(
         // Recorded before any `?` below, so the counts survive every failure from here on.
         let mut completion = SyncCompletion::deferred_only(deferred, lasting_skips(plan));
         completion.incomplete_listings = listing_names(&incomplete_directories);
+        completion.link_guard_unchecked = plan.link_guard_unchecked;
         completion.add_deferred(std::mem::take(&mut completed.deferred));
         completion.mtime_not_kept = completed
             .mtime_not_kept
@@ -3344,6 +3589,9 @@ fn build_reconciliation_plan(
         cancellation,
     )?;
     let mut remote = scanned.inventory;
+    // The same shape check as the run's own walk: a reconciliation built on misread real paths
+    // would excuse or blame the wrong entries (G-3).
+    sync::check_link_boundaries(&remote, &scanned.link_checks)?;
     cancellation.check()?;
     // The run's own digest pass and per-path deferral. Deliberately no promotion: a
     // reconciliation plan is only ever inspected by `ensure_reconciled` and is never executed, so
@@ -3360,6 +3608,9 @@ fn build_reconciliation_plan(
         &scanned.incomplete_directories,
         cancellation,
     )?;
+    deferred.extend(sync::vanished_remote_folder_deferrals(
+        &scanned.vanished_directories,
+    ));
     let mut plan = plan::build_plan(
         root,
         &local,
@@ -3367,6 +3618,7 @@ fn build_reconciliation_plan(
         rules,
         &sync::reconciliation_options(run_options, compare),
     )?;
+    plan.link_guard_unchecked = scanned.link_guard_unchecked;
     deferred.extend(sync::withhold_deletions_in_incomplete_listings(
         &mut plan,
         &scanned.incomplete_directories,
@@ -3375,6 +3627,11 @@ fn build_reconciliation_plan(
         &mut plan,
         &scanned.skipped,
     ));
+    // A mutation the run withheld because of a comma is withheld here too, rather than found
+    // still pending and failing the run.
+    deferred.extend(sync::withhold_comma_ambiguous_mutations(
+        client, &mut plan, &remote,
+    )?);
     let named_in_plan = sync::deferrals_in_plan_skips(&plan, &deferred);
     deferred.extend(named_in_plan);
     cancellation.check()?;
@@ -7271,6 +7528,7 @@ fn run_config(arguments: &cli::Cli, action: cli::ConfigAction) -> Result<()> {
     for profile in loaded.values.profiles.values() {
         config::validate_profile(profile).map_err(config_error)?;
     }
+    let overlaps = validate_profile_overlaps(&loaded, arguments.global.profile.as_deref())?;
     let selected = loaded
         .select_profile(arguments.global.profile.as_deref())
         .map_err(config_error)?;
@@ -7281,21 +7539,27 @@ fn run_config(arguments: &cli::Cli, action: cli::ConfigAction) -> Result<()> {
 
     match action {
         cli::ConfigAction::Path | cli::ConfigAction::Init { .. } => unreachable!(),
-        cli::ConfigAction::Validate => write_simple_value(
-            output.output,
-            format!(
-                "Configuration is valid: {} profile(s); selected {:?}.",
-                loaded.values.profiles.len(),
-                selected.name
-            ),
-            json!({
-                "schema": "sdsync.config-validation.v1",
-                "valid": true,
-                "path": loaded.path,
-                "profiles": loaded.values.profiles.len(),
-                "selected_profile": selected.name,
-            }),
-        ),
+        cli::ConfigAction::Validate => {
+            for warning in &overlaps {
+                eprintln!("warning: {warning}");
+            }
+            write_simple_value(
+                output.output,
+                format!(
+                    "Configuration is valid: {} profile(s); selected {:?}.",
+                    loaded.values.profiles.len(),
+                    selected.name
+                ),
+                json!({
+                    "schema": "sdsync.config-validation.v1",
+                    "valid": true,
+                    "path": loaded.path,
+                    "profiles": loaded.values.profiles.len(),
+                    "selected_profile": selected.name,
+                    "warnings": overlaps,
+                }),
+            )
+        }
         cli::ConfigAction::Show => {
             let view = selected.non_secret_view();
             match output.output {
@@ -7746,6 +8010,14 @@ fn write_deferred_human_to<W: Write>(writer: &mut W, completion: &SyncCompletion
         )
         .map_err(output_error)?;
     }
+    if completion.link_guard_unchecked > 0 {
+        writeln!(
+            writer,
+            "Warning: {}.",
+            link_guard_unchecked_text(completion.link_guard_unchecked)
+        )
+        .map_err(output_error)?;
+    }
     let transport = completion.transport;
     if transport != api::TransportCounters::default() || completion.report.copy_fallbacks > 0 {
         writeln!(
@@ -7998,6 +8270,7 @@ fn remote_snapshot_value(snapshot: &RemoteSnapshot) -> Value {
 
 fn plan_value(plan: &SyncPlan) -> Value {
     json!({
+        "link_guard_unchecked": plan.link_guard_unchecked,
         "summary": {
             "uploads": plan.uploads.len(),
             "upload_bytes": plan.upload_bytes,
@@ -8501,6 +8774,7 @@ fn plan_summary_record(plan: &SyncPlan) -> Value {
         "unchanged_files": plan.unchanged_files,
         "protected_entries": plan.protected_entries,
         "changes": !plan.is_empty(),
+        "link_guard_unchecked": plan.link_guard_unchecked,
     })
 }
 
@@ -8553,6 +8827,8 @@ fn execution_value(completion: &SyncCompletion, elapsed: Duration) -> Value {
         // Folders DSM listed short; deletions inside them were withheld and named in `deferred`.
         "incomplete_listings": completion.incomplete_listings.len(),
         "incomplete_listing_folders": completion.incomplete_listings,
+        // Folders listed without a real path, so links in them could not be told from folders.
+        "link_guard_unchecked": completion.link_guard_unchecked,
         // Everything recovered from on the run's behalf, so none of it is silent.
         "recovered": {
             "retries": completion.transport.retries,
@@ -9912,6 +10188,7 @@ mod tests {
             protected_entries: 1,
             upload_bytes: 0,
             skipped: Vec::new(),
+            link_guard_unchecked: 0,
         }
     }
 
@@ -10134,6 +10411,7 @@ mod tests {
             rules: local::IgnoreRules::none(),
             pre_deletes: vec![plan::DeleteAction {
                 relative: "conflict".to_owned(),
+                local_relative: "conflict".to_owned(),
                 remote_path: "/share/root/conflict".to_owned(),
                 kind: local::EntryKind::Directory,
                 type_conflict: true,
@@ -10169,6 +10447,7 @@ mod tests {
             }],
             post_deletes: vec![plan::DeleteAction {
                 relative: "old/guarded.bin".to_owned(),
+                local_relative: "old/guarded.bin".to_owned(),
                 remote_path: "/share/root/old/guarded.bin".to_owned(),
                 kind: local::EntryKind::File,
                 type_conflict: false,
@@ -10186,6 +10465,7 @@ mod tests {
             protected_entries: 2,
             upload_bytes: 11,
             skipped: Vec::new(),
+            link_guard_unchecked: 0,
         }
     }
 
@@ -10208,6 +10488,7 @@ mod tests {
         plan.post_deletes = (0..count)
             .map(|index| plan::DeleteAction {
                 relative: format!("stale-{index}"),
+                local_relative: format!("stale-{index}"),
                 remote_path: format!("/share/root/stale-{index}"),
                 kind: local::EntryKind::File,
                 type_conflict: false,
@@ -10985,6 +11266,7 @@ mod tests {
                 "incomplete_listing_folders",
                 "incomplete_listings",
                 "kept_deletes_uploaded",
+                "link_guard_unchecked",
                 "mtime_not_kept",
                 "outcome",
                 "recovered",
@@ -11006,6 +11288,7 @@ mod tests {
                 "deletions",
                 "directories",
                 "kind",
+                "link_guard_unchecked",
                 "protected_entries",
                 "renames",
                 "schema",
@@ -11606,6 +11889,7 @@ mod tests {
         let mut plan = empty_plan();
         plan.post_deletes.push(plan::DeleteAction {
             relative: "extra".to_owned(),
+            local_relative: "extra".to_owned(),
             remote_path: "/share/root/extra".to_owned(),
             kind: local::EntryKind::File,
             type_conflict: false,
@@ -11646,6 +11930,7 @@ mod tests {
         let mut rebuilt = empty_plan();
         rebuilt.post_deletes.push(plan::DeleteAction {
             relative: "build/output.tmp".to_owned(),
+            local_relative: "build/output.tmp".to_owned(),
             remote_path: "/share/root/build/output.tmp".to_owned(),
             kind: local::EntryKind::File,
             type_conflict: false,
@@ -11914,6 +12199,7 @@ mod tests {
             skipped: 0,
             transport: api::TransportCounters::default(),
             incomplete_listings: Vec::new(),
+            link_guard_unchecked: 0,
         });
         outcome.elapsed = Some(Duration::from_millis(17));
         outcome.error = Some("retained diagnostic".to_owned());
@@ -12220,6 +12506,43 @@ mod tests {
         );
     }
 
+    /// ADV3-P-1: a resend after a re-login is the next attempt of the same upload, numbered on, and
+    /// the observer accepts it. An attempt announced twice is a send the observer was not told
+    /// about, a possible double send, and still cancels the run: the check is never a warning.
+    #[test]
+    fn progress_observer_accepts_a_resend_numbered_on_and_refuses_a_repeated_attempt() {
+        let plan = rich_plan();
+        let output = resolved_output(cli::OutputFormat::Human);
+        let cancellation = CancellationToken::default();
+        let wiring = ProgressWiring::new(&plan, &output, None, cancellation.clone());
+        let observer = wiring.observer_factory()(&plan.uploads[0].local).unwrap();
+        assert!(observer(UploadTransferEvent::AttemptStarted { attempt: 1 }));
+        assert!(observer(UploadTransferEvent::Advanced { bytes: 4 }));
+        assert!(observer(UploadTransferEvent::AttemptStarted { attempt: 2 }));
+        assert!(observer(UploadTransferEvent::Advanced { bytes: 11 }));
+        assert!(observer(UploadTransferEvent::Completed));
+        assert!(!cancellation.is_cancelled());
+        assert_eq!(progress_metrics(&wiring.tracker.snapshot()).bytes, 11);
+        wiring.finish().unwrap();
+
+        let cancellation = CancellationToken::default();
+        let repeated = ProgressWiring::new(&plan, &output, None, cancellation.clone());
+        let observer = repeated.observer_factory()(&plan.uploads[0].local).unwrap();
+        assert!(observer(UploadTransferEvent::AttemptStarted { attempt: 1 }));
+        assert!(observer(UploadTransferEvent::Advanced { bytes: 4 }));
+        assert!(!observer(UploadTransferEvent::AttemptStarted {
+            attempt: 1
+        }));
+        assert!(cancellation.is_cancelled());
+        assert!(
+            repeated
+                .finish()
+                .unwrap_err()
+                .to_string()
+                .contains("attempt accounting")
+        );
+    }
+
     #[test]
     fn progress_decisions_and_failure_slot_are_deterministic() {
         let mut output = resolved_output(cli::OutputFormat::Human);
@@ -12442,6 +12765,7 @@ mod tests {
             skipped: 0,
             transport: api::TransportCounters::default(),
             incomplete_listings: Vec::new(),
+            link_guard_unchecked: 0,
         };
         let mut human_output = resolved_output(cli::OutputFormat::Human);
         human_output.verbosity = 1;
@@ -12472,6 +12796,7 @@ mod tests {
                 skipped: 0,
                 transport: api::TransportCounters::default(),
                 incomplete_listings: Vec::new(),
+                link_guard_unchecked: 0,
             }),
             Duration::from_millis(17),
             &human_output,
@@ -12592,6 +12917,7 @@ mod tests {
             skipped: 0,
             transport: api::TransportCounters::default(),
             incomplete_listings: Vec::new(),
+            link_guard_unchecked: 0,
         });
         completed.elapsed = Some(Duration::from_millis(19));
         completed.error = Some("retained warning".to_owned());
@@ -14309,6 +14635,7 @@ mod status_command_tests {
             protected_entries: 0,
             upload_bytes: 1_024,
             skipped: Vec::new(),
+            link_guard_unchecked: 0,
         }
     }
 
@@ -14410,6 +14737,7 @@ mod resync_output_tests {
             protected_entries: 0,
             upload_bytes: 1_024,
             skipped: Vec::new(),
+            link_guard_unchecked: 0,
         }
     }
 
@@ -14519,6 +14847,7 @@ mod resync_output_tests {
             skipped: 0,
             transport: api::TransportCounters::default(),
             incomplete_listings: Vec::new(),
+            link_guard_unchecked: 0,
         };
         let text = human(render(
             cli::OutputFormat::Human,

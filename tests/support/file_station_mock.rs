@@ -123,6 +123,52 @@ struct ServerState {
     /// Actions to run once, when the first request for an operation arrives and before it is
     /// answered: the way a test changes the local tree at a known point in a run.
     request_hooks: Vec<RequestHook>,
+    /// Folders whose `List.list` DSM refuses with a code, the way an ACL that denies this account
+    /// a sub-folder looks: the folder is still listed in its parent, and listing it is refused.
+    refused_listings: BTreeMap<String, i64>,
+    /// Once the first folder's `List.list` is answered, the second folder's tree is deleted: a
+    /// folder removed on the NAS while a walk is running.
+    vanish_after_listing: Option<(String, String)>,
+    /// Re-arm the session expiry after every expiry, so the session dies every N requests.
+    expire_every: Option<u32>,
+    /// Once `trigger` is answered, the next `operation` gets this HTTP status: a proxy failing the
+    /// read that follows a mutation.
+    http_fault_after: Option<(String, String, u16)>,
+    /// What `MD5.status` and `CopyMove.status` answer for a task id the mock never issued (or no
+    /// longer holds). `408` by default; DSM is believed to answer `599` (NAS question N3).
+    unknown_task_code: i64,
+    /// The next upload writes the file's full size and the sent `mtime`, but only this many of
+    /// the new bytes, keeping the old content (or zeros) after them, and then drops the connection
+    /// without answering: an in-place overwrite torn by a lost link (ADV-R-6).
+    tear_next_upload: Vec<usize>,
+    /// `getinfo` of a path answered with an HTTP status once, optionally after the file there is
+    /// changed: a proxy failing the read that verifies or guards a mutation.
+    getinfo_faults: Vec<GetinfoFault>,
+    /// Folders whose `total` grows by one on every page DSM answers for them: a folder written to
+    /// so steadily that no two pages ever agree.
+    churning_listings: BTreeMap<String, usize>,
+    /// Whether the client may keep a connection open for further requests. True by default, as
+    /// nginx in front of DSM does.
+    keep_alive: bool,
+    /// The code a request on a dead session is refused with. `119` by default; DSM also answers
+    /// `105`, which is why the client proves a 105 is about the session before it logs in again.
+    dead_session_code: i64,
+    /// The next copy task fails on `status` with this envelope code, after leaving this many
+    /// bytes of the source at the destination: a failed copy that did not clean up after itself.
+    fail_next_copy_leaving_partial: Option<(i64, usize)>,
+    /// Copy tasks that leave a partial destination when their status is first asked for.
+    partial_copy_tasks: BTreeMap<String, (String, FileNode)>,
+    /// Requests whose client closed or reset the connection part-way through the body: a
+    /// cancelled or stopped upload. Legitimate client behaviour, so counted rather than a panic.
+    aborted_requests: usize,
+}
+
+#[derive(Debug)]
+struct GetinfoFault {
+    path: String,
+    status: u16,
+    /// Contents and modification time the file takes as the failure is answered.
+    change_to: Option<(Vec<u8>, i64)>,
 }
 
 struct RequestHook {
@@ -156,6 +202,9 @@ enum FaultPhase {
 enum FaultResponse {
     HttpStatus(u16),
     ApiError(i64),
+    /// Close the connection without answering, after reading the whole request: a keep-alive
+    /// close race, a proxy reload, or a reset after the last upload byte.
+    DropConnection,
 }
 
 #[derive(Debug)]
@@ -172,6 +221,21 @@ pub struct MockFileStation {
     state: Arc<Mutex<ServerState>>,
     shutdown: Arc<AtomicBool>,
     worker: Option<JoinHandle<()>>,
+    /// One thread per accepted connection, so a client holding a connection open between
+    /// requests (keep-alive) does not stall every other connection. Joined on drop, so a
+    /// connection handler's assertion still fails the test that caused it.
+    connections: Arc<Mutex<Vec<JoinHandle<()>>>>,
+}
+
+impl MockFileStation {
+    /// How many TCP connections the mock has accepted, so a test can tell reuse from reconnecting.
+    #[allow(dead_code)]
+    pub fn accepted_connections(&self) -> usize {
+        self.connections
+            .lock()
+            .expect("mock connection list lock")
+            .len()
+    }
 }
 
 impl MockFileStation {
@@ -225,10 +289,25 @@ impl MockFileStation {
             real_path_withheld: BTreeSet::new(),
             misreport_real_paths: false,
             request_hooks: Vec::new(),
+            refused_listings: BTreeMap::new(),
+            vanish_after_listing: None,
+            expire_every: None,
+            http_fault_after: None,
+            unknown_task_code: 408,
+            tear_next_upload: Vec::new(),
+            getinfo_faults: Vec::new(),
+            churning_listings: BTreeMap::new(),
+            keep_alive: true,
+            dead_session_code: 119,
+            fail_next_copy_leaving_partial: None,
+            partial_copy_tasks: BTreeMap::new(),
+            aborted_requests: 0,
         }));
         let shutdown = Arc::new(AtomicBool::new(false));
+        let connections = Arc::new(Mutex::new(Vec::new()));
         let worker_state = Arc::clone(&state);
         let worker_shutdown = Arc::clone(&shutdown);
+        let worker_connections = Arc::clone(&connections);
         let worker = thread::spawn(move || {
             while !worker_shutdown.load(Ordering::Acquire) {
                 match listener.accept() {
@@ -239,7 +318,14 @@ impl MockFileStation {
                         stream
                             .set_nonblocking(false)
                             .expect("make accepted mock connection blocking");
-                        handle_connection(stream, &worker_state);
+                        let state = Arc::clone(&worker_state);
+                        let shutdown = Arc::clone(&worker_shutdown);
+                        let handle =
+                            thread::spawn(move || serve_connection(stream, &state, &shutdown));
+                        worker_connections
+                            .lock()
+                            .expect("mock connection list lock")
+                            .push(handle);
                     }
                     Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                         thread::sleep(Duration::from_millis(2));
@@ -253,6 +339,7 @@ impl MockFileStation {
             state,
             shutdown,
             worker: Some(worker),
+            connections,
         }
     }
 
@@ -466,6 +553,170 @@ impl MockFileStation {
             });
     }
 
+    /// Refuse `List.list` of `folder` with DSM `code` (105 or 407: an ACL that denies this
+    /// account the folder), while its parent still lists it.
+    #[allow(dead_code)]
+    pub fn refuse_listing(&self, folder: &str, code: i64) {
+        self.state
+            .lock()
+            .expect("mock state lock")
+            .refused_listings
+            .insert(folder.to_owned(), code);
+    }
+
+    /// Once `parent` has been listed, delete `child` and everything beneath it.
+    #[allow(dead_code)]
+    pub fn vanish_after_listing(&self, parent: &str, child: &str) {
+        self.state
+            .lock()
+            .expect("mock state lock")
+            .vanish_after_listing = Some((parent.to_owned(), child.to_owned()));
+    }
+
+    /// Expire the session after every `requests` authenticated requests, uploads included.
+    #[allow(dead_code)]
+    pub fn expire_session_every(&self, requests: u32) {
+        let mut state = self.state.lock().expect("mock state lock");
+        state.expire_every = Some(requests);
+        state.session_expires_after = Some(requests);
+    }
+
+    /// Once `trigger` has been answered, answer the next `operation` with HTTP `status`.
+    #[allow(dead_code)]
+    pub fn fail_http_after_operation(&self, trigger: &str, operation: &str, status: u16) {
+        self.state.lock().expect("mock state lock").http_fault_after =
+            Some((trigger.to_owned(), operation.to_owned(), status));
+    }
+
+    /// Answer a status poll for a task id the mock does not hold with `code` instead of `408`.
+    #[allow(dead_code)]
+    pub fn answer_unknown_tasks_with(&self, code: i64) {
+        self.state
+            .lock()
+            .expect("mock state lock")
+            .unknown_task_code = code;
+    }
+
+    /// Forget every MD5 and CopyMove task, the way a DSM restart loses them.
+    #[allow(dead_code)]
+    pub fn forget_tasks(&self) {
+        let mut state = self.state.lock().expect("mock state lock");
+        state.md5_tasks.clear();
+        state.copy_tasks.clear();
+    }
+
+    /// Read the next `operation` request in full and close the connection without answering.
+    #[allow(dead_code)]
+    pub fn drop_next_connection_on(&self, operation: &str) {
+        self.inject_fault(InjectedFault {
+            operation: operation.to_owned(),
+            request_path: None,
+            phase: FaultPhase::BeforeOperation,
+            response: FaultResponse::DropConnection,
+            remaining: 1,
+        });
+    }
+
+    /// Commit the next upload, then close the connection without answering.
+    #[allow(dead_code)]
+    pub fn drop_upload_connection_after_commit(&self) {
+        self.inject_fault(InjectedFault {
+            operation: "SYNO.FileStation.Upload.upload".to_owned(),
+            request_path: None,
+            phase: FaultPhase::AfterCommit,
+            response: FaultResponse::DropConnection,
+            remaining: 1,
+        });
+    }
+
+    /// Tear the next upload after `bytes` of new content (each call tears one more upload). See
+    /// the field.
+    #[allow(dead_code)]
+    pub fn tear_next_upload_after(&self, bytes: usize) {
+        self.state
+            .lock()
+            .expect("mock state lock")
+            .tear_next_upload
+            .push(bytes);
+    }
+
+    /// Answer the next `getinfo` of `path` with HTTP `status`.
+    #[allow(dead_code)]
+    pub fn fail_next_getinfo_of(&self, path: &str, status: u16) {
+        self.state
+            .lock()
+            .expect("mock state lock")
+            .getinfo_faults
+            .push(GetinfoFault {
+                path: path.to_owned(),
+                status,
+                change_to: None,
+            });
+    }
+
+    /// Answer the next `getinfo` of `path` with HTTP `status`, and change the file there as it
+    /// is answered, so the retried read sees a different file.
+    #[allow(dead_code)]
+    pub fn fail_next_getinfo_of_then_change(
+        &self,
+        path: &str,
+        status: u16,
+        contents: &[u8],
+        mtime_seconds: i64,
+    ) {
+        self.state
+            .lock()
+            .expect("mock state lock")
+            .getinfo_faults
+            .push(GetinfoFault {
+                path: path.to_owned(),
+                status,
+                change_to: Some((contents.to_vec(), mtime_seconds)),
+            });
+    }
+
+    /// Make the next copy fail on `status` with envelope `code`, leaving the first `bytes` of the
+    /// source at the destination.
+    #[allow(dead_code)]
+    pub fn fail_next_copy_status_with_envelope_leaving_partial(&self, code: i64, bytes: usize) {
+        self.state
+            .lock()
+            .expect("mock state lock")
+            .fail_next_copy_leaving_partial = Some((code, bytes));
+    }
+
+    /// How many requests the client abandoned part-way through their body (a cancelled or
+    /// stopped upload). They are never routed, so nothing they carried was committed.
+    #[allow(dead_code)]
+    pub fn aborted_requests(&self) -> usize {
+        self.state.lock().expect("mock state lock").aborted_requests
+    }
+
+    /// Refuse requests on a dead session with `code` instead of `119`.
+    #[allow(dead_code)]
+    pub fn answer_dead_sessions_with(&self, code: i64) {
+        self.state
+            .lock()
+            .expect("mock state lock")
+            .dead_session_code = code;
+    }
+
+    /// Make `folder`'s `total` grow by one on every page answered for it. See the field.
+    #[allow(dead_code)]
+    pub fn churn_listing(&self, folder: &str) {
+        self.state
+            .lock()
+            .expect("mock state lock")
+            .churning_listings
+            .insert(folder.to_owned(), 0);
+    }
+
+    /// Close every connection after its response, as the mock did before it kept them open.
+    #[allow(dead_code)]
+    pub fn close_every_connection(&self) {
+        self.state.lock().expect("mock state lock").keep_alive = false;
+    }
+
     /// The modification time the mock holds for a file.
     #[allow(dead_code)]
     pub fn file_mtime(&self, path: &str) -> Option<i64> {
@@ -667,15 +918,48 @@ impl Drop for MockFileStation {
         if let Some(worker) = self.worker.take() {
             worker.join().expect("mock File Station worker panicked");
         }
+        let connections = std::mem::take(
+            &mut *self
+                .connections
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        );
+        let mut panicked = false;
+        for connection in connections {
+            panicked |= connection.join().is_err();
+        }
+        // Not while already unwinding: a second panic would abort and hide the first.
+        if panicked && !thread::panicking() {
+            panic!("a mock File Station connection handler panicked");
+        }
     }
 }
 
-fn handle_connection(mut stream: TcpStream, state: &Arc<Mutex<ServerState>>) {
+/// Answer requests on one connection until the client closes it, asks for it to be closed, or
+/// the mock shuts down.
+fn serve_connection(mut stream: TcpStream, state: &Arc<Mutex<ServerState>>, shutdown: &AtomicBool) {
+    while handle_connection(&mut stream, state, shutdown) {}
+}
+
+/// Answer one request, and say whether the connection stays open for another.
+fn handle_connection(
+    stream: &mut TcpStream,
+    state: &Arc<Mutex<ServerState>>,
+    shutdown: &AtomicBool,
+) -> bool {
     // A connection that carried no request is not a request: it is recorded nowhere and answered
     // with nothing, exactly as a real server would leave it.
-    let Some((request_path, headers, body)) = read_request(&mut stream) else {
-        return;
+    let (request_path, headers, body) = match read_request(stream, shutdown) {
+        Some(RequestRead::Complete(request)) => request,
+        Some(RequestRead::AbortedBody) => {
+            state.lock().expect("mock state lock").aborted_requests += 1;
+            return false;
+        }
+        None => return false,
     };
+    let client_closes = headers
+        .get("connection")
+        .is_some_and(|value| value.eq_ignore_ascii_case("close"));
     let content_type = headers
         .get("content-type")
         .map(String::as_str)
@@ -699,7 +983,7 @@ fn handle_connection(mut stream: TcpStream, state: &Arc<Mutex<ServerState>>) {
         upload_bytes: upload.as_ref().map(|file| file.contents.len()),
     };
 
-    let response = {
+    let (response, keep_alive) = {
         let mut state = state.lock().expect("mock state lock");
         let operation = format!("{api}.{method}");
         if let Some(index) = state
@@ -720,17 +1004,51 @@ fn handle_connection(mut stream: TcpStream, state: &Arc<Mutex<ServerState>>) {
             &headers,
             upload,
         );
-        rotate_session_if_configured(&mut state, &api, &method, routed)
+        if state
+            .http_fault_after
+            .as_ref()
+            .is_some_and(|(trigger, _, _)| *trigger == operation)
+        {
+            let (_, target, status) = state.http_fault_after.take().expect("checked above");
+            state.faults.push(InjectedFault {
+                operation: target,
+                request_path: None,
+                phase: FaultPhase::BeforeOperation,
+                response: FaultResponse::HttpStatus(status),
+                remaining: 1,
+            });
+        }
+        (
+            rotate_session_if_configured(&mut state, &api, &method, routed),
+            state.keep_alive,
+        )
     };
-    write_response(&mut stream, response);
+    if matches!(response, MockResponse::Drop) {
+        // Everything was read; nothing is answered. A FIN, which reqwest reports exactly as it
+        // does a reset: the request was sent and no response arrived. The connection is over
+        // either way, so a failed shutdown changes nothing.
+        let _ = stream.shutdown(std::net::Shutdown::Both);
+        return false;
+    }
+    let keep_open = keep_alive && !client_closes;
+    write_response(stream, response, keep_open);
+    keep_open
 }
 
 enum MockResponse {
+    /// Close the connection without a response. See [`FaultResponse::DropConnection`].
+    Drop,
     Json(Value),
-    JsonWithCookie { value: Value, cookie: String },
+    JsonWithCookie {
+        value: Value,
+        cookie: String,
+    },
     Raw(String),
     Bytes(Vec<u8>),
-    HttpStatus { status: u16, body: String },
+    HttpStatus {
+        status: u16,
+        body: String,
+    },
 }
 
 fn route_request(
@@ -816,13 +1134,13 @@ fn route_request(
         state.session_generation += 1;
     }
     if !valid_session(state, fields, headers) {
-        return api_error(119);
+        return api_error(state.dead_session_code);
     }
     if let Some(remaining) = state.session_expires_after {
         if remaining == 0 {
-            state.session_expires_after = None;
+            state.session_expires_after = state.expire_every;
             state.session_generation += 1;
-            return api_error(119);
+            return api_error(state.dead_session_code);
         }
         state.session_expires_after = Some(remaining - 1);
     }
@@ -866,6 +1184,26 @@ fn route_request(
         }
         ("SYNO.FileStation.List", "getinfo") => {
             let path = first_json_string(fields.get("path"));
+            if let Some(index) = state
+                .getinfo_faults
+                .iter()
+                .position(|fault| Some(&fault.path) == path.as_ref())
+            {
+                let fault = state.getinfo_faults.remove(index);
+                if let Some((contents, mtime_seconds)) = fault.change_to {
+                    state.files.insert(
+                        fault.path,
+                        FileNode {
+                            contents,
+                            mtime_seconds,
+                        },
+                    );
+                }
+                return MockResponse::HttpStatus {
+                    status: fault.status,
+                    body: "injected transient mock failure".to_owned(),
+                };
+            }
             let real_path = wants_real_path(fields);
             match path.and_then(|path| listed_node(state, &path, real_path)) {
                 Some(node) => success(json!({"files": [node]})),
@@ -874,6 +1212,9 @@ fn route_request(
         }
         ("SYNO.FileStation.List", "list") => {
             let folder = json_string(fields.get("folder_path")).unwrap_or_default();
+            if let Some(code) = state.refused_listings.get(&folder) {
+                return api_error(*code);
+            }
             if !state.directories.contains(&resolve_links(state, &folder)) {
                 return api_error(408);
             }
@@ -881,7 +1222,14 @@ fn route_request(
             // `total` counts the whole directory, including entries DSM withholds from the page.
             let files = listed_children(state, &folder, wants_real_path(fields));
             let hidden = state.hidden_list_entries.get(&folder).copied().unwrap_or(0);
-            let total = files.len() + hidden;
+            let churn = match state.churning_listings.get_mut(&folder) {
+                Some(grown) => {
+                    *grown += 1;
+                    *grown
+                }
+                None => 0,
+            };
+            let total = files.len() + hidden + churn;
             let offset = fields
                 .get("offset")
                 .and_then(|value| value.parse::<usize>().ok())
@@ -897,6 +1245,18 @@ fn route_request(
                 .take(limit)
                 .collect::<Vec<_>>();
             let response = success(json!({"total": total, "files": page}));
+            if state
+                .vanish_after_listing
+                .as_ref()
+                .is_some_and(|(parent, _)| *parent == folder)
+            {
+                let (_, child) = state.vanish_after_listing.take().expect("checked above");
+                let prefix = format!("{child}/");
+                state
+                    .directories
+                    .retain(|directory| *directory != child && !directory.starts_with(&prefix));
+                state.files.retain(|file, _| !file.starts_with(&prefix));
+            }
             if let Some(mutation) = state.mutation_after_listing.take()
                 && state.files.contains_key(&mutation.path)
             {
@@ -987,6 +1347,26 @@ fn route_request(
             } else {
                 mtime_ms.div_euclid(1000)
             };
+            if !state.tear_next_upload.is_empty() {
+                let written = state.tear_next_upload.remove(0);
+                let new = upload.contents;
+                let mut torn = state
+                    .files
+                    .get(&path)
+                    .map(|file| file.contents.clone())
+                    .unwrap_or_default();
+                torn.resize(new.len(), 0);
+                let written = written.min(new.len());
+                torn[..written].copy_from_slice(&new[..written]);
+                state.files.insert(
+                    path,
+                    FileNode {
+                        contents: torn,
+                        mtime_seconds,
+                    },
+                );
+                return MockResponse::Drop;
+            }
             state.files.insert(
                 path,
                 FileNode {
@@ -1005,6 +1385,8 @@ fn route_request(
             let Some(path) = json_string(fields.get("file_path")) else {
                 return api_error(101);
             };
+            // Links followed, as for every other path File Station is handed.
+            let path = resolve_links(state, &path);
             if !state.files.contains_key(&path) {
                 return api_error(408);
             }
@@ -1018,7 +1400,7 @@ fn route_request(
                 return api_error(101);
             };
             let Some(path) = state.md5_tasks.get(&task).cloned() else {
-                return api_error(408);
+                return api_error(state.unknown_task_code);
             };
             let answered = state.md5_status_calls.entry(task.clone()).or_insert(0);
             *answered += 1;
@@ -1039,6 +1421,7 @@ fn route_request(
             let Some(path) = first_json_string(fields.get("path")) else {
                 return api_error(101);
             };
+            let path = resolve_links(state, &path);
             match state.files.get(&path) {
                 Some(file) => MockResponse::Bytes(file.contents.clone()),
                 None => api_error(408),
@@ -1051,6 +1434,8 @@ fn route_request(
             let Some(destination_parent) = json_string(fields.get("dest_folder_path")) else {
                 return api_error(101);
             };
+            let source = resolve_links(state, &source);
+            let destination_parent = resolve_links(state, &destination_parent);
             let Some(source_file) = state.files.get(&source).cloned() else {
                 return api_error(408);
             };
@@ -1069,6 +1454,15 @@ fn route_request(
                 state.envelope_failing_copy_tasks.insert(task.clone(), code);
                 return success(json!({"taskid": task}));
             }
+            if let Some((code, bytes)) = state.fail_next_copy_leaving_partial.take() {
+                state.envelope_failing_copy_tasks.insert(task.clone(), code);
+                let mut partial = source_file;
+                partial.contents.truncate(bytes);
+                state
+                    .partial_copy_tasks
+                    .insert(task.clone(), (destination, partial));
+                return success(json!({"taskid": task}));
+            }
             if std::mem::take(&mut state.fail_next_copy) {
                 state.failing_copy_tasks.insert(task.clone());
                 return success(json!({"taskid": task}));
@@ -1085,7 +1479,10 @@ fn route_request(
                 return api_error(101);
             };
             if !state.copy_tasks.contains(&task) {
-                return api_error(408);
+                return api_error(state.unknown_task_code);
+            }
+            if let Some((destination, partial)) = state.partial_copy_tasks.remove(&task) {
+                state.files.insert(destination, partial);
             }
             if let Some(code) = state.envelope_failing_copy_tasks.get(&task) {
                 return api_error(*code);
@@ -1205,6 +1602,7 @@ fn take_injected_fault(
             body: "injected transient mock failure".to_owned(),
         },
         FaultResponse::ApiError(code) => api_error(code),
+        FaultResponse::DropConnection => MockResponse::Drop,
     })
 }
 
@@ -1553,14 +1951,57 @@ fn split_bytes<'a>(haystack: &'a [u8], needle: &[u8]) -> Vec<&'a [u8]> {
 /// writing a byte, and every real HTTP server tolerates that. Treating it as a protocol violation
 /// would model something no server does, and would make the mock fail on traffic the client is
 /// entitled to send.
-fn read_request(stream: &mut TcpStream) -> Option<(String, BTreeMap<String, String>, Vec<u8>)> {
+/// What reading one request produced.
+enum RequestRead {
+    Complete((String, BTreeMap<String, String>, Vec<u8>)),
+    /// The client closed or reset the connection after the headers and before the whole body: a
+    /// cancelled or stopped upload, which a real server simply discards.
+    AbortedBody,
+}
+
+/// Read one request, waiting as long as the client keeps the connection open and the mock runs.
+///
+/// `None` when the client closed (or reset) the connection between requests, or the mock is
+/// shutting down.
+fn read_request(stream: &mut TcpStream, shutdown: &AtomicBool) -> Option<RequestRead> {
+    // A short poll, so an idle keep-alive connection notices the mock shutting down.
     stream
-        .set_read_timeout(Some(Duration::from_secs(10)))
+        .set_read_timeout(Some(Duration::from_millis(50)))
         .expect("set mock read timeout");
+    let mut read = |buffer: &mut [u8], between_requests: bool| -> Option<usize> {
+        loop {
+            match stream.read(buffer) {
+                Ok(count) => return Some(count),
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                    ) =>
+                {
+                    if shutdown.load(Ordering::Acquire) {
+                        return None;
+                    }
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                // A client that resets an idle connection simply ends it.
+                Err(error)
+                    if between_requests
+                        && matches!(
+                            error.kind(),
+                            std::io::ErrorKind::ConnectionReset
+                                | std::io::ErrorKind::ConnectionAborted
+                        ) =>
+                {
+                    return Some(0);
+                }
+                Err(error) => panic!("read mock request: {error}"),
+            }
+        }
+    };
     let mut received = Vec::new();
     let header_end = loop {
         let mut buffer = [0_u8; 8192];
-        let count = stream.read(&mut buffer).expect("read request headers");
+        let count = read(&mut buffer, received.is_empty())?;
         if count == 0 {
             assert!(
                 received.is_empty(),
@@ -1592,19 +2033,23 @@ fn read_request(stream: &mut TcpStream) -> Option<(String, BTreeMap<String, Stri
         .unwrap_or(0);
     while received.len() - header_end < content_length {
         let mut buffer = [0_u8; 8192];
-        let count = stream.read(&mut buffer).expect("read request body");
-        assert!(count > 0, "client closed before request body completed");
+        // A reset mid-body is the client giving the request up, as a close is.
+        let count = read(&mut buffer, true)?;
+        if count == 0 {
+            return Some(RequestRead::AbortedBody);
+        }
         received.extend_from_slice(&buffer[..count]);
     }
-    Some((
+    Some(RequestRead::Complete((
         request_path,
         headers,
         received[header_end..header_end + content_length].to_vec(),
-    ))
+    )))
 }
 
-fn write_response(stream: &mut TcpStream, response: MockResponse) {
+fn write_response(stream: &mut TcpStream, response: MockResponse, keep_open: bool) {
     let (status, reason, content_type, cookie, body) = match response {
+        MockResponse::Drop => unreachable!("a dropped connection is never answered"),
         MockResponse::Json(value) => (
             200,
             "OK",
@@ -1632,9 +2077,17 @@ fn write_response(stream: &mut TcpStream, response: MockResponse) {
     let cookie_header = cookie
         .map(|cookie| format!("Set-Cookie: {cookie}\r\n"))
         .unwrap_or_default();
+    // Persistent unless asked otherwise, as HTTP/1.1 and nginx are. Announcing `close` on every
+    // response kept the client from ever reusing a connection, so its keep-alive paths were never
+    // exercised.
+    let connection_header = if keep_open {
+        ""
+    } else {
+        "Connection: close\r\n"
+    };
     write!(
         stream,
-        "HTTP/1.1 {status} {reason}\r\nContent-Type: {content_type}\r\n{cookie_header}Content-Length: {}\r\nConnection: close\r\n\r\n",
+        "HTTP/1.1 {status} {reason}\r\nContent-Type: {content_type}\r\n{cookie_header}Content-Length: {}\r\n{connection_header}\r\n",
         body.len()
     )
     .expect("write mock response");

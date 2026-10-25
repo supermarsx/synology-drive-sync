@@ -281,6 +281,12 @@ fn ffi_apply_executes_and_returns_reconciled_json() {
         result["outcome"]["incomplete_listings"].is_array(),
         "{result}"
     );
+    // G-11: the link guard ran everywhere, and FFI callers see that as a count.
+    assert_eq!(result["outcome"]["link_guard_unchecked"], 0, "{result}");
+    assert_eq!(
+        result["outcome"]["plan"]["link_guard_unchecked"], 0,
+        "{result}"
+    );
     assert_eq!(
         server.file_contents("/team/ffi/nested/hello.txt"),
         Some(b"FFI applied".to_vec())
