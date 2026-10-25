@@ -183,7 +183,7 @@ test("a live PID that is not the controller is not reported as a healthy queue",
   const context = snapshotContext({ service: "untrusted", controller: { state: "running" } });
   assert.equal(context.queuedWaitDetail.kind, "untrusted");
   assert.match(context.queuedWaitDetail.text, /is not the controller/);
-  assert.match(context.queuedWaitDetail.text, /Restart the package/);
+  assert.match(context.queuedWaitDetail.text, /Stop the package in Package Center, then Run it again/);
 });
 
 test("a running idle controller promises the queue will drain", () => {

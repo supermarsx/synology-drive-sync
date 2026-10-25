@@ -4607,3 +4607,32 @@ opacity: 0.55;
 .sdsync-widget-profile.is-stale {
 opacity: 0.6;
 }
+.sdsync-attention-chip {
+padding: 2px 9px;
+border: 1px solid var(--sdsync-border);
+background: transparent;
+color: var(--sdsync-text);
+font-size: 11px;
+font-weight: 700;
+cursor: pointer;
+}
+.sdsync-attention-chip.is-fail {
+border-color: var(--sdsync-red);
+color: var(--sdsync-red);
+}
+.sdsync-attention-chip.is-warn,
+.sdsync-attention-chip.is-unknown {
+border-color: var(--sdsync-amber);
+color: var(--sdsync-amber);
+}
+.sdsync-toast-dismiss {
+align-self: flex-start;
+margin-top: 4px;
+padding: 2px 8px;
+border: 1px solid var(--sdsync-trace);
+background: transparent;
+color: var(--sdsync-text);
+font-size: 11px;
+cursor: pointer;
+pointer-events: auto;
+}

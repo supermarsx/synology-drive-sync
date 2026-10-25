@@ -39,6 +39,7 @@
           <header class="sdsync-topbar">
             <div><h1 id="sdsync-page-title">{{ pageTitle }}</h1></div>
             <div class="sdsync-topbar-actions">
+              <button v-if="attentionChip" type="button" class="sdsync-attention-chip" :class="'is-' + attentionChip.level" :title="attentionChip.title" :aria-label="attentionChip.title" @click="navigate('overview')">{{ attentionChip.text }}</button>
               <span class="sdsync-freshness">{{ freshness }}</span>
               <span :class="['sdsync-autosave-state', 'is-' + autosavePhase]" aria-live="polite"><action-icon name="save" :size="13" />{{ autosaveMessage }}</span>
               <v-button
@@ -144,17 +145,17 @@
             <ul v-if="attentionItems.length" class="sdsync-attention" role="status" aria-label="Run outcomes needing attention"><li v-for="item in attentionItems" :key="item.id" :class="'is-' + item.level"><strong>{{ item.title }}</strong> <span>{{ item.detail }}</span></li></ul>
             <details v-if="runStderrView" class="sdsync-run-stderr"><summary>Core error output of the last run<span v-if="runStderrView.error"> (could not be read)</span></summary><p v-if="runStderrView.error" class="is-fail">{{ runStderrView.error }}</p><pre v-else>{{ runStderrView.text }}</pre></details>
             <div class="sdsync-metrics" aria-label="Package summary">
-              <article><span>Profiles</span><strong>{{ profiles.length }}</strong><small>{{ readyProfileCount }} with protected password material</small></article>
-              <article><span>Next routine</span><strong>{{ nextRun }}</strong><small>{{ enabledRoutines.length }} enabled routine{{ enabledRoutines.length === 1 ? '' : 's' }}</small></article>
+              <article><span>Profiles</span><strong>{{ snapshotRead ? profiles.length : 'Not read' }}</strong><small>{{ snapshotRead ? readyProfileCount + ' with protected password material' : 'Waiting for the package status' }}</small></article>
+              <article><span>Next routine</span><strong>{{ snapshotRead ? nextRun : 'Not read' }}</strong><small>{{ snapshotRead ? enabledRoutines.length + ' enabled routine' + (enabledRoutines.length === 1 ? '' : 's') : 'Waiting for the package status' }}</small></article>
               <article><span>Last result</span><strong :class="'is-' + lastResult.level">{{ lastResult.title }}</strong><small>{{ lastResult.detail }}</small></article>
-              <article><span>Active scope</span><strong>{{ runActive ? runScope : 'Idle' }}</strong><small>{{ runActive ? runOperation + runningForSuffix : 'No active operation' }}</small></article>
-              <article><span>Realtime</span><strong>{{ realtimeRoutines.length ? realtimeRoutines.length + ' active' : 'Off' }}</strong><small>{{ realtimeDetail }}</small></article>
+              <article><span>Active scope</span><strong>{{ snapshotRead ? (runActive ? runScope : 'Idle') : 'Not read' }}</strong><small>{{ snapshotRead ? (runActive ? runOperation + runningForSuffix : 'No active operation') : 'Waiting for the package status' }}</small></article>
+              <article><span>Realtime</span><strong>{{ snapshotRead ? (realtimeRoutines.length ? realtimeRoutines.length + ' active' : 'Off') : 'Not read' }}</strong><small>{{ snapshotRead ? realtimeDetail : 'Waiting for the package status' }}</small></article>
             </div>
 
             <div class="sdsync-two-column">
               <article class="sdsync-panel">
                 <div class="sdsync-panel-heading"><div><p class="sdsync-eyebrow">Destinations</p><h3>Profile readiness</h3></div><v-button type="styleless" display="icon-text" tooltip="Open profile configuration and protected credentials" @click="navigate('profiles')"><template #icon><action-icon name="navigate" /></template>Manage profiles</v-button></div>
-                <p v-if="!profiles.length" class="sdsync-empty">No configured profiles.</p>
+                <p v-if="!profiles.length" class="sdsync-empty">{{ profilesEmptyText }}</p>
                 <div v-for="profile in profiles" :key="profile.name" class="sdsync-compact-profile">
                   <div><strong><bdi>{{ shownName(profile.name) }}</bdi></strong><span>{{ profile.remote || profile.remote_path || 'Destination unavailable' }}</span><small class="sdsync-profile-outcome" :class="'is-' + profileOutcome(profile.name).level">{{ profileOutcome(profile.name).text }}</small></div>
                   <span>{{ profile.has_password === true ? 'Credential stored' : 'Password required' }}</span>
@@ -183,7 +184,7 @@
                   <div class="sdsync-profile-filter-field"><span class="sdsync-profile-filter-label">Show <control-help help-key="profile-filter-status" /></span><v-single-select class="sdsync-select-control" v-model="profileFilterStatus" :options="profileFilterStatusOptions" width="100%" :custom-dropdown-cls="'sdsync-select-dropdown ' + themeClass" aria-label="Filter profiles by readiness" aria-describedby="sdsync-help-profile-filter-status"><template #dropdown-icon><action-icon name="chevron-down" /></template></v-single-select></div>
                   <div class="sdsync-profile-filter-summary" aria-live="polite"><span>{{ profileFilterSummary }}</span><v-button v-if="profileFiltersActive" type="styleless" display="icon-text" tooltip="Clear every profile catalog filter" @click="clearProfileFilters"><template #icon><action-icon name="close" /></template>Clear</v-button></div>
                 </div>
-                <p v-if="!filteredProfiles.length" class="sdsync-empty">{{ profiles.length ? 'No matching profiles.' : 'No configured profiles.' }}</p>
+                <p v-if="!filteredProfiles.length" class="sdsync-empty">{{ profiles.length ? 'No matching profiles.' : profilesEmptyText }}</p>
                 <button
                   v-for="profile in filteredProfiles"
                   :key="profile.name"
@@ -296,7 +297,7 @@
               <transition name="sdsync-page-swap" mode="out-in">
               <article v-if="!routineEditorOpen" key="routine-catalog" class="sdsync-panel sdsync-routine-catalog">
                 <div class="sdsync-panel-heading"><div><p class="sdsync-eyebrow">Configured routines</p><h3>Per-profile automation</h3></div><span class="sdsync-mini-badge">{{ routines.length }} total</span></div>
-                <p v-if="!routines.length" class="sdsync-empty">No configured routines. Choose New routine to automate a profile.</p>
+                <p v-if="!routines.length" class="sdsync-empty">{{ routinesEmptyText }}</p>
                 <button v-for="routine in routines" :key="routine.profile" type="button" :class="['sdsync-routine-row', { 'is-selected': selectedRoutine && selectedRoutine.profile === routine.profile }]" :title="'Edit routine for ' + routine.profile" :disabled="operationBusy" @click="openRoutine(routine.profile)"><span><strong><action-icon name="edit" />&nbsp;<bdi>{{ shownName(routine.profile) }}</bdi></strong><small>{{ routine.mode || 'interval' }} · {{ routine.backend || 'fallback unreported' }} · {{ routine.state || (routine.enabled ? 'enabled' : 'disabled') }}{{ routine.backend_reason && routine.backend_reason !== 'ok' ? ' · ' + routine.backend_reason : '' }}</small></span><time>{{ routineNextRunLabel(routine) }}</time></button>
               </article>
               <v-form v-else key="routine-editor" v-model="routineForm" class="sdsync-panel sdsync-editor sdsync-horizontal-form sdsync-routine-editor" direction="horizontal" @submit="saveRoutine">
@@ -309,6 +310,7 @@
                       <v-form-item v-if="routineForm.mode === 'interval'" class="sdsync-form-item sdsync-inline-form-item" label="Interval (seconds)" label-flex="0 0 150px" control-flex="1 1 auto"><template #label-after><control-help class="sdsync-form-label-help" help-key="routine-interval" /></template><v-input class="sdsync-input-control" v-model="routineForm.interval_seconds" number-only aria-describedby="sdsync-help-routine-interval" :disabled="!canChangeRoutines" /></v-form-item>
                       <v-form-item v-if="routineForm.mode === 'daily'" class="sdsync-form-item sdsync-inline-form-item" label="Window starts" label-flex="0 0 150px" control-flex="1 1 auto"><template #label-after><control-help class="sdsync-form-label-help" help-key="routine-window-start" /></template><input v-model="routineForm.time_window_start" class="sdsync-native-input" type="time" aria-label="Window starts" aria-describedby="sdsync-help-routine-window-start" :disabled="!canChangeRoutines"></v-form-item>
                       <v-form-item v-if="routineForm.mode === 'daily'" class="sdsync-form-item sdsync-inline-form-item" label="Window ends" label-flex="0 0 150px" control-flex="1 1 auto"><template #label-after><control-help class="sdsync-form-label-help" help-key="routine-window-end" /></template><input v-model="routineForm.time_window_end" class="sdsync-native-input" type="time" aria-label="Window ends" aria-describedby="sdsync-help-routine-window-end" :disabled="!canChangeRoutines"></v-form-item>
+                      <div v-if="routineForm.mode === 'daily' && nasTimeNote" class="sdsync-form-item span-2"><p class="sdsync-field-note">{{ nasTimeNote }}</p></div>
                       <v-form-item v-if="routineForm.mode === 'realtime'" class="sdsync-form-item sdsync-inline-form-item" label="Realtime debounce (seconds)" label-flex="0 0 150px" control-flex="1 1 auto"><template #label-after><control-help class="sdsync-form-label-help" help-key="routine-debounce" /></template><v-input class="sdsync-input-control" v-model="routineForm.debounce_seconds" number-only aria-describedby="sdsync-help-routine-debounce" :disabled="!canChangeRoutines" /></v-form-item>
                       <v-form-item v-if="routineForm.mode === 'realtime'" class="sdsync-form-item sdsync-inline-form-item" label="Fallback poll (seconds)" label-flex="0 0 150px" control-flex="1 1 auto"><template #label-after><control-help class="sdsync-form-label-help" help-key="routine-poll" /></template><v-input class="sdsync-input-control" v-model="routineForm.poll_seconds" number-only aria-describedby="sdsync-help-routine-poll" :disabled="!canChangeRoutines" /></v-form-item>
                       <div v-if="routineForm.mode === 'realtime' && selectedRoutine" class="sdsync-form-item span-2">
@@ -484,7 +486,7 @@
                     <div class="sdsync-panel-heading"><div><p class="sdsync-eyebrow">Bounded package logs</p><h3>Troubleshooting evidence</h3></div><div class="sdsync-evidence-heading-actions"><span class="sdsync-log-state">{{ logState }}</span><v-button type="border" display="icon-text" aria-label="Copy all visible package logs" tooltip="Copy the selected log sources as bounded, sanitized troubleshooting text" :disabled="!logRecords.length" @click="copyVisibleLogs"><template #icon><action-icon name="copy" /></template>Copy visible</v-button></div></div>
                     <div class="sdsync-filter-list sdsync-log-filters" aria-label="Log filters"><div class="sdsync-filter-row"><span class="sdsync-filter-label">Source</span><div class="sdsync-filter-control"><v-single-select class="sdsync-select-control" v-model="logSource" :options="logSourceOptions" width="100%" :custom-dropdown-cls="'sdsync-select-dropdown ' + themeClass" aria-label="Log source" aria-describedby="sdsync-help-log-source" @input="refreshLogs"><template #dropdown-icon><action-icon name="chevron-down" /></template></v-single-select><control-help help-key="log-source" /></div></div><div class="sdsync-filter-row"><span class="sdsync-filter-label">Lines</span><div class="sdsync-filter-control"><v-single-select class="sdsync-select-control" v-model="logLines" :options="logLineOptions" width="100%" :custom-dropdown-cls="'sdsync-select-dropdown ' + themeClass" aria-label="Log line count" aria-describedby="sdsync-help-log-lines" @input="refreshLogs"><template #dropdown-icon><action-icon name="chevron-down" /></template></v-single-select><control-help help-key="log-lines" /></div></div></div>
                     <p v-if="!logRecords.length" class="sdsync-empty">{{ logOutput }}</p>
-                    <div v-else class="sdsync-log-records"><section v-for="record in logRecords" :key="record.id" class="sdsync-log-record"><header><span><strong>{{ record.source }}</strong><small>{{ record.lineCount }} line{{ record.lineCount === 1 ? '' : 's' }}</small><small v-if="record.scanLimited">newest lines only; older history was not scanned</small></span><span class="sdsync-log-record-actions"><v-button class="sdsync-evidence-copy" type="border" display="icon-text" :aria-label="'Copy ' + record.source + ' log evidence'" tooltip="Copy this log record as bounded, sanitized troubleshooting text" @click="copyLogRecord(record)"><template #icon><action-icon name="copy" /></template>Copy</v-button><v-button class="sdsync-evidence-copy sdsync-log-clear" type="border" display="icon-text" :aria-label="'Clear the ' + record.source + ' package log'" :tooltip="logClearTooltip(record.source)" :disabled="!logSourceClearable(record.source) || !canRunOperations" @click="clearLogSource(record.source)"><template #icon><action-icon name="delete" /></template>Clear</v-button></span></header><div v-if="record.doctorInventories.length" class="sdsync-log-inventory-evidence"><div v-for="(inventoryRecord, recordIndex) in record.doctorInventories" :key="inventoryRecord.epoch + ':' + inventoryRecord.profile + ':' + recordIndex" class="sdsync-inventory-evidence"><div class="sdsync-inventory-evidence-summary"><strong>{{ inventoryRecord.profile }} · {{ doctorInventoryScopeLabel(inventoryRecord.inventory.scope) }}</strong><span>{{ inventoryRecord.inventory.total }} total · {{ inventoryRecord.inventory.entries.length }} shown<span v-if="inventoryRecord.inventory.truncated"> · truncated</span></span></div><p v-if="!inventoryRecord.inventory.entries.length">No logical entries were visible.</p><div v-for="(entry, index) in inventoryRecord.inventory.entries" :key="entry.path + ':' + index" class="sdsync-inventory-evidence-entry"><span>{{ entry.kind }}</span><code>{{ entry.path }}</code><small>{{ entry.name }}</small></div></div></div><p v-if="!record.lines.length" class="sdsync-empty sdsync-log-empty">No lines to show. This log can still hold records that the current log level for its category keeps out of this view.</p><ol v-else class="sdsync-log-lines" tabindex="0"><li v-for="line in record.lines" :key="line.id"><time v-if="line.epoch">{{ formatDate(line.epoch) }}</time><time v-else class="is-unrecorded" title="This line was written without a recorded time; the package now stamps every record it writes.">Time not recorded</time><span>{{ line.text }}</span></li></ol></section></div>
+                    <div v-else class="sdsync-log-records"><section v-for="record in logRecords" :key="record.id" class="sdsync-log-record"><header><span><strong>{{ record.source }}</strong><small>{{ record.lineCount }} line{{ record.lineCount === 1 ? '' : 's' }}</small><small v-if="record.scanLimited">newest lines only; older history was not scanned</small><small v-if="record.deadlineReached">the read ran out of time; older lines were not scanned</small></span><span class="sdsync-log-record-actions"><v-button class="sdsync-evidence-copy" type="border" display="icon-text" :aria-label="'Copy ' + record.source + ' log evidence'" tooltip="Copy this log record as bounded, sanitized troubleshooting text" @click="copyLogRecord(record)"><template #icon><action-icon name="copy" /></template>Copy</v-button><v-button class="sdsync-evidence-copy sdsync-log-clear" type="border" display="icon-text" :aria-label="'Clear the ' + record.source + ' package log'" :tooltip="logClearTooltip(record.source)" :disabled="!logSourceClearable(record.source) || !canRunOperations" @click="clearLogSource(record.source)"><template #icon><action-icon name="delete" /></template>Clear</v-button></span></header><div v-if="record.doctorInventories.length" class="sdsync-log-inventory-evidence"><div v-for="(inventoryRecord, recordIndex) in record.doctorInventories" :key="inventoryRecord.epoch + ':' + inventoryRecord.profile + ':' + recordIndex" class="sdsync-inventory-evidence"><div class="sdsync-inventory-evidence-summary"><strong>{{ inventoryRecord.profile }} · {{ doctorInventoryScopeLabel(inventoryRecord.inventory.scope) }}</strong><span>{{ inventoryRecord.inventory.total }} total · {{ inventoryRecord.inventory.entries.length }} shown<span v-if="inventoryRecord.inventory.truncated"> · truncated</span></span></div><p v-if="!inventoryRecord.inventory.entries.length">No logical entries were visible.</p><div v-for="(entry, index) in inventoryRecord.inventory.entries" :key="entry.path + ':' + index" class="sdsync-inventory-evidence-entry"><span>{{ entry.kind }}</span><code>{{ entry.path }}</code><small>{{ entry.name }}</small></div></div></div><p v-if="!record.lines.length" class="sdsync-empty sdsync-log-empty">No lines to show. This log can still hold records that the current log level for its category keeps out of this view.</p><ol v-else class="sdsync-log-lines" tabindex="0"><li v-for="line in record.lines" :key="line.id"><time v-if="line.epoch">{{ formatDate(line.epoch) }}</time><time v-else class="is-unrecorded" title="This line was written without a recorded time; the package now stamps every record it writes.">Time not recorded</time><span>{{ line.text }}</span></li></ol></section></div>
                   </article>
                 </div>
                 <div v-else :id="'sdsync-activity-panel-' + activityTab" :key="activityTab" class="sdsync-subtab-panel" :data-subtab-panel="activityTab" role="tabpanel" :aria-labelledby="'sdsync-activity-tab-' + activityTab" tabindex="0">
@@ -493,12 +495,13 @@
                       <div><p class="sdsync-eyebrow">Structured activity</p><h3>Recent package events</h3></div>
                       <div class="sdsync-evidence-heading-actions"><span class="sdsync-freshness">{{ reversedActivity.length }} of {{ activityLensTotal }} event{{ activityLensTotal === 1 ? '' : 's' }}</span><v-button type="border" display="icon-text" aria-label="Copy all visible activity events" tooltip="Copy the filtered activity events as bounded, sanitized troubleshooting text" :disabled="!reversedActivity.length" @click="copyVisibleActivity"><template #icon><action-icon name="copy" /></template>Copy visible</v-button></div>
                     </div>
+                    <p v-if="nasTimeNote" class="sdsync-field-note">{{ nasTimeNote }}</p>
                     <div class="sdsync-filter-list" aria-label="Activity filters">
                       <div class="sdsync-filter-row"><span class="sdsync-filter-label">Search</span><div class="sdsync-filter-control"><v-input v-model.trim="activitySearch" class="sdsync-input-control sdsync-activity-search" maxlength="128" placeholder="Search event text or request ID" aria-label="Search activity text or client request ID" aria-describedby="sdsync-help-activity-search" /><control-help help-key="activity-search" /></div></div>
                       <div class="sdsync-filter-row"><span class="sdsync-filter-label">Category</span><div class="sdsync-filter-control"><v-single-select class="sdsync-select-control" v-model="activityCategory" :options="activityLensCategoryOptions" width="100%" :custom-dropdown-cls="'sdsync-select-dropdown ' + themeClass" aria-label="Activity category" aria-describedby="sdsync-help-activity-category"><template #dropdown-icon><action-icon name="chevron-down" /></template></v-single-select><control-help help-key="activity-category" /></div></div>
                       <div class="sdsync-filter-row"><span class="sdsync-filter-label">Level</span><div class="sdsync-filter-control"><v-single-select class="sdsync-select-control" v-model="activityLevel" :options="activityLevelOptions" width="100%" :custom-dropdown-cls="'sdsync-select-dropdown ' + themeClass" aria-label="Activity level" aria-describedby="sdsync-help-activity-level"><template #dropdown-icon><action-icon name="chevron-down" /></template></v-single-select><control-help help-key="activity-level" /></div></div>
                     </div>
-                    <ol class="sdsync-activity-feed"><li v-if="!reversedActivity.length" class="sdsync-empty">{{ activityEmptyText }}</li><li v-for="event in reversedActivity" :key="event.rowKey"><time>{{ formatDate(event.epoch) }}</time><div class="sdsync-activity-detail"><strong>{{ event.code }}</strong><p v-if="event.message && !event.doctor_inventory">{{ event.message }}</p><div v-if="event.doctor_inventory" class="sdsync-inventory-evidence"><div class="sdsync-inventory-evidence-summary"><strong>{{ doctorInventoryScopeLabel(event.doctor_inventory.inventory.scope) }}</strong><span>{{ event.doctor_inventory.inventory.total }} total · {{ event.doctor_inventory.inventory.entries.length }} shown<span v-if="event.doctor_inventory.inventory.truncated"> · truncated</span></span></div><p v-if="!event.doctor_inventory.inventory.entries.length">No logical entries were visible.</p><div v-for="(entry, index) in event.doctor_inventory.inventory.entries" :key="entry.path + ':' + index" class="sdsync-inventory-evidence-entry"><span>{{ entry.kind }}</span><code>{{ entry.path }}</code><small>{{ entry.name }}</small></div></div><code v-if="event.client_request_id">Client request ID: {{ event.client_request_id }}</code></div><small><bdi>{{ shownName(event.profile) }}</bdi> · {{ event.state }} · {{ event.category }} / {{ event.level }}</small><v-button class="sdsync-evidence-copy" type="border" display="icon-text" :aria-label="'Copy activity event ' + event.code" tooltip="Copy this event as bounded, sanitized troubleshooting text" @click="copyActivityEvent(event)"><template #icon><action-icon name="copy" /></template>Copy</v-button></li></ol>
+                    <ol class="sdsync-activity-feed"><li v-if="!reversedActivity.length" class="sdsync-empty">{{ activityEmptyText }}</li><li v-for="event in shownActivity" :key="event.rowKey"><time>{{ formatDate(event.epoch) }}{{ nasTimeSuffix(event.epoch) }}</time><div class="sdsync-activity-detail"><strong>{{ event.code }}</strong><p v-if="event.message && !event.doctor_inventory">{{ event.message }}</p><div v-if="event.doctor_inventory" class="sdsync-inventory-evidence"><div class="sdsync-inventory-evidence-summary"><strong>{{ doctorInventoryScopeLabel(event.doctor_inventory.inventory.scope) }}</strong><span>{{ event.doctor_inventory.inventory.total }} total · {{ event.doctor_inventory.inventory.entries.length }} shown<span v-if="event.doctor_inventory.inventory.truncated"> · truncated</span></span></div><p v-if="!event.doctor_inventory.inventory.entries.length">No logical entries were visible.</p><div v-for="(entry, index) in event.doctor_inventory.inventory.entries" :key="entry.path + ':' + index" class="sdsync-inventory-evidence-entry"><span>{{ entry.kind }}</span><code>{{ entry.path }}</code><small>{{ entry.name }}</small></div></div><code v-if="event.client_request_id">Client request ID: {{ event.client_request_id }}</code></div><small><bdi>{{ shownName(event.profile) }}</bdi> · {{ event.state }} · {{ event.category }} / {{ event.level }}</small><v-button class="sdsync-evidence-copy" type="border" display="icon-text" :aria-label="'Copy activity event ' + event.code" tooltip="Copy this event as bounded, sanitized troubleshooting text" @click="copyActivityEvent(event)"><template #icon><action-icon name="copy" /></template>Copy</v-button></li><li v-if="activityHiddenCount" class="sdsync-empty sdsync-activity-more"><span>{{ activityMoreLabel }}</span> <v-button type="border" display="icon-text" tooltip="Draw the next 200 older events" @click="showMoreActivity">Show older</v-button></li></ol>
                   </article>
                 </div>
               </transition>
@@ -513,7 +516,7 @@
               <transition name="sdsync-subtab-swap" mode="out-in">
                 <div v-if="notificationTab === 'package-alerts'" id="sdsync-notifications-panel-package-alerts" key="package-alerts" class="sdsync-subtab-panel" data-subtab-panel="package-alerts" role="tabpanel" aria-labelledby="sdsync-notifications-tab-package-alerts" tabindex="0">
                   <v-form v-model="alertForm" class="sdsync-panel sdsync-horizontal-form sdsync-alert-form" direction="horizontal" @submit="saveAlerts">
-                    <div class="sdsync-panel-heading"><div><p class="sdsync-eyebrow">DSM desktop alerts</p><h3>Package alert policy</h3></div><span :class="pillClass(alertForm.enabled ? 'running' : 'disabled')">{{ alertForm.enabled ? 'Enabled' : 'Disabled' }}</span></div>
+                    <div class="sdsync-panel-heading"><div><p class="sdsync-eyebrow">DSM desktop alerts</p><h3>Package alert policy</h3></div><span :class="pillClass(alertPolicyPill.state)">{{ alertPolicyPill.text }}</span></div>
                     <div class="sdsync-toggle-row"><span class="sdsync-toggle-label">Enable DSM desktop alerts <control-help help-key="alerts-enabled" /></span><v-checkbox class="sdsync-checkbox-control" v-model="alertForm.enabled" aria-label="Enable DSM desktop alerts" aria-describedby="sdsync-help-alerts-enabled" :disabled="!canChangeNotifications" /></div>
                     <div class="sdsync-toggle-row"><span class="sdsync-toggle-label">Notify on success <control-help help-key="alerts-success" /></span><v-checkbox class="sdsync-checkbox-control" v-model="alertForm.on_success" aria-label="Notify on success" aria-describedby="sdsync-help-alerts-success" :disabled="!canChangeNotifications" /></div>
                     <div class="sdsync-toggle-row"><span class="sdsync-toggle-label">Notify on failure <control-help help-key="alerts-failure" /></span><v-checkbox class="sdsync-checkbox-control" v-model="alertForm.on_failure" aria-label="Notify on failure" aria-describedby="sdsync-help-alerts-failure" :disabled="!canChangeNotifications" /></div>
@@ -592,7 +595,7 @@
              so an error toast was announced at the wrong level, or twice,
              depending on the screen reader. The visual distinction (is-error)
              is unaffected; only the redundant ARIA mechanism is gone. -->
-        <div class="sdsync-toasts" aria-live="polite" aria-relevant="additions"><div v-for="toastItem in toasts" :key="toastItem.id" :class="['sdsync-toast', { 'is-error': toastItem.error }]"><strong>{{ toastItem.title }}</strong><span>{{ toastItem.message }}</span></div></div>
+        <div class="sdsync-toasts" aria-live="polite" aria-relevant="additions"><div v-for="toastItem in toasts" :key="toastItem.id" :class="['sdsync-toast', { 'is-error': toastItem.error }]"><strong>{{ toastItem.title }}</strong><span>{{ toastItem.message }}</span><button v-if="toastItem.error" type="button" class="sdsync-toast-dismiss" title="Dismiss this message" aria-label="Dismiss this message" @click="dismissToast(toastItem.id)">Dismiss</button></div></div>
         <div v-if="confirmation.visible" class="sdsync-modal-backdrop" role="presentation" @click.self="settleConfirmation(false)">
           <div ref="confirmationDialog" class="sdsync-modal" role="dialog" aria-modal="true" aria-labelledby="sdsync-confirm-title" aria-describedby="sdsync-confirm-message" tabindex="-1">
             <p class="sdsync-eyebrow">Confirm action</p>
@@ -632,7 +635,7 @@
               </div>
             </section>
             <footer class="sdsync-path-browser-footer">
-              <span class="sdsync-path-browser-summary"><span v-if="pathBrowser.loading">Reading folder…</span><span v-else-if="pathBrowser.error && !pathBrowser.directories.length">Listing unavailable</span><span v-else>{{ pathBrowser.directories.length }} child folder{{ pathBrowser.directories.length === 1 ? '' : 's' }} visible<span v-if="pathBrowser.truncated"> · bounded result truncated</span></span><code>{{ pathBrowser.current }}</code></span>
+              <span class="sdsync-path-browser-summary"><span v-if="pathBrowser.loading">Reading folder…</span><span v-else-if="pathBrowser.error && !pathBrowser.directories.length">Listing unavailable</span><span v-else>{{ pathBrowser.directories.length }} child folder{{ pathBrowser.directories.length === 1 ? '' : 's' }} visible<span v-if="pathBrowser.timeLimited"> · the folder took too long to list; not every child is shown</span><span v-else-if="pathBrowser.truncated"> · bounded result truncated</span></span><code>{{ pathBrowser.current }}</code></span>
               <span class="sdsync-path-browser-footer-actions"><v-button suffix="cancel" display="icon-text" tooltip="Close without changing the profile path" @click="closePathBrowser"><template #icon><action-icon name="close" /></template>Cancel</v-button><v-button suffix="main" display="icon-text" tooltip="Use the current folder in this profile" :disabled="pathBrowser.loading || pathBrowser.current === '/'" @click="selectPath(pathBrowser.current)"><template #icon><action-icon name="confirm" /></template>Select this folder</v-button></span>
             </footer>
           </div>
@@ -658,6 +661,7 @@ import {
   WIDGET_IDLE_POLL_MS
 } from "./widgetModel.mjs";
 import {
+  CONTROLLER_TICK_STALE_SECONDS,
   attentionItems as outcomeAttentionItems,
   cacheHealthNote,
   failureKey as outcomeFailureKey,
@@ -671,6 +675,7 @@ import {
   resultDisplay,
   runIsActive,
   runIsStale,
+  serviceAttentionItem,
   spanLabel,
   staleRunCovers,
   warningsSentence
@@ -686,7 +691,7 @@ import {
   uniqueRowKeys
 } from "./feedModel.mjs";
 import { decodeLogPaths, plainText, visibleText } from "./textSafety.mjs";
-import { patchGuard } from "./uiErrors.mjs";
+import { clearRenderErrors, patchGuard, uiErrorSerial } from "./uiErrors.mjs";
 import {
   ACTIONS,
   AUTOSAVE_API_LIMITS,
@@ -712,6 +717,47 @@ import {
 import SecurityPanel from "./SecurityPanel.vue";
 
 const SETTINGS_KEY = "sdsync.ui.settings.v1";
+// What the last run of one profile left behind, as the row text and level. A retained
+// (stale) reading never reports ok. `entries` is an optional name -> outcome index.
+function profileOutcomeFor(name, outcomes, stale, nowSeconds, entries) {
+  if (!outcomes) return { level: "unknown", text: "Last run: outcome not reported by this package" };
+  // A dead run that covered this profile outranks the record it left behind.
+  if (staleRunCovers(outcomes, name)) {
+    return { level: "fail", text: ["Last run: Run died", reasonCopy("runner_died").text, stale ? "stale reading" : ""].filter(Boolean).join(" · ") };
+  }
+  const entry = entries ? entries.get(name) : outcomes.profiles.find((item) => item.profile === name);
+  if (!entry) return { level: "unknown", text: "Last run: not reported" };
+  const row = profileOutcomeRow(entry, nowSeconds);
+  // A retained reading is dimmed (unknown); a token this window cannot read is a
+  // warning, never the neutral colour of "nobody has looked".
+  const shownLevel = stale ? (row.level !== "fail" ? "unknown" : row.level) : (row.level === "unknown" ? "warn" : row.level);
+  return { level: shownLevel, text: ["Last run: " + row.label, row.detail, row.age, stale ? "stale reading" : ""].filter(Boolean).join(" · ") };
+}
+// The package clock when the newest snapshot was generated. The snapshot object is frozen,
+// so the value that moves on every poll lives in snapshotGeneratedAt; a window that has not
+// polled yet reads the document's own field.
+function packageGeneratedEpoch(vm) {
+  const own = Number(vm.snapshotGeneratedAt);
+  if (own > 0) return own;
+  return numberOr(vm.snapshot && vm.snapshot.generated_at_epoch, 0);
+}
+// "UTC+01:00", "UTC-05:30": a UTC offset in seconds east of UTC.
+function utcOffsetLabel(seconds) {
+  const sign = seconds < 0 ? "-" : "+";
+  const minutes = Math.floor(Math.abs(seconds) / 60);
+  return `UTC${sign}${String(Math.floor(minutes / 60)).padStart(2, "0")}:${String(minutes % 60).padStart(2, "0")}`;
+}
+function isPlainObject(value) { return Boolean(value) && typeof value === "object" && !Array.isArray(value); }
+function objectsOf(value) { return arrayOf(value).filter(isPlainObject); }
+// How many failure toasts stay on screen at once; the oldest make room.
+const MAX_STICKY_TOASTS = 4;
+// A queued "Run all" is assumed finished after this long when deciding whether to
+// warn that another is probably still waiting.
+const QUEUED_RUN_WARN_MS = 10 * 60 * 1000;
+// Activity rows rendered at first, and added per "show older" press. The feed is read
+// up to 1,000 events deep; rendering all of them is 20,000 DOM nodes and over a second
+// of main thread per changed feed, and nobody reads past the newest screens.
+const ACTIVITY_RENDER_STEP = 200;
 // The named in-service read failures, and the only place this window decides
 // what each one means.
 //
@@ -774,9 +820,21 @@ const BRIDGE_FAILURE_COPY = Object.freeze({
     cause: "the package is busy",
     retry: "backoff"
   }),
+  control_lock_busy: Object.freeze({
+    title: "Package is busy recording another change",
+    message: "The package is still recording another change, so this one was not accepted. Retrying is safe: the request is identified, so it cannot be applied twice. Select the action again in a moment.",
+    cause: "the package is busy recording another change",
+    retry: "backoff"
+  }),
+  shell_snapshot_building: Object.freeze({
+    title: "Package is building its status view",
+    message: "The package is preparing its status view on the shell read lane. This page will retry.",
+    cause: "the package is building its status view",
+    retry: "backoff"
+  }),
   manager_lane_poisoned: Object.freeze({
     title: "Package service needs a restart",
-    message: "The package service cannot serve further reads in this state. Restart Synology Drive Sync in Package Center.",
+    message: "The package service cannot serve further reads in this state. Stop Synology Drive Sync in Package Center, then Run it again.",
     cause: "the package service needs a restart",
     retry: "stop"
   }),
@@ -1016,17 +1074,9 @@ const PROGRESS_LABELS = Object.freeze(
       DOCTOR_SECTION_CATALOG.map((section) => section.label))
 );
 const PROGRESS_STALE_SECONDS = 120;
-// How long the package controller may go without republishing its state before
-// a job still sitting in the queue is evidence of a problem rather than of
-// ordinary waiting.
-//
-// The controller rewrites this record on every pass of its loop and its longest
-// idle sleep is thirty seconds, so six missed ticks is a daemon that is wedged
-// or gone, not one that is busy. Staleness is read only while nothing is
-// active, because a controller executing a long job publishes its active PID
-// and then blocks for as long as that job takes -- reading staleness there
-// would have a four-hour sync report its own controller as dead.
-const CONTROLLER_TICK_STALE_SECONDS = 180;
+// CONTROLLER_TICK_STALE_SECONDS (how long the controller may go without
+// republishing its state before a queued job is evidence of a problem) lives in
+// outcomes.mjs beside the attention rule that shares it.
 const PROGRESS_UNAVAILABLE_TEXT = "Progress unavailable — the package published a progress record this AppWindow could not validate, so it is not being shown. The operation itself is unaffected and is still queued.";
 
 function formatCount(value) {
@@ -1622,11 +1672,13 @@ const ABOUT_METADATA = Object.freeze({
   releaseSelectorUrl: "https://supermarsx.github.io/synology-drive-sync/release-selector.html"
 });
 const ABOUT_RUST_DEPENDENCIES = Object.freeze([
+  { name: "bytes", pin: "1.12.1", scope: "All platforms", url: "https://crates.io/crates/bytes" },
   { name: "clap", pin: "4.6.7", scope: "All platforms", url: "https://crates.io/crates/clap" },
   { name: "clap_complete", pin: "4.6.11", scope: "All platforms", url: "https://crates.io/crates/clap_complete" },
   { name: "clap_mangen", pin: "0.3.3", scope: "All platforms", url: "https://crates.io/crates/clap_mangen" },
   { name: "crc32fast", pin: "1.5.3", scope: "All platforms", url: "https://crates.io/crates/crc32fast" },
   { name: "ctrlc", pin: "3.5.2", scope: "All platforms", url: "https://crates.io/crates/ctrlc" },
+  { name: "http-body", pin: "1.1.0", scope: "All platforms", url: "https://crates.io/crates/http-body" },
   { name: "icu_normalizer", pin: "2.3.0", scope: "All platforms", url: "https://crates.io/crates/icu_normalizer" },
   { name: "ignore", pin: "0.4.33", scope: "All platforms", url: "https://crates.io/crates/ignore" },
   { name: "keyring-core", pin: "1.0.1", scope: "All platforms", url: "https://crates.io/crates/keyring-core" },
@@ -1834,7 +1886,7 @@ function emptyProfile() {
 }
 
 function emptyPathBrowser() {
-  return { visible: false, kind: "", current: "/", parent: null, directories: [], loading: false, error: "", truncated: false, request: 0 };
+  return { visible: false, kind: "", current: "/", parent: null, directories: [], loading: false, error: "", truncated: false, timeLimited: false, request: 0 };
 }
 
 function emptyRoutine(profile = "") {
@@ -3234,13 +3286,19 @@ function normalizedActivityEvent(event) {
   const completeMessage = redactedTroubleshootingText(rawMessage).slice(0, 4096);
   // Names inside a message may carry bidi or zero-width controls; show their code points.
   const message = visibleText(completeMessage.slice(0, ACTIVITY_MESSAGE_LIMIT));
+  // Before the runner could write run.cancelled, a cancel was recorded as run.failed at info
+  // level with a message that says so. Those records are history and stay as written, but the
+  // row reads as what it was.
+  const code = field(event.code, "unknown.event");
+  const level = field(event.level, "info");
+  const legacyCancel = code === "run.failed" && level === "info" && /\bcancel(?:led|ed)\b/i.test(rawMessage);
   return {
     epoch: numberOr(event.epoch, 0),
-    code: field(event.code, "unknown.event"),
+    code: legacyCancel ? "run.cancelled" : code,
     profile: field(event.profile, "none"),
-    state: field(event.state, "unknown"),
+    state: legacyCancel ? "cancelled" : field(event.state, "unknown"),
     category: field(event.category, "operations"),
-    level: field(event.level, "info"),
+    level,
     message,
     client_request_id: validatedClientRequestId(event.client_request_id),
     doctor_inventory: doctorInventory
@@ -3440,10 +3498,12 @@ function retainedDocumentFreshness(receivedAtMs, code, nowMs = Date.now()) {
   return `Stale · as of ${describeRetainedAge(age)} ago; the package could not refresh it${because}.${stopped}`;
 }
 
-function describeEvidenceAge(epoch) {
+function describeEvidenceAge(epoch, nowSeconds = Date.now() / 1000) {
   const observed = Number(epoch);
   if (!Number.isFinite(observed) || observed <= 0) return "never observed";
-  const seconds = Math.floor(Date.now() / 1000) - observed;
+  // `nowSeconds` is the package's clock (packageNowSeconds): the observation time was
+  // written by the NAS, so only another NAS reading can be subtracted from it.
+  const seconds = Math.floor(nowSeconds) - observed;
   if (seconds < 0) return formatDate(observed);
   if (seconds < 90) return "moments ago";
   if (seconds < 3 * 3600) return `${Math.floor(seconds / 60)} minutes ago`;
@@ -3650,7 +3710,7 @@ function describeBridgeFailure(error, phase = "status") {
     return issue(named.title, named.message);
   }
   if (status === 503) {
-    return issue("Package service unavailable", "Restart Synology Drive Sync and inspect its API log if the package bridge does not recover.");
+    return issue("Package service unavailable", "Stop Synology Drive Sync in Package Center, then Run it again, and inspect its API log if the package bridge does not recover.");
   }
   if (status === 0 && code.includes("forbidden")) {
     return issue("DSM access denied", "Use a DSM administrator account and, if HTTPS is required by policy, reopen this app over HTTPS.");
@@ -3662,7 +3722,7 @@ function describeBridgeFailure(error, phase = "status") {
     return issue("Package UI route unavailable", "DSM did not reach this package's native API. Repair or reinstall the same package release, then reopen the app.");
   }
   if (status === 0 && code.includes("unavailable")) {
-    return issue("Package service unavailable", "Restart Synology Drive Sync and inspect its API log if the package bridge does not recover.");
+    return issue("Package service unavailable", "Stop Synology Drive Sync in Package Center, then Run it again, and inspect its API log if the package bridge does not recover.");
   }
   if (message.includes("unsupported dsm api schema") || code === "invalid_document") {
     return issue("UI and package versions differ", "Repair or reinstall one complete release so the AppWindow and package API use the same schema.");
@@ -3775,6 +3835,38 @@ function tickClock(vm, nowMs = Date.now()) {
   }
 }
 
+// DSM may drop this window's element without calling $destroy, which would leave
+// its listeners, retained snapshot and timers running for the rest of the DSM
+// session. A minimised window stays attached (hidden, not removed), so an element
+// that was in the document and has been out of it for two consecutive ticks is a
+// closed window. One missed tick could be DSM moving it, and an element that was
+// never attached (or is not an element) is left alone.
+function clockWatchdog(vm) {
+  if (vm.disposed) return;
+  const element = vm.$el;
+  if (!element || element.nodeType !== 1) return;
+  if (element.isConnected === true) {
+    vm.wasAttached = true;
+    vm.detachedTicks = 0;
+    return;
+  }
+  if (!vm.wasAttached) return;
+  vm.detachedTicks += 1;
+  if (vm.detachedTicks >= 2) vm.$destroy();
+}
+
+// A feed read that succeeds while the status snapshot is stale proves the bridge is
+// back, so ask for the snapshot now rather than when the backoff expires. Not for a
+// code that stood the poll down on purpose (the package refuses to vouch for
+// itself): the operator's Retry is the way out of those.
+function probeSnapshotAfterAnswer(vm) {
+  if (vm.disposed || vm.connected || !vm.snapshot || vm.snapshotLoading || vm.snapshotPromise) return;
+  const named = BRIDGE_FAILURE_COPY[vm.snapshotFailureCode];
+  if (named && named.retry === "stop") return;
+  vm.snapshotFailureStreak = 0;
+  vm.refreshSnapshot(false);
+}
+
 function scheduleClock(vm) {
   window.clearTimeout(vm.clockTimer);
   vm.clockTimer = 0;
@@ -3782,7 +3874,8 @@ function scheduleClock(vm) {
   vm.clockTimer = window.setTimeout(() => {
     vm.clockTimer = 0;
     tickClock(vm);
-    scheduleClock(vm);
+    clockWatchdog(vm);
+    if (!vm.disposed) scheduleClock(vm);
   }, WIDGET_CLOCK_TICK_MS);
 }
 
@@ -3794,6 +3887,9 @@ function observeWindowVisibility(vm) {
   vm.visibilityObserver = new window.IntersectionObserver((entries) => {
     const entry = entries[entries.length - 1];
     if (!entry || vm.disposed) return;
+    // The first report arrives as soon as the element is laid out, which is the
+    // earliest moment the watchdog can know it was ever attached.
+    clockWatchdog(vm);
     const box = entry.boundingClientRect || {};
     const hidden = !entry.isIntersecting && box.width === 0 && box.height === 0;
     if (hidden === vm.windowHidden) return;
@@ -3837,6 +3933,10 @@ export default {
       // is what makes retaining it safe at all. Nothing is ever assigned to a
       // module-level cache.
       snapshotReceivedAtMs: 0, logsReceivedAtMs: 0, activityReceivedAtMs: 0,
+      // The package clock's reading in the newest snapshot. The snapshot object itself is
+      // frozen (it is data to be replaced, never tracked or edited), so the one field that
+      // moves on every poll lives here.
+      snapshotGeneratedAt: 0,
       // The last named read failure and how many consecutive reads have failed.
       // Together they select the polling ladder in snapshotRetryDelay().
       snapshotFailureCode: "", snapshotFailureStreak: 0,
@@ -3908,7 +4008,7 @@ export default {
       // window instead of once per keystroke. The input itself still binds to
       // activitySearch for immediate typing feedback.
       activitySearchDebounced: "", activitySearchDebounceTimer: 0,
-      activityCategory: "all", activityLevel: "all",
+      activityCategory: "all", activityLevel: "all", activityRenderLimit: ACTIVITY_RENDER_STEP,
       activityTabs: [
         { id: "events", label: "All events" },
         { id: "changes", label: "Changes" },
@@ -3922,13 +4022,46 @@ export default {
       confirmationPriorFocus: null, confirmationKeyHandler: null,
       pathBrowserPriorFocus: null, pathBrowserKeyHandler: null,
       systemLight: false, visibilityHandler: null, beforeUnloadHandler: null, mediaQuery: null, mediaHandler: null,
-      toastTimers: [], abortController: null, connectionWatchCleanups: [], disposed: false
+      toastTimers: [], abortController: null, connectionWatchCleanups: [], disposed: false,
+      // When this window last queued a "Run all", so a second one can say the first
+      // is probably still waiting. Browser time: it is compared with Date.now() only.
+      runQueuedAtMs: 0,
+      // The watchdog for a window DSM removed from the document without destroying it.
+      wasAttached: false, detachedTicks: 0,
+      // uiErrors.mjs's report count at the previous render flush (see updated()).
+      uiErrorSerialSeen: uiErrorSerial()
     };
   },
   computed: {
     pageTitle() { const found = this.routes.find((item) => item.id === this.route); return found ? found.title : "Overview"; },
-    profiles() { return arrayOf(this.snapshot && this.snapshot.profiles); },
-    routines() { return arrayOf(this.snapshot && this.snapshot.routines); },
+    // Only objects: a hostile or future snapshot with a null member must cost one
+    // row, not the whole page (a render that throws freezes it on its last paint).
+    profiles() { return objectsOf(this.snapshot && this.snapshot.profiles); },
+    profileOutcomeMap() {
+      const map = new Map();
+      if (!this.snapshot) return map;
+      const outcomes = this.outcomes;
+      const stale = this.retainedStale;
+      const now = this.packageNowSeconds;
+      const entries = outcomes ? new Map(outcomes.profiles.map((item) => [item.profile, item])) : null;
+      for (const profile of this.profiles) {
+        const name = String(profile.name);
+        if (!map.has(name)) map.set(name, profileOutcomeFor(name, outcomes, stale, now, entries));
+      }
+      return map;
+    },
+    routines() { return objectsOf(this.snapshot && this.snapshot.routines); },
+    // True once a snapshot has been read. Until then every "none", "Idle" and "Off"
+    // would be a claim about a package this window has not heard from.
+    snapshotRead() { return Boolean(this.snapshot); },
+    profilesEmptyText() { return this.snapshotRead ? "No configured profiles." : "Profiles have not been read yet; the package status is not loaded."; },
+    routinesEmptyText() { return this.snapshotRead ? "No configured routines. Choose New routine to automate a profile." : "Routines have not been read yet; the package status is not loaded."; },
+    alertPolicyPill() {
+      if (!this.snapshotRead) return { state: "unknown", text: "Not read" };
+      const alerts = this.snapshot.alerts;
+      if (!alerts || typeof alerts !== "object" || Array.isArray(alerts)) return { state: "unknown", text: "Not reported" };
+      return this.alertForm.enabled ? { state: "running", text: "Enabled" } : { state: "disabled", text: "Disabled" };
+    },
     filteredProfiles() {
       const query = this.profileFilter.trim().toLowerCase();
       const status = this.profileFilterStatus;
@@ -3960,7 +4093,10 @@ export default {
     capabilities() { return this.snapshot && this.snapshot.capabilities && typeof this.snapshot.capabilities === "object" ? this.snapshot.capabilities : {}; },
     securityPolicy() { return normalizedSecurityPolicy(this.snapshot && this.snapshot.security_policy); },
     installedPackageVersion() { return boundedText(this.snapshot && this.snapshot.package && this.snapshot.package.version, "Not reported by package API"); },
-    canMutate() { return this.capabilities.mutations === true && Boolean(this.csrfToken); },
+    // A stale reading is a page the window itself calls history. A CSRF read can
+    // succeed again while the snapshot read is still hanging, and the buttons must
+    // not contradict the dimmed page beside them.
+    canMutate() { return this.capabilities.mutations === true && Boolean(this.csrfToken) && !this.retainedStale; },
     profileOutcomeUnresolved() { return scopeMutationOutcomeUnresolved(this, "profile"); },
     routineOutcomeUnresolved() { return scopeMutationOutcomeUnresolved(this, "routine"); },
     alertsOutcomeUnresolved() { return scopeMutationOutcomeUnresolved(this, "alerts"); },
@@ -4178,7 +4314,7 @@ export default {
           pending: `${entry.state.wouldTransfer.files}${more} · ${formatBytes(entry.state.wouldTransfer.bytes)}${more}`,
           attention: `${entry.state.attention}${more}`,
           trust: this.rollupTrustNote(entry.profile),
-          observed: describeEvidenceAge(entry.observedAtEpoch),
+          observed: describeEvidenceAge(entry.observedAtEpoch, this.packageNowSeconds),
           observedExact: entry.observedAtEpoch ? formatDate(entry.observedAtEpoch) : "Never observed"
         };
       });
@@ -4190,7 +4326,7 @@ export default {
       const suffix = degraded ? ` · ${degraded}` : "";
       if (!this.statusRollup.loaded) return "Not read yet" + suffix;
       if (!this.statusRollup.observedAtEpoch) return "Never observed" + suffix;
-      return `Oldest evidence ${describeEvidenceAge(this.statusRollup.observedAtEpoch)}${suffix}`;
+      return `Oldest evidence ${describeEvidenceAge(this.statusRollup.observedAtEpoch, this.packageNowSeconds)}${suffix}`;
     },
     statusRollupTotalNote() {
       const rollup = this.statusRollup;
@@ -4316,9 +4452,31 @@ export default {
     // time since this window received it. The browser's clock alone moves every
     // age by however far it is from the NAS, and it is advanced by tickClock() so
     // an idle NAS's "moments ago" does not freeze for hours.
+    // The NAS clock the snapshot reports (zone and offset east of UTC). Never guessed: a
+    // missing or malformed block is "unknown", and no NAS time is then shown.
+    browserOffsetSeconds() { return -new Date(Number(this.nowMs) || Date.now()).getTimezoneOffset() * 60; },
+    nasClock() {
+      const raw = this.snapshot && this.snapshot.nas_clock;
+      if (!raw || typeof raw !== "object" || Array.isArray(raw)) return { present: false, known: false, differs: false, offset: 0, label: "", error: "" };
+      const offset = raw.utc_offset_seconds;
+      const known = typeof offset === "number" && Number.isInteger(offset) && Math.abs(offset) <= 18 * 3600;
+      const error = typeof raw.error === "string" ? plainText(raw.error, 40) : "";
+      if (!known) return { present: true, known: false, differs: false, offset: 0, label: "", error };
+      const zone = typeof raw.zone === "string" && /^[A-Za-z0-9+-]{1,12}$/.test(raw.zone) ? raw.zone : "";
+      return { present: true, known: true, differs: offset !== this.browserOffsetSeconds, offset, label: `${utcOffsetLabel(offset)}${zone ? ` (${zone})` : ""}`, error: "" };
+    },
+    // One line wherever NAS-clock times are read or typed. Empty when the zones agree.
+    nasTimeNote() {
+      const clock = this.nasClock;
+      if (clock.known && clock.differs) {
+        return `NAS time is ${clock.label}; this browser is ${utcOffsetLabel(this.browserOffsetSeconds)}. Times marked NAS, and routine windows, use NAS time.`;
+      }
+      if (clock.present && !clock.known) return "The NAS time zone is unavailable, so times here cannot be related to NAS time. Routine windows use NAS local time.";
+      return "";
+    },
     packageNowSeconds() {
       const now = Number(this.nowMs) || Date.now();
-      const generated = Number(this.snapshot && this.snapshot.generated_at_epoch);
+      const generated = packageGeneratedEpoch(this);
       const received = Number(this.snapshotReceivedAtMs);
       if (!Number.isFinite(generated) || generated <= 0 || !(received > 0)) return now / 1000;
       return generated + Math.max(0, now - received) / 1000;
@@ -4326,12 +4484,46 @@ export default {
     attentionItems() {
       if (!this.snapshot) return [];
       const items = this.outcomes ? outcomeAttentionItems(this.outcomes, this.packageNowSeconds) : [outcomesUnavailableItem(this.snapshot.outcomes)];
+      // Nothing is syncing if the service is down or the controller has gone quiet, and
+      // a green "Succeeded" from last night must not be the only thing on screen.
+      const service = this.serviceAttentionItem;
+      if (service) items.unshift(service);
       // A defect in this window while applying a good snapshot is shown for as long
       // as it lasts, not only in a six-second toast.
       if (this.applyError) items.push({ id: "ui-apply-error", level: "warn", title: "This window failed to apply part of the package status", detail: `${this.applyError}. The package itself answered.` });
       return this.retainedStale
         ? [{ id: "stale-poll", level: "unknown", title: "Showing a stale reading", detail: `${this.freshness} Rows below are history, not current status.` }].concat(items)
         : items;
+    },
+    serviceAttentionItem() { return this.snapshot ? serviceAttentionItem(this.snapshot, this.serviceState, packageGeneratedEpoch(this)) : null; },
+    // One line visible on every page. The Overview's attention list exists only on
+    // the Overview and Activity, and a failure toast is gone before anyone looks.
+    // It counts distinct problems: a failed all-profiles run and the profiles that
+    // run failed are one failure, not several.
+    attentionChip() {
+      const run = this.outcomes && this.outcomes.run;
+      // A profile that finished no earlier than the run began, in a run that covers it,
+      // is that run's failure seen from the profile's side. Without a start time the
+      // run's own finish (less a few seconds) stands in; with neither, count it apart.
+      const ranFailing = (profile) => {
+        const record = this.outcomes.profiles.find((candidate) => `profile-${candidate.profile}` === profile);
+        if (!run || !record || !(run.scope === "all" || run.scope === record.profile)) return false;
+        const since = run.startedEpoch > 0 ? run.startedEpoch : (run.finishedEpoch > 0 ? run.finishedEpoch - 5 : 0);
+        return since > 0 && (record.outcomeEpoch || record.finishedEpoch) >= since;
+      };
+      const runLevel = (id) => this.attentionItems.some((item) => item.id === id);
+      const runItem = ["run-failed", "run-stale", "run-unknown", "run-partial"].some(runLevel);
+      const items = this.attentionItems.filter((item) => {
+        if (item.id === "stale-poll" || item.id === "ui-apply-error") return false;
+        return !(runItem && item.id.startsWith("profile-") && ranFailing(item.id.replace(/#\d+$/, "")));
+      });
+      if (!items.length) return null;
+      const level = items.some((item) => item.level === "fail") ? "fail" : (items.some((item) => item.level === "unknown") ? "unknown" : "warn");
+      const failing = items.filter((item) => item.level === "fail").length;
+      const text = level === "fail"
+        ? `${failing} failing${items.length > failing ? ` · ${items.length - failing} more` : ""}`
+        : (items.length === 1 ? "1 needs attention" : `${items.length} need attention`);
+      return { level, text, title: `${items.map((item) => item.title).slice(0, 4).join("; ")}${items.length > 4 ? "; ..." : ""}. Select to open the Overview.` };
     },
     activityHistoryNote() { return historyNote(this.activityHistory, formatDate); },
     lastResult() {
@@ -4351,7 +4543,10 @@ export default {
     runningForSuffix() {
       const run = this.outcomes && this.outcomes.run;
       const stuck = run && (run.longRunning || run.stalled);
-      return run && run.outcome === "running" && run.runningFor !== null ? ` · running for ${spanLabel(run.runningFor)}${stuck ? " (check whether it is stuck)" : ""}` : "";
+      // A run whose progress cannot be observed says so beside its age, in place of the
+      // "stuck" check it cannot offer: silence there is not health.
+      const quiet = run && run.stallUnobservable ? " · hang detection unavailable (progress cannot be observed)" : "";
+      return run && run.outcome === "running" && run.runningFor !== null ? ` · running for ${spanLabel(run.runningFor)}${stuck ? " (check whether it is stuck)" : ""}${quiet}` : (quiet && run.outcome === "running" ? quiet : "");
     },
     runStderrView() {
       const held = this.runStderr;
@@ -4362,7 +4557,7 @@ export default {
     runStatus() { return runIsStale(this.outcomes) ? "stale" : boundedText(pick(this.run, "status", "state", "result"), "Unavailable"); },
     runScope() { return boundedText(this.run.scope, "Unavailable"); },
     runOperation() { return boundedText(this.run.operation, "Unavailable"); },
-    lastRunDetail() { return this.run.finished_epoch ? formatDate(this.run.finished_epoch) : "No completion time"; },
+    lastRunDetail() { return this.run.finished_epoch ? formatDate(this.run.finished_epoch) + this.nasTimeSuffix(this.run.finished_epoch) : (this.snapshotRead ? "No completion time" : "Not read"); },
     serviceState() { const service = this.snapshot && this.snapshot.service; const value = service && typeof service === "object" ? pick(service, "state", "status") : service; return boundedText(value, this.snapshot ? "unknown" : "Unavailable"); },
     overviewSummary() { return this.serviceState === "running" ? "The package controller is running. Status and logs update while this window remains open." : `The package controller reports ${this.serviceState}. Review Health and Activity before relying on automation.`; },
     // Everything this reads has been on the wire all along: the snapshot has
@@ -4379,7 +4574,7 @@ export default {
       // The package's clock, never the browser's: `updated_epoch` is written by
       // the NAS, so only another NAS timestamp can be subtracted from it without
       // turning clock skew into a liveness verdict.
-      const generatedEpoch = numberOr(this.snapshot && this.snapshot.generated_at_epoch, 0);
+      const generatedEpoch = packageGeneratedEpoch(this);
       const updatedEpoch = numberOr(record && record.updated_epoch, 0);
       return {
         known: Boolean(this.snapshot && record),
@@ -4427,7 +4622,7 @@ export default {
       if (liveness.service === "untrusted") {
         return {
           kind: "untrusted",
-          text: "A process holds the package controller's PID file and is not the controller, so nothing is servicing the queue. Restart the package in Package Center, then review Logs."
+          text: "A process holds the package controller's PID file and is not the controller, so nothing is servicing the queue. Stop the package in Package Center, then Run it again, and review Logs."
         };
       }
       if (liveness.service !== "running") {
@@ -4450,7 +4645,7 @@ export default {
           kind: "stalled",
           text: guidanceText(
             `The package controller last reported at ${formatDate(liveness.updatedEpoch)} and has not checked in since, although it is running nothing.`,
-            "It may be wedged. Review Logs, and restart the package if it does not recover."
+            "It may be wedged. Review Logs, and stop the package in Package Center, then Run it again if it does not recover."
           )
         };
       }
@@ -4470,7 +4665,7 @@ export default {
       return published || guidanceText("Queued.", this.queuedWaitDetail.text);
     },
     nextRun() { const epochs = this.enabledRoutines.map((routine) => Number(routine.next_run_epoch)).filter((value) => Number.isFinite(value) && value > 0); return epochs.length ? formatDate(Math.min(...epochs)) : "None"; },
-    healthRows() { const explicit = this.snapshot && this.snapshot.health; if (Array.isArray(explicit)) return explicit; return this.profiles.map((profile) => { const health = profile.health && typeof profile.health === "object" ? profile.health : {}; const routine = this.routines.find((item) => String(item.profile) === String(profile.name)) || {}; return Object.assign({ profile: profile.name, last_success_epoch: routine.last_success_epoch }, health); }); },
+    healthRows() { const explicit = this.snapshot && this.snapshot.health; if (Array.isArray(explicit)) return explicit.filter(isPlainObject); return this.profiles.map((profile) => { const health = profile.health && typeof profile.health === "object" ? profile.health : {}; const routine = this.routines.find((item) => String(item.profile) === String(profile.name)) || {}; return Object.assign({ profile: profile.name, last_success_epoch: routine.last_success_epoch }, health); }); },
     healthFreshness() { const newest = this.healthRows.reduce((value, health) => Math.max(value, numberOr(health.last_check_epoch || health.checked_at_epoch || health.checked_epoch, 0)), 0); return newest ? `Newest check ${formatDate(newest)}` : "Cached time unavailable"; },
     // Shared by reversedActivity and activityLensTotal so that redacting and
     // shaping every activity event (normalizedActivityEvent) happens once per
@@ -4503,6 +4698,14 @@ export default {
           && (this.activityLevel === "all" || level === this.activityLevel)
           && (!query || searchable.includes(query));
       }).reverse();
+    },
+    // Only the newest rows are drawn; the filtered total above still counts every event,
+    // and the control under the list says how many are not drawn.
+    shownActivity() { return this.reversedActivity.slice(0, Math.max(ACTIVITY_RENDER_STEP, Number(this.activityRenderLimit) || 0)); },
+    activityHiddenCount() { return Math.max(0, this.reversedActivity.length - this.shownActivity.length); },
+    activityMoreLabel() {
+      const hidden = this.activityHiddenCount;
+      return hidden ? `${hidden} older event${hidden === 1 ? "" : "s"} not shown.` : "";
     },
     // The heading's "N of M" needs M to count only the active lens, not every
     // recorded event, or switching to Changes would still claim "of 400"
@@ -4588,6 +4791,7 @@ export default {
     settings: { deep: true, handler() { this.autosaveChanged("interface"); } },
     operationBusy(value) { if (this.autosaveCoordinator) this.autosaveCoordinator.setGlobalBusy(value === true); },
     activityTab(value) {
+      this.activityRenderLimit = ACTIVITY_RENDER_STEP;
       // A lens change can strand the Category dropdown on a value the new
       // lens does not offer; "all" always fits every lens, so that is the
       // only value this ever has to fall back to.
@@ -4672,6 +4876,16 @@ export default {
     if (this.disposed) return;
     if (csrfReady) await this.refreshSnapshot(false);
     else this.scheduleSnapshot();
+  },
+  // The error banner outlives the error that raised it unless something takes it
+  // down. A render that throws keeps the previous page on screen, so a later flush
+  // in which nothing was reported is proof the page is rendering again. Only
+  // failed renders are cleared: a failed patch leaves the DOM half updated and keeps
+  // the banner until the window is reloaded (see clearRenderErrors).
+  updated() {
+    const serial = uiErrorSerial();
+    if (serial === this.uiErrorSerialSeen) clearRenderErrors(this.$root);
+    this.uiErrorSerialSeen = serial;
   },
   beforeDestroy() {
     this.disposed = true;
@@ -5261,7 +5475,12 @@ export default {
       const formatting = options && typeof options === "object" ? options : {};
       const unknown = Boolean(error && error.outcomeUnknown === true);
       const inspection = Boolean(error && error.requiresInspection === true);
-      const observed = boundedText(error && error.message, fallback).slice(0, MUTATION_MESSAGE_LIMIT / 2);
+      // A named in-service refusal (the package answered 503 with a code this window has copy for)
+      // is described in this window's words, not the envelope's.
+      const namedRefusal = error && error.status === 503 ? BRIDGE_FAILURE_COPY[String(error.code || "").toLowerCase()] : undefined;
+      const observed = namedRefusal
+        ? `${namedRefusal.title}. ${namedRefusal.message}`.slice(0, MUTATION_MESSAGE_LIMIT / 2)
+        : boundedText(error && error.message, fallback).slice(0, MUTATION_MESSAGE_LIMIT / 2);
       const requestId = error && error.trustedRequestId === true
         ? validatedClientRequestId(error.requestId)
         : "";
@@ -5719,7 +5938,32 @@ export default {
     },
     integer(value, fallback) { const parsed = Number(value); return Number.isInteger(parsed) ? parsed : fallback; },
     between(value, minimum, maximum) { const parsed = Number(value); return Number.isInteger(parsed) && parsed >= minimum && parsed <= maximum; },
-    toast(title, message, error = false) { if (this.disposed) return; const item = { id: ++this.toastSequence, title, message, error }; this.toasts.push(item); const timer = window.setTimeout(() => { if (this.disposed) return; const index = this.toasts.findIndex((candidate) => candidate.id === item.id); if (index >= 0) this.toasts.splice(index, 1); this.toastTimers = this.toastTimers.filter((candidate) => candidate !== timer); }, 6000); this.toastTimers.push(timer); },
+    // An ordinary toast fades after six seconds. A failure stays until it is dismissed:
+    // the operator may be on another page, or away, when it arrives, and the topbar
+    // chip only says that something is wrong, not what. The same failure is not
+    // stacked, and the stack is bounded so a failing poll cannot fill the window.
+    toast(title, message, error = false) {
+      if (this.disposed) return;
+      if (error) {
+        const duplicate = this.toasts.find((candidate) => candidate.error && candidate.title === title && candidate.message === message);
+        if (duplicate) return;
+        const failures = this.toasts.filter((candidate) => candidate.error);
+        for (let index = 0; failures.length - index >= MAX_STICKY_TOASTS; index += 1) this.dismissToast(failures[index].id);
+      }
+      const item = { id: ++this.toastSequence, title, message, error };
+      this.toasts.push(item);
+      if (error) return;
+      const timer = window.setTimeout(() => {
+        if (this.disposed) return;
+        this.dismissToast(item.id);
+        this.toastTimers = this.toastTimers.filter((candidate) => candidate !== timer);
+      }, 6000);
+      this.toastTimers.push(timer);
+    },
+    dismissToast(id) {
+      const index = this.toasts.findIndex((candidate) => candidate.id === id);
+      if (index >= 0) this.toasts.splice(index, 1);
+    },
     installProfileWindowGuard() {
       if (this.beforeUnloadHandler) return;
       this.beforeUnloadHandler = (event) => {
@@ -5768,6 +6012,11 @@ export default {
     //
     // An unnamed code keeps today's behaviour exactly: the configured cadence,
     // no backoff, which is what every 503 did before any of them had a name.
+    //
+    // The AppWindow never waits past the ramp's first step (one minute) between status
+    // reads, where the desktop card ramps on to five minutes: a person at this window is
+    // waiting for an outage to clear, and one request a minute is no load on a bridge
+    // that is down. Hence `WIDGET_BACKOFF_RAMP_MS[0]` below, not the ramp indexed by streak.
     snapshotRetryDelay(interval) {
       // A window DSM has minimised has no layout box; nobody is reading it, so it
       // looks at the package no faster than the desktop card does.
@@ -5784,7 +6033,7 @@ export default {
         const outage = status === 0 || status === 401 || status === 429 || status >= 500;
         const streak = Number(this.snapshotFailureStreak);
         if (streak >= 2 && outage) {
-          return Math.max(interval, floor, WIDGET_BACKOFF_RAMP_MS[Math.min(streak - 2, WIDGET_BACKOFF_RAMP_MS.length - 1)]);
+          return Math.max(interval, floor, WIDGET_BACKOFF_RAMP_MS[0]);
         }
         return Math.max(interval, floor);
       }
@@ -5792,9 +6041,18 @@ export default {
       if (named.retry === "auto") return Math.max(interval, floor, WIDGET_ACTIVE_POLL_MS);
       const step = Number(this.snapshotFailureStreak) - 2;
       if (step < 0) return Math.max(interval, floor);
-      return Math.max(interval, floor, WIDGET_BACKOFF_RAMP_MS[Math.min(step, WIDGET_BACKOFF_RAMP_MS.length - 1)]);
+      return Math.max(interval, floor, WIDGET_BACKOFF_RAMP_MS[0]);
     },
     tickClock(nowMs = Date.now()) { tickClock(this, nowMs); },
+    // " (NAS 2026-10-25 21:54)" beside a browser-zone time, only when the NAS zone is known and differs.
+    nasTimeSuffix(epoch) {
+      const clock = this.nasClock;
+      const seconds = Number(epoch);
+      if (!clock.known || !clock.differs || !Number.isFinite(seconds) || seconds <= 0) return "";
+      return ` (NAS ${new Date((seconds + clock.offset) * 1000).toISOString().slice(0, 16).replace("T", " ")})`;
+    },
+    showMoreActivity() { this.activityRenderLimit = (Number(this.activityRenderLimit) || ACTIVITY_RENDER_STEP) + ACTIVITY_RENDER_STEP; },
+    clockWatchdog() { clockWatchdog(this); },
     // `warnings` is the list of { code, text } the save returned, or null.
     noteMutationWarning(warnings) {
       const list = Array.isArray(warnings) && warnings.length ? warnings : null;
@@ -5872,12 +6130,14 @@ export default {
           // object reference.
           const comparable = Object.assign({}, snapshot, { generated_at_epoch: 0 });
           const serialized = JSON.stringify(comparable);
+          // The snapshot is data: frozen, so Vue never tracks it (a deeply reactive 254-profile
+          // snapshot cost 400 ms a poll), replaced whole when it changes and never edited in
+          // place. The one value that moves on every poll is kept beside it.
           if (serialized !== this.snapshotSignature) {
-            this.snapshot = snapshot;
+            this.snapshot = Object.freeze(snapshot);
             this.snapshotSignature = serialized;
-          } else if (this.snapshot) {
-            this.snapshot.generated_at_epoch = snapshot.generated_at_epoch;
           }
+          this.snapshotGeneratedAt = Number(snapshot.generated_at_epoch) > 0 ? Number(snapshot.generated_at_epoch) : 0;
           this.snapshotReceivedAtMs = Date.now();
           this.nowMs = this.snapshotReceivedAtMs;
           this.snapshotFailureCode = "";
@@ -6301,6 +6561,7 @@ export default {
         this.pathBrowser.parent = kind === "local" ? (result.parent === null ? null : boundedText(result.parent, "")) : this.browserParent(current);
         this.pathBrowser.directories = directories;
         this.pathBrowser.truncated = result.truncated === true;
+        this.pathBrowser.timeLimited = result.time_limited === true && result.truncated === true;
         if (kind === "remote") {
           this.pathBrowser.error = isolatedIncidentUnresolved(this, "connection")
             ? `Directory listing succeeded, but prior unresolved connection evidence remains: ${isolatedIncidentGuidance(this, "connection")}`
@@ -6845,6 +7106,7 @@ export default {
           this.doctorProgress = { active: false, phase: "complete", level: doctorLevel, started_epoch: doctorStartedEpoch };
         }
         const operation = `${kind.charAt(0).toUpperCase()}${kind.slice(1)}`;
+        if (kind === "run") this.runQueuedAtMs = Date.now();
         this.toast(`${operation} ${awaitTerminal ? "completed" : "queued"}`, operationMessage);
         await this.refreshSnapshot(false, true);
       } catch (error) {
@@ -6880,7 +7142,27 @@ export default {
       }
     },
     quickPlan() { return this.executeOperation("plan", { scope: "all", level: null, write_test: null, allow_delete: false, max_total_delete: 0 }); },
-    async quickRun() { if (!this.canRunOperations || this.operationBusy) return; if (await this.confirmAction("Run all configured profiles?", "This starts a real one-way sync. Remote deletion stays disabled for this quick action.", "Run all")) return this.executeOperation("run", { scope: "all", level: null, write_test: null, allow_delete: false, max_total_delete: 0 }); },
+    // What the confirmation must add when a sync is already going: a second "Run all"
+    // does not replace the first, it queues behind it, and the result is two full
+    // syncs back to back. "" when nothing is known to be in progress.
+    runInProgressNote() {
+      if (this.runActive) {
+        const started = numberOr(this.run.started_epoch, 0) || (this.outcomes ? this.outcomes.run.startedEpoch : 0);
+        const since = started > 0 ? ` (started ${spanLabel(Math.max(0, this.packageNowSeconds - started))} ago)` : "";
+        return `A sync is already running${since}. A second one is queued behind it and runs a full sync again when the first finishes.`;
+      }
+      const queuedAt = Number(this.runQueuedAtMs);
+      if (queuedAt > 0 && Date.now() - queuedAt < QUEUED_RUN_WARN_MS) {
+        return `You queued a sync from this window ${spanLabel(Math.max(0, (Date.now() - queuedAt) / 1000))} ago and it may still be waiting. A second one runs a full sync again after it.`;
+      }
+      return "";
+    },
+    async quickRun() {
+      if (!this.canRunOperations || this.operationBusy) return;
+      const note = this.runInProgressNote();
+      const message = "This starts a real one-way sync. Remote deletion stays disabled for this quick action.";
+      if (await this.confirmAction("Run all configured profiles?", note ? `${note} ${message}` : message, note ? "Queue another" : "Run all")) return this.executeOperation("run", { scope: "all", level: null, write_test: null, allow_delete: false, max_total_delete: 0 });
+    },
     async runDoctor(event) {
       if (event && event.preventDefault) event.preventDefault();
       if (!this.canRunOperations || this.operationBusy) return;
@@ -7280,7 +7562,7 @@ export default {
             append(source, entry.lines.map((line) => typeof line === "string" ? decodeLogPaths(line) : "").join("\n"), true);
             // The bridge reads only the newest bytes of a large log; say so rather
             // than letting a short list read as the whole history.
-            if (entry.scan_limited === true && records.length > before) records[records.length - 1].scanLimited = true;
+            if (entry.scan_limited === true && records.length > before) { records[records.length - 1].scanLimited = true; if (entry.deadline_reached === true) records[records.length - 1].deadlineReached = true; }
             return;
           }
           const timestamp = typeof entry.timestamp === "string" ? entry.timestamp : "";
@@ -7360,6 +7642,7 @@ export default {
           }
           this.activityHistory = activity.value.history === undefined ? null : activity.value.history;
           this.activityReceivedAtMs = Date.now();
+          probeSnapshotAfterAnswer(this);
         }
         this.logState = logsFeedState(
           fetchLogs,
@@ -7563,21 +7846,14 @@ export default {
     },
     // What the last run of one profile left behind, as the row text and level.
     // A retained (stale) reading never reports ok.
+    // Looked up per row, twice a row: the shared computeds are read once per render, in the
+    // map, rather than once per call (each read of a computed copies its dependency list).
     profileOutcome(name) {
+      const map = this.profileOutcomeMap;
+      const hit = map ? map.get(String(name)) : undefined;
+      if (hit) return hit;
       if (!this.snapshot) return { level: "unknown", text: "" };
-      if (!this.outcomes) return { level: "unknown", text: "Last run: outcome not reported by this package" };
-      // A dead run that covered this profile outranks the record it left behind.
-      if (staleRunCovers(this.outcomes, name)) {
-        return { level: "fail", text: ["Last run: Run died", reasonCopy("runner_died").text, this.retainedStale ? "stale reading" : ""].filter(Boolean).join(" · ") };
-      }
-      const entry = this.outcomes.profiles.find((item) => item.profile === String(name));
-      if (!entry) return { level: "unknown", text: "Last run: not reported" };
-      const row = profileOutcomeRow(entry, this.packageNowSeconds);
-      const stale = this.retainedStale;
-      // A retained reading is dimmed (unknown); a token this window cannot read is a
-      // warning, never the neutral colour of "nobody has looked".
-      const shownLevel = stale ? (row.level !== "fail" ? "unknown" : row.level) : (row.level === "unknown" ? "warn" : row.level);
-      return { level: shownLevel, text: ["Last run: " + row.label, row.detail, row.age, stale ? "stale reading" : ""].filter(Boolean).join(" · ") };
+      return profileOutcomeFor(String(name), this.outcomes, this.retainedStale, this.packageNowSeconds);
     },
     // The tree comparison is not a run verdict; say so beside it whenever the
     // last run did not finish cleanly.

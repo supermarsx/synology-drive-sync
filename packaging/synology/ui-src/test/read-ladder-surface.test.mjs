@@ -72,9 +72,21 @@ const SHIPPED_COPY = Object.freeze([
     cause: "the package is busy"
   }),
   Object.freeze({
+    code: "control_lock_busy", kind: "Unavailable", retry: "backoff",
+    title: "Package is busy recording another change",
+    message: "The package is still recording another change, so this one was not accepted. Retrying is safe: the request is identified, so it cannot be applied twice. Select the action again in a moment.",
+    cause: "the package is busy recording another change"
+  }),
+  Object.freeze({
+    code: "shell_snapshot_building", kind: "Unavailable", retry: "backoff",
+    title: "Package is building its status view",
+    message: "The package is preparing its status view on the shell read lane. This page will retry.",
+    cause: "the package is building its status view"
+  }),
+  Object.freeze({
     code: "manager_lane_poisoned", kind: "UnsafeRuntime", retry: "stop",
     title: "Package service needs a restart",
-    message: "The package service cannot serve further reads in this state. Restart Synology Drive Sync in Package Center.",
+    message: "The package service cannot serve further reads in this state. Stop Synology Drive Sync in Package Center, then Run it again.",
     cause: "the package service needs a restart"
   }),
   Object.freeze({
@@ -145,7 +157,7 @@ const SHIPPED_COPY = Object.freeze([
 // for a 503 this release has never heard of.
 const CATCH_ALL = Object.freeze({
   title: "Package service unavailable",
-  message: "Restart Synology Drive Sync and inspect its API log if the package bridge does not recover."
+  message: "Stop Synology Drive Sync in Package Center, then Run it again, and inspect its API log if the package bridge does not recover."
 });
 
 function loadAppComponent({ apiGet = async () => ({}) } = {}) {
@@ -370,7 +382,7 @@ test("a runtime the package refuses to vouch for is never polled through, and sa
       assert.equal(row.retry, "stop", `${row.code} keeps polling an unverifiable runtime`);
       assert.match(
         row.message,
-        /inspect|repair|reinstall|restart|correct the system time/i,
+        /inspect|repair|reinstall|restart|stop .* then run|correct the system time/i,
         `${row.code} does not tell the operator what to do`
       );
     }
@@ -387,7 +399,10 @@ test("a runtime the package refuses to vouch for is never polled through, and sa
  *
  * The numbers are the widget's, deliberately: WIDGET_BACKOFF_RAMP_MS and
  * WIDGET_ACTIVE_POLL_MS are reviewed literals that validate_spk.py already
- * holds, and a second ramp would be a second thing to keep in step.
+ * holds, and a second ramp would be a second thing to keep in step. The
+ * AppWindow enters the ramp at its first step and stays there (D3-UI-4): a person
+ * at the screen waits for an outage to clear, and a five-minute wait after it
+ * had cleared read as a dashboard that was still broken.
  */
 test("each named failure selects its own bounded retry ladder", () => {
   const component = loadAppComponent();
@@ -420,7 +435,7 @@ test("each named failure selects its own bounded retry ladder", () => {
     // One failed read is not a verdict, exactly as the desktop card holds.
     assert.equal(delay(row.code, 1), 5000, `${row.code} backed off on a single failure`);
     const walked = [2, 3, 4, 5, 6, 7].map((streak) => delay(row.code, streak));
-    assert.deepEqual(walked, [...WIDGET_BACKOFF_RAMP_MS, WIDGET_BACKOFF_RAMP_MS[3], WIDGET_BACKOFF_RAMP_MS[3]], row.code);
+    assert.deepEqual(walked, new Array(6).fill(WIDGET_BACKOFF_RAMP_MS[0]), row.code);
   }
 });
 
@@ -446,7 +461,7 @@ test("a stood-down ladder schedules nothing, and a manual retry re-arms it", asy
     // A success clears both, and the ordinary cadence returns.
     context.snapshotFailureCode = "manager_timeout";
     context.snapshotFailureStreak = 4;
-    assert.equal(context.snapshotRetryDelay(5000), WIDGET_BACKOFF_RAMP_MS[2]);
+    assert.equal(context.snapshotRetryDelay(5000), WIDGET_BACKOFF_RAMP_MS[0]);
     context.snapshotFailureCode = "";
     context.snapshotFailureStreak = 0;
     assert.equal(context.snapshotRetryDelay(5000), 5000);
@@ -488,7 +503,7 @@ test("scheduleSnapshot honours the ladder, Manual only, and the profile-draft bl
     context.snapshotFailureCode = "manager_busy";
     context.snapshotFailureStreak = 3;
     schedule();
-    assert.deepEqual(scheduled, [5000, WIDGET_BACKOFF_RAMP_MS[1]]);
+    assert.deepEqual(scheduled, [5000, WIDGET_BACKOFF_RAMP_MS[0]]);
 
     // Manual only and an open profile draft both still win outright.
     context.settings.status_refresh = 0;
@@ -641,7 +656,7 @@ test("a snapshot with a stray key is accepted, as it is today", async () => {
  * (src/dsm_api.rs's current_epoch() call), and only reassigns when that text
  * actually differs.
  */
-test("an unchanged poll keeps the same retained snapshot object, but its generated_at_epoch still advances", async () => {
+test("an unchanged poll keeps the same retained snapshot object, and the package clock still advances beside it", async () => {
   const first = validSnapshot({ generated_at_epoch: 1000, profiles: [{ name: "nightly" }] });
   const second = validSnapshot({ generated_at_epoch: 2000, profiles: [{ name: "nightly" }] });
   const responses = [first, second];
@@ -655,9 +670,11 @@ test("an unchanged poll keeps the same retained snapshot object, but its generat
     // Everything but generated_at_epoch was byte-identical, so the retained
     // object itself must not have been replaced...
     assert.strictEqual(context.snapshot, first, "an unchanged poll replaced the retained object");
-    // ...but its one volatile field must still read the latest poll's value,
-    // or controllerLiveness's dead-controller check would freeze along with it.
-    assert.equal(context.snapshot.generated_at_epoch, 2000);
+    // ...and it is frozen data, never edited in place (SC-1), so its one volatile field
+    // lives beside it and must still read the latest poll's value, or
+    // controllerLiveness's dead-controller check would freeze along with it.
+    assert.equal(context.snapshot.generated_at_epoch, 1000);
+    assert.equal(context.snapshotGeneratedAt, 2000);
     // The receipt clock and the freshness line are this browser's own
     // evidence and must keep advancing regardless of document content.
     assert.match(context.freshness, /^Updated /);

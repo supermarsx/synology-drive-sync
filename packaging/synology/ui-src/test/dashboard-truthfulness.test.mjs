@@ -422,8 +422,8 @@ test("ADV-U-11 unnamed failures back off after the second consecutive one, and a
   const base = { snapshotFailureCode: "", windowHidden: false };
   assert.equal(delay({ ...base, snapshotFailureStatus: 401, snapshotFailureStreak: 1 }), 5000, "one failed read is not a verdict");
   assert.equal(delay({ ...base, snapshotFailureStatus: 401, snapshotFailureStreak: 2 }), WIDGET_BACKOFF_RAMP_MS[0]);
-  assert.equal(delay({ ...base, snapshotFailureStatus: 0, snapshotFailureStreak: 4 }), WIDGET_BACKOFF_RAMP_MS[2]);
-  assert.equal(delay({ ...base, snapshotFailureStatus: 502, snapshotFailureStreak: 9 }), WIDGET_BACKOFF_RAMP_MS[3]);
+  assert.equal(delay({ ...base, snapshotFailureStatus: 0, snapshotFailureStreak: 4 }), WIDGET_BACKOFF_RAMP_MS[0], "the AppWindow never waits past the first ramp step (D3-UI-4)");
+  assert.equal(delay({ ...base, snapshotFailureStatus: 502, snapshotFailureStreak: 9 }), WIDGET_BACKOFF_RAMP_MS[0]);
   assert.equal(delay({ ...base, snapshotFailureStatus: 400, snapshotFailureStreak: 9 }), 5000, "a request error is not a transport outage");
   assert.equal(delay({ ...base, snapshotFailureStatus: 0, snapshotFailureStreak: 0 }), 5000, "healthy cadence is untouched");
   assert.equal(delay({ ...base, windowHidden: true, snapshotFailureStatus: 0, snapshotFailureStreak: 0 }), WIDGET_IDLE_POLL_MS);

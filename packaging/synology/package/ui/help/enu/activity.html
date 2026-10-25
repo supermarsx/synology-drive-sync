@@ -12,6 +12,8 @@
 <body>
   <h1>Activity and logs</h1>
   <p>Activity shows bounded structured events and recent package log output. Browser polling runs only while this page and the DSM document are visible, and more slowly while the window is minimised or the package keeps failing.</p>
+  <p>The newest 200 events that match the filters are drawn, newest first. When more match, the heading still counts all of them and a line under the list says how many older events are not shown; <strong>Show older</strong> draws 200 more. Copying the visible events copies every match, not only the rows drawn.</p>
+  <p>Times are shown in this browser's zone. When the NAS reports a different zone, a note above the filters names both and each time is followed by the NAS's own date and time, as <em>(NAS 2026-10-25 21:54)</em>; if the NAS cannot report its zone, the note says so and no NAS time is shown. A cancelled run is recorded as <code>run.cancelled</code> with state <em>cancelled</em>; older cancels recorded as <code>run.failed</code> at info level are shown as cancelled too. A package log whose read ran out of its time budget shows <em>the read ran out of time; older lines were not scanned</em>, and a log line the package could not safely redact is replaced by <code>[line withheld: could not be redacted]</code>.</p>
 
   <p>The same attention list as the Overview appears above the tabs, so a failed, partial or stale run, an unavailable alert path or degraded package records are visible here with their cause.</p>
 

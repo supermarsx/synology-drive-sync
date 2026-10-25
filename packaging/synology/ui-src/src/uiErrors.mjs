@@ -20,6 +20,13 @@ import { plainText } from "./textSafety.mjs";
 const BANNER_CLASS = "sdsync-banner sdsync-ui-error";
 const MESSAGE_LIMIT = 300;
 const state = new WeakMap();
+// Counts every report, so a caller can tell whether anything was reported while it
+// was busy. Module state is fine here: it is a number, not a document.
+let serial = 0;
+
+export function uiErrorSerial() {
+  return serial;
+}
 
 function describe(error) {
   return plainText(error && error.message ? error.message : String(error), MESSAGE_LIMIT);
@@ -71,6 +78,7 @@ function hostFor(root) {
  * label for where the error was raised ("render", "v-on handler", ...).
  */
 export function reportUiError(error, info, root) {
+  serial += 1;
   const message = describe(error);
   if (typeof console !== "undefined" && console.error) console.error(`[sdsync] ${info || "error"}: ${message}`, error);
   const host = hostFor(root);
@@ -85,11 +93,12 @@ export function reportUiError(error, info, root) {
     const reload = () => {
       if (typeof location !== "undefined" && typeof location.reload === "function") location.reload();
     };
-    entry = { ...build(documentRef, reload), count: 0 };
+    entry = { ...build(documentRef, reload), count: 0, onlyRender: true };
     state.set(host, entry);
     host.insertBefore(entry.banner, host.firstChild || null);
   }
   entry.count += 1;
+  if (info !== "render") entry.onlyRender = false;
   entry.detail.textContent = ` Parts of this page may be showing old information (${info || "error"}: ${message}). ${
     entry.count > 1 ? `(${entry.count} errors so far) ` : ""
   }Reload to recover.`;
@@ -117,3 +126,20 @@ export const patchGuard = {
     };
   }
 };
+
+/**
+ * Takes the banner down once the page has rendered cleanly again, but only when
+ * every error behind it was a failed render. A render that throws leaves the
+ * previous vnode on screen untouched, so a later render that succeeds is real
+ * proof the page recovered. A failed patch leaves the DOM half updated, and a
+ * handler or watcher error says nothing about what is on screen, so those keep
+ * the banner until the window is reloaded. Returns whether a banner was removed.
+ */
+export function clearRenderErrors(root) {
+  const host = hostFor(root);
+  const entry = host ? state.get(host) : null;
+  if (!entry || !entry.onlyRender) return false;
+  if (entry.banner.parentNode === host) host.removeChild(entry.banner);
+  state.delete(host);
+  return true;
+}

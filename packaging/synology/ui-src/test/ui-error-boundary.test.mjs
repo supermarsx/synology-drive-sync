@@ -59,7 +59,7 @@ function duplicateHeavyEvents(count, random) {
 }
 
 test("the Activity feed key expression is unique for identical events and survives filtering and sliding", async () => {
-  const keyExpression = appSource.match(/v-for="event in reversedActivity"\s+:key="([^"]+)"/);
+  const keyExpression = appSource.match(/v-for="event in shownActivity"\s+:key="([^"]+)"/);
   assert.ok(keyExpression, "the Activity feed v-for must declare a :key");
   const keyOf = new Function("event", `return ${keyExpression[1]};`);
   const component = await loadApp();
@@ -83,7 +83,7 @@ test("the Activity feed key expression is unique for identical events and surviv
 });
 
 test("keys stay stable when the 200-line window slides by one event", async () => {
-  const keyExpression = appSource.match(/v-for="event in reversedActivity"\s+:key="([^"]+)"/);
+  const keyExpression = appSource.match(/v-for="event in shownActivity"\s+:key="([^"]+)"/);
   const keyOf = new Function("event", `return ${keyExpression[1]};`);
   const component = await loadApp();
   const base = duplicateHeavyEvents(30, seeded(3));

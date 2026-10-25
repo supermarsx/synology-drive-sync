@@ -490,6 +490,7 @@ test("v1.5 result facts render as warn lines on the run and on profiles", () => 
 
 test("remote-unreadable and deferred_paths have copy; unrecorded counts are never shown as zero; Doctor surfaces skipped entries", () => {
   assert.match(reasonCopy("remote-unreadable").text, /Grant the sync account read permission/);
+  assert.match(reasonCopy("remote-unreadable").text, /this file or folder/, "an unlistable remote folder is covered by the same reason");
   assert.equal(reasonCopy("deferred_paths").known, true);
   const unrecorded = attentionItems(normalizeOutcomes(block({ run: runWith({ outcome: "partial", counts_available: false, reason: "deferred_paths" }) })), NOW)[0];
   assert.match(unrecorded.detail, /Entry counts were not recorded for this run/);

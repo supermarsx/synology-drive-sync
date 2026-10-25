@@ -50,6 +50,7 @@ import {
   routineDeferCopy,
   runIsActive,
   runIsStale,
+  serviceAttentionItem,
   spanLabel,
   staleRunCovers
 } from "./outcomes.mjs";
@@ -389,6 +390,12 @@ function deriveOverview(snapshot, nowMs, options) {
       detail: "Routines and schedules do not run while the service is stopped."
     };
   }
+  // A controller that is "running" but has stopped checking in schedules nothing,
+  // and every row beneath it would otherwise read as healthy.
+  const silent = serviceAttentionItem(snapshot, serviceState);
+  if (silent && silent.id === "controller-silent") {
+    return { level: WIDGET_LEVELS.warn, title: silent.title, detail: staleNote + "Scheduled syncs may not be running. Open the dashboard." };
+  }
   const needing = rows.filter((row) => !row.running && (row.level === WIDGET_LEVELS.warn || (row.level === WIDGET_LEVELS.unknown && !row.stale)));
   if (needing.length) {
     return {
@@ -470,8 +477,14 @@ const WIDGET_BRIDGE_FAILURES = Object.freeze({
   manager_busy: Object.freeze({
     level: "warn", title: "Package is busy", detail: "Retrying shortly."
   }),
+  control_lock_busy: Object.freeze({
+    level: "warn", title: "Package is busy recording another change", detail: "A retry is safe."
+  }),
+  shell_snapshot_building: Object.freeze({
+    level: "warn", title: "Package is building its status view", detail: "Retrying shortly."
+  }),
   manager_lane_poisoned: Object.freeze({
-    level: "fail", title: "Package service needs a restart", detail: "Restart it in Package Center."
+    level: "fail", title: "Package service needs a restart", detail: "Stop it in Package Center, then Run it again."
   }),
   manager_unsafe: Object.freeze({
     level: "fail", title: "Package files are not in a safe state", detail: "Repair or reinstall the package."

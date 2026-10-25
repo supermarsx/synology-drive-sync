@@ -49,6 +49,29 @@ const BACKEND_REASONS = [
   new RegExp(`\\b(?:realtime_watcher_reason|routine_backend_reason_value|watcher_failed_reason)=${TOKEN}\\b`, "g")
 ];
 
+// RU-1: the writers that carry their reason as an argument rather than as a
+// `name=token` assignment. `write_run_state STATE STARTED FINISHED EXIT SCOPE OPERATION
+// REASON DETAIL` takes it as the seventh word, so a renamed token there was invisible to
+// the assignment patterns, and the old `reason=runner_died` rule was satisfied by the
+// controller's log lines whatever the writer said. Backslash continuations are joined and
+// comment lines dropped first; a reason that is a variable ("$run_reason") is computed
+// elsewhere and is covered by the assignment that fills the variable.
+const SHELL_WORD = String.raw`(?:"[^"]*"|\S+)`;
+const WRITE_RUN_STATE = new RegExp(String.raw`\bwrite_run_state\s+${Array(6).fill(SHELL_WORD).join(String.raw`\s+`)}\s+([a-z][a-z0-9_]*)(?=\s)`, "g");
+// A record written by printf: 'outcome=unknown\nreason=runner_died\nscope=%s'.
+const PRINTF_REASON = /\bprintf\s+'[^']*\\nreason=([a-z][a-z0-9_]*)\\n/g;
+// reconcile_stale_run_state's default mode, which becomes the reason it writes.
+const DEFAULT_MODE_REASON = /\bstale_run_mode=\$\{2:-([a-z][a-z0-9_]*)\}/g;
+
+export function positionalReasons(source) {
+  const joined = source.split("\n").filter((line) => !/^\s*#/.test(line)).join("\n").replace(/\\\r?\n\s*/g, " ");
+  const found = new Set();
+  for (const pattern of [WRITE_RUN_STATE, PRINTF_REASON, DEFAULT_MODE_REASON]) {
+    for (const match of joined.matchAll(pattern)) if (!NONE.has(match[1])) found.add(match[1]);
+  }
+  return found;
+}
+
 async function writerTokens() {
   const run = await read(`${LIBEXEC}sdsync-run`);
   const controller = await read(`${LIBEXEC}sdsync-controller`);
@@ -65,7 +88,9 @@ async function writerTokens() {
     for (const [token, line] of collect(source, BACKEND_REASONS)) backend.set(token, `${file}:${line}`);
   }
   // The controller rewrites a dead runner's run.state, and the bridge derives the rest.
-  for (const [token, line] of collect(controller, [new RegExp(`\\breason=(runner_died)\\b`, "g")])) state.set(token, `sdsync-controller:${line}`);
+  for (const [file, source] of [["sdsync-run", run], ["sdsync-controller", controller], ["sdsync-common", common]]) {
+    for (const token of positionalReasons(source)) if (!state.has(token)) state.set(token, `${file} (positional writer)`);
+  }
   const implied = functionBody(bridge, "fn implied_reason");
   for (const match of implied.matchAll(/Some\("([a-z_]+)"\.to_owned\(\)\)/g)) state.set(match[1], "dsm_api.rs implied_reason");
   for (const match of bridge.matchAll(/stale_reason\s*=\s*Some\("([a-z_]+)"\)/g)) state.set(match[1], "dsm_api.rs stale_reason");
@@ -73,7 +98,7 @@ async function writerTokens() {
   const classes = functionBody(observability.slice(observability.indexOf("impl EventReason")), "pub fn as_str");
   const coreClasses = [...classes.matchAll(/=>\s*"([a-z_]+)"/g)].map((match) => match[1]);
   for (const token of coreClasses) state.set(token, "observability.rs EventReason");
-  return { state, defer, backend, coreClasses, counts: { run, controller, common } };
+  return { state, defer, backend, coreClasses, counts: { run, controller, common }, sources: { run, controller, common } };
 }
 
 test("the extractor reads real writers (it would otherwise pass on an empty set)", async () => {
@@ -162,4 +187,25 @@ test("routine defer and last reasons read as copy, not as unknown", () => {
   const items = attentionItems(normalizeOutcomes(snapshot.outcomes), 1_700_000_000);
   assert.doesNotMatch(JSON.stringify(items), /unknown/);
   assert.match(JSON.stringify(items), /depends on/);
+});
+
+test("RU-1 the stale-run writers are read from the writer, so a renamed token is seen even while log lines keep the old one", async () => {
+  const { sources } = await writerTokens();
+  const controller = positionalReasons(sources.controller);
+  assert.ok(controller.has("runner_died"), "sdsync-controller no longer writes runner_died through write_run_state");
+  assert.ok(controller.has("cancelled"), "sdsync-controller no longer writes cancelled through write_run_state");
+  assert.ok(positionalReasons(sources.common).has("runner_died"), "sdsync-common no longer writes runner_died into a profile record");
+
+  // Rename the token at the controller's write_run_state call only.
+  const call = /(write_run_state failed "\$stale_run_started" "\$stale_run_now" -1 "\$stale_run_scope" \\r?\n\s*"\$stale_run_operation" )runner_died/;
+  assert.match(sources.controller, call, "the writer's shape changed; this test must follow it");
+  const renamed = sources.controller.replace(call, "$1runner_gone");
+  assert.match(renamed, /reason=runner_died/, "the controller's log lines still carry the old token, which is what hid the rename before");
+  const after = positionalReasons(renamed);
+  assert.ok(after.has("runner_gone"), "the renamed token is extracted from the positional writer");
+  assert.ok(!reasonCopy("runner_gone").known, "and it has no label, so the vocabulary test above fails on it");
+  // The same rename in the profile-record writer.
+  const profileRecord = sources.common.replace(/(\\nreason=)runner_died(\\n)/, "$1runner_gone$2");
+  assert.notEqual(profileRecord, sources.common);
+  assert.ok(positionalReasons(profileRecord).has("runner_gone") && !positionalReasons(profileRecord).has("runner_died"));
 });

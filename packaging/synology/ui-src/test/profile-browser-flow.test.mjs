@@ -1675,7 +1675,7 @@ test("closing a remote explorer preserves late cleanup evidence without repainti
   context.selectedProfile = "different-draft";
   assert.deepEqual(context.pathBrowser, {
     visible: false, kind: "", current: "/", parent: null, directories: [],
-    loading: false, error: "", truncated: false, request: 2
+    loading: false, error: "", truncated: false, timeLimited: false, request: 2
   });
 
   pending.reject(Object.assign(
@@ -1691,7 +1691,7 @@ test("closing a remote explorer preserves late cleanup evidence without repainti
 
   assert.deepEqual(context.pathBrowser, {
     visible: false, kind: "", current: "/", parent: null, directories: [],
-    loading: false, error: "", truncated: false, request: 2
+    loading: false, error: "", truncated: false, timeLimited: false, request: 2
   });
   assert.equal(context.isolatedIncidents.connection.active, true);
   assert.equal(context.isolatedIncidents.connection.requiresInspection, true);
@@ -1727,7 +1727,7 @@ test("closing a remote explorer ignores a late ordinary rejection but releases i
 
   assert.deepEqual(context.pathBrowser, {
     visible: false, kind: "", current: "/", parent: null, directories: [],
-    loading: false, error: "", truncated: false, request: 2
+    loading: false, error: "", truncated: false, timeLimited: false, request: 2
   });
   assert.equal(context.toasts.length, 0);
   assert.equal(context.isolatedIncidents.connection.active, false);

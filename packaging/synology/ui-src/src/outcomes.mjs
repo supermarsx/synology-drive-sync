@@ -55,24 +55,24 @@ const REASONS = Object.freeze({
   secret_unsafe: ["a stored secret file failed its ownership or mode check", "Enter the password again on the Profiles page, or repair the package."],
   log_file_unsafe: ["the profile's log file path failed its ownership or mode check", "Repair the package, or reset the profile's log file setting."],
   log_path_mismatch: ["package paths mismatch (the profile log file is not the package-managed path)", "Repair the package, or reset the profile's log file setting."],
-  busy: ["another run, Doctor or management action holds the package, or the package is stopping or upgrading", "Nothing to do; the run is retried."],
+  busy: ["another run, Doctor or management action holds the package, or the package is stopping or upgrading", "A routine tries again on its own; a run you started is not repeated, so run it again if you still need it."],
   interrupted: ["the routine was interrupted before it finished", "It is retried automatically."],
   admission_refused: ["the package refused to start the run (lifecycle change or lock)", "It is retried automatically."],
   dependency: ["a routine this one depends on has not succeeded", "Fix the dependency routine first."],
   source: ["the routine's source folder is missing or unreadable", "Check the source folder is mounted and readable."],
   window: ["the routine is outside its daily window", "It runs when the window opens."],
-  pid_unreadable: ["controller.pid exists but holds no process ID", "Restart the package service."],
-  identity_refused: ["the process the PID file names is not the verified controller", "Restart the package service."],
-  identity_changed: ["the controller's identity changed while the package was telling it to reload", "Restart the package service."],
-  signal_failed: ["the package could not signal the running controller", "Restart the package service."],
-  lock_busy: ["another run, Doctor or management action held the run lock", "Nothing to do; the run is retried."],
+  pid_unreadable: ["controller.pid exists but holds no process ID", "Stop the package in Package Center, then Run it again."],
+  identity_refused: ["the process the PID file names is not the verified controller", "Stop the package in Package Center, then Run it again."],
+  identity_changed: ["the controller's identity changed while the package was telling it to reload", "Stop the package in Package Center, then Run it again."],
+  signal_failed: ["the package could not signal the running controller", "Stop the package in Package Center, then Run it again."],
+  lock_busy: ["another run, Doctor or management action held the run lock", "A routine tries again on its own; a run you started is not repeated, so run it again if you still need it."],
   runner_died: ["the runner died before it finished (killed, out of memory or power loss)", "Review Logs, then run again."],
   core_partial: ["the run changed the destination and then failed part-way", "Review Logs, then run again; nothing is rolled back."],
   runner_vanished: ["the runner died before it finished (killed, out of memory or power loss)", "Review Logs, then run again."],
   supervisor_refused: ["the package supervisor refused the sync command", "Review Logs and the package version."],
   dependency_unmet: ["a routine this one depends on has not succeeded", "Fix the dependency routine first."],
   outside_window: ["the routine is outside its daily window", "It runs when the window opens."],
-  cancelled: ["the run was stopped", "Run again when ready."],
+  cancelled: ["the run was stopped", "A routine runs again on its own; a run you started is not repeated, so run it again when ready."],
   batch_target_failed: ["the run stopped at this profile, so later profiles did not run", "Fix this profile, then run again."],
   not_reached: ["an earlier profile failed, so this one did not run", "Fix the failing profile first."],
   authentication: ["the target rejected the login (password changed, a one-time code or 2-step verification is required, or the account is locked or disabled)", "Check the account on the target DSM, then re-enter the password and test the connection."],
@@ -99,7 +99,7 @@ const REASONS = Object.freeze({
   server_copy_failed: ["server-side copy failed", "Files re-upload on the next run; review Logs if it repeats."],
   reconciliation_pending: ["a previous change is still being reconciled", "Wait for it to settle, then run again."],
   credential_unavailable: ["the stored credential could not be read", "Re-enter the password."],
-  config_invalid: ["the configuration is invalid", "Correct it on the Profiles page."],
+  config_invalid: ["the configuration is invalid, or two profiles have overlapping destinations and one of them deletes (the detail names the pair)", "Correct it on the Profiles page; profiles whose destinations overlap need separate destinations."],
   https_required: ["the target must use HTTPS", "Change the target to HTTPS."],
   scope_not_found: ["the named profile does not exist", "Check the profile name."],
   unclassified: ["the failure has no specific classification", "Review Logs."],
@@ -115,7 +115,7 @@ const REASONS = Object.freeze({
   "remote-digest-unavailable": ["the target gave no digest to verify against", "It is re-checked on the next run."],
   "remote-changed": ["the destination changed during the run", "Run again."],
   "unrepresentable-name": ["a file name cannot be represented on the target", "Rename it."],
-  "remote-unreadable": ["the NAS does not let this account read this file, so it is never compared or deleted", "Grant the sync account read permission on it."],
+  "remote-unreadable": ["the NAS does not let this account read this file or folder, or list a folder's contents, so it is never compared or deleted", "Grant the sync account read permission on it."],
   deferred_paths: ["some paths were deferred", "They sync on the next run; review the entry.deferred records in the sync log."],
   "listing-incomplete": ["the destination listed fewer or more entries than expected, so deletions in those folders are withheld", "Run again; review Logs if it repeats."],
   "remote-refused": ["not synced until you fix this: the NAS refuses this name, or this account's access to it", "Rename it, or fix the sync account's permissions on it in File Station. It is named on every run until then."],
@@ -126,6 +126,8 @@ const REASONS = Object.freeze({
   "unsupported-entry": ["not synced until you fix this: a name, path or file type Synology Drive cannot hold", "Rename it, or exclude it. It is named on every run until then."],
   "type-conflict": ["not synced until you fix this: a file replaced a folder, the reverse, or a local folder sits where the NAS has a mount point", "Run with deletion enabled, or remove the excluded or DSM-managed items inside the NAS folder."],
   "remote-link": ["not synced until you fix this: a local folder sits where the NAS has a link to somewhere else, and nothing is synced there", "Replace the link with a folder on the NAS."],
+  remote_refused_share_wide: ["the NAS refused most folders or files for one cause (this account's permission or a share-wide restriction), so the run stopped instead of working through them one by one", "Fix the sync account's permission on the share in File Station, run Doctor, then run again."],
+  remote_real_path_unusable: ["DSM reported real paths in an unexpected shape, so almost every folder looked like a link; nothing was synced", "Update the package; if it repeats, report it with the DSM version."],
   "remote-real-path-unusable": ["DSM reported real paths in an unexpected shape, so almost every folder looked like a link; nothing was synced", "Update the package; if it repeats, report it with the DSM version."],
   "protected-descendant": ["not synced until you fix this: a folder deleted locally is kept on the NAS because it still holds an excluded or DSM-managed item", "Remove that item in File Station."],
   deferred: ["a path was deferred", "It syncs on the next run; the entry.deferred record names the cause."],
@@ -137,6 +139,11 @@ const REASONS = Object.freeze({
   "local-case-collision": ["names differing only in case collide locally", "Rename one."],
   "remote-case-collision": ["names differing only in case collide on the target", "Rename one."],
   "case-rename-needs-delete": ["a case-only rename needs a deletion", "Enable bounded deletion or rename back."]
+});
+
+// Record-error codes the bridge can name, with what they mean for the reader.
+const RECORD_ERROR_COPY = Object.freeze({
+  clock_skew: "a run record is stamped in the future by the NAS clock, so hang detection is switched off for it; check the NAS time settings"
 });
 
 const SAFE_TOKEN = /^[A-Za-z0-9_:.-]{1,64}$/;
@@ -201,6 +208,8 @@ function factsOf(record) {
     folders: (Array.isArray(r.incomplete_listing_folders) ? r.incomplete_listing_folders : [])
       .filter((f) => typeof f === "string" && f).map((f) => f.replace(/[^\x20-\x7e]/g, "?").slice(0, 120)).slice(0, 5),
     mtimeNotKept: count(r.mtime_not_kept),
+    // NAS folders listed, or passed on the scope chain, with no real path to check entries against.
+    linkGuardUnchecked: count(r.link_guard_unchecked),
     recovered: rec ? {
       reauthenticationFailures: count(rec.reauthentication_failures),
       serverTasksNotStopped: count(rec.server_tasks_not_stopped),
@@ -228,6 +237,8 @@ export function warningText(warning, r = {}) {
   if (warning === "reauthentication_failures") return `${rec.reauthenticationFailures > 0 ? n(rec.reauthenticationFailures, "re-login failure", "re-login failures") : "Re-login failures"} during the run; check the account and password on the target DSM`;
   if (warning === "server_tasks_not_stopped") return `${rec.serverTasksNotStopped > 0 ? n(rec.serverTasksNotStopped, "server-side task", "server-side tasks") : "Server-side tasks"} could not be stopped on the target; check its Task Manager`;
   if (warning === "keepalive_failures") return `Recovered from ${rec.keepaliveFailures > 0 ? n(rec.keepaliveFailures, "keep-alive failure", "keep-alive failures") : "keep-alive failures"}; check the network if it repeats`;
+  if (warning === "link_guard_unchecked") return `${r.linkGuardUnchecked > 0 ? `Link check unavailable for ${n(r.linkGuardUnchecked, "folder", "folders")}` : "Link check unavailable for some folders"}: DSM gave no real path to check entries against, so links there could not be ruled out; nothing was refused. Run Doctor`;
+  if (warning === "stall_unobservable") return "Cannot tell whether this run is stuck: the core's I/O counters are not readable here, so its progress cannot be observed and a stuck run would not be flagged";
   if (warning === "stalled") return "Run may be stuck: no progress for over 30 minutes";
   if (warning === "long_running") return `Running for ${r.runningFor !== null && r.runningFor !== undefined ? spanLabel(r.runningFor) : "a long time"}; check whether it is stuck`;
   return `unknown warning (${shown(warning)})`;
@@ -338,9 +349,13 @@ export function normalizeOutcomes(raw) {
       } : null,
       countsAvailable: typeof run.counts_available === "boolean" ? run.counts_available : null,
       warnings: tokens(run.warnings),
-      runningFor: count(run.running_for_seconds),
+      // null when the bridge cannot say (a run record stamped ahead of the NAS clock): not zero.
+      runningFor: run.running_for_seconds === null ? null : count(run.running_for_seconds),
       // true / false / null (the runner writes no heartbeat): no progress for 30 min.
       stalled: run.stalled === true,
+      // null while running (no heartbeat epoch, liveness only, or a skewed clock): nothing can be
+      // said either way, which is not the same as "not stuck".
+      stallUnobservable: token(run.outcome) === "running" && (run.stalled === null || tokens(run.warnings).includes("stall_unobservable")),
       // When the runner last showed progress, if the bridge says (optional).
       heartbeatEpoch: count(run.heartbeat_epoch),
       // What the runner last saw advance: io (the core read or wrote), progress (its
@@ -520,11 +535,11 @@ export function attentionItems(outcomes, nowSeconds = Date.now() / 1000) {
   } else if (run.outcome === "succeeded" && run.warnings.length) {
     items.push({ id: "run-warnings", level: "warn", title: "Last run synced with warnings", detail: `${warningsSentence(run)}. Skipped and deferred entries are listed as entry.skipped / entry.deferred records in the sync log${when}.` });
   } else if (run.outcome === "running" && run.longRunning) {
-    items.push({ id: "run-long", level: "warn", title: `A run has been going for ${run.runningFor !== null ? spanLabel(run.runningFor) : "a long time"}`, detail: "Check whether it is stuck: a core waiting on an unresponsive source or target never fails, it just never finishes. Review Logs, and stop and restart the package if nothing is moving." });
+    items.push({ id: "run-long", level: "warn", title: `A run has been going for ${run.runningFor !== null ? spanLabel(run.runningFor) : "a long time"}`, detail: "Check whether it is stuck: a core waiting on an unresponsive source or target never fails, it just never finishes. Review Logs, and stop the package in Package Center, then Run it again if nothing is moving." });
   } else if (run.outcome === "busy") {
     items.push({ id: "run-busy", level: "warn", title: "Last run was refused as busy", detail: `${reasonCopy("lock_busy").text}${when}` });
   } else if (run.outcome === "cancelled") {
-    items.push({ id: "run-cancelled", level: "warn", title: "Last run was cancelled", detail: `Nothing was synced after the stop${when}.` });
+    items.push({ id: "run-cancelled", level: "warn", title: "Last run was cancelled", detail: `Nothing was synced after the stop${when}. A routine runs again on its own; a run you started is not repeated.` });
   } else if (run.outcome === "unknown") {
     items.push({ id: "run-unknown", level: "fail", title: "Last run status unknown", detail: `The package could not interpret the last run record, so it counts as failed${when}. Review Logs.` });
   } else if (!Object.prototype.hasOwnProperty.call(OUTCOME_LABELS, run.outcome)) {
@@ -536,18 +551,18 @@ export function attentionItems(outcomes, nowSeconds = Date.now() / 1000) {
   if (run.outcome === "running" && run.stalled) {
     const quiet = run.heartbeatEpoch ? spanLabel(Math.max(0, nowSeconds - run.heartbeatEpoch)) : "";
     const how = HEARTBEAT_SOURCE_COPY[run.heartbeatSource] ? ` ${HEARTBEAT_SOURCE_COPY[run.heartbeatSource]}` : "";
-    items.push({ id: "run-stalled", level: "warn", title: quiet ? `Run may be stuck: no progress for ${quiet}` : "Run may be stuck: no progress for 30 minutes", detail: `The runner's heartbeat has stopped advancing. Check whether it is stuck on an unresponsive source or target: review Logs, and restart the package service if nothing is moving.${how}` });
+    items.push({ id: "run-stalled", level: "warn", title: quiet ? `Run may be stuck: no progress for ${quiet}` : "Run may be stuck: no progress for 30 minutes", detail: `The runner's heartbeat has stopped advancing. Check whether it is stuck on an unresponsive source or target: review Logs, and stop the package in Package Center, then Run it again if nothing is moving.${how}` });
   }
   if (outcomes.controllerReload.pending === true) {
     const reload = outcomes.controllerReload;
     const when = reload.epoch ? ` (${ageLabel(reload.epoch, nowSeconds)})` : "";
     const why = reload.reason ? reasonCopy(reload.reason).text : "";
-    items.push({ id: "controller-reload", level: "warn", title: "Saved, not yet applied; restart the package service", detail: `A change${reload.operation ? ` (${reload.operation})` : ""} was saved${when}, but the running controller was not told to reload it, so it keeps the previous settings${why ? `: ${why.split(". ")[0]}` : ""}. Restart the package service in Package Center.` });
+    items.push({ id: "controller-reload", level: "warn", title: "Saved, not yet applied; stop and run the package service", detail: `A change${reload.operation ? ` (${reload.operation})` : ""} was saved${when}, but the running controller was not told to reload it, so it keeps the previous settings${why ? `: ${why.split(". ")[0]}` : ""}. Stop the package in Package Center, then Run it again.` });
   } else if (outcomes.controllerReload.pending === null) {
-    items.push({ id: "controller-reload", level: "warn", title: "Cannot tell whether saved changes are applied", detail: "The marker that records a pending controller reload could not be read. If a recent save did not take effect, restart the package service." });
+    items.push({ id: "controller-reload", level: "warn", title: "Cannot tell whether saved changes are applied", detail: "The marker that records a pending controller reload could not be read. If a recent save did not take effect, stop the package in Package Center, then Run it again." });
   }
-  if (run.warnings.some((w) => w !== "long_running" && w !== "stalled") && run.outcome !== "succeeded") {
-    items.push({ id: "run-warnings-extra", level: "warn", title: "The last run also reported warnings", detail: `${warningsSentence(Object.assign({}, run, { warnings: run.warnings.filter((w) => w !== "long_running" && w !== "stalled") }))}${when}.` });
+  if (run.warnings.some((w) => w !== "long_running" && w !== "stalled" && w !== "stall_unobservable") && run.outcome !== "succeeded") {
+    items.push({ id: "run-warnings-extra", level: "warn", title: "The last run also reported warnings", detail: `${warningsSentence(Object.assign({}, run, { warnings: run.warnings.filter((w) => w !== "long_running" && w !== "stalled" && w !== "stall_unobservable") }))}${when}.` });
   }
   if (run.degraded) {
     const sinks = run.degraded.sinks.join(", ");
@@ -587,7 +602,7 @@ export function attentionItems(outcomes, nowSeconds = Date.now() / 1000) {
     items.push({ id: "alerts-count", level: "warn", title: `Sync has failed ${a.failureCount} time${a.failureCount === 1 ? "" : "s"} in a row`, detail: a.thresholdReached ? "The alert threshold has been reached." : `Alerts fire at ${a.threshold || 1}.` });
   }
   if (outcomes.errors.length) {
-    const named = outcomes.errors.slice(0, 3).map((e) => `${e.source} ${e.code}`).join(", ");
+    const named = outcomes.errors.slice(0, 3).map((e) => `${e.source} ${e.code}${RECORD_ERROR_COPY[e.code] ? ` (${RECORD_ERROR_COPY[e.code]})` : ""}`).join(", ");
     items.push({ id: "record-errors", level: "warn", title: "Package record-keeping is degraded", detail: `${outcomes.errors.length} record${outcomes.errors.length === 1 ? "" : "s"} could not be read: ${named}${outcomes.errors.length > 3 ? ", …" : ""}. Results above may be incomplete.` });
   }
   // The ids are v-for keys; two profiles or routines with one id would collide.
@@ -597,6 +612,52 @@ export function attentionItems(outcomes, nowSeconds = Date.now() / 1000) {
     seen.set(item.id, count + 1);
     return count ? Object.assign({}, item, { id: `${item.id}#${count}` }) : item;
   });
+}
+
+/**
+ * How long the package controller may go without republishing its state before
+ * it is wedged or gone rather than busy.
+ *
+ * The controller rewrites `controller.updated_epoch` on every pass of its loop and
+ * its longest idle sleep is thirty seconds, so six missed ticks is a daemon that
+ * is wedged or gone. Staleness is read only while nothing is active: a controller
+ * executing a long job publishes its active PID and then blocks for as long as
+ * that job takes, and reading staleness there would have a four-hour sync report
+ * its own controller as dead.
+ */
+export const CONTROLLER_TICK_STALE_SECONDS = 180;
+
+/**
+ * The service and the controller's own heartbeat as one attention item, or null.
+ *
+ * `serviceState` is the snapshot's `service.state` (running, stopped, untrusted);
+ * `generatedEpoch` optionally overrides the snapshot's `generated_at_epoch`.
+ * Nothing is syncing when the service is down, and nothing is scheduled when a
+ * running controller has stopped checking in, so a green "Succeeded" from last
+ * night must not be the only thing a reader sees. Both clocks here are the
+ * package's: `generated_at_epoch` and `controller.updated_epoch` are written by
+ * the NAS, so the browser's clock never enters.
+ */
+export function serviceAttentionItem(snapshot, serviceState, generatedEpoch) {
+  if (!snapshot || typeof snapshot !== "object" || Array.isArray(snapshot)) return null;
+  const state = token(serviceState);
+  if (state === "untrusted") {
+    return { id: "service-untrusted", level: "fail", title: "Service identity untrusted", detail: "The process holding the controller's PID file failed its identity check, so nothing is servicing routines or queued requests. Stop the package in Package Center, then Run it again, and review Logs." };
+  }
+  if (state !== "running") {
+    const named = state === "stopped" ? "Package service stopped" : `Package service ${state ? shown(state) : "state unknown"}`;
+    return { id: "service-down", level: "warn", title: named, detail: "Routines and schedules do not run, and queued requests wait, until the service is running. Run the package in Package Center." };
+  }
+  const controller = obj(snapshot.controller);
+  // The AppWindow keeps its snapshot frozen and tracks the package clock beside it, so the
+  // caller passes the live reading; without one the document's own is used.
+  const generated = Number(generatedEpoch > 0 ? generatedEpoch : snapshot.generated_at_epoch);
+  const updated = Number(controller.updated_epoch);
+  const activePid = Number(controller.active_pid);
+  if (Object.keys(controller).length && generated > 0 && updated > 0 && !(activePid > 0) && generated - updated >= CONTROLLER_TICK_STALE_SECONDS) {
+    return { id: "controller-silent", level: "warn", title: `The controller has not checked in for ${spanLabel(generated - updated)}`, detail: "The controller process exists but is running nothing and has stopped reporting, so scheduled syncs may not be happening. Review Logs, and stop the package in Package Center, then Run it again if it does not recover." };
+  }
+  return null;
 }
 
 /** Shown when the snapshot has no outcomes block: absence is never green. */

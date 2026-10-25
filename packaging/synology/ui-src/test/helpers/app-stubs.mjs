@@ -7,15 +7,15 @@ import {
   ACTIVITY_SCHEMA, LOGS_SCHEMA, activityContentKey, feedDocumentProblem, feedSignature, runStderrBlock, uniqueRowKeys
 } from "../../src/feedModel.mjs";
 import {
-  outcomesUnavailableItem, runIsActive, runIsStale, spanLabel, staleRunCovers
+  CONTROLLER_TICK_STALE_SECONDS, outcomesUnavailableItem, runIsActive, runIsStale, serviceAttentionItem, spanLabel, staleRunCovers
 } from "../../src/outcomes.mjs";
 import { decodeLogPaths, plainText, visibleText } from "../../src/textSafety.mjs";
-import { patchGuard } from "../../src/uiErrors.mjs";
+import { clearRenderErrors, patchGuard, uiErrorSerial } from "../../src/uiErrors.mjs";
 import { WIDGET_CLOCK_TICK_MS } from "../../src/widgetModel.mjs";
 
 export const APP_MODULE_STUBS = Object.freeze({
-  ACTIVITY_SCHEMA, LOGS_SCHEMA, WIDGET_CLOCK_TICK_MS,
-  activityContentKey, causeSentence, decodeLogPaths, errorCause, feedDocumentProblem, feedSignature,
-  outcomesUnavailableItem, patchGuard, plainText, runIsActive, runIsStale, runStderrBlock, spanLabel, staleRunCovers,
-  uniqueRowKeys, visibleText
+  ACTIVITY_SCHEMA, CONTROLLER_TICK_STALE_SECONDS, LOGS_SCHEMA, WIDGET_CLOCK_TICK_MS,
+  activityContentKey, causeSentence, clearRenderErrors, decodeLogPaths, errorCause, feedDocumentProblem, feedSignature,
+  outcomesUnavailableItem, patchGuard, plainText, runIsActive, runIsStale, runStderrBlock, serviceAttentionItem, spanLabel, staleRunCovers,
+  uiErrorSerial, uniqueRowKeys, visibleText
 });

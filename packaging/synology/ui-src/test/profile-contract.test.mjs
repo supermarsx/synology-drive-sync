@@ -252,7 +252,7 @@ test("structured profile filters search useful fields and distinguish no matches
   assert.deepEqual(filtered("does-not-exist", "all"), []);
   assert.match(
     appSource,
-    /v-if="!filteredProfiles\.length"[^>]*>\{\{ profiles\.length \? 'No matching profiles\.' : 'No configured profiles\.' \}\}/
+    /v-if="!filteredProfiles\.length"[^>]*>\{\{ profiles\.length \? 'No matching profiles\.' : profilesEmptyText \}\}/
   );
 });
 

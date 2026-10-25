@@ -35,11 +35,11 @@ function snapshot(outcomes, over = {}) {
   };
 }
 
-test("a pending controller reload is a persistent warning that says to restart the package service", () => {
+test("a pending controller reload is a persistent warning that says to stop and run the package service", () => {
   const pending = normalizeOutcomes(block({ controller_reload: { pending: true, epoch: NOW - 600, reason: "identity_refused", pid: 4242, operation: "configure-routine" } }));
   const item = attentionItems(pending, NOW).find((candidate) => candidate.id === "controller-reload");
   assert.equal(item.level, "warn");
-  assert.match(item.title, /Saved, not yet applied; restart the package service/);
+  assert.match(item.title, /Saved, not yet applied; stop and run the package service/);
   assert.match(item.detail, /configure-routine/);
   assert.match(item.detail, /not the verified controller/);
   assert.doesNotMatch(item.detail, /unknown reason/);
