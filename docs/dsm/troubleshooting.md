@@ -153,8 +153,8 @@ Semantic status 503 with code `service_unavailable` and stage `bridge_connect` m
 package-private API socket was not ready for a verified connection. A request that overlaps normal
 startup retries only the missing, connection-refused, or private pre-commit socket state for a short
 bounded window. Retry once after Package Center reports the package running. Repeated semantic 503
-responses mean the service did not become ready; restart **Synology Drive Sync** in Package Center
-and inspect the package startup result rather than repeatedly refreshing the dashboard.
+responses mean the service did not become ready; **Stop** **Synology Drive Sync** in Package Center,
+**Run** it again (DSM offers no Restart action for a package), and inspect the package startup result rather than repeatedly refreshing the dashboard.
 
 Semantic stage `dsm_authentication` identifies the server-side DSM identity boundary. Its fixed
 codes are:
@@ -393,10 +393,12 @@ says so, and **Retry** re-arms it once the package is repaired.
 | `runtime_marker_unsafe` | A transition or admission marker is unreadable or corrupt | Inspect `api.log`. **Not retried** |
 | `policy_unreadable` | The service could not read its own `security.conf` | Repair or reinstall one complete release. **Not retried** |
 | `manager_busy` | The five-second wait for a manager lane expired; at most three reads run at once | Close AppWindows you are not using. Retried on a bounded ramp |
-| `manager_lane_poisoned` | The manager lane cannot serve further reads in this process | Restart the package in Package Center. **Not retried** |
+| `manager_lane_poisoned` | The manager lane cannot serve further reads in this process | Stop the package in Package Center, then Run it again. **Not retried** |
 | `manager_unsafe` | The manager is missing, wrongly owned, writable by others, setuid, or not executable | Repair or reinstall; do not change ownership or permissions by hand. **Not retried** |
 | `manager_spawn_failed` | The service could not fork or exec the manager | Inspect `api.log`. Retried on a bounded ramp |
 | `manager_timeout` | The manager exceeded its twenty-second read ceiling | Check for a concurrent sync or an unusually large log set. Retried on a bounded ramp |
+| `shell_snapshot_building` | The forced shell lane is building the status snapshot in the background (a package with hundreds of profiles on a small CPU) and the read gave up waiting after eight seconds; the build is not killed, and the read after it finishes is served | Wait; the page retries on its own with backoff, and the title reads "Package is building its status view". If it never clears, the build failed and the read reports that failure's own code (`manager_exit_status`, `manager_timeout`, `manager_busy`) |
+| `control_lock_busy` | A dashboard request waited eight seconds for the control lock (the queue or audit-outbox lock) held by another job; the consumer and CLI wait up to 120 seconds | Retry. It is safe: an enqueue is idempotent by client request id. Persistent occurrences mean a job is holding the lock for a long time; inspect `controller.log` |
 | `manager_output_too_large` | The manager produced more than the one-mebibyte output bound | Inspect `api.log`. Retried on a bounded ramp |
 | `manager_exit_status` | The manager exited non-zero | Inspect `api.log`. Retried on a bounded ramp |
 | `manager_output_invalid` | Manager output was not JSON, not an object, or missing a required key | Inspect `api.log`. Retried on a bounded ramp |
@@ -441,7 +443,7 @@ independent CSRF. Possible causes include cookie authentication/admin rejection,
 failure, a stopped API service, wrong CGI/socket ownership or mode, a stopped controller/private
 state, or an unsafe package path.
 
-Use `status`, `paths`, the bounded logs above, and Package Center restart. Do not chmod or chown the
+Use `status`, `paths`, the bounded logs above, and a Package Center Stop followed by Run. Do not chmod or chown the
 CGI/socket, add any identity-changing permission or capability, expose the socket, or hand-create
 the CSRF key.
 
@@ -634,7 +636,7 @@ before this field existed, and that reads as `ok`.
 | `source_symlink` | The configured source path is a symlink. | Point the profile at the real directory it targets. |
 | `watch_unavailable` | No native watcher is available on this NAS. | Install inotify-tools from SynoCommunity or Entware; polling continues to observe the source meanwhile. |
 | `watch_setup_failed` | The native watcher failed to start after repeated attempts and the controller stopped retrying. | Inspect the controller log for the reported error, then save the routine to try again. |
-| `watch_limit` | The source has more directories than the inotify watch budget allows. | Raise `fs.inotify.max_user_watches`, or narrow the source. Compare `cat /proc/sys/fs/inotify/max_user_watches` against `find <source> -type d \| wc -l`. |
+| `watch_limit` | The source has more directories than the inotify watch budget allows. | Raise `fs.inotify.max_user_watches`, or narrow the source. Compare `cat /proc/sys/fs/inotify/max_user_watches` against `find <source> -type d \| wc -l`. The controller reads the limit whole and counts directories in a bounded background job (it stops one past the budget, and the result is cached for an hour per profile in `run/watch-<profile>.dircount`), so a Save on the dashboard does not walk every tree again. `routine_watch_limit` in `controller.log` carries `dirs=` and `budget=`. A limit that cannot be read or a count that fails is logged once per controller lifetime as `routine_watch_limit_unchecked` (`cause=absent`, `not_a_file`, `unreadable`, `malformed`, `count_failed`, `cache_unsafe` or `cache_unwritable`) and the watcher is started anyway; its normal ENOSPC handling still applies. |
 | `watch_stopped` | A stopped native watcher was found and was replaced automatically. | Nothing, unless it recurs; if it does, inspect what is pausing the watcher process. |
 | `poll_unreadable` | Part of the source could not be read during the last poll. | Fix permissions on the unreadable subtree; the readable part is still observed. |
 | `poll_unavailable` | The last poll of the source failed outright. | Confirm the source path is reachable and readable. |
@@ -659,11 +661,11 @@ shows the core's last error line and the path it failed on when the runner recor
 | `no_password:<profile>` | That profile's password file is missing | Enter the password on Profiles. |
 | `supervisor_refused` | The package supervisor refused before the core ran (exit `78`) | Read the stderr line in `api.log`/`controller.log`; reinstall if the binary identity mismatch persists. |
 | `runner_died` | The runner was killed or lost before it finished (out of memory, power loss) | Review Logs, then run again. Nothing is rolled back. |
-| `core_failed` / a core reason (`authentication`, `network`, `timeout`, `share_not_writable`, ...) | The core ran and failed; the reason is the class of the core's error | Follow the dashboard's next step; the one-line `detail` is the core's last error line. |
+| `core_failed` / a core reason (`authentication`, `network`, `timeout`, `share_not_writable`, ...) | The core ran and failed; the reason is the class of the core's error | Follow the dashboard's next step; the one-line `detail` is the core's last error line (a profile's own record keeps up to 240 bytes of it; `run.state` and Activity keep 160). A core killed with exit `137` that did not report an error reads "the sync core was killed (SIGKILL, exit 137) without reporting an error; out of memory?", or "killed by the out-of-memory killer" when this cgroup's OOM counter moved; `core_killed` in `controller.log` records it. A refused `config validate` reads "configuration did not validate: <the core's line>". |
 | `profiles_skipped` | An aggregate ran without the profiles that failed preflight | Fix those profiles; each has its own failed record. |
 | `batch_target_failed:<profile>` / `not_reached` | An aggregate stopped at, or never reached, this profile | Fix the named profile, then run again. |
 | `deferred_paths` | The core exited `3`: finished, with some paths deferred to the next run. Recorded as `succeeded` with outcome `partial`, an Activity warning counting the waiting paths, no alert and no failure count | Nothing; the next run picks them up. Read `entry.deferred` in the sync log if it repeats. |
-| `lock_busy` | Another run, Doctor, or management action held the run lock | Nothing: this is a deferral, retried, and is not counted as a failure. |
+| `lock_busy` | Another run, Doctor, or management action held the run lock | Nothing for a routine: it is a deferral, retried 30 seconds later, and is not counted as a failure. A run you started yourself is not repeated; run it again if you still need it. |
 
 **Failure alerts unavailable** means the alert state file is unsafe or corrupt, so the failure counter
 and its notifications are disabled too; the consecutive-failure count is shown as unavailable rather
@@ -681,18 +683,19 @@ rename File Station would not make) are in that group and stay amber on every ru
 refusal covers most of the share the run instead **fails**, naming the cause.
 
 **A run that never finishes.** The attention list flags a run going for more than six hours
-(`long_running`) and one whose heartbeat is more than 30 minutes old (`stalled`: its I/O counters and
-progress record stopped moving). Neither stops the run, and nothing in the package stops the core on its
+(`long_running`) and one whose heartbeat is more than 30 minutes old (`stalled`: its read and write
+counters stopped growing by 16 KiB a minute; where the kernel hides them, `stalled` is `null` with the
+warning `stall_unobservable` and a hang cannot be detected). Neither stops the run, and nothing in the package stops the core on its
 own. There is no dashboard *Cancel run*: a package stop is the way to end a hung run (Package Center
-stop or `synopkg stop`). The controller stops within 60 seconds, the run is recorded as `cancelled`
-(not `runner_died`), and a core that ignores the termination request is killed after the grace. Meanwhile every routine waits behind the run as “Waiting (busy)”. Check the NAS side first: a hung SMB or NFS
+stop or `synopkg stop`; DSM offers Stop and Run, not Restart). The controller stops within 60 seconds, the run is recorded as `cancelled`
+(not `runner_died`), with an Activity `run.cancelled` row, and a core that ignores the termination request is killed after the grace. Meanwhile every routine waits behind the run as “Waiting (busy)”. Check the NAS side first: a hung SMB or NFS
 source mount, or a File Station request with no deadline.
 
 **A save that is not applied.** A green save followed by the red notice *Saved, but it is not fully in
-effect* (and an Overview item *Saved, not yet applied; restart the package service*) means the change
+effect* (and an Overview item *Saved, not yet applied; stop and run the package service*) means the change
 is on disk but the running controller could not be told to reload; the reason is one of
-`pid_unreadable`, `identity_refused`, `identity_changed` or `signal_failed`. Restart the package in
-Package Center; the controller reads the saved files when it starts. *Cannot tell whether saved changes
+`pid_unreadable`, `identity_refused`, `identity_changed` or `signal_failed`. Stop the package in
+Package Center, then Run it again; the controller reads the saved files when it starts. *Cannot tell whether saved changes
 are applied* means the marker file itself failed its safety check.
 
 ## Routine is deferred
@@ -759,7 +762,42 @@ power loss before the last boot counts as dead and is recovered, rather than end
 At controller start it also removes capture, admission and fingerprint leftovers of processes
 that are no longer live and logs `runtime_leftovers_pruned`. Do not recursively delete
 package run/control directories. If identity/path validation reports `73`, preserve evidence and
-repair through a verified reinstall/upgrade rather than manual chmod/chown edits.
+repair through a verified reinstall/upgrade rather than manual chmod/chown edits. A `73` from the
+identity check now says why in the refusal line (`refusing unsafe controller identity before signal`,
+`cannot validate package lifecycle admission`, and the CLI's `refusing to signal/wake unverified
+controller PID`): `boot_identity_unreadable`, `invalid_pid`, `invalid_start`, `package_owner_unknown`,
+`status_fields_missing`, `status_unreadable`, `process_exited`, `stat_unreadable`, `start_mismatch`,
+`uid_mismatch` or `state_unknown`. Reading a busy process's identity from `/proc` is done from one
+snapshot (under bash, `/bin/sh` on DSM, in a single read), so a loaded NAS can no longer make a live,
+healthy controller look unprovable; if a field is missing the check retries up to three bounded passes
+while the process exists, then fails closed with `status_fields_missing`.
+
+**The controller died but the API service is still up.** After a SIGKILL or an out-of-memory kill of the
+controller alone, Package Center may still report the package running. `status` now logs
+`controller_found_dead phase=status` once for that dead controller and service pair, and **Start** (or
+Run in Package Center) repairs it: it logs `controller_found_dead phase=start`, stops the surviving
+service and any orphaned run through the normal teardown, and starts both again, writing an Activity
+`service.restarted` row (`warn`). It does that only when it can prove the controller is dead (no live
+PID, no ready file, no live lock owner, no startup lease) and the service is the verified one; anything
+unprovable is still refused, and no run is ever concurrent with the repair. If the stop step fails, Start
+refuses with a named message and you stop the package by hand.
+
+**An overlapping deleting pair blocks the routines of its two profiles.** The runner validates the
+configuration before every run, scoped to the profile being run (an all-profiles run is validated
+unscoped). Two profiles whose NAS destinations are equal or nested, where either deletes, are a
+configuration error (exit `2`), so such a pair that already exists in a configuration written before
+this release makes the runs of those two profiles fail as `config_invalid` until the pair is fixed;
+other profiles are unaffected. The profile's detail reads "configuration did not validate: error:
+profiles "a" and "b" have overlapping NAS destinations and ..." and names both profiles and the remedy. The dashboard and `configure-profile` now refuse to create
+the pair (exit `64`); fix an existing one by giving the two profiles separate destinations or turning
+deletion off on both.
+
+Lock owner records torn by a power loss are recovered by claiming the record (a rename to
+`<lock>.torn.<pid>.<start>.<boot>`), judging the claimed copy, and deleting it only if it is still the
+torn record that was judged; otherwise it is put back without clobbering, and a record that a
+competing process published while it was being judged is treated as a race, not as damage. A live
+owner's record is never deleted. If a record cannot be put back (exit `75`) it is kept and
+`lock_owner_restore_failed` is written to standard error.
 
 ## No remote-to-remote shortcut
 

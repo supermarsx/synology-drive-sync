@@ -372,7 +372,7 @@ limited to matching content already present within the one target NAS.
 ## Questions only a real NAS can answer
 
 The File Station mock reproduces what DSM is documented to do. It cannot say what DSM actually does in
-fourteen places where a safeguard of the client rests on an assumption. Each is a question to put to a
+nineteen places where a safeguard of the client rests on an assumption. Each is a question to put to a
 disposable share on the exact DSM build in service, and each answer changes what the client or the
 dashboard can be trusted to do. Run them against a scratch path only, with a throwaway account, and
 record the result in the [acceptance record](#acceptance-record). Where a probe gives an expected
@@ -407,18 +407,24 @@ UP() { # UP /share/folder local-file [extra curl -F options]
    - The old file intact, or a truncated file, is safe: either differs from the source in size or
      content.
    - The **full size with the new modification time** and wrong content would let a `metadata`
-     comparison call the file unchanged. Report it. The client's only defence today is a post-failure
-     check (when the final attempt of an upload fails in transport, it compares the NAS copy's size,
-     time and MD5 and, if they match the source's size and time but not its content, says so and asks
-     for `--compare content`). A cancelled run (Ctrl-C) and the *next* run have no such defence.
+     comparison call the file unchanged. Report it. The client's defence today is a post-failure
+     check: when the final attempt of an upload fails in transport, it compares the NAS copy's size,
+     time and MD5. If they match the source's size and time but not its content (a torn overwrite),
+     it makes exactly **one more full attempt** in the same run, and if that also fails the error
+     names the path and asks for `--compare content` or a resync of it. Nothing persists the
+     suspicion: a cancelled run (Ctrl-C) and the *next* run have no such defence, so the question of
+     whether DSM really leaves a full-size, new-mtime torn file after an interrupted overwrite is
+     still open until you have answered it.
 3. **What does a failed server-side copy look like?** `CopyMove.start` `/share/a/f.bin` into `/share/b`
    where `b/f.bin` already exists (fields `path=["/share/a/f.bin"]`, `dest_folder_path=/share/b`,
    `remove_src=false`, `accurate_progress=false`; CopyMove is version 3), then poll `CopyMove.status`
    with the returned `taskid`.
    - `success:false` with an error code of 1000 to 1007, 414, 415, 416 or 418, or a `data.error`
-     field: both shapes are handled, and the file is deferred as `server-copy-failed` and uploaded next
-     run. Record which shape DSM uses. Also note whether the copy's modification time equals the
-     source's.
+     field: both shapes are handled. A copy that never started, or that failed and left the destination
+     empty, is uploaded instead **in the same run**; a copy that failed *leaving an entry at the
+     destination* is deferred as `server-copy-failed` and replaced by an upload next run. Record
+     which shape DSM uses, and whether a failed copy leaves a partial destination entry (the case that
+     defers). Also note whether the copy's modification time equals the source's.
 4. **Are remote symbolic links reported, and is `real_path` resolved?** Over SSH:
    `ln -s /volume1/other /volume1/share/t/link; ln -s .. /volume1/share/t/loop`. Then list `/share/t`
    and `/share/t/link`, and `GI /share/t/link`.
@@ -432,13 +438,25 @@ UP() { # UP /share/folder local-file [extra curl -F options]
      its children under the same prefix). The comparison folds a trailing `/`, Unicode normalisation
      and case, and tolerates a volume prefix, but any other mismatch would make ordinary folders look
      like links. The client then fails the run with `remote-real-path-unusable` (at least three link
-     boundaries that are more than half the folders listed), uploading and deleting nothing. If DSM
-     reports no `real_path` at all, `sync` and `plan` print a warning that the check could not run.
+     boundaries that are more than half the folders, or more than half the files, that the guard
+     checked), uploading and deleting nothing. If DSM reports no `real_path` for some folders, `sync`
+     and `plan` print a warning that the check could not run there, and `link_guard_unchecked` in the
+     result counts them.
+   - Run `sync --scope link` (and `--scope link/sub`) against the link you created. A scope that is, or
+     lies beneath, a link must be refused before anything is listed, exit `1`, with the link named. A
+     scope that DSM resolves to a *different case* of its listing also counts as a link; record whether
+     DSM ever reports a different case of the real path for an ordinary folder (a USB `/volumeUSB*`
+     exFAT share is the likely place). If it does, such a folder is skipped by name and fails safe.
+   - Make a folder the account may not list (`chmod 000` over SSH, or an ACL that denies the account
+     list rights) and run `sync`: it must be one amber `remote-skipped` warning naming the folder, exit
+     `0`, with the rest of the share synced and nothing beneath the folder uploaded or deleted. Record
+     the DSM code `List.list` answers (105 or 407).
 5. **How does an idle session expire?** Log in, wait past the DSM logout timer, call
    `SYNO.FileStation.List` `list_share`. Separately, start an upload that takes longer than the timer,
    then `GI` the path. Record codes 106 and 119.
    - 106 (timeout) or 119 (invalid session) at the next request is the case the client is built
-     for: the CLI re-authenticates once and carries on. The SDK installs no re-authenticator, so for
+     for: the CLI re-authenticates and carries on (at most 4 times in 10 minutes, plus one per 15 minutes
+     of run time; then the run fails naming the cap). The SDK installs no re-authenticator, so for
      SDK and FFI callers an expired session ends the run. Whether the long upload survives the timer
      decides whether a slow upload needs a keepalive; record what the `GI` afterwards shows.
 6. **Do task ids survive a re-login?** Start `SYNO.FileStation.MD5` `start` on a big file with session A
@@ -453,9 +471,11 @@ UP() { # UP /share/folder local-file [extra curl -F options]
    a FAT32 USB share. Record each DSM code.
    - 418, 1100, 400 or 1804 are the expected refusals. The client turns each into a `remote-refused`
      deferral (418, 414, 1100, 1101, 400, 1802 and 1804 are per-path; 407 and 105 once the session is
-     proven alive too) and carries on with the other files. A refusal it does not classify (for example
-     411 read-only volume, 415 or 416 quota or disk full) fails the run, which is the right answer for a
-     share-wide condition. Note that the client also refuses a component over 255 bytes itself,
+     proven alive too) and carries on with the other files. Refusals are grouped by class (permission,
+     name, size, clash, folder-limit, create-failed); three or more of one class that are more than half of
+     what the run considered fail the run as `remote-refused-share-wide`, and a folder-create `1100` is
+     classed by its inner code. A refusal it does not classify (for example 411 read-only volume, 415 or
+     416 quota or disk full) fails the run, which is the right answer for a share-wide condition. Note that the client also refuses a component over 255 bytes itself,
      before sending anything.
 8. **Is a non-recursive delete really non-recursive?** `SYNO.FileStation.Delete` `delete` (version 2)
    on a non-empty folder with `recursive=false`:
@@ -499,6 +519,57 @@ UP() { # UP /share/folder local-file [extra curl -F options]
     - Requests that stop mean DSM destroys the instance and the cleanup runs. Requests that continue
       mean a closed window keeps polling, keeps its CSRF token and any unsaved secret drafts in
       memory, until the DSM tab itself is closed; report it with the DSM build.
+15. **Which `/bin/sh` and BusyBox does this DSM build ship?** Over SSH as an administrator:
+    `readlink -f /bin/sh; busybox | head -1; bash --version | head -1`.
+    - The package scripts are written for POSIX `sh` and run under whatever `/bin/sh` is. The repository
+      tests them under dash, under bash as `/bin/sh` (a matrix leg of the `packaging-suite` CI job, bash
+      by three shards, because DSM's `sh` is believed to be bash, 4.4 on DSM 7, and dash and BusyBox
+      read a builtin `read` a byte at a time where bash seeks) and under BusyBox `ash`. Record the three answers with the DSM build. A `/bin/sh` that is
+      none of dash, bash or BusyBox means a shell the suite has never run under.
+    - Note, not a probe: BusyBox 1.38.0 has an upstream bug in `read` combined with `trap`. DSM does not
+      ship that BusyBox, so it is not a DSM behaviour, and the CI Alpine image must stay pinned at a
+      release with BusyBox 1.37 until upstream fixes it. A NAS that does report BusyBox 1.38.0 should
+      be reported before the DSM lifecycle scripts are relied on.
+16. **Does File Station split a JSON-array path argument on commas?** (question N1) Create two scratch
+    entries, `/share/t/a` (a folder) and `/share/t/a,b` (a file), then ask for the comma path only:
+    `GI /share/t/a,b | jq '.data.files[] | .path'`.
+    - One entry, `/share/t/a,b`, means DSM treats the comma inside a JSON string as part of the name.
+      Two entries (`/share/t/a` and an error or entry for `/share/t/b`) mean it splits, so a delete or
+      rename of `/share/t/a,b` could address `/share/t/a`. Only after `GI` is clean, on the scratch
+      share only, try `Delete` of `["/share/t/a,b"]` with `recursive=false` and `GI /share/t/a`.
+    - Until this is answered the client withholds a delete or rename of any path whose text before the
+      first comma is an existing entry (a lasting `remote-skipped`, naming that entry), and falls back
+      to an upload for a server copy of such a path. Report the answer with the DSM build; a clean
+      "no splitting" answer is what would let that guard be retired.
+17. **Do the bridge service and the controller see the same time zone?** (`nas_clock`) The dashboard's
+    snapshot carries `nas_clock` (`now_epoch`, `utc_offset_seconds`, `zone`), read by the API service
+    with `localtime_r`, while routine windows are judged by the controller with `date`. As the package
+    user: `sdsync-dsm api snapshot | jq .nas_clock`, `date '+%z %Z'`, and note the `TZ` in
+    `/proc/<controller pid>/environ` and `/proc/<api service pid>/environ`.
+    - The offset and abbreviation must agree, and must match **Control Panel, Regional Options**. They
+      are expected to, since both read the NAS time zone, but the code cannot prove it: a service
+      started with a different `TZ` in its environment would show a dashboard in one zone and run
+      routine windows in another. A routine window also belongs to the day it **starts** on, and a
+      window that falls into a daylight-saving gap logs `routine_window_dst_gap`; if the zone is a
+      DST zone, set a window across the change and record what the controller logs.
+18. **Does a case-folding mount used as a source root fold names the way the client believes?** (D3-8)
+    The client decides whether `--exclude` rules fold case by asking the filesystem inside the root. A USB
+    exFAT share (`/volumeUSB1/usbshare`) or a mounted CIFS/SMB share beneath a case-sensitive parent is the
+    case this is for. On the NAS, with that folder as the source: `touch Probe.txt; ls probe.TXT`.
+    Then `synology-drive-sync plan SOURCE REMOTE --exclude 'probe.txt'`.
+    - `ls` finding the file means the mount folds; `plan` must then leave `Probe.txt` out as excluded
+      and report no upload for it. If it does not fold, `plan` must still upload `Probe.txt` (the rule
+      is case-sensitive there). A mismatch in either direction is a defect: on a folding mount the rule
+      would miss a spelling and upload what the user excluded; report it with the filesystem type
+      (`mount | grep <path>`). Run it on an internal volume as well as the mount, as a control.
+19. **What does DSM answer for an unknown background task id?** (N3) `SYNO.FileStation.MD5` `status`
+    with `taskid=bogus`, and `SYNO.FileStation.CopyMove` `status` likewise.
+    - The client treats both `408` ("no such file or folder") and `599` as confined to the one file: the
+      checksum is deferred as `remote-digest-unavailable` and the run carries on. It now describes
+      `599` as "no such background task", so the error text says which. Record which code DSM gives for
+      an unknown task id, for an expired one, and for one started under another session (probe 6). A
+      `408` for a lost task reads as a missing file in the message, which is misleading but safe;
+      report whichever DSM answers, with the build.
 
 ## Acceptance record
 
@@ -518,7 +589,8 @@ Production approval should retain evidence for all of the following:
 - for SPK deployments, source-share ACL isolation, arbitrary nested target creation, Package Center
   install/upgrade/start/stop/uninstall evidence, reboot persistence, and two-NAS TOTP/proxy results.
 - the answers to the [questions only a real NAS can answer](#questions-only-a-real-nas-can-answer),
-  at least probes 4 and 8 before enabling deletion, and probe 14 before relying on the dashboard
-  to release its timers and secret drafts when its window closes.
+  at least probes 4, 8 and 16 before enabling deletion, probe 14 before relying on the dashboard
+  to release its timers and secret drafts when its window closes, and probes 15 and 17 on the exact DSM
+  build before relying on the package's scripts and routine windows.
 
 Repeat the relevant steps after DSM/File Station upgrades, reverse-proxy changes, authentication-policy changes, scheduler identity changes, or a major application upgrade.

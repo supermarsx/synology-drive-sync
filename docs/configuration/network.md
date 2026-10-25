@@ -88,12 +88,29 @@ for controlled LAN testing and sends credentials without TLS protection.
 | Setting | Default | Scope |
 | --- | --- | --- |
 | `connect-timeout` | 15 seconds | TCP/TLS connection setup |
-| `timeout` | 7200 seconds | One upload or File Station background operation |
+| `timeout` | 7200 seconds | An upload's progress and answer windows (below), and one File Station background operation (checksum, server-side copy) |
 | Control-plane cap | 10 seconds | Discovery, login, inventory, hash, permission, and similar requests |
 
 The application timeout is not a whole-job deadline. An outer service-manager timeout must cover
 local scan/hash work, remote inventory, every upload and retry, verification, final replan, and
 cooperative shutdown.
+
+### What `timeout` means for an upload
+
+An upload attempt is no longer cut off by one total deadline. `timeout` bounds it three ways:
+
+| Bound | Value | When it ends the attempt |
+| --- | --- | --- |
+| Stall window | `min(timeout, 300 s)` | The connection took no body bytes for that long. The attempt is retried like any timeout, after the check for a copy that landed. |
+| Response wait | `timeout` | DSM did not answer within that long after the last body byte was sent. |
+| Ceiling | `max(timeout, file size / 16 KiB/s)` | The whole body took longer than this, even though it never quite stalled (a trickle). **Not retried**, because the next attempt would end the same way. |
+
+A transfer that keeps moving is therefore not cut by `timeout` alone, and a large file on a slow but
+steady link no longer needs a `timeout` as long as the whole transfer. What it cannot do is average
+below 16 KiB/s. Each error names the bound that ended the attempt, for example "the upload stalled: the
+connection took no body bytes for N s (X of Y bytes sent in T s); check the link and any proxy in front
+of DSM, or raise --timeout". The background-operation timeout (checksums, server-side copy) and the
+10-second control-plane cap are unchanged.
 
 ## Retries and upload behavior
 
@@ -101,6 +118,27 @@ cooperative shutdown.
 502/503/504 failures are bounded. File Station has no resumable upload protocol. In content mode, a
 lost response first triggers a check of the destination's exact size, modification time and server-side MD5; if completion cannot be proved, the
 retry restarts the whole file.
+
+What is retried, and what never is:
+
+- **Login** is retried within `retries` on a connection failure and on HTTP 502/503/504 only (a proxy
+  that is still starting). A timeout, a refused password or any DSM answer is never retried.
+- **Reads** (listings, for example) and **uploads** are also retried when the connection was closed
+  after the request was sent but before an answer. The reads that verify or guard a mutation
+  (the post-upload and post-copy check, and the live check before a delete) are retried too. A
+  `Delete`, `Rename`, or server-copy start is sent once.
+- **A torn overwrite** (the destination has the right size and modification time but the wrong
+  checksum after the last attempt) gets exactly one more full attempt in the same run. If that also
+  fails, the error names the path and the repair.
+- **Session expiry.** DSM ending the session mid-run is recovered by logging in again, at most 4 times
+  in any 10 minutes and at most `4 + elapsed / 15 minutes` over the run. When the allowance is spent
+  the original session error is reported with "DSM ended N sessions in M minutes, so re-authentication
+  stopped": a NAS or proxy that kills sessions faster than that is the problem, not the file. The SDK
+  does not install a re-authenticator.
+- The background copy poll starts at 50 ms and backs off to a 2 second ceiling.
+
+HTTP 301-308, 413, 502 and 504 answers from a reverse proxy are named with a hint (raise the
+request-body limit, fix the route or the redirect) for every API, without echoing the response body.
 
 ## Upload rate limit
 
@@ -111,12 +149,14 @@ max-rate = 1048576 # 1 MiB/s total
 jobs = 4
 ```
 
-Four jobs divide the one budget; they do not each receive 1 MiB/s. Raise `timeout` above the largest
-single file divided by the configured rate. A 4 GiB file at 1 MiB/s needs roughly 4096 seconds before
-protocol and retry overhead.
+Four jobs divide the one budget; they do not each receive 1 MiB/s. A limit stretches every transfer by
+definition. At 16 KiB/s or more an upload's own ceiling (`max(timeout, size / 16 KiB/s)`) already allows
+for it, and a transfer that keeps moving is not cut by `timeout`. Below 16 KiB/s, raise `timeout` above the
+largest single file divided by the configured rate: a 4 GiB file at 8 KiB/s needs roughly 524,288 seconds.
 
 The client enforces that relationship before sending anything. An upload whose minimum duration at
-`max-rate` (its size less one second of budget, divided by the rate) already exceeds `timeout` is refused
+`max-rate` (its size less one second of budget, divided by the rate) already exceeds the upload's
+ceiling (`max(timeout, size / 16 KiB/s)`, so only a rate below 16 KiB/s can trigger it) is refused
 with a configuration error that names the file, the seconds needed and both settings, instead of being
 sent `retries + 1` times and timing out each time. The check is a lower bound: other concurrent uploads
 sharing the budget only make a transfer longer.

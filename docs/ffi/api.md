@@ -38,10 +38,10 @@ following fields are accepted:
 | `danger_accept_invalid_certificates` | boolean | `false` | Disable certificate validation. |
 | `ca_certificate` | string or null | none | Path to an additional PEM CA certificate. |
 | `connect_timeout_seconds` | unsigned integer or null | `15` | Positive connection timeout. |
-| `request_timeout_seconds` | unsigned integer or null | `7200` | Positive complete-request timeout. |
+| `request_timeout_seconds` | unsigned integer or null | `7200` | Positive request timeout. For an upload it is the no-progress window (at most 300 s) and the wait for DSM's answer after the last byte; a transfer that keeps moving is not cut by it, but one attempt may not average below 16 KiB/s. It also bounds one background operation. |
 | `retries` | unsigned integer or null | `2` | Retries after the first request, from `0` through `5`. |
 | `max_upload_rate` | unsigned integer or null | unlimited | Shared positive upload limit in bytes per second. |
-| `exclusions` | string array | `[]` | Gitignore-style exclusion patterns; they fold case and Unicode normalisation when the source filesystem does, and protect matching NAS entries from deletion. |
+| `exclusions` | string array | `[]` | Gitignore-style exclusion patterns; they match Unicode-normalised (NFC) on every source, fold case when the source filesystem does, and protect matching NAS entries (under either spelling of a renamed or normalisation-paired folder) from deletion. |
 | `comparison` | string or null | `content` | `content`, `metadata`, or `size-only`. |
 | `deletion` | object or null | disabled | Explicit bounded mirror-deletion policy. |
 | `jobs` | unsigned integer or null | `2` | Concurrent mutation-worker count, from `1` through `16`. |
@@ -107,13 +107,14 @@ A successful result is:
   "schema": "sdsync.ffi-result.v1",
   "ok": true,
   "outcome": {
-    "plan": { "changes": [], "creates": 0, "copies": 0, "uploads": 0, "deletes": 0, "unchanged_files": 0, "protected_entries": 0, "upload_bytes": 0, "skipped": [] },
+    "plan": { "changes": [], "creates": 0, "copies": 0, "uploads": 0, "deletes": 0, "unchanged_files": 0, "protected_entries": 0, "upload_bytes": 0, "skipped": [], "link_guard_unchecked": 0 },
     "applied": false,
     "reconciled": false,
     "execution": null,
     "deferred": [],
     "recovered": { "retries": 0, "reauthentications": 0, "reauthentication_failures": 0, "keepalive_failures": 0, "server_tasks_not_stopped": 0 },
-    "incomplete_listings": []
+    "incomplete_listings": [],
+    "link_guard_unchecked": 0
   }
 }
 ```
@@ -123,7 +124,9 @@ reason and detail), `recovered` (the retries, re-authentications and other recov
 under the same key names as the command-line result) and `incomplete_listings` (NAS folders DSM listed
 short). When `execution` is not `null` it holds `deleted`, `created`, `copied`, `uploaded`,
 `uploaded_bytes`, `mtime_not_kept`, `copy_fallbacks`, `deletes_skipped`, `kept_deletes_uploaded` and
-`renamed`. `plan.skipped` lists the paths the plan declines to carry. The reason names and which of
+`renamed`. `link_guard_unchecked` (in `outcome` and in `outcome.plan`) counts NAS folders DSM listed
+without a real path, so the link guard could not check them for symbolic links; it is a lasting warning
+and `0` means the guard ran everywhere. `plan.skipped` lists the paths the plan declines to carry. The reason names and which of
 them are lasting are in [Partial runs, deferrals and skips](../observability.md#partial-runs-deferrals-and-skips).
 
 A failure uses the same envelope with `ok: false` and an `error` object:

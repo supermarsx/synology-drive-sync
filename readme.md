@@ -371,9 +371,14 @@ prevent overlap, and allow enough time for the complete scan-transfer-verify wor
   deleted from the NAS; OS metadata files (`desktop.ini`, `Thumbs.db`, `.DS_Store`, `~$*`) are
   excluded by default. Special files, unreadable folders, unsafe or over-long names and names the
   NAS refuses are set aside by name, never uploaded and never deleted from the NAS, and the rest of the
-  run proceeds with exit `0` and a named warning. A file that changes or is locked mid-run is
-  deferred, and the run exits `3` (partial) so it is retried. Keep the
-  source quiescent and run as an unprivileged identity that owns or exclusively controls it.
+  run proceeds with exit `0` and a named warning; so is a NAS folder this account may not list. A file
+  that changes or is locked mid-run is deferred, and the run exits `3` (partial) so it is retried. Keep
+  the source quiescent and run as an unprivileged identity that owns or exclusively controls it.
+- Safety refusals that stop a run: a scope that is, or lies beneath, a NAS symbolic link (exit `1`); two
+  profiles whose NAS destinations overlap when either deletes (exit `2`); a share-wide refusal or a
+  link-shaped `real_path` answer on most of the share. Excludes match Unicode-normalised on every source
+  and protect a renamed folder's NAS spelling too, but content an exclude newly covers stays on the NAS
+  as it is: delete it by hand.
 - There is no two-way reconciliation, Drive conflict protocol, block-level delta, resumable upload,
   transactional multi-profile rollback, or crash-atomic overwrite/type replacement.
 - File content, hierarchy, names, and file mtime are in scope. ACLs, ownership, modes, xattrs, hard
@@ -402,7 +407,7 @@ and DLL, `.so`, or `.dylib` from the same release SDK. See the
 | Install and operate the DSM dashboard | [Synology package](https://supermarsx.github.io/synology-drive-sync/synology-package.html) |
 | Schedule and monitor unattended jobs | [Scheduling](https://supermarsx.github.io/synology-drive-sync/operations/scheduling.html) · [Observability](https://supermarsx.github.io/synology-drive-sync/observability.html) |
 | Diagnose failures and complete live acceptance | [Troubleshooting](https://supermarsx.github.io/synology-drive-sync/operations/troubleshooting.html) · [Acceptance runbook](https://supermarsx.github.io/synology-drive-sync/production-acceptance.html) |
-| Inspect commands and release evidence | [CLI reference](https://supermarsx.github.io/synology-drive-sync/reference/cli.html) · [Release verification](https://supermarsx.github.io/synology-drive-sync/releases.html) |
+| Inspect commands and release evidence | [CLI reference](https://supermarsx.github.io/synology-drive-sync/reference/cli.html) · [Release verification](https://supermarsx.github.io/synology-drive-sync/releases.html) · [Behaviour changes](https://supermarsx.github.io/synology-drive-sync/release-notes.html) |
 
 ### Development
 

@@ -55,14 +55,27 @@ exits `0` with a warning that names the path and the rule, on every run until th
 excluded. The same applies to a path that is too long once the destination prefix is prepended, a name
 over 255 bytes, a FIFO, socket or device, and a modification time before 1970.
 
-Rules match case-insensitively, with the pattern and the path both Unicode-normalised (NFC), when the
-source resolves names that way. The tool asks the filesystem rather than assuming the platform: it looks
-up the source root's own name with its letters' case swapped, and falls back to the platform default
-(folding on Windows and macOS) when the root's name has no cased letter. An SMB share mounted on Linux
-can therefore fold, and a case-sensitive macOS volume does not. The folding applies to **both** walks. Under
-`--exclude report.pdf` on such a source, a NAS-only `Report.pdf` is excluded (never deleted, never
-overwritten) and a local `Report.pdf` is never uploaded, whichever spelling either side uses. On a
-case-sensitive source the rules stay case-sensitive.
+Rules always compare the pattern and the path Unicode-normalised (NFC), on every source: a rule typed
+with a composed `é` excludes a decomposed `é` folder on a Linux or case-sensitive source, and the reverse.
+Letter case is folded only when the source resolves names that way. The tool asks the filesystem rather
+than assuming the platform: it first asks inside the root, looking up one of the root's own entries with
+its letters' case swapped, because the root may be a mount point (a USB or CIFS volume) whose parent is
+another filesystem. Only an empty root is answered by its own name in its parent directory, and only a
+root neither can ask falls back to the platform default (folding on Windows and macOS). The first answer
+decides; answers are never combined. An SMB share mounted on Linux can therefore fold, and a
+case-sensitive macOS volume does not. The
+matching applies to **both** walks. Under `--exclude report.pdf` on a folding source, a NAS-only
+`Report.pdf` is excluded (never deleted, never overwritten) and a local `Report.pdf` is never uploaded,
+whichever spelling either side uses. On a case-sensitive source the rules stay case-sensitive.
+
+A rule also covers **both spellings of a pair** the run has matched: when a local folder was renamed
+(`Reports` to `reports`) or differs from its NAS folder only by normalisation, a rule that excludes the
+local spelling protects the NAS spelling from deletion and replacement, and a rule written against the
+NAS spelling excludes the local content under the new one. Protection only widens: a negation
+(`!rule`) can never make a NAS entry deletable that a rule typed against its other spelling protects.
+Content an exclude newly covers is left on the NAS exactly as it is. A file that an earlier release
+uploaded before the rule matched it is **not** removed by this release or by a later `--delete`; delete it
+by hand in File Station.
 
 Both walks apply the same rules. On the destination side an excluded directory, and every DSM-managed
 directory (`@eaDir`, `#recycle`, `#snapshot`, `@tmp`), is recorded but not descended into: nothing
@@ -81,8 +94,10 @@ with its parent's relatively, so a volume prefix or an encrypted share's prefix 
 folders look like links. If DSM reports no `real_path` at all for the destination, the link guard cannot
 run; sync and plan print a warning and carry on, and the guard stays unverified until a real NAS answers
 the [link questions](../production-acceptance.md#questions-only-a-real-nas-can-answer). When a
-majority of the folders listed (and at least three) look like links, the run fails with the named cause
-`remote-real-path-unusable` instead of silently syncing nothing there.
+majority of the folders listed (and at least three) look like links, or the same holds for the files
+checked, the run fails with the named cause `remote-real-path-unusable` instead of silently syncing
+nothing there. Folders DSM listed without any real path are counted as `link_guard_unchecked` in the
+result.
 
 ## Enabling mirror deletion
 
@@ -118,13 +133,19 @@ excluded, DSM-managed or mounted entry, only that path is set aside as a lasting
 skip: both sides are left as they are, nothing beneath it is written, and the run exits `0` with a
 warning. A local entry whose NAS counterpart is a link (a symlink or a folder DSM resolves
 elsewhere) is the lasting `remote-link` skip: nothing is written, deleted or descended at or beneath it.
+A `--scope` that is, or lies beneath, a NAS link is not skipped but **refused**, exit `1`, before
+anything is listed: a scoped run never writes or deletes through a link (see
+[Partial runs, deferrals and skips](../observability.md#partial-runs-deferrals-and-skips)).
 
 A file or folder the NAS refuses by name or permission (DSM codes such as 418, 414, 407 or 105 once the
 session is proven alive) is named and left out, and its siblings continue; see
 [Partial runs, deferrals and skips](../observability.md#partial-runs-deferrals-and-skips). A refusal
-that is really about the share is not hidden by that rule: when at least three refusals share one cause
-and they are more than half of the folders and files the run attempted, the run fails once and names
-the cause and the paths, so a share that refuses everything cannot read as a green run.
+that is really about the share is not hidden by that rule: when at least three refusals share one class
+(permission, name, size, clash, folder-limit or create-failed) and they are more than half of what the
+run considered (every planned folder, copy and upload plus the files already in sync), the run fails
+once and names the class, DSM's answers and the paths, so a share that refuses everything cannot read
+as a green run. On a large share that is already in sync, a new share-wide refusal can read amber with
+every path named instead; that is the price of not blaming the share for three bad names.
 
 A planned mirror deletion re-checks that the local path is still absent immediately before it
 deletes the remote copy. If the local file reappeared in the meantime, the remote copy is kept and

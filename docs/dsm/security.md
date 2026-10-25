@@ -365,7 +365,8 @@ records below the configured level before persistence. No threshold, `off` inclu
 an unlevelled line (raw stderr a child process left in `controller.log`) is read as an error. Each pre-relay API record uses the exact
 stage-derived `bridge`, `authentication`, or `security` category; a corrupt or unsafe policy fails
 closed without writing the record or its coalescing state. Log reads scan bounded rotated history,
-newest first and at most 1 MiB per source (a source that was cut short says `scan_limited`), and
+newest first, at most 1 MiB per source and within a four-second deadline (a source that was cut short
+says `scan_limited`, and one the deadline cut also says `deadline_reached`), and
 return up to the requested number of matching records, so newer trace/debug noise cannot hide an
 older allowed error. A selected log source is emitted alone; `all` divides a fixed encoded-output
 budget across all six sources—API, private Doctor discovery, controller, scheduler, sync, and
@@ -383,6 +384,14 @@ Snapshot reports only presence booleans. The API service recursively redacts res
 password, secret, token, authorization value, or cookie, except reviewed `has_*` flags. It also
 redacts an exact submitted secret if a child unexpectedly echoes it. Unsafe output becomes a generic
 failure document.
+
+Log lines are redacted **whole, before** they are shortened, on both the in-service and the shell read
+path: terminal escape sequences are stripped first so they cannot split a secret, only a complete JSON
+record gets the string-token rule (any other line is redacted as text, an unterminated token to the end
+of the line), and only then is the line cut to 8,192 bytes on a character boundary. A line over 32 KiB
+is replaced by `[line too long: N bytes, withheld]`, and a line that still holds a secret after every
+rewrite by `[line withheld: could not be redacted]`; neither placeholder shows any part of the line.
+Before this, a secret that straddled the length limit could survive as a fragment.
 
 Package-generated failures use the bounded `sdsync.dsm-error.v1` document with `ok:false`, the
 original numeric application `status`, a stable `code`, a bounded `stage`, and a generic `message`.

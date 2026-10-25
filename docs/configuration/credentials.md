@@ -93,8 +93,11 @@ scheduled job; use a protected reusable seed only when the account policy permit
 
 DSM can expire or drop a session under a long run (codes `106`, `107` and `119`, and `105` only when
 a follow-up `list_share` liveness probe also fails). The CLI re-authenticates once, transparently,
-and resends the request that met the expiry. Re-authentication is serialised, capped at four per run,
-and counted in the result's `recovered` object; a failed re-login surfaces its own cause (a one-time
+and resends the request that met the expiry. Re-authentication is serialised, capped at four per rolling 10 minutes plus an allowance of one more
+every 15 minutes of run time (`4 + elapsed / 15 min`), and counted in the result's `recovered` object.
+When the allowance is spent the original session error is reported with "DSM ended N sessions in M
+minutes, so re-authentication stopped", so a NAS or proxy that kills sessions faster than that ends the
+run by name instead of looping; a failed re-login surfaces its own cause (a one-time
 code required, a changed password, a locked account) rather than a generic session error. A keepalive
 touches the session every five minutes during long plan hashing and promotion, and once before the
 first mutation.

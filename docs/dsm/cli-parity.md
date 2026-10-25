@@ -138,8 +138,9 @@ previous schedule, routines or policy stay in effect until the package service r
 reloads it. A manager that prints the older single pair `warning_code` and `warning` is accepted and
 normalised into `warnings`, so the dashboard only ever sees the list. The bridge records each entry as
 one `mutation_warning` record in `api.log` and shows the dashboard a red *Saved, but it is not fully in
-effect* notice with the message. The bridge also captures the queued manager's standard error (16 KiB
-kept, the rest counted) and records a non-empty one as `manager_stderr`, rather than discarding it.
+effect* notice with the message; a warning line that sanitises to nothing is shown as "The change was saved,
+but its warning could not be shown; see the package logs", never as an empty notice. The bridge also
+captures the queued manager's standard error (the last 16 KiB kept, the rest counted) and records a non-empty one as `manager_stderr`, rather than discarding it.
 
 `service.state` and `service.pid` are the one part of the snapshot that is not a function of package
 files, and the service derives them the same way the manager does rather than from the controller's
@@ -208,6 +209,7 @@ overlap validation.
 | Password/TOTP/remote-log-token files | `/var/packages/synology-drive-sync/home/secrets/` |
 | Controller/run/routine/health state | `/var/packages/synology-drive-sync/var/state/` |
 | PID and overlap locks | `/var/packages/synology-drive-sync/var/run/` |
+| Watch-limit directory-count caches (`watch-<profile>.dircount`, valid for one hour) and the dead-controller marker (`controller.found-dead`) | `/var/packages/synology-drive-sync/var/run/watch-*.dircount`, `.../var/run/controller.found-dead` |
 | API-service PID file | `/var/packages/synology-drive-sync/var/run/api.pid` |
 | Private control queue/results/CSRF key | `/var/packages/synology-drive-sync/var/control/` |
 | Package logs and Activity | `/var/packages/synology-drive-sync/var/log/` |

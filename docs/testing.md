@@ -39,6 +39,18 @@ The deterministic suite has these complementary layers:
   production NAS produces per path (a name DSM refuses, a remote symbolic link, a name the walk cannot
   address, a share-wide refusal, an exclude that must protect every spelling) and assert that the run
   names the path, deletes nothing on its account and lets its siblings finish.
+  `tests/file_station_protocol.rs` runs the CLI and the API against a keep-alive mock with the
+  protocol failures a proxy and a real DSM produce: sessions that expire mid-upload, a connection
+  closed after the request, an upload the server stops reading, a scope that is or lies beneath a
+  folder link, an unlistable or vanishing folder, a torn overwrite and a comma in a path.
+  `tests/fix3_engine.rs` pins exclude matching across Unicode spellings and renames (and that nothing
+  is deleted near them) and `tests/fix3_breaker.rs` the share-wide refusal and link breakers.
+- **DSM package suite** (`packaging/synology/test_synology_package.py`) runs the controller, runner and
+  lifecycle scripts against fakes. CI runs it twice, under dash and under bash as `/bin/sh` (the
+  `packaging-suite` matrix of shell and three shards selected with `SDSYNC_TEST_SHARD=K/N` and balanced by
+  measured test weights, because DSM's `/bin/sh` is believed to be bash and dash and BusyBox read a
+  builtin `read` differently), and also runs the lifecycle under BusyBox in an Alpine container. Every
+  shell-sensitive probe also loops over each shell present on the host.
 - **Dashboard surface tests** (`packaging/synology/ui-src/test/outcomes-surface.test.mjs` and the
   widget and AppWindow contract tests) feed every outcome, every reason code, unknown tokens and
   hostile input through the pure `outcomes.mjs` model and assert that nothing renders as plain success

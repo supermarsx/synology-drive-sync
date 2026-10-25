@@ -178,6 +178,10 @@ apart or together depending on the volume. These now converge instead of failing
   Station refuses the rename (or the DSM has no `Rename` v2), the content still syncs under the NAS
   spelling and the rename is a lasting `case-rename-pending` warning that names the reason. Nothing
   is ever deleted on its account; renaming the folder in File Station finishes it.
+- An exclude applies to both spellings of a pair: a rule that excludes the local `Reports` also protects
+  the NAS `reports` folder from deletion and replacement, and a rule typed against the NAS spelling
+  excludes the local content under the new one. A composed `é` rule matches a decomposed `é` name on any
+  source, because exclude matching is NFC-normalised everywhere (case folds only where the source does).
 - If the NAS holds both spellings (`Photos` and `photos`) and the source holds one of them, the other
   is never touched: not deleted, not written, not renamed. It is reported on every run as a lasting
   `case-rename-pending` warning that names both spellings, and the source's spelling keeps syncing.
@@ -185,7 +189,9 @@ apart or together depending on the volume. These now converge instead of failing
 - A **true collision**, two local names (`local-case-collision`) or two remote names
   (`remote-case-collision`, only when the source holds neither spelling) that fold to the same name,
   is skipped and reported with both spellings named. Nothing under either is deleted. Rename one of
-  them to continue.
+  them to continue. A spelling this run already set aside for another reason (a link, an unreadable
+  folder) counts as one side of the pair: its case-variant sibling is named as a
+  `local-case-collision` too, with its subtree, instead of being silently shielded.
 - A scoped run (one that names folders) never creates a second spelling: it withholds a scope whose
   parent holds a same-folding sibling as `remote-case-collision`, and a scope whose parent listing
   was incomplete as `listing-incomplete`.

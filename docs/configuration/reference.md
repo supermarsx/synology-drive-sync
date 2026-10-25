@@ -40,7 +40,7 @@ for the complete resolution order and scheduler guidance.
 | --- | --- | --- | --- |
 | `compare` | `--compare`, `SDSYNC_COMPARE` | `content`; enum | `content`, `metadata`, or `size-only`. Content is the safest default. |
 | `jobs` | `--jobs`, `SDSYNC_JOBS` | integer; `2` | Concurrent uploads, from `1` through `16`. The configured rate limit is shared rather than multiplied by this value. |
-| `excludes` | repeated `--exclude`; no core environment variable | array of strings; `[]` | Gitignore-style rules evaluated in order. CLI rules append. A leading `!` negates an earlier match. Matching folds case and Unicode normalisation when the source filesystem does (see [Comparison, exclusions, and deletion](safety.md#exclusions)), on both the local and the NAS side. The root `.sdsyncignore` also participates. Built-in defaults (`desktop.ini`, `Thumbs.db`, `ehthumbs.db`, `.DS_Store`, `Icon\r`, `~$*`) are applied first and can be negated. |
+| `excludes` | repeated `--exclude`; no core environment variable | array of strings; `[]` | Gitignore-style rules evaluated in order. CLI rules append. A leading `!` negates an earlier match. Matching is always Unicode-normalised (NFC) and folds case when the source filesystem does (see [Comparison, exclusions, and deletion](safety.md#exclusions)), on both the local and the NAS side. The root `.sdsyncignore` also participates. Built-in defaults (`desktop.ini`, `Thumbs.db`, `ehthumbs.db`, `.DS_Store`, `Icon\r`, `~$*`) are applied first and can be negated. |
 
 ## Deletion safety
 
@@ -58,9 +58,9 @@ Multi-profile invocations also accept the CLI/environment guard `--max-total-del
 | TOML key | CLI / core environment | Type and default | Rules |
 | --- | --- | --- | --- |
 | `retries` | `--retries`, `SDSYNC_RETRIES` | integer; `2` | From `0` through `5`; applies to bounded retryable transport/API failures. |
-| `timeout` | `--timeout`, `SDSYNC_TIMEOUT` | seconds; `7200` | At least `1`. Covers one upload or background operation, not the entire job. Account for the largest file and any rate cap. |
+| `timeout` | `--timeout`, `SDSYNC_TIMEOUT` | seconds; `7200` | At least `1`. For an upload it is the no-progress window (at most 300 s) and the wait for DSM's answer after the last byte, not a total deadline: a transfer that keeps moving is not cut by it, but one attempt may not average below 16 KiB/s over the file's size. It also bounds one background operation. Not the entire job; see [Network](network.md#what-timeout-means-for-an-upload). |
 | `connect-timeout` | `--connect-timeout`, `SDSYNC_CONNECT_TIMEOUT` | seconds; `15` | At least `1`; bounds TCP/TLS connection setup. |
-| `max-rate` | `--max-rate`, `SDSYNC_MAX_RATE` | bytes/second; unlimited | At least `1` when set. One shared upload budget across all jobs. |
+| `max-rate` | `--max-rate`, `SDSYNC_MAX_RATE` | bytes/second; unlimited | At least `1` when set. One shared upload budget across all jobs. At 16 KiB/s or more an upload's own ceiling allows for the limit; below that, raise `timeout` to cover the largest single upload at the limited rate, or the run stops with a configuration error before sending it. |
 | `ca-certificate` | `--ca-certificate`, `SDSYNC_CA_CERTIFICATE` | path; unset | PEM certificate added to the TLS trust store for a private reverse-proxy CA. |
 | `allow-http` | `--allow-http`, `SDSYNC_ALLOW_HTTP` | boolean; `false` | Permits HTTP only for controlled LAN testing. It does not weaken certificate checks for HTTPS. |
 | `danger-accept-invalid-certs` | `--danger-accept-invalid-certs`, `SDSYNC_DANGER_ACCEPT_INVALID_CERTS` | boolean; `false` | Disables TLS certificate verification. Prefer a private CA file; do not use for production. |

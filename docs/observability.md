@@ -133,6 +133,7 @@ connection.established
 api_discovery.started          api_discovery.completed
 authentication.started         session.established             authentication.completed
 remote_scan.started            remote_scan.completed
+remote_scan.link_guard_unchecked
 plan.ready
 api_call.started               api_call.completed              api_call.redirected
 upload.started                 upload.attempt_started          upload.progress
@@ -173,10 +174,15 @@ delete_limit              source_invalid            local_entry_unsupported   lo
 source_changed            resync_ticket_stale       content_verification_failed
 remote_changed            server_copy_unavailable   server_copy_failed        reconciliation_pending
 credential_unavailable    config_invalid            https_required            scope_not_found
-cancelled                 unclassified
+cancelled                 remote_refused_share_wide remote_real_path_unusable
+unclassified
 changed_during_run        delete_bound              server_copy_fallback      excluded
 upload_failed
 ```
+
+`remote_refused_share_wide` is the refusal breaker and `remote_real_path_unusable` is the link-shape
+breaker (see [Partial runs, deferrals and skips](#partial-runs-deferrals-and-skips)). A scope that is,
+or lies beneath, a NAS link fails with `remote_path_refused`.
 
 The DSM package surfaces these on the dashboard as the reason a run failed or is partial.
 
@@ -273,7 +279,7 @@ For example, a single-profile `plan --output json` returns the full plan in one
 `sdsync.plan.v1` object:
 
 ```json
-{"schema":"sdsync.plan.v1","plan":{"summary":{"uploads":1,"upload_bytes":5242880,"server_copy_fallback_bytes":0,"server_copies":0,"directories":1,"deletions":0,"renames":0,"unchanged_files":41,"protected_entries":0,"changes":true},"actions":{"pre_deletes":[],"creates":[{"relative":"releases","remote_path":"/team/export/releases","reason":"missing-remote"}],"copies":[],"uploads":[{"relative":"release.bin","remote_path":"/team/export/release.bin","bytes":5242880,"mtime_ms":1785769200000,"reason":"content-differs"}],"post_deletes":[],"renames":[]}}}
+{"schema":"sdsync.plan.v1","plan":{"summary":{"uploads":1,"upload_bytes":5242880,"server_copy_fallback_bytes":0,"server_copies":0,"directories":1,"deletions":0,"renames":0,"unchanged_files":41,"protected_entries":0,"changes":true},"link_guard_unchecked":0,"actions":{"pre_deletes":[],"creates":[{"relative":"releases","remote_path":"/team/export/releases","reason":"missing-remote"}],"copies":[],"uploads":[{"relative":"release.bin","remote_path":"/team/export/release.bin","bytes":5242880,"mtime_ms":1785769200000,"reason":"content-differs"}],"post_deletes":[],"renames":[]}}}
 ```
 
 ### Change reasons
@@ -372,15 +378,15 @@ that clears by itself (a file still changing, a lock, a checksum the NAS could n
 | `source-vanished` | Deleted locally during the run. Re-run; the deletion is then planned normally. | no |
 | `source-unreadable` | Locked or otherwise briefly unreadable (a sharing violation, a transient I/O error). Release the lock and re-run. A permission refusal is `local-permission-denied` instead. | no |
 | `remote-digest-unavailable` | The NAS could not compute the checksum of this one file. Only per-file DSM or HTTP outcomes defer; transport, session, permission and busy errors still fail the run once, with that cause. | no |
-| `remote-changed` | The NAS entry changed after planning, or an upload destination had appeared. Left as found, never overwritten. | no |
-| `server-copy-failed` | The NAS-side copy finished with an error; the file is uploaded next run. | no |
+| `remote-changed` | The NAS entry changed after planning, an upload destination had appeared, or a NAS folder that the parent listing showed was deleted (DSM `408`) before the walk reached it. Left as found, never overwritten; deletions near it are withheld. | no |
+| `server-copy-failed` | A NAS-side copy ended with an error **and left an entry at the destination**. The file is not uploaded over it in this run; the next run replaces that entry with an upload. A copy that never started, or that failed leaving the destination empty, does not defer: the file is uploaded in the same run (counted in `recovered.server_copy_fallbacks`), and a refused fallback upload counts toward the refusal breaker. | no |
 | `delete-failed` | The NAS failed the deletion for a reason other than permission (for example code 900); it is retried next run. | no |
 | `unrepresentable-name` | A NAS name this host's filesystem cannot hold (a trailing dot or space, a reserved device name, characters NTFS refuses). Never deleted on that account. | yes |
 | `unsupported-local-entry` | Not a regular file or directory the sync carries, including a Windows file whose open fails with error 1920 or 1921. | yes |
-| `remote-unreadable` | The NAS does not let this account read the file (for example DSM code 105), so it is never compared or deleted until its permissions change. Exit `0` with a warning. | yes |
-| `listing-incomplete` | The NAS folder listed fewer entries than it counted on two stable reads, typically Advanced Permission hiding items. Deletions among its direct children, the folder itself and its ancestors are withheld; other folders are unaffected. | yes |
-| `remote-refused` | DSM refused this one path: its name (code 418, 414, 1100, 1101), its size for the destination filesystem (1804), or this account's permissions (105 once the session is proven alive, 407). The detail reads `NAS refused <api.method> of "<path>" with code N: ...`. A refused folder also withholds its own subtree; its siblings carry on. Rename it or change the permission. If three or more refusals share one cause and are more than half of the folders and files attempted, the run **fails** instead, naming the cause and the paths. | yes |
-| `remote-skipped` | A NAS entry the walk will not carry: a name this tool cannot address (a control character, a backslash), a link out of the destination, or a folder already walked. Never deleted, overwritten or descended, and its folder and ancestors are kept. Rename or remove it on the NAS. | yes |
+| `remote-unreadable` | The NAS does not let this account read the file or list the folder (for example DSM code 105 or 407), so it is never compared or deleted until its permissions change. Local content beneath a NAS folder this account cannot list is reported with this reason and never uploaded. Exit `0` with a warning. | yes |
+| `listing-incomplete` | The NAS folder listed fewer entries than it counted on two stable reads, typically Advanced Permission hiding items, or its listing changed on both reads (a folder that keeps changing while it is walked). Deletions among its direct children, the folder itself and its ancestors are withheld; other folders are unaffected. | yes |
+| `remote-refused` | DSM refused this one path: its name (code 418, 414, 1100, 1101), its size for the destination filesystem (1804), or this account's permissions (105 once the session is proven alive, 407). The detail reads `NAS refused <api.method> of "<path>" with code N: ...`. A refused folder also withholds its own subtree; its siblings carry on. Rename it or change the permission. If three or more refusals share one class and are more than half of what the run considered, the run **fails** instead, naming the class and the paths (see the breakers below). | yes |
+| `remote-skipped` | A NAS entry the walk will not carry: a name this tool cannot address (a control character, a backslash), a link out of the destination, a folder already walked, a folder this account may not list (`remote-folder-unlistable`), or a deletion or rename that is withheld because a comma in its path could make DSM address a different, existing entry (see below). Never deleted, overwritten or descended, and its folder and ancestors are kept. Rename or remove it on the NAS. | yes |
 | `unsupported-entry` | A local name, path or entry kind Synology Drive cannot hold: a refused name (leading `~`, a control character, one of `* : ? " < >` or a pipe, a trailing dot or space, a reserved device name), a path over 247 characters once the destination prefix is prepended, a name over 255 bytes, a non-UTF-8 name, a FIFO, socket or device, or a modification time before 1970. In a `plan` it appears in `plan.skipped` with the tag `deferred` and a detail starting `unsupported-entry:`. Never uploaded, and the NAS copy is never deleted. Rename or exclude it. | yes |
 | `local-permission-denied` | This account may not read the local file or list the folder (permission denied). A folder that cannot be listed is withheld whole: nothing beneath it is deleted on the NAS. Change the permission. | yes |
 | `delete-not-permitted` | DSM refused to delete the entry for permission (105 once the session is proven alive, or 407). The entry stays until the folder's rights change. Any other refused deletion (for example code 900) is `delete-failed`. | yes |
@@ -431,14 +437,51 @@ the log.
 
 Two breakers turn a share-wide condition into one named failure instead of a wall of per-path warnings:
 
-- **Refusals.** When at least three per-path refusals share one cause (`<api>.<method>:<code>`) and are
-  more than half of the folders and files the run attempted, the run fails once and names the cause and
-  the paths (`remote-refused` above).
-- **Link boundaries.** Right after the remote walk, when at least three folders look like links and
-  they are more than half of the folders listed, the run fails with a message starting
+- **Refusals.** Refusals are grouped by **class**, not by DSM code: `permission`, `name`, `size`,
+  `clash`, `folder-limit` and `create-failed` (a folder-create `1100` is classed by its inner code).
+  When at least three refusals share one class and are more than half of what the run considered, the
+  run fails once with a message starting `remote-refused-share-wide: <class>:` that tallies DSM's
+  answers (`<operation>:<code> xN`), says how many planned writes were not attempted, and names at most
+  ten paths and then "and N more". What the run considered is every planned folder create, server copy
+  and upload plus the files already in sync (a refused server-copy fallback counts). Residual: on a
+  large share that is already in sync, a new share-wide refusal can therefore read amber, with every
+  path named, rather than red; a small first run that is mostly refused still fails. The breaker
+  settles each write once and is checked after every settlement, after the folder phase (so it can
+  trip before any upload) and before mirror deletions; writes beneath a refused folder are counted
+  neither way. It never runs in `plan`. Every refused path stays in `result.deferred` as
+  `remote-refused`. A `105` counts only once the session is proven alive.
+- **Link boundaries.** Right after the remote walk (and again after the reconciliation walk), when at
+  least three **folders**, or at least three **files**, look like links and they are more than half of
+  that kind which the guard actually checked, the run fails with a message starting
   `remote-real-path-unusable:`. That pattern means DSM's `real_path` answers do not have the shape the
-  link guard compares, not that the share is made of links; nothing is uploaded or deleted. If DSM
-  reports no `real_path` at all, the guard cannot run and sync and plan print a warning instead.
+  link guard compares, not that the share is made of links; nothing is uploaded or deleted. If the
+  links are real, exclude them by name. Where DSM reports no real path, the guard could not run: see
+  `link_guard_unchecked` below.
+- **Unlistable folders.** A NAS folder this account may not list (`105` on a live session, or `407`)
+  is its own lasting `remote-skipped` warning (`remote-folder-unlistable`) and the rest of the share
+  syncs, exit `0`. When at least three such folders are more than half of the folders found, the run
+  fails by name instead: the account's rights on the share are the likely problem.
+
+A **scope** (`--scope`, a profile scope, a `resync` scope) whose path is a NAS link, or lies beneath
+one, is refused before anything is listed or planned: exit `1`, event reason `remote_path_refused`,
+with a message that names the link and says a scoped run never writes or deletes through one ("run
+without --scope, or replace the link with a folder"). A real path that differs from its listing only
+in letter case counts as a link. A link *below* the scope is skipped and named as `remote-link`, as in
+an unscoped run.
+
+`link_guard_unchecked` is the number of NAS folders (and scope-chain elements) that DSM listed without
+a real path, so the link guard could not check for symbolic links inside them; a link there is walked
+like a folder. It is in every sync result, in the plan object and in the NDJSON plan summary record
+(0 for a file scope or no scope), is printed as a `Warning:` line and on stderr (hidden only by
+`--quiet`), is emitted as the `remote_scan.link_guard_unchecked` warning event, and is shown by the DSM
+dashboard as the `link_guard_unchecked` warning. It is lasting: the exit code does not change.
+
+A deletion or rename of a NAS path whose text **before the first comma** is itself an existing entry
+is withheld (`remote-skipped`, naming that entry), and
+so are the folders above it. File Station's path arguments are JSON arrays, and it is not yet known
+whether DSM splits an element on commas; deleting `/team/a,b` must not be able to delete `/team/a`.
+A server copy of such a path falls back to an upload. See the NAS question in
+[production acceptance](production-acceptance.md#questions-only-a-real-nas-can-answer).
 
 When a remote checksum fails with the same cause for three files in a row (or three before any
 succeeds; DSM `408` and `105` do not count), the run fails once instead of deferring every file: "N
@@ -461,11 +504,11 @@ ordered as follows:
 3. for `sync` only, one `sdsync.output.v1` record with `kind: "completion"`.
 
 ```ndjson
-{"schema":"sdsync.plan.v1","kind":"summary","uploads":1,"upload_bytes":5242880,"server_copy_fallback_bytes":4096,"server_copies":1,"directories":1,"deletions":0,"renames":0,"unchanged_files":41,"protected_entries":0,"changes":true}
+{"schema":"sdsync.plan.v1","kind":"summary","uploads":1,"upload_bytes":5242880,"server_copy_fallback_bytes":4096,"server_copies":1,"directories":1,"deletions":0,"renames":0,"unchanged_files":41,"protected_entries":0,"changes":true,"link_guard_unchecked":0}
 {"schema":"sdsync.plan-action.v1","action":"create-directory","relative":"releases","remote_path":"/team/export/releases","reason":"missing-remote"}
 {"schema":"sdsync.plan-action.v1","action":"copy-remote-content","from_relative":"old/report.bin","from_remote_path":"/team/export/old/report.bin","to_relative":"new/report.bin","to_remote_path":"/team/export/new/report.bin","expected_size":4096,"expected_mtime_seconds":1785769200,"content_md5":"d41d8cd98f00b204e9800998ecf8427e","source_snapshot_guard":{"entry_kind":"file","size":4096,"mtime_seconds":1785769200,"content_md5":"d41d8cd98f00b204e9800998ecf8427e","require_mtime":true},"verified_upload_fallback":"only-before-copy-task-start"}
 {"schema":"sdsync.plan-action.v1","action":"upload","relative":"release.bin","remote_path":"/team/export/release.bin","bytes":5242880,"mtime_ms":1785769200000,"reason":"content-differs"}
-{"schema":"sdsync.output.v1","kind":"completion","result":{"changed":true,"uploaded":1,"server_copied":1,"upload_bytes":5242880,"directories_created":1,"deleted":0,"renamed":0,"deletes_skipped":0,"kept_deletes_uploaded":0,"changed_during_run":0,"failed":false,"outcome":"complete","deferred":[],"mtime_not_kept":0,"skipped":0,"incomplete_listings":0,"incomplete_listing_folders":[],"recovered":{"retries":0,"reauthentications":0,"reauthentication_failures":0,"keepalive_failures":0,"server_tasks_not_stopped":0,"server_copy_fallbacks":0},"elapsed_ms":8421}}
+{"schema":"sdsync.output.v1","kind":"completion","result":{"changed":true,"uploaded":1,"server_copied":1,"upload_bytes":5242880,"directories_created":1,"deleted":0,"renamed":0,"deletes_skipped":0,"kept_deletes_uploaded":0,"changed_during_run":0,"failed":false,"outcome":"complete","deferred":[],"link_guard_unchecked":0,"mtime_not_kept":0,"skipped":0,"incomplete_listings":0,"incomplete_listing_folders":[],"recovered":{"retries":0,"reauthentications":0,"reauthentication_failures":0,"keepalive_failures":0,"server_tasks_not_stopped":0,"server_copy_fallbacks":0},"elapsed_ms":8421}}
 ```
 
 A plan-only NDJSON stream ends after its last action. An unchanged sync emits the summary followed
@@ -638,6 +681,9 @@ In `best-effort` mode:
 
 - a full queue drops the new remote event without stopping the sync;
 - transport failures and rejected responses are counted;
+- if the delivery worker exits (normally, on a shutdown command, or by a panic), every event it had
+  accepted but not finished, including the one it died sending and everything still queued, is added to
+  `remote_events_dropped`, so the counter is exact rather than missing the events the worker discarded;
 - local stderr/file logging continues;
 - shutdown reports drop/failure counters but remote delivery does not determine command success.
 

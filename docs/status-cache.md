@@ -15,11 +15,14 @@ The DSM package passes this automatically; there is nothing to enable in the das
 
 ## It is a cache, not a record
 
-**Deleting the directory is always safe and only ever costs time.** Every guarantee the package
+**Deleting the cache files is always safe and only ever costs time.** Every guarantee the package
 makes holds with the cache absent, stale, truncated, or corrupt, because all of those degrade to
 exactly one behaviour: recompute from live evidence.
 
-If you ever want to be certain of an answer, delete the directory or pass `--status-cache-refresh`.
+If you ever want to be certain of an answer, delete the cache files or pass `--status-cache-refresh`.
+
+The directory must be **dedicated to the cache**. Eviction deletes files from it, so the cache refuses a
+directory it cannot prove is its own. See [Size, and where it lives](#size-and-where-it-lives).
 
 ## What it stores
 
@@ -78,7 +81,8 @@ issues are also logged as warnings.
 
 | Code | Meaning |
 | --- | --- |
-| `cache-profile-name-unsafe`, `cache-directory-unusable` | The cache directory or the profile's file name is refused (missing, group- or world-writable, not owned by the package); the pass runs uncached and `state` is `unusable`. |
+| `cache-profile-name-unsafe`, `cache-directory-unusable` | The cache directory or the profile's file name is refused (missing, group- or world-writable, not owned by the package, or not a dedicated cache directory: no `.sdsync-status-cache` marker and it holds entries the cache did not write); the pass runs uncached and `state` is `unusable`. |
+| `cache-directory-adopted` | `info`. A cache directory written before the marker existed, holding only cache files, was marked and adopted. Named once; nothing needs fixing. |
 | `cache-file-unsafe`, `cache-file-unreadable`, `cache-file-corrupt` | The profile's file is not private, cannot be read, or is damaged (the cause names the bad header field, record, or "truncated"). It is served cold. |
 | `cache-file-retired` | Written by another build, query, or comparison mode. Expected after an upgrade or a repoint. |
 | `cache-records-rejected` | Records were refused during a rewrite. |
@@ -167,6 +171,17 @@ answer says which kind of pass it was.
 Under DSM: `$SYNOPKG_PKGVAR/state/cache/status/`, one file per profile, mode `0600` inside a `0700`
 directory. The cache is trusted input, so it is refused if the directory grants write access to
 group or other.
+
+**The directory must be dedicated to the cache.** The first use writes a small marker file,
+`.sdsync-status-cache` (content `sdsync.status-cache.v1`), and eviction and the temporary-file sweep
+touch only files whose names the cache itself writes (`<profile>.ndjson`, `<profile>.rollup.json` and
+their temporaries), never anything else. A directory without the marker is accepted only when every
+entry in it is such a name, which is what a package cache from before the marker looks like: it is
+**adopted** by writing the marker, and named once as the `info` issue `cache-directory-adopted` (not a
+warning, and the cache is not degraded). A directory that holds anything else (your photos folder, a
+home directory) is **refused** with the `warning` issue `cache-directory-unusable`, naming the first few
+offending entries; the query runs uncached and nothing in the directory is touched. Point
+`--status-cache` at a directory used for nothing else.
 
 Measured at the 20,000-entry ceiling with deep paths: **5.4 MB, 269 bytes per entry**. Reading
 the whole of it holds about **9 KB** of memory, and writing it about **9 KB** — 17 KB when the

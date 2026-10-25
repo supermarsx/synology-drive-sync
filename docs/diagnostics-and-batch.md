@@ -438,6 +438,30 @@ or nested File Station roots on the same normalized endpoint. DSM username is in
 of that overlap key: two accounts do not make concurrent writers to the same remote tree safe.
 Sibling component names such as `/team/root` and `/team/rooted` are not overlaps.
 
+**A single-profile run checks the same thing.** `sync --profile X` and `plan --profile X` (which is
+what every per-profile routine, realtime trigger and **Sync now** runs) compare X's destination with
+every other profile in the configuration, from the configuration alone and before any network access,
+so a NAS that is down cannot let a run past the check:
+
+- If the two destinations are equal or nested on the same endpoint **and either profile deletes**, the
+  run is refused with exit code `2` (a configuration error), scoped to that pair: other profiles'
+  runs are unaffected. X counts as deleting when this run is `--delete` or its profile sets `delete`;
+  the other profile counts by its own configured `delete`, because its own routine runs with it.
+  The message names both profiles and the remedy first, for example: `profiles "a" and "b" have
+  overlapping NAS destinations and "b" deletes: give them separate destinations, or a mirror run of
+  one deletes the other's files (...)`. Without this, the outer profile's mirror deleted the inner
+  profile's backup on every run.
+- If neither deletes, the run proceeds and stderr carries `warning: profiles "a" and "b" have
+  overlapping NAS destinations; neither deletes, so nothing is lost, but each one's runs also carry
+  the other's files`. `--quiet` hides the warning.
+- A profile with no `url` of its own takes the run's endpoint. `config validate` compares only pairs
+  that both name a `url` or both omit it.
+- `config validate` applies the same rule to the whole file: a deleting overlapping pair is a
+  configuration error (exit `2`), and a non-deleting pair is valid. Each warning goes to stderr and
+  into a new `warnings` array (strings) in the `sdsync.config-validation.v1` JSON result.
+- On DSM, `configure-profile` refuses such a pair too (exit `64`, with the core's refusal text) and the
+  runner records the refusal as the profile's failure detail.
+
 This protection cannot determine that different public URLs reach the same NAS. Different DNS
 names, ports, or reverse-proxy prefixes can be aliases while appearing to be different endpoints.
 Operators must use one canonical public base URL per NAS or manually prove that selected roots do

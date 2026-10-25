@@ -150,19 +150,30 @@ how long it has been held and why it stopped moving:
 | Nothing has been read for longer than five minutes | `Unanswered · the package has not answered for 6 minutes: the package is busy. These values are no longer current evidence.` |
 | Nothing has ever been read | `Status unavailable` |
 
-The age is the browser's own receipt time, not the snapshot's `generated_at_epoch`. The two answer
-different questions: the epoch is the package's clock and needs an agreement about skew that a NAS
-with an unset clock cannot supply, while "how long have you been looking at this" is a question
-about this window. Five minutes is not a new threshold — it is the widget's own failure-backoff
+The age in this header is the browser's own receipt time, not the snapshot's `generated_at_epoch`. The
+two answer different questions: the epoch is the package's clock and needs an agreement about skew
+that a NAS with an unset clock cannot supply, while "how long have you been looking at this" is a
+question about this window. The evidence ages inside the snapshot ("Observed", "Oldest evidence") are
+the opposite case: they are measured against the snapshot's own clock, so a browser whose clock differs
+from the NAS's no longer shows "121 minutes ago" for a fresh reading. The snapshot also carries
+`nas_clock` (`now_epoch`, `utc_offset_seconds`, `zone`, read by the API service). When the NAS's UTC
+offset differs from the browser's, absolute times (the last result, Activity rows) are followed by the
+same instant in NAS time, for example `(NAS 2026-10-24 22:40)`. The fields are `null` with an `error`
+(`clock_unavailable` or `timezone_unavailable`) when the NAS clock or zone cannot be read, never a
+guessed UTC. Five minutes is not a new threshold — it is the widget's own failure-backoff
 floor, the point past which the most patient surface in the bundle has given up on a fresh answer.
 
 The cause comes from the code the package names in its failure envelope, and the same codes decide
 whether the window keeps asking:
 
 - a package that is **busy, slow, or answering badly** is retried on a bounded ramp that starts at
-  the configured cadence, enters the widget's 60/120/240/300-second ramp from the second
-  consecutive failure, and clears completely on the first success. One failed read is never treated
-  as a verdict;
+  the configured cadence, then holds at **60 seconds** from the second consecutive failure, and
+  clears completely on the first success. The AppWindow never backs off past 60 seconds, so a bridge
+  that returns is noticed within a minute. (The desktop widget keeps its own, slower
+  60/120/240/300-second ramp.) One failed read is never treated as a verdict. An Activity or Logs read
+  that succeeds while the status document is stale also reads the status again at once, instead of
+  waiting for the next scheduled poll, and the window disables every action that would change
+  something while the status shown is stale;
 - a package that is **stopping or upgrading** is retried at the configured cadence with a
   twenty-second floor, because that condition clears on its own and a one-second poll against a
   ten-minute upgrade is pure load;
@@ -171,6 +182,10 @@ whether the window keeps asking:
   The header says automatic refresh has stopped, and **Retry** re-arms it once the package is
   repaired. Polling through a fault that waiting cannot fix only buries the operator's own repair
   under identical failures.
+
+The Activity feed draws the newest 200 events that match its filter and says "N older events not shown"
+with a **Show older** button that draws 200 more (the heading still counts the whole filtered list,
+and **Copy visible** copies every match), so a thousand-event feed does not stall the page.
 
 The Activity and Logs feeds settle independently of each other and retain their rows the same way,
 so the feed state beside them dates what is left on screen: `activity feed unavailable, retained
@@ -183,6 +198,14 @@ polls (a 30-second tick), so an old reading does not look fresh just because not
 Every retained document lives in the window that read it. It is never keyed, never shared between
 tabs, never written to browser storage, and gone when the window closes: a tab is one DSM session,
 one package identity and one argument set, which is what makes holding the document safe at all.
+
+A snapshot with a missing or non-object member (a `profiles`, `routines` or `health` entry that is
+`null`) is read with those entries dropped rather than failing the page. If rendering throws, the window
+shows an error banner and clears it by itself on the first later render that succeeds; an error in a
+handler or watcher, which says nothing about the page, keeps the banner. A window whose root element has
+been removed from the page without DSM destroying it (DSM did not call `$destroy`; see
+[production acceptance](../production-acceptance.md#questions-only-a-real-nas-can-answer), probe 14) is
+disposed after two consecutive 30-second clock ticks seeing it detached, which stops its polling.
 
 Mutation controls require both a valid independent package CSRF token and
 `capabilities.mutations=true`. Secret controls additionally require `capabilities.secrets=true`,
@@ -210,9 +233,21 @@ a look: a failed or died run with its cause, consecutive failures against the al
 unreadable failure alerts, partial runs and skipped or deferred entries, records that could not be
 written, a run that has been going for more than six hours or has shown no progress for 30 minutes,
 a routine whose deletion limit can never be satisfied (*blocked*), a configuration saved but not yet
-applied by the running controller, and unreadable status figures. It persists in every poll until a success clears it, so it
+applied by the running controller, unreadable status figures, and the service itself: an
+**untrusted** controller identity (failure), a **stopped** controller (warning) and a **silent**
+controller (warning: it reports `running`, has no active child process and has not updated its record
+for three minutes; a controller with an active child process and an old heartbeat, such as a long sync,
+raises nothing). A wedged controller therefore no longer reads as "All profiles healthy" in the widget
+either. It persists in every poll until a success clears it, so it
 does not depend on having seen a notification, and a failure that happened while the page was closed
-is announced once, by a toast, when it loads. Each profile shows a “Last run:” line, the
+is announced once, by a toast, when it loads. A **chip in the top bar**, on every page, counts the
+distinct problems (a failed all-profiles run and the profiles it failed count once) and opens the
+Overview. A failure toast does not fade: it stays until dismissed, identical failures are not stacked,
+and at most four are kept. Before the first status read the cards say **Not read**, and the Profiles
+and Routines lists say they have not been read yet, instead of asserting that nothing is configured.
+Starting a second full sync while one is running (or one was queued from this window in the last ten
+minutes) says so in the confirmation: "A sync is already running (started 12 minutes ago). A second one
+is queued behind it", with the button **Queue another**. Each profile shows a “Last run:” line, the
 tree-comparison table notes “Last run failed: …” beside a profile whose last run failed (a comparison
 is taken when someone asks, not a verdict on the last run), and while the bridge is unreachable the
 page is dimmed rather than left looking current.
@@ -298,6 +333,11 @@ Standard and Extensive destination inventory displays no more than five determin
 direct children plus File Station's total count and an explicit truncated marker. It is one bounded,
 non-recursive page with safe metadata only: it does not read or hash remote payloads, expose ACLs or
 secrets, or replace the full Plan/Run inventory. Extensive does not expand that listing.
+
+The local **source browser** is bounded in time as well as in size: a listing that exhausts its
+six-second budget (a slow SMB or USB mount, for example) returns what it has with `truncated` and
+`time_limited` set to true, and the dashboard says the list is partial, rather than waiting on the
+mount.
 
 **Disposable write test** is a separate, capability-gated mutation opt-in. Enabling it locks the
 level to Extensive and requires confirmation. It briefly creates and uploads a unique probe,
@@ -485,7 +525,7 @@ is:
 | What the snapshot shows | What the dashboard says |
 | --- | --- |
 | The controller is stopped | Queued, the controller is stopped since a named time, and the request runs when the package is started in Package Center |
-| A live PID holds the controller’s PID file but is not the controller | Queued, nothing is servicing the queue, restart the package |
+| A live PID holds the controller’s PID file but is not the controller | Queued, nothing is servicing the queue; stop the package in Package Center, then run it again |
 | The controller is running a job | Queued behind that operation, named with its scope and start time when the run state carries them |
 | The controller is running, idle, and reporting normally | Queued, and it starts as soon as the work ahead of it finishes |
 | The controller is running, idle, and has not reported for three minutes | Queued, the controller may be wedged, review Logs |

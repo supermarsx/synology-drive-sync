@@ -38,8 +38,16 @@ made with File Station `Rename` raises `MutationEvent::Renamed` and is counted i
 `ExecutionSummary::renamed()`.
 
 A refusal confined to one path (`remote-refused`) no longer fails the run, but a share-wide one still
-does: three or more refusals with one cause that are more than half of what the run attempted fail it
-with an error that names the cause and the paths.
+does: three or more refusals of one class (permission, name, size, clash, folder-limit or
+create-failed) that are more than half of what the run considered, counting the files already in
+sync, fail it with an error (`ErrorCode::Remote`) that names the class, DSM's answers and the paths.
+A scoped run whose scope is, or lies beneath, a NAS link fails before planning with
+`ErrorCode::Safety`.
+
+`PlanSummary::link_guard_unchecked()`, `SyncOutcome::link_guard_unchecked()` and
+`SdkError::link_guard_unchecked()` (for a part-way failure) return how many NAS folders DSM listed
+without a real path, so the symbolic-link guard could not check them. It is a lasting warning:
+surface it, but it does not make the outcome partial.
 
 `PlanSummary::skipped()` returns the paths the plan declines to carry (links and reparse points,
 SYSTEM files, dehydrated placeholders, case and normalisation collisions, and the `type-conflict`,
@@ -55,8 +63,10 @@ the NAS did not keep, so a `metadata` comparison will see them changed next run)
 made. `SyncOutcome::recovered()` reports the
 retries, re-authentications, keepalive failures and unconfirmed server tasks the engine absorbed; the
 SDK does not install a re-authenticator, so an expired session is not re-established there (the
-keepalive and the pre-mutation touch still run). A server-side copy that finishes with an error
-surfaces as `ErrorCode::Remote`.
+keepalive and the pre-mutation touch still run). A server-side copy that never started, or that
+failed leaving the destination empty, is uploaded instead in the same run (`copy_fallbacks()`); one
+that failed leaving an entry at the destination is the transient `server-copy-failed` deferral, and
+the next run replaces that entry with an upload.
 
 When a run fails part-way through execution, mutations that already happened are not lost:
 `SdkError::completed()` returns the `ExecutionSummary` of what was done, or `None` when nothing had

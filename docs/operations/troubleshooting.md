@@ -56,7 +56,7 @@ DSM can return HTTP 200 with a JSON API failure, so both transport status and re
 | HTTP 504 or DSM `1801` | Proxy/File Station/application timeout | Long-upload timeout, rate cap, and largest file. |
 | DSM `150` | Requests appear from different client IPs | Proxy source-IP/session consistency. |
 | DSM `1800` | Multipart content length absent/inconsistent | Proxy buffering/body transformations and client version. |
-| DSM `106`, `107`, or `119` immediately after login (a session that expires *mid-run* is re-established once per occurrence, up to four times per run, and counted in `recovered.reauthentications`; a failed re-login reports its own cause) | File Station rejected, expired, or lost the DSM session before evaluating the path | Run `doctor` and read the **DSM session channel ablation** section: it presents the same request through one session channel at a time and says whether the fault is which channel this client uses or the path itself. Then compare the same account through a direct LAN or tested custom-domain route. |
+| DSM `106`, `107`, or `119` immediately after login (a session that expires *mid-run* is re-established once per occurrence, up to four times in any 10 minutes (plus one more per 15 minutes of run time), and counted in `recovered.reauthentications`; when that allowance is spent the error says "DSM ended N sessions in M minutes, so re-authentication stopped"; a failed re-login reports its own cause) | File Station rejected, expired, or lost the DSM session before evaluating the path | Run `doctor` and read the **DSM session channel ablation** section: it presents the same request through one session channel at a time and says whether the fault is which channel this client uses or the path itself. Then compare the same account through a direct LAN or tested custom-domain route. |
 | Login succeeds but inventory returns DSM `105` | Account or package permission mismatch | File Station application permission and the exact destination ACL. |
 | Destination missing | Root or ancestor is not writable/does not exist | Create/enable the share or user home in DSM; the client only creates below it. |
 
@@ -137,14 +137,30 @@ comparison above, which is the one mechanism that can confirm it outright.
   (most folders look like links, which means DSM's `real_path` answers are not what the link guard
   expects; run `doctor` and compare with the
   [NAS questions](../production-acceptance.md#questions-only-a-real-nas-can-answer)) and a
-  refusal breaker that trips.
+  refusal breaker that trips (`remote-refused-share-wide`: three or more refusals of one class that
+  are most of what the run considered; the message names the class, DSM's answers and the paths).
+- A NAS folder this account may not list is one amber `remote-skipped` warning (exit `0`) naming the
+  folder, and local content beneath it is `remote-unreadable`; fix the account's rights on the folder.
+  If most folders are unlistable the run fails by name, which points at the account's rights on the
+  whole share.
+- A scope (`--scope`) that is, or lies beneath, a NAS symbolic link fails with exit `1` and names the
+  link; run without the scope or replace the link with a folder. A link below the scope is skipped
+  and named.
+- `error: configuration error: profiles "a" and "b" have overlapping NAS destinations and "b"
+  deletes` (exit `2`) means a mirror run of one would delete the other's files: give the profiles
+  separate destinations or turn deletion off. With deletion off on both, the same overlap is only a
+  warning.
+- A delete or rename that is withheld "until it is known how DSM parses a comma in a path list" is the
+  comma guard; see probe 16 in the [NAS questions](../production-acceptance.md#questions-only-a-real-nas-can-answer).
 - A case-only rename (`Report.pdf` to `report.pdf`) under `--delete` is one File Station rename; if it
   cannot be made it is a lasting `case-rename-pending` warning and nothing is deleted. NFC/NFD
   spellings converge; only a true collision (two names that fold to one) is skipped, with both
   spellings named. Rename one to continue.
-- `--exclude` patterns fold case and Unicode normalisation on a source that does (Windows, macOS, most
-  SMB mounts), on both sides: `--exclude report.pdf` also protects a NAS-only `Report.pdf` and keeps a
-  local `Report.pdf` from uploading.
+- `--exclude` patterns match Unicode-normalised (NFC) on every source and fold case on a source that
+  does (Windows, macOS, most SMB mounts), on both sides: `--exclude report.pdf` also protects a NAS-only
+  `Report.pdf` and keeps a local `Report.pdf` from uploading. A rule also covers both spellings of a
+  renamed or NFC/NFD-paired folder. Content an exclude newly covers stays on the NAS as it is; delete a
+  file that was uploaded before the rule matched it by hand in File Station.
 - `metadata` comparison treats a remote second equal to the floor or the rounded value of the local
   time as unchanged, so an edit of the same size within the same second is not detected; use
   `--compare content` where that matters.

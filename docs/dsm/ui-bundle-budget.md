@@ -35,7 +35,8 @@ stylesheet is now spent as a lever, and the numbers say so:
   `from`/`to`, `minmax(112px, 0.72fr)`, newline-anchored selectors, and the 260/220-char keyframe
   windows. No minifier has a knob for any of them.
 
-The bundle exceeds the 512,000-byte hint by about 91.1 KB (603,128 bytes). It was about 62.1 KB over before the
+The bundle exceeds the 512,000-byte hint by about 104.3 KB (616,344 bytes). It was about 91.1 KB over before
+the third fix round described [below](#what-the-third-fix-round-cost), about 62.1 KB over before the
 adversarial-audit fix round described [below](#what-the-audit-fix-round-cost-and-what-that-28970-bytes-is-made-of),
 about 34.3 KB over before the run-outcome
 surfaces landed (reason copy, attention list, per-profile last run, stale rendering; about 17.3 KB, of
@@ -44,8 +45,8 @@ realtime routine surfaced its `backend_reason` and last-poll age, the manual Ref
 diffing were fixed, and the Activity search box was debounced; about 28.5 KB over before the
 Activity route split into event-lens tabs; about 19.6 KB over before the in-service read failures
 were named; about 10.0 KB over before queued progress landed; and about 21.7 KB over before the
-stylesheet was condensed. Any further reduction has to come out of the JavaScript: at ~479.3 KB
-excluding the embedded stylesheet (~451.2 KB before the audit fix round), that is where the remaining headroom is, and there is no second
+stylesheet was condensed. Any further reduction has to come out of the JavaScript: at ~491.9 KB
+excluding the embedded stylesheet (~479.3 KB before the third fix round, ~451.2 KB before the audit fix round), that is where the remaining headroom is, and there is no second
 stylesheet-shaped win behind it.
 
 Nine pieces of work have landed over the budget since it was first written (the timestamped log view and
@@ -156,6 +157,28 @@ minifier cannot touch and which is the feature: `reason-vocabulary.test.mjs` now
 token the package can write that has no label, so a new token cannot silently fall back to its raw
 code. The structural alternative is the same one declined above, packing prose into arrays, and it
 is declined for the same reasons. Any reduction still has to come out of the existing JavaScript.
+
+### What the third fix round cost
+
+The dashboard signals (the problem chip, sticky failure toasts, the service and controller attention
+items, cold-start "Not read" text, the 60-second poll cap, the Activity render cap, the NAS-clock
+labels, the render-error recovery and detached-window disposal) grew `dist/SynologyDriveSync.js` from
+603,128 to 616,344 bytes, +13,216, and `dist/style.css` from 123,846 to 124,494, +648 (counted inside the
+13,216). The excess over the unenforced 512,000-byte hint moves from about 91.1 KB to about 104.3 KB;
+the limit in `webpack.config.js` was not raised.
+
+Source growth, in the same unminified terms as above (read as proportions only):
+
+| Source | Before | After |
+| --- | ---: | ---: |
+| `outcomes.mjs` | 46,130 | 51,951 |
+| `App.vue` | 513,580 | 532,416 |
+| `widgetModel.mjs` | 27,741 | 28,471 |
+| `uiErrors.mjs` | 4,850 | 5,927 |
+
+The same performance work that added bytes also removed work: the snapshot is stored frozen so Vue
+tracks nothing under it, which took a 254-profile poll from about 366 ms to about 31 ms of main-thread
+time.
 
 ## Constraints on transforming the stylesheet
 

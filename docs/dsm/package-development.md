@@ -253,6 +253,14 @@ python3 packaging/synology/test_synology_package.py
 ```
 
 Run the package suite in a Linux/WSL environment that provides its expected shell/process semantics.
+Run it under dash (the usual `/bin/sh`) **and** with `/bin/sh` pointed at bash: DSM's `sh` is believed to
+be bash (4.4 on DSM 7), dash and BusyBox read a builtin `read` a byte at a time where bash seeks, and a
+`/proc` identity check that tore only under bash once shipped because no CI shell was bash. CI's
+`packaging-suite` job runs the whole suite under both, as a matrix of shell (dash, bash) and three shards
+(`SDSYNC_TEST_SHARD=0/3`, `1/3` and `2/3`), balanced by the measured per-test weights in `SHARD_WEIGHTS`
+in the suite, which also checks that every test lands in exactly one shard; the shell-sensitive tests also
+loop over each shell the host has.
+New shell must stay POSIX `sh` and BusyBox `ash` compatible, including 32-bit arithmetic on armv7.
 Negative tests deliberately tamper with architecture, helper identity, symlinks, permissions,
 reserved resources, notifier arguments, UI security markers, icons, and archive fields. They
 specifically reject `conf/resource`, legacy sysnotify mail templates, a dynamic notifier operand, an

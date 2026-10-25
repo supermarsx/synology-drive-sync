@@ -47,7 +47,9 @@ Each selected batch profile must independently resolve:
 Selection is deduplicated and execution order is deterministic by profile name. Every job is
 preflighted before the first remote mutation. Overlapping source or remote scopes, conflicting
 endpoint identities, invalid credentials, or a deletion-budget breach prevent the batch from
-starting.
+starting. A single-profile run (`--profile NAME`) refuses, with exit `2`, a destination that overlaps
+another profile's when either of them deletes, and only warns when neither does; `config validate`
+reports the same, with its warnings in a `warnings` array.
 
 ## Endpoint identity and aliases
 

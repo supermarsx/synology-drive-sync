@@ -36,16 +36,27 @@ The controller defers rather than runs when a dependency has not succeeded.
 
 The window is inclusive and uses the NAS local clock. When start is earlier than or equal to end,
 the allowed time is within that same-day interval. When start is later than end, the window crosses
-midnight. The selected weekday is evaluated when the controller checks the routine.
+midnight. The selected weekday is the weekday of the **window day**, the day on which the window
+opens, not the weekday at the moment the controller checks.
 
 A daily routine runs once per **window day**, the calendar day on which its window opened. In the part
-of a wrapping window after midnight (23:00 to 01:00, at 00:30) the window day is still yesterday. The
+of a wrapping window after midnight (23:00 to 01:00, at 00:30) the window day is still yesterday, so a
+Friday-only routine with that window runs at Saturday 00:30 (Friday's window) and a Saturday 00:30 is
+not Saturday's. A later window that has already run closes the tail of an earlier one. The
 day is recorded when the run is dispatched, not when it finishes, so a run that crosses midnight no
 longer consumes the next night and a wrapping window no longer runs twice in one night. A run cancelled
 (`130`/`143`) is held for 30 seconds before the routine is considered again, so a stop or reboot does
 not turn into an immediate re-run. If the NAS clock steps backwards, a next-run or poll time that is
 further ahead than its interval allows is clamped to now and recorded as `clock_step_detected` in
 `controller.log`.
+
+**Daylight saving.** The window is judged on the NAS wall clock, once per turn, from one reading of the
+clock. When the clocks go back, a window runs once, not twice, and a window nearly a whole day long runs
+once on the long night. When the clocks go forward, a window that falls wholly inside the skipped hour
+opens right after the gap and the controller logs `routine_window_dst_gap` (`warn`, scheduler;
+`profile=`, `window_day=`, `start=`, `end=`) so the shifted run is explained. A clock the controller cannot read never dispatches: it logs
+`routine_clock_unavailable cause=` once per episode and `routine_clock_recovered` when the clock
+returns.
 
 A due daily routine outside its weekday/window is marked `deferred`, including a daily retry whose
 deadline has passed. Interval and realtime routines never consult weekdays or clock windows.
@@ -89,10 +100,17 @@ debounce, and it is derived from that one field rather than adding a second numb
 explains.
 
 **Fallback poll is a floor, not a fallback.** It runs on every install and alongside every healthy
-native watcher, checking a periodic source fingerprint (file path, size, and mtime) whenever no
+native watcher, checking a periodic source fingerprint (file path, size and mtime, plus the names of directories) whenever no
 native event is pending for that turn. A native event inside its debounce only suppresses the poll
 for that one turn; it does not turn polling off. Reducing **Fallback poll** therefore increases
 source traversal work even on a routine whose watcher has never failed.
+
+While a poll walk is in flight, the controller splits its five-second turn into one-second ticks; with
+no walk in flight it naps until the soonest realtime poll is due (at least one second, at most the
+five-second turn). A tick costs no evaluation until the walk ends; then a poll turn evaluates only the
+routine whose walk finished and the routine whose poll is due next, so a source tree that takes seconds
+to walk no longer delays the rest of the controller. Everything else (native events, windows, the queue
+and the schedule) keeps the five-second turn.
 
 The poll requires one unchanged reading before it dispatches: a fingerprint that differs from the
 last one is held rather than acted on immediately, and is only promoted once the next poll sees that
@@ -103,12 +121,18 @@ fails on a permissions error the operator never set. A subtree that is genuinely
 reported rather than silently retried forever: the readable part of the source stays observed and
 polled, and the routine's `backend_reason` (below) names which condition applies.
 
-**Known limitation: the poll fingerprint is path, size and mtime.** A rewrite that keeps both the size and
-the mtime, and the creation, removal or rename of an empty directory, change none of those and are not
-seen by polling. Where either matters, use an interval or daily routine, whose runs compare the whole
-tree. A stronger fingerprint (change
-time and directories) was designed and deferred because it would silently re-baseline every realtime
-routine at upgrade and its change-time noise on a real DSM is unmeasured.
+**Known limitation: the poll fingerprint is path, size and mtime for files, and the name of each
+directory.** The creation, removal or rename of an empty directory is seen (format `v3`; releases before
+it could not see one). A rewrite that keeps both the size and the mtime is not seen by polling. Where
+that matters, use an interval or daily routine, whose runs compare the whole tree. No change time is
+used, because its noise on a real DSM is unmeasured.
+
+**Upgrading changes the fingerprint format, so every realtime routine syncs once.** A baseline written
+by an earlier release (untagged or `v2`) cannot be compared with a `v3` reading, so it is treated as
+unknown: the controller logs `routine_fingerprint_format_changed` (`info`; `profile=`, `from=`,
+`to=v3`, `action=one comparison sync`) once, lets the reading settle over one more poll, runs one
+ordinary sync, and takes the `v3` reading as the new baseline. The old silent rebase
+(`routine_fingerprint_rebased`) no longer exists. Nothing outside the controller reads the fingerprint.
 
 This is not a kernel event stream and very short-lived changes between identical fingerprints may not
 be observable; final sync planning still performs the engine's normal complete source/target work. A

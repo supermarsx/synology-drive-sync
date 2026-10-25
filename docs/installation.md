@@ -285,7 +285,9 @@ synology-drive-sync sync --config /etc/synology-drive-sync/config.toml \
   --all-profiles --max-total-delete 20 --output ndjson
 ```
 
-The built-in overlap check covers only profiles selected by that process. It is not a lock and
+The built-in overlap check covers only profiles selected by that process, plus a configuration-level
+check that refuses a single-profile run (exit `2`) whose destination overlaps another profile's when
+either of them deletes, and warns when neither does. It is not a lock and
 cannot coordinate separate services, containers, hosts, or manual commands. If related profiles
 must use separate scheduler entries, put every batch and single-profile invocation behind the same
 host-level lock; use a distributed operational lock as well when more than one host can reach the

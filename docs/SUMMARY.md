@@ -64,6 +64,7 @@
 
 - [Release selector](release-selector.md)
 - [Release artifacts and verification](releases.md)
+- [Release notes: behaviour changes](release-notes.md)
 - [Testing and coverage](testing.md)
 - [Security](security.md)
 - [Contributing](contributing.md)

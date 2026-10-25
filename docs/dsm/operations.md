@@ -116,8 +116,8 @@ a missing, unsafe, or unrecognised state file degrades that one entry and adds a
 | `succeeded` | Finished, exit 0. Counts of skipped or deferred entries turn it into a warning, never plain success. |
 | `partial` | The core exited `3`: finished, but named paths were deferred and sync on the next run. Not a failure: no failure alert, no retry consumed, and a dependent routine may run after it. |
 | `failed` | Ended non-zero, or was refused in preflight. `reason` says why when known. |
-| `busy` | Refused because another run, Doctor, or management action held the run lock (exit `75`). A deferral that is retried; not a failure and not counted by the failure alert. |
-| `cancelled` | Stopped by the user or a package stop (`130`/`143`, or `137` when a package stop had to kill a runner that did not finish cancelling within its 60-second grace). No alert. |
+| `busy` | Refused because another run, Doctor, or management action held the run lock (exit `75`). A routine retries on its own (30 seconds later, no retry consumed); a run the user started is not repeated, so run it again if it is still needed. Not a failure and not counted by the failure alert. |
+| `cancelled` | Stopped by the user or a package stop (`130`/`143`, or `137` when a package stop had to kill a runner that did not finish cancelling within its 60-second grace). No alert, and an Activity `run.cancelled` row. A routine runs again on its own; a run the user started is not repeated. |
 | `not_run` | No record, or the last aggregate run did not reach this profile; its previous completion is kept. |
 | `stale` | `run.state` says `running` but the runner is gone (see below). Treated as failed. |
 | `unknown` | A record exists but its value is not one this reader knows. Shown as “Status unknown”, never as success. |
@@ -138,12 +138,24 @@ silence another's alert.
 how long, and `long_running` turns true past six hours (adding the warning token `long_running`). A
 core waiting on a hung mount or a request with no deadline never fails; it just never finishes, and it
 holds the run lock, so every routine waits behind it. To make that visible the runner refreshes
-`run.state` every 60 seconds with `heartbeat_epoch`, the last time the core showed progress: its I/O
-counters in `/proc/<pid>/io` moved, or, where those cannot be read, its progress record changed
-(`heartbeat_source` is `io`, `progress` or `liveness`; with `liveness` the epoch only proves the core is
-alive). The snapshot reports `outcomes.run.heartbeat_epoch` and `stalled`: `true` when the heartbeat is
+`run.state` every 60 seconds with `heartbeat_epoch`, the last time the core showed progress: its
+`rchar + wchar` counters in `/proc/<pid>/io` grew by at least 16 KiB since the previous 60-second tick
+(the floor is lowered to 60 times the slowest covered profile's `max-rate` when that is less, so a
+deliberately throttled run is not called stuck). Those counters follow reads and writes over NFS and
+CIFS too, which block-device counters would miss. `heartbeat_source` is `io`, or `liveness` where the
+kernel hides the counters: a `liveness` record is written **without** an epoch, because it only proves
+the core is alive. A progress record no longer counts as a signal (a batch run has none, and a refresh
+moves its modification time). If the counters become unreadable during a run the runner logs
+`run_stall_detection_unavailable` once (`warn`, scheduler; `scope=`, `pid=`, `cause=`). The snapshot reports `outcomes.run.heartbeat_epoch` and `stalled`: `true` when the heartbeat is
 more than 30 minutes old (adding the warning token `stalled`), `false` while it is recent, and `null`
-when the run published no heartbeat. The runner logs `run_stalled` (`error`) once, and `run_stall_cleared`
+when the run published no heartbeat **or when the heartbeat source is `liveness`**. A liveness-only
+heartbeat proves the core process exists, not that it is working, so it can never read as healthy: the
+snapshot reports `stalled: null` (with or without an epoch) and adds the warning token
+`stall_unobservable` while the run is `running`, and the dashboard says progress cannot be observed
+rather than "not stalled". Only `io` decides true or false. A run
+record whose start or heartbeat is more than 60 seconds ahead of the NAS clock reads as unknown
+(`running_for_seconds` and `stalled` are `null`) with `{"source":"run.state","code":"clock_skew"}` in
+`outcomes.errors`, instead of a negative duration. The runner logs `run_stalled` (`error`) once, and `run_stall_cleared`
 if progress resumes. When the heartbeat has been stale for 30 minutes the controller also logs
 `controller_blocked_by_stalled_run` (`error`, once per run; the scope, the last progress time, the number
 of queued jobs and what is waiting: `routines`, `polls`, `schedule`) and raises the failure alert (DSM
@@ -210,7 +222,9 @@ A package **stop** is not a died run. The controller waits up to 60 seconds for 
 cooperatively (`SDSYNC_DSM_RUNNER_STOP_GRACE`, 1 to 110 seconds, inside the 120-second lifecycle
 budget; dashboard jobs still get 3 seconds). If the runner still has to be killed, the controller logs
 `runner_stop_forced` (`warn`) and publishes `run.state` `failed` with outcome and reason `cancelled`
-and exit `137`, with an `info` Activity `run.failed` row, no alert and no `runner_died`.
+and exit `137`, with an `info` Activity `run.cancelled` row (state `cancelled`), no alert and no
+`runner_died`. A cancellation the runner itself observes, before the core starts or before it
+completes, writes the same `run.cancelled` row; cancellations no longer appear as `run.failed`.
 
 A run read as stale is never reported as running anywhere in the snapshot: the legacy `run.state`,
 `outcomes.run.state` and every covered routine's state read `failed` (`outcomes.run.outcome` stays
@@ -269,6 +283,7 @@ codes are:
 | `run.started` | Package Plan/Sync action started |
 | `run.succeeded` | Package action completed successfully |
 | `run.failed` | Package action completed with a nonzero result, was refused in preflight, or its runner died; the message carries the cause |
+| `run.cancelled` | A run was cancelled by a package stop, a reboot or the user (`info`, state `cancelled`), by the runner or, for a forced stop, the controller. A routine run again on its own; a run the user started is not repeated |
 | `run.deferred` | A run was refused only because another operation held the run lock, or a routine wrapper was never admitted; retried, not a failure. For a scheduled routine or the schedule it is written once per busy episode, not on every 30-second re-check; a manual run's deferral is always written |
 | `routine.deferred` | Routine was outside its window or dependency evidence was not satisfied; recorded once per episode, not on every controller turn |
 | `routine.retry_scheduled` | A whole-action retry was scheduled |
@@ -304,8 +319,28 @@ The service answers a Logs read itself, newest first and bounded: for each sourc
 retained files backwards and stops once it has the requested number of lines or has scanned 1 MiB of
 that source. A read that stops at the scan budget because a strict threshold hid most lines carries
 `"scan_limited": true` on that source, and the dashboard says *newest lines only; older history was not
-scanned* rather than implying there is nothing older. The result is byte-for-byte what the shell
-manager returns for the same files, including the redaction; a test compares the two.
+scanned* rather than implying there is nothing older. A whole read also has a four-second deadline,
+shared evenly between the sources still to be read; a source the deadline cut carries `scan_limited`
+**and** `"deadline_reached": true`, and the service writes one coalesced (every five minutes) `warn`
+record `logs_read_deadline` (`sources`, `elapsed_ms`) to `api.log`. The result is byte-for-byte what the
+shell manager returns for the same files, including the redaction and the placeholders below, except
+for `deadline_reached`; a test compares the two.
+
+Redaction is applied to the **whole line** first and only then is the line shortened, so a secret cut in
+two by a length limit cannot survive as a fragment:
+
+- terminal escape sequences are stripped before redaction, so a secret cannot be hidden by an escape
+  placed inside it;
+- only a line that is a complete JSON record has the string-token rule applied; every other line is
+  redacted as plain text, and an unterminated token is redacted to the end of the line;
+- a line is then shown cut to 8,192 bytes on a character boundary;
+- a line longer than 32 KiB is not shown at all: it reads `[line too long: N bytes, withheld]`, with N
+  the raw byte length;
+- a line that still contains a secret after every rewrite reads `[line withheld: could not be
+  redacted]`.
+
+The level of a long line is read from its first 8,192 bytes, so the threshold still applies to a line
+the dashboard shows only as a placeholder.
 
 API, controller, scheduler, and audit logs retain five rotations. The core sync log retains three.
 The DSM package's private Doctor discovery history uses a 1 MiB rotation threshold plus three
@@ -370,6 +405,13 @@ knowing when reading it:
 | `child_launch_failed` | The controller could not launch a child (`kind=`, `status=`) |
 | `controller_exited` | The controller's last line: `status=` and `shutdown=`, `info` after a requested stop and `error` otherwise |
 | `run_state_unverifiable` | The controller could not decide whether a run was alive (`phase=liveness` or `acquire`) |
+| `controller_found_dead` | `warn`, category controller. The controller is gone while its API service is still running: `phase=status` (written once per dead controller and API instance, which is the record a SIGKILL never wrote) or `phase=start` (written whenever Start repairs it); `pid=` the controller's recorded pid or `none`, `api_pid=` the service. Start then stops the service and starts both again, and writes an Activity `service.restarted` (`warn`) saying so |
+| `core_killed` | `error`, scheduler. The sync core was killed (`exit=137`) without reporting an error and the run was not a cancellation. `scope=`, `oom_kill=<before>-><after>`, `proven=true\|false`: `proven=true` when this cgroup's out-of-memory kill counter moved across the run. The profile and run detail then say "killed by the out-of-memory killer" (or, unproven, "killed (SIGKILL, exit 137) without reporting an error; out of memory? check the DSM system log"); the reason stays `core_failed`. The package does not read `dmesg`, which is privileged |
+| `routine_watch_limit_unchecked` | `warn`. The inotify watch limit could not be checked for a routine (`profile=`, `cause=absent\|not_a_file\|unreadable\|malformed\|count_failed\|cache_unsafe\|cache_unwritable`, sometimes `path=`); logged once per controller lifetime, and the watcher is started anyway |
+| `run_stall_detection_unavailable` | `warn`, scheduler. The core's I/O counters stopped being readable mid-run (`scope=`, `pid=`, `cause=`), so hang detection is unavailable for the rest of that run; the heartbeat becomes `liveness` and `stalled` reads `null`. Once per run |
+| `routine_window_dst_gap` | `warn`, scheduler. A daily window fell wholly inside a spring-forward gap and opened after it (`profile=`, `window_day=`, `start=`, `end=`) |
+| `routine_clock_unavailable` / `routine_clock_recovered` | The controller could not read the clock (`cause=`; `warn`, once per episode, and nothing is dispatched meanwhile) / it could again (`info`) |
+| `routine_fingerprint_format_changed` | `info`. A realtime routine's stored fingerprint was written by an earlier release (`from=`), so one comparison sync runs and the `to=v3` reading becomes the baseline. Replaces `routine_fingerprint_rebased` |
 
 Re-levelled from `warn` to `error` because each records a failed write or delivery:
 `activity_append_failed`, `alert_unavailable`, `observability_write_failed` (which now carries the

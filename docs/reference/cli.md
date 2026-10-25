@@ -26,6 +26,13 @@ The explicit command tree is preferred. Run `synology-drive-sync --help` and
 | `completions SHELL` | Generate Bash, Zsh, Fish, PowerShell, or Elvish completion source. |
 | `manpage [--all DIRECTORY]` | Generate the root roff page on stdout or every nested command page in a directory. |
 
+`--timeout SECONDS` is the request timeout, with a different meaning for uploads: an upload attempt ends
+when the connection takes no bytes for `min(SECONDS, 300)` seconds (and is retried), when it has run longer
+than `max(SECONDS, file size / 16 KiB/s)` (not retried), or when DSM does not answer within SECONDS of its
+last byte; an upload that keeps moving at 16 KiB/s or more is never cut by SECONDS. Every other request,
+and background operations such as MD5 and CopyMove, keep SECONDS as a plain timeout, and control-plane
+requests are capped at 10 seconds. See [Network](../configuration/network.md#what-timeout-means-for-an-upload).
+
 Target Doctor prints its build identity, then reports fixed timed sections as `pass`, `warn`,
 `fail`, or `skip`, each with the DSM calls it made and, for a failure, a concrete remediation hint.
 Sections carry an execution `step` because the report groups them for reading rather than listing
