@@ -49,6 +49,11 @@ use synology_drive_sync::progress_record::ProgressRecorder;
 use synology_drive_sync::status_cache;
 use synology_drive_sync::vault::{generate_totp, parse_totp_secret};
 
+/// The Phase-2 daemon (`--daemon`). A child of this module so its golden tests can
+/// read its state files through the snapshot and outcome readers below.
+#[path = "daemon/mod.rs"]
+mod daemon;
+
 const PACKAGE_ROOT: &str = "/var/packages/synology-drive-sync/target";
 const PACKAGE_HOME: &str = "/var/packages/synology-drive-sync/home";
 const PACKAGE_VAR: &str = "/var/packages/synology-drive-sync/var";
