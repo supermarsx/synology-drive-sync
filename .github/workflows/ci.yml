@@ -202,6 +202,40 @@ jobs:
       - name: Rust 1.88 compatibility
         run: cargo test --locked --workspace --all-targets
 
+  # The DSM realtime watcher against real inotify, beyond what the test matrix
+  # runs: the walk deadline under the fault hook only the fault-inject feature
+  # compiles, and the kernel's own per-user watch limit, lowered for this job.
+  # The sysctl is global to the runner VM, which exists only for this job, and
+  # is restored before the step ends either way.
+  native-watcher:
+    name: Native watcher (walk deadline, lowered inotify limit)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable (2026-08-05)
+        with:
+          toolchain: 1.88.0
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: native-watcher
+      - name: Walk deadline under fault injection
+        run: cargo test --locked --features fault-inject --test watch_cli
+      - name: Build the watcher tests before the limit is lowered
+        run: cargo test --locked --test watch_inotify --test watch_cli --no-run
+      - name: Named watch_limit under a lowered max_user_watches
+        shell: bash
+        run: |
+          set -euo pipefail
+          original=$(cat /proc/sys/fs/inotify/max_user_watches)
+          sudo sysctl -w fs.inotify.max_user_watches=512
+          status=0
+          SDSYNC_TEST_LOWERED_WATCH_LIMIT=1 cargo test --locked --test watch_inotify --test watch_cli limit || status=$?
+          sudo sysctl -w "fs.inotify.max_user_watches=$original"
+          exit "$status"
+
   synology-package:
     name: Synology package ${{ matrix.synology_arch }}
     runs-on: ${{ matrix.runner }}
