@@ -75,6 +75,54 @@ pub trait EvidenceSource {
         strong: &BTreeSet<String>,
         spellings: &BTreeMap<String, String>,
     ) -> Vouched;
+
+    /// The pairs in `live` (remote relatives) had both digests computed live by this pass, from
+    /// local reads that began at `read_started`. A store harvests its evidence here.
+    fn observe_live(
+        &mut self,
+        _local: &LocalInventory,
+        _remote: &RemoteInventory,
+        _live: &BTreeSet<String>,
+        _spellings: &BTreeMap<String, String>,
+        _read_started: std::time::SystemTime,
+    ) {
+    }
+
+    /// What the pass did with this source's evidence, canary verdict included.
+    fn conclude(&mut self, _report: &EvidenceReport) {}
+}
+
+/// A carry within the run, plus a store that harvests the pass's live proofs: reconciliation's
+/// evidence when the verified-pair index is on.
+pub struct CarryAndHarvest<'run, 'plan> {
+    pub carry: PlanCarry<'plan>,
+    pub store: &'run mut dyn EvidenceSource,
+}
+
+impl EvidenceSource for CarryAndHarvest<'_, '_> {
+    fn vouch(
+        &mut self,
+        local: &LocalInventory,
+        remote: &RemoteInventory,
+        comparison: &BTreeSet<String>,
+        strong: &BTreeSet<String>,
+        spellings: &BTreeMap<String, String>,
+    ) -> Vouched {
+        self.carry
+            .vouch(local, remote, comparison, strong, spellings)
+    }
+
+    fn observe_live(
+        &mut self,
+        local: &LocalInventory,
+        remote: &RemoteInventory,
+        live: &BTreeSet<String>,
+        spellings: &BTreeMap<String, String>,
+        read_started: std::time::SystemTime,
+    ) {
+        self.store
+            .observe_live(local, remote, live, spellings, read_started);
+    }
 }
 
 /// A canary pair whose live digest disagreed with the vouched one.

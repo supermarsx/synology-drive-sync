@@ -2643,13 +2643,15 @@ pub fn populate_plan_digests_evidenced(
                 delete,
                 incomplete,
             );
-            let vouched = match evidence {
+            let mut evidence = evidence;
+            let vouched = match evidence.as_deref_mut() {
                 Some(source) => source.vouch(local, remote, &comparison, &strong, &spellings),
                 None => crate::digest_evidence::Vouched::default(),
             };
             crate::digest_evidence::apply_vouched(local, remote, &mut comparison, &vouched.served);
             report.served = vouched.served.len();
             report.verified_live = comparison.difference(&strong).count();
+            let read_started = std::time::SystemTime::now();
             populate_digests_live(
                 client,
                 local,
@@ -2667,10 +2669,11 @@ pub fn populate_plan_digests_evidenced(
                     &mut report,
                 );
             }
+            let mut redo = BTreeSet::new();
             if report.canary_mismatch.is_some() && !vouched.served.is_empty() {
                 // The evidence was wrong about a pair whose facts all held, so none of what it
                 // vouched for is trusted: every pair is read again, now, on both sides it vouched.
-                let mut redo = crate::digest_evidence::undo_vouched(local, remote, &vouched.served);
+                redo = crate::digest_evidence::undo_vouched(local, remote, &vouched.served);
                 report.fell_back = true;
                 report.served = 0;
                 report.verified_live += redo.len();
@@ -2683,6 +2686,24 @@ pub fn populate_plan_digests_evidenced(
                     &mut deferred,
                     cancellation,
                 )?;
+            }
+            if let Some(source) = evidence {
+                // Every comparison pair whose two digests this pass read live, the fallback's
+                // included. A pair vouched for only locally was read live on the NAS but not
+                // locally, so it is not live evidence and is not offered.
+                let mut live: BTreeSet<String> = comparison
+                    .iter()
+                    .filter(|relative| !strong.contains(*relative))
+                    .cloned()
+                    .collect();
+                for pair in vouched.served.iter().filter(|pair| !pair.remote_too) {
+                    if !redo.contains(&pair.remote) {
+                        live.remove(&pair.remote);
+                    }
+                }
+                live.extend(redo);
+                source.observe_live(local, remote, &live, &spellings, read_started);
+                source.conclude(&report);
             }
         }
         CompareMode::Force if delete => {

@@ -9,6 +9,7 @@ pub mod integrity;
 pub mod local;
 pub mod memory_budget;
 pub mod observability;
+pub mod pair_index;
 pub mod path;
 pub mod plan;
 pub mod progress;
