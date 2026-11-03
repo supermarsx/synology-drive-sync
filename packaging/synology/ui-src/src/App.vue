@@ -1700,7 +1700,8 @@ const ABOUT_RUST_DEPENDENCIES = Object.freeze([
   { name: "apple-native-keyring-store", pin: "1.0.2", scope: "macOS", url: "https://crates.io/crates/apple-native-keyring-store" },
   { name: "libc", pin: "0.2.191", scope: "Linux", url: "https://crates.io/crates/libc" },
   { name: "nix", pin: "0.31.3", scope: "Linux", url: "https://crates.io/crates/nix" },
-  { name: "zbus-secret-service-keyring-store", pin: "1.0.1", scope: "Linux", url: "https://crates.io/crates/zbus-secret-service-keyring-store" }
+  { name: "zbus-secret-service-keyring-store", pin: "1.0.1", scope: "Linux", url: "https://crates.io/crates/zbus-secret-service-keyring-store" },
+  { name: "redb", pin: "4.4.0", scope: "Linux and macOS", url: "https://crates.io/crates/redb" }
 ]);
 const ABOUT_UI_DEPENDENCIES = Object.freeze([
   { name: "@babel/core", pin: "8.0.1", scope: "devDependency", url: "https://www.npmjs.com/package/@babel/core" },

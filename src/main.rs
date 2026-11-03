@@ -29,6 +29,7 @@ use synology_drive_sync::observability::{
     EventReason, FileLogConfig, LogEvent, LogFormat as EventLogFormat, LogLevel as EventLogLevel,
     LoggerConfig, RemoteDelivery, RemoteLogConfig, RequestOutcome, SessionTransport, failure_path,
 };
+use synology_drive_sync::pair_index;
 use synology_drive_sync::path::RemoteRoot;
 use synology_drive_sync::plan::{self, CompareMode, PlanOptions, RemoteSnapshot, SyncPlan};
 use synology_drive_sync::progress::{
@@ -53,6 +54,7 @@ use zeroize::Zeroizing;
 mod cli;
 mod config;
 mod credentials;
+mod run_index;
 
 const FILE_LOG_MAX_BYTES: u64 = 10 * 1024 * 1024;
 const FILE_LOG_BACKUPS: usize = 3;
@@ -1774,6 +1776,8 @@ struct SyncCompletion {
     link_guard_unchecked: usize,
     /// How reconciliation proved content, when the run reconciled.
     reconciliation: Option<ReconciliationEvidence>,
+    /// What the verified-pair index did, when one was asked for.
+    pair_index: Option<pair_index::IndexReport>,
 }
 
 /// How a run's reconciliation proved content: which mode, and what carried evidence did.
@@ -2836,6 +2840,9 @@ fn prepare_and_run_sync_reporting(
         LogEvent::new(EventLogLevel::Info, EventCode::LocalScanStarted),
     )?;
     let scope = resolved_scope(settings)?;
+    // The verified-pair index's directory is claimed before anything is read; a directory it
+    // cannot use is named, and the run goes on live.
+    let index_start = run_index::begin(profile, settings);
     cancellation.phase("scan_local");
     let mut local = local::scan_scoped(
         &settings.source,
@@ -2925,6 +2932,15 @@ fn prepare_and_run_sync_reporting(
     )?;
     client = client.with_reauthenticator(reauthenticator(settings, password));
 
+    // Opened (and verified) after authentication, because its binding names the File Station
+    // host that answers; then closed again until the comparison set is known.
+    let mut index_session: Option<pair_index::IndexSession> = None;
+    let mut index_report: Option<pair_index::IndexReport> = None;
+    match run_index::open(index_start, profile, settings, &client) {
+        Ok(session) => index_session = session,
+        Err(report) => index_report = Some(report),
+    }
+
     let operation = (|| {
         cancellation.check()?;
         log_event(
@@ -2984,6 +3000,21 @@ fn prepare_and_run_sync_reporting(
         if memory.refuses(&local, Some(&remote), plan_out, completion_out)? {
             return Ok(());
         }
+        if let Some(session) = index_session.as_mut() {
+            // Entries reached through a folder listed without a real path have the facts of
+            // whatever a link there points at: nothing is served this run.
+            if link_guard_unchecked > 0 {
+                session.suspend_serving(pair_index::IndexIssue::info(
+                    "pair-index-link-guard-unchecked",
+                    settings.remote.clone(),
+                    format!(
+                        "{link_guard_unchecked} NAS folder(s) were listed without a real path, so \
+                         stored evidence is not served this run"
+                    ),
+                ));
+            }
+            session.observe_listing(&remote);
+        }
 
         // Before any digest is computed and before anything is planned: a scope that names nothing is
         // not a plan with no work in it.
@@ -2999,18 +3030,29 @@ fn prepare_and_run_sync_reporting(
         // A file that cannot be hashed, or whose remote digest File Station cannot produce, is left
         // out of both inventories and named, rather than failing the run. See
         // `sync::populate_plan_digests`.
-        let mut deferred = sync::populate_plan_digests_with_listings(
+        let (mut deferred, _) = sync::populate_plan_digests_evidenced(
             &client,
             &mut local,
             &mut remote,
             &rules,
-            run_options.compare,
-            server_copy,
-            run_options.delete,
-            &incomplete_directories,
+            sync::DigestSelection {
+                compare: run_options.compare,
+                server_copy,
+                delete: run_options.delete,
+                incomplete: &incomplete_directories,
+            },
+            index_session
+                .as_mut()
+                .map(|session| session as &mut dyn digest_evidence::EvidenceSource),
             cancellation,
         )?;
         deferred.extend(vanished);
+        // The NAS clock before anything is written, for the remote change-time self-test.
+        let nas_clock_before = remote
+            .entries
+            .values()
+            .filter_map(|entry| entry.digest_nas_time)
+            .max();
 
         cancellation.phase("build_plan");
         let mut plan = plan::build_plan(&root, &local, &remote, &rules, &run_options)?;
@@ -3063,6 +3105,10 @@ fn prepare_and_run_sync_reporting(
 
         if plan_only {
             warn_deferred(&settings.output, &deferred);
+            // A plan's digests are live evidence: storing them warms the next run.
+            if let Some(session) = index_session.take() {
+                index_report = Some(session.commit(Some(&local), None, scope.is_root()));
+            }
             return Ok(());
         }
 
@@ -3094,6 +3140,9 @@ fn prepare_and_run_sync_reporting(
             // run both cheaper and more correct. Post-execution reconciliation below is untouched:
             // that one verifies work that actually happened, which is the case it exists for.
             cancellation.check()?;
+            if let Some(session) = index_session.take() {
+                index_report = Some(session.commit(Some(&local), None, scope.is_root()));
+            }
             return Ok(());
         }
 
@@ -3203,17 +3252,18 @@ fn prepare_and_run_sync_reporting(
         cancellation.phase("reconcile");
         // SC-3: the plan pass's digests are carried for every pair this run did not touch and
         // whose facts did not move; touched pairs and a canary sample are verified live.
-        let carry = (settings.behavior.reconcile == cli::ReconcileArg::Carry).then(|| {
-            let deferred_so_far = completion_out
+        let touched = TouchedPaths::from_run(
+            plan,
+            completion_out
                 .as_ref()
-                .map_or(&[][..], |completion| completion.deferred.as_slice());
-            PlanCarry {
-                local: &local,
-                remote: &remote,
-                touched: TouchedPaths::from_run(plan, deferred_so_far),
-                canary: settings.behavior.reconcile_canary,
-                seed: canary_seed(started_at),
-            }
+                .map_or(&[][..], |completion| completion.deferred.as_slice()),
+        );
+        let carry = (settings.behavior.reconcile == cli::ReconcileArg::Carry).then(|| PlanCarry {
+            local: &local,
+            remote: &remote,
+            touched: touched.clone(),
+            canary: settings.behavior.reconcile_canary,
+            seed: canary_seed(started_at),
         });
         let carrying = carry.is_some();
         let (reconciliation, reconciliation_deferred, evidence) = build_reconciliation_plan(
@@ -3222,7 +3272,13 @@ fn prepare_and_run_sync_reporting(
             &root,
             &rules,
             &run_options,
-            carry,
+            ReconcileInputs {
+                carry,
+                index: index_session.as_mut(),
+                plan_remote: &remote,
+                written: pair_index::written_paths(plan),
+                nas_clock_before,
+            },
             cancellation,
         )?;
         let completion = completion_out
@@ -3246,8 +3302,25 @@ fn prepare_and_run_sync_reporting(
         )?;
         completion.changed_during_run = verdict.changed_during_run;
         cancellation.check()?;
+        if let Some(session) = index_session.take() {
+            index_report = Some(session.commit(Some(&local), Some(&touched), scope.is_root()));
+        }
         Ok(())
     })();
+    // A run that stopped before its end writes no evidence: what it gathered stays unwritten,
+    // and the index stays exactly as it was.
+    if let Some(session) = index_session.take() {
+        index_report = Some(session.abandon());
+    }
+    if let Some(report) = index_report {
+        run_index::report(&report, &settings.output, logger.as_ref(), profile)?;
+        if let Some(plan) = plan_out.as_mut() {
+            plan.pair_index = Some(report.clone());
+        }
+        if let Some(completion) = completion_out.as_mut() {
+            completion.pair_index = Some(report);
+        }
+    }
 
     // Whatever the verdict, the result says what the client recovered from along the way.
     if let Some(completion) = completion_out.as_mut() {
@@ -3760,14 +3833,23 @@ fn log_reconcile_evidence(
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
+/// What reconciliation takes from the run besides its settings: the SC-3 carry, and the index
+/// that harvests its live proofs and self-tests the NAS change time against this run's writes.
+struct ReconcileInputs<'run, 'plan> {
+    carry: Option<PlanCarry<'plan>>,
+    index: Option<&'run mut pair_index::IndexSession>,
+    plan_remote: &'plan api::RemoteInventory,
+    written: Vec<String>,
+    nas_clock_before: Option<i64>,
+}
+
 fn build_reconciliation_plan(
     client: &ApiClient,
     settings: &config::ResolvedSync,
     root: &RemoteRoot,
     rules: &IgnoreRules,
     run_options: &PlanOptions,
-    carry: Option<PlanCarry<'_>>,
+    inputs: ReconcileInputs<'_, '_>,
     cancellation: &CancellationToken,
 ) -> Result<(SyncPlan, Vec<DeferredPath>, EvidenceReport)> {
     cancellation.check()?;
@@ -3801,7 +3883,21 @@ fn build_reconciliation_plan(
     // reconciliation plan is only ever inspected by `ensure_reconciled` and is never executed, so
     // nothing consumes an upload's digest and raising it would read every changed file again to
     // answer a question nobody asks.
-    let mut carry = carry;
+    let ReconcileInputs {
+        carry,
+        index,
+        plan_remote,
+        written,
+        nas_clock_before,
+    } = inputs;
+    let mut index = index;
+    if let Some(index) = index.as_deref_mut() {
+        index.self_test_uploads(&written, plan_remote, &remote, nas_clock_before);
+    }
+    let mut source = digest_evidence::ReconcileEvidence {
+        carry,
+        store: index.map(|index| index as &mut dyn digest_evidence::EvidenceSource),
+    };
     let (mut deferred, evidence) = sync::populate_plan_digests_evidenced(
         client,
         &mut local,
@@ -3813,9 +3909,7 @@ fn build_reconciliation_plan(
             delete: run_options.delete,
             incomplete: &scanned.incomplete_directories,
         },
-        carry
-            .as_mut()
-            .map(|carry| carry as &mut dyn digest_evidence::EvidenceSource),
+        Some(&mut source),
         cancellation,
     )?;
     deferred.extend(sync::vanished_remote_folder_deferrals(
@@ -8235,6 +8329,13 @@ fn write_deferred_human_to<W: Write>(writer: &mut W, completion: &SyncCompletion
     {
         writeln!(writer, "Warning: {}.", reconcile_canary_text(mismatch)).map_err(output_error)?;
     }
+    if let Some(line) = completion
+        .pair_index
+        .as_ref()
+        .and_then(run_index::human_line)
+    {
+        writeln!(writer, "{line}").map_err(output_error)?;
+    }
     let transport = completion.transport;
     if transport != api::TransportCounters::default() || completion.report.copy_fallbacks > 0 {
         writeln!(
@@ -8486,6 +8587,14 @@ fn remote_snapshot_value(snapshot: &RemoteSnapshot) -> Value {
 }
 
 fn plan_value(plan: &SyncPlan) -> Value {
+    let mut value = plan_value_core(plan);
+    if let Some(report) = &plan.pair_index {
+        value["pair_index"] = run_index::value(report);
+    }
+    value
+}
+
+fn plan_value_core(plan: &SyncPlan) -> Value {
     json!({
         "link_guard_unchecked": plan.link_guard_unchecked,
         "summary": {
@@ -9068,6 +9177,9 @@ fn execution_value(completion: &SyncCompletion, elapsed: Duration) -> Value {
         // How reconciliation proved content (SC-3): pairs carried from the plan pass, pairs
         // verified live, and the canary. `null` when the run did not reconcile.
         "reconciliation": completion.reconciliation.as_ref().map(reconciliation_value),
+        // What the verified-pair index did (`--pair-index`): pairs served from evidence, pairs
+        // verified live, the canary, and every named condition. `null` when none was asked for.
+        "pair_index": completion.pair_index.as_ref().map(run_index::value),
         // Everything recovered from on the run's behalf, so none of it is silent.
         "recovered": {
             "retries": completion.transport.retries,
@@ -10428,6 +10540,7 @@ mod tests {
             upload_bytes: 0,
             skipped: Vec::new(),
             link_guard_unchecked: 0,
+            pair_index: None,
         }
     }
 
@@ -10584,6 +10697,11 @@ mod tests {
                 reconcile: cli::ReconcileArg::Carry,
                 reconcile_canary: synology_drive_sync::digest_evidence::DEFAULT_CANARY,
                 memory_budget_mib: None,
+                pair_index: None,
+                pair_index_refresh: false,
+                pair_index_max_age_days: 30,
+                pair_index_canary: 25,
+                pair_index_cache_mib: 8,
             },
             safety: config::ResolvedSafety {
                 delete: false,
@@ -10709,6 +10827,7 @@ mod tests {
             upload_bytes: 11,
             skipped: Vec::new(),
             link_guard_unchecked: 0,
+            pair_index: None,
         }
     }
 
@@ -11512,6 +11631,7 @@ mod tests {
                 "link_guard_unchecked",
                 "mtime_not_kept",
                 "outcome",
+                "pair_index",
                 "reconciliation",
                 "recovered",
                 "renamed",
@@ -12446,6 +12566,7 @@ mod tests {
             incomplete_listings: Vec::new(),
             link_guard_unchecked: 0,
             reconciliation: None,
+            pair_index: None,
         });
         outcome.elapsed = Some(Duration::from_millis(17));
         outcome.error = Some("retained diagnostic".to_owned());
@@ -13013,6 +13134,7 @@ mod tests {
             incomplete_listings: Vec::new(),
             link_guard_unchecked: 0,
             reconciliation: None,
+            pair_index: None,
         };
         let mut human_output = resolved_output(cli::OutputFormat::Human);
         human_output.verbosity = 1;
@@ -13045,6 +13167,7 @@ mod tests {
                 incomplete_listings: Vec::new(),
                 link_guard_unchecked: 0,
                 reconciliation: None,
+                pair_index: None,
             }),
             Duration::from_millis(17),
             &human_output,
@@ -13167,6 +13290,7 @@ mod tests {
             incomplete_listings: Vec::new(),
             link_guard_unchecked: 0,
             reconciliation: None,
+            pair_index: None,
         });
         completed.elapsed = Some(Duration::from_millis(19));
         completed.error = Some("retained warning".to_owned());
@@ -14589,6 +14713,11 @@ mod status_command_tests {
                 reconcile: cli::ReconcileArg::Carry,
                 reconcile_canary: synology_drive_sync::digest_evidence::DEFAULT_CANARY,
                 memory_budget_mib: None,
+                pair_index: None,
+                pair_index_refresh: false,
+                pair_index_max_age_days: 30,
+                pair_index_canary: 25,
+                pair_index_cache_mib: 8,
             },
             safety: config::ResolvedSafety {
                 delete: false,
@@ -14890,6 +15019,7 @@ mod status_command_tests {
             upload_bytes: 1_024,
             skipped: Vec::new(),
             link_guard_unchecked: 0,
+            pair_index: None,
         }
     }
 
@@ -14993,6 +15123,7 @@ mod resync_output_tests {
             upload_bytes: 1_024,
             skipped: Vec::new(),
             link_guard_unchecked: 0,
+            pair_index: None,
         }
     }
 
@@ -15104,6 +15235,7 @@ mod resync_output_tests {
             incomplete_listings: Vec::new(),
             link_guard_unchecked: 0,
             reconciliation: None,
+            pair_index: None,
         };
         let text = human(render(
             cli::OutputFormat::Human,

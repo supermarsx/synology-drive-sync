@@ -68,6 +68,12 @@ toml = "1.1.8"
 totp-rs = { version = "6.0.0", default-features = false, features = ["std", "zeroize"] }
 zeroize = "1.9.1"
 
+# The verified-pair index (`pair_index_redb`). Unix only: the index needs a file identity and a
+# status-change time, which Windows does not expose through a path stat, so it is never used
+# there. 4.2 and later report damaged files as errors instead of panicking.
+[target.'cfg(unix)'.dependencies]
+redb = "4.4.0"
+
 [target.'cfg(target_os = "windows")'.dependencies]
 windows-native-keyring-store = { version = "1.1.0", default-features = false }
 
@@ -87,6 +93,13 @@ zbus-secret-service-keyring-store = { version = "1.0.1", default-features = fals
 # path, the way a directory on a dying disk does, so a test can prove the walk's deadline. Never
 # enabled in a release build.
 fault-inject = []
+
+# redb's debug assertions walk every page of a file at open, before anything has verified it, and
+# panic on a corrupted page that release builds report as an error. Tests must exercise the code
+# that ships, so redb is built as it ships in every profile.
+[profile.dev.package.redb]
+debug-assertions = false
+overflow-checks = false
 
 [profile.release]
 lto = "thin"

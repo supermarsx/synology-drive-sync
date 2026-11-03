@@ -4074,6 +4074,7 @@ mod tests {
             upload_bytes: 1,
             skipped: Vec::new(),
             link_guard_unchecked: 0,
+            pair_index: None,
         }
     }
 
@@ -6063,6 +6064,7 @@ mod tests {
             upload_bytes: 0,
             skipped: Vec::new(),
             link_guard_unchecked: 0,
+            pair_index: None,
         };
         let mut reported = Vec::new();
         // `execute` (unlike `execute_with`, used by every other test in this module) is the

@@ -363,6 +363,12 @@ pub struct ResolvedSyncBehavior {
     pub reconcile_canary: usize,
     /// `--memory-budget`, in MiB. Command line only.
     pub memory_budget_mib: Option<u64>,
+    /// `--pair-index`: where verified-pair evidence is kept. Command line only.
+    pub pair_index: Option<PathBuf>,
+    pub pair_index_refresh: bool,
+    pub pair_index_max_age_days: u32,
+    pub pair_index_canary: usize,
+    pub pair_index_cache_mib: u64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -811,6 +817,13 @@ fn resolve_behavior(
             .reconcile_canary
             .unwrap_or(synology_drive_sync::digest_evidence::DEFAULT_CANARY),
         memory_budget_mib: arguments.memory_budget,
+        pair_index: arguments.pair_index.clone(),
+        pair_index_refresh: arguments.pair_index_refresh,
+        pair_index_max_age_days: arguments.pair_index_max_age.unwrap_or(30),
+        pair_index_canary: arguments
+            .pair_index_canary
+            .unwrap_or(synology_drive_sync::digest_evidence::DEFAULT_CANARY),
+        pair_index_cache_mib: arguments.pair_index_cache_mib.unwrap_or(8),
     })
 }
 
@@ -2263,6 +2276,11 @@ mod scope_and_force_tests {
             reconcile: None,
             reconcile_canary: None,
             memory_budget: None,
+            pair_index: None,
+            pair_index_refresh: false,
+            pair_index_max_age: None,
+            pair_index_canary: None,
+            pair_index_cache_mib: None,
         }
     }
 

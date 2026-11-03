@@ -151,8 +151,31 @@ impl Severity {
     }
 }
 
+/// Every issue code the index can name: the closed vocabulary `docs/observability.schema.json`
+/// publishes (`$defs.pairIndex`) and the dashboard renders.
+pub const ISSUE_CODES: &[&str] = &[
+    "pair-index-locked",
+    "pair-index-readonly",
+    "pair-index-corrupt",
+    "pair-index-format-unsupported",
+    "pair-index-store-failed",
+    "pair-index-unsafe",
+    "pair-index-directory-unusable",
+    "pair-index-unbound",
+    "pair-index-canary-mismatch",
+    "pair-index-remote-ctime-static",
+    "pair-index-retired",
+    "pair-index-compacted",
+    "pair-index-compaction-failed",
+    "pair-index-not-applicable",
+    "pair-index-unsupported-platform",
+    "pair-index-link-guard-unchecked",
+    "pair-index-remote-ctime-unavailable",
+];
+
 impl IndexIssue {
     pub fn warning(code: &'static str, path: impl Into<String>, cause: impl Into<String>) -> Self {
+        debug_assert!(ISSUE_CODES.contains(&code), "unpublished issue code {code}");
         Self {
             code,
             severity: Severity::Warning,
@@ -162,6 +185,7 @@ impl IndexIssue {
     }
 
     pub fn info(code: &'static str, path: impl Into<String>, cause: impl Into<String>) -> Self {
+        debug_assert!(ISSUE_CODES.contains(&code), "unpublished issue code {code}");
         Self {
             code,
             severity: Severity::Info,
@@ -199,6 +223,10 @@ pub trait PairIndex {
     /// How many pairs are stored, when the backend knows cheaply.
     fn stored_pairs(&mut self) -> Option<u64> {
         None
+    }
+    /// Conditions the backend met that the run should name (a repair, a compaction).
+    fn take_notes(&mut self) -> Vec<IndexIssue> {
+        Vec::new()
     }
 }
 
@@ -425,6 +453,9 @@ impl IndexSession {
             serving = false;
             report.state = IndexState::Refreshed;
         }
+        // The read window closes until the comparison set is known: the file is not held while
+        // the run lists the NAS.
+        backend.finish_reads();
         Self {
             backend,
             binding,
@@ -524,6 +555,15 @@ impl IndexSession {
     fn discard(&mut self) {
         self.clear = true;
         self.serving = false;
+    }
+
+    /// Serve nothing from the stored evidence and clear it in this run's commit: the backend
+    /// found damage it repaired, so none of it is trusted. The issue is the backend's to name.
+    pub fn discard_evidence(&mut self) {
+        self.discard();
+        if self.report.state == IndexState::Warm {
+            self.report.state = IndexState::Cold;
+        }
     }
 
     fn mark_broken(&mut self, issue: IndexIssue) {
@@ -690,6 +730,7 @@ impl IndexSession {
                 self.report.issues.push(issue);
             }
         }
+        self.report.issues.extend(self.backend.take_notes());
         self.report
     }
 
@@ -698,6 +739,7 @@ impl IndexSession {
     pub fn abandon(mut self) -> IndexReport {
         self.backend.finish_reads();
         self.report.remote_signal = Some(self.signal);
+        self.report.issues.extend(self.backend.take_notes());
         self.report
     }
 

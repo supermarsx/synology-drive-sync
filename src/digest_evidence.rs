@@ -92,14 +92,14 @@ pub trait EvidenceSource {
     fn conclude(&mut self, _report: &EvidenceReport) {}
 }
 
-/// A carry within the run, plus a store that harvests the pass's live proofs: reconciliation's
-/// evidence when the verified-pair index is on.
-pub struct CarryAndHarvest<'run, 'plan> {
-    pub carry: PlanCarry<'plan>,
-    pub store: &'run mut dyn EvidenceSource,
+/// Reconciliation's evidence: the SC-3 carry (unless `--reconcile full`), plus a store that
+/// harvests the pass's live proofs without serving anything (the verified-pair index).
+pub struct ReconcileEvidence<'run, 'plan> {
+    pub carry: Option<PlanCarry<'plan>>,
+    pub store: Option<&'run mut dyn EvidenceSource>,
 }
 
-impl EvidenceSource for CarryAndHarvest<'_, '_> {
+impl EvidenceSource for ReconcileEvidence<'_, '_> {
     fn vouch(
         &mut self,
         local: &LocalInventory,
@@ -108,8 +108,10 @@ impl EvidenceSource for CarryAndHarvest<'_, '_> {
         strong: &BTreeSet<String>,
         spellings: &BTreeMap<String, String>,
     ) -> Vouched {
-        self.carry
-            .vouch(local, remote, comparison, strong, spellings)
+        match &mut self.carry {
+            Some(carry) => carry.vouch(local, remote, comparison, strong, spellings),
+            None => Vouched::default(),
+        }
     }
 
     fn observe_live(
@@ -120,8 +122,9 @@ impl EvidenceSource for CarryAndHarvest<'_, '_> {
         spellings: &BTreeMap<String, String>,
         read_started: std::time::SystemTime,
     ) {
-        self.store
-            .observe_live(local, remote, live, spellings, read_started);
+        if let Some(store) = self.store.as_deref_mut() {
+            store.observe_live(local, remote, live, spellings, read_started);
+        }
     }
 }
 

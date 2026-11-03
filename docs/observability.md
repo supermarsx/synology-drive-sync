@@ -142,6 +142,10 @@ directory.created              entry.deleted
 retry.scheduled                cancellation.requested
 run.partial                    entry.skipped                   entry.deferred
 result_record.failed
+reconcile.evidence             reconcile.carry_canary_mismatch
+pair_index.served              pair_index.canary_mismatch      pair_index.unusable
+pair_index.store_failed
+memory.tree_too_large          memory.budget_unchecked
 ```
 
 Every JSON log record has the same seven base fields. `operation_id` and `attempt` are `null` when
@@ -178,7 +182,15 @@ cancelled                 remote_refused_share_wide remote_real_path_unusable
 unclassified
 changed_during_run        delete_bound              server_copy_fallback      excluded
 upload_failed
+evidence_canary_mismatch  pair_index_unusable       pair_index_store_failed   tree_too_large_for_memory
 ```
+
+`reconcile.evidence` counts the pairs post-run reconciliation carried from the plan pass
+(`operations`) and verified live (`files`); `reconcile.carry_canary_mismatch` names a canary that
+disagreed. `pair_index.*` reports the [verified-pair index](pair-index.md): `served` with the pairs
+served and verified live, the others with the path and one of the reasons above.
+`memory.tree_too_large` carries the entry count and the estimate in bytes; `memory.budget_unchecked`
+says the host exposed no limits to check against.
 
 `remote_refused_share_wide` is the refusal breaker and `remote_real_path_unusable` is the link-shape
 breaker (see [Partial runs, deferrals and skips](#partial-runs-deferrals-and-skips)). A scope that is,

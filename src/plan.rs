@@ -342,6 +342,9 @@ pub struct SyncPlan {
     /// ([`crate::api::ScopedRemoteInventory::link_guard_unchecked`]). Zero means the link guard ran
     /// everywhere it was needed; more is a lasting, named warning.
     pub link_guard_unchecked: usize,
+    /// What the verified-pair index did for this plan's digest pass, when one was asked for.
+    /// Not the planner's to know: the caller sets it (`--pair-index`).
+    pub pair_index: Option<crate::pair_index::IndexReport>,
 }
 
 impl SyncPlan {
@@ -362,6 +365,7 @@ impl SyncPlan {
             upload_bytes: 0,
             skipped: Vec::new(),
             link_guard_unchecked: 0,
+            pair_index: None,
         }
     }
 
@@ -823,6 +827,7 @@ pub fn build_plan(
         upload_bytes: 0,
         skipped,
         link_guard_unchecked: 0,
+        pair_index: None,
     };
     let pairs = &resolution.pairs;
     let shield = &resolution.shield;
@@ -6392,6 +6397,7 @@ mod resync_ticket_tests {
             upload_bytes,
             skipped: Vec::new(),
             link_guard_unchecked: 0,
+            pair_index: None,
         }
     }
 

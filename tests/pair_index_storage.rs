@@ -1,0 +1,497 @@
+//! The verified-pair index's redb file under faults (perf-design §2.7, §6 "redb fault matrix").
+//!
+//! Each case damages, locks, hides or fills the file a previous run wrote and asserts the open
+//! gives exactly one named condition and either an empty, usable index or none at all: never a
+//! panic, and never evidence read from a file that did not verify.
+#![cfg(unix)]
+
+use std::collections::BTreeMap;
+use std::fs;
+use std::io::{Seek as _, SeekFrom, Write as _};
+use std::os::unix::fs::PermissionsExt as _;
+use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::time::{Duration, Instant};
+
+use synology_drive_sync::pair_index::{
+    Binding, IndexCommit, IndexMeta, PairIndex, PairRecord, RemoteSignal, SCHEMA, SEMANTICS_EPOCH,
+    StoredPair,
+};
+use synology_drive_sync::pair_index_redb::{
+    IndexPaths, MARKER, RedbPairIndex, decode_record, encode_record, prepare_directory,
+};
+
+struct Dir(PathBuf);
+
+impl Dir {
+    fn new(label: &str) -> Self {
+        let path = std::env::temp_dir().join(format!(
+            "sdsync-pairstore-{label}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&path).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
+        Self(path)
+    }
+}
+
+impl Drop for Dir {
+    fn drop(&mut self) {
+        let _ = fs::set_permissions(&self.0, fs::Permissions::from_mode(0o700));
+        let _ = fs::remove_dir_all(&self.0);
+    }
+}
+
+fn record(index: u64, generation: u64) -> PairRecord {
+    PairRecord {
+        size: index,
+        local_mtime_ns: 1_700_000_000_000_000_000 + index as i64,
+        local_ctime_ns: 1_700_000_000_000_000_000 + generation as i64,
+        device: 41,
+        inode: index,
+        remote_mtime: 1_700_000_000,
+        remote_ctime: Some(1_700_000_000 + generation as i64),
+        remote_crtime: None,
+        md5: [index as u8; 16],
+        verified_at: 1_700_000_000,
+        verified_at_nas: Some(1_700_000_000),
+        racy: false,
+    }
+}
+
+fn key(index: u64) -> String {
+    format!("folder-{:03}/file-{index:07}.bin", index % 97)
+}
+
+fn meta() -> IndexMeta {
+    IndexMeta {
+        schema: SCHEMA.to_owned(),
+        semantics_epoch: SEMANTICS_EPOCH,
+        binding: Binding {
+            profile: "photos".to_owned(),
+            source: "/volume1/photos".to_owned(),
+            source_device: 41,
+            remote: "/backup/photos".to_owned(),
+            server: "https://nas.example/ DS920".to_owned(),
+        },
+        remote_signal: RemoteSignal::Ctime,
+        canary_at: 0,
+    }
+}
+
+fn paths(dir: &Dir) -> IndexPaths {
+    prepare_directory(&dir.0).unwrap();
+    IndexPaths::new(&dir.0, "photos").unwrap()
+}
+
+/// Write `count` pairs of `generation` in one commit and close.
+fn write(dir: &Dir, count: u64, generation: u64) {
+    let opened = RedbPairIndex::open(paths(dir), 8);
+    let mut backend = opened.backend.expect("a usable index");
+    backend
+        .commit(IndexCommit {
+            clear: false,
+            remove: Vec::new(),
+            upsert: (0..count)
+                .map(|index| {
+                    (
+                        key(index),
+                        StoredPair {
+                            record: record(index, generation),
+                            remote_spelling: (index % 50 == 0).then(|| key(index).to_uppercase()),
+                        },
+                    )
+                })
+                .collect(),
+            meta: Some(meta()),
+        })
+        .unwrap();
+}
+
+/// Read every pair back, in key order.
+fn read_all(backend: &mut RedbPairIndex) -> BTreeMap<String, StoredPair> {
+    let mut keys = Vec::new();
+    backend
+        .for_each_key(&mut |key| keys.push(key.to_owned()))
+        .unwrap();
+    let mut pairs = BTreeMap::new();
+    for key in keys {
+        let pair = backend.get(&key).unwrap().expect("listed key has a pair");
+        pairs.insert(key, pair);
+    }
+    backend.finish_reads();
+    pairs
+}
+
+fn database(dir: &Dir) -> PathBuf {
+    dir.0.join("photos.redb")
+}
+
+#[test]
+fn pairs_round_trip_through_a_real_file_and_the_directory_is_claimed() {
+    let dir = Dir::new("roundtrip");
+    write(&dir, 500, 1);
+    let mode = fs::metadata(database(&dir)).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode, 0o600);
+    assert!(dir.0.join(MARKER).is_file());
+    let opened = RedbPairIndex::open(paths(&dir), 8);
+    assert!(opened.issues.is_empty(), "{:?}", opened.issues);
+    let mut backend = opened.backend.unwrap();
+    assert_eq!(backend.meta().unwrap(), Some(meta()));
+    let pairs = read_all(&mut backend);
+    assert_eq!(pairs.len(), 500);
+    assert_eq!(pairs[&key(7)].record, record(7, 1));
+    assert_eq!(
+        pairs[&key(50)].remote_spelling.as_deref(),
+        Some(key(50).to_uppercase().as_str())
+    );
+    let bytes = encode_record(&record(3, 9), false);
+    assert_eq!(decode_record(&bytes), Some((record(3, 9), false)));
+}
+
+/// What one damaged file must give: a named condition and a usable empty index, or a clean read
+/// of exactly what was written. Never a panic, never a partial or wrong read.
+fn assert_survives(dir: &Dir, case: &str) {
+    let opened = RedbPairIndex::open(paths(dir), 8);
+    let codes: Vec<&str> = opened.issues.iter().map(|issue| issue.code).collect();
+    let mut backend = opened
+        .backend
+        .unwrap_or_else(|| panic!("{case}: a damaged file is replaced, not refused: {codes:?}"));
+    let pairs = read_all(&mut backend);
+    if codes.is_empty() {
+        // The damage hit free space: what is read is what was written.
+        assert_eq!(pairs.len(), 2_000, "{case}");
+        for (index, (key_text, pair)) in pairs.iter().enumerate() {
+            let _ = index;
+            let number: u64 = key_text
+                .rsplit('-')
+                .next()
+                .and_then(|tail| tail.strip_suffix(".bin"))
+                .and_then(|digits| digits.parse().ok())
+                .unwrap();
+            assert_eq!(pair.record, record(number, 1), "{case}: {key_text}");
+        }
+    } else {
+        assert_eq!(codes, vec!["pair-index-corrupt"], "{case}");
+        assert!(
+            pairs.is_empty() || opened.clear,
+            "{case}: damaged evidence is never served"
+        );
+        let set_aside = fs::read_dir(&dir.0)
+            .unwrap()
+            .flatten()
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .contains(".redb.corrupt-")
+            })
+            .count();
+        assert!(set_aside <= 1, "{case}: one quarantined copy is kept");
+    }
+}
+
+#[test]
+fn a_truncated_file_is_named_set_aside_and_rebuilt() {
+    for cut in [4096_u64, 65_536, 1 << 20, 0] {
+        let dir = Dir::new("truncated");
+        write(&dir, 2_000, 1);
+        let length = fs::metadata(database(&dir)).unwrap().len();
+        let cut = if cut == 0 {
+            length / 2
+        } else {
+            cut.min(length - 1)
+        };
+        fs::OpenOptions::new()
+            .write(true)
+            .open(database(&dir))
+            .unwrap()
+            .set_len(cut)
+            .unwrap();
+        let opened = RedbPairIndex::open(paths(&dir), 8);
+        let codes: Vec<&str> = opened.issues.iter().map(|issue| issue.code).collect();
+        assert_eq!(codes, vec!["pair-index-corrupt"], "cut at {cut}");
+        let mut backend = opened.backend.expect("rebuilt empty");
+        assert!(read_all(&mut backend).is_empty());
+    }
+}
+
+#[test]
+fn an_overwritten_header_garbage_and_foreign_files_are_named() {
+    for (case, damage) in [
+        (
+            "header",
+            Box::new(|file: &mut fs::File| {
+                file.seek(SeekFrom::Start(0)).unwrap();
+                file.write_all(&[0x5a; 512]).unwrap();
+            }) as Box<dyn Fn(&mut fs::File)>,
+        ),
+        (
+            "garbage",
+            Box::new(|file: &mut fs::File| {
+                file.set_len(0).unwrap();
+                file.seek(SeekFrom::Start(0)).unwrap();
+                let bytes: Vec<u8> = (0..200_000_u32)
+                    .map(|value| (value.wrapping_mul(2_654_435_761) >> 24) as u8)
+                    .collect();
+                file.write_all(&bytes).unwrap();
+            }),
+        ),
+    ] {
+        let dir = Dir::new(case);
+        write(&dir, 2_000, 1);
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .open(database(&dir))
+            .unwrap();
+        damage(&mut file);
+        drop(file);
+        let opened = RedbPairIndex::open(paths(&dir), 8);
+        let codes: Vec<&str> = opened.issues.iter().map(|issue| issue.code).collect();
+        assert_eq!(codes, vec!["pair-index-corrupt"], "{case}");
+        assert!(opened.backend.is_some(), "{case}: rebuilt");
+    }
+}
+
+/// Deterministic pseudo-random positions, so a failure reproduces.
+fn positions(seed: u64, count: usize, length: u64) -> Vec<u64> {
+    let mut state = seed;
+    (0..count)
+        .map(|_| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state % length
+        })
+        .collect()
+}
+
+#[test]
+fn random_page_smashes_and_byte_flips_never_panic_or_misread() {
+    for (round, seed) in (0..20_u64).map(|round| (round, 0x9e37_79b9 + round)) {
+        for smash in [true, false] {
+            let dir = Dir::new("smash");
+            write(&dir, 2_000, 1);
+            let length = fs::metadata(database(&dir)).unwrap().len();
+            let mut file = fs::OpenOptions::new()
+                .write(true)
+                .open(database(&dir))
+                .unwrap();
+            for position in positions(seed, if smash { 1 } else { 8 }, length) {
+                file.seek(SeekFrom::Start(if smash {
+                    position & !4095
+                } else {
+                    position
+                }))
+                .unwrap();
+                if smash {
+                    file.write_all(&[0xa5; 4096]).unwrap();
+                } else {
+                    file.write_all(&[(position as u8) ^ 0xff]).unwrap();
+                }
+            }
+            drop(file);
+            eprintln!("case: round {round} smash={smash}");
+            assert_survives(&dir, &format!("round {round} smash={smash}"));
+        }
+    }
+}
+
+#[test]
+fn a_symlink_a_fifo_and_a_shared_mode_are_refused_by_name() {
+    let dir = Dir::new("unsafe");
+    let outside = Dir::new("unsafe-target");
+    let target = outside.0.join("elsewhere");
+    fs::write(&target, b"not ours").unwrap();
+    prepare_directory(&dir.0).unwrap();
+    std::os::unix::fs::symlink(&target, database(&dir)).unwrap();
+    let opened = RedbPairIndex::open(paths(&dir), 8);
+    assert!(opened.backend.is_none());
+    assert_eq!(opened.issues[0].code, "pair-index-unsafe");
+    assert_eq!(
+        fs::read(&target).unwrap(),
+        b"not ours",
+        "never written through"
+    );
+    fs::remove_file(database(&dir)).unwrap();
+
+    let status = Command::new("mkfifo").arg(database(&dir)).status();
+    if status.is_ok_and(|status| status.success()) {
+        let opened = RedbPairIndex::open(paths(&dir), 8);
+        assert!(opened.backend.is_none());
+        assert_eq!(opened.issues[0].code, "pair-index-unsafe");
+        fs::remove_file(database(&dir)).unwrap();
+    }
+
+    write(&dir, 10, 1);
+    fs::set_permissions(database(&dir), fs::Permissions::from_mode(0o644)).unwrap();
+    let opened = RedbPairIndex::open(paths(&dir), 8);
+    assert!(opened.backend.is_none());
+    assert_eq!(opened.issues[0].code, "pair-index-unsafe");
+    assert!(
+        opened.issues[0].cause.contains("644"),
+        "{}",
+        opened.issues[0].cause
+    );
+}
+
+#[test]
+fn a_read_only_file_is_named_and_left_alone() {
+    let dir = Dir::new("readonly");
+    write(&dir, 10, 1);
+    fs::set_permissions(database(&dir), fs::Permissions::from_mode(0o400)).unwrap();
+    // Root reads and writes past mode bits; the case cannot be made there.
+    if fs::OpenOptions::new()
+        .write(true)
+        .open(database(&dir))
+        .is_ok()
+    {
+        return;
+    }
+    let opened = RedbPairIndex::open(paths(&dir), 8);
+    assert!(opened.backend.is_none());
+    assert_eq!(opened.issues[0].code, "pair-index-readonly");
+}
+
+#[test]
+fn a_foreign_directory_is_refused_with_its_contents_named() {
+    let dir = Dir::new("foreign");
+    fs::write(dir.0.join("holiday.jpg"), b"x").unwrap();
+    let issue = prepare_directory(&dir.0).unwrap_err();
+    assert_eq!(issue.code, "pair-index-directory-unusable");
+    assert!(issue.cause.contains("holiday.jpg"), "{}", issue.cause);
+    let shared = Dir::new("shared");
+    fs::set_permissions(&shared.0, fs::Permissions::from_mode(0o770)).unwrap();
+    let issue = prepare_directory(&shared.0).unwrap_err();
+    assert!(
+        issue.cause.contains("writable by group or other"),
+        "{}",
+        issue.cause
+    );
+}
+
+/// The core waits for a short holder (a dashboard read) and then proceeds.
+#[test]
+fn the_core_waits_out_a_short_holder() {
+    let dir = Dir::new("lock");
+    write(&dir, 10, 1);
+    let holder = redb::Database::open(database(&dir)).unwrap();
+    let released = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_secs(2));
+        drop(holder);
+    });
+    let started = Instant::now();
+    let opened = RedbPairIndex::open(paths(&dir), 8);
+    released.join().unwrap();
+    assert!(opened.backend.is_some(), "{:?}", opened.issues);
+    assert!(started.elapsed() >= Duration::from_millis(1_500));
+}
+
+/// The child of the kill test: commit generation after generation until killed.
+#[test]
+#[ignore = "run by kill_nine_mid_commit_leaves_all_old_or_all_new"]
+fn commit_forever_until_killed() {
+    let Some(directory) = std::env::var_os("SDSYNC_TEST_INDEX_WRITER") else {
+        return;
+    };
+    // The parent owns the directory: this process is killed, so it must never remove it.
+    let dir = std::mem::ManuallyDrop::new(Dir(PathBuf::from(directory)));
+    let mut generation = 2;
+    loop {
+        write(&dir, 200_000, generation);
+        fs::write(dir.0.join("committed"), generation.to_string()).unwrap();
+        generation += 1;
+    }
+}
+
+#[test]
+fn kill_nine_mid_commit_leaves_all_old_or_all_new() {
+    for delay_ms in [150_u64, 400, 900, 1_700, 2_600] {
+        let dir = Dir::new("kill");
+        write(&dir, 200_000, 1);
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--ignored",
+                "--exact",
+                "commit_forever_until_killed",
+                "--nocapture",
+            ])
+            .env("SDSYNC_TEST_INDEX_WRITER", &dir.0)
+            .spawn()
+            .unwrap();
+        std::thread::sleep(Duration::from_millis(delay_ms));
+        child.kill().unwrap();
+        child.wait().unwrap();
+        let opened = RedbPairIndex::open(paths(&dir), 8);
+        assert!(
+            opened
+                .issues
+                .iter()
+                .all(|issue| issue.code == "pair-index-corrupt"),
+            "{:?}",
+            opened.issues
+        );
+        let mut backend = opened.backend.expect("usable after a kill");
+        let pairs = read_all(&mut backend);
+        if opened.clear || pairs.is_empty() {
+            continue;
+        }
+        let generations: std::collections::BTreeSet<i64> = pairs
+            .values()
+            .map(|pair| pair.record.local_ctime_ns - 1_700_000_000_000_000_000)
+            .collect();
+        assert_eq!(
+            generations.len(),
+            1,
+            "kill at {delay_ms} ms left a mix of generations {generations:?}"
+        );
+        assert_eq!(pairs.len(), 200_000);
+    }
+}
+
+/// A full volume: the write fails by name and the previous commit stays intact. Needs a small
+/// filesystem, given as `SDSYNC_TEST_FULL_DIR` (a size-limited tmpfs); skipped without one.
+#[test]
+fn a_full_volume_fails_the_store_by_name_and_keeps_the_previous_commit() {
+    let Some(full) = std::env::var_os("SDSYNC_TEST_FULL_DIR") else {
+        eprintln!("skipped: set SDSYNC_TEST_FULL_DIR to a small tmpfs to run this case");
+        return;
+    };
+    let dir = Dir(Path::new(&full).join(format!("full-{}", std::process::id())));
+    fs::create_dir_all(&dir.0).unwrap();
+    fs::set_permissions(&dir.0, fs::Permissions::from_mode(0o700)).unwrap();
+    write(&dir, 1_000, 1);
+    let mut failed = None;
+    for round in 2..200 {
+        let opened = RedbPairIndex::open(paths(&dir), 8);
+        let mut backend = opened.backend.expect("usable");
+        let result = backend.commit(IndexCommit {
+            upsert: (0..20_000)
+                .map(|index| {
+                    (
+                        format!("bulk-{round}-{index:08}-{}", "x".repeat(64)),
+                        StoredPair {
+                            record: record(index, 1),
+                            remote_spelling: None,
+                        },
+                    )
+                })
+                .collect(),
+            ..IndexCommit::default()
+        });
+        if let Err(issue) = result {
+            failed = Some(issue);
+            break;
+        }
+    }
+    let issue = failed.expect("the volume filled");
+    assert_eq!(issue.code, "pair-index-store-failed", "{issue:?}");
+    let opened = RedbPairIndex::open(paths(&dir), 8);
+    let mut backend = opened.backend.expect("the previous commit is intact");
+    let pairs = read_all(&mut backend);
+    assert_eq!(pairs[&key(5)].record, record(5, 1));
+}

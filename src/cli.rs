@@ -573,6 +573,31 @@ pub struct SyncBehaviorArgs {
     /// (`tree_too_large_for_memory`) before it is listed.
     #[arg(long, value_name = "MIB", hide = true, help_heading = "Sync")]
     pub memory_budget: Option<u64>,
+
+    /// Keep verified-pair evidence in DIRECTORY so unchanged files are not re-read every run.
+    #[arg(
+        long,
+        value_name = "DIRECTORY",
+        help_heading = "Sync",
+        long_help = "Keep a verified-pair index in DIRECTORY (one file per profile, `<profile>.redb`). After a content comparison proves a pair equal with two live MD5s, the facts both sides had are stored with the digest: local size, modification and status-change time, device and inode; NAS size, modification, change and creation time. A later run whose fresh facts still match exactly on both sides takes the stored digest instead of reading the file and asking the NAS to read its copy, so a run where nothing changed costs the listing, not a read of the whole share on both sides.\n\nA stored digest only ever suppresses an upload. It is MD5-only, so no deletion guard and no server-side copy can use it, and it is never stored for a pair that differed. Every run re-verifies a canary sample live (--pair-index-canary); a disagreement discards the whole index, re-verifies everything live in the same run and is reported as pair-index-canary-mismatch. Evidence older than --pair-index-max-age is re-verified, spread across the second half of that window. Content comparison only, and Unix only: Windows exposes no status-change time to a directory walk.\n\nThe directory must be private (no group or other write access) and is claimed with a .sdsync-pair-index marker; a directory holding anything else is refused. Every way the index cannot be used (locked, corrupt, unsafe, a full disk) is a named warning and a fully live run, never a failed one. Off unless given."
+    )]
+    pub pair_index: Option<PathBuf>,
+
+    /// Ignore the stored evidence for this run and rebuild it from live digests.
+    #[arg(long, requires = "pair_index", help_heading = "Sync")]
+    pub pair_index_refresh: bool,
+
+    /// Re-verify stored evidence older than DAYS (default 30), spread across the second half.
+    #[arg(long, value_name = "DAYS", requires = "pair_index", value_parser = clap::value_parser!(u32).range(1..=3650), help_heading = "Sync")]
+    pub pair_index_max_age: Option<u32>,
+
+    /// Stored pairs re-verified live every run as a canary (default 25).
+    #[arg(long, value_name = "N", requires = "pair_index", help_heading = "Sync")]
+    pub pair_index_canary: Option<usize>,
+
+    /// The index's page cache, in MiB (default 8, at most 64).
+    #[arg(long, value_name = "MIB", requires = "pair_index", value_parser = clap::value_parser!(u64).range(1..=64), hide = true, help_heading = "Sync")]
+    pub pair_index_cache_mib: Option<u64>,
 }
 
 /// How post-run reconciliation proves content. See [`SyncBehaviorArgs::reconcile`].

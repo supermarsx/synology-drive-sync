@@ -7,6 +7,11 @@ answers are the same as last time.
 
 `--status-cache DIR` stores those digests so an unchanged file need not be re-read and re-hashed.
 
+The [verified-pair index](pair-index.md) is the run-side counterpart and has a different contract:
+its evidence does decide whether a run uploads a file. It can only ever suppress an upload, keys on
+the local and NAS change times as well, and is checked by a canary on every run. The status cache
+neither reads nor writes it.
+
 ```bash
 synology-drive-sync status --profile photos --status-cache /var/packages/synology-drive-sync/var/state/cache/status
 ```

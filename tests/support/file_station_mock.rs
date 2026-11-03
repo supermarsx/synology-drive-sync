@@ -417,6 +417,17 @@ impl MockFileStation {
         );
     }
 
+    /// Delete a file from the NAS, as another client would.
+    #[allow(dead_code)]
+    pub fn remove_file(&self, path: &str) {
+        self.state
+            .lock()
+            .expect("mock state lock")
+            .files
+            .remove(path)
+            .expect("removed file exists");
+    }
+
     /// When the first `operation` request arrives, replace `path`'s content as a second writer
     /// would: keeping size and mtime, and moving ctime unless `keep_ctime` (a change no fact
     /// shows, which only a live digest can catch).

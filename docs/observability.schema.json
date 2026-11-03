@@ -13,6 +13,63 @@
     { "$ref": "#/$defs/resultRecord" }
   ],
   "$defs": {
+    "pairIndex": {
+      "type": "object",
+      "description": "What the verified-pair index (`--pair-index`) did for this run. A stored digest only ever suppresses an upload; every condition that kept the index from being used is in `issues` and the run verified those pairs live.",
+      "additionalProperties": false,
+      "required": ["state", "served", "verified_live", "racy", "expired", "canary_checked", "canary_inconclusive", "canary_mismatches", "oldest_evidence_epoch", "remote_change_signal", "stored", "removed", "issues"],
+      "properties": {
+        "state": {
+          "description": "`off`: not asked for, or not applicable to this compare mode. `cold`: no usable evidence yet (new, retired, discarded or repaired); this run filled it. `warm`: evidence was served. `refreshed`: `--pair-index-refresh`. `unusable`: the index could not be used (see `issues`); every pair was verified live. `local-only`: the NAS change time cannot be trusted, so only local reads were skipped.",
+          "enum": ["off", "cold", "warm", "refreshed", "unusable", "local-only"]
+        },
+        "served": { "description": "Pairs whose digests came from the index.", "$ref": "#/$defs/nonNegativeInteger" },
+        "verified_live": { "description": "Comparison pairs whose remote digest was computed live.", "$ref": "#/$defs/nonNegativeInteger" },
+        "racy": { "description": "Stored pairs whose facts matched but which were observed within two seconds of a write, so verified live.", "$ref": "#/$defs/nonNegativeInteger" },
+        "expired": { "description": "Stored pairs past the rolling max age, verified live.", "$ref": "#/$defs/nonNegativeInteger" },
+        "canary_checked": { "$ref": "#/$defs/nonNegativeInteger" },
+        "canary_inconclusive": { "$ref": "#/$defs/nonNegativeInteger" },
+        "canary_mismatches": { "description": "Canary pairs whose live digest disagreed with the index; any makes the run discard the index and verify every pair live.", "$ref": "#/$defs/nonNegativeInteger" },
+        "oldest_evidence_epoch": { "oneOf": [{ "type": "null" }, { "type": "integer" }] },
+        "remote_change_signal": { "oneOf": [{ "type": "null" }, { "enum": ["ctime", "local-only"] }] },
+        "stored": { "description": "Pairs written by this run's commit.", "$ref": "#/$defs/nonNegativeInteger" },
+        "removed": { "description": "Pairs removed by this run's commit (touched, changed or gone).", "$ref": "#/$defs/nonNegativeInteger" },
+        "issues": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["code", "severity", "path", "cause"],
+            "properties": {
+              "code": {
+                "enum": [
+                  "pair-index-locked",
+                  "pair-index-readonly",
+                  "pair-index-corrupt",
+                  "pair-index-format-unsupported",
+                  "pair-index-store-failed",
+                  "pair-index-unsafe",
+                  "pair-index-directory-unusable",
+                  "pair-index-unbound",
+                  "pair-index-canary-mismatch",
+                  "pair-index-remote-ctime-static",
+                  "pair-index-retired",
+                  "pair-index-compacted",
+                  "pair-index-compaction-failed",
+                  "pair-index-not-applicable",
+                  "pair-index-unsupported-platform",
+                  "pair-index-link-guard-unchecked",
+                  "pair-index-remote-ctime-unavailable"
+                ]
+              },
+              "severity": { "enum": ["info", "warning"] },
+              "path": { "type": "string" },
+              "cause": { "type": "string" }
+            }
+          }
+        }
+      }
+    },
     "nonNegativeInteger": {
       "type": "integer",
       "minimum": 0
@@ -681,6 +738,7 @@
       "required": ["summary", "actions", "skipped", "link_guard_unchecked"],
       "properties": {
         "summary": { "$ref": "#/$defs/planSummary" },
+        "pair_index": { "$ref": "#/$defs/pairIndex" },
         "link_guard_unchecked": {
           "description": "NAS folders this run listed, or passed through on the way to its scope, for which the NAS reported no real path, so a NAS link among their entries could not be told from a folder and is synced and deleted through like one. 0 means the link guard ran everywhere it was needed. A lasting, user-fixable warning: it never changes the outcome or the exit code.",
           "$ref": "#/$defs/nonNegativeInteger"
@@ -848,6 +906,10 @@
             "server_tasks_not_stopped": { "description": "Abandoned server-side MD5 or copy tasks whose stop could not be confirmed.", "$ref": "#/$defs/nonNegativeInteger" },
             "server_copy_fallbacks": { "description": "Planned server-side copies uploaded instead because DSM refused to start them.", "$ref": "#/$defs/nonNegativeInteger" }
           }
+        },
+        "pair_index": {
+          "description": "What the verified-pair index did, or `null` when none was asked for.",
+          "oneOf": [{ "type": "null" }, { "$ref": "#/$defs/pairIndex" }]
         },
         "reconciliation": {
           "description": "How the post-run reconciliation proved content, or `null` when the run did not reconcile (nothing was executed). Reconciliation re-lists both sides in full and verifies live every pair the run touched plus a canary sample; every other pair whose size, times and identity did not move on either side keeps the digests the plan pass proved (`carried`). A canary that disagrees makes the same pass re-verify every carried pair live and is named in `canary_mismatch`; it never changes the outcome or the exit code by itself.",

@@ -8,6 +8,26 @@ lists its own commits.
 
 ## Read this before upgrading
 
+- **Rust 1.90 or newer is needed to build from source** (was 1.88). The verified-pair index uses redb
+  4.4, which reports a damaged file as an error instead of crashing, and needs 1.90.
+- **Post-run reconciliation no longer re-reads the whole tree.** It still re-lists both sides in full,
+  but verifies live only the pairs the run touched plus a canary of 25; untouched pairs whose facts
+  did not move keep the plan pass's digests. A run that changed two files in 1,000 now asks the NAS for
+  27 checksums during reconciliation instead of 1,000. The result's new `reconciliation` object counts
+  both; `--reconcile full` restores the old pass. See
+  [Comparison, exclusions, and deletion](configuration/safety.md).
+- **A file whose permissions or attributes change while it is being read is deferred.** The checks
+  that bracket a read now include the status-change time, so a `chmod`, `chown` or extended-attribute
+  change during the read defers that file to the next run (`source-changed`) instead of uploading a
+  digest taken across the change.
+- **A tree too large for the memory a run may use is refused by name.** The run estimates its peak
+  memory after the local walk and again after the listing, against the cgroup limit and
+  `MemAvailable`. Over budget, it syncs nothing, exits `0` and reports one lasting deferral of `.`
+  with reason `tree-too-large-for-memory`, naming the entry counts, the estimate and the fix (split
+  the profile). On a DSM package a core killed with exit `137` is now recorded as `core_oom_killed`
+  (the cgroup's OOM counter moved) or `core_killed`, instead of `core_failed`.
+- **`--pair-index DIR` is new** (opt-in, Unix only). See [Verified-pair index](pair-index.md).
+
 - **Excluded files that already leaked to the NAS stay there; delete them by hand.** Exclude matching
   now covers cases an earlier release missed (a composed `é` rule against a decomposed `é` folder, a
   renamed folder's other spelling). Content that an exclude newly covers is left on the NAS exactly as

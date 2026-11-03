@@ -5,11 +5,14 @@ pub mod batch;
 pub mod cancel;
 pub mod digest_evidence;
 pub mod error;
+pub mod evidence_dir;
 pub mod integrity;
 pub mod local;
 pub mod memory_budget;
 pub mod observability;
 pub mod pair_index;
+#[cfg(unix)]
+pub mod pair_index_redb;
 pub mod path;
 pub mod plan;
 pub mod progress;
