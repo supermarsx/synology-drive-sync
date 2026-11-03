@@ -165,16 +165,19 @@ pub enum EventCode {
     ReconcileCarryCanaryMismatch,
     /// The verified-pair index vouched for comparison pairs: `operations` served, `files`
     /// verified live.
-    PairCacheServed,
+    PairIndexServed,
     /// A verified-pair index canary disagreed; the index was discarded and the run verified live.
-    PairCacheCanaryMismatch,
+    PairIndexCanaryMismatch,
     /// The verified-pair index could not be used (locked, corrupt, newer format, unsafe, bound to
     /// another profile); the run verified everything live.
-    PairCacheUnusable,
+    PairIndexUnusable,
     /// The verified-pair index could not be written; the previous one stays valid evidence.
-    PairCacheStoreFailed,
+    PairIndexStoreFailed,
     /// The tree needs more memory than the run may use; refused before the listing (SC-2).
     TreeTooLargeForMemory,
+    /// The memory budget could not be checked on this host (not Linux, `/proc` unreadable); the
+    /// run went ahead unchecked.
+    MemoryBudgetUnchecked,
 }
 
 impl EventCode {
@@ -183,7 +186,7 @@ impl EventCode {
     /// Exhaustive by construction: a new variant that is not listed here fails
     /// `every_event_code_has_a_stable_machine_and_human_name`, so no code can ship without a
     /// stable machine name and human message.
-    pub const ALL: [Self; 39] = [
+    pub const ALL: [Self; 40] = [
         Self::RunBuild,
         Self::RunStarted,
         Self::RunCompleted,
@@ -218,11 +221,12 @@ impl EventCode {
         Self::ResultRecordFailed,
         Self::ReconcileEvidence,
         Self::ReconcileCarryCanaryMismatch,
-        Self::PairCacheServed,
-        Self::PairCacheCanaryMismatch,
-        Self::PairCacheUnusable,
-        Self::PairCacheStoreFailed,
+        Self::PairIndexServed,
+        Self::PairIndexCanaryMismatch,
+        Self::PairIndexUnusable,
+        Self::PairIndexStoreFailed,
         Self::TreeTooLargeForMemory,
+        Self::MemoryBudgetUnchecked,
     ];
 
     /// The stable machine name, as `docs/observability.schema.json` publishes it.
@@ -262,11 +266,12 @@ impl EventCode {
             Self::ResultRecordFailed => "result_record.failed",
             Self::ReconcileEvidence => "reconcile.evidence",
             Self::ReconcileCarryCanaryMismatch => "reconcile.carry_canary_mismatch",
-            Self::PairCacheServed => "pair_cache.served",
-            Self::PairCacheCanaryMismatch => "pair_cache.canary_mismatch",
-            Self::PairCacheUnusable => "pair_cache.unusable",
-            Self::PairCacheStoreFailed => "pair_cache.store_failed",
+            Self::PairIndexServed => "pair_index.served",
+            Self::PairIndexCanaryMismatch => "pair_index.canary_mismatch",
+            Self::PairIndexUnusable => "pair_index.unusable",
+            Self::PairIndexStoreFailed => "pair_index.store_failed",
             Self::TreeTooLargeForMemory => "memory.tree_too_large",
+            Self::MemoryBudgetUnchecked => "memory.budget_unchecked",
         }
     }
 
@@ -310,16 +315,19 @@ impl EventCode {
             Self::ReconcileCarryCanaryMismatch => {
                 "a reconciliation canary disagreed with the plan pass; every pair was re-verified live"
             }
-            Self::PairCacheServed => "verified-pair index served",
-            Self::PairCacheCanaryMismatch => {
+            Self::PairIndexServed => "verified-pair index served",
+            Self::PairIndexCanaryMismatch => {
                 "a verified-pair index canary disagreed; the index was discarded and the run verified live"
             }
-            Self::PairCacheUnusable => {
+            Self::PairIndexUnusable => {
                 "the verified-pair index could not be used; the run verified everything live"
             }
-            Self::PairCacheStoreFailed => "the verified-pair index could not be written",
+            Self::PairIndexStoreFailed => "the verified-pair index could not be written",
             Self::TreeTooLargeForMemory => {
                 "the tree needs more memory than this run may use; split the profile"
+            }
+            Self::MemoryBudgetUnchecked => {
+                "the memory budget could not be checked on this host; the run went ahead unchecked"
             }
         }
     }
@@ -375,9 +383,9 @@ pub enum EventReason {
     /// Stored or carried evidence disagreed with a live digest while every fact matched.
     EvidenceCanaryMismatch,
     /// The verified-pair index could not be opened, read or trusted.
-    PairCacheUnusable,
+    PairIndexUnusable,
     /// The verified-pair index could not be written.
-    PairCacheStoreFailed,
+    PairIndexStoreFailed,
     /// The tree needs more memory than the run may use (SC-2).
     TreeTooLargeForMemory,
 }
@@ -422,8 +430,8 @@ impl EventReason {
         Self::Excluded,
         Self::UploadFailed,
         Self::EvidenceCanaryMismatch,
-        Self::PairCacheUnusable,
-        Self::PairCacheStoreFailed,
+        Self::PairIndexUnusable,
+        Self::PairIndexStoreFailed,
         Self::TreeTooLargeForMemory,
     ];
 
@@ -466,8 +474,8 @@ impl EventReason {
             Self::Excluded => "excluded",
             Self::UploadFailed => "upload_failed",
             Self::EvidenceCanaryMismatch => "evidence_canary_mismatch",
-            Self::PairCacheUnusable => "pair_cache_unusable",
-            Self::PairCacheStoreFailed => "pair_cache_store_failed",
+            Self::PairIndexUnusable => "pair_index_unusable",
+            Self::PairIndexStoreFailed => "pair_index_store_failed",
             Self::TreeTooLargeForMemory => "tree_too_large_for_memory",
         }
     }

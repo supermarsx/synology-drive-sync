@@ -837,6 +837,9 @@ pub enum DeferredReason {
     UnsupportedEntry,
     /// The NAS refuses this account the deletion (no permission); lasting until that changes.
     DeleteNotPermitted,
+    /// The tree needs more memory than the run may use; nothing was synced. Lasting until the
+    /// tree is split. The SDK does not run this check itself; the variant mirrors the engine's.
+    TreeTooLargeForMemory,
 }
 
 impl DeferredReason {
@@ -867,6 +870,7 @@ impl DeferredReason {
             Self::RemoteSkipped => sync::DeferReason::RemoteSkipped,
             Self::UnsupportedEntry => sync::DeferReason::UnsupportedEntry,
             Self::DeleteNotPermitted => sync::DeferReason::DeleteNotPermitted,
+            Self::TreeTooLargeForMemory => sync::DeferReason::TreeTooLargeForMemory,
         }
     }
 }
@@ -891,6 +895,7 @@ impl From<sync::DeferReason> for DeferredReason {
             sync::DeferReason::RemoteSkipped => Self::RemoteSkipped,
             sync::DeferReason::UnsupportedEntry => Self::UnsupportedEntry,
             sync::DeferReason::DeleteNotPermitted => Self::DeleteNotPermitted,
+            sync::DeferReason::TreeTooLargeForMemory => Self::TreeTooLargeForMemory,
         }
     }
 }

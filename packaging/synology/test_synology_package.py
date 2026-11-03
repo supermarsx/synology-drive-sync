@@ -24415,6 +24415,13 @@ fi
         )
         run_state = self.state_fields(self.real_var / "state/run.state")
         self.assertIn("the sync core was killed", run_state.get("detail", ""), run_state)
+        # Named as a kill, not as an ordinary core failure: core_oom_killed when this cgroup's
+        # OOM counter moved, core_killed when nothing proves who sent the SIGKILL.
+        self.assertIn(run_state.get("reason"), ("core_killed", "core_oom_killed"), run_state)
+        if "out-of-memory killer" in run_state.get("detail", ""):
+            self.assertEqual(run_state.get("reason"), "core_oom_killed", run_state)
+        else:
+            self.assertEqual(run_state.get("reason"), "core_killed", run_state)
         killed = self.ctl_events("core_killed", "scope=big ")
         self.assertEqual(len(killed), 1, self.ctl_dump())
         self.assertEqual(killed[0].get("level"), "error")

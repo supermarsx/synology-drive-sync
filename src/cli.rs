@@ -565,6 +565,14 @@ pub struct SyncBehaviorArgs {
     /// Untouched pairs reconciliation re-verifies live as a canary (default 25).
     #[arg(long, value_name = "N", hide = true, help_heading = "Sync")]
     pub reconcile_canary: Option<usize>,
+
+    /// Memory this run may use, in MiB, instead of what the kernel reports (CLI only).
+    ///
+    /// Linux reads the cgroup limit and `MemAvailable`; elsewhere the check is skipped unless this
+    /// is given. A tree whose estimated need exceeds the budget is refused by name
+    /// (`tree_too_large_for_memory`) before it is listed.
+    #[arg(long, value_name = "MIB", hide = true, help_heading = "Sync")]
+    pub memory_budget: Option<u64>,
 }
 
 /// How post-run reconciliation proves content. See [`SyncBehaviorArgs::reconcile`].

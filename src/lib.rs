@@ -7,6 +7,7 @@ pub mod digest_evidence;
 pub mod error;
 pub mod integrity;
 pub mod local;
+pub mod memory_budget;
 pub mod observability;
 pub mod path;
 pub mod plan;

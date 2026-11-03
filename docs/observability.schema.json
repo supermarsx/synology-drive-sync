@@ -164,11 +164,12 @@
             "result_record.failed",
             "reconcile.evidence",
             "reconcile.carry_canary_mismatch",
-            "pair_cache.served",
-            "pair_cache.canary_mismatch",
-            "pair_cache.unusable",
-            "pair_cache.store_failed",
-            "memory.tree_too_large"
+            "pair_index.served",
+            "pair_index.canary_mismatch",
+            "pair_index.unusable",
+            "pair_index.store_failed",
+            "memory.tree_too_large",
+            "memory.budget_unchecked"
           ]
         },
         "operation_id": { "$ref": "#/$defs/nullableNonNegativeInteger" },
@@ -232,8 +233,8 @@
         "excluded",
         "upload_failed",
         "evidence_canary_mismatch",
-        "pair_cache_unusable",
-        "pair_cache_store_failed",
+        "pair_index_unusable",
+        "pair_index_store_failed",
         "tree_too_large_for_memory"
       ]
     },
@@ -798,11 +799,11 @@
           "type": "boolean"
         },
         "outcome": {
-          "description": "The run's verdict. `complete`: everything converged. `partial`: everything converged except the transient paths in `deferred` (every reason but `unrepresentable-name`, `unsupported-local-entry`, `listing-incomplete`, `remote-unreadable`, `local-permission-denied`, `delete-not-permitted`, `remote-refused`, `remote-skipped`, `unsupported-entry` and `case-rename-pending`), which the next run picks up; the process exits 3. Lasting skips and lasting deferrals are reported and logged but leave the outcome `complete` and the exit code 0. `failed`: the run stopped (see `failed`).",
+          "description": "The run's verdict. `complete`: everything converged. `partial`: everything converged except the transient paths in `deferred` (every reason but `unrepresentable-name`, `unsupported-local-entry`, `listing-incomplete`, `remote-unreadable`, `local-permission-denied`, `delete-not-permitted`, `remote-refused`, `remote-skipped`, `unsupported-entry`, `case-rename-pending` and `tree-too-large-for-memory`), which the next run picks up; the process exits 3. Lasting skips and lasting deferrals are reported and logged but leave the outcome `complete` and the exit code 0. `failed`: the run stopped (see `failed`).",
           "enum": ["complete", "partial", "failed"]
         },
         "deferred": {
-          "description": "Each path this run left for the next run, by name. A deferred path was neither uploaded nor deleted, and nothing else was deleted on its account. Any transient reason makes the outcome `partial`; `unrepresentable-name`, `unsupported-local-entry`, `listing-incomplete`, `remote-unreadable`, `local-permission-denied`, `delete-not-permitted`, `remote-refused`, `remote-skipped`, `unsupported-entry` and `case-rename-pending` recur every run until someone acts, so they are reported without changing the outcome.",
+          "description": "Each path this run left for the next run, by name. A deferred path was neither uploaded nor deleted, and nothing else was deleted on its account. Any transient reason makes the outcome `partial`; `unrepresentable-name`, `unsupported-local-entry`, `listing-incomplete`, `remote-unreadable`, `local-permission-denied`, `delete-not-permitted`, `remote-refused`, `remote-skipped`, `unsupported-entry`, `case-rename-pending` and `tree-too-large-for-memory` recur every run until someone acts, so they are reported without changing the outcome.",
           "type": "array",
           "items": { "$ref": "#/$defs/deferredPath" }
         },
@@ -955,7 +956,7 @@
           "type": "string"
         },
         "reason": {
-          "description": "`source-changed`: the local file changed while it was read or sent. `source-vanished`: deleted locally during the run. `source-unreadable`: locked or briefly unreadable (transient). `unsupported-local-entry`: not a regular file or directory the sync carries. `remote-digest-unavailable`: the NAS could not checksum it. `remote-unreadable`: the NAS refuses this one file to the account (lasting until its permissions change). `remote-changed`: the NAS entry changed after planning and was left as found. `unrepresentable-name`: a NAS name this host's filesystem cannot hold; never deleted on that account. `listing-incomplete`: its NAS folder listed fewer entries than it counted, so no deletion was made there. `server-copy-failed`: the NAS-side copy finished with an error. `delete-failed`: the NAS refused the deletion. `remote-refused`: the NAS refuses this name or this account's access to it (lasting until it is renamed or its permissions change; three or more refusals with one cause that are more than half the attempts fail the run instead). `local-permission-denied`: this account may not read it (lasting until its permissions change). `case-rename-pending`: a case-only rename on the NAS was not made or did not finish, and the content keeps syncing under the NAS spelling (lasting until the NAS spelling is changed or the blocking entry removed). `remote-skipped`: a NAS name or link this tool will not follow; never deleted, overwritten or descended (lasting). `unsupported-entry`: a local name, path or entry kind Synology Drive cannot hold (a refused name, a path too long once the destination is prepended, a non-UTF-8 name, a FIFO, socket or device, a modification time before 1970); lasting until it is renamed or excluded. `delete-not-permitted`: DSM refused to delete it for permission (lasting until the folder's rights change).",
+          "description": "`source-changed`: the local file changed while it was read or sent. `source-vanished`: deleted locally during the run. `source-unreadable`: locked or briefly unreadable (transient). `unsupported-local-entry`: not a regular file or directory the sync carries. `remote-digest-unavailable`: the NAS could not checksum it. `remote-unreadable`: the NAS refuses this one file to the account (lasting until its permissions change). `remote-changed`: the NAS entry changed after planning and was left as found. `unrepresentable-name`: a NAS name this host's filesystem cannot hold; never deleted on that account. `listing-incomplete`: its NAS folder listed fewer entries than it counted, so no deletion was made there. `server-copy-failed`: the NAS-side copy finished with an error. `delete-failed`: the NAS refused the deletion. `remote-refused`: the NAS refuses this name or this account's access to it (lasting until it is renamed or its permissions change; three or more refusals with one cause that are more than half the attempts fail the run instead). `local-permission-denied`: this account may not read it (lasting until its permissions change). `case-rename-pending`: a case-only rename on the NAS was not made or did not finish, and the content keeps syncing under the NAS spelling (lasting until the NAS spelling is changed or the blocking entry removed). `remote-skipped`: a NAS name or link this tool will not follow; never deleted, overwritten or descended (lasting). `unsupported-entry`: a local name, path or entry kind Synology Drive cannot hold (a refused name, a path too long once the destination is prepended, a non-UTF-8 name, a FIFO, socket or device, a modification time before 1970); lasting until it is renamed or excluded. `delete-not-permitted`: DSM refused to delete it for permission (lasting until the folder's rights change). `tree-too-large-for-memory`: recorded against `.`, the whole tree needs more memory than the run may use, so nothing was listed, compared or written; the detail names the entry counts, the estimate and the available memory (lasting until the profile is split).",
           "enum": [
             "source-changed",
             "source-vanished",
@@ -973,7 +974,8 @@
             "case-rename-pending",
             "remote-skipped",
             "unsupported-entry",
-            "delete-not-permitted"
+            "delete-not-permitted",
+            "tree-too-large-for-memory"
           ]
         },
         "detail": {

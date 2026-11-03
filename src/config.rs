@@ -361,6 +361,8 @@ pub struct ResolvedSyncBehavior {
     pub reconcile: ReconcileArg,
     /// Untouched pairs reconciliation re-verifies live as a canary.
     pub reconcile_canary: usize,
+    /// `--memory-budget`, in MiB. Command line only.
+    pub memory_budget_mib: Option<u64>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -808,6 +810,7 @@ fn resolve_behavior(
         reconcile_canary: arguments
             .reconcile_canary
             .unwrap_or(synology_drive_sync::digest_evidence::DEFAULT_CANARY),
+        memory_budget_mib: arguments.memory_budget,
     })
 }
 
@@ -2259,6 +2262,7 @@ mod scope_and_force_tests {
             scope: None,
             reconcile: None,
             reconcile_canary: None,
+            memory_budget: None,
         }
     }
 

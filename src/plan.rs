@@ -345,6 +345,26 @@ pub struct SyncPlan {
 }
 
 impl SyncPlan {
+    /// A plan that does nothing, for a run refused before anything was compared.
+    pub fn nothing(source_root: PathBuf, scope: Scope, rules: IgnoreRules) -> Self {
+        Self {
+            source_root,
+            scope,
+            rules,
+            pre_deletes: Vec::new(),
+            creates: Vec::new(),
+            copies: Vec::new(),
+            uploads: Vec::new(),
+            post_deletes: Vec::new(),
+            renames: Vec::new(),
+            unchanged_files: 0,
+            protected_entries: 0,
+            upload_bytes: 0,
+            skipped: Vec::new(),
+            link_guard_unchecked: 0,
+        }
+    }
+
     pub fn delete_count(&self) -> usize {
         self.pre_deletes.len() + self.post_deletes.len()
     }

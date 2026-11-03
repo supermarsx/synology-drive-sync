@@ -23,6 +23,7 @@ use synology_drive_sync::batch::{BatchJob, ValidatedBatch};
 use synology_drive_sync::cancel::CancellationToken;
 use synology_drive_sync::digest_evidence::{self, EvidenceReport, PlanCarry, TouchedPaths};
 use synology_drive_sync::local::{self, IgnoreRules, LocalEntry};
+use synology_drive_sync::memory_budget;
 use synology_drive_sync::observability::{
     BUILD, BearerTokenSource, BoundedText, DecodeFault, EventCode, EventLogger, EventMetrics,
     EventReason, FileLogConfig, LogEvent, LogFormat as EventLogFormat, LogLevel as EventLogLevel,
@@ -2859,6 +2860,18 @@ fn prepare_and_run_sync_reporting(
             ..EventMetrics::default()
         }),
     )?;
+    // SC-2, before the listing: the remote side is assumed to mirror the local one.
+    let memory = MemoryGate {
+        profile,
+        settings,
+        scope: &scope,
+        rules: &rules,
+        plan_only,
+        logger: logger.as_ref(),
+    };
+    if memory.refuses(&local, None, plan_out, completion_out)? {
+        return Ok(());
+    }
 
     log_event(
         logger.as_ref(),
@@ -2967,6 +2980,10 @@ fn prepare_and_run_sync_reporting(
                 },
             ),
         )?;
+        // SC-2 again, with the remote count, before any digest is taken.
+        if memory.refuses(&local, Some(&remote), plan_out, completion_out)? {
+            return Ok(());
+        }
 
         // Before any digest is computed and before anything is planned: a scope that names nothing is
         // not a plan with no work in it.
@@ -3239,6 +3256,95 @@ fn prepare_and_run_sync_reporting(
     finish_authenticated_operation(&mut client, operation)
 }
 
+/// SC-2: the memory check a run makes after its walk and after its listing.
+struct MemoryGate<'run> {
+    profile: &'run str,
+    settings: &'run config::ResolvedSync,
+    scope: &'run plan::Scope,
+    rules: &'run IgnoreRules,
+    plan_only: bool,
+    logger: Option<&'run Arc<EventLogger>>,
+}
+
+impl MemoryGate<'_> {
+    /// Check the tree against the memory this run may use. Over budget, record the refusal (a
+    /// plan that does nothing and one lasting `tree-too-large-for-memory` deferral of `.`) and
+    /// answer true: the run stops there, exits 0 and is named as a warning. A check that could
+    /// not be made is named (stderr and a `memory.budget_unchecked` event) and the run goes on.
+    fn refuses(
+        &self,
+        local: &local::LocalInventory,
+        remote: Option<&api::RemoteInventory>,
+        plan_out: &mut Option<SyncPlan>,
+        completion_out: &mut Option<SyncCompletion>,
+    ) -> Result<bool> {
+        let probe = match memory_budget::probe(self.settings.behavior.memory_budget_mib) {
+            Ok(probe) => probe,
+            Err(cause) => {
+                // Named once per run, at the first check.
+                if remote.is_none() {
+                    // Every run on a host without the limits says this, so it is a `-v` line and
+                    // a logged event rather than noise on every plain run.
+                    if !self.settings.output.quiet && self.settings.output.verbosity > 0 {
+                        eprintln!("info: {cause}");
+                    }
+                    log_event(
+                        self.logger,
+                        LogEvent::new(EventLogLevel::Info, EventCode::MemoryBudgetUnchecked)
+                            .profile(self.profile),
+                    )?;
+                }
+                return Ok(false);
+            }
+        };
+        let paths: u64 = local.entries.keys().map(|key| key.len() as u64).sum();
+        let average = paths.checked_div(local.entries.len() as u64).unwrap_or(0);
+        let check = memory_budget::assess(
+            local.entries.len() as u64,
+            remote.map(|remote| remote.entries.len() as u64),
+            average,
+            !self.plan_only,
+            probe,
+        );
+        let memory_budget::BudgetCheck::TooLarge(figures) = check else {
+            return Ok(false);
+        };
+        let text = figures.refusal_text();
+        if !self.settings.output.quiet {
+            eprintln!("warning: {text}");
+        }
+        log_event(
+            self.logger,
+            LogEvent::new(EventLogLevel::Warn, EventCode::TreeTooLargeForMemory)
+                .reason(EventReason::TreeTooLargeForMemory)
+                .profile(self.profile)
+                .path(".")
+                .metrics(EventMetrics {
+                    operations: figures.local_entries.saturating_add(figures.remote_entries),
+                    bytes: figures.need_bytes,
+                    ..EventMetrics::default()
+                }),
+        )?;
+        let record = DeferredPath {
+            relative: ".".to_owned(),
+            reason: sync::DeferReason::TreeTooLargeForMemory,
+            detail: text,
+        };
+        let mut plan = SyncPlan::nothing(
+            self.settings.source.clone(),
+            self.scope.clone(),
+            self.rules.clone(),
+        );
+        if self.plan_only {
+            sync::record_deferrals_in_plan(&mut plan, std::slice::from_ref(&record));
+        } else {
+            *completion_out = Some(SyncCompletion::deferred_only(vec![record], 0));
+        }
+        *plan_out = Some(plan);
+        Ok(true)
+    }
+}
+
 /// One `entry.deferred` per path the run left for the next run, and one `entry.skipped` per path
 /// the plan declined to carry, each with its path and reason.
 ///
@@ -3319,6 +3425,7 @@ fn defer_event_reason(reason: sync::DeferReason) -> EventReason {
         sync::DeferReason::RemoteChanged => EventReason::RemoteChanged,
         sync::DeferReason::ListingIncomplete => EventReason::RemoteResponseInvalid,
         sync::DeferReason::ServerCopyFailed => EventReason::ServerCopyFailed,
+        sync::DeferReason::TreeTooLargeForMemory => EventReason::TreeTooLargeForMemory,
     }
 }
 
@@ -10476,6 +10583,7 @@ mod tests {
                 force_resync: false,
                 reconcile: cli::ReconcileArg::Carry,
                 reconcile_canary: synology_drive_sync::digest_evidence::DEFAULT_CANARY,
+                memory_budget_mib: None,
             },
             safety: config::ResolvedSafety {
                 delete: false,
@@ -14480,6 +14588,7 @@ mod status_command_tests {
                 force_resync: false,
                 reconcile: cli::ReconcileArg::Carry,
                 reconcile_canary: synology_drive_sync::digest_evidence::DEFAULT_CANARY,
+                memory_budget_mib: None,
             },
             safety: config::ResolvedSafety {
                 delete: false,

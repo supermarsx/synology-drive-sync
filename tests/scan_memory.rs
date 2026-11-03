@@ -13,8 +13,10 @@
 //! # What the bytes are made of
 //!
 //! Measured for a 99-byte relative path, per local+remote entry pair. Windows and Linux/glibc agree
-//! to within 1% (**1,466** and **1,451**), so the figure is the data structures, not the allocator.
-//! It projects to 27 MiB of the 32 MiB ceiling at the shipped budget.
+//! to within 1% (**1,466** and **1,451** before the verified-pair facts), so the figure is the data
+//! structures, not the allocator. The facts the verified-pair evidence needs
+//! (`LocalEntry::times`, `RemoteEntry::{ctime,crtime}_seconds` and `digest_nas_time`) raised it to
+//! **1,583** on Windows, which projects to 30 MiB of the 32 MiB ceiling at the shipped budget.
 //!
 //! The itemised breakdown that used to live here totalled 1,336 and is **not** re-derived below,
 //! because it no longer adds up and re-deriving it honestly means attributing every struct change
@@ -222,5 +224,23 @@ fn the_scan_budget_is_derived_from_a_measured_per_request_memory_ceiling() {
         projected.saturating_mul(4) >= REQUEST_MEMORY_CEILING_BYTES,
         "the budget projects to only {projected} bytes against a {REQUEST_MEMORY_CEILING_BYTES}-byte \
          ceiling, which truncates scans that would fit; re-derive it from the measurement"
+    );
+
+    // SC-2's run-level estimator (`memory_budget`) must never be below the measurement either: an
+    // optimistic estimate lets the kernel's OOM killer, not the named refusal, end the run.
+    let path_bytes = relative_path(0).len() as u64;
+    let modelled = 2
+        * (synology_drive_sync::memory_budget::ENTRY_FIXED_BYTES
+            + synology_drive_sync::memory_budget::PATH_COPIES_PER_ENTRY * path_bytes);
+    println!("memory_budget models {modelled} bytes per pair at {path_bytes}-byte paths");
+    assert!(
+        modelled >= per_pair as u64,
+        "memory_budget models {modelled} bytes per entry pair, below the measured {per_pair}; \
+         raise ENTRY_FIXED_BYTES"
+    );
+    assert!(
+        modelled <= per_pair as u64 * 3 / 2,
+        "memory_budget models {modelled} bytes per pair, over 1.5x the measured {per_pair}; it \
+         would refuse trees that fit"
     );
 }

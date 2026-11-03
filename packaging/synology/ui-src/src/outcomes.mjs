@@ -33,6 +33,8 @@ const REASONS = Object.freeze({
   // (test/reason-vocabulary.test.mjs reads those writers and fails on a token
   // with no row here).
   core_failed: ["the sync core exited with an error", "Review Logs for the cause, then run again."],
+  core_oom_killed: ["the sync core was killed by the out-of-memory killer: the source holds more entries than this NAS has memory for", "Split the profile into smaller ones (a scope or subfolder profiles), then run again."],
+  core_killed: ["the sync core was killed (SIGKILL) without reporting an error, possibly out of memory", "Check the DSM system log for the out-of-memory killer; split the profile if the source is very large."],
   profiles_skipped: ["some profiles were not run because they failed their pre-run checks", "Fix the profiles listed above, then run again."],
   runner_error: ["the package runner stopped before the core started, without naming a cause", "Review Logs, then run again."],
   audit_unavailable: ["the mandatory audit record could not be written", "Check free space on the volume, then repair or reinstall the package."],
@@ -108,6 +110,11 @@ const REASONS = Object.freeze({
   server_copy_fallback: ["server-side copy was refused", "Files re-upload on the next run."],
   excluded: ["files were excluded", "Check the exclude rules if unexpected."],
   upload_failed: ["some uploads failed", "They retry on the next run."],
+  evidence_canary_mismatch: ["a stored or carried checksum disagreed with a live one, so the run re-checked every file live", "Nothing to do for this run; if it repeats, review Logs and report it."],
+  pair_index_unusable: ["the verified-checksum index could not be used, so every file was checked live (slower, still correct)", "Review Logs for the cause; the index is rebuilt on its own."],
+  pair_index_store_failed: ["the verified-checksum index could not be saved, so the next run checks files live again", "Check free space on the volume holding the package."],
+  tree_too_large_for_memory: ["the source holds more entries than this run has memory for, so nothing was synced", "Split the profile into smaller ones (a scope or subfolder profiles)."],
+  "tree-too-large-for-memory": ["not synced until you fix this: the source holds more entries than this run has memory for, so nothing was synced", "Split the profile into smaller ones (a scope or subfolder profiles)."],
   "source-changed": ["files changed during the run", "They sync next run."],
   "source-vanished": ["a source file disappeared during the run", "Nothing to do unless it was unintended."],
   "source-unreadable": ["a source file could not be read", "Check its permissions."],

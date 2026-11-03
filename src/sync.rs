@@ -715,6 +715,10 @@ pub enum DeferReason {
     /// DSM refused to delete this entry for permission (105 once the session is proven alive, or
     /// 407). That recurs until someone changes the folder's rights, so it is lasting.
     DeleteNotPermitted,
+    /// The whole tree (recorded against `.`, the source root) needs more memory than this run may
+    /// use, so nothing was listed, compared or written (SC-2). Lasting: it recurs until the
+    /// profile is split, and a partial run would re-trigger a realtime profile forever.
+    TreeTooLargeForMemory,
 }
 
 impl DeferReason {
@@ -737,6 +741,7 @@ impl DeferReason {
             Self::RemoteSkipped => "remote-skipped",
             Self::UnsupportedEntry => "unsupported-entry",
             Self::DeleteNotPermitted => "delete-not-permitted",
+            Self::TreeTooLargeForMemory => "tree-too-large-for-memory",
         }
     }
 
@@ -784,6 +789,9 @@ impl DeferReason {
             Self::DeleteNotPermitted => {
                 "the NAS does not let this account delete it; kept until its permissions change"
             }
+            Self::TreeTooLargeForMemory => {
+                "the tree needs more memory than this run may use, so nothing was synced; split the profile with a scope or into subfolder profiles"
+            }
         }
     }
 
@@ -806,11 +814,12 @@ impl DeferReason {
                 | Self::RemoteSkipped
                 | Self::UnsupportedEntry
                 | Self::CaseRenamePending
+                | Self::TreeTooLargeForMemory
         )
     }
 
     /// Every reason, so readers can be checked against the whole vocabulary.
-    pub const ALL: [Self; 17] = [
+    pub const ALL: [Self; 18] = [
         Self::SourceChanged,
         Self::SourceVanished,
         Self::SourceUnreadable,
@@ -828,6 +837,7 @@ impl DeferReason {
         Self::RemoteSkipped,
         Self::UnsupportedEntry,
         Self::DeleteNotPermitted,
+        Self::TreeTooLargeForMemory,
     ];
 
     /// The reason a failure reading one local file defers it, or `None` when the failure is not
