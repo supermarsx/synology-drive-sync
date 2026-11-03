@@ -7,8 +7,11 @@
 //!
 //! - `window`: daily windows and DST (port of `routine_window_state`).
 
+// TEMPORARY while the modules land one by one; removed once `--daemon` wires them.
+#![allow(dead_code)]
 #![deny(clippy::unwrap_used, clippy::expect_used)]
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
 pub(crate) mod routines;
+pub(crate) mod state;
 pub(crate) mod window;
