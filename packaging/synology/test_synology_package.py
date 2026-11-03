@@ -23399,11 +23399,25 @@ fi
         stopped = self.shell(self.lifecycle, "stop", timeout=15)
         self.assertEqual(stopped.returncode, 0, stopped.stdout + stopped.stderr)
 
+    # A core that writes SIZE bytes every 0.2 s from one process. It must not
+    # spawn a child per beat: the kernel folds a reaped child's I/O into its
+    # parent's /proc/PID/io, and each /bin/sleep of a shell loop added about
+    # 4 KiB of loader reads -- 20 KB a second, which is real progress at the
+    # 16 KiB floor whenever a test-compressed heartbeat tick took more than a
+    # second (a busy CI runner, bash), so the "noise" core read as working.
+    @staticmethod
+    def f3_paced_core(stop: Path, size: int) -> str:
+        return (
+            "exec python3 -c 'import os, sys, time\n"
+            'sink = os.open("/dev/null", os.O_WRONLY)\n'
+            "while not os.path.exists(sys.argv[1]):\n"
+            f'    os.write(sink, b"x" * {size}); time.sleep(0.2)\n'
+            f"' {shlex.quote(str(stop))}\n"
+        )
+
     def test_a_core_that_only_makes_noise_is_flagged_stalled(self) -> None:
         stop = self.root / "noisy-core.stop"
-        run = self.f3_heartbeat_run(
-            f'while [ ! -e "{stop}" ]; do /bin/sleep 0.2; printf x > /dev/null; done\nexit 0\n'
-        )
+        run = self.f3_heartbeat_run(self.f3_paced_core(stop, 1))
         run_state = self.real_var / "state/run.state"
         try:
             self.wait_for_state(run_state, lambda f: f.get("state") == "running", timeout=30)
@@ -23439,12 +23453,12 @@ fi
             self.f3_heartbeat_finish(run, stop)
 
     def test_a_slow_max_rate_lowers_the_progress_floor(self) -> None:
-        # About 4 KiB a tick is under 16 KiB, but over a 10 B/s profile's whole
-        # minute (600 bytes): that run is progressing, not stalled.
+        # 2 KB a second is under 16 KiB for any tick shorter than 8 s, but over
+        # a 10 B/s profile's whole minute (600 bytes) for any tick longer than
+        # 0.3 s: that run is progressing, not stalled.
         stop = self.root / "slow-core.stop"
         run = self.f3_heartbeat_run(
-            'chunk=$(/bin/dd if=/dev/zero bs=2048 count=1 2>/dev/null | /usr/bin/tr "\\0" x)\n'
-            f'while [ ! -e "{stop}" ]; do /bin/sleep 0.2; printf "%s" "$chunk" > /dev/null; done\nexit 0\n',
+            self.f3_paced_core(stop, 400),
             profile_options=("--max-rate", "10"),
         )
         run_state = self.real_var / "state/run.state"
