@@ -131,6 +131,26 @@ fn database(dir: &Dir) -> PathBuf {
     dir.0.join("photos.redb")
 }
 
+/// redb's debug assertions walk every page at open, before anything verified them, and panic on a
+/// page a release build reports as an error. Without this manifest line the fault matrix below
+/// would test code that never ships (and fail on panics that never happen in a release).
+#[test]
+fn redb_is_built_without_debug_assertions_in_every_profile() {
+    let manifest = fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml"))
+        .expect("the manifest");
+    let section = manifest
+        .split("[profile.dev.package.redb]")
+        .nth(1)
+        .expect("Cargo.toml keeps a [profile.dev.package.redb] section");
+    let section = section.split("\n[").next().unwrap_or(section);
+    assert!(
+        section
+            .lines()
+            .any(|line| line.trim() == "debug-assertions = false"),
+        "[profile.dev.package.redb] must set debug-assertions = false"
+    );
+}
+
 #[test]
 fn pairs_round_trip_through_a_real_file_and_the_directory_is_claimed() {
     let dir = Dir::new("roundtrip");
