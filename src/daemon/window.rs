@@ -313,7 +313,8 @@ mod tests {
     /// `Sun 2026-03-08 03:00` -- the shape the shell suite compares against.
     fn shown(clock: &dyn LocalClock, epoch: i64) -> String {
         let fields = clock.fields(epoch).unwrap();
-        let name = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"][usize::from(fields.weekday) - 1];
+        let name =
+            ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"][usize::from(fields.weekday) - 1];
         format!(
             "{name} {} {:02}:{:02}",
             fields.day,
@@ -368,12 +369,34 @@ mod tests {
         assert_eq!(shown(&ny, 1_772_953_200), "Sun 2026-03-08 03:00");
         // Lord Howe moves by thirty minutes: +10:30 standard, +11 summer.
         let lh = zone("Australia/Lord_Howe");
-        assert_eq!(lh.fields(local_epoch(&lh, "2026-07-01T12:00")).unwrap().offset, 630);
-        assert_eq!(lh.fields(local_epoch(&lh, "2026-12-01T12:00")).unwrap().offset, 660);
+        assert_eq!(
+            lh.fields(local_epoch(&lh, "2026-07-01T12:00"))
+                .unwrap()
+                .offset,
+            630
+        );
+        assert_eq!(
+            lh.fields(local_epoch(&lh, "2026-12-01T12:00"))
+                .unwrap()
+                .offset,
+            660
+        );
         // Lisbon: WET in winter, WEST in summer.
         let lisbon = zone("Europe/Lisbon");
-        assert_eq!(lisbon.fields(local_epoch(&lisbon, "2026-01-15T12:00")).unwrap().offset, 0);
-        assert_eq!(lisbon.fields(local_epoch(&lisbon, "2026-07-15T12:00")).unwrap().offset, 60);
+        assert_eq!(
+            lisbon
+                .fields(local_epoch(&lisbon, "2026-01-15T12:00"))
+                .unwrap()
+                .offset,
+            0
+        );
+        assert_eq!(
+            lisbon
+                .fields(local_epoch(&lisbon, "2026-07-15T12:00"))
+                .unwrap()
+                .offset,
+            60
+        );
     }
 
     #[test]
@@ -394,7 +417,9 @@ mod tests {
         assert_eq!(parse_minutes("00:00"), Some(0));
         assert_eq!(parse_minutes("23:59"), Some(1_439));
         assert_eq!(parse_minutes("09:05"), Some(545));
-        for bad in ["24:00", "29:00", "1:00", "01:60", "01-00", "", "01:000", "3a:00"] {
+        for bad in [
+            "24:00", "29:00", "1:00", "01:60", "01-00", "", "01:000", "3a:00",
+        ] {
             assert_eq!(parse_minutes(bad), None, "{bad}");
         }
         assert_eq!(
@@ -415,7 +440,14 @@ mod tests {
     #[test]
     fn unreadable_clock_fails_closed() {
         assert_eq!(
-            window_state("1,2,3,4,5,6,7", "00:00", "23:59", 1_000, "none", &BrokenClock),
+            window_state(
+                "1,2,3,4,5,6,7",
+                "00:00",
+                "23:59",
+                1_000,
+                "none",
+                &BrokenClock
+            ),
             Err(WindowError::ClockUnavailable)
         );
         assert_eq!(
@@ -438,7 +470,10 @@ mod tests {
             900,
         );
         assert_eq!(
-            sunday.iter().map(|(e, _, _)| shown(&UTC, *e)).collect::<Vec<_>>(),
+            sunday
+                .iter()
+                .map(|(e, _, _)| shown(&UTC, *e))
+                .collect::<Vec<_>>(),
             [
                 "Sun 2026-10-04 23:00",
                 "Sun 2026-10-11 23:00",
@@ -446,7 +481,10 @@ mod tests {
             ]
         );
         assert_eq!(
-            sunday.iter().map(|(_, d, _)| d.as_str()).collect::<Vec<_>>(),
+            sunday
+                .iter()
+                .map(|(_, d, _)| d.as_str())
+                .collect::<Vec<_>>(),
             ["2026-10-04", "2026-10-11", "2026-10-18"]
         );
         let weekdays = window_runs(
@@ -462,7 +500,10 @@ mod tests {
         for (epoch, _, _) in &weekdays {
             let local = shown(&UTC, *epoch);
             assert!(local.ends_with(" 23:00"), "{local}");
-            assert!(!local.starts_with("Sat") && !local.starts_with("Sun"), "{local}");
+            assert!(
+                !local.starts_with("Sat") && !local.starts_with("Sun"),
+                "{local}"
+            );
         }
     }
 
@@ -579,7 +620,9 @@ mod tests {
             300,
         );
         assert_eq!(
-            wide.iter().map(|(e, _, _)| shown(&ny, *e)).collect::<Vec<_>>(),
+            wide.iter()
+                .map(|(e, _, _)| shown(&ny, *e))
+                .collect::<Vec<_>>(),
             [
                 "Sat 2026-10-31 12:00",
                 "Sun 2026-11-01 01:30",
@@ -743,8 +786,15 @@ mod tests {
     fn a_gap_window_that_already_ran_today_stays_closed() {
         let ny = zone("America/New_York");
         let after_gap = local_epoch(&ny, "2026-03-08T03:10");
-        let state =
-            window_state("1,2,3,4,5,6,7", "02:00", "02:30", after_gap, "2026-03-08", &ny).unwrap();
+        let state = window_state(
+            "1,2,3,4,5,6,7",
+            "02:00",
+            "02:30",
+            after_gap,
+            "2026-03-08",
+            &ny,
+        )
+        .unwrap();
         assert!(!state.open && !state.due);
         assert_eq!(state.note, None);
     }
