@@ -2243,6 +2243,7 @@ mod tests {
                     device: 2049,
                     inode,
                 },
+                times: Default::default(),
                 content_md5: None,
             },
         );
@@ -2254,6 +2255,9 @@ mod tests {
                 kind: EntryKind::File,
                 size,
                 mtime_seconds: mtime_ms.div_euclid(1000),
+                ctime_seconds: None,
+                crtime_seconds: None,
+                digest_nas_time: None,
                 mount_point_type: None,
                 content_md5: None,
             },

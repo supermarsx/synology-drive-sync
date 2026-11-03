@@ -2550,6 +2550,55 @@ pub fn populate_plan_digests_with_listings(
     incomplete: &[String],
     cancellation: &CancellationToken,
 ) -> Result<Vec<DeferredPath>> {
+    populate_plan_digests_evidenced(
+        client,
+        local,
+        remote,
+        rules,
+        DigestSelection {
+            compare,
+            server_copy,
+            delete,
+            incomplete,
+        },
+        None,
+        cancellation,
+    )
+    .map(|(deferred, _)| deferred)
+}
+
+/// What a digest pass selects for: the run's compare mode and the facts its selection depends on.
+#[derive(Clone, Copy, Debug)]
+pub struct DigestSelection<'a> {
+    pub compare: CompareMode,
+    pub server_copy: bool,
+    pub delete: bool,
+    /// Folders DSM listed short; see [`populate_plan_digests_with_listings`].
+    pub incomplete: &'a [String],
+}
+
+/// [`populate_plan_digests_with_listings`], letting `evidence` vouch for comparison pairs instead
+/// of both being read live. See [`crate::digest_evidence`].
+///
+/// Only content mode consults `evidence`: a forced run compares nothing, and the metadata modes
+/// read no content. The returned report says what the evidence did, including a canary
+/// disagreement, after which every vouched pair was re-verified live in this same pass.
+pub fn populate_plan_digests_evidenced(
+    client: &ApiClient,
+    local: &mut LocalInventory,
+    remote: &mut RemoteInventory,
+    rules: &IgnoreRules,
+    selection: DigestSelection<'_>,
+    evidence: Option<&mut dyn crate::digest_evidence::EvidenceSource>,
+    cancellation: &CancellationToken,
+) -> Result<(Vec<DeferredPath>, crate::digest_evidence::EvidenceReport)> {
+    let DigestSelection {
+        compare,
+        server_copy,
+        delete,
+        incomplete,
+    } = selection;
+    let mut report = crate::digest_evidence::EvidenceReport::default();
     let mut deferred = Vec::new();
     // A remote file whose deletion a short listing withholds is not worth its guard's download,
     // and a content-mode deletion planned without one fails the plan. Taken out up front, by name,
@@ -2576,7 +2625,7 @@ pub fn populate_plan_digests_with_listings(
     match compare {
         CompareMode::Content => {
             client.require_content_fingerprint_api()?;
-            let (mut comparison, mut strong) = crate::plan::select_plan_digests(
+            let (mut comparison, mut strong, spellings) = crate::plan::select_plan_digests_paired(
                 local,
                 remote,
                 rules,
@@ -2584,34 +2633,46 @@ pub fn populate_plan_digests_with_listings(
                 delete,
                 incomplete,
             );
-            // Local strength mirrors remote strength, entry for entry: MD5 where the remote side
-            // will only carry MD5, full strength everywhere else. Uploads promoted out of the
-            // comparison set are raised by `promote_upload_fingerprints_deferring` before
-            // execution. Hours of this send DSM nothing, so the session is kept alive through it.
-            let failed_local =
-                client.keep_session_alive_while(crate::api::SESSION_KEEPALIVE_INTERVAL, || {
-                    crate::local::populate_content_md5_selective_deferring(
-                        local,
-                        &comparison,
-                        cancellation,
-                    )
-                })?;
-            for (relative, error) in failed_local {
-                let reason =
-                    DeferReason::for_local_error(&error).unwrap_or(DeferReason::SourceUnreadable);
-                comparison.remove(&relative);
-                strong.remove(&relative);
-                deferred.push(withhold(local, relative, reason, &error));
-            }
-            let failed_remote = client.populate_remote_content_digests_deferring(
+            let vouched = match evidence {
+                Some(source) => source.vouch(local, remote, &comparison, &strong, &spellings),
+                None => crate::digest_evidence::Vouched::default(),
+            };
+            crate::digest_evidence::apply_vouched(local, remote, &mut comparison, &vouched.served);
+            report.served = vouched.served.len();
+            report.verified_live = comparison.difference(&strong).count();
+            populate_digests_live(
+                client,
+                local,
                 remote,
-                &comparison,
-                &strong,
+                &mut comparison,
+                &mut strong,
+                &mut deferred,
                 cancellation,
             )?;
-            for (relative, error) in failed_remote {
-                let reason = remote_digest_reason(&error);
-                deferred.push(withhold(local, relative, reason, &error));
+            if !vouched.canaries.is_empty() {
+                crate::digest_evidence::check_canaries(
+                    local,
+                    remote,
+                    &vouched.canaries,
+                    &mut report,
+                );
+            }
+            if report.canary_mismatch.is_some() && !vouched.served.is_empty() {
+                // The evidence was wrong about a pair whose facts all held, so none of what it
+                // vouched for is trusted: every pair is read again, now, on both sides it vouched.
+                let mut redo = crate::digest_evidence::undo_vouched(local, remote, &vouched.served);
+                report.fell_back = true;
+                report.served = 0;
+                report.verified_live += redo.len();
+                populate_digests_live(
+                    client,
+                    local,
+                    remote,
+                    &mut redo,
+                    &mut BTreeSet::new(),
+                    &mut deferred,
+                    cancellation,
+                )?;
             }
         }
         CompareMode::Force if delete => {
@@ -2633,7 +2694,45 @@ pub fn populate_plan_digests_with_listings(
         }
         CompareMode::Force | CompareMode::Metadata | CompareMode::SizeOnly => {}
     }
-    Ok(deferred)
+    Ok((deferred, report))
+}
+
+/// Hash every local file still without a digest and ask File Station for the `comparison` and
+/// `strong` remote digests, withholding each file either side could not produce.
+fn populate_digests_live(
+    client: &ApiClient,
+    local: &mut LocalInventory,
+    remote: &mut RemoteInventory,
+    comparison: &mut BTreeSet<String>,
+    strong: &mut BTreeSet<String>,
+    deferred: &mut Vec<DeferredPath>,
+    cancellation: &CancellationToken,
+) -> Result<()> {
+    // Local strength mirrors remote strength, entry for entry: MD5 where the remote side
+    // will only carry MD5, full strength everywhere else. Uploads promoted out of the
+    // comparison set are raised by `promote_upload_fingerprints_deferring` before
+    // execution. Hours of this send DSM nothing, so the session is kept alive through it.
+    let failed_local = client
+        .keep_session_alive_while(crate::api::SESSION_KEEPALIVE_INTERVAL, || {
+            crate::local::populate_content_md5_selective_deferring(local, comparison, cancellation)
+        })?;
+    for (relative, error) in failed_local {
+        let reason = DeferReason::for_local_error(&error).unwrap_or(DeferReason::SourceUnreadable);
+        comparison.remove(&relative);
+        strong.remove(&relative);
+        deferred.push(withhold(local, relative, reason, &error));
+    }
+    let failed_remote = client.populate_remote_content_digests_deferring(
+        remote,
+        comparison,
+        strong,
+        cancellation,
+    )?;
+    for (relative, error) in failed_remote {
+        let reason = remote_digest_reason(&error);
+        deferred.push(withhold(local, relative, reason, &error));
+    }
+    Ok(())
 }
 
 /// Why a deletion inside a folder DSM listed short was withheld.
@@ -3851,6 +3950,7 @@ mod tests {
             size: 1,
             mtime_ms: 1,
             identity: Default::default(),
+            times: Default::default(),
             content_md5: None,
         }
     }
@@ -6990,6 +7090,7 @@ mod tests {
                             size: 1,
                             mtime_ms: 1_000,
                             identity: Default::default(),
+                            times: Default::default(),
                             content_md5: None,
                         },
                     )
@@ -7013,6 +7114,9 @@ mod tests {
                             kind: EntryKind::Directory,
                             size: 0,
                             mtime_seconds: 0,
+                            ctime_seconds: None,
+                            crtime_seconds: None,
+                            digest_nas_time: None,
                             mount_point_type: None,
                             content_md5: None,
                         },

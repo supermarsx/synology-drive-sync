@@ -127,6 +127,7 @@ fn local_inventory(count: usize) -> LocalInventory {
                 size: 4096,
                 mtime_ms: 1_762_000_000_000,
                 identity: Default::default(),
+                times: Default::default(),
                 content_md5: None,
             },
         );
@@ -150,6 +151,9 @@ fn remote_inventory(count: usize) -> RemoteInventory {
                 kind: EntryKind::File,
                 size: 4096,
                 mtime_seconds: 1_762_000_000,
+                ctime_seconds: None,
+                crtime_seconds: None,
+                digest_nas_time: None,
                 mount_point_type: None,
                 content_md5: None,
             },

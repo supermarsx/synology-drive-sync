@@ -553,6 +553,26 @@ pub struct SyncBehaviorArgs {
         long_help = "Restrict the run to one SOURCE-relative path, naming either a folder (its whole subtree) or a single file. The path is relative to SOURCE: it is not absolute and not a pattern. Entries outside the scope are neither compared nor modified.\n\nMirror deletion is restricted to the scope as well: with --delete, only remote-only entries inside the scope are considered, never the rest of the destination. The deletion guards still apply and are evaluated against the scoped counts, so scope-mirroring a folder whose local contents were all removed still requires --allow-empty-source.\n\nBecause only the scope is scanned, the check for paths that differ only by letter case covers the scope alone. A scoped run cannot create a collision outside it, but a clean scoped result is not a whole-tree result.\n\nThis never implies --compare force. Scoping selects what is examined; it does not change how it is compared."
     )]
     pub scope: Option<String>,
+
+    /// How post-run reconciliation proves content (operator escape hatch, not a profile key).
+    ///
+    /// `carry` (the default) re-lists both sides in full, verifies live every path the run
+    /// touched plus a canary sample, and carries the plan pass's digests for untouched pairs whose
+    /// facts did not move. `full` re-verifies every pair live, as before.
+    #[arg(long, value_enum, hide = true, help_heading = "Sync")]
+    pub reconcile: Option<ReconcileArg>,
+
+    /// Untouched pairs reconciliation re-verifies live as a canary (default 25).
+    #[arg(long, value_name = "N", hide = true, help_heading = "Sync")]
+    pub reconcile_canary: Option<usize>,
+}
+
+/// How post-run reconciliation proves content. See [`SyncBehaviorArgs::reconcile`].
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, ValueEnum)]
+pub enum ReconcileArg {
+    #[default]
+    Carry,
+    Full,
 }
 
 #[derive(Debug, Args)]

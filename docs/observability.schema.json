@@ -161,7 +161,14 @@
             "run.partial",
             "entry.skipped",
             "entry.deferred",
-            "result_record.failed"
+            "result_record.failed",
+            "reconcile.evidence",
+            "reconcile.carry_canary_mismatch",
+            "pair_cache.served",
+            "pair_cache.canary_mismatch",
+            "pair_cache.unusable",
+            "pair_cache.store_failed",
+            "memory.tree_too_large"
           ]
         },
         "operation_id": { "$ref": "#/$defs/nullableNonNegativeInteger" },
@@ -223,7 +230,11 @@
         "delete_bound",
         "server_copy_fallback",
         "excluded",
-        "upload_failed"
+        "upload_failed",
+        "evidence_canary_mismatch",
+        "pair_cache_unusable",
+        "pair_cache_store_failed",
+        "tree_too_large_for_memory"
       ]
     },
     "buildIdentity": {
@@ -836,6 +847,42 @@
             "server_tasks_not_stopped": { "description": "Abandoned server-side MD5 or copy tasks whose stop could not be confirmed.", "$ref": "#/$defs/nonNegativeInteger" },
             "server_copy_fallbacks": { "description": "Planned server-side copies uploaded instead because DSM refused to start them.", "$ref": "#/$defs/nonNegativeInteger" }
           }
+        },
+        "reconciliation": {
+          "description": "How the post-run reconciliation proved content, or `null` when the run did not reconcile (nothing was executed). Reconciliation re-lists both sides in full and verifies live every pair the run touched plus a canary sample; every other pair whose size, times and identity did not move on either side keeps the digests the plan pass proved (`carried`). A canary that disagrees makes the same pass re-verify every carried pair live and is named in `canary_mismatch`; it never changes the outcome or the exit code by itself.",
+          "oneOf": [
+            { "type": "null" },
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["mode", "carried", "verified_live", "canary_checked", "canary_inconclusive", "canary_mismatch", "fell_back_to_full"],
+              "properties": {
+                "mode": { "description": "`carry`, or `full` under the operator escape hatch `--reconcile full`.", "enum": ["carry", "full"] },
+                "carried": { "description": "Pairs whose plan-pass digests were carried.", "$ref": "#/$defs/nonNegativeInteger" },
+                "verified_live": { "description": "Pairs whose remote digest reconciliation computed live.", "$ref": "#/$defs/nonNegativeInteger" },
+                "canary_checked": { "$ref": "#/$defs/nonNegativeInteger" },
+                "canary_inconclusive": { "description": "Canary pairs that could not be read live (deferred, vanished).", "$ref": "#/$defs/nonNegativeInteger" },
+                "canary_mismatch": {
+                  "oneOf": [
+                    { "type": "null" },
+                    {
+                      "type": "object",
+                      "additionalProperties": false,
+                      "required": ["code", "path", "vouched_md5_prefix", "local_md5_prefix", "remote_md5_prefix"],
+                      "properties": {
+                        "code": { "const": "reconcile-carry-canary-mismatch" },
+                        "path": { "type": "string" },
+                        "vouched_md5_prefix": { "type": "string", "pattern": "^[0-9a-f]{0,12}$" },
+                        "local_md5_prefix": { "type": "string", "pattern": "^[0-9a-f]{0,12}$" },
+                        "remote_md5_prefix": { "oneOf": [{ "type": "null" }, { "type": "string", "pattern": "^[0-9a-f]{0,12}$" }] }
+                      }
+                    }
+                  ]
+                },
+                "fell_back_to_full": { "type": "boolean" }
+              }
+            }
+          ]
         },
         "elapsed_ms": { "$ref": "#/$defs/nonNegativeInteger" }
       }

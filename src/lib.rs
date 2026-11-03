@@ -3,6 +3,7 @@
 pub mod api;
 pub mod batch;
 pub mod cancel;
+pub mod digest_evidence;
 pub mod error;
 pub mod integrity;
 pub mod local;

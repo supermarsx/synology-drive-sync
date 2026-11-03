@@ -19,7 +19,7 @@ use thiserror::Error;
 use crate::cli::{
     AuthenticationArgs, CompareArg, ConnectionArgs, CredentialProfileArgs, DoctorArgs, DoctorLevel,
     LogFormat, LogLevel, NetworkArgs, OutputArgs, OutputFormat, ProgressMode, REMOTE_LOG_TOKEN_ENV,
-    RemoteLogMode, SafetyArgs, SyncArgs, SyncBehaviorArgs,
+    ReconcileArg, RemoteLogMode, SafetyArgs, SyncArgs, SyncBehaviorArgs,
 };
 
 const MAX_CONFIG_BYTES: usize = 1024 * 1024;
@@ -356,6 +356,11 @@ pub struct ResolvedSyncBehavior {
     /// a persisted unconditional re-upload would overwrite the whole destination on every
     /// scheduled run, with nothing in the configuration reading as destructive.
     pub force_resync: bool,
+    /// How post-run reconciliation proves content. Command line only: an operator escape hatch
+    /// and a test hook, never a profile key.
+    pub reconcile: ReconcileArg,
+    /// Untouched pairs reconciliation re-verifies live as a canary.
+    pub reconcile_canary: usize,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -799,6 +804,10 @@ fn resolve_behavior(
         // Never resolved from arguments or a profile. `resync` sets it on the settings it has
         // already planned and had confirmed; nothing else can reach it.
         force_resync: false,
+        reconcile: arguments.reconcile.unwrap_or_default(),
+        reconcile_canary: arguments
+            .reconcile_canary
+            .unwrap_or(synology_drive_sync::digest_evidence::DEFAULT_CANARY),
     })
 }
 
@@ -2248,6 +2257,8 @@ mod scope_and_force_tests {
             jobs: None,
             excludes: Vec::new(),
             scope: None,
+            reconcile: None,
+            reconcile_canary: None,
         }
     }
 
