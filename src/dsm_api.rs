@@ -13275,6 +13275,18 @@ fn record_pre_relay_activity(stage: &str, code: &str, status: u16) -> BridgeResu
 }
 
 pub(crate) fn main_entry() -> ExitCode {
+    // The realtime watcher and its probe touch no network and no package state, so they are
+    // dispatched before anything else this process sets up.
+    let mut early = std::env::args_os().skip(1);
+    match early.next() {
+        Some(mode) if mode == "--watch" => {
+            return synology_drive_sync::watch::cli::watch_main(&early.collect::<Vec<_>>());
+        }
+        Some(mode) if mode == "--watch-probe" => {
+            return synology_drive_sync::watch::cli::probe_main(&early.collect::<Vec<_>>());
+        }
+        _ => {}
+    }
     // Same reasoning as the CLI: install the TLS provider first, and refuse to
     // run without one rather than discovering it inside a queued job. This
     // process serves the CGI and executes queued connection work, so a late
