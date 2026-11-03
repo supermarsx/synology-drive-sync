@@ -397,7 +397,7 @@ const _: () = assert!(
 // their own, without leaving items behind that exist only to be checked and would otherwise
 // need an `#[allow(dead_code)]` marking a constant unused whose whole purpose is to be used.
 //
-// Verified on 1.88.0 and stable: clean under `-D warnings`, and still fails the build when
+// Verified on 1.90.0 and stable: clean under `-D warnings`, and still fails the build when
 // the invariant is violated.
 #[cfg(target_os = "linux")]
 #[allow(clippy::assertions_on_constants)]

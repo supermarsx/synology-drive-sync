@@ -2,7 +2,7 @@
 name = "synology-drive-sync"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.88"
+rust-version = "1.90"
 description = "Lean one-way folder sync to Synology Drive-backed folders through File Station WebAPI"
 license = "MIT"
 readme = "readme.md"

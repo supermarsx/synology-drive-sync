@@ -113,7 +113,7 @@ dedicated CI packaging gate also rebuilds twice and compares bundle hashes for d
 
 ## Native x86-64 example
 
-Build both binaries with Rust 1.88 or newer and a matching musl linker:
+Build both binaries with Rust 1.90 or newer and a matching musl linker:
 
 ```bash
 rustup target add x86_64-unknown-linux-musl
@@ -141,15 +141,15 @@ copying a path blindly.
 
 ## ARMv7 cross-build example
 
-The supported release/local cross-build path uses Rust 1.88.0, Zig 0.16.0, and
+The supported release/local cross-build path uses Rust 1.90.0, Zig 0.16.0, and
 `cargo-zigbuild` 0.23.3:
 
 ```bash
-rustup toolchain install 1.88.0 --profile minimal \
+rustup toolchain install 1.90.0 --profile minimal \
   --target armv7-unknown-linux-musleabihf
 cargo install --locked cargo-zigbuild --version 0.23.3
 
-cargo +1.88.0 zigbuild \
+cargo +1.90.0 zigbuild \
   --release --locked \
   --package synology-drive-sync \
   --bins \

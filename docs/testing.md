@@ -77,8 +77,8 @@ Coverage uses the exact Rust and `cargo-llvm-cov` versions in the tracked
 Install those prerequisites before running a report:
 
 ```bash
-rustup toolchain install 1.88.0 --component llvm-tools-preview
-cargo +1.88.0 install cargo-llvm-cov --version 0.9.0 --locked
+rustup toolchain install 1.90.0 --component llvm-tools-preview
+cargo +1.90.0 install cargo-llvm-cov --version 0.9.0 --locked
 ```
 
 Run the full report or the same hard check used by CI:

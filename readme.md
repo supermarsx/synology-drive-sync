@@ -6,7 +6,7 @@
 [![Scheduled dependency audit](https://github.com/supermarsx/synology-drive-sync/actions/workflows/security.yml/badge.svg)](https://github.com/supermarsx/synology-drive-sync/actions/workflows/security.yml)
 [![Latest release](https://img.shields.io/github/v/release/supermarsx/synology-drive-sync)](https://github.com/supermarsx/synology-drive-sync/releases/latest)
 [![License](https://img.shields.io/github/license/supermarsx/synology-drive-sync)](https://github.com/supermarsx/synology-drive-sync/blob/main/license.md)
-[![Rust](https://img.shields.io/badge/rust-1.88%2B%20%C2%B7%20edition%202024-orange.svg)](https://github.com/supermarsx/synology-drive-sync/blob/main/Cargo.toml)
+[![Rust](https://img.shields.io/badge/rust-1.90%2B%20%C2%B7%20edition%202024-orange.svg)](https://github.com/supermarsx/synology-drive-sync/blob/main/Cargo.toml)
 [![Platforms](https://img.shields.io/badge/platforms-Linux%20%7C%20macOS%20%7C%20Windows%20%7C%20DSM%207-blue.svg)](https://supermarsx.github.io/synology-drive-sync/installation.html)
 
 `synology-drive-sync` is a finite, one-way synchronization engine. It sends an ordinary readable
