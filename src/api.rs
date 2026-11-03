@@ -17490,6 +17490,10 @@ FplE
         StopAfter(usize),
         /// Read the whole body, then hold the connection without answering.
         NeverAnswer,
+        /// Read nothing of the body for this long, then read it all and answer success: a body
+        /// small enough for the socket buffers is handed over at once, and reaches the server
+        /// only later.
+        ReadAfter(Duration),
     }
 
     /// A server answering discovery, login and `getinfo` like DSM, and every upload as
@@ -17604,6 +17608,9 @@ FplE
         let mut body = received.split_off(header_end);
         if head.contains("multipart/form-data") {
             uploads.fetch_add(1, Ordering::AcqRel);
+            if let UploadServerBehaviour::ReadAfter(delay) = behaviour {
+                thread::sleep(delay);
+            }
             // Large reads, so the pacing sleeps stay well above the platform timer resolution.
             let chunk = 256 * 1024;
             loop {
@@ -17741,15 +17748,23 @@ FplE
     }
 
     /// The body is handed over long before DSM has read it when the socket buffers can hold
-    /// much of it. 4 MiB read at 1 MiB/s with a one-second timeout: on Linux, whose buffers
-    /// autotune into megabytes, the last byte left the client seconds before the server took it,
-    /// and the wait for the answer used to end a transfer that was still moving.
+    /// it: the last byte leaves the client, and the server takes it later. The wait for the answer
+    /// used to start at that hand-off, so a transfer still on its way was ended as "DSM did not
+    /// answer".
+    ///
+    /// Modelled exactly rather than with a slow reader: a 48 KiB body fits the default loopback
+    /// socket buffers of Linux, macOS and Windows, so the client hands it all over at once, and
+    /// the server takes none of it for two seconds, twice the timeout. The old wait ends the
+    /// attempt at one second; the drain allowance for 48 KiB at the 16 KiB/s floor (three
+    /// seconds) lets it succeed. A slow *reader* instead made the platforms' different socket
+    /// buffering decide when the client could next hand bytes over, which tripped the one-second
+    /// stall window on macOS x86_64 before any answer was due.
     #[test]
     fn an_upload_still_draining_from_the_socket_buffers_is_not_cut_by_the_response_wait() {
-        let size = 4 * 1024 * 1024;
+        let size = 48 * 1024;
         let (path, local) = sized_upload_source("p4-drain", size);
         let server = behaving_upload_server(
-            UploadServerBehaviour::ReadAt(1024 * 1024),
+            UploadServerBehaviour::ReadAfter(Duration::from_secs(2)),
             local.size,
             local.mtime_ms.div_euclid(1000),
             UPLOAD_SERVER_BACKSTOP,
