@@ -85,7 +85,6 @@ impl Launcher for FakeLauncher {
                 records: Vec::new(),
                 record_error: None,
                 oom_proven: None,
-                elapsed: Duration::ZERO,
                 last_phase: None,
             })));
         });
@@ -110,7 +109,6 @@ impl MutationRunner for SlowMutations {
 
 struct Harness {
     root: PathBuf,
-    home: PathBuf,
     var: PathBuf,
     tx: Sender<Msg>,
     handle: Option<thread::JoinHandle<()>>,
@@ -187,7 +185,6 @@ impl Harness {
         let (tx, handle) = spawn(parts).unwrap();
         Self {
             root,
-            home,
             var,
             tx,
             handle: Some(handle),
@@ -376,6 +373,7 @@ fn ctl_answers_and_mutations_complete_while_a_sync_runs() {
         let (status, took) = h.timed(Request::Status);
         assert!(took < Duration::from_secs(1), "{took:?}");
         assert_eq!(status["active"]["scope"], "alpha");
+        assert_eq!(status["busy_profiles"], json!(["alpha"]));
     }
     let (saved, took) = h.timed(Request::Mutate(Mutation {
         op: "configure-profile".into(),
@@ -720,4 +718,12 @@ fn an_invalid_routine_is_reported_once_per_field() {
         .filter(|r| r.code == "routine.deferred")
         .count();
     assert_eq!(rows, 1);
+}
+
+#[test]
+fn the_performance_level_sets_the_core_nice_value() {
+    assert_eq!(performance_nice(Some(b"level=full\n")), 0);
+    assert_eq!(performance_nice(Some(b"level=gentle\n")), 19);
+    assert_eq!(performance_nice(Some(b"level=turbo\n")), 10);
+    assert_eq!(performance_nice(None), 10);
 }

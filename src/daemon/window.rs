@@ -52,6 +52,7 @@ pub(crate) enum WindowNote {
 }
 
 impl WindowNote {
+    #[cfg(test)]
     pub(crate) fn as_str(self) -> &'static str {
         match self {
             Self::DstGap => "dst_gap",
@@ -212,6 +213,7 @@ pub(crate) fn clamp_clock_step(value: i64, now: i64, horizon: i64) -> Option<i64
 }
 
 /// Days since 1970-01-01 -> (year, month, day), proleptic Gregorian.
+#[cfg(test)]
 pub(crate) fn civil_from_days(days: i64) -> (i64, u32, u32) {
     let z = days + 719_468;
     let era = z.div_euclid(146_097);
@@ -228,6 +230,7 @@ pub(crate) fn civil_from_days(days: i64) -> (i64, u32, u32) {
 }
 
 /// (year, month, day) -> days since 1970-01-01, proleptic Gregorian.
+#[cfg(test)]
 pub(crate) fn days_from_civil(year: i64, month: u32, day: u32) -> i64 {
     let year = if month <= 2 { year - 1 } else { year };
     let era = year.div_euclid(400);
@@ -240,6 +243,7 @@ pub(crate) fn days_from_civil(year: i64, month: u32, day: u32) -> i64 {
 }
 
 /// The wall fields of `epoch` at a fixed UTC offset of `offset_seconds`.
+#[cfg(test)]
 pub(crate) fn fields_at_offset(epoch: i64, offset_seconds: i64) -> WallFields {
     let local = epoch + offset_seconds;
     let days = local.div_euclid(86_400);
@@ -258,11 +262,13 @@ pub(crate) fn fields_at_offset(epoch: i64, offset_seconds: i64) -> WallFields {
 }
 
 /// A zone with one fixed offset, such as UTC.
+#[cfg(test)]
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct FixedOffsetClock {
     pub(crate) offset_seconds: i64,
 }
 
+#[cfg(test)]
 impl LocalClock for FixedOffsetClock {
     fn fields(&self, epoch: i64) -> Option<WallFields> {
         Some(fields_at_offset(epoch, self.offset_seconds))

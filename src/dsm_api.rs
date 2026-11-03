@@ -13301,6 +13301,9 @@ pub(crate) fn main_entry() -> ExitCode {
         return ExitCode::from(1);
     }
     let arguments = std::env::args_os().skip(1).collect::<Vec<_>>();
+    if let Some(code) = daemon::dispatch(&arguments) {
+        return code;
+    }
     if arguments.is_empty() {
         let is_get = std::env::var("REQUEST_METHOD").is_ok_and(|method| method == "GET");
         let response = match run_cgi() {

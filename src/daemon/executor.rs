@@ -134,7 +134,6 @@ pub(crate) struct RunReport {
     pub(crate) record_error: Option<String>,
     /// For an exit 137 the daemon did not cause: did the cgroup OOM counter move?
     pub(crate) oom_proven: Option<bool>,
-    pub(crate) elapsed: Duration,
     /// The progress phase last seen in the progress record, if any.
     pub(crate) last_phase: Option<String>,
 }
@@ -590,7 +589,6 @@ mod process {
     }
 
     fn supervise(spec: RunSpec, requests: mpsc::Receiver<StopCause>, sink: &dyn Fn(ExecEvent)) {
-        let started = Instant::now();
         let finished = |exit, ending, tail: Vec<u8>, records, record_error, oom, phase| {
             sink(ExecEvent::Finished(Box::new(RunReport {
                 exit,
@@ -599,7 +597,6 @@ mod process {
                 records,
                 record_error,
                 oom_proven: oom,
-                elapsed: started.elapsed(),
                 last_phase: phase,
             })));
         };
@@ -1120,7 +1117,6 @@ mod tests {
             records: Vec::new(),
             record_error: None,
             oom_proven: None,
-            elapsed: Duration::ZERO,
             last_phase: None,
         }
     }

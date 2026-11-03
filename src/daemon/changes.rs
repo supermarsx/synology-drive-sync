@@ -21,6 +21,10 @@ use std::time::{Duration, Instant};
 use super::routines::{Backend, BackendReason, SourceStatus};
 
 /// What a change source reports. Delivered to the control thread as a message.
+#[allow(
+    dead_code,
+    reason = "constructed by the Phase-1 change source, which plugs in at integration"
+)]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum ChangeEvent {
     /// Something changed in `dir`, relative to the routine's source (`""` is the root).

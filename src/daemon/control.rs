@@ -132,6 +132,7 @@ pub(crate) enum Msg {
     Ctl(Request, Sender<Value>),
     Exec(u64, ExecEvent),
     MutationDone(u64, MutationOutcome),
+    #[allow(dead_code, reason = "sent by the Phase-1 change source")]
     Change(ChangeEvent),
 }
 
@@ -156,7 +157,6 @@ pub(crate) struct Paths {
     pub(crate) routine_state_dir: PathBuf,
     pub(crate) profile_state_dir: PathBuf,
     pub(crate) run_dir: PathBuf,
-    pub(crate) log_root: PathBuf,
     pub(crate) core_binary: PathBuf,
 }
 
@@ -174,7 +174,6 @@ impl Paths {
             profile_state_dir: state_dir.join("profiles"),
             state_dir,
             run_dir: var.join("run"),
-            log_root: var.join("log"),
             core_binary,
         }
     }
@@ -189,8 +188,11 @@ pub(crate) struct Settings {
     pub(crate) mutation_deadline: Duration,
     /// The performance level's nice value for the core.
     pub(crate) core_nice: Option<i32>,
-    /// Phase 3 hook (perf design §2.2): passed to the core as `--pair-cache DIR`
-    /// once the core accepts it. `None` keeps today's argv.
+    /// Phase 3 hook (perf design §2.2): `var/state/cache/pairs`, passed to the
+    /// core as `--pair-cache DIR` once the core accepts it. `None` keeps today's
+    /// argv. The daemon never opens the index itself: only the sync child does,
+    /// briefly, and runs stay child processes (redb can abort a process on some
+    /// damaged files).
     pub(crate) pair_cache_dir: Option<PathBuf>,
     /// Publish `run.lock` for the bridge and shell readers (Linux).
     pub(crate) publish_run_lock: bool,
@@ -247,7 +249,6 @@ struct Active {
     stop: Option<StopCause>,
     stall: Option<String>,
     heartbeat_source: &'static str,
-    last_heartbeat: Instant,
     /// Every profile the run covers (for R6 and the per-profile records).
     profiles: Vec<String>,
     degraded: Vec<&'static str>,
@@ -1231,7 +1232,11 @@ impl Control {
             program: self.paths.core_binary.clone(),
             args: self.core_args(&request, &result_record),
             env: self.settings.child_env.clone(),
-            nice: self.settings.core_nice,
+            nice: self.settings.core_nice.or_else(|| {
+                Some(performance_nice(
+                    read_small(&self.paths.config_dir.join("performance.conf")).as_deref(),
+                ))
+            }),
             result_record: Some(result_record),
             progress_record: None,
             timings: self.settings.timings,
@@ -1281,7 +1286,6 @@ impl Control {
                         records: Vec::new(),
                         record_error: None,
                         oom_proven: None,
-                        elapsed: Duration::ZERO,
                         last_phase: None,
                     })),
                 ));
@@ -1297,7 +1301,6 @@ impl Control {
             stop: None,
             stall: None,
             heartbeat_source: "io",
-            last_heartbeat: Instant::now(),
             profiles,
             degraded: Vec::new(),
         });
@@ -2079,6 +2082,7 @@ impl Control {
                     "backend_reason": state.map(|s| s.backend_reason.as_str()),
                     "next_run_epoch": state.map(|s| s.next_run),
                     "pending_change": !e.dirty.is_empty(),
+                    "mode": e.routine.as_ref().ok().and_then(|r| r.as_ref()).map(|r| r.mode.as_str()),
                 })
             })
             .collect();
@@ -2097,6 +2101,9 @@ impl Control {
             "active": active,
             "queue": queue,
             "schedule": {"enabled": self.schedule.enabled, "next_run_epoch": self.schedule_deadline},
+            // Profiles a run is using now: a status read reports `index: "busy"`
+            // for these rather than waiting on the pair index (perf design §2.7).
+            "busy_profiles": self.active.as_ref().map(|a| a.profiles.clone()).unwrap_or_default(),
             "routines": routines,
             "mutations": mutations,
             "held_outcome": self.held.as_ref().map(|(name, _)| name.clone()),
@@ -2236,6 +2243,19 @@ pub(crate) fn signal_kind(signal: i32) -> Option<SignalKind> {
         1 => Some(SignalKind::Reload),
         10 | 12 => Some(SignalKind::Wake),
         _ => None,
+    }
+}
+
+/// The performance level's nice value for the core (`load_performance_policy_runtime`):
+/// full 0, balanced 10, gentle 19; unknown, malformed or absent is balanced.
+pub(crate) fn performance_nice(bytes: Option<&[u8]>) -> i32 {
+    let doc = bytes.map_or_else(routines::KvDocument::empty, |b| {
+        routines::KvDocument::parse(b, 256)
+    });
+    match doc.get("level") {
+        Some("full") => 0,
+        Some("gentle") => 19,
+        _ => 10,
     }
 }
 

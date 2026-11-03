@@ -940,6 +940,10 @@ pub(crate) struct RealtimeView {
     pub(crate) due: bool,
 }
 
+#[allow(
+    dead_code,
+    reason = "Missing and Symlink arrive from the Phase-1 change source's root check"
+)]
 /// The routine's source as the daemon found it (one `symlink_metadata`, done by
 /// the caller off the control thread's critical path or with a bounded probe).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
