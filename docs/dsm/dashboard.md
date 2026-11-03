@@ -298,8 +298,9 @@ Routines opens on **Configured routines**, a catalog of per-profile automation. 
 the **Routine editor** beside the catalog; selecting a saved routine opens that same editor with the
 profile's automation policy loaded. The page shows each routine's requested
 mode, effective backend, state, next run, and last success. The Overview realtime card makes an
-`inotify` backend or `polling` fallback visible rather than implying that a native watcher exists on
-every NAS.
+`inotify` backend or `polling` fallback visible, and each enabled realtime routine whose native
+watcher is not in use (`watch_unavailable`, `watch_limit` or `watch_setup_failed`) is an amber item in
+the Overview's attention list, and so in the top-bar chip, with the same guidance as the editor.
 
 The editor shows only timing controls that affect the selected mode: interval cadence, daily
 weekdays/window, or realtime debounce/polling. Manual Plan, manual Run, the legacy global interval

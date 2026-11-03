@@ -88,8 +88,9 @@ account already has access to.
   LaunchAgent starts the finite run.
 - **One Synology pushing to another.** The DSM 7 package runs on the NAS that holds the
   authoritative folder and sends it over HTTPS to a File Station path on a second Synology.
-  Interval and daily routines cover a schedule; a realtime routine watches with `inotify` when
-  available, polls the source on a floor either way, and launches a finite run after a debounce.
+  Interval and daily routines cover a schedule; a realtime routine watches with the package's own
+  `inotify` watcher (DSM ships no `inotifywait`), polls the source on a floor either way, and
+  launches a finite run after a debounce.
 - **Getting a folder into Synology Drive without speaking Drive's protocol.** Point the destination
   at a path under the remote account's My Drive or an enabled Team Folder and Drive indexes what
   File Station wrote, so the result reaches Drive clients without this tool implementing anything
@@ -124,7 +125,8 @@ mtime only; ACLs, ownership, modes, and extended attributes are not preserved.
 | Rust SDK or C ABI | Another application needs to embed the engine | Synchronous library call with caller-owned secrets, cancellation, and process policy |
 
 The core binary is not a resident watcher. In **realtime** routine mode, the DSM package controller
-watches with `inotify` when available and polls the source on a floor regardless, then launches a
+watches with its own `inotify` watcher (`sdsync-dsm-api --watch`) and polls the source on a floor
+regardless, then launches a
 finite plan or sync after debounce. Interval and daily routines also launch finite runs. The
 dashboard and the
 `sdsync-dsm` recovery/automation manager operate the same package-owned profiles, credentials,

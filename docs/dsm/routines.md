@@ -84,8 +84,27 @@ is available.
 ## Realtime mode and fallback
 
 Realtime mode is still a sequence of finite sync actions, not a permanently connected sync engine.
-The controller tries a recursive `inotifywait` watcher when that command exists and the watcher stays
-healthy. The quiet period is measured from the event file's last write, so each newly observed
+DSM ships no `inotifywait`, so the package brings its own recursive watcher: the controller runs
+`sdsync-dsm-api --watch`, which watches every directory of the source except the DSM-managed ones
+(`@eaDir`, `#recycle`, `#snapshot`, `@tmp`, ...) and whatever the profile's excludes and the source's
+`.sdsyncignore` exclude, using the same matcher as the sync. It reports file writes when they are
+closed, creations, deletions, moves, permission changes and bare modification-time changes, at most
+one marker line per 100 ms however many files change. An `inotifywait` from inotify-tools is used
+only if the package binary fails its executable checks; nothing needs to be installed from SynoCommunity
+or Entware, and the controller logs which watcher it chose once per start (`realtime_watcher_command`).
+
+**Watch budget.** inotify needs one watch per directory. The watcher may use 80% of
+`fs.inotify.max_user_watches`, minus the watches this user (the package user) already holds for other
+watchers. A source with more directories than that is not watched at all: the routine reports
+`backend_reason=watch_limit` with the numbers (`dirs=`, `budget=`, `limit=`, `held=`), appears on the
+Overview as an amber item, and is polled meanwhile. Raising the limit needs root and is optional; see
+[Raising the inotify watch limit](troubleshooting.md#raising-the-inotify-watch-limit). The setup walk that arms the
+watches has a 120-second deadline; if a directory (a hibernating disk, a hung mount) holds it up the
+watcher gives up and names that directory (`watch_setup_failed`, `deadline=120s`). If the kernel drops
+events (`IN_Q_OVERFLOW`), the watcher re-walks the tree to restore its watches and reports that the whole
+tree must be treated as changed, so a run is triggered. The watcher keeps about 6 MiB of
+memory at 20,000 directories and about 16 MiB at 100,000. A directory created while watching is added to
+the watch set as it appears. The quiet period is measured from the event file's last write, so each newly observed
 change restarts the debounce and a run cannot begin until the full period has elapsed. The default
 debounce is 45 seconds. Realtime mode has no interval, weekday, window-start, or window-end setting.
 The controller revalidates and consumes one exact native-event generation only after dependency and

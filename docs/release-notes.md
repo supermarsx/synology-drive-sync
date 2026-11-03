@@ -30,6 +30,23 @@ lists its own commits.
   held only cache files is adopted and marked automatically.
 - **Rust library users:** `plan::DeleteAction` has a new public field, `local_relative`. Code that
   constructs one must fill it. The SDK and FFI results gain `link_guard_unchecked`.
+- **DSM realtime routines watch natively without inotify-tools.** DSM ships no `inotifywait`, so
+  until now every realtime routine on a stock NAS was only polled (`backend_reason=watch_unavailable`).
+  The package now brings its own watcher, `sdsync-dsm-api --watch`; routines report `backend=inotify`
+  after the upgrade. It skips the DSM-managed folders and whatever the profile excludes, and it also
+  reports permission changes and bare modification-time changes. A source with more directories than
+  80% of the per-user `fs.inotify.max_user_watches` is refused by name (`watch_limit`, with the
+  numbers) and polled; only root can raise that limit, which is optional (see
+  [Raising the inotify watch limit](dsm/troubleshooting.md#raising-the-inotify-watch-limit)). The
+  watch budget is 80% of that limit minus what the package user already holds. An `inotifywait` is now
+  only a fallback, used if the package binary fails its executable checks. The setup walk has a
+  120-second deadline that names the directory it was stuck on, and a kernel event overflow triggers a
+  full re-walk. A realtime routine that is not watched natively is now an amber item on the Overview.
+  The watcher uses about 6 MiB at 20,000 directories and about 16 MiB at 100,000.
+  `sdsync-dsm-api --watch-probe <folder>`, run as the package user, shows what inotify sees on a share;
+  see [Troubleshooting](dsm/troubleshooting.md#probe-what-inotify-sees-on-a-share) and probe 20 in the
+  [acceptance runbook](production-acceptance.md#questions-only-a-real-nas-can-answer). CI gained a
+  `native-watcher` job.
 - **DSM:** Package Center offers Stop and Run, not Restart. Every message that said "Restart" now says
   to stop the package and run it again.
 

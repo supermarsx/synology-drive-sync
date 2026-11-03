@@ -610,8 +610,10 @@ and inspect for leftovers after a failure.
 
 ## Realtime reports polling
 
-`polling` is the expected backend unless inotify-tools has been installed from SynoCommunity or
-Entware. Polling is not merely a fallback: it runs alongside a healthy native watcher too, checking
+`inotify` is the expected backend: the package's own watcher (`sdsync-dsm-api --watch`) needs no
+inotify-tools. `polling` with `backend_reason=watch_limit`, `watch_setup_failed` or
+`watch_unavailable` means the native watcher is not in use for that routine; the Overview lists
+each such routine as an amber item. Polling is not merely a fallback: it runs alongside a healthy native watcher too, checking
 path/size/mtime fingerprints at the configured interval whenever no native event is pending for that
 turn, and it now requires one unchanged reading before it dispatches. Confirm source ACLs and
 controller logs. Reducing the interval increases source traversal work. Do not claim native realtime
@@ -634,15 +636,57 @@ before this field existed, and that reads as `ok`.
 | `ok` | Observing normally, natively or by polling. | Nothing; this is healthy. |
 | `source_missing` | The configured source path does not exist. | Restore it, or point the profile at a path that exists. |
 | `source_symlink` | The configured source path is a symlink. | Point the profile at the real directory it targets. |
-| `watch_unavailable` | No native watcher is available on this NAS. | Install inotify-tools from SynoCommunity or Entware; polling continues to observe the source meanwhile. |
-| `watch_setup_failed` | The native watcher failed to start after repeated attempts and the controller stopped retrying. | Inspect the controller log for the reported error, then save the routine to try again. |
-| `watch_limit` | The source has more directories than the inotify watch budget allows. | Raise `fs.inotify.max_user_watches`, or narrow the source. Compare `cat /proc/sys/fs/inotify/max_user_watches` against `find <source> -type d \| wc -l`. The controller reads the limit whole and counts directories in a bounded background job (it stops one past the budget, and the result is cached for an hour per profile in `run/watch-<profile>.dircount`), so a Save on the dashboard does not walk every tree again. `routine_watch_limit` in `controller.log` carries `dirs=` and `budget=`. A limit that cannot be read or a count that fails is logged once per controller lifetime as `routine_watch_limit_unchecked` (`cause=absent`, `not_a_file`, `unreadable`, `malformed`, `count_failed`, `cache_unsafe` or `cache_unwritable`) and the watcher is started anyway; its normal ENOSPC handling still applies. |
+| `watch_unavailable` | No native watcher is available: the package's own watcher failed its executable checks and no inotify-tools `inotifywait` was found. | Reinstall the package; `realtime_watcher_command` in `controller.log` (a `warn` with `path=none`) says which. Polling continues to observe the source meanwhile. |
+| `watch_setup_failed` | The native watcher failed to start, or stopped, and is retried with a growing delay; after five failures the controller stops retrying. | `routine_watch_failed` in `controller.log` carries the watcher's own line, which names the cause and then the path: an unreadable directory (`cannot watch the directory: Permission denied`), an ignore file or profile fragment that does not parse (`rules:`), or a walk that did not finish within 120 seconds (`deadline=120s`, the directory it was stuck on). Fix that, then save the routine to try again. |
+| `watch_limit` | The source has more directories than the inotify watch budget allows. | Raise `fs.inotify.max_user_watches`, or narrow the source. Compare `cat /proc/sys/fs/inotify/max_user_watches` against `find <source> -type d \| wc -l`. The controller reads the limit whole and counts directories in a bounded background job (it stops one past the budget, and the result is cached for an hour per profile in `run/watch-<profile>.dircount`), so a Save on the dashboard does not walk every tree again. `routine_watch_limit` in `controller.log` carries `dirs=` and `budget=`. The native watcher checks the same budget itself, less the watches this user's other watchers already hold, and refuses with `watch_limit dirs=… budget=… limit=… held=…` (or `at=<directory>` when the kernel refused a watch with ENOSPC); that is logged as `routine_watch_limit` with `source=watcher`. The limit is per user, and only root can raise it (`sysctl -w fs.inotify.max_user_watches=…`). Until then the source is polled, which keeps its disks from hibernating. A limit that cannot be read or a count that fails is logged once per controller lifetime as `routine_watch_limit_unchecked` (`cause=absent`, `not_a_file`, `unreadable`, `malformed`, `count_failed`, `cache_unsafe` or `cache_unwritable`) and the watcher is started anyway; its normal ENOSPC handling still applies. |
 | `watch_stopped` | A stopped native watcher was found and was replaced automatically. | Nothing, unless it recurs; if it does, inspect what is pausing the watcher process. |
 | `poll_unreadable` | Part of the source could not be read during the last poll. | Fix permissions on the unreadable subtree; the readable part is still observed. |
 | `poll_unavailable` | The last poll of the source failed outright. | Confirm the source path is reachable and readable. |
 
 `backend` itself is only as current as the last poll that actually completed; a stalled or failing
 poll leaves it holding whatever it last reported rather than updating to reflect the present.
+
+### Probe what inotify sees on a share
+
+`sdsync-dsm-api --watch-probe` arms the same watcher the routine uses, prints the directory count
+against the watch limit, then prints every change that arrives while you change files. Run it as the
+package user, so the per-user limit and the share permissions are the routine's own. DSM may
+collision-rename that account, so resolve it as [CLI parity](cli-parity.md) does:
+
+```sh
+PACKAGE_USER=$(stat -L -c '%U' /var/packages/synology-drive-sync/home)
+sudo -u "$PACKAGE_USER" -- /var/packages/synology-drive-sync/target/bin/sdsync-dsm-api \
+  --watch-probe --seconds 60 \
+  --profile-fragment /var/packages/synology-drive-sync/home/config/profiles.d/<profile>.toml \
+  /volume1/<share>/<folder>
+```
+
+While it waits, save a file into the folder over SMB, from File Station, and from Synology Drive. It
+exits 0 when changes arrived, 1 when it was armed but nothing arrived (inotify does not see writes
+made that way to that share), and with the watcher's own status and a `refused:` line when it could
+not arm: `watch_limit` with the numbers, `source_missing`, or `watch_setup_failed` with the cause.
+
+### Raising the inotify watch limit
+
+This is **optional** and needs **root**; the package never does it, because the package user cannot.
+It matters only for a source with more directories than the watch budget (80% of the limit, less what
+the package user already holds), which shows as `watch_limit` and is polled in the meantime. Compare
+`cat /proc/sys/fs/inotify/max_user_watches` with the `dirs=` and `budget=` the routine reports, or run
+the [watch probe](#probe-what-inotify-sees-on-a-share), which prints both. The limit is per user, so
+raise it for the whole NAS rather than guessing a per-package value. From an SSH session as an
+administrator:
+
+```sh
+sudo sysctl -w fs.inotify.max_user_watches=524288
+```
+
+That lasts until the next reboot. To make it persistent on DSM, create a **Control Panel > Task
+Scheduler > Create > Triggered Task > User-defined script** that runs at **Boot-up** as `root` and
+executes the same `sysctl -w` line; adding the setting to `/etc/sysctl.conf` is also commonly done but
+a DSM update can replace that file, so check it after upgrades. Neither route is exercised by this
+repository's tests, and a value that is too large costs kernel memory (roughly 1 KiB per watch on a 64-bit
+kernel), so raise it only as far as the source needs. After changing it, save the routine (or stop and
+run the package) so the controller tries again.
 
 ## A run failed, died, or was refused
 

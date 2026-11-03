@@ -372,7 +372,7 @@ limited to matching content already present within the one target NAS.
 ## Questions only a real NAS can answer
 
 The File Station mock reproduces what DSM is documented to do. It cannot say what DSM actually does in
-nineteen places where a safeguard of the client rests on an assumption. Each is a question to put to a
+twenty places where a safeguard of the client rests on an assumption. Each is a question to put to a
 disposable share on the exact DSM build in service, and each answer changes what the client or the
 dashboard can be trusted to do. Run them against a scratch path only, with a throwaway account, and
 record the result in the [acceptance record](#acceptance-record). Where a probe gives an expected
@@ -571,6 +571,25 @@ UP() { # UP /share/folder local-file [extra curl -F options]
       `408` for a lost task reads as a missing file in the message, which is misleading but safe;
       report whichever DSM answers, with the build.
 
+20. **What does inotify see on this share, and how big is the watch budget?** The realtime watcher
+    depends on the kernel reporting changes in the form a user makes them. As the package user (so the
+    per-user limit and the share permissions are the routine's own; resolve the account with
+    `stat -L -c '%U' /var/packages/synology-drive-sync/home`), arm the probe on a real source and, while
+    it waits, change files in it from every route that matters:
+    `sudo -u "$PACKAGE_USER" -- /var/packages/synology-drive-sync/target/bin/sdsync-dsm-api --watch-probe --seconds 60 --profile-fragment /var/packages/synology-drive-sync/home/config/profiles.d/<profile>.toml /volume1/<share>/<folder>`.
+    Save a file over SMB, from File Station and from Synology Drive, and create and rename a folder.
+    - The probe prints the directory count against `max_user_watches`, `held_by_this_user` and the
+      budget (80% of the limit), then each change it sees, and exits 0 when changes arrived, 1 when it
+      was armed but nothing arrived, and prints a `refused:` line when it could not arm. A route that
+      produces no line is a route the realtime routine cannot see, which polling will still catch;
+      record which. Do this on every volume type in use (btrfs, ext4, an encrypted share, a USB share).
+    - Record `max_user_watches`, the directory count of the largest source and whether `watch_limit`
+      appears. A limit below the budget needed is a root-only change (see
+      [Raising the inotify watch limit](dsm/troubleshooting.md#raising-the-inotify-watch-limit));
+      record the DSM build's default.
+    - Also record the watcher's resident memory while the routine runs (`VmRSS` in `/proc/<pid>/status`
+      of the `--watch` process): about 6 MiB is expected at 20,000 directories and about 16 MiB at 100,000.
+
 ## Acceptance record
 
 Production approval should retain evidence for all of the following:
@@ -590,7 +609,8 @@ Production approval should retain evidence for all of the following:
   install/upgrade/start/stop/uninstall evidence, reboot persistence, and two-NAS TOTP/proxy results.
 - the answers to the [questions only a real NAS can answer](#questions-only-a-real-nas-can-answer),
   at least probes 4, 8 and 16 before enabling deletion, probe 14 before relying on the dashboard
-  to release its timers and secret drafts when its window closes, and probes 15 and 17 on the exact DSM
-  build before relying on the package's scripts and routine windows.
+  to release its timers and secret drafts when its window closes, probes 15 and 17 on the exact DSM
+  build before relying on the package's scripts and routine windows, and probe 20 before relying on a
+  realtime routine to see changes made over SMB or Synology Drive.
 
 Repeat the relevant steps after DSM/File Station upgrades, reverse-proxy changes, authentication-policy changes, scheduler identity changes, or a major application upgrade.

@@ -51,6 +51,13 @@ The deterministic suite has these complementary layers:
   measured test weights, because DSM's `/bin/sh` is believed to be bash and dash and BusyBox read a
   builtin `read` differently), and also runs the lifecycle under BusyBox in an Alpine container. Every
   shell-sensitive probe also loops over each shell present on the host.
+- **Native watcher tests** (`tests/watch_inotify.rs`, `tests/watch_cli.rs`, and the unit tests in
+  `src/watch/`) drive the real inotify watcher on Linux: which directories are watched (DSM-managed
+  names and the profile's excludes are not), the marker lines, new directories, overflow, the watch
+  budget and the setup deadline. The CI job `native-watcher` adds what the normal matrix cannot: the
+  walk deadline under the `fault-inject` feature (compiled only there), and the kernel's own per-user
+  limit, lowered to 512 with `sysctl` for that job, to prove the named `watch_limit` refusal against
+  real ENOSPC. The package suite covers the controller side with a fake watcher.
 - **Dashboard surface tests** (`packaging/synology/ui-src/test/outcomes-surface.test.mjs` and the
   widget and AppWindow contract tests) feed every outcome, every reason code, unknown tokens and
   hostile input through the pure `outcomes.mjs` model and assert that nothing renders as plain success
