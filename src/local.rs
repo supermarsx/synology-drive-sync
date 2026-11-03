@@ -284,14 +284,18 @@ pub struct IgnoreRules {
     /// exclude typed NFD left the NAS's NFC folder deletable (V3-2). Both walks, every comparison
     /// and every upload use this matcher, so the two sides agree about what exists.
     composed: Gitignore,
-    /// The patterns as typed, matched against paths as spelled: the matcher earlier versions used
-    /// on a case-sensitive source.
+    /// The patterns as typed, matched against paths as spelled and case-sensitively: the matcher
+    /// earlier versions used on a case-sensitive source.
     ///
     /// Kept for deletion only, where it is ORed with [`Self::composed`]: composing a negation
     /// (`!café.txt`, typed NFC) can newly re-include an NFD NAS name the typed rules excluded, and
     /// a change to how rules match must never turn a protected entry into a deletion candidate.
-    /// `None` on a folding source, where the typed rules were already matched composed.
-    exact: Option<Gitignore>,
+    /// Kept on a folding source too. Whether a source folds is probed, and the probe has changed
+    /// (it now asks inside the root), so a source one version judged case-sensitive another may
+    /// judge folding; and a folding negation (`!Report.txt` against `report.txt`) re-includes what
+    /// the typed rules excluded in just the same way. With both matchers on every source,
+    /// deletion protection covers whatever either kind of earlier matcher protected.
+    exact: Gitignore,
     /// Whether patterns match regardless of case.
     ///
     /// True when the source resolves names that way (Windows, macOS, most SMB shares). There
@@ -379,17 +383,7 @@ impl IgnoreRules {
         extra_patterns: &[String],
     ) -> Result<Self> {
         let composed = Self::matcher(root, fold, true, ignore_file, extra_patterns)?;
-        let exact = if fold {
-            None
-        } else {
-            Some(Self::matcher(
-                root,
-                false,
-                false,
-                ignore_file,
-                extra_patterns,
-            )?)
-        };
+        let exact = Self::matcher(root, false, false, ignore_file, extra_patterns)?;
         Ok(Self {
             composed,
             exact,
@@ -468,7 +462,7 @@ impl IgnoreRules {
     pub fn none() -> Self {
         Self {
             composed: Gitignore::empty(),
-            exact: None,
+            exact: Gitignore::empty(),
             fold: false,
         }
     }
@@ -490,21 +484,22 @@ impl IgnoreRules {
     }
 
     /// Whether the rules forbid deleting `relative`: [`Self::is_ignored`], or the patterns as typed
-    /// matching the path as spelled.
+    /// matching the path as spelled, case-sensitively, on every source.
     ///
     /// Never narrower than [`Self::is_ignored`], and for deletion only. An entry only the typed
     /// rules exclude is still walked, compared and uploaded to as the composed rules say; it is
-    /// never deleted, exactly as before the rules were composed.
+    /// never deleted, as it was not before the rules were composed. On a folding source that keeps
+    /// a negation from deleting what the typed rules exclude: with `*.txt` and `!Report.txt`, a
+    /// NAS-only `report.txt` (or a decomposed `café.txt` under `!café.txt`) stays protected.
     pub fn excludes_for_deletion(&self, relative: &str, is_dir: bool) -> bool {
         if self.is_ignored(relative, is_dir) {
             return true;
         }
         !relative.is_empty()
-            && self.exact.as_ref().is_some_and(|exact| {
-                exact
-                    .matched_path_or_any_parents(path_for_match(relative), is_dir)
-                    .is_ignore()
-            })
+            && self
+                .exact
+                .matched_path_or_any_parents(path_for_match(relative), is_dir)
+                .is_ignore()
     }
 
     /// Whether these rules match regardless of case. They always match regardless of Unicode
@@ -2302,9 +2297,33 @@ mod tests {
         assert!(rules.excludes_for_deletion("notes.txt", false));
         assert!(!rules.excludes_for_deletion("notes.bin", false));
         assert!(!rules.excludes_for_deletion("", true));
-        // A folding source matched composed before and still does: one matcher.
-        let folding = IgnoreRules::for_source(true, &["*.txt", "!caf\u{e9}.txt"]);
-        assert!(!folding.excludes_for_deletion("cafe\u{301}.txt", false));
+    }
+
+    /// I-1 on a folding source (macOS, Windows, most SMB shares), the same union: a negation the
+    /// walks honour regardless of case or normalisation never makes deletable what the typed rules
+    /// exclude as spelled. It used to be one matcher there, so on macOS `!café.txt` deleted a
+    /// NAS-only decomposed `café.txt`, and on Windows `!Report.txt` a NAS-only `report.txt`, though
+    /// `*.txt` excludes both as typed and a source judged case-sensitive had kept them.
+    #[test]
+    fn deletion_protection_is_the_union_on_a_folding_source_too() {
+        let accented = IgnoreRules::for_source(true, &["*.txt", "!caf\u{e9}.txt"]);
+        assert!(
+            !accented.is_ignored("cafe\u{301}.txt", false),
+            "the walks re-include it"
+        );
+        assert!(accented.excludes_for_deletion("cafe\u{301}.txt", false));
+        assert!(!accented.excludes_for_deletion("caf\u{e9}.txt", false));
+        let cased = IgnoreRules::for_source(true, &["*.txt", "!Report.txt"]);
+        assert!(
+            !cased.is_ignored("report.txt", false),
+            "the walks re-include it"
+        );
+        assert!(cased.excludes_for_deletion("report.txt", false));
+        assert!(!cased.excludes_for_deletion("Report.txt", false));
+        // Whatever folds stays protected the folding way as well.
+        let folded = IgnoreRules::for_source(true, &["report.pdf"]);
+        assert!(folded.excludes_for_deletion("Report.pdf", false));
+        assert!(folded.excludes_for_deletion("REPORT.PDF", false));
     }
 
     /// D3-8: the first probe that answers decides whether names fold, and the probes are never

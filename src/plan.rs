@@ -3776,32 +3776,44 @@ mod tests {
         assert_eq!(renames_pending(&plan), ["photos"]);
     }
 
-    /// I-1, monotone: composing the patterns must not let a composed negation expose a decomposed
-    /// NAS-only name the rules as typed excluded. `*.txt` with `!café.txt` typed composed, against
-    /// a NAS-only decomposed `café.txt` on a case-sensitive source: still protected, as before.
+    /// I-1, monotone: a negation must not expose a NAS-only name the rules as typed exclude, on a
+    /// case-sensitive or a folding source alike. `*.txt` with `!café.txt` typed composed against a
+    /// NAS-only decomposed `café.txt`, and `*.txt` with `!Report.txt` against a NAS-only
+    /// `report.txt`: both stay protected, whatever the source does with case.
     #[test]
     fn a_composed_negation_never_makes_a_protected_entry_deletable() {
         let root = RemoteRoot::parse("/share/root").unwrap();
-        let rules = IgnoreRules::for_source(false, &["*.txt", "!caf\u{e9}.txt"]);
-        assert!(
-            !rules.is_ignored("cafe\u{301}.txt", false),
-            "composed, the negation re-includes it for the walks"
-        );
-        assert!(rules.excludes_for_deletion("cafe\u{301}.txt", false));
-        let plan = build_plan(
-            &root,
-            &local(&[("keep.bin", EntryKind::File, 1, 1_000)]),
-            &remote(&[
-                ("keep.bin", EntryKind::File, 1, 1),
-                ("cafe\u{301}.txt", EntryKind::File, 9, 1),
-                ("stale.bin", EntryKind::File, 1, 1),
-            ]),
-            &rules,
-            &options(true),
-        )
-        .unwrap();
-        assert_eq!(deleted(&plan), ["stale.bin"]);
-        assert_eq!(plan.protected_entries, 1);
+        for fold in [false, true] {
+            for (negation, remote_only) in [
+                ("!caf\u{e9}.txt", "cafe\u{301}.txt"),
+                ("!Report.txt", "report.txt"),
+            ] {
+                let rules = IgnoreRules::for_source(fold, &["*.txt", negation]);
+                assert!(
+                    !rules.is_ignored(remote_only, false) || !fold,
+                    "on a folding source the walks re-include {remote_only:?}"
+                );
+                assert!(rules.excludes_for_deletion(remote_only, false));
+                let plan = build_plan(
+                    &root,
+                    &local(&[("keep.bin", EntryKind::File, 1, 1_000)]),
+                    &remote(&[
+                        ("keep.bin", EntryKind::File, 1, 1),
+                        (remote_only, EntryKind::File, 9, 1),
+                        ("stale.bin", EntryKind::File, 1, 1),
+                    ]),
+                    &rules,
+                    &options(true),
+                )
+                .unwrap();
+                assert_eq!(
+                    deleted(&plan),
+                    ["stale.bin"],
+                    "fold={fold} {negation} {remote_only}"
+                );
+                assert_eq!(plan.protected_entries, 1, "fold={fold} {negation}");
+            }
+        }
     }
 
     /// F-5: every deletion carries the local spelling the plan checked for absence, under a

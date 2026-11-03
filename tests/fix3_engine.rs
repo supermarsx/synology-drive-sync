@@ -404,6 +404,15 @@ fn a_composed_exclude_excludes_the_decomposed_local_folder() {
 #[test]
 fn a_skipped_spelling_names_its_case_variant_sibling() {
     let fixture = Fixture::new("fix3-shadow");
+    if source_folds_names(&fixture) {
+        eprintln!(
+            "skipped: {} resolves names regardless of case (macOS APFS, for one), so it cannot \
+             hold notes.txt beside Notes.txt; the rule itself is covered by \
+             local::tests::a_skipped_spelling_makes_its_case_variant_sibling_a_named_collision",
+            fixture.source.display()
+        );
+        return;
+    }
     fixture.write("Notes.txt", b"the real notes");
     fixture.write("target.txt", b"link target");
     std::os::unix::fs::symlink("target.txt", fixture.source.join("notes.txt")).unwrap();
@@ -423,6 +432,56 @@ fn a_skipped_spelling_names_its_case_variant_sibling() {
     );
     assert_eq!(
         fixture.text("/team/shadow/Notes.txt").as_deref(),
+        Some("older notes"),
+        "the NAS copy is neither replaced nor deleted"
+    );
+}
+
+/// Whether the fixture's source resolves names regardless of case, asked the way the sync asks
+/// it: the ignore rules' own probe of the source.
+#[cfg(unix)]
+fn source_folds_names(fixture: &Fixture) -> bool {
+    synology_drive_sync::local::IgnoreRules::build(&fixture.source, &[])
+        .expect("probe the fixture source")
+        .folds_names()
+}
+
+/// D3-5 on a source that folds case but keeps Unicode normalisations apart (NTFS): a skipped
+/// decomposed `café.txt` (a SYSTEM file) names its composed sibling as a `local-case-collision`
+/// rather than silently shielding it, and the NAS copy is left alone.
+#[cfg(windows)]
+#[test]
+fn a_skipped_spelling_names_its_normalisation_variant_sibling() {
+    use std::os::windows::fs::OpenOptionsExt as _;
+    const FILE_ATTRIBUTE_SYSTEM: u32 = 0x4;
+    let fixture = Fixture::new("fix3-shadow-nfd");
+    fixture.write("caf\u{e9}.txt", b"the real notes");
+    let mut system = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .attributes(FILE_ATTRIBUTE_SYSTEM)
+        .open(fixture.source.join("cafe\u{301}.txt"))
+        .expect("NTFS keeps a decomposed name beside its composed twin");
+    std::io::Write::write_all(&mut system, b"system file").unwrap();
+    drop(system);
+    fixture.server.add_directory("/team/shadow-nfd");
+    fixture.server.add_file(
+        "/team/shadow-nfd/caf\u{e9}.txt",
+        b"older notes",
+        1_700_000_000,
+    );
+    let output = fixture.sync("/team/shadow-nfd", &["--delete"]);
+    let document = json(&output);
+    assert_eq!(output.status.code(), Some(0), "{}", describe(&output));
+    let skips = plan_skips(&document);
+    assert!(
+        skips
+            .iter()
+            .any(|(reason, path)| reason == "local-case-collision" && path == "caf\u{e9}.txt"),
+        "{skips:?}"
+    );
+    assert_eq!(
+        fixture.text("/team/shadow-nfd/caf\u{e9}.txt").as_deref(),
         Some("older notes"),
         "the NAS copy is neither replaced nor deleted"
     );
@@ -574,37 +633,59 @@ fn a_kept_deletion_under_a_case_renamed_folder_is_uploaded() {
     }
 }
 
-/// I-1, monotone: composing the patterns must not let a composed negation newly expose a NAS-only
-/// decomposed name the exact rules excluded. `*.txt` + `!café.txt` (typed composed) with a
-/// NAS-only decomposed `café.txt` under `--delete`: it survives, as it did before.
-#[cfg(unix)]
+/// I-1, monotone, on every source: a negation the walks honour regardless of normalisation (or,
+/// on a folding source, of case) must not expose a NAS-only name the rules as typed exclude.
+/// `*.txt` + `!café.txt` (typed composed) with a NAS-only decomposed `café.txt`, and `*.txt` +
+/// `!Report.txt` with a NAS-only `report.txt`, under `--delete`: both survive. On macOS (a folding
+/// source) the decomposed file used to be deleted, as on Windows the lower-case one.
 #[test]
 fn a_composed_negation_does_not_expose_a_decomposed_nas_only_name() {
-    let fixture = Fixture::new("fix3-mono");
-    fixture.write("keep.bin", b"keep");
-    fixture.server.add_directory("/team/mono");
-    fixture
-        .server
-        .add_file("/team/mono/cafe\u{301}.txt", b"only copy", 1_700_000_000);
-    let output = fixture.sync(
-        "/team/mono",
-        &[
-            "--delete",
-            "--compare",
-            "metadata",
-            "--exclude",
-            "*.txt",
-            "--exclude",
-            "!caf\u{e9}.txt",
-        ],
-    );
-    let document = json(&output);
-    assert_eq!(output.status.code(), Some(0), "{}", describe(&output));
-    assert_eq!(
-        fixture.text("/team/mono/cafe\u{301}.txt").as_deref(),
-        Some("only copy")
-    );
-    assert_eq!(count(&document, "deleted"), 0);
+    for (label, negation, remote_only) in [
+        ("nfd", "!caf\u{e9}.txt", "cafe\u{301}.txt"),
+        ("case", "!Report.txt", "report.txt"),
+    ] {
+        let fixture = Fixture::new(&format!("fix3-mono-{label}"));
+        fixture.write("keep.bin", b"keep");
+        fixture.server.add_directory("/team/mono");
+        fixture.server.add_file(
+            &format!("/team/mono/{remote_only}"),
+            b"only copy",
+            1_700_000_000,
+        );
+        fixture
+            .server
+            .add_file("/team/mono/stale.bin", b"stale", 1_700_000_000);
+        let output = fixture.sync(
+            "/team/mono",
+            &[
+                "--delete",
+                "--compare",
+                "metadata",
+                "--exclude",
+                "*.txt",
+                "--exclude",
+                negation,
+            ],
+        );
+        let document = json(&output);
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "[{label}] {}",
+            describe(&output)
+        );
+        assert_eq!(
+            fixture
+                .text(&format!("/team/mono/{remote_only}"))
+                .as_deref(),
+            Some("only copy"),
+            "[{label}] {}",
+            describe(&output)
+        );
+        // The mirror itself still runs: only the protected name is kept.
+        assert!(fixture.text("/team/mono/stale.bin").is_none(), "[{label}]");
+        assert_eq!(count(&document, "deleted"), 1, "[{label}]");
+    }
 }
 
 fn overlap_config(
