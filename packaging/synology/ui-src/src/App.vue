@@ -1699,6 +1699,7 @@ const ABOUT_RUST_DEPENDENCIES = Object.freeze([
   { name: "windows-native-keyring-store", pin: "1.1.0", scope: "Windows", url: "https://crates.io/crates/windows-native-keyring-store" },
   { name: "apple-native-keyring-store", pin: "1.0.2", scope: "macOS", url: "https://crates.io/crates/apple-native-keyring-store" },
   { name: "libc", pin: "0.2.191", scope: "Linux", url: "https://crates.io/crates/libc" },
+  { name: "nix", pin: "0.31.3", scope: "Linux", url: "https://crates.io/crates/nix" },
   { name: "zbus-secret-service-keyring-store", pin: "1.0.1", scope: "Linux", url: "https://crates.io/crates/zbus-secret-service-keyring-store" }
 ]);
 const ABOUT_UI_DEPENDENCIES = Object.freeze([
@@ -1902,6 +1903,13 @@ function emptyRoutine(profile = "") {
 const REALTIME_NOT_OBSERVING_REASONS = Object.freeze([
   "source_missing", "source_symlink", "watch_limit", "watch_setup_failed", "poll_unreadable", "poll_unavailable"
 ]);
+// The reasons a realtime routine is not watched natively. Each is a named amber
+// item in the Overview's attention list (and so in the top-bar chip), not only a
+// suffix on the routine's catalog row: when DSM had no watcher at all, every
+// realtime routine was quietly polled and nothing on the Overview said so.
+const REALTIME_WATCHER_DEMOTED_REASONS = Object.freeze([
+  "watch_unavailable", "watch_limit", "watch_setup_failed"
+]);
 // One operator-actionable line per reason, shown in the routine editor only
 // (routineReasonGuidance()). Never derived from watcher stderr or a log
 // event: the snapshot carries only the fixed reason code, so the guidance
@@ -1909,9 +1917,9 @@ const REALTIME_NOT_OBSERVING_REASONS = Object.freeze([
 const REALTIME_REASON_GUIDANCE = Object.freeze({
   source_missing: "The configured source path does not exist. Restore it, or point this routine's profile at a path that exists.",
   source_symlink: "The configured source path is a symlink. Point the profile at the real directory it targets.",
-  watch_unavailable: "No native watcher is available on this NAS. Install inotify-tools from SynoCommunity or Entware for native detection; polling continues to observe the source meanwhile.",
-  watch_setup_failed: "The native watcher failed to start after repeated attempts, and the controller has stopped retrying. Inspect the controller log for the reported error, then save this routine to try again.",
-  watch_limit: "The source has more directories than the inotify watch budget allows. Raise fs.inotify.max_user_watches, or narrow the source.",
+  watch_unavailable: "No native watcher is available: the package's own watcher failed its executable checks and no inotify-tools inotifywait was found. Polling continues to observe the source meanwhile; reinstall the package to restore native detection, and see realtime_watcher_command in the controller log.",
+  watch_setup_failed: "The native watcher failed to start, or stopped. The controller retries with a growing delay and stops after five failures; routine_watch_failed in the controller log names the cause. Fix it, then save this routine to try again.",
+  watch_limit: "The source has more directories than the inotify watch budget allows. Raise fs.inotify.max_user_watches (a root sysctl), or narrow the source. routine_watch_limit in the controller log gives the numbers. Until then the source is polled, which keeps its disks from hibernating.",
   watch_stopped: "A stopped native watcher was found and was replaced automatically. Inspect what is pausing it if this keeps happening.",
   poll_unreadable: "Part of the source could not be read during the last poll. Fix permissions on the unreadable subtree; the readable part is still observed.",
   poll_unavailable: "The last poll of the source failed outright. Confirm the source path is reachable and readable."
@@ -4491,11 +4499,26 @@ export default {
       // A defect in this window while applying a good snapshot is shown for as long
       // as it lasts, not only in a six-second toast.
       if (this.applyError) items.push({ id: "ui-apply-error", level: "warn", title: "This window failed to apply part of the package status", detail: `${this.applyError}. The package itself answered.` });
+      items.push(...this.realtimeAttentionItems);
       return this.retainedStale
         ? [{ id: "stale-poll", level: "unknown", title: "Showing a stale reading", detail: `${this.freshness} Rows below are history, not current status.` }].concat(items)
         : items;
     },
     serviceAttentionItem() { return this.snapshot ? serviceAttentionItem(this.snapshot, this.serviceState, packageGeneratedEpoch(this)) : null; },
+    // One amber item per enabled realtime routine whose native watcher is not in use,
+    // named by its reason and carrying the same guidance as the routine editor.
+    realtimeAttentionItems() {
+      const routines = Array.isArray(this.routines) ? this.routines : [];
+      return routines
+        .filter((routine) => routine && routine.enabled === true && routine.mode === "realtime")
+        .filter((routine) => REALTIME_WATCHER_DEMOTED_REASONS.includes(String(routine.backend_reason || "ok")))
+        .map((routine) => ({
+          id: `realtime-${routine.profile}`,
+          level: "warn",
+          title: `Realtime routine ${routine.profile} is not watched natively (${routine.backend_reason})`,
+          detail: REALTIME_REASON_GUIDANCE[routine.backend_reason]
+        }));
+    },
     // One line visible on every page. The Overview's attention list exists only on
     // the Overview and Activity, and a failure toast is gone before anyone looks.
     // It counts distinct problems: a failed all-profiles run and the profiles that

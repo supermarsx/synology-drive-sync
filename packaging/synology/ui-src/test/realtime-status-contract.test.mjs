@@ -191,3 +191,41 @@ test("the routine-poll help copy no longer calls polling a fallback", () => {
   );
   assert.doesNotMatch(appSource, /Fallback observation cadence when a native realtime hook is unavailable/);
 });
+
+test("a realtime routine the native watcher is not observing is a named amber attention item", () => {
+  const items = (routines) => component.computed.realtimeAttentionItems.call({ routines });
+  for (const reason of ["watch_unavailable", "watch_limit", "watch_setup_failed"]) {
+    const [item, ...rest] = items([routine({ backend: "polling", backend_reason: reason })]);
+    assert.deepEqual(rest, [], reason);
+    assert.equal(item.id, "realtime-photos", reason);
+    assert.equal(item.level, "warn", reason);
+    assert.equal(item.title, `Realtime routine photos is not watched natively (${reason})`, reason);
+    assert.equal(item.detail, component.methods.realtimeReasonGuidance.call({}, reason), reason);
+  }
+  // Healthy, self-healed, polled for another reason, disabled, or not realtime: none.
+  for (const overrides of [
+    {}, { backend_reason: "ok" }, { backend_reason: undefined }, { backend_reason: "watch_stopped" },
+    { backend_reason: "poll_unreadable" }, { backend_reason: "source_missing" },
+    { backend_reason: "watch_unavailable", enabled: false },
+    { backend_reason: "watch_unavailable", mode: "interval" }
+  ]) {
+    assert.deepEqual(items([routine(overrides)]), [], JSON.stringify(overrides));
+  }
+  // One item per routine; a window without a routine list yet shows none.
+  assert.equal(items([
+    routine({ backend_reason: "watch_limit" }), routine({ profile: "docs", backend_reason: "watch_unavailable" })
+  ]).length, 2);
+  assert.deepEqual(items(undefined), []);
+  // The Overview's attention list carries them, so the top-bar chip counts them.
+  const attention = appSource.match(/attentionItems\(\) \{[\s\S]*?\n    \},/);
+  assert.ok(attention, "attentionItems is missing");
+  assert.match(attention[0], /items\.push\(\.\.\.this\.realtimeAttentionItems\);/);
+});
+
+test("watch guidance names the package's own watcher and the root-only limit", () => {
+  const guidance = (reason) => component.methods.realtimeReasonGuidance.call({}, reason);
+  assert.match(guidance("watch_unavailable"), /package's own watcher/);
+  assert.match(guidance("watch_unavailable"), /realtime_watcher_command/);
+  assert.match(guidance("watch_limit"), /root sysctl/);
+  assert.match(guidance("watch_limit"), /hibernating/);
+});
