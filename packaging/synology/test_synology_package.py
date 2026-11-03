@@ -74,6 +74,24 @@ def select_validator_binary_path(
     return max(available, key=lambda candidate: candidate.stat().st_mtime_ns, default=None)
 
 
+def inotify_watches_held(pid: int) -> int:
+    """Watches the process holds, as /proc/<pid>/fdinfo publishes them."""
+    held = 0
+    try:
+        descriptors = list(Path(f"/proc/{pid}/fd").iterdir())
+    except OSError:
+        return 0
+    for descriptor in descriptors:
+        try:
+            if os.readlink(descriptor) != "anon_inode:inotify":
+                continue
+            info = Path(f"/proc/{pid}/fdinfo/{descriptor.name}").read_text(encoding="ascii")
+        except OSError:
+            continue
+        held += sum(1 for line in info.splitlines() if line.startswith("inotify wd:"))
+    return held
+
+
 def bounded_file_tail(path: Path, limit: int = 2048) -> str:
     """Return a bounded diagnostic tail without following an unexpected symlink."""
     if path.is_symlink():
@@ -1827,12 +1845,44 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
             "import json\n"
             "import os\n"
             "from pathlib import Path\n"
+            "import shutil\n"
             "import signal\n"
             "import socket\n"
             "import stat\n"
             "import subprocess\n"
             "import sys\n"
             "import time\n"
+            "\n"
+            "def run_mock_watch():\n"
+            "    # The package's own realtime watcher. With SDSYNC_TEST_NATIVE_WATCH\n"
+            "    # naming the built sdsync-dsm-api, the real binary replaces this mock\n"
+            "    # under the mock's own argv[0], so the controller's identity checks see\n"
+            "    # exactly the process shape they see on DSM. Without it, whatever\n"
+            "    # inotifywait the test put on PATH stands in, run as a child with the\n"
+            "    # inotifywait argv: the fixtures written for the inotifywait era keep\n"
+            "    # driving the controller's watcher handling unchanged.\n"
+            "    native = os.environ.get('SDSYNC_TEST_NATIVE_WATCH')\n"
+            "    if native:\n"
+            "        os.execv(native, [sys.argv[0], *sys.argv[1:]])\n"
+            "    arguments = sys.argv[2:]\n"
+            "    if arguments[:1] == ['--profile-fragment']:\n"
+            "        arguments = arguments[2:]\n"
+            "    arguments = ['close_write,create,delete,move' if value == 'close_write,create,delete,move,attrib,modify' else value for value in arguments]\n"
+            "    stand_in = shutil.which('inotifywait')\n"
+            "    if not stand_in:\n"
+            "        sys.stderr.write('watch_unavailable: the mock bridge has no watcher to stand in\\n')\n"
+            "        raise SystemExit(69)\n"
+            "    libc = ctypes.CDLL(None, use_errno=True)\n"
+            "    child = subprocess.Popen([stand_in, *arguments], preexec_fn=lambda: libc.prctl(1, signal.SIGKILL))\n"
+            "    def forward(signum, frame):\n"
+            "        child.send_signal(signum)\n"
+            "    signal.signal(signal.SIGTERM, forward)\n"
+            "    signal.signal(signal.SIGINT, forward)\n"
+            "    status = child.wait()\n"
+            "    raise SystemExit(status if status >= 0 else 128 - status)\n"
+            "\n"
+            "if len(sys.argv) >= 2 and sys.argv[1] == '--watch':\n"
+            "    run_mock_watch()\n"
             "\n"
             "def migrate_mock_security_policy(status_only=False):\n"
             "    policy = Path(os.environ['SYNOPKG_PKGHOME']) / 'config/security.conf'\n"
@@ -3239,6 +3289,63 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
             {"PATH": f"{fake_bin}:{self.environment['PATH']}", "SDSYNC_TEST_CLOCK": str(clock)},
             clock,
         )
+
+    def native_watch_environment(self) -> dict[str, str]:
+        """Make the package's own watcher the real built sdsync-dsm-api.
+
+        The fixture's sdsync-dsm-api is a Python mock. With this variable set,
+        its --watch mode execs the real binary under the mock's own argv[0], so
+        the controller resolves, spawns, identifies, STOPs and TERMs the real
+        native watcher exactly as it does on DSM, and the watcher sees real
+        inotify events from the fixture's source.
+        """
+        binary = select_validator_binary_path(
+            os.environ.get("SDSYNC_WATCH_BINARY"),
+            [
+                REPOSITORY / "target/debug/sdsync-dsm-api",
+                REPOSITORY / "target/release/sdsync-dsm-api",
+            ],
+        )
+        self.assertIsNotNone(
+            binary,
+            "the native watcher tests need `cargo build --locked` or SDSYNC_WATCH_BINARY",
+        )
+        return {"SDSYNC_TEST_NATIVE_WATCH": str(binary)}
+
+    def native_watcher_pid(self, profile: str) -> int:
+        """The live native watcher for profile, once it holds its watches."""
+        pid_path = self.real_var / f"run/watch-{profile}.pid"
+        deadline = time.monotonic() + 15
+        while time.monotonic() < deadline:
+            try:
+                pid = int(pid_path.read_text(encoding="utf-8").strip())
+                argv = Path(f"/proc/{pid}/cmdline").read_bytes().split(b"\0")
+            except (OSError, ValueError):
+                time.sleep(0.03)
+                continue
+            if len(argv) > 1 and argv[1] == b"--watch" and inotify_watches_held(pid) > 0:
+                return pid
+            time.sleep(0.03)
+        self.fail(f"the native watcher for {profile} never armed")
+
+    def settle_native_marker(self, event_path: Path) -> None:
+        """Wait until the real watcher has marked a change the test just made, and stopped.
+
+        A test that drives the debounce with a fake clock then rewrites the
+        marker and its mtime itself; the watcher must not append after that.
+        """
+        deadline = time.monotonic() + 10
+        last_size = -1
+        stable_since = time.monotonic()
+        while time.monotonic() < deadline:
+            size = event_path.stat().st_size if event_path.exists() else 0
+            if size != last_size:
+                last_size = size
+                stable_since = time.monotonic()
+            elif size > 0 and time.monotonic() - stable_since >= 0.3:
+                return
+            time.sleep(0.03)
+        self.fail("the native watcher never marked the change")
 
     def write_mock_control_job(
         self,
@@ -7385,19 +7492,18 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
             "#!/bin/sh\ncase ${1:-} in 1) exec /bin/sleep 1 ;; *) exec /bin/sleep 0.03 ;; esac\n",
             encoding="utf-8",
         )
-        fake_inotify = fake_bin / "inotifywait"
-        fake_inotify.write_text(
-            "#!/bin/sh\ntrap 'exit 0' TERM INT\nwhile :; do /bin/sleep 1; done\n",
-            encoding="utf-8",
-        )
-        for path in (fake_date, fake_sleep, fake_inotify):
+        for path in (fake_date, fake_sleep):
             path.chmod(0o755)
         if os.getuid() == 0:
-            for path in (fake_bin, clock, fake_date, fake_sleep, fake_inotify):
+            for path in (fake_bin, clock, fake_date, fake_sleep):
                 os.chown(path, self.drop_uid, self.drop_gid)
+        # The real native watcher: each change below is seen by inotify and
+        # marked by the watcher itself before the test pins the marker's
+        # mtime to the fake clock.
         environment = {
             "PATH": f"{fake_bin}:{self.environment['PATH']}",
             "SDSYNC_TEST_CLOCK": str(clock),
+            **self.native_watch_environment(),
         }
 
         self.capture.write_text("", encoding="utf-8")
@@ -7416,11 +7522,13 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
             time.sleep(0.03)
         else:
             self.fail("native watcher did not establish its initial fingerprint and event file")
+        self.native_watcher_pid("watch")
 
         self.capture.write_text("", encoding="utf-8")
         (self.source_two / "watched.txt").write_text(
             "changed with a different size\n", encoding="utf-8"
         )
+        self.settle_native_marker(event_path)
         event_path.write_text("change\n", encoding="utf-8")
         os.utime(event_path, (100, 100))
         write_clock(clock, "144\n")
@@ -7467,6 +7575,7 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
         )
 
         (self.source_two / "watched.txt").write_text("second change\n", encoding="utf-8")
+        self.settle_native_marker(event_path)
         event_path.write_text("event at 200\n", encoding="utf-8")
         os.utime(event_path, (200, 200))
         write_clock(clock, "244\n")
@@ -7476,6 +7585,7 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
         (self.source_two / "watched.txt").write_text(
             "third change resets debounce\n", encoding="utf-8"
         )
+        self.settle_native_marker(event_path)
         event_path.write_text("new event at 230\n", encoding="utf-8")
         os.utime(event_path, (230, 230))
         write_clock(clock, "274\n")
@@ -7953,6 +8063,7 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
         )
         self.assertEqual(routine.returncode, 0, routine.stderr)
         environment, clock = self.realtime_watcher_environment(label="ceiling")
+        environment.update(self.native_watch_environment())
         self.capture.write_text("", encoding="utf-8")
         started = self.shell(self.lifecycle, "start", extra_environment=environment, timeout=15)
         self.assertEqual(started.returncode, 0, started.stderr)
@@ -7969,6 +8080,7 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
             time.sleep(0.03)
         else:
             self.fail("native watcher did not establish its initial fingerprint and event file")
+        self.native_watcher_pid("watch")
 
         # A fixed clock-step loop with a hardcoded end bound races the
         # controller's own turn latency: event_first_seen_epoch is stamped on
@@ -8056,6 +8168,7 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
         )
         self.assertEqual(routine.returncode, 0, routine.stderr)
         environment, clock = self.realtime_watcher_environment(label="ceiling-race")
+        environment.update(self.native_watch_environment())
         self.capture.write_text("", encoding="utf-8")
         started = self.shell(self.lifecycle, "start", extra_environment=environment, timeout=15)
         self.assertEqual(started.returncode, 0, started.stderr)
@@ -8072,6 +8185,7 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
             time.sleep(0.03)
         else:
             self.fail("native watcher did not establish its initial fingerprint and event file")
+        self.native_watcher_pid("watch")
 
         invocation = "sync --profile watch --no-delete"
         current_now = [100]
@@ -8723,6 +8837,7 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
         )
         self.assertEqual(routine.returncode, 0, routine.stderr)
         environment, clock = self.realtime_watcher_environment(label="below-ceiling")
+        environment.update(self.native_watch_environment())
         self.capture.write_text("", encoding="utf-8")
         started = self.shell(self.lifecycle, "start", extra_environment=environment, timeout=15)
         self.assertEqual(started.returncode, 0, started.stderr)
@@ -8739,6 +8854,7 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
             time.sleep(0.03)
         else:
             self.fail("native watcher did not establish its initial fingerprint and event file")
+        self.native_watcher_pid("watch")
 
         invocation = "sync --profile watch --no-delete"
         now = 100
@@ -8797,21 +8913,7 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
             "--allow-delete", "false", "--max-total-delete", "100",
         )
         self.assertEqual(routine.returncode, 0, routine.stderr)
-        fake_bin = self.root / "watch-limit-bin"
-        fake_bin.mkdir(mode=0o700)
-        invoked_marker = self.root / "watch-limit-invoked"
-        fake_inotify = fake_bin / "inotifywait"
-        fake_inotify.write_text(
-            "#!/bin/sh\n"
-            f': > "{invoked_marker}"\n'
-            "trap 'exit 0' TERM INT\nwhile :; do /bin/sleep 1; done\n",
-            encoding="utf-8",
-        )
-        fake_inotify.chmod(0o755)
-        if os.getuid() == 0:
-            os.chown(fake_bin, self.drop_uid, self.drop_gid)
-            os.chown(fake_inotify, self.drop_uid, self.drop_gid)
-        environment = {"PATH": f"{fake_bin}:{self.environment['PATH']}"}
+        environment = self.native_watch_environment()
         started = self.shell(self.lifecycle, "start", extra_environment=environment, timeout=15)
         self.assertEqual(started.returncode, 0, started.stderr)
         matches = self.wait_for_controller_event("routine_watch_limit")
@@ -8835,16 +8937,30 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
         else:
             self.fail("watch-limit refusal was never recorded in the routine state")
         self.assertFalse(
-            invoked_marker.exists(), "inotifywait was spawned despite exceeding the watch limit"
+            (self.real_var / "run/watch-watch.pid").exists(),
+            "the native watcher was spawned despite exceeding the watch limit",
         )
+        spawned = []
+        for process in Path("/proc").iterdir():
+            if not process.name.isdigit():
+                continue
+            try:
+                argv = (process / "cmdline").read_bytes().split(b"\0")
+            except OSError:
+                continue
+            if b"--watch" in argv and os.fsencode(self.source_two) in argv:
+                spawned.append(process.name)
+        self.assertEqual(spawned, [], "a native watcher process exists over the watch limit")
         stopped = self.shell(self.lifecycle, "stop", timeout=15)
         self.assertEqual(stopped.returncode, 0, stopped.stdout + stopped.stderr)
 
     def test_realtime_watch_setup_failure_reports_sanitized_detail(self) -> None:
-        # Row 12. inotifywait exits 1 and writes "Couldn't watch <path>: ..."
-        # to stderr even under -q; that must land in the private
-        # watch-<profile>.stderr, never raw in controller.log, and
-        # routine_watch_failed's detail must carry it sanitized.
+        # Row 12, against the real native watcher. An ignore file the
+        # watcher cannot compile stops it at setup with one stderr line; that
+        # line must land in the private watch-<profile>.stderr, never raw in
+        # controller.log, and routine_watch_failed's detail must carry it
+        # sanitized. The poll does not read the ignore file, so nothing else
+        # fails beside it.
         self.assertEqual(
             self.configure("watch", self.source_two, "/home/Drive/Watch", True).returncode, 0
         )
@@ -8854,6 +8970,7 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
         )
         self.assertEqual(secret.returncode, 0, secret.stderr)
         (self.source_two / "watched.txt").write_text("one\n", encoding="utf-8")
+        (self.source_two / ".sdsyncignore").write_text("{unclosed\n", encoding="utf-8")
         routine, _ = self.api(
             "routine", "--profile", "watch", "--enabled", "true", "--action", "sync",
             "--mode", "realtime", "--debounce-seconds", "1", "--poll-seconds", "5",
@@ -8861,32 +8978,22 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
             "--allow-delete", "false", "--max-total-delete", "100",
         )
         self.assertEqual(routine.returncode, 0, routine.stderr)
-        fake_bin = self.root / "watch-enospc-bin"
-        fake_bin.mkdir(mode=0o700)
-        fake_inotify = fake_bin / "inotifywait"
-        fake_inotify.write_text(
-            "#!/bin/sh\n"
-            "printf \"Couldn't watch %s: No space left on device\\n\" \"$8\" >&2\n"
-            "exit 1\n",
-            encoding="utf-8",
-        )
-        fake_inotify.chmod(0o755)
-        if os.getuid() == 0:
-            os.chown(fake_bin, self.drop_uid, self.drop_gid)
-            os.chown(fake_inotify, self.drop_uid, self.drop_gid)
-        environment = {"PATH": f"{fake_bin}:{self.environment['PATH']}"}
+        environment = self.native_watch_environment()
         started = self.shell(self.lifecycle, "start", extra_environment=environment, timeout=15)
         self.assertEqual(started.returncode, 0, started.stderr)
         matches = self.wait_for_controller_event("routine_watch_failed")
         details = [str(m.get("detail", "")) for m in matches]
-        self.assertTrue(any("No space left on device" in d for d in details), details)
+        self.assertTrue(
+            any("detail=watch_setup_failed rules: invalid ignore file" in d for d in details),
+            details,
+        )
         # The sanitized routine_watch_failed event's own detail field is
         # *supposed* to carry this text -- that is what row 12 exists to
         # prove. What must never happen is the raw stderr leaking in
         # unstructured, outside that one JSON event's detail field (the old
         # behaviour, redirecting stderr straight into controller.log).
         for line in (self.real_var / "log/controller.log").read_text(encoding="utf-8").splitlines():
-            if "Couldn't watch" not in line:
+            if "invalid ignore file" not in line:
                 continue
             record = json.loads(line)
             self.assertEqual(record.get("event"), "routine_watch_failed", line)
@@ -8896,7 +9003,9 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
             if stderr_record.exists() and stderr_record.read_text(encoding="utf-8").strip():
                 break
             time.sleep(0.03)
-        self.assertIn("Couldn't watch", stderr_record.read_text(encoding="utf-8"))
+        recorded = stderr_record.read_text(encoding="utf-8")
+        self.assertTrue(recorded.startswith("watch_setup_failed rules: invalid ignore file"), recorded)
+        self.assertEqual(len(recorded.splitlines()), 1, recorded)
         stopped = self.shell(self.lifecycle, "stop", timeout=15)
         self.assertEqual(stopped.returncode, 0, stopped.stdout + stopped.stderr)
 
@@ -8924,6 +9033,9 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
         )
         self.assertEqual(secret.returncode, 0, secret.stderr)
         (self.source_two / "watched.txt").write_text("one\n", encoding="utf-8")
+        # The real native watcher fails at setup on every attempt: the ignore
+        # file does not compile. Each attempt is one routine_watch_failed.
+        (self.source_two / ".sdsyncignore").write_text("{unclosed\n", encoding="utf-8")
         routine, _ = self.api(
             "routine", "--profile", "watch", "--enabled", "true", "--action", "sync",
             "--mode", "realtime", "--debounce-seconds", "1", "--poll-seconds", "5",
@@ -8935,8 +9047,6 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
         fake_bin.mkdir(mode=0o700)
         clock = self.root / "watch-ladder-clock"
         write_clock(clock, "1000\n")
-        invocations = self.root / "watch-ladder-invocations"
-        invocations.write_text("0\n", encoding="utf-8")
         fake_date = fake_bin / "date"
         fake_date.write_text(
             "#!/bin/sh\n"
@@ -8955,22 +9065,19 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
             "#!/bin/sh\ncase ${1:-} in 1) exec /bin/sleep 1 ;; *) exec /bin/sleep 0.03 ;; esac\n",
             encoding="utf-8",
         )
-        fake_inotify = fake_bin / "inotifywait"
-        fake_inotify.write_text(
-            "#!/bin/sh\n"
-            f'invocations="{invocations}"\n'
-            'IFS= read -r count < "$invocations"\n'
-            'count=$((count + 1))\n'
-            'printf \'%s\\n\' "$count" > "$invocations"\n'
-            'exit 1\n',
-            encoding="utf-8",
-        )
-        for path in (fake_date, fake_sleep, fake_inotify):
+        for path in (fake_date, fake_sleep):
             path.chmod(0o755)
         if os.getuid() == 0:
-            for path in (fake_bin, clock, invocations, fake_date, fake_sleep, fake_inotify):
+            for path in (fake_bin, clock, fake_date, fake_sleep):
                 os.chown(path, self.drop_uid, self.drop_gid)
-        environment = {"PATH": f"{fake_bin}:{self.environment['PATH']}", "SDSYNC_TEST_CLOCK": str(clock)}
+        environment = {
+            "PATH": f"{fake_bin}:{self.environment['PATH']}",
+            "SDSYNC_TEST_CLOCK": str(clock),
+            **self.native_watch_environment(),
+        }
+
+        def attempts() -> int:
+            return len(self.event_details("routine_watch_failed"))
         started = self.shell(self.lifecycle, "start", extra_environment=environment, timeout=15)
         self.assertEqual(started.returncode, 0, started.stderr)
         failed_path = self.real_var / "run/watch-watch.failed"
@@ -9017,11 +9124,12 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
                 time.sleep(0.03)
             else:
                 self.fail(f"post-give-up state was never persisted: {state_text}")
-            invocations_before = int(invocations.read_text(encoding="utf-8").strip())
+            attempts_before = attempts()
+            self.assertEqual(attempts_before, 5)
             now += 3600
             write_clock(clock, f"{now}\n")
             time.sleep(0.5)
-            self.assertEqual(int(invocations.read_text(encoding="utf-8").strip()), invocations_before, "a sixth spawn was attempted after give-up")
+            self.assertEqual(attempts(), attempts_before, "a sixth spawn was attempted after give-up")
 
         stopped = self.shell(self.lifecycle, "stop", timeout=15)
         self.assertEqual(stopped.returncode, 0, stopped.stdout + stopped.stderr)
@@ -9340,6 +9448,7 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
         )
         self.assertEqual(routine.returncode, 0, routine.stderr)
         environment, _clock = self.realtime_watcher_environment(label="no-zombies")
+        environment.update(self.native_watch_environment())
         started = self.shell(self.lifecycle, "start", extra_environment=environment, timeout=15)
         self.assertEqual(started.returncode, 0, started.stderr)
         pid_path = self.real_var / "run/watch-watch.pid"
@@ -9351,6 +9460,7 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
             time.sleep(0.03)
         else:
             self.fail("watcher or controller did not start")
+        self.native_watcher_pid("watch")
         controller_pid = int(controller_pid_path.read_text(encoding="utf-8").strip())
 
         # No "reload" lifecycle verb exists; a reload is a controller HUP.
@@ -9414,6 +9524,7 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
         )
         self.assertEqual(routine.returncode, 0, routine.stderr)
         fast_environment = self.fast_clock_environment(step=31)
+        fast_environment.update(self.native_watch_environment())
         started = self.shell(self.lifecycle, "start", extra_environment=fast_environment, timeout=15)
         self.assertEqual(started.returncode, 0, started.stderr)
         state_path = self.real_var / "state/routines/watch.state"
@@ -9424,6 +9535,7 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
             time.sleep(0.03)
         else:
             self.fail("baseline was never established before removing the source")
+        watcher_pid = self.native_watcher_pid("watch")
 
         shutil.rmtree(source)
         removed = self.wait_for_controller_event("routine_source_unavailable")
@@ -9436,8 +9548,288 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
             time.sleep(0.03)
         else:
             self.fail("state file was not updated after the source was removed")
+        watcher_deadline = time.monotonic() + 15
+        while time.monotonic() < watcher_deadline:
+            try:
+                stat_text = Path(f"/proc/{watcher_pid}/stat").read_text(encoding="ascii")
+            except OSError:
+                break
+            if stat_text.rsplit(") ", 1)[1].split()[0] in ("Z", "X"):
+                break
+            time.sleep(0.03)
+        else:
+            self.fail("the native watcher outlived its removed source")
         stopped = self.shell(self.lifecycle, "stop", timeout=15)
         self.assertEqual(stopped.returncode, 0, stopped.stdout + stopped.stderr)
+
+    def _realtime_watch_profile(self, *, debounce: str = "1", poll: str = "5") -> None:
+        self.assertEqual(
+            self.configure("watch", self.source_two, "/home/Drive/Watch", True).returncode, 0
+        )
+        secret, _ = self.api(
+            "set-secret", "--profile", "watch", "--kind", "password", "--mode", "replace",
+            input_text="test-password\n",
+        )
+        self.assertEqual(secret.returncode, 0, secret.stderr)
+        routine, _ = self.api(
+            "routine", "--profile", "watch", "--enabled", "true", "--action", "sync",
+            "--mode", "realtime", "--debounce-seconds", debounce, "--poll-seconds", poll,
+            "--retry-count", "0", "--retry-backoff-seconds", "10", "--retry-exponential", "true",
+            "--allow-delete", "false", "--max-total-delete", "100",
+        )
+        self.assertEqual(routine.returncode, 0, routine.stderr)
+
+    def _without_the_package_watcher(self) -> None:
+        """Make the package binary fail resolution, as one failing its checks would."""
+        controller = self.real_target / "libexec/sdsync-controller"
+        source = controller.read_text(encoding="utf-8")
+        needle = 'for inotify_probe in "$api_bridge" "$inotify_path_candidate"'
+        self.assertEqual(source.count(needle), 1, "watcher resolution order changed")
+        controller.write_text(
+            source.replace(needle, 'for inotify_probe in "$inotify_path_candidate"', 1),
+            encoding="utf-8",
+        )
+
+    def _fast_sleep_environment(self, label: str) -> dict[str, str]:
+        """Only the controller's multi-second sleeps are shortened; the clock is real."""
+        fake_bin = self.root / f"{label}-sleep-bin"
+        fake_bin.mkdir(mode=0o700)
+        fake_sleep = fake_bin / "sleep"
+        fake_sleep.write_text(
+            "#!/bin/sh\ncase ${1:-} in 1) exec /bin/sleep 1 ;; *) exec /bin/sleep 0.03 ;; esac\n",
+            encoding="utf-8",
+        )
+        fake_sleep.chmod(0o755)
+        if os.getuid() == 0:
+            os.chown(fake_bin, self.drop_uid, self.drop_gid)
+            os.chown(fake_sleep, self.drop_uid, self.drop_gid)
+        return {"PATH": f"{fake_bin}:{self.environment['PATH']}"}
+
+    def test_realtime_native_watcher_is_the_package_binary_and_dispatches_on_a_real_change(self) -> None:
+        # DSM ships no inotifywait. The package's own binary is the watcher,
+        # spawned with --watch, the profile fragment and the wider event set;
+        # a file saved into a nested folder reaches a sync through real
+        # inotify alone. The poll interval is the maximum, so the run cannot
+        # come from the fingerprint fallback, and the clock is real.
+        nested = self.source_two / "Projects" / "2026" / "q4"
+        nested.mkdir(parents=True)
+        if os.getuid() == 0:
+            for path in (self.source_two / "Projects", nested.parent, nested):
+                os.chown(path, self.drop_uid, self.drop_gid)
+        self._realtime_watch_profile(debounce="1", poll="3600")
+        environment = {
+            **self._fast_sleep_environment("native-real"),
+            **self.native_watch_environment(),
+        }
+        self.capture.write_text("", encoding="utf-8")
+        started = self.shell(self.lifecycle, "start", extra_environment=environment, timeout=15)
+        self.assertEqual(started.returncode, 0, started.stderr)
+        state_path = self.real_var / "state/routines/watch.state"
+        deadline = time.monotonic() + 15
+        while time.monotonic() < deadline:
+            state_text = state_path.read_text(encoding="utf-8") if state_path.exists() else ""
+            if "fingerprint=none" not in state_text and "backend=inotify" in state_text:
+                break
+            time.sleep(0.03)
+        else:
+            self.fail(f"the routine never reported the native backend: {state_text}")
+        self.assertIn("backend_reason=ok", state_path.read_text(encoding="utf-8"))
+        watcher = self.native_watcher_pid("watch")
+        argv = [
+            os.fsdecode(value)
+            for value in Path(f"/proc/{watcher}/cmdline").read_bytes().split(b"\0")[:-1]
+        ]
+        self.assertEqual(Path(argv[0]).name, "sdsync-dsm-api", argv)
+        self.assertEqual(argv[1:3], ["--watch", "--profile-fragment"], argv)
+        self.assertTrue(argv[3].endswith("config/profiles.d/watch.toml"), argv)
+        self.assertEqual(
+            argv[4:-1],
+            ["-m", "-q", "-r", "--format", "x", "-e", "close_write,create,delete,move,attrib,modify"],
+        )
+        self.assertEqual(argv[-1], str(self.source_two))
+        commands = self.event_details("realtime_watcher_command")
+        self.assertTrue(any(detail.endswith(" kind=native") for detail in commands), commands)
+        self.assertEqual(self.capture.read_text(encoding="utf-8"), "")
+
+        (nested / "minutes.txt").write_text("saved over SMB\n", encoding="utf-8")
+        invocation = "sync --profile watch --no-delete"
+        deadline = time.monotonic() + 20
+        while time.monotonic() < deadline:
+            if invocation in self.capture.read_text(encoding="utf-8"):
+                break
+            time.sleep(0.05)
+        else:
+            self.fail("a change seen by the native watcher never dispatched a sync")
+        stopped = self.shell(self.lifecycle, "stop", timeout=15)
+        self.assertEqual(stopped.returncode, 0, stopped.stdout + stopped.stderr)
+        # A package stop leaves no watcher behind.
+        try:
+            stat_text = Path(f"/proc/{watcher}/stat").read_text(encoding="ascii")
+        except OSError:
+            stat_text = ""
+        self.assertIn(
+            stat_text.rsplit(") ", 1)[1].split()[0] if stat_text else "gone",
+            ("gone", "Z", "X"),
+            "the native watcher outlived the package stop",
+        )
+
+    def test_realtime_falls_back_to_inotifywait_when_the_package_watcher_is_refused(self) -> None:
+        # The package binary is preferred; an inotifywait on PATH is only the
+        # fallback, used with the inotifywait argv and identified as such.
+        self._without_the_package_watcher()
+        self._realtime_watch_profile()
+        environment, _clock = self.realtime_watcher_environment(label="fallback")
+        started = self.shell(self.lifecycle, "start", extra_environment=environment, timeout=15)
+        self.assertEqual(started.returncode, 0, started.stdout + started.stderr)
+        pid_path = self.real_var / "run/watch-watch.pid"
+        state_path = self.real_var / "state/routines/watch.state"
+        deadline = time.monotonic() + 15
+        while time.monotonic() < deadline:
+            state_text = state_path.read_text(encoding="utf-8") if state_path.exists() else ""
+            if pid_path.is_file() and "backend=inotify" in state_text:
+                break
+            time.sleep(0.03)
+        else:
+            self.fail("the inotifywait fallback was never adopted")
+        pid = int(pid_path.read_text(encoding="utf-8").strip())
+        argv = Path(f"/proc/{pid}/cmdline").read_bytes().split(b"\0")
+        self.assertNotIn(b"--watch", argv)
+        self.assertTrue(any(value.endswith(b"/inotifywait") for value in argv), argv)
+        self.assertIn(b"close_write,create,delete,move", argv)
+        commands = self.event_details("realtime_watcher_command")
+        self.assertTrue(any(detail.endswith(" kind=inotifywait") for detail in commands), commands)
+        stopped = self.shell(self.lifecycle, "stop", timeout=15)
+        self.assertEqual(stopped.returncode, 0, stopped.stdout + stopped.stderr)
+
+    def test_realtime_without_any_watcher_is_polled_and_says_watch_unavailable(self) -> None:
+        # Neither the package watcher nor an inotifywait: every realtime
+        # routine is polled, the controller says so once as a warning, and
+        # the routine carries the named reason the dashboard shows.
+        for candidate in ("/usr/local/bin/inotifywait", "/opt/bin/inotifywait",
+                          "/var/packages/inotify-tools/target/bin/inotifywait"):
+            if os.path.exists(candidate):
+                self.skipTest(f"{candidate} exists on this host")
+        if shutil.which("inotifywait", path=self.environment["PATH"]):
+            self.skipTest("an inotifywait is on PATH on this host")
+        self._without_the_package_watcher()
+        self._realtime_watch_profile()
+        started = self.shell(
+            self.lifecycle, "start", extra_environment=self._fast_sleep_environment("no-watcher"),
+            timeout=15,
+        )
+        self.assertEqual(started.returncode, 0, started.stderr)
+        state_path = self.real_var / "state/routines/watch.state"
+        deadline = time.monotonic() + 15
+        while time.monotonic() < deadline:
+            state_text = state_path.read_text(encoding="utf-8") if state_path.exists() else ""
+            if "backend=polling" in state_text and "backend_reason=watch_unavailable" in state_text:
+                break
+            time.sleep(0.03)
+        else:
+            self.fail(f"the routine never said watch_unavailable: {state_text}")
+        records = [
+            json.loads(line)
+            for line in (self.real_var / "log/controller.log").read_text(encoding="utf-8").splitlines()
+            if '"realtime_watcher_command"' in line
+        ]
+        self.assertTrue(records, "the watcher resolution was never logged")
+        self.assertTrue(
+            any(record.get("level") == "warn" and "path=none" in str(record.get("detail", ""))
+                for record in records),
+            records,
+        )
+        self.assertFalse((self.real_var / "run/watch-watch.pid").exists())
+        stopped = self.shell(self.lifecycle, "stop", timeout=15)
+        self.assertEqual(stopped.returncode, 0, stopped.stdout + stopped.stderr)
+
+    def test_realtime_native_watch_limit_line_keeps_the_watch_limit_reason(self) -> None:
+        # The native watcher counts directories against the per-user budget
+        # itself and refuses with a line that starts "watch_limit dirs=...".
+        # The controller must keep that reason -- the dashboard's named
+        # watch_limit -- and log the numbers, not fold it into a generic
+        # setup failure. A stand-in prints the real binary's line, because
+        # the kernel limit cannot be lowered for one test.
+        self._realtime_watch_profile()
+        fake_bin = self.root / "native-limit-bin"
+        fake_bin.mkdir(mode=0o700)
+        fake_inotify = fake_bin / "inotifywait"
+        fake_inotify.write_text(
+            "#!/bin/sh\n"
+            "printf '%s\\n' 'watch_limit dirs=9 budget=8 limit=10 held=0: more directories than 80% "
+            "of the per-user inotify limit leaves; raise fs.inotify.max_user_watches (root sysctl) "
+            "or narrow the source' >&2\n"
+            "exit 73\n",
+            encoding="utf-8",
+        )
+        fake_inotify.chmod(0o755)
+        if os.getuid() == 0:
+            os.chown(fake_bin, self.drop_uid, self.drop_gid)
+            os.chown(fake_inotify, self.drop_uid, self.drop_gid)
+        started = self.shell(
+            self.lifecycle, "start",
+            extra_environment={"PATH": f"{fake_bin}:{self.environment['PATH']}"}, timeout=15,
+        )
+        self.assertEqual(started.returncode, 0, started.stderr)
+        limits = self.wait_for_controller_event("routine_watch_limit")
+        details = [str(match.get("detail", "")) for match in limits]
+        self.assertTrue(
+            any("source=watcher" in detail and "dirs=9 budget=8 limit=10" in detail for detail in details),
+            details,
+        )
+        state_path = self.real_var / "state/routines/watch.state"
+        deadline = time.monotonic() + 15
+        while time.monotonic() < deadline:
+            state_text = state_path.read_text(encoding="utf-8") if state_path.exists() else ""
+            if "backend_reason=watch_limit" in state_text:
+                break
+            time.sleep(0.03)
+        else:
+            self.fail(f"the watcher's limit refusal did not reach the routine state: {state_text}")
+        failure = (self.real_var / "run/watch-watch.failed").read_text(encoding="utf-8").split()
+        self.assertEqual(failure[2:], ["watch_limit"])
+        stopped = self.shell(self.lifecycle, "stop", timeout=15)
+        self.assertEqual(stopped.returncode, 0, stopped.stdout + stopped.stderr)
+
+    def test_realtime_native_watcher_never_adopts_a_bridge_process_by_pid(self) -> None:
+        # sdsync-dsm-api is also the API bridge and the queue consumer. A pid
+        # file naming one of those -- a recycled pid -- must not pass for a
+        # watcher: adopting it would report a healthy backend, and the event
+        # consume would SIGSTOP the bridge.
+        self._realtime_watch_profile()
+        bridge = self.fhs / "target/bin/sdsync-dsm-api"
+        impostor = subprocess.Popen(
+            [str(bridge), "-c", "import time; time.sleep(120)"],
+            executable=sys.executable,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        self.addCleanup(impostor.wait)
+        self.addCleanup(impostor.kill)
+        run = self.real_var / "run"
+        run.mkdir(mode=0o700, exist_ok=True)
+        (run / "watch-watch.pid").write_text(f"{impostor.pid}\n", encoding="utf-8")
+        (run / "watch-watch.source").write_text(f"{self.source_two}\n", encoding="utf-8")
+        for path in (run / "watch-watch.pid", run / "watch-watch.source"):
+            path.chmod(0o600)
+            if os.getuid() == 0:
+                os.chown(path, self.drop_uid, self.drop_gid)
+        environment, _clock = self.realtime_watcher_environment(label="impostor")
+        environment.update(self.native_watch_environment())
+        started = self.shell(self.lifecycle, "start", extra_environment=environment, timeout=15)
+        self.assertEqual(started.returncode, 0, started.stderr)
+        self.wait_for_controller_event("routine_watch_failed")
+        state_path = self.real_var / "state/routines/watch.state"
+        deadline = time.monotonic() + 15
+        while not state_path.exists() and time.monotonic() < deadline:
+            time.sleep(0.03)
+        state = Path(f"/proc/{impostor.pid}/stat").read_text(encoding="ascii").rsplit(") ", 1)[1].split()[0]
+        self.assertIn(state, ("S", "R"), "the bridge-shaped process was stopped or signalled")
+        self.assertIsNone(impostor.poll(), "the bridge-shaped process was terminated")
+        self.assertNotIn("backend=inotify", state_path.read_text(encoding="utf-8"))
+        stopped = self.shell(self.lifecycle, "stop", timeout=15)
+        self.assertEqual(stopped.returncode, 0, stopped.stdout + stopped.stderr)
+        self.assertIsNone(impostor.poll(), "the package stop terminated a process that is not a watcher")
 
     def test_realtime_source_replaced_by_symlink_defers(self) -> None:
         # Row 21. Replacing the source with a symlink to a real directory

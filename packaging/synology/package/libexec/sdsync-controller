@@ -915,8 +915,9 @@ stop_realtime_watchers() {
 # stop a process. Uninstalling inotify-tools empties $inotify_command, and the
 # strong check then refuses every live watcher, so nothing could kill the one
 # still holding watches on the source. Live, package-owned and argv[0] named
-# inotifywait is enough to send a signal; it is never enough to report a
-# backend as healthy.
+# inotifywait -- or the package's own sdsync-dsm-api in --watch mode, as
+# argv[0] or as argv[1] after an interpreter -- is enough to send a signal; it
+# is never enough to report a backend as healthy.
 realtime_watcher_is_stoppable() {
     stoppable_pid=$1
     pid_is_live "$stoppable_pid" || return 1
@@ -924,9 +925,27 @@ realtime_watcher_is_stoppable() {
     stoppable_uid=$(sed -n 's/^Uid:[[:space:]]*\([0-9][0-9]*\).*/\1/p' \
         "/proc/$stoppable_pid/status" 2>/dev/null | sed -n '1p')
     [ "$stoppable_uid" = "$path_owner" ] || return 1
-    stoppable_argv_zero=$(tr '\000' '\n' < "/proc/$stoppable_pid/cmdline" 2>/dev/null | sed -n '1p')
+    stoppable_argv=$(tr '\000' '\n' < "/proc/$stoppable_pid/cmdline" 2>/dev/null | sed -n '1,3p')
+    stoppable_argv_zero=$(printf '%s\n' "$stoppable_argv" | sed -n '1p')
+    stoppable_argv_one=$(printf '%s\n' "$stoppable_argv" | sed -n '2p')
+    stoppable_argv_two=$(printf '%s\n' "$stoppable_argv" | sed -n '3p')
     [ -n "$stoppable_argv_zero" ] || return 1
-    [ "${stoppable_argv_zero##*/}" = inotifywait ]
+    [ "${stoppable_argv_zero##*/}" = inotifywait ] && return 0
+    [ "${stoppable_argv_zero##*/}" = sdsync-dsm-api ] && [ "$stoppable_argv_one" = --watch ] && return 0
+    [ "${stoppable_argv_one##*/}" = sdsync-dsm-api ] && [ "$stoppable_argv_two" = --watch ]
+}
+
+# The strong identity of a running watcher: pid_matches_command on the resolved
+# command, and for the package's own binary also the --watch mode right after
+# it. sdsync-dsm-api is the API bridge and the queue consumer too, so a
+# recycled pid naming one of those must never be adopted as a watcher -- the
+# event consume would SIGSTOP it.
+realtime_watcher_matches() {
+    pid_matches_command "$1" "$inotify_command" || return 1
+    [ "${inotify_native:-false}" = true ] || return 0
+    watcher_mode_argument=$(tr '\000' '\n' < "/proc/$1/cmdline" 2>/dev/null \
+        | sed -n "$((command_position + 1))p")
+    [ "$watcher_mode_argument" = --watch ]
 }
 
 terminate_realtime_watcher() {
@@ -1223,7 +1242,7 @@ ensure_realtime_watcher() {
         fi
     done
     watcher_existing=$(read_pid "$watcher_pid_path" 2>/dev/null || true)
-    if [ -n "$watcher_existing" ] && pid_matches_command "$watcher_existing" "$inotify_command"; then
+    if [ -n "$watcher_existing" ] && realtime_watcher_matches "$watcher_existing"; then
         # pid_matches_command deliberately never looks at the watched
         # directory: it also verifies the API bridge's parent, and teaching it
         # about watcher arguments would put that logic on the bridge path. The
@@ -1274,8 +1293,17 @@ ensure_realtime_watcher() {
                 "$watcher_stderr_path" 2>/dev/null || true)
         fi
         rm -f "$watcher_pid_path" "$watcher_source_path"
-        realtime_watcher_reason=watch_setup_failed
-        if record_realtime_watcher_failure_or_abandon "$watcher_profile" watch_setup_failed; then
+        # The native watcher's line starts with the reason: a tree over the
+        # per-user watch budget, or one the kernel refused another watch for,
+        # is watch_limit with its numbers, not a generic setup failure.
+        watcher_dead_reason=watch_setup_failed
+        case $watcher_dead_detail in 'watch_limit '*) watcher_dead_reason=watch_limit ;; esac
+        realtime_watcher_reason=$watcher_dead_reason
+        if record_realtime_watcher_failure_or_abandon "$watcher_profile" "$watcher_dead_reason"; then
+            if [ "$watcher_dead_reason" = watch_limit ]; then
+                watch_note_once "$watcher_profile:watcher_limit:$watcher_dead_detail" warn routine_watch_limit \
+                    "profile=$watcher_profile source=watcher detail=$watcher_dead_detail"
+            fi
             controller_log_event warn routine_watch_failed \
                 "profile=$watcher_profile consecutive=$realtime_watcher_failure_consecutive detail=$watcher_dead_detail"
         fi
@@ -1402,8 +1430,21 @@ ensure_realtime_watcher() {
     # do, but `--no-newline` exists precisely because that is a choice, and a
     # build that printed nothing for an empty format would never dispatch a
     # realtime run. Two bytes an event keeps the measured saving above.
-    "$inotify_command" -m -q -r --format x -e close_write,create,delete,move "$watcher_source" \
-        >> "$watcher_event_path" 2>> "$watcher_stderr_path" &
+    #
+    # The package's own watcher (sdsync-dsm-api --watch) takes the same flags,
+    # plus the profile fragment so it skips what the profile excludes, and two
+    # more events: attrib for a permission or ownership change, and modify for
+    # a write still in progress and for a bare mtime change (touch -m), which
+    # the kernel reports as a modification. Its output is coalesced to at most
+    # one line per 100 ms, so the extra events do not grow the marker.
+    if [ "${inotify_native:-false}" = true ]; then
+        "$inotify_command" --watch --profile-fragment "$profiles_dir/$watcher_profile.toml" \
+            -m -q -r --format x -e close_write,create,delete,move,attrib,modify "$watcher_source" \
+            >> "$watcher_event_path" 2>> "$watcher_stderr_path" &
+    else
+        "$inotify_command" -m -q -r --format x -e close_write,create,delete,move "$watcher_source" \
+            >> "$watcher_event_path" 2>> "$watcher_stderr_path" &
+    fi
     watcher_pid=$!
     if ! { printf '%s\n' "$watcher_pid" > "$watcher_pid_path" && finish_private_file "$watcher_pid_path"; }; then
         # Without its pid file the watcher could be neither adopted nor
@@ -1421,11 +1462,16 @@ ensure_realtime_watcher() {
     realtime_watcher_reason=ok
 }
 
-# DSM does not ship inotify-tools, and the service environment's PATH is not
-# where an operator's install of it ends up: SynoCommunity puts the binary under
-# /var/packages, Entware under /opt, a manual build under /usr/local. Probe
-# those after PATH so a routine configured for realtime is not silently demoted
-# to polling on a NAS that does have a watcher.
+# DSM does not ship inotify-tools, so the package brings its own watcher: the
+# bridge binary in --watch mode, an inotifywait-compatible subset that skips
+# what the profile excludes. It is preferred whenever it passes the checks
+# below, which it does as installed.
+#
+# An inotifywait stays the fallback, for a package binary that fails those
+# checks. The service environment's PATH is not where an operator's install of
+# it ends up: SynoCommunity puts the binary under /var/packages, Entware under
+# /opt, a manual build under /usr/local. Probe those after PATH. With neither,
+# every realtime routine is polled and says so: backend_reason=watch_unavailable.
 #
 # The chosen path is validated before it is trusted, in the same shape as every
 # other executable identity this package accepts: a regular file, never a
@@ -1433,8 +1479,9 @@ ensure_realtime_watcher() {
 # bit and not writable by others.
 resolve_inotify_command() {
     inotify_command=
+    inotify_native=false
     inotify_path_candidate=$(command -v inotifywait 2>/dev/null || true)
-    for inotify_probe in "$inotify_path_candidate" /usr/local/bin/inotifywait \
+    for inotify_probe in "$api_bridge" "$inotify_path_candidate" /usr/local/bin/inotifywait \
         /opt/bin/inotifywait /var/packages/inotify-tools/target/bin/inotifywait; do
         [ -n "$inotify_probe" ] || continue
         case $inotify_probe in /*) ;; *) continue ;; esac
@@ -1452,6 +1499,7 @@ resolve_inotify_command() {
         esac
         case $inotify_probe_mode in *[2367]) continue ;; esac
         inotify_command=$inotify_probe
+        [ "$inotify_probe" != "$api_bridge" ] || inotify_native=true
         break
     done
     # Deliberately no capability probe here. Asking the binary what it supports
@@ -1463,10 +1511,16 @@ resolve_inotify_command() {
     if [ -n "$inotify_command" ]; then
         inotify_command_detail=$(printf '%s\n' "$inotify_command" | LC_ALL=C awk \
             'NR == 1 { gsub(/[^ -~]/, "?"); print substr($0, 1, 120); exit }')
+        inotify_command_kind=inotifywait
+        [ "$inotify_native" != true ] || inotify_command_kind=native
+        controller_log_event info realtime_watcher_command \
+            "path=$inotify_command_detail kind=$inotify_command_kind" || true
     else
-        inotify_command_detail=none
+        # Every realtime routine is polled from here on: said once, as a
+        # warning, and not only through each routine's backend_reason.
+        controller_log_event warn realtime_watcher_command \
+            "path=none kind=none detail=neither the package watcher nor an inotifywait passed the executable checks; realtime routines are polled" || true
     fi
-    controller_log_event info realtime_watcher_command "path=$inotify_command_detail" || true
 }
 
 # Stop the native marker writer while comparing and consuming one exact event
@@ -1491,7 +1545,7 @@ consume_realtime_event() {
     case $consume_expected_identity in ''|*[!0-9:]*) return 73 ;; esac
     kill -STOP "$consume_watcher_pid" 2>/dev/null || return 73
     consume_event_status=0
-    if ! pid_matches_command "$consume_watcher_pid" "$inotify_command"; then
+    if ! realtime_watcher_matches "$consume_watcher_pid"; then
         consume_event_status=73
     elif ! sed -n 's/^State:[[:space:]]*\([Tt]\).*/\1/p' \
         "/proc/$consume_watcher_pid/status" 2>/dev/null | grep -Eq '^[Tt]$'; then
