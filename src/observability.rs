@@ -497,6 +497,8 @@ impl EventReason {
             Error::InvalidSource(_) => Self::SourceInvalid,
             Error::UnsupportedLocalEntry { .. } => Self::LocalEntryUnsupported,
             Error::FileIo { .. } => Self::LocalIo,
+            // A request that timed out is named as one, not as a generic network fault.
+            Error::Http { source, .. } if source.is_timeout() => Self::Timeout,
             Error::Http { .. } | Error::HttpBody { .. } => Self::Network,
             Error::HttpStatus { .. } => Self::HttpStatus,
             Error::InvalidResponse { .. } => Self::RemoteResponseInvalid,

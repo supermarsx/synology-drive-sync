@@ -32,7 +32,9 @@ pub enum Error {
         source: std::io::Error,
     },
 
-    #[error("HTTP request failed during {operation}: {source}")]
+    // The cause chain, not just reqwest's outer layer: `error sending request for
+    // url (...)` alone hides whether it timed out, was refused or failed TLS.
+    #[error("HTTP request failed during {operation}: {}", cause_chain(source))]
     Http {
         operation: String,
         #[source]
@@ -322,6 +324,27 @@ impl Error {
     }
 }
 
+/// An error with every distinct cause in its source chain, `outer: inner: innermost`.
+///
+/// `reqwest` puts what distinguishes one transport failure from another
+/// (`operation timed out`, `Connection refused`, a TLS verification message) in
+/// the source chain, which its `Display` drops; a hung server then read as an
+/// unexplained "error sending request". The chain names no credential: it is
+/// the transport's own text.
+pub fn cause_chain(error: &dyn std::error::Error) -> String {
+    let mut text = error.to_string();
+    let mut source = error.source();
+    while let Some(cause) = source {
+        let cause_text = cause.to_string();
+        if !cause_text.is_empty() && !text.contains(&cause_text) {
+            text.push_str(": ");
+            text.push_str(&cause_text);
+        }
+        source = cause.source();
+    }
+    text
+}
+
 fn join_refusal_codes(codes: &[(String, usize)]) -> String {
     codes
         .iter()
@@ -524,5 +547,37 @@ mod tests {
         assert!(text.contains("NAS link"), "{text}");
         assert!(text.contains("run without --scope"), "{text}");
         assert!(!text.contains("  "), "{text}");
+    }
+
+    #[derive(Debug)]
+    struct Layer(&'static str, Option<Box<Layer>>);
+    impl std::fmt::Display for Layer {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str(self.0)
+        }
+    }
+    impl std::error::Error for Layer {
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+            self.1.as_deref().map(|l| l as _)
+        }
+    }
+
+    /// A transport failure names its innermost cause (a black-hole server reads
+    /// "operation timed out", not just "error sending request").
+    #[test]
+    fn cause_chains_name_the_innermost_cause_once() {
+        let error = Layer(
+            "error sending request for url (http://127.0.0.1:9/webapi/entry.cgi)",
+            Some(Box::new(Layer(
+                "client error (Connect)",
+                Some(Box::new(Layer("operation timed out", None))),
+            ))),
+        );
+        assert_eq!(
+            super::cause_chain(&error),
+            "error sending request for url (http://127.0.0.1:9/webapi/entry.cgi): client error (Connect): operation timed out"
+        );
+        let repeated = Layer("timed out", Some(Box::new(Layer("timed out", None))));
+        assert_eq!(super::cause_chain(&repeated), "timed out");
     }
 }

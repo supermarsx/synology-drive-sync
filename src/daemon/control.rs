@@ -157,6 +157,7 @@ pub(crate) struct Paths {
     pub(crate) routine_state_dir: PathBuf,
     pub(crate) profile_state_dir: PathBuf,
     pub(crate) run_dir: PathBuf,
+    pub(crate) log_root: PathBuf,
     pub(crate) core_binary: PathBuf,
 }
 
@@ -174,6 +175,7 @@ impl Paths {
             profile_state_dir: state_dir.join("profiles"),
             state_dir,
             run_dir: var.join("run"),
+            log_root: var.join("log"),
             core_binary,
         }
     }
@@ -1456,7 +1458,49 @@ impl Control {
         if !self.activity(code, &request.scope, state, "sync", level, message) {
             push_degraded(&mut active.degraded, "activity");
         }
+        if sync && verdict.outcome == RunOutcome::Failed {
+            // The failure alert (counter, desktop notification, system log) is
+            // not ported to the daemon yet: say so, and mark the run's record.
+            self.log(
+                Level::Error,
+                "scheduler",
+                "alert_unavailable",
+                format!(
+                    "scope={} reason={} channel=desktop,system_log cause=the daemon does not deliver failure alerts yet",
+                    request.scope, verdict.reason
+                ),
+            );
+            push_degraded(&mut active.degraded, "alert");
+        }
 
+        // The core's stderr tail, kept where the dashboard's run-stderr source
+        // reads it, under the header that ties it to this run (RB-2).
+        if !report.stderr_tail.is_empty() {
+            let mut document = format!(
+                "# epoch={finished} scope={} operation={} exit={}\n",
+                request.scope,
+                request.action.as_str(),
+                report.exit.max(0)
+            )
+            .into_bytes();
+            document.extend_from_slice(&report.stderr_tail);
+            if !document.ends_with(b"\n") {
+                document.push(b'\n');
+            }
+            let path = self.paths.log_root.join("run-stderr.log");
+            let rotated = rotate_generations(&path, 3);
+            if let Err(cause) = rotated {
+                self.log(
+                    Level::Error,
+                    "scheduler",
+                    "run_stderr_unavailable",
+                    format!("path={} step=rotate cause={cause}", path.display()),
+                );
+                push_degraded(&mut active.degraded, "run_stderr");
+            } else if self.write_state(&path, document).is_err() {
+                push_degraded(&mut active.degraded, "run_stderr");
+            }
+        }
         let (deferred, skipped) = sum_counts(&report);
         let mut record = RunRecord::running(
             &request.scope,
@@ -2293,6 +2337,20 @@ fn sum_counts(report: &RunReport) -> (Option<u64>, Option<u64>) {
             .try_fold(0u64, |acc, v| v.map(|v| acc + v))
     };
     (sum(&|r| r.deferred), sum(&|r| r.skipped))
+}
+
+/// `base.(keep-1)` -> `base.keep`, …, `base` -> `base.1`.
+fn rotate_generations(base: &Path, keep: usize) -> io::Result<()> {
+    let generation = |n: usize| PathBuf::from(format!("{}.{n}", base.display()));
+    for n in (1..keep).rev() {
+        if generation(n).exists() {
+            fs::rename(generation(n), generation(n + 1))?;
+        }
+    }
+    match fs::rename(base, generation(1)) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        other => other,
+    }
 }
 
 /// A small package document (config or state), or `None` when absent or unreadable.
