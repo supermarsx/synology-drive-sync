@@ -598,7 +598,7 @@ pub struct NetworkArgs {
         value_name = "SECONDS",
         value_parser = clap::value_parser!(u64).range(1..),
         help_heading = "Network",
-        long_help = "Request timeout in seconds. An upload attempt is bounded three ways instead: it ends when the connection takes no bytes for min(SECONDS, 300) seconds, and is retried; it ends when it has run longer than max(SECONDS, file size / 16 KiB/s), and is not retried; and it waits SECONDS for DSM's answer after its last byte. So an upload that keeps moving at 16 KiB/s or more is never cut by SECONDS. Every other request, and background operations such as MD5 and CopyMove, keep SECONDS as a plain timeout. Control-plane requests are capped at 10 seconds."
+        long_help = "Request timeout in seconds. An upload attempt is bounded three ways instead: it ends when the connection takes no bytes for min(SECONDS, 300) seconds, and is retried; it ends when it has run longer than max(SECONDS, file size / 16 KiB/s), and is not retried; and after its last byte it waits SECONDS for DSM's answer, plus up to 1024 seconds for the bytes the connection was still carrying. So an upload that keeps moving at 16 KiB/s or more is never cut by SECONDS. Every other request, and background operations such as MD5 and CopyMove, keep SECONDS as a plain timeout. Control-plane requests are capped at 10 seconds."
     )]
     pub timeout: Option<u64>,
 

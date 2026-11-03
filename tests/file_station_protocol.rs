@@ -1439,7 +1439,8 @@ fn the_mock_counts_an_upload_body_the_client_abandons() {
         )
         .unwrap();
     drop(stream);
-    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    // A backstop only: the loop ends as soon as the mock has counted the abandoned request.
+    let deadline = std::time::Instant::now() + Duration::from_secs(120);
     while server.aborted_requests() == 0 && std::time::Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(10));
     }

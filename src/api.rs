@@ -6175,6 +6175,10 @@ const UPLOAD_MINIMUM_RATE: u64 = 16 * 1024;
 /// "taken by the transport" stays close to "written to the connection".
 const UPLOAD_BODY_CHUNK: usize = 64 * 1024;
 const UPLOAD_BODY_CHANNEL_CHUNKS: usize = 2;
+/// The most body bytes the connection is assumed to hold when the client has handed over the
+/// last one: socket send and receive buffers, which autotune into megabytes. See
+/// [`UploadProgress::drain_allowance`].
+const UPLOAD_DRAIN_ALLOWANCE_BYTES: u64 = 16 * 1024 * 1024;
 /// How often a running attempt is checked against its bounds and the cancellation token.
 const UPLOAD_WATCH_INTERVAL: Duration = Duration::from_millis(100);
 /// How long a finished attempt waits for its body reader to notice and stop.
@@ -6314,6 +6318,22 @@ impl UploadProgress {
         }
     }
 
+    /// How long the bytes the connection may still hold after the last one was handed over take
+    /// to reach DSM at the slowest rate an attempt may run at.
+    ///
+    /// "The last byte was sent" is when the transport took it, not when DSM received it: the socket
+    /// buffers between hold up to megabytes, and on a slow link draining them takes longer than a
+    /// short `--timeout`. Without this, a transfer that was still moving was ended as "DSM did not
+    /// answer". Bounded by [`UPLOAD_DRAIN_ALLOWANCE_BYTES`] at [`UPLOAD_MINIMUM_RATE`], the same
+    /// floor the ceiling holds every attempt to.
+    fn drain_allowance(taken: u64) -> Duration {
+        Duration::from_secs(
+            taken
+                .min(UPLOAD_DRAIN_ALLOWANCE_BYTES)
+                .div_ceil(UPLOAD_MINIMUM_RATE),
+        )
+    }
+
     /// The bound this attempt has broken, if any, with the words that name it.
     fn broken_bound(&self, bounds: UploadBounds, label: &UploadLabel) -> Option<UploadAborted> {
         let now_ms = self.elapsed_ms();
@@ -6322,14 +6342,17 @@ impl UploadProgress {
         let finished_ms = self.finished_ms.load(Ordering::Acquire);
         if finished_ms > 0 {
             let waited = Duration::from_millis(now_ms.saturating_sub(finished_ms - 1));
-            return (waited >= bounds.response).then(|| UploadAborted {
+            let drain = Self::drain_allowance(taken);
+            return (waited >= bounds.response.saturating_add(drain)).then(|| UploadAborted {
                 bound: UploadBound::Response,
                 message: format!(
                     "DSM did not answer within {} s (--timeout) after the last byte of {:?} \
-                     ({} bytes) was sent",
+                     ({} bytes) was sent, allowing {} s more for what the connection was still \
+                     carrying",
                     bounds.response.as_secs(),
                     label.relative,
-                    label.size
+                    label.size,
+                    drain.as_secs()
                 ),
             });
         }
@@ -8848,7 +8871,10 @@ mod tests {
     use super::*;
     use crate::observability::MAX_DESCRIBED_COOKIES;
 
-    const SCRIPTED_SERVER_TIMEOUT: Duration = Duration::from_secs(5);
+    /// How long a scripted server waits for the client before giving up. A backstop only: a healthy
+    /// test is answered in milliseconds, but a starved runner can take seconds just to schedule the
+    /// client, and a server that left first turned its request into a connection refusal.
+    const SCRIPTED_SERVER_TIMEOUT: Duration = Duration::from_secs(60);
 
     /// Reporting that DSM rotated the session must never report *what it rotated it to*.
     ///
@@ -9149,14 +9175,19 @@ mod tests {
         F: FnOnce() + Send + 'static,
     {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
         let address = listener.local_addr().unwrap();
         let handle = std::thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
+            let Some(mut stream) = accept_scripted_connection_if_any(&listener) else {
+                return Vec::new();
+            };
             stream.set_nodelay(true).unwrap();
             stream
                 .set_write_timeout(Some(SCRIPTED_SERVER_TIMEOUT))
                 .unwrap();
-            let request = read_scripted_request(&mut stream, 0);
+            let Some(request) = read_scripted_request_if_sent(&mut stream) else {
+                return Vec::new();
+            };
             write!(
                 stream,
                 "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
@@ -9191,13 +9222,18 @@ mod tests {
         F: FnOnce() + Send + 'static,
     {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
         let address = listener.local_addr().unwrap();
         let handle = std::thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
+            let Some(mut stream) = accept_scripted_connection_if_any(&listener) else {
+                return Vec::new();
+            };
             stream
                 .set_write_timeout(Some(SCRIPTED_SERVER_TIMEOUT))
                 .unwrap();
-            let request = read_scripted_request(&mut stream, 0);
+            let Some(request) = read_scripted_request_if_sent(&mut stream) else {
+                return Vec::new();
+            };
             before_headers();
             thread::sleep(delay);
             let _ = write!(
@@ -9320,6 +9356,31 @@ mod tests {
         (format!("http://{address}/prefix/"), done_send, handle)
     }
 
+    /// The one connection a single-response server expects, or `None` once
+    /// [`SCRIPTED_SERVER_TIMEOUT`] passes without one.
+    ///
+    /// A client whose whole deadline is shorter than the time it takes to get scheduled (a starved
+    /// runner) gives up before it connects. A blocking `accept` then waited forever and hung the
+    /// test binary; an answer of "nobody came" lets the test decide.
+    fn accept_scripted_connection_if_any(listener: &TcpListener) -> Option<TcpStream> {
+        let deadline = Instant::now() + SCRIPTED_SERVER_TIMEOUT;
+        loop {
+            match listener.accept() {
+                Ok((stream, _)) => {
+                    stream.set_nonblocking(false).unwrap();
+                    return Some(stream);
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    if Instant::now() >= deadline {
+                        return None;
+                    }
+                    thread::sleep(Duration::from_millis(1));
+                }
+                Err(error) => panic!("failed to accept the scripted request: {error}"),
+            }
+        }
+    }
+
     fn accept_scripted_connection(listener: &TcpListener, index: usize) -> TcpStream {
         let deadline = Instant::now() + SCRIPTED_SERVER_TIMEOUT;
         loop {
@@ -9341,11 +9402,38 @@ mod tests {
     }
 
     fn read_scripted_request(stream: &mut TcpStream, index: usize) -> CapturedRequest {
+        read_scripted_request_inner(stream, index, false)
+            .unwrap_or_else(|| panic!("connection closed before request {index} headers"))
+    }
+
+    /// [`read_scripted_request`] for a client that may give the request up before sending any of
+    /// it, as one whose whole deadline passes while it is starved of CPU does: `None` then, instead
+    /// of a panic that fails the test for the property it pins.
+    fn read_scripted_request_if_sent(stream: &mut TcpStream) -> Option<CapturedRequest> {
+        read_scripted_request_inner(stream, 0, true)
+    }
+
+    fn read_scripted_request_inner(
+        stream: &mut TcpStream,
+        index: usize,
+        may_be_abandoned: bool,
+    ) -> Option<CapturedRequest> {
         let deadline = Instant::now() + SCRIPTED_SERVER_TIMEOUT;
         let mut received = Vec::new();
         let header_end = loop {
             let mut buffer = [0_u8; 4096];
-            let count = read_scripted_bytes(stream, &mut buffer, deadline, index, "headers");
+            let count = if may_be_abandoned && received.is_empty() {
+                stream
+                    .set_read_timeout(Some(deadline.saturating_duration_since(Instant::now())))
+                    .unwrap();
+                // A reset before the first byte is the client giving up, as a close is.
+                stream.read(&mut buffer).unwrap_or(0)
+            } else {
+                read_scripted_bytes(stream, &mut buffer, deadline, index, "headers")
+            };
+            if count == 0 && may_be_abandoned && received.is_empty() {
+                return None;
+            }
             assert!(
                 count > 0,
                 "connection closed before request {index} headers"
@@ -9373,11 +9461,11 @@ mod tests {
             assert!(count > 0, "connection closed before request {index} body");
             received.extend_from_slice(&buffer[..count]);
         }
-        CapturedRequest {
+        Some(CapturedRequest {
             request_line,
             headers,
             body: received[header_end..header_end + content_length].to_vec(),
-        }
+        })
     }
 
     fn read_scripted_bytes(
@@ -10068,25 +10156,27 @@ mod tests {
     fn remote_download_stall_is_idle_bounded_and_observes_cancellation() {
         let cancellation = CancellationToken::default();
         let server_cancellation = cancellation.clone();
+        // Cancelled as the headers go out, then a body that stalls longer than the idle bound.
+        // The bounds are seconds rather than milliseconds so that the order of the two events is
+        // the scenario's, not the scheduler's: with a 60 ms idle bound a starved runner ran the
+        // server's cancellation after the client's idle timer had already fired.
+        let idle_timeout = Duration::from_secs(2);
         let (base, server) = scripted_slow_download_server_with_hook(
             b"payload".to_vec(),
-            Duration::from_millis(120),
+            Duration::from_secs(3),
             Duration::ZERO,
             move || server_cancellation.cancel(),
         );
-        let client = fingerprint_test_client_with_timeouts(
-            &base,
-            0,
-            Duration::from_millis(60),
-            Duration::from_secs(1),
-        );
+        let client =
+            fingerprint_test_client_with_timeouts(&base, 0, idle_timeout, Duration::from_secs(10));
         let started = Instant::now();
 
         assert!(matches!(
             client.remote_content_fingerprint("/share/payload.bin", 7, &cancellation),
             Err(Error::Cancelled)
         ));
-        assert!(started.elapsed() < Duration::from_millis(500));
+        // Observed while the transfer was stalled, before the idle bound could end it.
+        assert!(started.elapsed() < idle_timeout, "{:?}", started.elapsed());
         assert_eq!(server.join().unwrap().len(), 1);
     }
 
@@ -10146,15 +10236,16 @@ mod tests {
     fn remote_download_header_stall_observes_cancellation_before_transport_error() {
         let cancellation = CancellationToken::default();
         let server_cancellation = cancellation.clone();
-        let (base, server) = scripted_delayed_download_headers_server_with_hook(
-            Duration::from_millis(150),
-            move || server_cancellation.cancel(),
-        );
+        // Seconds, not milliseconds, for the same reason as the body-stall test above.
+        let (base, server) =
+            scripted_delayed_download_headers_server_with_hook(Duration::from_secs(3), move || {
+                server_cancellation.cancel()
+            });
         let client = fingerprint_test_client_with_timeouts(
             &base,
             0,
-            Duration::from_millis(60),
-            Duration::from_secs(1),
+            Duration::from_secs(2),
+            Duration::from_secs(10),
         );
 
         assert!(matches!(
@@ -10184,7 +10275,8 @@ mod tests {
                 operation: "remote content fingerprint download"
             })
         ));
-        assert_eq!(server.join().unwrap().len(), 1);
+        // At most one request: a starved client can reach its 70 ms deadline before it connects.
+        assert!(server.join().unwrap().len() <= 1);
     }
 
     #[test]
@@ -10193,8 +10285,12 @@ mod tests {
         let (base, server) =
             scripted_slow_download_server(body.clone(), Duration::ZERO, Duration::from_millis(50));
         let idle_timeout = Duration::from_secs(1);
+        // The property is that progress outlives the idle timeout. The total operation deadline
+        // has its own test (`..._drip_feed_cannot_extend_the_total_operation_deadline`); here it
+        // is only a backstop, set far enough out that a starved runner's slow timers (26 chunks
+        // of 50 ms took over 4 s on a busy macOS aarch64 runner) cannot reach it.
         let client =
-            fingerprint_test_client_with_timeouts(&base, 0, idle_timeout, Duration::from_secs(4));
+            fingerprint_test_client_with_timeouts(&base, 0, idle_timeout, Duration::from_secs(60));
         let started = Instant::now();
 
         let fingerprint = client
@@ -10236,7 +10332,8 @@ mod tests {
             })
         ));
         assert!(started.elapsed() < Duration::from_millis(500));
-        assert_eq!(server.join().unwrap().len(), 1);
+        // At most one request: a starved client can reach its 70 ms deadline before it connects.
+        assert!(server.join().unwrap().len() <= 1);
     }
 
     #[test]
@@ -17411,6 +17508,9 @@ FplE
         let seen = Arc::clone(&uploads);
         let stopping = Arc::clone(&stop);
         let handle = thread::spawn(move || {
+            // Until the test ends it. `window` is only a backstop for a test that never does, and
+            // is far beyond any run: a server that left on a timer while a starved client was
+            // still uploading made the client's next request a connection refusal.
             let deadline = Instant::now() + window;
             let mut connections = Vec::new();
             while Instant::now() < deadline && !stopping.load(Ordering::Acquire) {
@@ -17463,10 +17563,11 @@ FplE
         }
     }
 
-    /// Hold a connection open without reading or answering, as a wedged proxy does.
+    /// Hold a connection open without reading or answering, as a wedged proxy does, until the
+    /// test ends: a hold that ended on a timer turned a slow client's bound into a closed
+    /// connection.
     fn hold(stop: &AtomicBool) {
-        let until = Instant::now() + Duration::from_secs(8);
-        while Instant::now() < until && !stop.load(Ordering::Acquire) {
+        while !stop.load(Ordering::Acquire) {
             thread::sleep(Duration::from_millis(20));
         }
     }
@@ -17565,8 +17666,33 @@ FplE
     /// A local file of `size` bytes with no planned digest, so a successful upload is verified by
     /// its size and time alone and the server needs no MD5 task.
     fn sized_upload_source(tag: &str, size: usize) -> (PathBuf, LocalEntry) {
-        let (path, mut entry) = temp_upload_source(tag, &vec![7_u8; size]);
-        entry.content_md5 = None;
+        // Written directly rather than through `temp_upload_source`, which also fingerprints the
+        // contents: tens of megabytes hashed in a debug build was load enough to starve the
+        // timing tests running beside it.
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("sdsync-upload-{tag}-{nonce}.bin"));
+        fs::write(&path, vec![7_u8; size]).unwrap();
+        let metadata = fs::metadata(&path).unwrap();
+        let entry = LocalEntry {
+            relative: "abc.bin".to_owned(),
+            full_path: path.clone(),
+            kind: EntryKind::File,
+            size: metadata.len(),
+            mtime_ms: i64::try_from(
+                metadata
+                    .modified()
+                    .unwrap()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap()
+                    .as_millis(),
+            )
+            .unwrap(),
+            identity: Default::default(),
+            content_md5: None,
+        };
         (path, entry)
     }
 
@@ -17587,29 +17713,52 @@ FplE
 
     #[test]
     fn a_progressing_upload_slower_than_the_timeout_succeeds() {
-        // 48 MiB read at 8 MiB/s takes about six seconds, half again the timeout. Under the old
-        // total deadline every attempt was cut at four seconds. The timeout is large enough that
-        // whatever the loopback socket buffers hold when the last byte is handed over drains well
-        // within the wait for the answer.
-        let size = 48 * 1024 * 1024;
+        // 8 MiB read at 2 MiB/s: the server alone needs four seconds, twice the timeout, however
+        // fast the machine is, and a slower (starved) machine only makes it longer. Under the old
+        // total deadline every attempt was cut at two seconds. Whatever the loopback socket
+        // buffers still hold when the last byte is handed over is allowed for in the wait for the
+        // answer.
+        let size = 8 * 1024 * 1024;
         let (path, local) = sized_upload_source("p4-progress", size);
         let server = behaving_upload_server(
-            UploadServerBehaviour::ReadAt(8 * 1024 * 1024),
+            UploadServerBehaviour::ReadAt(2 * 1024 * 1024),
             local.size,
             local.mtime_ms.div_euclid(1000),
-            Duration::from_secs(25),
+            UPLOAD_SERVER_BACKSTOP,
         );
-        let client = bounded_upload_client(server.url.clone(), Duration::from_secs(4), 0);
+        let timeout = Duration::from_secs(2);
+        let client = bounded_upload_client(server.url.clone(), timeout, 0);
 
         let started = Instant::now();
         let result = client.upload(&local, "/share/root/abc.bin");
         let elapsed = started.elapsed();
 
         assert!(result.is_ok(), "{result:?} after {elapsed:?}");
-        assert!(
-            elapsed > Duration::from_secs(4),
-            "{elapsed:?}: the timeout was outlasted"
+        assert!(elapsed > timeout, "{elapsed:?}: the timeout was outlasted");
+        drop(client);
+        assert_eq!(server.finish(), 1);
+        fs::remove_file(path).unwrap();
+    }
+
+    /// The body is handed over long before DSM has read it when the socket buffers can hold
+    /// much of it. 4 MiB read at 1 MiB/s with a one-second timeout: on Linux, whose buffers
+    /// autotune into megabytes, the last byte left the client seconds before the server took it,
+    /// and the wait for the answer used to end a transfer that was still moving.
+    #[test]
+    fn an_upload_still_draining_from_the_socket_buffers_is_not_cut_by_the_response_wait() {
+        let size = 4 * 1024 * 1024;
+        let (path, local) = sized_upload_source("p4-drain", size);
+        let server = behaving_upload_server(
+            UploadServerBehaviour::ReadAt(1024 * 1024),
+            local.size,
+            local.mtime_ms.div_euclid(1000),
+            UPLOAD_SERVER_BACKSTOP,
         );
+        let client = bounded_upload_client(server.url.clone(), Duration::from_secs(1), 0);
+
+        let result = client.upload(&local, "/share/root/abc.bin");
+
+        assert!(result.is_ok(), "{result:?}");
         drop(client);
         assert_eq!(server.finish(), 1);
         fs::remove_file(path).unwrap();
@@ -17623,15 +17772,22 @@ FplE
             UploadServerBehaviour::StopAfter(256 * 1024),
             local.size,
             local.mtime_ms.div_euclid(1000),
-            Duration::from_secs(12),
+            UPLOAD_SERVER_BACKSTOP,
         );
-        let client = bounded_upload_client(server.url.clone(), Duration::from_secs(1), 0);
+        let timeout = Duration::from_secs(1);
+        let client = bounded_upload_client(server.url.clone(), timeout, 0);
 
         let started = Instant::now();
         let error = client.upload(&local, "/share/root/abc.bin").unwrap_err();
         let elapsed = started.elapsed();
 
-        assert!(elapsed < Duration::from_secs(6), "{elapsed:?}");
+        // Which bound ended it is the property, not how fast a starved machine got there: the
+        // stall window, long before the ceiling this size earns.
+        assert!(
+            elapsed < UploadBounds::for_upload(timeout, size as u64).ceiling,
+            "{elapsed:?}"
+        );
+        assert_eq!(upload_bound_of(&error), Some(UploadBound::Stall), "{error}");
         let message = error.to_string();
         assert!(message.contains("stalled"), "{message}");
         assert!(message.contains(&size.to_string()), "{message}");
@@ -17648,21 +17804,76 @@ FplE
             UploadServerBehaviour::NeverAnswer,
             local.size,
             local.mtime_ms.div_euclid(1000),
-            Duration::from_secs(12),
+            UPLOAD_SERVER_BACKSTOP,
         );
         let client = bounded_upload_client(server.url.clone(), Duration::from_secs(1), 0);
 
-        let started = Instant::now();
         let error = client.upload(&local, "/share/root/abc.bin").unwrap_err();
-        let elapsed = started.elapsed();
 
-        assert!(elapsed < Duration::from_secs(6), "{elapsed:?}");
+        assert_eq!(
+            upload_bound_of(&error),
+            Some(UploadBound::Response),
+            "{error}"
+        );
         let message = error.to_string();
         assert!(message.contains("did not answer"), "{message}");
         assert!(message.contains("--timeout"), "{message}");
         drop(client);
         assert_eq!(server.finish(), 1);
         fs::remove_file(path).unwrap();
+    }
+
+    /// Far beyond any run of these tests; only a test that never ends its server meets it.
+    const UPLOAD_SERVER_BACKSTOP: Duration = Duration::from_secs(600);
+
+    /// The bound an upload error says ended the attempt.
+    fn upload_bound_of(error: &Error) -> Option<UploadBound> {
+        match error {
+            Error::HttpBody { source, .. } => upload_bound_hit(source),
+            _ => None,
+        }
+    }
+
+    /// The answer is awaited for `--timeout` plus what the connection may still have been
+    /// carrying when the last byte was handed over, never less.
+    #[test]
+    fn the_response_wait_allows_for_bytes_still_in_the_connection() {
+        let size = 64 * 1024;
+        let bounds = UploadBounds::for_upload(Duration::from_secs(1), size);
+        // 64 KiB at the 16 KiB/s floor: four seconds to drain, on top of the one-second timeout.
+        assert_eq!(
+            UploadProgress::drain_allowance(size),
+            Duration::from_secs(4)
+        );
+        // Started ten seconds ago; the body ended `ago` before now.
+        let finished_ago = |ago: Duration| {
+            let progress = progress_at(Duration::from_secs(10), ago, size);
+            progress.finished_ms.store(
+                duration_millis_saturating(Duration::from_secs(10) - ago).saturating_add(1),
+                Ordering::Release,
+            );
+            progress
+        };
+        assert!(
+            finished_ago(Duration::from_secs(3))
+                .broken_bound(bounds, &label(size))
+                .is_none(),
+            "still within the drain allowance"
+        );
+        let aborted = finished_ago(Duration::from_secs(6))
+            .broken_bound(bounds, &label(size))
+            .expect("past timeout and drain allowance");
+        assert_eq!(aborted.bound, UploadBound::Response);
+        assert!(
+            aborted.message.contains("allowing 4 s more"),
+            "{}",
+            aborted.message
+        );
+        // Huge bodies are not allowed unbounded drains.
+        assert_eq!(
+            UploadProgress::drain_allowance(1 << 40),
+            Duration::from_secs(UPLOAD_DRAIN_ALLOWANCE_BYTES / UPLOAD_MINIMUM_RATE)
+        );
     }
 
     fn label(size: u64) -> UploadLabel {
