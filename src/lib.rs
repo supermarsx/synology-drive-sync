@@ -17,6 +17,7 @@ pub mod status_cache;
 pub mod sync;
 pub mod transport_diagnostics;
 pub mod vault;
+pub mod watch;
 
 pub use error::{Error, Result};
 

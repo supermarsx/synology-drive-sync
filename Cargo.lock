@@ -1958,6 +1958,7 @@ dependencies = [
  "keyring-core",
  "libc",
  "md-5",
+ "nix",
  "reqwest",
  "rpassword",
  "rustls",

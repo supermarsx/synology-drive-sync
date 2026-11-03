@@ -76,7 +76,17 @@ apple-native-keyring-store = { version = "1.0.2", default-features = false, feat
 
 [target.'cfg(target_os = "linux")'.dependencies]
 libc = "0.2.191"
+# Already in the tree through `ctrlc`; named directly for the native realtime watcher
+# (`watch::TreeWatch`): inotify, poll(2) on its descriptor, and the parent-death signal that stops
+# a watcher whose controller died. Safe wrappers only, so the library stays `forbid(unsafe_code)`.
+nix = { version = "0.31.3", default-features = false, features = ["inotify", "poll", "process", "signal"] }
 zbus-secret-service-keyring-store = { version = "1.0.1", default-features = false, features = ["crypto-rust"] }
+
+[features]
+# `SDSYNC_FAULT_BLOCK=read_dir:*/slow` blocks the watcher's directory walk forever on a matching
+# path, the way a directory on a dying disk does, so a test can prove the walk's deadline. Never
+# enabled in a release build.
+fault-inject = []
 
 [profile.release]
 lto = "thin"
