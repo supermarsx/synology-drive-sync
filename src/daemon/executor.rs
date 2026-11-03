@@ -436,7 +436,7 @@ pub(crate) fn take_result_record(path: &std::path::Path) -> Result<Vec<JobRecord
 }
 
 #[cfg(target_os = "linux")]
-pub(crate) use process::{RunHandle, oom_kill_count, start_run};
+pub(crate) use process::{RunHandle, start_run};
 
 #[cfg(target_os = "linux")]
 mod process {

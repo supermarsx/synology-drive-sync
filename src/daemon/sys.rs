@@ -113,10 +113,10 @@ pub(crate) unsafe fn child_setup(parent: libc::pid_t, nice: Option<i32>) -> io::
         if status != 0 {
             return Err(io::Error::from_raw_os_error(status));
         }
-        if let Some(nice) = nice {
-            if libc::setpriority(libc::PRIO_PROCESS, 0, nice) != 0 {
-                return Err(io::Error::last_os_error());
-            }
+        if let Some(nice) = nice
+            && libc::setpriority(libc::PRIO_PROCESS, 0, nice) != 0
+        {
+            return Err(io::Error::last_os_error());
         }
     }
     Ok(())

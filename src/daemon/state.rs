@@ -643,6 +643,75 @@ pub(crate) fn render_schedule_state(next_run: u64) -> Vec<u8> {
     format!("next_run_epoch={next_run}\n").into_bytes()
 }
 
+/// Publish `run.lock` for the run the daemon is about to start, in the shell's
+/// private-lock format (a 0700 directory whose only entry is a 0600 `pid` file
+/// of three lines: pid, start tick, boot id), naming the daemon itself.
+///
+/// The bridge reads `run.state=running` beside a lock with no live owner as a
+/// dead runner (`runner_died`), and the shell manager reads a live one as "a
+/// run is in flight". The daemon holds `daemon.lock`, so a lock left by an
+/// earlier daemon that died is stale by construction and is replaced.
+#[cfg(target_os = "linux")]
+pub(crate) fn publish_run_lock(run_dir: &Path) -> Result<(), WriteError> {
+    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+    let lock = run_dir.join("run.lock");
+    let fail = |step: &'static str, cause: String| WriteError {
+        path: lock.clone(),
+        step,
+        cause,
+    };
+    let pid = std::process::id();
+    let start = super::super::linux_files::process_start(pid).map_err(|_| {
+        fail(
+            "identity",
+            "the daemon's start tick could not be read".into(),
+        )
+    })?;
+    let boot = fs::read_to_string("/proc/sys/kernel/random/boot_id")
+        .map_err(|error| fail("identity", io_cause(&error)))?;
+    let boot = boot.trim();
+    remove_run_lock(run_dir)?;
+    fs::DirBuilder::new()
+        .mode(0o700)
+        .create(&lock)
+        .map_err(|error| fail("create", io_cause(&error)))?;
+    fs::set_permissions(&lock, fs::Permissions::from_mode(0o700))
+        .map_err(|error| fail("chmod", io_cause(&error)))?;
+    atomic_write(
+        &lock.join("pid"),
+        format!("{pid}\n{start}\n{boot}\n").as_bytes(),
+    )?;
+    // atomic_write leaves its temporary beside the target only on failure; the
+    // lock directory must hold exactly `pid`.
+    Ok(())
+}
+
+/// Remove `run.lock` (after the final `run.state` is written).
+#[cfg(target_os = "linux")]
+pub(crate) fn remove_run_lock(run_dir: &Path) -> Result<(), WriteError> {
+    let lock = run_dir.join("run.lock");
+    match fs::symlink_metadata(&lock) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(WriteError {
+            path: lock,
+            step: "inspect",
+            cause: io_cause(&error),
+        }),
+        Ok(metadata) if metadata.file_type().is_dir() => {
+            fs::remove_dir_all(&lock).map_err(|error| WriteError {
+                path: lock,
+                step: "remove",
+                cause: io_cause(&error),
+            })
+        }
+        Ok(_) => fs::remove_file(&lock).map_err(|error| WriteError {
+            path: lock,
+            step: "remove",
+            cause: io_cause(&error),
+        }),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1103,6 +1172,33 @@ mod tests {
                 "no progress for 45 min in phase upload"
             );
             assert_eq!(outcomes["run"]["aggregate"]["outcome"], "failed");
+        }
+
+        /// A daemon run in flight reads as running, not as a dead runner, and
+        /// the lock goes with it.
+        #[test]
+        fn a_running_daemon_run_with_its_lock_reads_running_not_stale() {
+            let tree = Tree::new("lock");
+            let mut record = RunRecord::running("all", "sync", 1_700_000_000);
+            record.heartbeat_source = Some("io");
+            tree.private("var/state/run.state", &render_run_state(&record, None));
+            let run_dir = tree.p("var/run");
+            // Without the lock the bridge calls it a dead runner.
+            assert_eq!(tree.outcomes()["run"]["outcome"], "stale");
+            publish_run_lock(&run_dir).unwrap();
+            let outcomes = tree.outcomes();
+            assert_eq!(outcomes["run"]["outcome"], "running", "{outcomes}");
+            assert_eq!(outcomes["run"]["stale"]["lock"], "live");
+            assert_eq!(outcomes["errors"], json!([]));
+            // Publishing again (a stale lock from an earlier daemon) replaces it.
+            publish_run_lock(&run_dir).unwrap();
+            let names: Vec<_> = fs::read_dir(run_dir.join("run.lock"))
+                .unwrap()
+                .map(|e| e.unwrap().file_name())
+                .collect();
+            assert_eq!(names, ["pid"]);
+            remove_run_lock(&run_dir).unwrap();
+            assert!(!run_dir.join("run.lock").exists());
         }
 
         /// Each completed outcome the executor names reads back as itself.

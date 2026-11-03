@@ -12,6 +12,9 @@
 #![deny(clippy::unwrap_used, clippy::expect_used)]
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
+pub(crate) mod changes;
+pub(crate) mod control;
+pub(crate) mod events;
 pub(crate) mod executor;
 pub(crate) mod routines;
 pub(crate) mod state;
