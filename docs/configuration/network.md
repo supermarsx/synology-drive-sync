@@ -102,14 +102,16 @@ An upload attempt is no longer cut off by one total deadline. `timeout` bounds i
 | Bound | Value | When it ends the attempt |
 | --- | --- | --- |
 | Stall window | `min(timeout, 300 s)` | The connection took no body bytes for that long. The attempt is retried like any timeout, after the check for a copy that landed. |
-| Response wait | `timeout` | DSM did not answer within that long after the last body byte was sent. |
+| Response wait | `timeout` plus a drain allowance | DSM did not answer within `timeout` plus the drain allowance after the last body byte was handed to the connection. The allowance is the time the bytes still buffered in the connection need at the 16 KiB/s floor, counting at most 16 MiB of them, so the wait is at most `timeout` + 1024 s. |
 | Ceiling | `max(timeout, file size / 16 KiB/s)` | The whole body took longer than this, even though it never quite stalled (a trickle). **Not retried**, because the next attempt would end the same way. |
 
 A transfer that keeps moving is therefore not cut by `timeout` alone, and a large file on a slow but
 steady link no longer needs a `timeout` as long as the whole transfer. What it cannot do is average
 below 16 KiB/s. Each error names the bound that ended the attempt, for example "the upload stalled: the
 connection took no body bytes for N s (X of Y bytes sent in T s); check the link and any proxy in front
-of DSM, or raise --timeout". The background-operation timeout (checksums, server-side copy) and the
+of DSM, or raise --timeout"; for the response wait: "DSM did not answer within N s (--timeout) after the last
+byte of FILE (X bytes) was sent, allowing M s more for what the connection was still carrying" (M is the
+drain allowance). The background-operation timeout (checksums, server-side copy) and the
 10-second control-plane cap are unchanged.
 
 ## Retries and upload behavior

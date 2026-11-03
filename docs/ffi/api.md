@@ -38,7 +38,7 @@ following fields are accepted:
 | `danger_accept_invalid_certificates` | boolean | `false` | Disable certificate validation. |
 | `ca_certificate` | string or null | none | Path to an additional PEM CA certificate. |
 | `connect_timeout_seconds` | unsigned integer or null | `15` | Positive connection timeout. |
-| `request_timeout_seconds` | unsigned integer or null | `7200` | Positive request timeout. For an upload it is the no-progress window (at most 300 s) and the wait for DSM's answer after the last byte; a transfer that keeps moving is not cut by it, but one attempt may not average below 16 KiB/s. It also bounds one background operation. |
+| `request_timeout_seconds` | unsigned integer or null | `7200` | Positive request timeout. For an upload it is the no-progress window (at most 300 s) and the wait for DSM's answer after the last byte (plus an allowance, at most 1024 s, for the bytes the connection was still carrying); a transfer that keeps moving is not cut by it, but one attempt may not average below 16 KiB/s. It also bounds one background operation. |
 | `retries` | unsigned integer or null | `2` | Retries after the first request, from `0` through `5`. |
 | `max_upload_rate` | unsigned integer or null | unlimited | Shared positive upload limit in bytes per second. |
 | `exclusions` | string array | `[]` | Gitignore-style exclusion patterns; they match Unicode-normalised (NFC) on every source, fold case when the source filesystem does, and protect matching NAS entries (under either spelling of a renamed or normalisation-paired folder) from deletion. |

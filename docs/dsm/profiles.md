@@ -107,7 +107,7 @@ required, and all-profile actions can require an aggregate bound. See
 | Excludes | One non-empty glob per line; at most 64 entries, each at most 512 bytes |
 | Allow an empty source | Dangerous opt-out from the empty-source deletion guard; off by default |
 | Retries | `0..5`; default `2` |
-| Upload timeout | DSM manager and dashboard range `1..86400` seconds; default `7200`. The no-progress window (at most 300 s) and the wait for DSM's answer after the last byte, not a total deadline; see [Network](../configuration/network.md#what-timeout-means-for-an-upload) |
+| Upload timeout | DSM manager and dashboard range `1..86400` seconds; default `7200`. The no-progress window (at most 300 s) and the wait for DSM's answer after the last byte (plus a drain allowance of at most 1024 s), not a total deadline; see [Network](../configuration/network.md#what-timeout-means-for-an-upload) |
 | Connect timeout | DSM manager and dashboard range `1..600` seconds; default `15` |
 | Maximum rate | Positive bytes per second, or `0` in the form for unlimited |
 

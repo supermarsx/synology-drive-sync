@@ -28,8 +28,8 @@ The explicit command tree is preferred. Run `synology-drive-sync --help` and
 
 `--timeout SECONDS` is the request timeout, with a different meaning for uploads: an upload attempt ends
 when the connection takes no bytes for `min(SECONDS, 300)` seconds (and is retried), when it has run longer
-than `max(SECONDS, file size / 16 KiB/s)` (not retried), or when DSM does not answer within SECONDS of its
-last byte; an upload that keeps moving at 16 KiB/s or more is never cut by SECONDS. Every other request,
+than `max(SECONDS, file size / 16 KiB/s)` (not retried), or when DSM does not answer within SECONDS (plus an
+allowance of at most 1024 seconds for the bytes the connection was still carrying) of its last byte; an upload that keeps moving at 16 KiB/s or more is never cut by SECONDS. Every other request,
 and background operations such as MD5 and CopyMove, keep SECONDS as a plain timeout, and control-plane
 requests are capped at 10 seconds. See [Network](../configuration/network.md#what-timeout-means-for-an-upload).
 

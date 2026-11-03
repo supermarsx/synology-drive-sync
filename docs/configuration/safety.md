@@ -71,8 +71,19 @@ whichever spelling either side uses. On a case-sensitive source the rules stay c
 A rule also covers **both spellings of a pair** the run has matched: when a local folder was renamed
 (`Reports` to `reports`) or differs from its NAS folder only by normalisation, a rule that excludes the
 local spelling protects the NAS spelling from deletion and replacement, and a rule written against the
-NAS spelling excludes the local content under the new one. Protection only widens: a negation
-(`!rule`) can never make a NAS entry deletable that a rule typed against its other spelling protects.
+NAS spelling excludes the local content under the new one.
+
+**What protects a NAS-only name from `--delete`.** On every source, including case- and
+normalisation-folding ones (Windows NTFS, macOS APFS, most SMB mounts), a NAS-only name is protected when
+either of two readings of your rules excludes it: the rules matched Unicode-normalised, with case folded
+where the source folds (the reading the walks use), **or** the patterns exactly as typed, case-sensitive and
+as spelled, against the NAS path. Protection only widens, so a negation (`!rule`) can never make deletable
+a NAS-only name that the typed patterns exclude. For example, with `*.txt` and `!Report.txt`, a NAS-only
+`report.txt` is kept on Windows even though the folding reading re-includes it, and with `*.txt` and
+`!café.txt` (composed) a NAS-only decomposed `café.txt` is kept on macOS. Such names are reported as
+protected, not deleted. Before this release those two cases were deleted on a folding source, because only
+the folded reading protected there. Uploads, comparison and the two walks still use the folded reading
+only: the negation still re-includes the local `Report.txt` for upload.
 Content an exclude newly covers is left on the NAS exactly as it is. A file that an earlier release
 uploaded before the rule matched it is **not** removed by this release or by a later `--delete`; delete it
 by hand in File Station.

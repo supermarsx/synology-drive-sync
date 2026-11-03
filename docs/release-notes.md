@@ -40,6 +40,12 @@ lists its own commits.
   make a protected NAS entry deletable. The probe that decides whether a source folds case now asks
   inside the root first, so a USB exFAT or CIFS mount beneath a case-sensitive parent is detected as
   folding.
+- **Negated excludes under `--delete` on Windows and macOS (any case- or normalisation-folding source).**
+  A NAS-only name is now protected from deletion if the patterns as typed (case-sensitive, as spelled)
+  exclude it, as well as when the folded rules do. With `*.txt` and `!Report.txt` a NAS-only `report.txt`
+  used to be deleted on Windows, and with `*.txt` and `!café.txt` (composed) a NAS-only decomposed
+  `café.txt` on macOS; both are now kept and reported as protected. Uploads and walks are unchanged.
+  If you relied on a negation to delete such a name, delete it by hand in File Station.
 - **A deletion under a renamed or normalisation-paired folder** is checked against the spelling the
   plan recorded, and a file recreated under a decomposed paired folder keeps its NAS copy. A kept
   deletion under a case-renamed folder is uploaded in the same run.
@@ -76,7 +82,8 @@ lists its own commits.
 ## Transfers and the network
 
 - **`--timeout` has a new meaning for uploads.** It is the no-progress window (at most 300 seconds) and
-  the wait for DSM's answer after the last byte, not a total deadline; a transfer that keeps moving is
+  the wait for DSM's answer after the last byte (plus a drain allowance of at most 1024 seconds), not a
+  total deadline; a transfer that keeps moving is
   not cut by it, but one attempt must average at least 16 KiB/s over the file's size. See
   [Timeouts](configuration/network.md#what-timeout-means-for-an-upload). The control-plane cap and the
   background-operation timeout are unchanged.
