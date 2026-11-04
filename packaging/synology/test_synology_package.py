@@ -25,6 +25,7 @@ import threading
 import time
 import traceback
 import unittest
+from collections.abc import Callable
 from pathlib import Path
 
 if os.name == "posix":
@@ -12189,6 +12190,478 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
             "a profile save was still refused after the run finished",
         )
 
+    # The barrier above, narrowed for daemon runs. The daemon names the profiles
+    # of its run in var/run/run.scope (pid, start, boot of the run.lock owner,
+    # then `profiles=a,b`); a scope that names the live run.lock owner exactly
+    # lets a save commit beside the run, unless it would change what the running
+    # profile is. Anything else is the shell runner's run, or a scope that cannot
+    # be proven, and keeps the whole-package refusal above.
+
+    DAEMON_RUN_NOTE = "note: profile syncing is syncing now; this change takes effect on its next run"
+    GLOBAL_RUN_NOTE = "note: a sync is running; this change takes effect on the next run"
+
+    def _plant_live_lock(self, name: str) -> tuple[int, str, str, Callable[[], None]]:
+        """A live private lock var/run/NAME owned by a real sleeper; returns its release."""
+        lock = self.real_var / "run" / name
+        lock.mkdir(mode=0o700)
+        if os.getuid() == 0:
+            os.chown(lock, self.drop_uid, self.drop_gid)
+        sleeper = subprocess.Popen(
+            ["/bin/sleep", "120"],
+            preexec_fn=(
+                (lambda: (os.setgroups([]), os.setgid(self.drop_gid), os.setuid(self.drop_uid)))
+                if os.getuid() == 0
+                else None
+            ),
+        )
+
+        def release() -> None:
+            if sleeper.poll() is None:
+                sleeper.terminate()
+                sleeper.wait(timeout=5)
+            (lock / "pid").unlink(missing_ok=True)
+            if lock.is_dir():
+                lock.rmdir()
+
+        self.addCleanup(release)
+        start = Path(f"/proc/{sleeper.pid}/stat").read_text(encoding="utf-8").split()[21]
+        boot = Path("/proc/sys/kernel/random/boot_id").read_text(encoding="utf-8").strip()
+        owner = lock / "pid"
+        owner.write_text(f"{sleeper.pid}\n{start}\n{boot}\n", encoding="utf-8")
+        owner.chmod(0o600)
+        if os.getuid() == 0:
+            os.chown(owner, self.drop_uid, self.drop_gid)
+        return sleeper.pid, start, boot, release
+
+    def _write_run_scope(
+        self, pid: int, start: str, boot: str, profiles: list[str], *, mode: int = 0o600
+    ) -> Path:
+        scope = self.real_var / "run/run.scope"
+        staged = self.real_var / "run/.run.scope.staged"
+        staged.write_text(
+            f"{pid}\n{start}\n{boot}\nprofiles={','.join(profiles)}\n", encoding="ascii"
+        )
+        staged.chmod(mode)
+        if os.getuid() == 0:
+            os.chown(staged, self.drop_uid, self.drop_gid)
+        staged.replace(scope)
+        self.addCleanup(lambda: scope.unlink(missing_ok=True))
+        return scope
+
+    def _daemon_run_fixture(self) -> tuple[int, str, str, Callable[[], None]]:
+        """Profiles `syncing` (default) and `other`; a daemon run of `syncing` is live."""
+        for name, source, default in (
+            ("syncing", self.source_one, True),
+            ("other", self.source_two, False),
+        ):
+            configured = self.configure(name, source, f"/home/Drive/{name}", default)
+            self.assertEqual(configured.returncode, 0, configured.stderr)
+            stored = self.shell(
+                self.manager, "set-password", name, input_text="test-password\n"
+            )
+            self.assertEqual(stored.returncode, 0, stored.stderr)
+        pid, start, boot, release = self._plant_live_lock("run.lock")
+        self._write_run_scope(pid, start, boot, ["syncing"])
+        return pid, start, boot, release
+
+    def _assert_profile_running(
+        self, result: subprocess.CompletedProcess[str], operation: str, profile: str = "syncing"
+    ) -> None:
+        self.assertEqual(result.returncode, 75, f"{operation}: {result.stdout}{result.stderr}")
+        refusal = [line for line in result.stderr.splitlines() if line.startswith("profile_running:")]
+        self.assertEqual(len(refusal), 1, f"{operation}: {result.stderr}")
+        self.assertIn(f"profile {profile}", refusal[0])
+        self.assertIn(operation, refusal[0])
+        self.assertIn("retry after the run", refusal[0])
+        self.assertNotIn("planning/syncing", result.stderr)
+
+    def test_daemon_run_admits_profile_saves_and_refuses_identity_edits(self) -> None:
+        _, _, _, release = self._daemon_run_fixture()
+        fragment = self.real_home / "config/profiles.d/syncing.toml"
+        try:
+            # Another profile: committed, and nothing about the run to say.
+            other = self.configure("other", self.source_two, "/home/Drive/Moved")
+            self.assertEqual(other.returncode, 0, other.stderr)
+            self.assertNotIn("takes effect", other.stdout + other.stderr)
+            self.assertIn(
+                'remote = "/home/Drive/Moved"',
+                (self.real_home / "config/profiles.d/other.toml").read_text(encoding="utf-8"),
+            )
+
+            # The running profile, tuning only: committed, applies next run.
+            base = [
+                "configure-profile", "--name", "syncing", "--source", str(self.source_one),
+                "--url", "https://files.example.test/proxy/", "--username", "syncing-bot",
+                "--remote", "/home/Drive/syncing",
+            ]
+            tuned = self.shell(self.manager, *base, "--jobs", "4", "--retries", "3")
+            self.assertEqual(tuned.returncode, 0, tuned.stderr)
+            self.assertEqual(tuned.stderr.strip().splitlines()[-1], self.DAEMON_RUN_NOTE)
+            self.assertIn("jobs = 4\n", fragment.read_text(encoding="utf-8"))
+
+            # The running profile, what it syncs: refused, nothing written.
+            before = fragment.read_text(encoding="utf-8")
+            identity_edits = (
+                ("source", ["--source", str(self.source_two)]),
+                ("remote", ["--remote", "/home/Drive/Elsewhere"]),
+                ("url", ["--url", "https://other.example.test/"]),
+                ("username", ["--username", "someone-else"]),
+                ("compare", ["--compare", "size-only"]),
+                ("excludes", ["--exclude", "*.tmp"]),
+            )
+            for field, change in identity_edits:
+                arguments = list(base)
+                for index in range(0, len(change), 2):
+                    if change[index] in arguments:
+                        arguments[arguments.index(change[index]) + 1] = change[index + 1]
+                    else:
+                        arguments.extend(change[index:index + 2])
+                refused = self.shell(self.manager, *arguments, "--jobs", "4", "--retries", "3")
+                self._assert_profile_running(refused, "configure-profile")
+                self.assertIn(field, refused.stderr, field)
+                self.assertEqual(fragment.read_text(encoding="utf-8"), before, field)
+        finally:
+            release()
+        # The run is over: the same edit commits, with nothing to note.
+        after = self.configure("syncing", self.source_two, "/home/Drive/syncing")
+        self.assertEqual(after.returncode, 0, after.stderr)
+        self.assertNotIn("note:", after.stdout + after.stderr)
+
+    def test_daemon_run_refuses_removing_what_the_running_profile_uses(self) -> None:
+        _, _, _, release = self._daemon_run_fixture()
+        profiles = self.real_home / "config/profiles.d"
+        secrets = self.real_home / "secrets"
+        audit_log = self.real_var / "log/audit.log"
+        try:
+            for operation in ("remove-profile", "set-default", "remove-routine",
+                              "remove-password", "remove-totp", "remove-remote-log-token"):
+                before = len(audit_log.read_text(encoding="utf-8").splitlines())
+                refused = self.shell(self.manager, operation, "syncing")
+                self._assert_profile_running(refused, operation)
+                # A refusal is an attempt that failed, never one left pending.
+                states = [
+                    json.loads(line)["state"]
+                    for line in audit_log.read_text(encoding="utf-8").splitlines()[before:]
+                    if line and json.loads(line).get("profile") == "syncing"
+                ]
+                self.assertEqual(states, ["requested", "failed"], operation)
+            self.assertTrue((profiles / "syncing.toml").is_file())
+            self.assertTrue((secrets / "syncing.password").is_file())
+
+            # Credentials of the running profile may be replaced: the core reads
+            # them at the next authentication, which is what the note says.
+            replaced = self.shell(
+                self.manager, "set-password", "syncing", input_text="rotated-password\n"
+            )
+            self.assertEqual(replaced.returncode, 0, replaced.stderr)
+            self.assertEqual(replaced.stderr.strip().splitlines()[-1], self.DAEMON_RUN_NOTE)
+
+            # Every one of them commits for a profile the run does not cover.
+            routine = self.shell(self.manager, "configure-routine", "--profile", "other")
+            self.assertEqual(routine.returncode, 0, routine.stderr)
+            self.assertEqual(routine.stderr.strip().splitlines()[-1], self.GLOBAL_RUN_NOTE)
+            for operation in ("remove-routine", "remove-totp", "remove-remote-log-token",
+                              "remove-password"):
+                committed = self.shell(self.manager, operation, "other")
+                self.assertEqual(committed.returncode, 0, f"{operation}: {committed.stderr}")
+            self.assertFalse((secrets / "other.password").exists())
+            made_default = self.shell(self.manager, "set-default", "other")
+            self.assertEqual(made_default.returncode, 0, made_default.stderr)
+            self.assertEqual(made_default.stderr.strip().splitlines()[-1], self.GLOBAL_RUN_NOTE)
+            back = self.shell(self.manager, "set-default", "syncing")
+            self._assert_profile_running(back, "set-default")
+            removed = self.shell(self.manager, "remove-profile", "other")
+            self.assertEqual(removed.returncode, 0, removed.stderr)
+            self.assertNotIn("takes effect", removed.stderr)
+            self.assertFalse((profiles / "other.toml").exists())
+        finally:
+            release()
+
+    def test_daemon_run_global_saves_commit_with_a_note(self) -> None:
+        _, _, _, release = self._daemon_run_fixture()
+        schedule = self.real_home / "config/schedule.conf"
+        try:
+            enabled = self.shell(self.manager, "enable", "--interval", "600")
+            self.assertEqual(enabled.returncode, 0, enabled.stderr)
+            self.assertEqual(enabled.stderr.strip().splitlines()[-1], self.GLOBAL_RUN_NOTE)
+            self.assertIn("enabled=true", schedule.read_text(encoding="utf-8"))
+            disabled = self.shell(self.manager, "disable")
+            self.assertEqual(disabled.returncode, 0, disabled.stderr)
+            self.assertEqual(disabled.stderr.strip().splitlines()[-1], self.GLOBAL_RUN_NOTE)
+            self.assertIn("enabled=false", schedule.read_text(encoding="utf-8"))
+
+            # Through the API the note is the result's warning, so the dashboard
+            # can say the save waits for the next run instead of a plain success.
+            result, payload = self.api(
+                "schedule", "--enabled", "false", "--interval", "900",
+                "--allow-delete", "false", "--max-total-delete", "100",
+            )
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertIs(payload["ok"], True, payload)
+            self.assertEqual(payload["warning_code"], "applies_next_run", payload)
+            self.assertEqual(
+                payload["warning"], "a sync is running; this change takes effect on the next run"
+            )
+            result, payload = self.api(
+                "configure-profile", "--name", "syncing", "--source", str(self.source_one),
+                "--url", "https://files.example.test/proxy/", "--username", "syncing-bot",
+                "--remote", "/home/Drive/syncing", "--jobs", "3",
+            )
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertEqual(payload["warning_code"], "applies_next_run", payload)
+            self.assertEqual(
+                payload["warning"],
+                "profile syncing is syncing now; this change takes effect on its next run",
+            )
+            result, payload = self.api("remove-profile", "syncing")
+            self.assertEqual(result.returncode, 75, result.stdout + result.stderr)
+            self.assertEqual(payload["code"], "busy", payload)
+            self.assertTrue(str(payload["message"]).startswith("profile_running:"), payload)
+        finally:
+            release()
+
+    def test_daemon_run_refuses_confirmed_resync_but_not_read_only_commands(self) -> None:
+        _, _, _, release = self._daemon_run_fixture()
+        try:
+            for profile in ("syncing", "other"):
+                refused = self.shell(
+                    self.manager, "resync", profile, "--confirm", "0123456789abcdef"
+                )
+                self._assert_profile_running(refused, "resync", profile)
+            self.assertFalse(self.capture.exists() and "--confirm" in self.capture.read_text(encoding="utf-8"))
+
+            # Read-only commands take no management lock, so a save in progress
+            # (a live management.lock) does not hold them either.
+            _, _, _, release_management = self._plant_live_lock("management.lock")
+            try:
+                planned = self.shell(self.manager, "resync", "syncing")
+                self.assertEqual(planned.returncode, 0, planned.stderr)
+                doctor = self.shell(self.manager, "doctor", "syncing", "--level", "quick")
+                self.assertEqual(doctor.returncode, 0, doctor.stdout + doctor.stderr)
+                self.assertNotIn("note:", doctor.stderr)
+            finally:
+                release_management()
+            calls = self.capture.read_text(encoding="utf-8")
+            self.assertIn("resync --profile syncing", calls)
+            self.assertIn("doctor --profile syncing --level quick target", calls)
+
+            # A write test writes into the destination the run is syncing.
+            for scope in (["syncing"], ["--all"]):
+                write_test = self.shell(self.manager, "doctor", *scope, "--write-test")
+                self._assert_profile_running(write_test, "doctor --write-test")
+        finally:
+            release()
+
+    def test_an_unprovable_run_scope_keeps_the_whole_package_refusal(self) -> None:
+        pid, start, boot, release = self._daemon_run_fixture()
+        scope = self.real_var / "run/run.scope"
+        try:
+            cases = (
+                ("start", lambda: self._write_run_scope(pid, str(int(start) + 1), boot, ["syncing"]),
+                 "does not name the run.lock owner"),
+                ("mode", lambda: self._write_run_scope(pid, start, boot, ["syncing"], mode=0o644),
+                 "mode 644"),
+                ("symlink", lambda: (
+                    self._write_run_scope(pid, start, boot, ["syncing"]).rename(self.root / "scope.real"),
+                    scope.symlink_to(self.root / "scope.real"),
+                ), "symlink"),
+                ("profiles", lambda: self._write_run_scope(pid, start, boot, ["syncing", ""]),
+                 "line 4"),
+            )
+            for label, plant, cause in cases:
+                scope.unlink(missing_ok=True)
+                plant()
+                for arguments in (
+                    ("configure-profile", "--name", "other", "--source", str(self.source_two),
+                     "--url", "https://files.example.test/proxy/", "--username", "other-bot",
+                     "--remote", "/home/Drive/Moved"),
+                    ("doctor", "other", "--level", "quick"),
+                ):
+                    refused = self.shell(self.manager, *arguments)
+                    self.assertEqual(refused.returncode, 75, f"{label}: {refused.stderr}")
+                    lines = refused.stderr.strip().splitlines()
+                    self.assertIn("planning/syncing", lines[-1], label)
+                    self.assertIn(f"while PID {pid} ", lines[-1], label)
+                    ignored = [line for line in lines if line.startswith("run.scope ignored:")]
+                    self.assertEqual(len(ignored), 1, f"{label}: {refused.stderr}")
+                    self.assertIn(str(self.fhs / "var/run/run.scope"), ignored[0], label)
+                    self.assertIn(cause, ignored[0], label)
+            # No scope at all is the shell runner's run: the old refusal, and
+            # nothing to report about a file that is not there.
+            scope.unlink()
+            refused = self.configure("other", self.source_two, "/home/Drive/Moved")
+            self.assertEqual(refused.returncode, 75, refused.stderr)
+            self.assertEqual(
+                refused.stderr.strip(),
+                f"cannot change profiles, credentials, or schedule while PID {pid} is planning/syncing",
+            )
+        finally:
+            release()
+
+    def test_resync_through_the_manager_is_audited_and_reaches_the_engine(self) -> None:
+        # resync was missing from begin_mutation's audited operations, so
+        # mark_mutation_commit_started found no audit pending and every resync,
+        # plan or confirmed, ended 64 before the engine was called.
+        self.assertEqual(
+            self.configure("personal", self.source_one, "/home/Drive/Test", True).returncode, 0
+        )
+        self.assertEqual(
+            self.shell(
+                self.manager, "set-password", "personal", input_text="test-password\n"
+            ).returncode,
+            0,
+        )
+        audit_log = self.real_var / "log/audit.log"
+        before = len(audit_log.read_text(encoding="utf-8").splitlines())
+        planned = self.shell(self.manager, "resync")
+        self.assertEqual(planned.returncode, 0, planned.stderr)
+        confirmed = self.shell(self.manager, "resync", "personal", "--confirm", "0123456789abcdef")
+        self.assertEqual(confirmed.returncode, 0, confirmed.stderr)
+        calls = [
+            line for line in self.capture.read_text(encoding="utf-8").splitlines()
+            if " resync " in f" {line} "
+        ]
+        self.assertEqual(len(calls), 2, calls)
+        self.assertIn("resync --profile personal", calls[0])
+        self.assertNotIn("--confirm", calls[0])
+        self.assertIn("--confirm 0123456789abcdef", calls[1])
+        records = [
+            json.loads(line)
+            for line in audit_log.read_text(encoding="utf-8").splitlines()[before:]
+            if line
+        ]
+        self.assertEqual(
+            [(record["operation"], record["profile"], record["state"]) for record in records],
+            [("resync", "personal", "requested"), ("resync", "personal", "succeeded")] * 2,
+        )
+
+    def test_remove_profile_removes_the_state_its_runs_left_behind(self) -> None:
+        # alerts-<p>.state was never removed, so a profile recreated under the
+        # name inherited its failure streak; the pair index, its quarantined
+        # copies and the daemon's lasting condition are per-profile state too.
+        state = self.real_var / "state"
+        for directory in (state / "cache/pairs", state / "lasting"):
+            directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+
+        def leftovers(name: str) -> list[Path]:
+            return [
+                state / f"alerts-{name}.state",
+                state / f"lasting/{name}.state",
+                state / f"cache/pairs/{name}.redb",
+                state / f"cache/pairs/{name}.redb.corrupt-123",
+            ]
+
+        for name, source, default in (
+            ("gone", self.source_one, True),
+            ("kept", self.source_two, False),
+            ("stuck", self.dsm_system_root / "volume1", False),
+        ):
+            configured = self.configure(name, source, f"/home/Drive/{name}", default)
+            self.assertEqual(configured.returncode, 0, configured.stderr)
+            for path in leftovers(name):
+                path.write_text("state\n", encoding="utf-8")
+                path.chmod(0o600)
+
+        removed = self.shell(self.manager, "remove-profile", "gone")
+        self.assertEqual(removed.returncode, 0, removed.stderr)
+        self.assertNotIn("warning:", removed.stderr)
+        for path in leftovers("gone"):
+            self.assertFalse(path.exists(), path)
+        for path in leftovers("kept") + leftovers("stuck"):
+            self.assertTrue(path.is_file(), path)
+
+        # One that cannot be removed is named with its cause; the profile is
+        # still removed, and the API carries the line as the result's warning.
+        index = state / "cache/pairs/stuck.redb"
+        index.unlink()
+        index.mkdir()
+        (index / "held").write_text("x\n", encoding="utf-8")
+        result, payload = self.api("remove-profile", "stuck")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(payload["warning_code"], "operation_warning", payload)
+        self.assertIn("stuck.redb was not removed", str(payload["warning"]), payload)
+        self.assertFalse((self.real_home / "config/profiles.d/stuck.toml").exists())
+        self.assertTrue(index.is_dir())
+        for path in leftovers("stuck"):
+            if path != index:
+                self.assertFalse(path.exists(), path)
+        for path in leftovers("kept"):
+            self.assertTrue(path.is_file(), path)
+
+    def test_runner_refuses_while_package_configuration_is_being_changed(self) -> None:
+        # The run side of the two-lock exclusion: a save holds management.lock
+        # across a multi-file commit, and a run must not start reading it mid-way.
+        self.assertEqual(
+            self.configure("kept", self.source_one, "/home/Drive/Kept", True).returncode, 0
+        )
+        self.assertEqual(
+            self.shell(
+                self.manager, "set-password", "kept", input_text="test-password\n"
+            ).returncode,
+            0,
+        )
+        started = self.shell(self.lifecycle, "start", timeout=20)
+        self.assertEqual(started.returncode, 0, started.stdout + started.stderr)
+        _, _, _, release = self._plant_live_lock("management.lock")
+        try:
+            refused = self.shell(
+                self.real_target / "libexec/sdsync-run",
+                "sync", "all", "false", "foreground", "100",
+                extra_environment={"SDSYNC_DSM_AUDIT_WRAPPED": "true"},
+            )
+            self.assertEqual(refused.returncode, 75, refused.stdout + refused.stderr)
+            self.assertIn(
+                "package configuration is being changed", refused.stdout + refused.stderr
+            )
+            self.assertFalse((self.real_var / "run/run.lock").exists())
+        finally:
+            release()
+
+    def test_secret_prompt_waits_without_holding_the_management_lock(self) -> None:
+        # A person typing a password used to hold management.lock for as long as
+        # the prompt waited, and every run refused meanwhile.
+        self.assertEqual(
+            self.configure("personal", self.source_one, "/home/Drive/Test", True).returncode,
+            0,
+        )
+        master_fd, slave_fd = pty.openpty()
+        process = subprocess.Popen(
+            ["/bin/sh", str(self.manager), "set-password", "personal"],
+            stdin=slave_fd,
+            stdout=slave_fd,
+            stderr=slave_fd,
+            env=self.environment.copy(),
+            preexec_fn=(
+                (lambda: (os.setgid(self.drop_gid), os.setuid(self.drop_uid)))
+                if os.getuid() == 0
+                else None
+            ),
+            close_fds=True,
+        )
+        output = b""
+        try:
+            for _ in range(100):
+                readable, _, _ = select.select([master_fd], [], [], 0.05)
+                if readable:
+                    output += os.read(master_fd, 4096)
+                    if b"DSM password:" in output:
+                        break
+            self.assertIn(b"DSM password:", output)
+            self.assertFalse((self.real_var / "run/management.lock").exists())
+            os.write(master_fd, b"typed-password\n")
+            self.assertEqual(process.wait(timeout=10), 0)
+            self.assertEqual(
+                (self.real_home / "secrets/personal.password").read_text(encoding="utf-8"),
+                "typed-password\n",
+            )
+            self.assertFalse((self.real_var / "run/management.lock").exists())
+        finally:
+            if process.poll() is None:
+                process.kill()
+                process.wait(timeout=5)
+            os.close(master_fd)
+            os.close(slave_fd)
+
     def test_a_run_records_completion_only_for_the_profiles_it_covered(self) -> None:
         # The runner's own contract, tested on its own terms.
         #
@@ -12198,9 +12671,11 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
         # the later listing was never part of the run, yet received a record saying
         # this run had succeeded for it, which on a backup tool is a false assurance.
         #
-        # No supported path can produce that state: every mutation that could add a
-        # profile is refused while the run lock is live, which the test above pins.
-        # This one therefore writes the fragment directly, bypassing the manager, to
+        # A shell-runner run cannot meet that state through the manager: every
+        # mutation that could add a profile is refused while its run lock is live,
+        # which the test above pins. A daemon run can -- it names its scope, and a
+        # new profile commits beside it -- so the frozen set is load-bearing there.
+        # This one writes the fragment directly, bypassing the manager, to
         # exercise the runner's contract without depending on a guard in another
         # file -- which is the point of freezing the set rather than re-globbing.
         for name, source in (("kept", self.source_one), ("removed", self.source_two)):

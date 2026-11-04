@@ -238,7 +238,7 @@ code rather than served.
 | `66` | Required profile, configuration, or protected credential is absent |
 | `69` | Installed executable or required runtime facility is unavailable |
 | `73` | Unsafe package path, state, lock, log, queue, or untrusted PID |
-| `75` | Another management or Plan/Run operation is active; a deferral, retried, not a failure |
+| `75` | Another management or Plan/Run operation is active; a deferral, retried, not a failure. Beside a daemon run the refusal is narrowed to what would change the running profiles and begins `profile_running:` ([operations](operations.md#saves-beside-a-daemon-run)) |
 | `76` | A configuration change that needs the running controller to reload (`configure-routine`, `remove-routine`, `enable` / `set-schedule` with an interval, `configure-performance`) was **saved and audited as succeeded**, but the controller could not be told to reload it. stderr names the reason and PID |
 | `77` | Command was not run as the DSM package identity |
 | `78` | The package supervisor refused to start the core (binary identity mismatch); the core never ran, and one `supervised core refused: <code>` line is printed |

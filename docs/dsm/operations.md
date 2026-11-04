@@ -116,7 +116,7 @@ a missing, unsafe, or unrecognised state file degrades that one entry and adds a
 | `succeeded` | Finished, exit 0. Counts of skipped or deferred entries turn it into a warning, never plain success. |
 | `partial` | The core exited `3`: finished, but named paths were deferred and sync on the next run. Not a failure: no failure alert, no retry consumed, and a dependent routine may run after it. |
 | `failed` | Ended non-zero, or was refused in preflight. `reason` says why when known. |
-| `busy` | Refused because another run, Doctor, or management action held the run lock (exit `75`). A routine retries on its own (30 seconds later, no retry consumed); a run the user started is not repeated, so run it again if it is still needed. Not a failure and not counted by the failure alert. |
+| `busy` | Refused because another run held the run lock, or a save or a Doctor write test held the management lock (exit `75`). A routine retries on its own (30 seconds later, no retry consumed); a run the user started is not repeated, so run it again if it is still needed. Not a failure and not counted by the failure alert. |
 | `cancelled` | Stopped by the user or a package stop (`130`/`143`, or `137` when a package stop had to kill a runner that did not finish cancelling within its 60-second grace). No alert, and an Activity `run.cancelled` row. A routine runs again on its own; a run the user started is not repeated. |
 | `not_run` | No record, or the last aggregate run did not reach this profile; its previous completion is kept. |
 | `stale` | `run.state` says `running` but the runner is gone (see below). Treated as failed. |
@@ -269,9 +269,46 @@ its own wait for a queued result at thirty seconds, so such a save was reported 
 page could not determine — while the save itself was still queued and landed later. A save now
 proceeds beside a status walk instead of behind it.
 
-A scheduled or manual **Run** is still a barrier for saves, deliberately: it is the one long job that
-is reading the configuration a save would rewrite. A save started during a run is queued and applied
-when the run finishes.
+A scheduled or manual **Run** of the shell engine (`var/state/engine` = `shell`) is still a barrier
+for saves, deliberately: it is the one long job that is reading the configuration a save would
+rewrite. A save started during such a run is queued and applied when the run finishes, and
+`sdsync-dsm` refuses one that reaches it with exit `75` (`cannot change profiles, credentials, or
+schedule while PID … is planning/syncing`).
+
+### Saves beside a daemon run
+
+A daemon run names the profiles it covers in `var/run/run.scope`, a package-owned `0600` regular file
+beside `run.lock` of exactly four lines: the PID, `/proc` start time and boot id of the `run.lock`
+owner, then `profiles=` and a comma-separated list. While that file names the live `run.lock` owner
+exactly, the manager narrows its barrier to what would change or remove what the run is using, and
+refuses that with exit `75` and a message beginning `profile_running:` that names the profile and the
+operation:
+
+- `remove-profile`, `set-default` and `remove-routine` of a profile in the run;
+- `remove-password`, `remove-totp` and `remove-remote-log-token` of a profile in the run (the core
+  reads its credentials again at each re-authentication);
+- `configure-profile` of a profile in the run that changes its `source`, `remote`, `url`, `username`,
+  `compare`, `excludes`, `delete`, `allow-empty-source` or `max-delete` (any other setting — jobs,
+  retries, timeouts, logging, rate — is saved);
+- a confirmed `resync` of any profile (it re-uploads, and never runs beside a sync);
+- `doctor --write-test` of a profile in the run, or of `--all`.
+
+Everything else commits during the run, and its stderr ends with
+`note: profile <p> is syncing now; this change takes effect on its next run` (a change to a profile
+in the run) or `note: a sync is running; this change takes effect on the next run` (schedule,
+routines, the default profile, alert, performance and security policy). Through
+`sdsync-dsm api <mutation>` the note is the result's `applies_next_run` warning. The run in flight
+keeps the settings it started with.
+
+A `run.scope` that is absent, a symlink, not `0600` or not package-owned, over 4096 bytes, malformed,
+or naming anything but the live `run.lock` owner is not trusted: the run is treated as a shell run and
+the whole-package refusal above applies, preceded — when the file exists — by one
+`run.scope ignored: <cause> (<path>)` line.
+
+**Doctor** and a **resync plan** (no `--confirm`) only read, and take no management lock, so a save
+does not wait for them and they do not make a run refuse. Beside a shell-engine run they are still
+refused as before. A **Doctor write test** writes into the destination and keeps the management lock
+for its whole duration.
 
 ## Structured Activity
 
