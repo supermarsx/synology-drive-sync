@@ -506,7 +506,9 @@ fn a_discarded_index_is_rebuilt_from_this_runs_live_evidence() {
     let (local, remote) = tree(&[("a.jpg", facts(), Some(MD5_A))]);
     session.discard();
     session.harvest(&local, &remote, &keys(&remote), &BTreeMap::new(), at(NOW));
-    session.commit(Some(&local), None, true);
+    let report = session.commit(Some(&local), None, true);
+    // What the index holds after the commit, for the status `index:` line.
+    assert_eq!(report.entries, Some(1));
     let index = shared.borrow();
     assert_eq!(index.pairs.keys().collect::<Vec<_>>(), vec!["a.jpg"]);
     assert_eq!(index.pairs["a.jpg"].record.md5, MD5_A);
@@ -526,7 +528,12 @@ fn an_abandoned_run_leaves_the_index_exactly_as_it_was() {
     );
     let (local, remote) = tree(&[("a.jpg", facts(), Some(MD5_B))]);
     session.harvest(&local, &remote, &keys(&remote), &BTreeMap::new(), at(NOW));
-    session.abandon();
+    let report = session.abandon();
+    assert_eq!(
+        report.entries,
+        Some(1),
+        "the untouched index is still counted"
+    );
     assert_eq!(shared.borrow().pairs, before);
     assert_eq!(shared.borrow().commits, 0);
 }
@@ -766,5 +773,8 @@ impl PairIndex for SharedIndex {
     }
     fn commit(&mut self, commit: IndexCommit) -> Result<(), IndexIssue> {
         self.0.borrow_mut().commit(commit)
+    }
+    fn stored_pairs(&mut self) -> Option<u64> {
+        self.0.borrow_mut().stored_pairs()
     }
 }

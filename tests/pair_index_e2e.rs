@@ -185,6 +185,8 @@ fn a_second_run_takes_stored_evidence_and_reads_only_the_canary() {
     assert_eq!(count(&requests, "SYNO.FileStation.MD5.start"), 60);
     assert_eq!(index_of(&document)["state"], "cold");
     assert_eq!(index_of(&document)["stored"], 60);
+    // What the redb file holds after the commit, for the package's status line.
+    assert_eq!(index_of(&document)["entries"], 60);
     let database = database_file(&tree);
     use std::os::unix::fs::PermissionsExt as _;
     assert_eq!(

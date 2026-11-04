@@ -332,6 +332,8 @@ pub struct IndexReport {
     /// Pairs written and removed by the end-of-run commit.
     pub stored: usize,
     pub removed: usize,
+    /// Pairs the index holds after the run, when the backend can say cheaply.
+    pub entries: Option<u64>,
     pub issues: Vec<IndexIssue>,
 }
 
@@ -725,6 +727,7 @@ impl IndexSession {
             Ok(()) => {
                 self.report.stored = stored;
                 self.report.removed = removed;
+                self.report.entries = self.backend.stored_pairs();
             }
             Err(issue) => {
                 self.report.issues.push(issue);
@@ -738,6 +741,7 @@ impl IndexSession {
     /// and the evidence stays exactly as it was.
     pub fn abandon(mut self) -> IndexReport {
         self.backend.finish_reads();
+        self.report.entries = self.backend.stored_pairs();
         self.report.remote_signal = Some(self.signal);
         self.report.issues.extend(self.backend.take_notes());
         self.report

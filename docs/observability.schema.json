@@ -17,7 +17,7 @@
       "type": "object",
       "description": "What the verified-pair index (`--pair-index`) did for this run. A stored digest only ever suppresses an upload; every condition that kept the index from being used is in `issues` and the run verified those pairs live.",
       "additionalProperties": false,
-      "required": ["state", "served", "verified_live", "racy", "expired", "canary_checked", "canary_inconclusive", "canary_mismatches", "oldest_evidence_epoch", "remote_change_signal", "stored", "removed", "issues"],
+      "required": ["state", "served", "verified_live", "racy", "expired", "canary_checked", "canary_inconclusive", "canary_mismatches", "oldest_evidence_epoch", "remote_change_signal", "stored", "removed", "entries", "issues"],
       "properties": {
         "state": {
           "description": "`off`: not asked for, or not applicable to this compare mode. `cold`: no usable evidence yet (new, retired, discarded or repaired); this run filled it. `warm`: evidence was served. `refreshed`: `--pair-index-refresh`. `unusable`: the index could not be used (see `issues`); every pair was verified live. `local-only`: the NAS change time cannot be trusted, so only local reads were skipped.",
@@ -34,6 +34,7 @@
         "remote_change_signal": { "oneOf": [{ "type": "null" }, { "enum": ["ctime", "local-only"] }] },
         "stored": { "description": "Pairs written by this run's commit.", "$ref": "#/$defs/nonNegativeInteger" },
         "removed": { "description": "Pairs removed by this run's commit (touched, changed or gone).", "$ref": "#/$defs/nonNegativeInteger" },
+        "entries": { "description": "Pairs the index holds after this run, or null when the backend could not count them cheaply (an index that was never opened).", "oneOf": [{ "type": "null" }, { "$ref": "#/$defs/nonNegativeInteger" }] },
         "issues": {
           "type": "array",
           "items": {

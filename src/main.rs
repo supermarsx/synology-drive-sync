@@ -2938,7 +2938,7 @@ fn prepare_and_run_sync_reporting(
     let mut index_report: Option<pair_index::IndexReport> = None;
     match run_index::open(index_start, profile, settings, &client) {
         Ok(session) => index_session = session,
-        Err(report) => index_report = Some(report),
+        Err(report) => index_report = Some(*report),
     }
 
     let operation = (|| {

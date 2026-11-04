@@ -91,13 +91,13 @@ pub(crate) fn open(
     profile: &str,
     settings: &config::ResolvedSync,
     client: &ApiClient,
-) -> std::result::Result<Option<IndexSession>, IndexReport> {
+) -> std::result::Result<Option<IndexSession>, Box<IndexReport>> {
     // Without the index (not Unix), nothing below needs the run's settings or its client.
     #[cfg(not(unix))]
     let _ = (profile, settings, client);
     match start {
         IndexStart::Off => Ok(None),
-        IndexStart::Report(report) => Err(report),
+        IndexStart::Report(report) => Err(Box::new(report)),
         #[cfg(unix)]
         IndexStart::Ready { paths, cache_mib } => {
             use synology_drive_sync::pair_index_redb::RedbPairIndex;
@@ -109,7 +109,7 @@ pub(crate) fn open(
                     ..IndexReport::default()
                 };
                 report.issues = opened.issues;
-                return Err(report);
+                return Err(Box::new(report));
             };
             let binding = match binding(profile, settings, client) {
                 Ok(binding) => binding,
@@ -121,7 +121,7 @@ pub(crate) fn open(
                         cause,
                     ));
                     report.issues.splice(0..0, opened.issues);
-                    return Err(report);
+                    return Err(Box::new(report));
                 }
             };
             let mut session = IndexSession::open(
@@ -248,6 +248,7 @@ pub(crate) fn value(report: &IndexReport) -> Value {
         "remote_change_signal": report.remote_signal.map(|signal| signal.as_str()),
         "stored": report.stored,
         "removed": report.removed,
+        "entries": report.entries,
         "issues": report.issues.iter().map(|issue| json!({
             "code": issue.code,
             "severity": issue.severity.as_str(),
