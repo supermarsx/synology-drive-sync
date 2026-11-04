@@ -106,7 +106,26 @@ impl Package {
             );
             thread::sleep(Duration::from_millis(50));
         }
-        assert!(self.p("var/run/daemon.ready").exists());
+        // The socket answers from the moment it listens, a beat before the daemon publishes
+        // daemon.ready (listen, then the record): wait for the record, and say what is there.
+        let ready = self.p("var/run/daemon.ready");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !ready.exists() {
+            assert!(
+                Instant::now() < deadline,
+                "the daemon answered ping but never published {}: {:?}
+{}",
+                ready.display(),
+                fs::read_dir(self.p("var/run"))
+                    .map(|entries| entries
+                        .flatten()
+                        .map(|entry| entry.file_name())
+                        .collect::<Vec<_>>())
+                    .unwrap_or_default(),
+                self.stderr()
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
     }
 
     fn stderr(&self) -> String {
@@ -815,18 +834,9 @@ fn a_supervisor_lock_held_for_a_moment_does_not_make_the_supervisor_leave() {
 fn a_lock_held_for_a_moment_does_not_refuse_the_daemon() {
     let mut package = Package::new("lock-moment");
     let core = script(&package.p("core"), "exit 0");
-    private_dir(&package.p("@appdata/run"));
-    let lock = package.p("@appdata/run/daemon.lock");
-    fs::write(&lock, b"").unwrap();
-    fs::set_permissions(&lock, fs::Permissions::from_mode(0o600)).unwrap();
-    let mut holder = Command::new("flock")
-        .arg("-x")
-        .arg(&lock)
-        .args(["sleep", "1"])
-        .spawn()
-        .unwrap();
-    // Let flock take it.
-    thread::sleep(Duration::from_millis(200));
+    // Held before the daemon starts, and known to be held: not "a moment after
+    // spawning flock", which under load could be after the daemon had the lock.
+    let mut holder = hold_lock(&package.p("@appdata/run/daemon.lock"), 1);
     package.start(&core, &[]);
     let _ = holder.wait();
     package.stop(Duration::from_secs(5));

@@ -1274,12 +1274,16 @@ pub(crate) fn run_launch(options: &Options) -> ExitCode {
                 break;
             }
         }
+        // The socket answers from the moment it listens, a beat before the
+        // daemon publishes daemon.ready: a launch that returned then left a
+        // started service no stop or status could yet prove. Both are waited for.
         if ctl::request(
             &options.socket(),
             &json!({"verb": "ping"}),
             Duration::from_secs(1),
         )
         .is_ok_and(|reply| reply["ok"] == true)
+            && ready_record_published(&options.var)
         {
             return ExitCode::SUCCESS;
         }
@@ -1298,6 +1302,13 @@ pub(crate) fn run_launch(options: &Options) -> ExitCode {
         last_words(&options.var)
     ));
     ExitCode::from(1)
+}
+
+/// Whether `daemon.ready` holds a complete identity record (pid, start tick,
+/// boot id, one per line): the daemon writes it after its socket listens.
+fn ready_record_published(var: &Path) -> bool {
+    fs::read_to_string(var.join("run").join("daemon.ready"))
+        .is_ok_and(|text| text.lines().count() == 3 && text.ends_with('\n'))
 }
 
 /// TERM `child`, KILL it after `grace`, and reap it (bounded). Says how it
@@ -1701,6 +1712,22 @@ mod tests {
         assert_eq!(outcome.exit, 0, "{outcome:?}");
         assert_eq!(outcome.detail, "saved alpha", "{outcome:?}");
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A launch is ready when the socket answers AND daemon.ready is published;
+    /// the socket answers a beat earlier.
+    #[test]
+    fn a_launch_waits_for_the_ready_record() {
+        let var = std::env::temp_dir().join(format!("sdsyncd-ready-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&var);
+        fs::create_dir_all(var.join("run")).unwrap();
+        assert!(!ready_record_published(&var), "no record yet");
+        fs::write(var.join("run/daemon.ready"), b"123\n").unwrap();
+        assert!(!ready_record_published(&var), "a torn record is not ready");
+        let record = identity_record(std::process::id()).unwrap();
+        fs::write(var.join("run/daemon.ready"), record).unwrap();
+        assert!(ready_record_published(&var));
+        let _ = fs::remove_dir_all(&var);
     }
 
     #[test]
