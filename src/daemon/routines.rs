@@ -1386,6 +1386,26 @@ pub(crate) fn apply_outcome(
             "busy".into()
         };
         state.next_run = finished + RETRY_FLOOR_SECONDS;
+    } else if end.reason == "core_oom_killed" {
+        // A lasting, user-fixable condition (daemon/lasting.rs): retrying only
+        // repeats the kill. Failed, honestly; no ladder and no escalation; the
+        // control thread holds every automatic run of the profile until Run
+        // now or a settings change, and the cadence moves on as after a run.
+        state.state = RoutineRunState::Failed;
+        state.last_reason = end.reason.clone();
+        state.retry_attempt = 0;
+        state.partial_streak = 0;
+        match routine.mode {
+            Mode::Interval { interval } => state.next_run = finished + interval,
+            Mode::Daily { .. } => close_day(state),
+            Mode::Realtime { .. } => state.next_run = 0,
+        }
+        effects.push(activity(
+            "routine.deferred",
+            "deferred",
+            "Routine stopped: the sync core was killed by the out-of-memory killer. It does not run again on its own until you click Run now or change this profile's settings or the performance level",
+            Level::Warn,
+        ));
     } else if end.cancelled {
         // Consumes no attempt and does not burn a daily last_day (I-5: failed,
         // never succeeded). An owed retry keeps its count; the floor bounds its
@@ -2123,6 +2143,45 @@ mod tests {
             reason: reason.into(),
             admission_refused: false,
         }
+    }
+
+    /// An OOM kill takes no retry and escalates nothing: retrying repeats it.
+    #[test]
+    fn an_oom_kill_takes_no_retry_and_names_the_block() {
+        let r = interval_routine();
+        let mut state = RoutineState::default();
+        let mut effects = Vec::new();
+        apply_outcome(
+            &r,
+            &mut state,
+            "photos",
+            &end(137, false, "core_oom_killed"),
+            100,
+            "d",
+            &mut effects,
+        );
+        assert_eq!(state.state, RoutineRunState::Failed);
+        assert_eq!(state.last_reason, "core_oom_killed");
+        assert_eq!(state.retry_attempt, 0);
+        assert!(!effects.iter().any(|e| matches!(e, Effect::Escalate { .. })));
+        assert!(
+            effects
+                .iter()
+                .any(|e| format!("{e:?}").contains("out-of-memory killer")),
+            "{effects:?}"
+        );
+        // A plain kill still climbs the ladder.
+        let mut state = RoutineState::default();
+        apply_outcome(
+            &r,
+            &mut state,
+            "photos",
+            &end(137, false, "core_killed"),
+            100,
+            "d",
+            &mut Vec::new(),
+        );
+        assert_eq!(state.retry_attempt, 1);
     }
 
     #[test]

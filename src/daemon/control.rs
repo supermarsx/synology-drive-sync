@@ -164,6 +164,8 @@ pub(crate) struct Paths {
     pub(crate) run_dir: PathBuf,
     pub(crate) log_root: PathBuf,
     pub(crate) core_binary: PathBuf,
+    /// `var/state/lasting`: the daemon's lasting blocks (daemon/lasting.rs).
+    pub(crate) lasting_dir: PathBuf,
 }
 
 impl Paths {
@@ -182,6 +184,7 @@ impl Paths {
             run_dir: var.join("run"),
             log_root: var.join("log"),
             core_binary,
+            lasting_dir: var.join("state/lasting"),
         }
     }
 }
@@ -272,6 +275,26 @@ struct Entry {
     armed: Option<ArmSpec>,
 }
 
+/// Why a profile's automatic runs are held (daemon/lasting.rs).
+#[derive(Clone, Debug)]
+enum Blocked {
+    Lasting(super::lasting::Lasting),
+    /// The block's record is unreadable: held, named, never read as cleared.
+    Unreadable(String),
+}
+
+impl Blocked {
+    fn reason(&self) -> &str {
+        match self {
+            Self::Lasting(lasting) => &lasting.reason,
+            Self::Unreadable(_) => "lasting_state_unreadable",
+        }
+    }
+}
+
+/// How often one held trigger is logged.
+const SUPPRESSED_LOG_EVERY: Duration = Duration::from_secs(3600);
+
 struct InFlightMutation {
     mutation: Mutation,
     started: Instant,
@@ -309,6 +332,9 @@ pub(crate) struct Control {
     write_failures: HashSet<String>,
     events: VecDeque<Value>,
     in_flight: BTreeMap<u64, InFlightMutation>,
+    blocked: BTreeMap<String, Blocked>,
+    suppressed_logged: std::collections::HashMap<String, Instant>,
+    lasting_reported: HashSet<String>,
     last_controller_write: Option<Instant>,
     wall_unavailable: bool,
     turn_now: bool,
@@ -365,6 +391,9 @@ impl Control {
             write_failures: HashSet::new(),
             events: VecDeque::new(),
             in_flight: BTreeMap::new(),
+            blocked: BTreeMap::new(),
+            suppressed_logged: std::collections::HashMap::new(),
+            lasting_reported: HashSet::new(),
             last_controller_write: None,
             wall_unavailable: false,
             turn_now: true,
@@ -734,6 +763,7 @@ impl Control {
     // ------------------------------------------------------------ configuration
 
     fn reload(&mut self, why: &str) {
+        self.load_lasting();
         let schedule = routines::parse_schedule(
             read_small(&self.paths.config_dir.join("schedule.conf")).as_deref(),
         );
@@ -970,6 +1000,16 @@ impl Control {
                 .active
                 .as_ref()
                 .is_some_and(|a| a.request.origin == Origin::Aggregate);
+        if now >= self.schedule_deadline
+            && !pending
+            && self.held_back(&self.profile_names(), "schedule")
+        {
+            // A profile in a lasting block would be killed again by an
+            // all-profiles run; the next attempt is a whole interval away.
+            self.schedule_deadline = now + self.schedule.interval;
+            self.save_schedule();
+            return;
+        }
         if now >= self.schedule_deadline && !pending {
             let id = self.take_id();
             self.queue.push_back(RunRequest {
@@ -982,6 +1022,209 @@ impl Control {
                 subscope: None,
             });
         }
+    }
+
+    // ------------------------------------------------------------ lasting blocks
+
+    /// The fingerprint a block is tied to: the profile fragment and the
+    /// performance level, by content.
+    fn settings_fingerprint(&self, name: &str) -> u64 {
+        super::lasting::fingerprint(
+            read_small(&self.paths.profiles_dir.join(format!("{name}.toml"))).as_deref(),
+            read_small(&self.paths.config_dir.join("performance.conf")).as_deref(),
+        )
+    }
+
+    /// Read `var/state/lasting`: drop the block of a removed profile and of a
+    /// profile whose settings changed; hold an unreadable record as a block.
+    fn load_lasting(&mut self) {
+        let dir = self.paths.lasting_dir.clone();
+        let entries = match fs::read_dir(&dir) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                self.blocked.clear();
+                return;
+            }
+            Err(error) => {
+                // Keep what was held: an unreadable directory is not a lifted block.
+                if self.lasting_reported.insert(format!("dir {error}")) {
+                    self.log(
+                        Level::Error,
+                        "controller",
+                        "lasting_state_unreadable",
+                        format!("path={} cause={error}", dir.display()),
+                    );
+                }
+                return;
+            }
+        };
+        let mut found = BTreeMap::new();
+        for entry in entries.flatten() {
+            let file = entry.file_name().to_string_lossy().into_owned();
+            let Some(name) = file.strip_suffix(".state").filter(|n| valid_name(n)) else {
+                continue;
+            };
+            let name = name.to_owned();
+            let path = entry.path();
+            if !self
+                .paths
+                .profiles_dir
+                .join(format!("{name}.toml"))
+                .is_file()
+            {
+                self.remove_block_file(&name, "profile_removed");
+                continue;
+            }
+            let parsed = match fs::symlink_metadata(&path) {
+                Ok(metadata) if !metadata.file_type().is_file() => {
+                    Err("not a regular file".to_owned())
+                }
+                Ok(_) => match fs::read(&path) {
+                    Ok(bytes) => super::lasting::Lasting::parse(&bytes),
+                    Err(error) => Err(error.to_string()),
+                },
+                Err(error) => Err(error.to_string()),
+            };
+            match parsed {
+                Ok(lasting) if lasting.fingerprint != self.settings_fingerprint(&name) => {
+                    self.remove_block_file(&name, "settings_changed");
+                }
+                Ok(lasting) => {
+                    found.insert(name, Blocked::Lasting(lasting));
+                }
+                Err(cause) => {
+                    if self.lasting_reported.insert(format!("{name} {cause}")) {
+                        self.log(
+                            Level::Warn,
+                            "controller",
+                            "lasting_state_unreadable",
+                            format!("profile={name} path={} cause={cause}", path.display()),
+                        );
+                    }
+                    found.insert(
+                        name,
+                        Blocked::Unreadable(format!("{}: {cause}", path.display())),
+                    );
+                }
+            }
+        }
+        self.blocked = found;
+    }
+
+    fn remove_block_file(&mut self, name: &str, cause: &str) {
+        let path = self.paths.lasting_dir.join(format!("{name}.state"));
+        match fs::remove_file(&path) {
+            Ok(()) => self.log(
+                Level::Info,
+                "controller",
+                "lasting_cleared",
+                format!("profile={name} cause={cause}"),
+            ),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => {
+                if self
+                    .lasting_reported
+                    .insert(format!("{name} remove {error}"))
+                {
+                    self.log(
+                        Level::Error,
+                        "controller",
+                        "lasting_unremovable",
+                        format!(
+                            "profile={name} path={} cause={error} wanted={cause}",
+                            path.display()
+                        ),
+                    );
+                }
+            }
+        }
+        self.blocked.remove(name);
+        self.suppressed_logged.remove(name);
+    }
+
+    /// Hold `profile`'s automatic runs after an OOM kill, durably.
+    fn block(&mut self, profile: &str, reason: &str, detail: &str, finished: u64) {
+        let lasting = super::lasting::Lasting {
+            reason: reason.to_owned(),
+            detail: detail.to_owned(),
+            since: finished,
+            fingerprint: self.settings_fingerprint(profile),
+        };
+        let dir = self.paths.lasting_dir.clone();
+        let path = dir.join(format!("{profile}.state"));
+        let written = create_private_dir(&dir)
+            .map_err(|error| format!("{}: {error}", dir.display()))
+            .and_then(|()| {
+                self.write_state(&path, lasting.render())
+                    .map_err(|error| error.to_string())
+            });
+        if let Err(cause) = written {
+            // Held for this process's life anyway; a restart would forget it.
+            self.log(
+                Level::Error,
+                "controller",
+                "lasting_unwritable",
+                format!("profile={profile} path={} cause={cause}", path.display()),
+            );
+        }
+        self.log(
+            Level::Warn,
+            "controller",
+            "lasting_blocked",
+            format!(
+                "profile={profile} reason={reason} clears_on=run_now_or_settings_change detail={}",
+                sanitize_detail(detail, 160)
+            ),
+        );
+        self.suppressed_logged.remove(profile);
+        self.blocked
+            .insert(profile.to_owned(), Blocked::Lasting(lasting));
+    }
+
+    /// Lift the blocks a requested run of `scope` covers.
+    fn clear_blocks(&mut self, scope: &str, cause: &str) {
+        let names: Vec<String> = self
+            .blocked
+            .keys()
+            .filter(|name| scope == "all" || name.as_str() == scope)
+            .cloned()
+            .collect();
+        for name in names {
+            self.remove_block_file(&name, cause);
+        }
+    }
+
+    /// Whether an automatic run of `profiles` is held back by a block; each
+    /// held profile is logged at most once an hour, so the hold is never silent
+    /// and never floods the log.
+    fn held_back(&mut self, profiles: &[String], run: &str) -> bool {
+        let held: Vec<(String, String)> = profiles
+            .iter()
+            .filter_map(|p| {
+                self.blocked
+                    .get(p)
+                    .map(|b| (p.clone(), b.reason().to_owned()))
+            })
+            .collect();
+        for (profile, reason) in &held {
+            let due = self
+                .suppressed_logged
+                .get(profile)
+                .is_none_or(|at| at.elapsed() >= SUPPRESSED_LOG_EVERY);
+            if due {
+                self.suppressed_logged
+                    .insert(profile.clone(), Instant::now());
+                self.log(
+                    Level::Warn,
+                    "scheduler",
+                    "routine_suppressed",
+                    format!(
+                        "profile={profile} run={run} reason={reason} clears_on=run_now_or_settings_change"
+                    ),
+                );
+            }
+        }
+        !held.is_empty()
     }
 
     fn take_id(&mut self) -> u64 {
@@ -1133,6 +1376,13 @@ impl Control {
                     );
                 }
                 _ => {}
+            }
+            if matches!(verdict, Verdict::Dispatch(_))
+                && self.held_back(std::slice::from_ref(&name), "routine")
+            {
+                // Held by a lasting block: nothing is committed, so the routine
+                // stays due and runs as soon as the block is lifted.
+                continue;
             }
             if matches!(verdict, Verdict::Dispatch(_)) && !slot_free {
                 // Not this turn: the slot is taken. Nothing is committed, so the
@@ -1365,6 +1615,7 @@ impl Control {
                         records: Vec::new(),
                         record_error: None,
                         oom_proven: None,
+                        memory_note: None,
                         last_phase: None,
                     })),
                 ));
@@ -1510,6 +1761,23 @@ impl Control {
                 {
                     push_degraded(&mut active.degraded, "profile_state");
                 }
+            }
+        }
+        if sync && !verdict.cancelled && verdict.reason == "core_oom_killed" {
+            // The profiles the core was on when it was killed: the run's own
+            // scope, or in an all-profiles run every profile it did not finish.
+            let killed: Vec<String> = if request.scope == "all" {
+                active
+                    .profiles
+                    .iter()
+                    .filter(|p| !report.records.iter().any(|r| &r.profile == *p))
+                    .cloned()
+                    .collect()
+            } else {
+                vec![request.scope.clone()]
+            };
+            for profile in killed {
+                self.block(&profile, &verdict.reason, &verdict.detail, finished);
             }
         }
         let (code, state) = match verdict.outcome {
@@ -2014,6 +2282,9 @@ impl Control {
         {
             return refusal("scope_not_found", "no profile has that name");
         }
+        // Run now is how an operator lifts a lasting block (and if the run is
+        // killed again, it records red and blocks again).
+        self.clear_blocks(&scope, "run_now");
         let duplicate = self.queue.iter().find(|r| {
             r.origin == Origin::Requested
                 && r.scope == scope
@@ -2265,6 +2536,24 @@ impl Control {
             "busy_profiles": self.active.as_ref().map(|a| a.profiles.clone()).unwrap_or_default(),
             "routines": routines,
             "index": index,
+            "lasting": self
+                .blocked
+                .iter()
+                .map(|(name, blocked)| {
+                    let value = match blocked {
+                        Blocked::Lasting(lasting) => json!({
+                            "reason": lasting.reason, "detail": lasting.detail,
+                            "since_epoch": lasting.since,
+                            "clears_on": "run_now_or_settings_change",
+                        }),
+                        Blocked::Unreadable(cause) => json!({
+                            "reason": "lasting_state_unreadable", "error": cause,
+                            "clears_on": "run_now",
+                        }),
+                    };
+                    (name.clone(), value)
+                })
+                .collect::<serde_json::Map<String, Value>>(),
             "mutations": mutations,
             "held_outcome": self.held.as_ref().map(|(name, _)| name.clone()),
             "events": self.events.iter().rev().take(32).cloned().collect::<Vec<_>>(),
@@ -2469,6 +2758,22 @@ fn rotate_generations(base: &Path, keep: usize) -> io::Result<()> {
 }
 
 /// A small package document (config or state), or `None` when absent or unreadable.
+/// `mkdir -p` with mode 0700 for a directory the daemon owns.
+fn create_private_dir(dir: &Path) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(dir)
+    }
+    #[cfg(not(unix))]
+    {
+        fs::create_dir_all(dir)
+    }
+}
+
 fn read_small(path: &Path) -> Option<Vec<u8>> {
     use std::io::Read;
     let file = fs::File::open(path).ok()?;

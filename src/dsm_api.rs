@@ -18047,6 +18047,7 @@ fn outcomes_value(paths: &PackagePaths<'_>, package_uid: u32) -> Value {
         .map(|name| profile_outcome_value(paths, package_uid, name, &run, &mut errors))
         .collect::<Vec<_>>();
     let routines = routine_outcomes_value(paths, package_uid, &mut errors);
+    let lasting = lasting_outcomes_value(paths, package_uid, &names, &mut errors);
     let cache = status_cache_health_value(paths, &names, &mut errors);
     let controller_reload = controller_reload_value(paths, package_uid, &mut errors);
     json!({
@@ -18056,9 +18057,74 @@ fn outcomes_value(paths: &PackagePaths<'_>, package_uid: u32) -> Value {
         "alerts": alerts,
         "profiles": profiles,
         "routines": routines,
+        "lasting": lasting,
         "status_cache_health": cache,
         "errors": errors.into_value(),
     })
+}
+
+/// Profiles the daemon holds after a lasting, user-fixable failure (an out-of-memory kill), from
+/// its private `state/lasting/<profile>.state`: what happened, since when, and that Run now or a
+/// change to the profile's settings or the performance level lifts it. A record that cannot be
+/// read is shown as held and unreadable, never as lifted.
+#[cfg(target_os = "linux")]
+fn lasting_outcomes_value(
+    paths: &PackagePaths<'_>,
+    package_uid: u32,
+    names: &[String],
+    errors: &mut OutcomeErrors,
+) -> Value {
+    let mut held = Vec::new();
+    for name in names {
+        let source = format!("lasting/{name}.state");
+        let document = match linux_files::read_optional_private_document(
+            &paths
+                .state_dir
+                .join("lasting")
+                .join(format!("{name}.state")),
+            package_uid,
+            4096,
+        ) {
+            Ok(Some(document)) => document,
+            Ok(None) => continue,
+            Err(_) => {
+                errors.push(&source, "unsafe_file");
+                held.push(json!({
+                    "profile": name, "reason": "lasting_state_unreadable",
+                    "error": "the record is not a private package file",
+                }));
+                continue;
+            }
+        };
+        held.push(match daemon::lasting::Lasting::parse(&document) {
+            Ok(lasting) => json!({
+                "profile": name,
+                "reason": lasting.reason,
+                "detail": sanitize_outcome_line(&lasting.detail),
+                "since_epoch": lasting.since,
+                "clears_on": "run_now_or_settings_change",
+            }),
+            Err(cause) => {
+                errors.push(&source, "malformed");
+                json!({
+                    "profile": name, "reason": "lasting_state_unreadable",
+                    "error": sanitize_outcome_line(&cause), "clears_on": "run_now",
+                })
+            }
+        });
+    }
+    Value::Array(held)
+}
+
+/// One printable line of at most 240 bytes, for text that reaches the dashboard verbatim.
+#[cfg(target_os = "linux")]
+fn sanitize_outcome_line(text: &str) -> String {
+    let mut line: String = text
+        .chars()
+        .map(|c| if (' '..='~').contains(&c) { c } else { ' ' })
+        .collect();
+    line.truncate(240);
+    line
 }
 
 /// A token-shaped value, or `None` for the writers' `none` placeholder and for an absent key.

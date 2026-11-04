@@ -16,6 +16,7 @@ pub(crate) mod control;
 pub(crate) mod ctl;
 pub(crate) mod events;
 pub(crate) mod executor;
+pub(crate) mod lasting;
 #[cfg(target_os = "linux")]
 pub(crate) mod lifecycle;
 pub(crate) mod poll;

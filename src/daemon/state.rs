@@ -1093,6 +1093,7 @@ mod tests {
                     "var/state/health",
                     "var/state/routines",
                     "var/state/profiles",
+                    "var/state/lasting",
                     "home/secrets",
                     "var/state/cache/status",
                     "var/run",
@@ -1437,6 +1438,41 @@ mod tests {
             assert_eq!(tree.outcomes()["profiles"][0]["index"], Value::Null);
         }
 
+        /// A lasting block reads back as held, with how it clears; a corrupt
+        /// record as held and unreadable, never as lifted.
+        #[test]
+        fn a_lasting_block_reads_back_through_the_bridge() {
+            let tree = Tree::new("lasting");
+            tree.private("home/config/profiles.d/photos.toml", b"");
+            tree.private("home/config/profiles.d/docs.toml", b"");
+            let lasting = super::super::super::lasting::Lasting {
+                reason: "core_oom_killed".into(),
+                detail: "killed by the out-of-memory killer; a run could use about 412 MiB".into(),
+                since: 1_700_000_100,
+                fingerprint: 7,
+            };
+            tree.private("var/state/lasting/photos.state", &lasting.render());
+            tree.private("var/state/lasting/docs.state", b"garbage\n");
+            let outcomes = tree.outcomes();
+            let held = outcomes["lasting"].as_array().unwrap();
+            let docs = held.iter().find(|h| h["profile"] == "docs").unwrap();
+            let photos = held.iter().find(|h| h["profile"] == "photos").unwrap();
+            assert_eq!(photos["reason"], "core_oom_killed", "{outcomes}");
+            assert_eq!(photos["since_epoch"], 1_700_000_100);
+            assert_eq!(photos["clears_on"], "run_now_or_settings_change");
+            assert!(photos["detail"].as_str().unwrap().contains("412 MiB"));
+            assert_eq!(docs["reason"], "lasting_state_unreadable", "{outcomes}");
+            assert!(docs["error"].as_str().unwrap().contains("first line"));
+            assert!(
+                outcomes["errors"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|e| e["source"] == "lasting/docs.state"),
+                "{outcomes}"
+            );
+        }
+
         #[test]
         fn every_run_outcome_reads_back_as_itself() {
             let tree = Tree::new("outcomes");
@@ -1462,6 +1498,20 @@ mod tests {
                     RunOutcome::Failed,
                     "core_failed",
                     json!("core_failed"),
+                ),
+                (
+                    RunStatus::Failed,
+                    137,
+                    RunOutcome::Failed,
+                    "core_oom_killed",
+                    json!("core_oom_killed"),
+                ),
+                (
+                    RunStatus::Failed,
+                    137,
+                    RunOutcome::Failed,
+                    "core_killed",
+                    json!("core_killed"),
                 ),
                 (
                     RunStatus::Failed,

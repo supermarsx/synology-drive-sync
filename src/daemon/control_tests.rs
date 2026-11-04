@@ -25,6 +25,8 @@ struct World {
     launched: Vec<RunSpec>,
     running: usize,
     max_running: usize,
+    /// A 137 exit reports the cgroup's OOM counter as moved.
+    oom_proven: bool,
 }
 
 struct FakeLauncher {
@@ -73,7 +75,11 @@ impl Launcher for FakeLauncher {
                 }
                 Err(_) => (plan.exit, Ending::Exited),
             };
-            world.lock().unwrap().running -= 1;
+            let oom = {
+                let mut world = world.lock().unwrap();
+                world.running -= 1;
+                world.oom_proven && exit == 137
+            };
             sink(ExecEvent::Finished(Box::new(RunReport {
                 exit,
                 ending,
@@ -84,7 +90,8 @@ impl Launcher for FakeLauncher {
                 },
                 records: Vec::new(),
                 record_error: None,
-                oom_proven: None,
+                oom_proven: oom.then_some(true),
+                memory_note: None,
                 last_phase: None,
             })));
         });
@@ -751,6 +758,233 @@ fn the_performance_level_sets_the_core_nice_value() {
     assert_eq!(performance_nice(Some(b"level=gentle\n")), 19);
     assert_eq!(performance_nice(Some(b"level=turbo\n")), 10);
     assert_eq!(performance_nice(None), 10);
+}
+
+// ------------------------------------------------------------ lasting blocks
+
+const ALPHA_FRAGMENT: &str = "source = \"/volume1/alpha\"\nmax-delete = 100\n";
+
+/// A block record for `alpha` tied to its current settings.
+fn plant_block(var: &Path) {
+    let lasting = super::super::lasting::Lasting {
+        reason: "core_oom_killed".into(),
+        detail: "the sync core was killed by the out-of-memory killer (exit 137)".into(),
+        since: T0 - 100,
+        fingerprint: super::super::lasting::fingerprint(Some(ALPHA_FRAGMENT.as_bytes()), None),
+    };
+    fs::create_dir_all(var.join("state/lasting")).unwrap();
+    fs::write(var.join("state/lasting/alpha.state"), lasting.render()).unwrap();
+}
+
+/// An interval routine of `alpha` that is already due.
+fn due_alpha(home: &Path, var: &Path) {
+    profile(home, "alpha");
+    routine(
+        home,
+        "alpha",
+        "enabled=true\nmode=interval\ninterval_seconds=60\n",
+    );
+    fs::write(
+        var.join("state/routines/alpha.state"),
+        format!("next_run_epoch={}\n", T0 - 5),
+    )
+    .unwrap();
+}
+
+fn suppressed_logs(h: &Harness) -> usize {
+    h.logs()
+        .iter()
+        .filter(|l| l.starts_with("routine_suppressed profile=alpha"))
+        .count()
+}
+
+/// A block survives a restart: the due routine is held, said once (not every
+/// turn), and `ctl status` names it with how it clears.
+#[test]
+fn a_lasting_block_holds_the_routine_across_a_restart() {
+    let h = Harness::new("lasting-restart", |home, var| {
+        due_alpha(home, var);
+        plant_block(var);
+    });
+    h.wait_for("the hold", Duration::from_secs(5), |h| {
+        suppressed_logs(h) == 1
+    });
+    h.advance(1);
+    h.advance(1);
+    thread::sleep(Duration::from_millis(300));
+    assert_eq!(h.launched(), 0, "a held routine ran");
+    assert_eq!(suppressed_logs(&h), 1, "held once an hour, not every turn");
+    let status = h.ask(Request::Status);
+    assert_eq!(
+        status["lasting"]["alpha"]["reason"], "core_oom_killed",
+        "{status}"
+    );
+    assert_eq!(
+        status["lasting"]["alpha"]["clears_on"],
+        "run_now_or_settings_change"
+    );
+}
+
+/// A save that changes nothing keeps the block; a real change lifts it.
+#[test]
+fn a_no_op_save_keeps_the_block_and_a_real_change_lifts_it() {
+    let h = Harness::new("lasting-save", |home, var| {
+        due_alpha(home, var);
+        plant_block(var);
+    });
+    let fragment = h.root.join("home/config/profiles.d/alpha.toml");
+    h.wait_for("the hold", Duration::from_secs(5), |h| {
+        suppressed_logs(h) == 1
+    });
+    fs::write(&fragment, ALPHA_FRAGMENT).unwrap();
+    let _ = h.ask(Request::Reload);
+    assert_eq!(
+        h.ask(Request::Status)["lasting"]["alpha"]["reason"],
+        "core_oom_killed"
+    );
+    assert!(h.var.join("state/lasting/alpha.state").exists());
+    fs::write(&fragment, "source = \"/volume1/alpha\"\nmax-delete = 50\n").unwrap();
+    let _ = h.ask(Request::Reload);
+    h.wait_for("the run", Duration::from_secs(5), |h| h.launched() == 1);
+    assert!(!h.var.join("state/lasting/alpha.state").exists());
+    assert!(
+        h.logs()
+            .iter()
+            .any(|l| l == "lasting_cleared profile=alpha cause=settings_changed"),
+        "{:?}",
+        h.logs()
+    );
+}
+
+/// Run now lifts the block and runs; killed again, it records red and blocks
+/// again, and the routine is held once more.
+#[test]
+fn run_now_lifts_the_block_and_a_second_kill_blocks_again() {
+    let h = Harness::new("lasting-run-now", |home, var| {
+        due_alpha(home, var);
+        plant_block(var);
+    });
+    h.wait_for("the hold", Duration::from_secs(5), |h| {
+        suppressed_logs(h) == 1
+    });
+    *h.plan.lock().unwrap() = Plan {
+        finish_after: Some(Duration::from_millis(30)),
+        exit: 137,
+        stop_takes: Duration::ZERO,
+    };
+    h.world.lock().unwrap().oom_proven = true;
+    assert_eq!(h.ask(run("alpha"))["ok"], true);
+    h.wait_for("the run", Duration::from_secs(5), |h| h.launched() >= 1);
+    h.wait_for("idle", Duration::from_secs(5), Harness::idle);
+    assert_eq!(h.launched(), 1, "only Run now ran: the routine stayed held");
+    let profile = h.state("profiles/alpha.state");
+    assert!(
+        profile.contains("state=failed\n") && profile.contains("reason=core_oom_killed\n"),
+        "{profile}"
+    );
+    assert!(h.var.join("state/lasting/alpha.state").exists());
+    let logs = h.logs();
+    assert!(
+        logs.iter()
+            .any(|l| l == "lasting_cleared profile=alpha cause=run_now")
+            && logs
+                .iter()
+                .any(|l| l.starts_with("lasting_blocked profile=alpha reason=core_oom_killed")),
+        "{logs:?}"
+    );
+    h.advance(120);
+    thread::sleep(Duration::from_millis(300));
+    assert_eq!(h.launched(), 1, "blocked again after the second kill");
+}
+
+/// A removed profile takes its block with it.
+#[test]
+fn a_removed_profile_takes_its_block_with_it() {
+    let h = Harness::new("lasting-removed", |home, var| {
+        due_alpha(home, var);
+        plant_block(var);
+    });
+    h.wait_for("the hold", Duration::from_secs(5), |h| {
+        suppressed_logs(h) == 1
+    });
+    fs::remove_file(h.root.join("home/config/profiles.d/alpha.toml")).unwrap();
+    let _ = h.ask(Request::Reload);
+    assert!(!h.var.join("state/lasting/alpha.state").exists());
+    assert_eq!(h.ask(Request::Status)["lasting"], json!({}));
+    assert!(
+        h.logs()
+            .iter()
+            .any(|l| l == "lasting_cleared profile=alpha cause=profile_removed")
+    );
+}
+
+/// A corrupt record is named and still holds: never read as lifted.
+#[test]
+fn a_corrupt_block_record_is_named_and_still_holds() {
+    let h = Harness::new("lasting-corrupt", |home, var| {
+        due_alpha(home, var);
+        fs::create_dir_all(var.join("state/lasting")).unwrap();
+        fs::write(var.join("state/lasting/alpha.state"), "garbage\n").unwrap();
+    });
+    h.wait_for("the hold", Duration::from_secs(5), |h| {
+        suppressed_logs(h) == 1
+    });
+    assert_eq!(h.launched(), 0);
+    let status = h.ask(Request::Status);
+    assert_eq!(
+        status["lasting"]["alpha"]["reason"], "lasting_state_unreadable",
+        "{status}"
+    );
+    assert!(
+        status["lasting"]["alpha"]["error"]
+            .as_str()
+            .is_some_and(|e| e.contains("alpha.state") && e.contains("first line")),
+        "{status}"
+    );
+    let named = h
+        .logs()
+        .iter()
+        .filter(|l| l.starts_with("lasting_state_unreadable profile=alpha"))
+        .count();
+    assert_eq!(named, 1, "named once, not every turn");
+    // Run now still lifts it.
+    assert_eq!(h.ask(run("alpha"))["ok"], true);
+    h.wait_for("the run", Duration::from_secs(5), |h| h.launched() == 1);
+    assert!(!h.var.join("state/lasting/alpha.state").exists());
+}
+
+/// An OOM kill of a routine run blocks it: no retry is scheduled.
+#[test]
+fn an_oom_killed_routine_run_blocks_instead_of_retrying() {
+    let h = Harness::new("lasting-oom", due_alpha);
+    *h.plan.lock().unwrap() = Plan {
+        finish_after: Some(Duration::from_millis(30)),
+        exit: 137,
+        stop_takes: Duration::ZERO,
+    };
+    h.world.lock().unwrap().oom_proven = true;
+    h.wait_for("the run", Duration::from_secs(5), |h| h.launched() == 1);
+    h.wait_for("the block", Duration::from_secs(5), |h| {
+        h.var.join("state/lasting/alpha.state").exists()
+    });
+    h.wait_for("the routine record", Duration::from_secs(5), |h| {
+        h.state("routines/alpha.state").contains(
+            "last_reason=core_oom_killed
+",
+        )
+    });
+    let routine = h.state("routines/alpha.state");
+    assert!(
+        routine.contains("retry_attempt=0\n") && routine.contains("last_reason=core_oom_killed\n"),
+        "{routine}"
+    );
+    h.advance(3600);
+    thread::sleep(Duration::from_millis(300));
+    assert_eq!(
+        h.launched(),
+        1,
+        "no automatic re-run walked into the kill again"
+    );
 }
 
 /// The generation of the newest arming of `routine` the fake source saw.

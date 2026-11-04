@@ -134,6 +134,9 @@ pub(crate) struct RunReport {
     pub(crate) record_error: Option<String>,
     /// For an exit 137 the daemon did not cause: did the cgroup OOM counter move?
     pub(crate) oom_proven: Option<bool>,
+    /// For an exit 137 the daemon did not cause: the memory a run could use
+    /// when it was killed (the core's own budget probe), named in the detail.
+    pub(crate) memory_note: Option<String>,
     /// The progress phase last seen in the progress record, if any.
     pub(crate) last_phase: Option<String>,
 }
@@ -379,17 +382,28 @@ pub(crate) fn classify(report: &RunReport) -> Verdict {
             false,
         ),
         137 => {
-            let named = if cause.starts_with("error:") || cause.starts_with("Error:") {
+            // Named as a kill, never as an ordinary core failure (the runner's
+            // reasons): `core_oom_killed` when this cgroup's OOM counter moved,
+            // `core_killed` when nothing proves who sent the SIGKILL.
+            let proven = report.oom_proven == Some(true);
+            let mut named = if cause.starts_with("error:") || cause.starts_with("Error:") {
                 cause
-            } else if report.oom_proven == Some(true) {
+            } else if proven {
                 "the sync core was killed by the out-of-memory killer (exit 137); the source may hold more entries than this NAS has memory for".into()
             } else {
                 "the sync core was killed (SIGKILL, exit 137) without reporting an error; out of memory? check the DSM system log for the OOM killer".into()
             };
+            if let Some(note) = &report.memory_note {
+                named = format!("{named}; {note}");
+            }
             verdict(
                 RunStatus::Failed,
                 RunOutcome::Failed,
-                "core_failed",
+                if proven {
+                    "core_oom_killed"
+                } else {
+                    "core_killed"
+                },
                 named,
                 false,
                 true,
@@ -518,6 +532,24 @@ mod process {
             .map(str::to_owned)
     }
 
+    /// What a run could use when it was killed: the core's own budget probe
+    /// (the tighter of the cgroup's headroom and `MemAvailable`), read now.
+    fn memory_note() -> String {
+        match synology_drive_sync::memory_budget::probe(None) {
+            Ok(probe) => format!(
+                "a run could use about {} MiB ({})",
+                probe.available / (1024 * 1024),
+                match probe.source {
+                    synology_drive_sync::memory_budget::BudgetSource::Operator => "operator budget",
+                    synology_drive_sync::memory_budget::BudgetSource::Kernel => {
+                        "cgroup headroom and MemAvailable"
+                    }
+                }
+            ),
+            Err(cause) => format!("the memory a run could use is unknown ({cause})"),
+        }
+    }
+
     /// The kernel's OOM-kill counter for this process's cgroup (v2
     /// `memory.events`, else v1 `memory.oom_control`), as `runner_oom_kill_count`.
     pub(crate) fn oom_kill_count() -> Option<u64> {
@@ -598,6 +630,7 @@ mod process {
                 records,
                 record_error,
                 oom_proven: oom,
+                memory_note: (exit == 137).then(memory_note),
                 last_phase: phase,
             })));
         };
@@ -1020,8 +1053,13 @@ mod process {
             let (report, _) = finish(&events, Duration::from_secs(10));
             assert_eq!(report.exit, 137);
             let verdict = classify(&report);
-            assert_eq!(verdict.reason, "core_failed");
+            // No OOM counter moved in a test container: a plain kill, named.
+            assert_eq!(verdict.reason, "core_killed");
             assert!(verdict.detail.contains("exit 137"), "{}", verdict.detail);
+            assert!(
+                report.memory_note.is_some(),
+                "a 137 names the memory a run had"
+            );
             assert!(!verdict.cancelled);
         }
 
@@ -1118,6 +1156,7 @@ mod tests {
             records: Vec::new(),
             record_error: None,
             oom_proven: None,
+            memory_note: None,
             last_phase: None,
         }
     }
@@ -1166,7 +1205,7 @@ mod tests {
                 137,
                 RunStatus::Failed,
                 RunOutcome::Failed,
-                "core_failed",
+                "core_killed",
                 false,
             ),
         ];
@@ -1189,10 +1228,26 @@ mod tests {
     fn an_oom_kill_is_named_when_the_counter_proves_it() {
         let mut r = report(137, Ending::Exited, "");
         r.oom_proven = Some(true);
-        assert!(classify(&r).detail.contains("out-of-memory killer"));
-        // The core's own error line wins over the guess.
+        r.memory_note = Some("a run could use about 412 MiB (kernel)".into());
+        let v = classify(&r);
+        assert_eq!(v.reason, "core_oom_killed");
+        assert!(v.detail.contains("out-of-memory killer"), "{}", v.detail);
+        assert!(
+            v.detail
+                .ends_with("; a run could use about 412 MiB (kernel)"),
+            "{}",
+            v.detail
+        );
+        // Unproven: a plain kill, named as one, never `core_failed`.
+        r.oom_proven = None;
+        assert_eq!(classify(&r).reason, "core_killed");
+        // The core's own error line wins over the guess for the detail.
         let r = report(137, Ending::Exited, "error: disk full\n");
-        assert_eq!(classify(&r).detail, "error: disk full");
+        let v = classify(&r);
+        assert_eq!(
+            (v.reason.as_str(), v.detail.as_str()),
+            ("core_killed", "error: disk full")
+        );
     }
 
     #[test]
