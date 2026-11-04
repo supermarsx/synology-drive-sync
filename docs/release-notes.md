@@ -86,6 +86,54 @@ lists its own commits.
 - **Log rotation by the daemon takes the shell's `event-log.lock`.** A rotation that cannot be made
   keeps the line and writes `var/state/log-rotation.failed`.
 
+### Daemon fixes from the integration review
+
+- **A crash can no longer wedge start or stop.**
+  - `run.lock/` never holds anything but `pid`, not even for an instant.
+  - `daemon.pid` names the daemon by PID, start time and boot id.
+  - A start that fails once it holds `daemon.lock` (including a `daemon.ready` it cannot write) is
+    named `service_start_failed` and removes its records.
+  - The supervisor publishes `supervisor.pid` and, when it gives up, removes the dead daemon's
+    records (`service_records_removed`).
+  - `--launch-daemon` stops the supervisor it started when the daemon is not ready, and shows the
+    daemon's last stderr line, which `log/daemon-stderr.log` keeps (1 MiB, shown in the controller
+    logs).
+  - A daemon waits out the lifecycle's own `daemon.lock` probe instead of exiting.
+- **No log line waits on `event-log.lock`.** An empty lock directory is free; a dead or torn owner
+  is cleared; a live one skips the rotation for a minute. Each case is named
+  (`event_log_rotation_failed`, `event_log_lock_stale`).
+- **The dashboard queue never waits forever.**
+  - A failing audit reconcile is named once and backed off. Waiting jobs are answered
+    `audit_unavailable` after 30 s, a new named failure with its own dashboard guidance.
+  - A worker that outlives KILL frees its lane (`consumer_unkillable`).
+  - Workers' stderr reaches `controller.log` (`consumer_stderr`).
+- **An unreadable configuration file is named, not read as absent.**
+  - It is named `config_unreadable` with its path and cause, and the last good configuration stays
+    in force.
+  - An unreadable routine conf no longer disarms realtime, and an unreadable `routines.d` no longer
+    reads as no routines.
+  - An unreadable routine state is held, not reset.
+- **A realtime source too large to walk within 2 minutes is still synced.**
+  - The walk and arm deadlines grow, named (`walk_deadline_exceeded`), up to 30 minutes.
+  - Meanwhile the routine stays amber (`watch_setup_failed`) and the whole tree is synced at most
+    once per poll interval, at most hourly.
+  - A disarmed routine's walk ends at once, and all walks share one cap of 16.
+- **The control socket keeps room for `ping` and `status`.**
+  - One deadline covers a whole request.
+  - Long verbs (`wait`, `mutate`, `stop`) are limited to 16 of 32 connections.
+  - A client's connect is bounded.
+  - Accept failures are named and backed off.
+- **Runs:**
+  - An all-profiles run passes the core the profiles its `run.scope` lists, not `--all-profiles`.
+  - The watchdog reads the core's progress record, which socket I/O does not bypass.
+  - A cancel or stop that arrives before the core starts keeps it from starting.
+  - `run.lock` is published and removed on the bounded state writer.
+- **The API service:**
+  - A server killed before it activated `api.sock` no longer blocks every restart
+    (`api_socket_stale_removed`).
+  - Readiness no longer connects (that connect was logged as a failed request).
+  - An API child that cannot be waited for is KILLed and reaped before a restart.
+
 ## Read this before upgrading
 
 - **Rust 1.90 or newer is needed to build from source** (was 1.88). The verified-pair index uses redb

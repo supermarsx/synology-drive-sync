@@ -126,7 +126,13 @@ watchers. A source with more directories than that is not watched at all: the ro
 Overview as an amber item, and is polled meanwhile. Raising the limit needs root and is optional; see
 [Raising the inotify watch limit](troubleshooting.md#raising-the-inotify-watch-limit). The setup walk that arms the
 watches has a 120-second deadline; if a directory (a hibernating disk, a hung mount) holds it up the
-watcher gives up and names that directory (`watch_setup_failed`, `deadline=120s`). If the kernel drops
+watcher gives up and names that directory (`watch_setup_failed`, `deadline=120s`). Under the daemon
+engine a tree that is simply too large to walk in time is not left unobserved. The arm deadline and
+the polling walk's deadline double on each attempt, up to 30 minutes, and the backend detail names
+the growth (`walk_deadline_exceeded … next_walk_deadline_seconds=N`). While no walk finishes, the
+routine stays amber (`watch_setup_failed`) and the whole tree is synced at most once per poll
+interval, and at most hourly. Disarming a routine ends its walk at once, and the process keeps at
+most 16 walks blocked in the filesystem. If the kernel drops
 events (`IN_Q_OVERFLOW`), the watcher re-walks the tree to restore its watches and reports that the whole
 tree must be treated as changed, so a run is triggered. The watcher keeps about 6 MiB of
 memory at 20,000 directories and about 16 MiB at 100,000. A directory created while watching is added to
