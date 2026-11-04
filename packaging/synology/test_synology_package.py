@@ -23396,6 +23396,8 @@ fi
             "config_forgotten", "service_degraded", "service_degraded_cleared",
             "api_server_respawn_held", "api_server_respawn_released",
             "api_server_identity_unavailable", "daemon_lock_probe", "routine_watch_pid_mismatch",
+            "ctl_peer_gone", "ctl_peer_unchecked", "ctl_reply_dropped", "ctl_socket_option_failed",
+            "routine_backend", "service_stop_forced",
         ]
         helper = self.root / "daemon-events-helper.sh"
         helper.write_text(
