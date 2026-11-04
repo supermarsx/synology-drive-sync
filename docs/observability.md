@@ -448,8 +448,10 @@ Two breakers turn a share-wide condition into one named failure instead of a wal
   path named, rather than red; a small first run that is mostly refused still fails. The breaker
   settles each write once and is checked after every settlement, after the folder phase (so it can
   trip before any upload) and before mirror deletions; writes beneath a refused folder are counted
-  neither way. It never runs in `plan`. Every refused path stays in `result.deferred` as
-  `remote-refused`. A `105` counts only once the session is proven alive.
+  neither way. With `--jobs` above 1 the verdict is taken by the worker that receives the deciding
+  refusal, before any worker starts another upload: at most one request per other worker is already in
+  flight, and the rest of the queue is counted as not attempted. It never runs in `plan`. Every
+  refused path stays in `result.deferred` as `remote-refused`. A `105` counts only once the session is proven alive.
 - **Link boundaries.** Right after the remote walk (and again after the reconciliation walk), when at
   least three **folders**, or at least three **files**, look like links and they are more than half of
   that kind which the guard actually checked, the run fails with a message starting

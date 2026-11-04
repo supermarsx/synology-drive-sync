@@ -95,6 +95,10 @@ lists its own commits.
 - Status rows beneath a NAS link or mount point read `excluded`, not `missing-remote`.
 - A share-wide refusal failure names at most ten paths and then "and N more"; every refused path
   stays in `result.deferred`.
+- With `--jobs` above 1, a tripped refusal breaker stops new uploads on every worker at once: the run
+  sends at most the refusals that trip it plus one request per other worker, however slow the
+  progress output is. Before, a stalled reader of that output could let workers send most of the queue
+  to a share already known to refuse it.
 
 ## Transfers and the network
 
