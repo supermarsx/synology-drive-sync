@@ -3088,6 +3088,16 @@ append_rotating_log() {
     return "$append_status"
 }
 
+# 0 when $1 is well-formed UTF-8 -- the bytes Rust's str::from_utf8 accepts:
+# shortest forms only, no surrogates, nothing above U+10FFFF. A single-line
+# value (the callers have refused control bytes already). grep -E in the C
+# locale on literal byte ranges, built with printf's octal escapes, so it needs
+# neither iconv(1) nor a UTF-8 locale and behaves the same under BusyBox.
+valid_utf8() {
+    valid_utf8_pattern=$(printf '^([^\200-\377]|[\302-\337][\200-\277]|\340[\240-\277][\200-\277]|[\341-\354\356\357][\200-\277][\200-\277]|\355[\200-\237][\200-\277]|\360[\220-\277][\200-\277][\200-\277]|[\361-\363][\200-\277][\200-\277][\200-\277]|\364[\200-\217][\200-\277][\200-\277])*$')
+    printf '%s\n' "${1:-}" | LC_ALL=C grep -E -q -- "$valid_utf8_pattern"
+}
+
 json_quote() {
     # All package-authored configuration rejects newlines and control bytes, but
     # logs can still contain them.  Keep this encoder self-contained so the DSM

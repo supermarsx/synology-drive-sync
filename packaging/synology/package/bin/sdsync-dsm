@@ -4450,10 +4450,13 @@ api_snapshot() {
     controller_degraded_json=
     if [ -n "$controller_degraded$controller_degraded_since$controller_degraded_cause" ]; then
         case $controller_degraded in ''|*[!a-z_]*) api_error corrupt_state "invalid controller degraded reason" 73 ;; esac
-        case $controller_degraded_since in ''|*[!0-9]*) api_error corrupt_state "invalid controller degraded_since" 73 ;; esac
+        # A JSON number has no leading zeros (007 would make the document
+        # invalid), and the in-process rung refuses both of these, so this one does.
+        case $controller_degraded_since in ''|*[!0-9]*|0[0-9]*) api_error corrupt_state "invalid controller degraded_since" 73 ;; esac
         [ -n "$controller_degraded_cause" ] || api_error corrupt_state "controller degraded_cause is missing or empty" 73
         controller_degraded_cause_bytes=$(printf '%s' "$controller_degraded_cause" | wc -c | tr -d ' ')
         [ "$controller_degraded_cause_bytes" -le 512 ] || api_error corrupt_state "controller degraded_cause exceeds its safe bound" 73
+        valid_utf8 "$controller_degraded_cause" || api_error corrupt_state "controller degraded_cause is not valid UTF-8" 73
         controller_degraded_json=$(printf ',"degraded":{"reason":%s,"since_epoch":%s,"cause":%s}' \
             "$(json_quote "$controller_degraded")" "$controller_degraded_since" "$(json_quote "$controller_degraded_cause")")
     fi

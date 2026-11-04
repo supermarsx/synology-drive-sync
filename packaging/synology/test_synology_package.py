@@ -4185,8 +4185,10 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
         controller_state = self.real_var / "state/controller.state"
         base = "state=running\npid=111\nnext_run_epoch=0\nactive_pid=0\nupdated_epoch=100\n"
 
-        def write(extra: str) -> None:
-            controller_state.write_text(base + extra, encoding="utf-8")
+        def write(extra: str | bytes) -> None:
+            controller_state.write_bytes(
+                base.encode("utf-8") + (extra if isinstance(extra, bytes) else extra.encode("utf-8"))
+            )
             controller_state.chmod(0o600)
             if os.getuid() == 0:
                 os.chown(controller_state, self.drop_uid, self.drop_gid)
@@ -4218,6 +4220,12 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
         quoted, quoted_payload = self.api("snapshot")
         self.assertEqual(quoted.returncode, 0, quoted.stdout + quoted.stderr)
         self.assertEqual(quoted_payload["controller"]["degraded"]["cause"], 'say "quote" and \\back')
+        # Well-formed UTF-8 of every width, and a since of exactly 0, are served.
+        write("degraded=audit_unavailable\ndegraded_since=0\ndegraded_cause=caf\u00e9 \u20ac \U0001f600\n")
+        wide, wide_payload = self.api("snapshot")
+        self.assertEqual(wide.returncode, 0, wide.stdout + wide.stderr)
+        self.assertEqual(wide_payload["controller"]["degraded"]["cause"], "caf\u00e9 \u20ac \U0001f600")
+        self.assertEqual(wide_payload["controller"]["degraded"]["since_epoch"], 0)
         malformed = {
             "a partial set": "degraded=audit_unavailable\n",
             "a cause without a reason": "degraded_since=90\ndegraded_cause=x\n",
@@ -4226,6 +4234,14 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
             "a non-numeric since": "degraded=audit_unavailable\ndegraded_since=soon\ndegraded_cause=x\n",
             "a cause over 512 bytes": "degraded=audit_unavailable\ndegraded_since=90\ndegraded_cause=" + "x" * 513 + "\n",
             "a duplicated reason": "degraded=a\ndegraded=b\ndegraded_since=90\ndegraded_cause=x\n",
+            # S3-20. The in-process rung refuses these; the shell served them
+            # (007 as invalid JSON, the bytes as a document that is not UTF-8).
+            "a since with leading zeros": "degraded=audit_unavailable\ndegraded_since=007\ndegraded_cause=x\n",
+            "a since of all zeros": "degraded=audit_unavailable\ndegraded_since=00\ndegraded_cause=x\n",
+            "a cause that is not UTF-8": b"degraded=audit_unavailable\ndegraded_since=90\ndegraded_cause=bad \xff\xfe bytes\n",
+            "a cause with an overlong encoding": b"degraded=audit_unavailable\ndegraded_since=90\ndegraded_cause=x\xc0\x80\n",
+            "a cause with a surrogate": b"degraded=audit_unavailable\ndegraded_since=90\ndegraded_cause=x\xed\xa0\x80\n",
+            "a cause cut inside a character": b"degraded=audit_unavailable\ndegraded_since=90\ndegraded_cause=x\xe2\x82\n",
         }
         for label, extra in malformed.items():
             with self.subTest(malformed=label):
