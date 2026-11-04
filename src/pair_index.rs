@@ -908,6 +908,7 @@ impl EvidenceSource for IndexSession {
                 remote: remote_relative.clone(),
                 md5: stored.record.md5,
                 remote_too: self.signal == RemoteSignal::Ctime,
+                nas_clock: stored.record.verified_at_nas,
             });
         }
         self.backend.finish_reads();
