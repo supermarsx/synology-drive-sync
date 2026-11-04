@@ -1209,7 +1209,16 @@ lock_file_probe() {
     lock_probe_status=0
     if command -v flock >/dev/null 2>&1; then
         lock_probe_tool=flock
-        lock_probe_output=$({ { $lock_probe_limit flock -n 8; } 8< "$lock_probe_path"; } 2>&1) || lock_probe_status=$?
+        if [ -n "$lock_probe_limit" ]; then
+            # The file is opened by the shell that timeout(1) starts, and flock
+            # replaces that shell, so the limit covers the open as well and no
+            # descriptor on the lock outlives flock: a BusyBox timeout leaves a
+            # five-second timer process behind, which would otherwise keep the
+            # lock it inherited held.
+            lock_probe_output=$($lock_probe_limit sh -c 'exec flock -n 8 8< "$1"' sh "$lock_probe_path" 2>&1) || lock_probe_status=$?
+        else
+            lock_probe_output=$({ { flock -n 8; } 8< "$lock_probe_path"; } 2>&1) || lock_probe_status=$?
+        fi
         daemon_lock_probe_announce flock
         case $lock_probe_status in
             0) return 1 ;;
