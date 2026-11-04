@@ -27,7 +27,7 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, UNIX_EPOCH};
 
-use synology_drive_sync::watch::{Filter, WatchError, profile_excludes};
+use synology_drive_sync::watch::{Filter, WalkSlot, WatchError, profile_excludes};
 
 use super::changes::{ArmSpec, ChangeEvent, ChangeSink, ChangeSource};
 use super::poll::{PollConfig, SharedCarry, new_carry, spawn_poller};
@@ -62,6 +62,11 @@ pub(crate) struct WatchSettings {
     /// How soon an arm that was refused by the process-wide walk cap is tried
     /// again (a crowd of routines arming together, not a broken tree).
     pub(crate) walk_cap_retry: Duration,
+    /// How long the start-up catch-up waits, retrying, for a place under the
+    /// process-wide walk cap before it gives up and syncs the tree whole (S3-13).
+    /// A crowd of routines starting together takes turns; a cap held by walks
+    /// abandoned on a stalled disk never frees, and unknown is not unchanged.
+    pub(crate) catch_up_cap_wait: Duration,
 }
 
 impl Default for WatchSettings {
@@ -78,6 +83,7 @@ impl Default for WatchSettings {
             floor_max: Duration::from_secs(3600),
             degraded_min: Duration::from_secs(15 * 60),
             walk_cap_retry: Duration::from_secs(15),
+            catch_up_cap_wait: Duration::from_secs(600),
         }
     }
 }
@@ -109,6 +115,8 @@ impl ChangeSource for WatchSource {
             sink: Arc::clone(&self.sink),
             settings: self.settings.clone(),
             carry: new_carry(),
+            armed: AtomicBool::new(false),
+            slot: real_slot(),
         };
         let spawned = thread::Builder::new()
             .name(format!("sdsyncd-watch-{}", spec.routine))
@@ -156,6 +164,72 @@ struct Worker {
     /// What the pollers of this arming hand to each other (N-D6): `poll_for`
     /// builds a new poller on every native retry.
     carry: SharedCarry,
+    /// Set by a native attempt that armed its watch, however it ended: a cap
+    /// episode that follows a successful arm is a new episode (S3-13).
+    armed: AtomicBool,
+    /// Where the arm-time walk takes its place under the process-wide cap
+    /// (tests refuse it without holding the real, process-wide places).
+    slot: SlotSource,
+}
+
+/// Where a walk takes its place under the process-wide walk cap.
+type SlotSource = Arc<dyn Fn() -> Result<WalkSlot, usize> + Send + Sync>;
+
+fn real_slot() -> SlotSource {
+    Arc::new(synology_drive_sync::watch::walk_slot)
+}
+
+/// How one try of the catch-up ended (S3-13).
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+enum CatchUp {
+    /// Settled: nothing to sync, or the whole-tree sync was asked for.
+    Done,
+    /// The routine was disarmed, or the control thread is gone.
+    Stopped,
+    /// The process-wide walk cap had no place for the walk: ask again.
+    Capped,
+}
+
+impl CatchUp {
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    fn of(alive: bool) -> Self {
+        if alive { Self::Done } else { Self::Stopped }
+    }
+}
+
+/// What a catch-up turn means for the native loop.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+enum Turn {
+    Done,
+    Waiting,
+    Stopped,
+}
+
+/// A catch-up the walk cap keeps refusing (S3-13).
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+struct CatchUpWait {
+    since: std::time::Instant,
+    next: std::time::Instant,
+    asks: u32,
+    /// The deferral has been named.
+    deferred: bool,
+}
+
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+impl CatchUpWait {
+    fn new() -> Self {
+        let now = std::time::Instant::now();
+        Self {
+            since: now,
+            next: now,
+            asks: 0,
+            deferred: false,
+        }
+    }
+
+    fn due(&self) -> bool {
+        std::time::Instant::now() >= self.next
+    }
 }
 
 /// How one native attempt ended.
@@ -238,16 +312,25 @@ impl Worker {
             if self.stopped() {
                 return;
             }
+            // S3-13: an attempt that armed its watch ended whatever came
+            // before it; a cap refusal after it is a new episode.
+            if self.armed.swap(false, Ordering::SeqCst) {
+                cap_reported = false;
+            }
             if matches!(failure, WatchError::WalkCap { .. }) {
                 // The process-wide walk cap is a transient crowd, not a verdict
                 // on this tree: say so once, and retry soon rather than after
-                // the long polling backoff.
+                // the long polling backoff. No poller runs during the episode
+                // (that is the point of retrying soon), so the routine is not
+                // reported as polling (S3-13): nothing observes it until an
+                // arm walk is admitted.
                 if !std::mem::replace(&mut cap_reported, true)
                     && !self.backend(
-                        Backend::Polling,
+                        Backend::None,
                         BackendReason::WatchSetupFailed,
                         format!(
-                            "{failure}; retrying every {} s",
+                            "{failure}; retrying every {} s; nothing is watching or polling \
+                             this tree until a walk is admitted",
                             self.settings.walk_cap_retry.as_secs()
                         ),
                     )
@@ -338,6 +421,9 @@ impl Worker {
             Ok(tree) => tree,
             Err(error) => return Attempt::Failed(error),
         };
+        // However this attempt ends, the watch armed: a cap refusal that
+        // follows is a new episode, not a continuation of an earlier one.
+        self.armed.store(true, Ordering::SeqCst);
         if std::mem::take(source_missing)
             && !self.emit(ChangeEvent::Source {
                 routine: self.spec.routine.clone(),
@@ -357,13 +443,35 @@ impl Worker {
         if !self.backend(Backend::Inotify, BackendReason::Ok, detail) {
             return Attempt::Stopped;
         }
-        if !std::mem::replace(caught_up, true) && !self.catch_up() {
-            return Attempt::Stopped;
+        // S3-13: a catch-up walk the process-wide cap refused is asked for
+        // again between the watch's own turns, not given up as unwalkable.
+        let mut waiting = (!*caught_up).then(CatchUpWait::new);
+        if let Some(wait) = waiting.as_mut() {
+            match self.catch_up_turn(wait) {
+                Turn::Stopped => return Attempt::Stopped,
+                Turn::Done => {
+                    *caught_up = true;
+                    waiting = None;
+                }
+                Turn::Waiting => {}
+            }
         }
         let mut floor = Floor::start(self);
         loop {
             if self.stopped() {
                 return Attempt::Stopped;
+            }
+            if let Some(wait) = waiting.as_mut()
+                && wait.due()
+            {
+                match self.catch_up_turn(wait) {
+                    Turn::Stopped => return Attempt::Stopped,
+                    Turn::Done => {
+                        *caught_up = true;
+                        waiting = None;
+                    }
+                    Turn::Waiting => {}
+                }
             }
             match tree.wait(self.settings.slice) {
                 Ok(changes) => {
@@ -442,6 +550,20 @@ impl Worker {
         self.floor().max(self.settings.degraded_min)
     }
 
+    /// How long a catch-up refused by the walk cap waits before it asks again
+    /// (S3-13): the retry interval plus up to as much again, by routine name,
+    /// so routines refused together (a daemon start with more than sixteen
+    /// realtime routines) come back one after another, not all at once.
+    fn stagger(&self) -> Duration {
+        let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+        for byte in self.spec.routine.bytes() {
+            hash ^= u64::from(byte);
+            hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        let retry = self.settings.walk_cap_retry;
+        retry + retry.mul_f64((hash % 1000) as f64 / 1000.0)
+    }
+
     #[cfg(not(target_os = "linux"))]
     fn native(
         &self,
@@ -459,26 +581,29 @@ impl Worker {
     /// routine's last success is synced whole. A walk that cannot finish is
     /// named, and the tree is synced whole too: unknown is not unchanged.
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-    fn catch_up(&self) -> bool {
+    fn catch_up(&self) -> CatchUp {
         let routine = Some(self.spec.routine.clone());
         let filter = match self.filter() {
             Ok(filter) => Arc::new(filter),
             Err(error) => {
-                return self.emit(ChangeEvent::Notice {
-                    routine: self.spec.routine.clone(),
-                    warn: true,
-                    detail: format!("catch_up=whole_tree cause={error}"),
-                }) && self.emit(ChangeEvent::Overflow { routine });
+                return CatchUp::of(
+                    self.emit(ChangeEvent::Notice {
+                        routine: self.spec.routine.clone(),
+                        warn: true,
+                        detail: format!("catch_up=whole_tree cause={error}"),
+                    }) && self.emit(ChangeEvent::Overflow { routine }),
+                );
             }
         };
-        let facts = newest_change(
+        let facts = newest_change_in(
             self.spec.source.clone(),
             filter,
             self.settings.walk_deadline,
             Some(&self.stop),
+            &self.slot,
         );
         if self.stopped() {
-            return false;
+            return CatchUp::Stopped;
         }
         // S3-7: what the walk could not read is named, not passed over.
         if let Ok(facts) = &facts
@@ -493,7 +618,7 @@ impl Worker {
                 ),
             })
         {
-            return false;
+            return CatchUp::Stopped;
         }
         if let Ok(facts) = &facts
             && !facts.mounts.is_empty()
@@ -514,19 +639,21 @@ impl Worker {
                 ),
             })
         {
-            return false;
+            return CatchUp::Stopped;
         }
         let Some(since) = self.spec.last_success_epoch else {
-            return self.emit(ChangeEvent::Notice {
-                routine: self.spec.routine.clone(),
-                warn: false,
-                detail: "catch_up=whole_tree cause=no_successful_run_yet".to_owned(),
-            }) && self.emit(ChangeEvent::Overflow { routine });
+            return CatchUp::of(
+                self.emit(ChangeEvent::Notice {
+                    routine: self.spec.routine.clone(),
+                    warn: false,
+                    detail: "catch_up=whole_tree cause=no_successful_run_yet".to_owned(),
+                }) && self.emit(ChangeEvent::Overflow { routine }),
+            );
         };
         match facts.map(|facts| facts.newest) {
-            Ok(Some(newest)) if newest + 2 < since as i64 => true,
-            Ok(None) => true,
-            Ok(Some(newest)) => {
+            Ok(Some(newest)) if newest + 2 < since as i64 => CatchUp::Done,
+            Ok(None) => CatchUp::Done,
+            Ok(Some(newest)) => CatchUp::of(
                 self.emit(ChangeEvent::Notice {
                     routine: self.spec.routine.clone(),
                     warn: false,
@@ -534,14 +661,82 @@ impl Worker {
                         "catch_up=whole_tree cause=changed_while_unwatched newest={newest} \
                          last_success={since}"
                     ),
-                }) && self.emit(ChangeEvent::Overflow { routine })
-            }
-            Err(cause) => {
+                }) && self.emit(ChangeEvent::Overflow { routine }),
+            ),
+            // S3-13: the process-wide cap had no place for the walk. That says
+            // nothing about this tree, so it is not synced whole for it: the
+            // caller asks again, staggered.
+            Err(CatchUpError::WalkCap(_)) => CatchUp::Capped,
+            Err(cause) => CatchUp::of(
                 self.emit(ChangeEvent::Notice {
                     routine: self.spec.routine.clone(),
                     warn: true,
                     detail: format!("catch_up=whole_tree cause={cause}"),
-                }) && self.emit(ChangeEvent::Overflow { routine })
+                }) && self.emit(ChangeEvent::Overflow { routine }),
+            ),
+        }
+    }
+
+    /// One turn of the catch-up (S3-13). A walk the cap refused is named once
+    /// as deferred, asked for again after a stagger that differs by routine (so
+    /// routines refused together do not return together), and reported when it
+    /// goes through. After `catch_up_cap_wait` of refusals the tree is synced
+    /// whole, with the cap as the cause: a cap that never frees must not leave
+    /// the tree unchecked.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    fn catch_up_turn(&self, wait: &mut CatchUpWait) -> Turn {
+        match self.catch_up() {
+            CatchUp::Stopped => Turn::Stopped,
+            CatchUp::Done => {
+                if wait.deferred
+                    && !self.emit(ChangeEvent::Notice {
+                        routine: self.spec.routine.clone(),
+                        warn: false,
+                        detail: format!(
+                            "catch_up=resumed waited_seconds={} asks={}",
+                            wait.since.elapsed().as_secs(),
+                            wait.asks
+                        ),
+                    })
+                {
+                    return Turn::Stopped;
+                }
+                Turn::Done
+            }
+            CatchUp::Capped => {
+                wait.asks += 1;
+                let waited = wait.since.elapsed();
+                if waited >= self.settings.catch_up_cap_wait {
+                    let routine = Some(self.spec.routine.clone());
+                    let alive = self.emit(ChangeEvent::Notice {
+                        routine: self.spec.routine.clone(),
+                        warn: true,
+                        detail: format!(
+                            "catch_up=whole_tree cause=walk_cap waited_seconds={} asks={}; the \
+                             process-wide walk cap never had a place for the catch-up walk",
+                            waited.as_secs(),
+                            wait.asks
+                        ),
+                    }) && self.emit(ChangeEvent::Overflow { routine });
+                    return if alive { Turn::Done } else { Turn::Stopped };
+                }
+                if !std::mem::replace(&mut wait.deferred, true)
+                    && !self.emit(ChangeEvent::Notice {
+                        routine: self.spec.routine.clone(),
+                        warn: false,
+                        detail: format!(
+                            "catch_up=deferred cause=walk_cap retry_seconds={} \
+                             give_up_after_seconds={}; the process-wide walk cap had no place \
+                             for the walk, and the tree is not synced whole for that",
+                            self.stagger().as_secs(),
+                            self.settings.catch_up_cap_wait.as_secs()
+                        ),
+                    })
+                {
+                    return Turn::Stopped;
+                }
+                wait.next = std::time::Instant::now() + self.stagger();
+                Turn::Waiting
             }
         }
     }
@@ -845,12 +1040,41 @@ fn newest_change(
     filter: Arc<Filter>,
     deadline: Duration,
     stop: Option<&AtomicBool>,
-) -> Result<TreeFacts, String> {
-    let slot = synology_drive_sync::watch::walk_slot().map_err(|live| {
-        format!(
-            "walker_unavailable: {}",
+) -> Result<TreeFacts, CatchUpError> {
+    newest_change_in(root, filter, deadline, stop, &real_slot())
+}
+
+/// Why the arm-time walk gave no answer.
+#[derive(Debug, PartialEq, Eq)]
+enum CatchUpError {
+    /// The process-wide walk cap had no place for it (S3-13): a crowd of
+    /// routines starting together, not a verdict on this tree. The walk was
+    /// not started.
+    WalkCap(String),
+    /// The walk was started and failed, or could not be started.
+    Failed(String),
+}
+
+impl std::fmt::Display for CatchUpError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::WalkCap(cause) | Self::Failed(cause) => formatter.write_str(cause),
+        }
+    }
+}
+
+fn newest_change_in(
+    root: PathBuf,
+    filter: Arc<Filter>,
+    deadline: Duration,
+    stop: Option<&AtomicBool>,
+    take_slot: &SlotSource,
+) -> Result<TreeFacts, CatchUpError> {
+    let slot = take_slot().map_err(|live| {
+        CatchUpError::WalkCap(format!(
+            "walk_cap: {}",
             synology_drive_sync::watch::walk_cap_refusal(live)
-        )
+        ))
     })?;
     let current = Arc::new(std::sync::Mutex::new(String::new()));
     let cancel = Arc::new(AtomicBool::new(false));
@@ -863,27 +1087,31 @@ fn newest_change(
             let _slot = slot;
             let _ = tx.send(walk_newest(&root, &filter, &walker_current, &walker_cancel));
         })
-        .map_err(|error| format!("walker_unavailable: {error}"))?;
+        .map_err(|error| CatchUpError::Failed(format!("walker_unavailable: {error}")))?;
     let give_up_at = std::time::Instant::now() + deadline;
     loop {
         if stop.is_some_and(|stop| stop.load(Ordering::SeqCst)) {
             cancel.store(true, Ordering::SeqCst);
-            return Err("walk_stopped: the routine was disarmed".to_owned());
+            return Err(CatchUpError::Failed(
+                "walk_stopped: the routine was disarmed".to_owned(),
+            ));
         }
         let left = give_up_at.saturating_duration_since(std::time::Instant::now());
         if left.is_zero() {
             cancel.store(true, Ordering::SeqCst);
             let at = current.lock().map(|path| path.clone()).unwrap_or_default();
-            return Err(format!(
+            return Err(CatchUpError::Failed(format!(
                 "walk_deadline deadline={}s path={at}",
                 deadline.as_secs()
-            ));
+            )));
         }
         match rx.recv_timeout(left.min(Duration::from_millis(100))) {
-            Ok(result) => return result,
+            Ok(result) => return result.map_err(CatchUpError::Failed),
             Err(mpsc::RecvTimeoutError::Timeout) => {}
             Err(mpsc::RecvTimeoutError::Disconnected) => {
-                return Err("walker_unavailable: the walk ended without a result".to_owned());
+                return Err(CatchUpError::Failed(
+                    "walker_unavailable: the walk ended without a result".to_owned(),
+                ));
             }
         }
     }
@@ -1070,6 +1298,7 @@ mod tests {
             floor_max: Duration::from_secs(3600),
             degraded_min: Duration::from_secs(900),
             walk_cap_retry: Duration::from_millis(100),
+            catch_up_cap_wait: Duration::from_secs(5),
         }
     }
 
@@ -1205,8 +1434,9 @@ mod tests {
             .is_ok()
         );
         // A missing root is named.
-        let missing =
-            newest_change(root.join("nope"), filter, Duration::from_secs(10), None).unwrap_err();
+        let missing = newest_change(root.join("nope"), filter, Duration::from_secs(10), None)
+            .unwrap_err()
+            .to_string();
         assert!(missing.starts_with("root_unreadable"), "{missing}");
         let _ = std::fs::remove_dir_all(&root);
         let _ = std::fs::remove_dir_all(&excluded);
@@ -1254,7 +1484,7 @@ mod tests {
         );
         // Stopped before or after a (fast) walk finished: never a hang.
         if let Err(cause) = stopped {
-            assert!(cause.starts_with("walk_stopped"), "{cause}");
+            assert!(cause.to_string().starts_with("walk_stopped"), "{cause}");
         }
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -1271,6 +1501,8 @@ mod tests {
             sink,
             settings: settings(false),
             carry: new_carry(),
+            armed: AtomicBool::new(false),
+            slot: real_slot(),
         };
         let reading = |pairs: &[(&str, u64)]| Reading {
             dirs: pairs.iter().map(|(d, h)| ((*d).to_owned(), *h)).collect(),
@@ -1409,6 +1641,8 @@ mod tests {
             sink,
             settings,
             carry: new_carry(),
+            armed: AtomicBool::new(false),
+            slot: real_slot(),
         }
     }
 
@@ -1535,10 +1769,27 @@ mod tests {
             .filter(|e| matches!(e, ChangeEvent::Backend { .. }))
             .collect();
         assert_eq!(named.len(), 1, "named once per episode: {events:?}");
-        let ChangeEvent::Backend { detail, reason, .. } = named[0] else {
+        let ChangeEvent::Backend {
+            detail,
+            reason,
+            backend,
+            ..
+        } = named[0]
+        else {
             unreachable!()
         };
         assert_eq!(*reason, BackendReason::WatchSetupFailed);
+        // S3-13: no poller runs during the episode, so the routine is not
+        // reported as polling.
+        assert_eq!(
+            *backend,
+            Backend::None,
+            "nothing watches or polls while the cap refuses the arm: {detail}"
+        );
+        assert!(
+            detail.contains("nothing is watching or polling"),
+            "the detail says so: {detail}"
+        );
         assert!(
             detail.contains("process-wide cap of 16 concurrent directory walks")
                 && detail.contains("retrying every"),
@@ -1547,6 +1798,198 @@ mod tests {
         assert!(
             !detail.contains("still blocked"),
             "the cap is not a blocked filesystem: {detail}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// S3-13: `cap_reported` was reset only by a non-cap failure, so a second
+    /// cap episode after a native watch had armed went unreported.
+    #[test]
+    fn a_second_cap_episode_after_a_successful_arm_is_reported() {
+        let root = temp_tree("walk-cap-twice");
+        let (recorder, sink) = Recorder::new();
+        let worker = worker(&root, Duration::from_millis(150), sink, settings(true));
+        let stop = Arc::clone(&worker.stop);
+        let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = Arc::clone(&attempts);
+        let handle = thread::spawn(move || {
+            worker.run_with(move |worker, _, _, _| {
+                let cap = || {
+                    Attempt::Failed(WatchError::WalkCap {
+                        path: worker.spec.source.clone(),
+                        live: 16,
+                    })
+                };
+                match counted.fetch_add(1, Ordering::SeqCst) {
+                    // The first episode: refused twice.
+                    0 | 1 => cap(),
+                    // The watch armed, and a later walk of it was refused.
+                    2 => {
+                        worker.armed.store(true, Ordering::SeqCst);
+                        cap()
+                    }
+                    3 => cap(),
+                    _ => {
+                        stop.store(true, Ordering::SeqCst);
+                        Attempt::Stopped
+                    }
+                }
+            });
+        });
+        handle.join().unwrap();
+        let events = recorder.events.lock().unwrap();
+        let reports = events
+            .iter()
+            .filter(|(_, e)| matches!(e, ChangeEvent::Backend { .. }))
+            .count();
+        assert_eq!(
+            reports, 2,
+            "one report per cap episode, and the arm in between ended the first: {events:?}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A walk-place source that refuses the first `refusals` requests (as the
+    /// process-wide cap does while other routines walk) and then takes a real
+    /// place. The real places are never held, so other tests are not starved.
+    fn refusing_slots(refusals: usize, asked: Arc<std::sync::atomic::AtomicUsize>) -> SlotSource {
+        Arc::new(move || {
+            if asked.fetch_add(1, Ordering::SeqCst) < refusals {
+                Err(16)
+            } else {
+                synology_drive_sync::watch::walk_slot()
+            }
+        })
+    }
+
+    fn notices(events: &[(u64, ChangeEvent)]) -> Vec<String> {
+        events
+            .iter()
+            .filter_map(|(_, e)| match e {
+                ChangeEvent::Notice { detail, .. } => Some(detail.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn overflows(events: &[(u64, ChangeEvent)]) -> usize {
+        events
+            .iter()
+            .filter(|(_, e)| matches!(e, ChangeEvent::Overflow { .. }))
+            .count()
+    }
+
+    /// S3-13: a catch-up walk refused by the process-wide cap was taken for an
+    /// unwalkable tree and synced whole, so more than sixteen routines starting
+    /// together all synced their whole trees at once. It waits its turn, and a
+    /// tree unchanged since its last success is not synced.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_catch_up_refused_by_the_cap_waits_instead_of_syncing_the_whole_tree() {
+        let root = temp_tree("catchup-cap");
+        let (recorder, sink) = Recorder::new();
+        let mut worker = worker(&root, Duration::from_secs(60), sink, settings(true));
+        // Nothing in the tree is newer than the last success.
+        worker.spec.last_success_epoch = Some(now_epoch() as u64 + 10_000);
+        let asked = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        worker.slot = refusing_slots(2, Arc::clone(&asked));
+        let stop = Arc::clone(&worker.stop);
+        let handle = thread::spawn(move || worker.run());
+        recorder.wait(
+            "the catch-up to finish",
+            Duration::from_secs(10),
+            |events| {
+                notices(events)
+                    .iter()
+                    .any(|n| n.starts_with("catch_up=resumed"))
+            },
+        );
+        stop.store(true, Ordering::SeqCst);
+        handle.join().unwrap();
+        let events = recorder.events.lock().unwrap();
+        let notices = notices(&events);
+        assert_eq!(
+            overflows(&events),
+            0,
+            "an unchanged tree is not synced whole because the cap was busy: {notices:?}"
+        );
+        assert!(
+            notices
+                .iter()
+                .any(|n| n.starts_with("catch_up=deferred") && n.contains("cause=walk_cap")),
+            "the wait is named: {notices:?}"
+        );
+        assert!(
+            asked.load(Ordering::SeqCst) >= 3,
+            "the walk was asked for again after each refusal: {}",
+            asked.load(Ordering::SeqCst)
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// S3-13: a cap that never frees (walks abandoned on a stalled disk) does
+    /// not leave the tree unsynced for good: after the wait it is synced whole,
+    /// and the notice says why.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_catch_up_the_cap_never_admits_ends_in_a_named_whole_tree_sync() {
+        let root = temp_tree("catchup-cap-held");
+        let (recorder, sink) = Recorder::new();
+        let mut settings = settings(true);
+        settings.catch_up_cap_wait = Duration::from_millis(500);
+        let mut worker = worker(&root, Duration::from_secs(60), sink, settings);
+        worker.spec.last_success_epoch = Some(now_epoch() as u64 + 10_000);
+        let asked = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        worker.slot = refusing_slots(usize::MAX, Arc::clone(&asked));
+        let stop = Arc::clone(&worker.stop);
+        let handle = thread::spawn(move || worker.run());
+        recorder.wait("the whole-tree sync", Duration::from_secs(10), |events| {
+            overflows(events) > 0
+        });
+        stop.store(true, Ordering::SeqCst);
+        handle.join().unwrap();
+        let events = recorder.events.lock().unwrap();
+        let notices = notices(&events);
+        assert!(
+            notices.iter().any(|n| n.starts_with("catch_up=whole_tree")
+                && n.contains("cause=walk_cap")
+                && n.contains("waited_seconds=")),
+            "the whole-tree sync names the cap: {notices:?}"
+        );
+        assert!(
+            asked.load(Ordering::SeqCst) >= 3,
+            "it tried again before giving up: {} asks",
+            asked.load(Ordering::SeqCst)
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Routines that were refused together do not come back together.
+    #[test]
+    fn refused_catch_ups_are_staggered_by_routine() {
+        let root = temp_tree("stagger");
+        let (_, sink) = Recorder::new();
+        let mut delays = std::collections::BTreeSet::new();
+        for n in 0..16 {
+            let mut worker = worker(
+                &root,
+                Duration::from_secs(60),
+                Arc::clone(&sink),
+                settings(true),
+            );
+            worker.spec.routine = format!("routine-{n}");
+            let delay = worker.stagger();
+            assert!(
+                delay >= worker.settings.walk_cap_retry
+                    && delay < worker.settings.walk_cap_retry * 2,
+                "{delay:?}"
+            );
+            delays.insert(delay);
+        }
+        assert!(
+            delays.len() >= 8,
+            "sixteen routines, {} delays",
+            delays.len()
         );
         let _ = std::fs::remove_dir_all(&root);
     }
