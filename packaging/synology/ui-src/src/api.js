@@ -1233,9 +1233,12 @@ async function pollJobResult(
 }
 
 // The operations whose success can carry a warning (the shell reloads the running
-// controller after each; if that fails the change is on disk but not in effect).
+// controller after each; if that fails the change is on disk but not in effect, and a save
+// committed beside a running sync says it applies on the next run). Every operation that goes
+// through the manager's api_capture_or_error belongs here; reads, probes, actions, resync and
+// log or preference writes never carry one, and listing them would clear a standing notice.
 const MUTATION_WARNING_OPERATIONS = Object.freeze([
-  "configure-profile", "remove-profile", "set-default", "schedule", "routine", "remove-routine",
+  "configure-profile", "remove-profile", "set-default", "set-secret", "schedule", "routine", "remove-routine",
   "alert-policy", "performance-policy", "security-policy"
 ]);
 

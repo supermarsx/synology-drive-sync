@@ -81,7 +81,7 @@
 
           <div v-if="mutationWarning" class="sdsync-banner sdsync-mutation-warning" role="alert">
             <div>
-              <strong>Saved, but it is not fully in effect</strong>
+              <strong>{{ mutationWarningTitle }}</strong>
               <span v-for="(warning, index) in mutationWarning" :key="index">{{ warning.text }}</span>
               <v-button type="border" display="icon-text" tooltip="Hide this notice. It returns if the next save has the same problem." @click="mutationWarning = null"><template #icon><action-icon name="close" /></template>Dismiss</v-button>
             </div>
@@ -556,6 +556,7 @@
                   <div><dt>Repository</dt><dd><a :href="aboutMetadata.repository" target="_blank" rel="noopener noreferrer">GitHub</a></dd></div>
                   <div><dt>License</dt><dd><a :href="aboutMetadata.licenseUrl" target="_blank" rel="noopener noreferrer">{{ aboutMetadata.license }}</a></dd></div>
                   <div><dt>Installed package version</dt><dd><code>{{ installedPackageVersion }}</code></dd></div>
+                  <div v-if="serviceEngineLabel"><dt>Service engine</dt><dd><code>{{ serviceEngineLabel }}</code></dd></div>
                   <div><dt>Core source version</dt><dd><code>{{ aboutMetadata.coreVersion }}</code></dd></div>
                   <div><dt>DSM UI build version</dt><dd><code>{{ aboutMetadata.uiVersion }}</code></dd></div>
                   <div><dt>API schema</dt><dd><code>{{ aboutMetadata.apiSchema }}</code></dd></div>
@@ -664,6 +665,7 @@ import {
   CONTROLLER_TICK_STALE_SECONDS,
   attentionItems as outcomeAttentionItems,
   cacheHealthNote,
+  engineLabel,
   failureKey as outcomeFailureKey,
   historyNote,
   normalizeOutcomes,
@@ -731,7 +733,7 @@ function profileOutcomeFor(name, outcomes, stale, nowSeconds, entries) {
   // A retained reading is dimmed (unknown); a token this window cannot read is a
   // warning, never the neutral colour of "nobody has looked".
   const shownLevel = stale ? (row.level !== "fail" ? "unknown" : row.level) : (row.level === "unknown" ? "warn" : row.level);
-  return { level: shownLevel, text: ["Last run: " + row.label, row.detail, row.age, stale ? "stale reading" : ""].filter(Boolean).join(" · ") };
+  return { level: shownLevel, text: ["Last run: " + row.label, row.detail, row.age, row.indexNote, stale ? "stale reading" : ""].filter(Boolean).join(" · ") };
 }
 // The package clock when the newest snapshot was generated. The snapshot object is frozen,
 // so the value that moves on every poll lives in snapshotGeneratedAt; a window that has not
@@ -4454,6 +4456,16 @@ export default {
     // The package's own verdict on runs, or null for a package that reports
     // none. Null is never read as success: attentionItems says so.
     outcomes() { return normalizeOutcomes(this.snapshot && this.snapshot.outcomes); },
+    // "daemon" or "shell (fallback)" for the About page; "" for a package that reports no engine.
+    // A save committed beside a running sync is complete, only not yet in effect: it is headed
+    // by that, and the generic heading is kept for a save whose side effect really failed.
+    mutationWarningTitle() {
+      const list = Array.isArray(this.mutationWarning) ? this.mutationWarning : [];
+      return list.length && list.every((warning) => warning.code === "applies_next_run")
+        ? "Saved, takes effect on the next run"
+        : "Saved, but it is not fully in effect";
+    },
+    serviceEngineLabel() { return this.outcomes ? engineLabel(this.outcomes.engine) : ""; },
     // True once a poll has failed while an earlier snapshot is still on screen.
     // Every value derived from it is then history, not evidence.
     retainedStale() { return Boolean(this.snapshot) && !this.connected; },
@@ -6081,7 +6093,7 @@ export default {
     noteMutationWarning(warnings) {
       const list = Array.isArray(warnings) && warnings.length ? warnings : null;
       this.mutationWarning = list;
-      if (list) this.toast("Saved, but not fully in effect", list.map((warning) => warning.text).join(" "), true);
+      if (list) this.toast(list.every((warning) => warning.code === "applies_next_run") ? this.mutationWarningTitle : "Saved, but not fully in effect", list.map((warning) => warning.text).join(" "), true);
     },
     shownName(value) { return visibleText(typeof value === "string" ? value : String(value === undefined || value === null ? "" : value)); },
     scheduleSnapshot() {

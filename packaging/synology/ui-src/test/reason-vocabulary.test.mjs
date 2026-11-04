@@ -4,7 +4,7 @@
 // the writers, so a token added to the runner or the bridge without a label fails
 // here, not on an operator's Overview.
 import assert from "node:assert/strict";
-import { readFile } from "node:fs/promises";
+import { readdir, readFile } from "node:fs/promises";
 import test from "node:test";
 import { attentionItems, normalizeOutcomes, profileOutcomeRow, reasonCopy } from "../src/outcomes.mjs";
 import { widgetView } from "../src/widgetModel.mjs";
@@ -208,4 +208,106 @@ test("RU-1 the stale-run writers are read from the writer, so a renamed token is
   const profileRecord = sources.common.replace(/(\\nreason=)runner_died(\\n)/, "$1runner_gone$2");
   assert.notEqual(profileRecord, sources.common);
   assert.ok(positionalReasons(profileRecord).has("runner_gone") && !positionalReasons(profileRecord).has("runner_died"));
+});
+
+// ---- the Rust daemon (src/daemon/**) ----------------------------------------------------
+//
+// The daemon writes the same state records the shell did, so its reasons must read as copy
+// too. What is scanned, and only this (a pattern per call shape, so an ordinary Rust string
+// is never mistaken for a reason):
+//   1. `.reason = <expr>;` and `.last_reason = <expr>;`   (every string literal in <expr>,
+//      so `if refused { "admission_refused".into() } else { "busy".into() }` yields both)
+//   2. `reason: <expr>,` and `last_reason: <expr>,`       (struct fields)
+//   3. `RunOutcome::X, "token",`                          (executor's ending_words tuples)
+//   4. `verdict(status, outcome, <reason>, ...)`          (the third argument)
+//   5. `detail: format!("token: ...` in lifecycle.rs      (the consumer deadline's prefix)
+//   6. the `as_str` of DeferReason (labels) and BackendReason (operator guidance)
+// Test code is cut off at the first `#[cfg(test)]`, and `*_tests.rs` files are skipped.
+// Literals are matched whole, so prose (`reason = "the worker is started ..."`) never counts.
+const DAEMON_DIR = "src/daemon/";
+const LITERAL = /"([a-z][a-z0-9_]*)"/g;
+
+function literals(expression) {
+  return [...expression.matchAll(LITERAL)].map((match) => match[1]).filter((name) => !NONE.has(name));
+}
+
+export function daemonReasons(file, rawSource) {
+  const cut = rawSource.search(/^#\[cfg\(test\)\]\s*\n\s*(?:pub(?:\([a-z]+\))? )?mod\s/m);
+  const source = (cut >= 0 ? rawSource.slice(0, cut) : rawSource).split("\n").filter((line) => !/^\s*\/\//.test(line)).join("\n");
+  const found = new Map();
+  const add = (name, shape) => { if (!NONE.has(name) && !found.has(name)) found.set(name, `${file} (${shape})`); };
+  for (const match of source.matchAll(/\.(?:last_reason|reason)\s*=(?!=)\s*([^;]+);/g)) literals(match[1]).forEach((name) => add(name, "assignment"));
+  for (const match of source.matchAll(/\b(?:last_reason|reason):\s*([^,;{}]*(?:\{[^{}]*\}[^,;{}]*)*),/g)) literals(match[1]).forEach((name) => add(name, "field"));
+  for (const match of source.matchAll(/RunOutcome::\w+,\s*"([a-z][a-z0-9_]*)",/g)) add(match[1], "ending");
+  for (const match of source.matchAll(/\bverdict\(\s*[^,()]+,\s*[^,()]+,\s*([^,]+),/g)) literals(match[1]).forEach((name) => add(name, "verdict"));
+  if (file.endsWith("lifecycle.rs")) {
+    for (const match of source.matchAll(/detail:\s*format!\(\s*"([a-z][a-z0-9_]*): /g)) add(match[1], "detail prefix");
+  }
+  return found;
+}
+
+async function daemonSources() {
+  const root = new URL(DAEMON_DIR, ROOT);
+  const names = (await readdir(root, { recursive: true })).map((name) => name.replaceAll("\\", "/"))
+    .filter((name) => name.endsWith(".rs") && !name.endsWith("_tests.rs")).sort();
+  const sources = new Map();
+  for (const name of names) sources.set(name, await readFile(new URL(name, root), "utf8"));
+  return sources;
+}
+
+async function daemonTokens() {
+  const sources = await daemonSources();
+  const reasons = new Map();
+  for (const [name, source] of sources) {
+    for (const [reason, where] of daemonReasons(`${DAEMON_DIR}${name}`, source)) if (!reasons.has(reason)) reasons.set(reason, where);
+  }
+  const routines = sources.get("routines.rs");
+  const arms = (enumName) => {
+    const body = functionBody(routines.slice(routines.indexOf(`impl ${enumName}`)), "pub(crate) fn as_str");
+    return [...body.matchAll(/=>\s*"([a-z_]+)"/g)].map((match) => match[1]).filter((name) => !NONE.has(name));
+  };
+  return { sources, reasons, defer: arms("DeferReason"), backend: arms("BackendReason") };
+}
+
+test("the daemon extractor reads real writers (it would otherwise pass on an empty set)", async () => {
+  const { sources, reasons, defer, backend } = await daemonTokens();
+  assert.ok(sources.size >= 10, `expected the daemon sources, read ${sources.size}`);
+  for (const sentinel of ["run_stalled", "launch_failed", "state_unwritable", "core_oom_killed", "core_killed", "core_failed", "supervisor_refused", "runner_died", "cancelled", "deferred_paths", "busy", "admission_refused", "interrupted", "consumer_timeout"]) {
+    assert.ok(reasons.has(sentinel), `daemon extractor missed ${sentinel}: ${[...reasons.keys()].join(", ")}`);
+  }
+  assert.ok(defer.includes("delete_bound") && defer.includes("dependency"), `defer: ${defer}`);
+  assert.ok(backend.length >= 8 && backend.includes("watch_limit"), `backend: ${backend}`);
+  // Test code and prose are not reasons.
+  for (const never of ["brand_new_reason", "bogus", "new_reason", "the_worker_is_started"]) assert.ok(!reasons.has(never), never);
+});
+
+test("every reason the daemon writes has a cause and a next step", async () => {
+  const { reasons } = await daemonTokens();
+  const missing = [...reasons].filter(([name]) => !reasonCopy(name).known).map(([name, where]) => `${name} (${where})`);
+  assert.deepEqual(missing, [], "reason tokens written by src/daemon with no label in outcomes.mjs");
+});
+
+test("every routine defer and backend reason the daemon writes has copy and operator guidance", async () => {
+  const { defer, backend } = await daemonTokens();
+  assert.deepEqual(defer.filter((name) => !reasonCopy(name).known), []);
+  const app = await readFile(new URL("../src/App.vue", import.meta.url), "utf8");
+  const guidance = app.slice(app.indexOf("const REALTIME_REASON_GUIDANCE"), app.indexOf("const SECURITY_BOOLEAN_FIELDS"));
+  assert.deepEqual(backend.filter((name) => !new RegExp(`\\b${name}:`).test(guidance)), []);
+});
+
+test("the daemon extractor sees a renamed token in each call shape", () => {
+  const sample = [
+    'state.last_reason = if x { "admission_refused".into() } else { "busy".into() };',
+    'record.reason = "runner_gone".into();',
+    'Foo { reason: "field_reason".into(), other: 1 }',
+    '(RunOutcome::Failed, "ending_reason", String::new(), false)',
+    'verdict(RunStatus::Failed, RunOutcome::Failed, if p { "kill_a" } else { "kill_b" }, d, false, true)',
+    "#[cfg(test)]",
+    "mod tests {",
+    '  fn t() { state.last_reason = "only_in_tests".into(); } }'
+  ].join("\n");
+  const found = [...daemonReasons("x.rs", sample).keys()];
+  assert.deepEqual(found.sort(), ["admission_refused", "busy", "ending_reason", "field_reason", "kill_a", "kill_b", "runner_gone"]);
+  const lifecycle = daemonReasons("src/daemon/lifecycle.rs", 'detail: format!(\n  "consumer_timeout: {} did not finish",\n  x)');
+  assert.ok(lifecycle.has("consumer_timeout"));
 });

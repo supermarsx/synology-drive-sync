@@ -44,7 +44,11 @@ const REASONS = Object.freeze({
   policy_operational: ["the security policy blocks Doctor, plan and run actions", "Allow operational actions on the Security page."],
   admission_failed: ["the package could not confirm it was safe to start a run", "Review Logs and run again; repair the package if it repeats."],
   no_profiles: ["no profiles are configured", "Create a profile on the Profiles page."],
-  state_unwritable: ["a package state file could not be written", "Check free space and file ownership, or repair the package."],
+  state_unwritable: ["a package state file could not be written (when a run was being started, the run was not started because its record could not be written)", "Check free space on the package volume and file ownership, or repair the package."],
+  run_stalled: ["the run made no progress for 30 minutes and was stopped", "Review Logs; check the source and target are reachable, then run again."],
+  launch_failed: ["the sync core could not be started", "Review Logs for the cause, then run again; repair the package if it repeats."],
+  consumer_timeout: ["the dashboard request did not finish within its deadline, so its outcome is unknown", "Try again; review Logs if it repeats."],
+  lasting_state_unreadable: ["the record that holds this profile's automatic runs could not be read, so automatic runs stay held", "Click Run now to clear it; repair the package if it repeats."],
   identity_failed: ["the runner could not record its own identity before the core started", "Review Logs and run again; repair the package if it repeats."],
   profile_unreadable: ["the profile file could not be read", "Save the profile again on the Profiles page, or repair the package."],
   profile_invalid: ["the profile did not validate", "Open Profiles and correct the highlighted setting."],
@@ -153,6 +157,27 @@ const RECORD_ERROR_COPY = Object.freeze({
   clock_skew: "a run record is stamped in the future by the NAS clock, so hang detection is switched off for it; check the NAS time settings"
 });
 
+// The verified-pair (checksum) index a profile's last run used. States are the closed list the
+// package writes; the issue codes below are the warning-level ones it names, in plain words.
+const INDEX_STATES = Object.freeze(["off", "cold", "warm", "refreshed", "unusable", "local-only"]);
+const INDEX_INFO_ISSUES = Object.freeze(["pair-index-retired", "pair-index-not-applicable", "pair-index-unsupported-platform"]);
+const INDEX_INFO_NOTES = Object.freeze({
+  "pair-index-retired": "rebuilt, it belonged to another source or remote",
+  "pair-index-not-applicable": "not used for this profile",
+  "pair-index-unsupported-platform": "not supported on this platform"
+});
+const INDEX_ISSUE_COPY =Object.freeze({
+  "pair-index-corrupt": "the checksum index was damaged; it was set aside and rebuilt from this run, so every file was checked live",
+  "pair-index-locked": "another process was using the checksum index, so this run did not use it and every file was checked live",
+  "pair-index-readonly": "the checksum index is on a read-only location, so it could not be used or updated and every file was checked live",
+  "pair-index-store-failed": "the checksum index could not be saved, so the next run checks files live again",
+  "pair-index-unsafe": "the checksum index failed its ownership or mode check, so it was not used and every file was checked live",
+  "pair-index-directory-unusable": "the folder that holds the checksum index could not be used, so every file was checked live",
+  "pair-index-unbound": "the checksum index belongs to a different source or destination, so it was not used and every file was checked live",
+  "pair-index-format-unsupported": "the checksum index was written in a format or version this package does not read, so it was not used and every file was checked live",
+  "pair-index-canary-mismatch": "a stored checksum disagreed with a live one, so the index was not trusted and every file was checked live"
+});
+
 const SAFE_TOKEN = /^[A-Za-z0-9_:.-]{1,64}$/;
 const has = (table, key) => Object.prototype.hasOwnProperty.call(table, key);
 
@@ -172,6 +197,135 @@ export function outcomeLabel(value) {
 export function outcomeLevel(value) {
   const key = token(value);
   return Object.prototype.hasOwnProperty.call(OUTCOME_LEVELS, key) ? OUTCOME_LEVELS[key] : "unknown";
+}
+
+// A count the package may leave out (null), which is not the same as zero.
+function countOrNull(value) { return value === null || value === undefined ? null : count(value); }
+function grouped(n) { return String(n).replace(/\B(?=(\d{3})+(?!\d))/g, ","); }
+function plural(n, one, many) { return `${grouped(n)} ${n === 1 ? one : many}`; }
+
+/** The `index` member of a profile outcome: null when the run used none, else a flat record. */
+function normalizeIndex(raw) {
+  if (raw === undefined || raw === null) return null;
+  const empty = { state: "", entries: null, hits: null, misses: null, canaryChecked: null, canaryMismatches: null, issue: "", issueDetail: "" };
+  if (typeof raw !== "object" || Array.isArray(raw)) return { ...empty, state: "unreadable", malformed: true };
+  return {
+    state: token(raw.state),
+    entries: countOrNull(raw.entries),
+    hits: countOrNull(raw.hits),
+    misses: countOrNull(raw.misses),
+    canaryChecked: countOrNull(raw.canary_checked),
+    canaryMismatches: countOrNull(raw.canary_mismatches),
+    issue: token(raw.issue),
+    issueDetail: typeof raw.issue_detail === "string" ? plainText(raw.issue_detail, 160) : "",
+    malformed: false
+  };
+}
+
+/**
+ * "Checksum index: warm, 1,000 pairs; 975 reused, 25 checked live (25 canary)": what the
+ * profile's last run did with the verified-pair index, or "" when it used none.
+ */
+export function indexLine(index) {
+  if (!index) return "";
+  if (index.malformed) return "Checksum index: unreadable (the package sent a value this window cannot read)";
+  const state = INDEX_STATES.includes(index.state) ? index.state : unknownLabel(index.state);
+  let line = `Checksum index: ${state}`;
+  if (index.entries !== null) line += `, ${plural(index.entries, "pair", "pairs")}`;
+  if (index.state === "off") {
+    line += "; every file was checked live";
+  } else {
+    if (index.hits !== null && index.misses !== null) {
+      line += `; ${index.hits} reused, ${index.misses} checked live`;
+      if (index.canaryChecked > 0) line += ` (${index.canaryChecked} canary)`;
+    }
+    if (index.canaryMismatches > 0) line += `, ${plural(index.canaryMismatches, "canary mismatch", "canary mismatches")}`;
+  }
+  // Info-level notes explain a state (a slow first run after a profile is re-created); they are
+  // not problems, so they ride on the line and never raise an attention item.
+  const note = has(INDEX_INFO_NOTES, index.issue) ? INDEX_INFO_NOTES[index.issue] : "";
+  if (note) line += `; ${note}${index.issueDetail ? ` (${index.issueDetail})` : ""}`;
+  return line;
+}
+
+/** The attention item for one profile's index, or null when it needs none. */
+function indexAttentionItem(profile) {
+  const index = profile.index;
+  if (!index) return null;
+  const name = visibleText(profile.profile);
+  const id = `pair-index-${profile.profile}`;
+  if (index.malformed) {
+    return { id, level: "warn", title: `${name}: checksum index unreadable`, detail: "The package sent an index record this window cannot read, so whether the checksum index was used is unknown. Every file is still checked; review Logs if it repeats." };
+  }
+  if (index.state && !INDEX_STATES.includes(index.state)) {
+    return { id, level: "warn", title: `${name}: checksum index state not recognised`, detail: `The checksum index reported ${unknownLabel(index.state)}. Review Logs.` };
+  }
+  if (!index.issue || INDEX_INFO_ISSUES.includes(index.issue)) return null;
+  const known = has(INDEX_ISSUE_COPY, index.issue);
+  const cause = known
+    ? `${INDEX_ISSUE_COPY[index.issue].charAt(0).toUpperCase()}${INDEX_ISSUE_COPY[index.issue].slice(1)}`
+    : `The checksum index reported an unknown index issue (${shown(index.issue)})`;
+  return {
+    id, level: "warn", title: `${name}: checksum index needs attention`,
+    detail: `${cause}${index.issueDetail ? `. ${index.issueDetail}` : ""}.`.replace(/\.+$/, ".")
+  };
+}
+
+/** The `lasting` list: profiles held after a user-fixable failure. Every entry is kept. */
+function normalizeLasting(raw) {
+  return (Array.isArray(raw) ? raw : []).slice(0, 256).map((item) => {
+    const l = obj(item);
+    return {
+      profile: token(l.profile),
+      reason: token(l.reason),
+      detail: typeof l.detail === "string" ? plainText(l.detail, 240) : "",
+      sinceEpoch: countOrNull(l.since_epoch),
+      error: typeof l.error === "string" ? plainText(l.error, 240) : ""
+    };
+  });
+}
+
+function lastingAttentionItem(held) {
+  const name = held.profile ? visibleText(held.profile) : "A profile";
+  let detail;
+  if (held.reason === "lasting_state_unreadable") {
+    detail = `The record that holds this profile's automatic runs could not be read${held.error ? ` (${held.error})` : ""}; automatic runs stay held. Click Run now to clear it.`;
+  } else if (held.reason === "core_oom_killed") {
+    detail = `${reasonCopy("core_oom_killed").text} ${held.detail}${held.detail ? " " : ""}It runs again when you click Run now, or when you change this profile's settings or the performance level.`;
+  } else {
+    detail = `This profile is held for ${unknownLabel(held.reason)}${held.detail ? `: ${held.detail}` : ""}. Click Run now to try again; review Logs.`;
+  }
+  return { id: `lasting-${held.profile || "unnamed"}`, level: "warn", title: `${name}: not synced until you fix this`, detail };
+}
+
+/** `outcomes.engine`: which service engine runs, from the package's engine record. */
+function normalizeEngine(raw) {
+  if (raw === undefined) return null;
+  const e = obj(raw);
+  return {
+    active: token(e.active),
+    file: token(e.file),
+    detail: typeof e.detail === "string" ? plainText(e.detail, 240) : ""
+  };
+}
+
+/** "daemon" or "shell (fallback)" for the About page; "" when the package reports no engine. */
+export function engineLabel(engine) {
+  if (!engine) return "";
+  if (engine.active === "daemon") return "daemon";
+  if (engine.active === "shell") return "shell (fallback)";
+  return unknownLabel(engine.active);
+}
+
+function engineAttentionItem(engine) {
+  if (!engine) return null;
+  if (engine.file === "invalid") {
+    return { id: "engine-invalid", level: "warn", title: "The service engine setting is not understood; the daemon runs", detail: `${engine.detail || "The engine record could not be read."} Correct or remove it, then stop the package in Package Center and Run it again.` };
+  }
+  if (!["absent", "daemon", "shell"].includes(engine.file)) {
+    return { id: "engine-unknown", level: "warn", title: "The service engine setting is not recognised", detail: `The package reported the engine setting as ${unknownLabel(engine.file)}. Review Logs.` };
+  }
+  return null;
 }
 
 /**
@@ -314,6 +468,8 @@ export function outcomesProblem(raw) {
   if (!Array.isArray(raw.profiles)) return "the per-profile outcomes are not a list";
   if (raw.routines !== undefined && !Array.isArray(raw.routines)) return "the routine outcomes are not a list";
   if (raw.errors !== undefined && !Array.isArray(raw.errors)) return "the record-error list is not a list";
+  if (raw.lasting !== undefined && !Array.isArray(raw.lasting)) return "the list of profiles held after a lasting failure is not a list";
+  if (raw.engine !== undefined && (!raw.engine || typeof raw.engine !== "object" || Array.isArray(raw.engine))) return "the service engine record is not a document";
   if (raw.status_cache_health !== undefined && (!raw.status_cache_health || typeof raw.status_cache_health !== "object" || Array.isArray(raw.status_cache_health))) {
     return "the status-figure health is not a document";
   }
@@ -410,9 +566,15 @@ export function normalizeOutcomes(raw) {
         warnings: tokens(p.warnings),
         skipped: count(p.skipped_files),
         deferred: count(p.deferred_files),
+        // The checksum (pair) index this profile's last run used, or null.
+        index: normalizeIndex(p.index),
         ...factsOf(p)
       };
     }).filter((p) => p.profile),
+    // Profiles held after a lasting failure; an older package sends none.
+    lasting: normalizeLasting(raw.lasting),
+    // Which service engine runs; null for a package that does not report it.
+    engine: normalizeEngine(raw.engine),
     routines: (Array.isArray(raw.routines) ? raw.routines : []).map((item) => {
       const r = obj(item);
       return {
@@ -496,7 +658,8 @@ export function profileOutcomeRow(entry, nowSeconds = Date.now() / 1000) {
     age,
     detail: parts.join("; "),
     failures: p.failures,
-    note: statusCacheNote(p)
+    note: statusCacheNote(p),
+    indexNote: indexLine(p.index)
   };
 }
 
@@ -586,6 +749,13 @@ export function attentionItems(outcomes, nowSeconds = Date.now() / 1000) {
       items.push({ id: `profile-${p.profile}`, level: row.level, title: `${visibleText(p.profile)}: ${row.label}`, detail: `${row.detail || "Review Logs."}${row.age ? ` (${row.age})` : ""}` });
     }
   }
+  for (const p of outcomes.profiles) {
+    const item = indexAttentionItem(p);
+    if (item) items.push(item);
+  }
+  for (const held of outcomes.lasting) items.push(lastingAttentionItem(held));
+  const engineItem = engineAttentionItem(outcomes.engine);
+  if (engineItem) items.push(engineItem);
   for (const r of outcomes.routines) {
     if (r.deferReason && !["window", "busy"].includes(r.deferReason)) {
       const why = routineDeferCopy(r.deferReason);
