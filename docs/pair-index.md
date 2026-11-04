@@ -74,6 +74,33 @@ restore) that keeps size and mtime.
   The windows are applied again when a record is about to be served, so evidence settled under a
   shorter window is not served on its word. A file changed within the window of a run is read
   live once more on the next run, after which it is served as before.
+
+  **What the window assumes.** It is a bound, not a proof, and it holds only while two things are
+  true. (1) The clocks are steady: the window is measured between a file's change time and the
+  clock that read it, so a clock stepped forward (an NTP correction, a VM resume, an operator) after
+  a change makes a recent change look old, and a step back makes everything racy. A forward step
+  of more than the window can let one write through a mapping hide for the rest of the dirty
+  page's life. On the NAS side the 20 s check above catches a clock that is wrong while the pass
+  reads, not one that steps between runs. (2) The kernel's flusher writes a dirty page back
+  within the margin: the local window is the configured writeback delay plus a 25 s margin, a
+  heuristic that covers a flusher that is late by that much. A host so loaded or throttled that
+  writeback runs later than that (a stalled disk, a cgroup write limit, a network or FUSE
+  filesystem with its own writeback) can leave a page dirty past the window. The canary and
+  rolling expiry are what remain for either case.
+- **Cost in realtime mode.** A realtime routine runs after each change (debounce 45 s by default),
+  so the pair it just synced is proven by a run that is, by the rule above, still inside the window
+  of the change (the local change time, and the NAS's change time of the copy it just uploaded). A
+  pair is stored settled only when a run proves it at least a window (60 s with the kernel
+  defaults) after the later of the two; until then each run stores it racy and reads it live
+  again: one local read of the file and one File Station `MD5` task (a start and at least one
+  status poll) per changed file per run. A file that changes continuously is therefore re-hashed on
+  both sides on every run and never served from the index, and a changed file costs one such
+  re-hash for each run that follows within the window (with a 45 s debounce, one or two) before it is
+  served.
+  Every other pair stays served, so the steady cost of an otherwise unchanged share is still the
+  listing plus the canary. For a few large files that change often (a database, a mail store, a VM
+  image) the cost is their size read on both sides per run, which a run without the index would
+  have paid for them anyway.
 - **Local-only mode.** If the NAS listing carries no change time, or one of the run's own uploads is
   listed with a change time that does not show the write, File Station's MD5 always runs and only the
   local read is skipped (`pair-index-remote-ctime-unavailable`, `pair-index-remote-ctime-static`).
@@ -124,11 +151,24 @@ interrupted write leaves the last complete commit.
 redb 4.4 can panic while it opens a file with a damaged allocator-state page, before any check
 can run; a release build stops there. A panic inside redb on an index file is recorded beside it
 as `<profile>.redb.panicked`, and the next run sets the file aside instead of opening it, so one
-crashed run heals the index.
+crashed run heals the index. Only a panic raised in redb's own sources is recorded (the hook reads
+the panic's reported source location); a panic from this program's own code never retires a healthy
+index. A panic record that cannot be examined, or a quarantined copy whose age cannot be read for the
+weekly sweep, is named as a warning with its path and cause (`pair-index-unsafe`, which leaves the
+index unused for the run, and `pair-index-cleanup-failed`).
 
-Size is about 340 bytes per pair at 100,000 pairs and 270 at a million; redb's page cache is held at
-8 MiB, so memory does not grow with the share. When the file grows past twice its contents plus
-64 MiB, it is compacted (`pair-index-compacted`).
+A pair costs its path plus about 125 bytes when the file is dense: 155 bytes at 36-byte paths, 200 at
+76, 247 at 116 and 281 at 150, the same at 100,000 pairs and at a million (measured on redb 4.4 after
+`compact()`, pairs written in key order as every commit writes them; pages that were filled in
+another order are half full and cost up to twice that, 375 at 76-byte paths). The file on disk is larger than that, because redb grows it in doubling steps and
+every rewrite is copy-on-write: a freshly built file stands at 1.1 to 2 times the dense size
+(168 to 336 bytes per pair measured), and after rewrites at 1.5 to 4 times (up to 800; a million
+pairs rewritten once stood at 538 bytes per pair, 539 MB). So a share of a million files wants
+roughly 160 to 650 MB of index, depending on path length and how recently it was compacted.
+redb's page cache is held at 8 MiB, so memory does not grow with the share. The compaction rule
+budgets 300 bytes per pair, the most a dense pair costs with paths up to about 160 bytes: when
+the file grows past twice that per pair plus 64 MiB, it is compacted (`pair-index-compacted`). The
+64 MiB of slack means an index of a few hundred thousand pairs or fewer is seldom compacted at all.
 
 ## On a DSM package
 
@@ -158,7 +198,9 @@ Independently of the index, post-run reconciliation re-lists both sides in full 
 only the pairs the run touched, plus a canary of 25 untouched pairs. Every other pair whose facts
 did not move keeps the digests the plan pass proved, provided the NAS listing carries a change
 time for it and neither side's change time was within the racy window of the read that produced
-the digest (the run's start locally, the `MD5.start` clock on the NAS); otherwise it is verified
-live. The result's `reconciliation` object says how
+the digest (the run's start locally, the `MD5.start` clock on the NAS), and the `MD5.start` clock
+was within 20 s of this host's clock over the run (a clock further out cannot judge the window, as
+for the index above); otherwise it is verified live. That demotion is not a separate warning: it
+shows as a lower carried count in the `reconciliation` object. The result's `reconciliation` object says how
 many pairs were carried and verified live. `--reconcile full` (hidden, command line only) restores
 the exhaustive pass.

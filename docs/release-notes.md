@@ -201,6 +201,16 @@ lists its own commits.
   three such copies a damaged file is deleted instead of kept.
 - **A profile name over 64 characters gets an index** (`<first 48 characters>-<16 hex of its
   SHA-256>.redb`) instead of `pair-index-unsafe` on every run.
+- **A panic from this program no longer retires a healthy index.** Only a panic raised in redb's own
+  sources is recorded beside the file. A panic record or a quarantined copy that cannot be examined
+  is now named with its path and cause (`pair-index-unsafe`, `pair-index-cleanup-failed`) instead of
+  being passed over.
+- **Reconciliation applies the 20 s NAS-clock bound too**: a pair whose plan-time `MD5.start` clock
+  stood further outside this host's clock is verified live rather than carried.
+- **Index size and the racy window are documented as measured.** A dense pair costs its path plus
+  about 125 bytes; the file on disk is 1.1 to 4 times that. The window's assumptions (steady
+  clocks, a flusher that drains within the margin) and the re-hash cost of a realtime routine are
+  in [Verified-pair index](pair-index.md#what-it-can-and-cannot-do).
 - New `pair_index.issues` codes: `pair-index-writeback-unknown`, `pair-index-writeback-unbounded`,
   `pair-index-nas-clock-skewed`, `pair-index-cleanup-failed`. See
   [Verified-pair index](pair-index.md#when-it-cannot-be-used).

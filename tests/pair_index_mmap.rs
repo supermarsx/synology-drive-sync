@@ -158,36 +158,79 @@ impl Fixture {
     }
 }
 
-/// The review-int probe, as a regression test: a store through a shared mapping into a page that
-/// is already dirty changes the content with size, mtime, ctime and inode unchanged. Proven 2.5 s
-/// after the change time, the old two-second window stored the pair as settled and the next run
-/// served the stale digest: the change was never uploaded.
-#[test]
-fn a_store_into_a_dirty_mapped_page_is_never_served_stale() {
-    let fixture = fixture("mmap");
+/// How many fresh files the mapped-write test tries before it gives up on provoking the case.
+const PROVOKE_ATTEMPTS: usize = 10;
+
+/// One attempt at the case: a store into an already-dirty mapped page that leaves every fact the
+/// index keys on unchanged.
+enum Attempt {
+    /// The facts did not move across the second store, the content did, and the next run was
+    /// checked: this is the case, and it passed.
+    Provoked,
+    /// The case did not arise (writeback cleaned the page first, or the filesystem stamps every
+    /// store): nothing was proven either way, and the reason is named.
+    NotProvoked(String),
+}
+
+/// A shared mapping of one file, unmapped when dropped.
+struct Mapping {
+    base: *mut u8,
+    length: usize,
+    _file: fs::File,
+}
+
+impl Mapping {
+    fn new(path: &Path, length: usize) -> Self {
+        let file = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)
+            .unwrap();
+        // SAFETY: a fresh shared mapping of a file this test owns and sized to `length`; it is
+        // unmapped in `Drop` and not used after.
+        let base = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                length,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_SHARED,
+                file.as_raw_fd(),
+                0,
+            )
+        };
+        assert_ne!(base, libc::MAP_FAILED, "mmap");
+        Self {
+            base: base.cast(),
+            length,
+            _file: file,
+        }
+    }
+
+    fn store(&self, offset: usize, byte: u8) {
+        assert!(offset < self.length);
+        // SAFETY: `offset` is inside the mapping, checked above.
+        unsafe { self.base.add(offset).write_volatile(byte) };
+    }
+}
+
+impl Drop for Mapping {
+    fn drop(&mut self) {
+        // SAFETY: the mapping made in `new`, not used after this.
+        unsafe { libc::munmap(self.base.cast(), self.length) };
+    }
+}
+
+fn mapped_write_attempt(attempt: usize) -> Attempt {
+    let fixture = fixture(&format!("mmap-{attempt}"));
     let mapped = fixture.source.join("db.bin");
     fs::write(&mapped, vec![b'A'; 4096]).unwrap();
-    let file = fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(&mapped)
-        .unwrap();
-    // SAFETY: a fresh 4096-byte shared mapping of a 4096-byte file this test owns, unmapped below.
-    let base = unsafe {
-        libc::mmap(
-            std::ptr::null_mut(),
-            4096,
-            libc::PROT_READ | libc::PROT_WRITE,
-            libc::MAP_SHARED,
-            file.as_raw_fd(),
-            0,
-        )
-    };
-    assert_ne!(base, libc::MAP_FAILED, "mmap");
-    let base = base.cast::<u8>();
+    // Without this the page `write(2)` just dirtied is still dirty, the first store through the
+    // mapping meets a dirty page and moves no time, and the case under test cannot arise: the
+    // first store must be the one that faults a clean page writable.
+    fs::File::open(&mapped).unwrap().sync_all().unwrap();
+    let mapping = Mapping::new(&mapped, 4096);
     // The first store faults the clean page writable: mtime and ctime move, now.
-    // SAFETY: offset 0 is inside the mapping.
-    unsafe { base.write_volatile(b'B') };
+    mapping.store(0, b'B');
     let first = fs::read(&mapped).unwrap();
     fixture
         .server
@@ -201,26 +244,57 @@ fn a_store_into_a_dirty_mapped_page_is_never_served_stale() {
 
     let before = facts(&mapped);
     // A second store into the still-dirty page: no fault, so no time update.
-    // SAFETY: offset 1 is inside the mapping.
-    unsafe { base.add(1).write_volatile(b'C') };
+    mapping.store(1, b'C');
     let after = facts(&mapped);
     let changed = fs::read(&mapped).unwrap();
     assert_ne!(changed, first, "the content changed");
-    eprintln!(
-        "facts before={before:?} after={after:?} (equal: {})",
-        before == after
-    );
+    if before != after {
+        return Attempt::NotProvoked(format!(
+            "the second store moved a fact the index keys on (before {before:?}, after {after:?}): \
+             the page was written back in between, or this filesystem stamps every mapped store"
+        ));
+    }
 
     let next = fixture.sync();
     assert_eq!(
         fixture.remote("db.bin"),
         changed,
-        "the change must reach the NAS: {next}"
+        "every fact was unchanged ({before:?}) and the content was not: the change must reach \
+         the NAS: {next}"
     );
     assert_eq!(Fixture::uploaded(&next), 1, "{next}");
     assert!(Fixture::index(&next)["racy"].as_u64() >= Some(1), "{next}");
-    // SAFETY: the mapping made above, not used after this.
-    unsafe { libc::munmap(base.cast(), 4096) };
+    Attempt::Provoked
+}
+
+/// The review-int probe, as a regression test: a store through a shared mapping into a page that
+/// is already dirty changes the content with size, mtime, ctime and inode unchanged. Proven 2.5 s
+/// after the change time, the old two-second window stored the pair as settled and the next run
+/// served the stale digest: the change was never uploaded.
+///
+/// The case only arises when the second store meets a dirty page and the first met a clean one,
+/// so each attempt starts from a synced file and checks that no fact moved across the second
+/// store. An attempt where one did proves nothing and is retried on fresh files; if no attempt
+/// arises, the test fails rather than pass without having tested the rule.
+#[test]
+fn a_store_into_a_dirty_mapped_page_is_never_served_stale() {
+    let mut not_provoked = Vec::new();
+    for attempt in 1..=PROVOKE_ATTEMPTS {
+        match mapped_write_attempt(attempt) {
+            Attempt::Provoked => {
+                eprintln!("PROVOKED on attempt {attempt} of {PROVOKE_ATTEMPTS}");
+                return;
+            }
+            Attempt::NotProvoked(reason) => {
+                eprintln!("attempt {attempt}: not provoked: {reason}");
+                not_provoked.push(reason);
+            }
+        }
+    }
+    panic!(
+        "the mapped-write case could not be provoked in {PROVOKE_ATTEMPTS} attempts, so the racy \
+         rule was not tested here (it is not passing): {not_provoked:#?}"
+    );
 }
 
 /// A normal `write(2)` again within the window, size and mtime kept: whatever the change time
