@@ -295,6 +295,8 @@ async function save(operation, result, seen) {
 
 test("the operations whose warnings reach the window are exactly the saves that can carry applies_next_run", () => {
   const listed = apiSource.match(/const MUTATION_WARNING_OPERATIONS = Object\.freeze\(\[([^\]]*)\]/)[1].match(/"[a-z-]+"/g).map((name) => name.slice(1, -1));
+  assert.deepEqual([...listed].sort(), [...CARRIERS].sort(), "the list holds the carriers and no dead name");
+  for (const operation of listed) assert.ok(api.ARGUMENT_KEYS[operation], `${operation} is not an operation this window can send`);
   for (const operation of CARRIERS) assert.ok(listed.includes(operation), `${operation} can commit during a sync but its warning would be dropped`);
   for (const operation of NEVER_CARRIERS) assert.ok(!listed.includes(operation), `${operation} never carries the note, and listing it would clear a standing banner`);
 });

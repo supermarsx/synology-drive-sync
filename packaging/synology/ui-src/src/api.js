@@ -1239,7 +1239,7 @@ async function pollJobResult(
 // log or preference writes never carry one, and listing them would clear a standing notice.
 const MUTATION_WARNING_OPERATIONS = Object.freeze([
   "configure-profile", "remove-profile", "set-default", "set-secret", "schedule", "routine", "remove-routine",
-  "alert-policy", "performance-policy", "security-policy"
+  "alert-policy", "security-policy"
 ]);
 
 function printableLine(value, limit) {
