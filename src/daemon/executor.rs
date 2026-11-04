@@ -1321,6 +1321,15 @@ mod tests {
             "{index:?}"
         );
         assert_eq!(records[1].facts.index, None, "no index, no line");
+        // A retired index alone is named too (info): it explains a slow run.
+        let records = parse_result_record(
+            br#"{"schema":"sdsync.result-record.v1","profile":"photos","status":"succeeded","error":null,"result":{"pair_index":{"state":"cold","served":0,"verified_live":5,"canary_checked":0,"canary_mismatches":0,"stored":5,"removed":0,"entries":5,"issues":[{"code":"pair-index-not-applicable","severity":"info","path":"/x","cause":"n/a"},{"code":"pair-index-retired","severity":"info","path":"/p/photos.redb","cause":"bound to remote \"/a\", this run uses \"/b\"; retired"}]}}}
+"#,
+        )
+        .unwrap();
+        let index = records[0].facts.index.clone().unwrap();
+        assert_eq!(index.issue.as_deref(), Some("pair-index-retired"));
+        assert!(index.issue_detail.unwrap().contains("bound to remote"));
     }
 
     #[test]

@@ -266,7 +266,8 @@ pub(crate) struct IndexFacts {
     pub(crate) canary_checked: u64,
     pub(crate) canary_mismatches: u64,
     /// The most serious issue the run named (`pair-index-corrupt`, ...), with
-    /// its path and cause on one line. Info-level notes are not issues here.
+    /// its path and cause on one line. Of the info-level notes only
+    /// `pair-index-retired` is kept, when nothing worse was named.
     pub(crate) issue: Option<String>,
     pub(crate) issue_detail: Option<String>,
 }
@@ -279,9 +280,13 @@ impl IndexFacts {
             return None;
         }
         let number = |key: &str| value.get(key).and_then(serde_json::Value::as_u64);
-        let rank = |severity: &str| match severity {
+        // A retired index (bound to another profile, source, remote or NAS)
+        // is safe and info-level, but it explains a slow first run after a
+        // profile is re-created, so it is shown when nothing worse is.
+        let rank = |severity: &str, code: &str| match severity {
             "error" => 3,
             "warning" => 2,
+            "info" if code == "pair-index-retired" => 1,
             _ => 0,
         };
         let worst = value
@@ -291,7 +296,7 @@ impl IndexFacts {
             .flatten()
             .filter_map(|issue| {
                 let code = issue.get("code")?.as_str()?;
-                let severity = rank(issue.get("severity")?.as_str()?);
+                let severity = rank(issue.get("severity")?.as_str()?, code);
                 (severity > 0 && index_issue_token(code)).then(|| {
                     let text = |key: &str| {
                         issue
