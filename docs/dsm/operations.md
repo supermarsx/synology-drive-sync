@@ -144,7 +144,7 @@ holds the run lock, so every routine waits behind it. To make that visible the r
 deliberately throttled run is not called stuck). Those counters follow reads and writes over NFS and
 CIFS too, which block-device counters would miss. `heartbeat_source` is `io`, or `liveness` where the
 kernel hides the counters: a `liveness` record is written **without** an epoch, because it only proves
-the core is alive. A progress record no longer counts as a signal (a batch run has none, and a refresh
+the core is alive. A progress record no longer counts as a signal (a batch run's record restarts per profile, and a refresh
 moves its modification time). If the counters become unreadable during a run the runner logs
 `run_stall_detection_unavailable` once (`warn`, scheduler; `scope=`, `pid=`, `cause=`). The snapshot reports `outcomes.run.heartbeat_epoch` and `stalled`: `true` when the heartbeat is
 more than 30 minutes old (adding the warning token `stalled`), `false` while it is recent, and `null`

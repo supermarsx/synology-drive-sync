@@ -4441,6 +4441,22 @@ api_snapshot() {
     api_load_kv "$controller_state" updated_epoch 0; controller_updated=$kv_value
     case $controller_status in running|stopped) ;; *) api_error corrupt_state "invalid controller state" 73 ;; esac
     case $controller_pid:$controller_next:$controller_active:$controller_updated in *[!0-9:]*) api_error corrupt_state "invalid controller numeric state" 73 ;; esac
+    # The daemon's amber state (fix6 H2): all three lines or none, only while
+    # the service runs degraded. A partial or malformed set is refused, not
+    # served as a snapshot without the amber.
+    api_load_kv_optional "$controller_state" degraded ""; controller_degraded=$kv_value
+    api_load_kv_optional "$controller_state" degraded_since ""; controller_degraded_since=$kv_value
+    api_load_kv_optional "$controller_state" degraded_cause ""; controller_degraded_cause=$kv_value
+    controller_degraded_json=
+    if [ -n "$controller_degraded$controller_degraded_since$controller_degraded_cause" ]; then
+        case $controller_degraded in ''|*[!a-z_]*) api_error corrupt_state "invalid controller degraded reason" 73 ;; esac
+        case $controller_degraded_since in ''|*[!0-9]*) api_error corrupt_state "invalid controller degraded_since" 73 ;; esac
+        [ -n "$controller_degraded_cause" ] || api_error corrupt_state "controller degraded_cause is missing or empty" 73
+        controller_degraded_cause_bytes=$(printf '%s' "$controller_degraded_cause" | wc -c | tr -d ' ')
+        [ "$controller_degraded_cause_bytes" -le 512 ] || api_error corrupt_state "controller degraded_cause exceeds its safe bound" 73
+        controller_degraded_json=$(printf ',"degraded":{"reason":%s,"since_epoch":%s,"cause":%s}' \
+            "$(json_quote "$controller_degraded")" "$controller_degraded_since" "$(json_quote "$controller_degraded_cause")")
+    fi
     api_load_kv "$run_state" state never; run_status=$kv_value
     api_load_kv "$run_state" started_epoch 0; run_started=$kv_value
     api_load_kv "$run_state" finished_epoch 0; run_finished=$kv_value
@@ -4536,8 +4552,9 @@ api_snapshot() {
     {
     printf '"schedule":{"enabled":%s,"interval_seconds":%s,"allow_delete":%s,"max_total_delete":%s},' \
         "$schedule_enabled" "$schedule_interval" "$schedule_delete" "$schedule_max"
-    printf '"controller":{"state":%s,"pid":%s,"next_run_epoch":%s,"active_pid":%s,"updated_epoch":%s},' \
-        "$(json_quote "$controller_status")" "$controller_pid" "$controller_next" "$controller_active" "$controller_updated"
+    printf '"controller":{"state":%s,"pid":%s,"next_run_epoch":%s,"active_pid":%s,"updated_epoch":%s%s},' \
+        "$(json_quote "$controller_status")" "$controller_pid" "$controller_next" "$controller_active" "$controller_updated" \
+        "$controller_degraded_json"
     printf '"run":{"state":%s,"started_epoch":%s,"finished_epoch":%s,"exit_code":' \
         "$(json_quote "$run_status")" "$run_started" "$run_finished"
     if [ "$run_exit" = -1 ]; then printf 'null'; else printf '%s' "$run_exit"; fi

@@ -4172,6 +4172,66 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
         self.assertEqual(corrupt.returncode, 73)
         self.assertIn(corrupt_payload["code"], {"corrupt_state", "unsafe_state"})
 
+    def test_snapshot_carries_the_daemons_degraded_state_and_refuses_a_malformed_set(self) -> None:
+        # fix6-core H2: while the audit reconcile has been failing for more than
+        # 30 s the daemon adds three lines to controller.state, all or none:
+        # degraded=<reason>, degraded_since=<epoch>, degraded_cause=<one line>.
+        # The in-process rung emits "controller":{...,"updated_epoch":N,
+        # "degraded":{"reason","since_epoch","cause"}}; the shell rung serves the
+        # same bytes, and a partial or malformed set is corrupt_state (73), not a
+        # snapshot without the amber.
+        controller_state = self.real_var / "state/controller.state"
+        base = "state=running\npid=111\nnext_run_epoch=0\nactive_pid=0\nupdated_epoch=100\n"
+
+        def write(extra: str) -> None:
+            controller_state.write_text(base + extra, encoding="utf-8")
+            controller_state.chmod(0o600)
+            if os.getuid() == 0:
+                os.chown(controller_state, self.drop_uid, self.drop_gid)
+
+        write("")
+        plain, plain_payload = self.api("snapshot")
+        self.assertEqual(plain.returncode, 0, plain.stdout + plain.stderr)
+        self.assertNotIn("degraded", plain_payload["controller"], plain.stdout)
+        write("degraded=audit_unavailable\ndegraded_since=90\ndegraded_cause=audit outbox: No space left on device\n")
+        amber, amber_payload = self.api("snapshot")
+        self.assertEqual(amber.returncode, 0, amber.stdout + amber.stderr)
+        self.assertEqual(
+            amber_payload["controller"],
+            {
+                "state": "running", "pid": 111, "next_run_epoch": 0, "active_pid": 0, "updated_epoch": 100,
+                "degraded": {
+                    "reason": "audit_unavailable", "since_epoch": 90,
+                    "cause": "audit outbox: No space left on device",
+                },
+            },
+            amber.stdout,
+        )
+        self.assertIn(
+            '"updated_epoch":100,"degraded":{"reason":"audit_unavailable","since_epoch":90,'
+            '"cause":"audit outbox: No space left on device"}}',
+            amber.stdout, "the member is not in the order the in-process rung writes it",
+        )
+        write('degraded=audit_unavailable\ndegraded_since=90\ndegraded_cause=say "quote" and \\back\n')
+        quoted, quoted_payload = self.api("snapshot")
+        self.assertEqual(quoted.returncode, 0, quoted.stdout + quoted.stderr)
+        self.assertEqual(quoted_payload["controller"]["degraded"]["cause"], 'say "quote" and \\back')
+        malformed = {
+            "a partial set": "degraded=audit_unavailable\n",
+            "a cause without a reason": "degraded_since=90\ndegraded_cause=x\n",
+            "an empty cause": "degraded=audit_unavailable\ndegraded_since=90\ndegraded_cause=\n",
+            "a reason with capitals": "degraded=Audit\ndegraded_since=90\ndegraded_cause=x\n",
+            "a non-numeric since": "degraded=audit_unavailable\ndegraded_since=soon\ndegraded_cause=x\n",
+            "a cause over 512 bytes": "degraded=audit_unavailable\ndegraded_since=90\ndegraded_cause=" + "x" * 513 + "\n",
+            "a duplicated reason": "degraded=a\ndegraded=b\ndegraded_since=90\ndegraded_cause=x\n",
+        }
+        for label, extra in malformed.items():
+            with self.subTest(malformed=label):
+                write(extra)
+                refused, refused_payload = self.api("snapshot")
+                self.assertEqual(refused.returncode, 73, refused.stdout + refused.stderr)
+                self.assertEqual(refused_payload["code"], "corrupt_state", refused.stdout)
+
     def test_api_logs_selected_source_and_aggregate_output_are_capture_bounded(self) -> None:
         payload = "x" * 7000
         records = {
@@ -23271,6 +23331,12 @@ fi
             "api_server_unwaitable", "audit_unavailable", "consumer_unkillable",
             "consumer_stderr", "config_unreadable", "event_log_lock_stale",
             "event_log_rotation_failed", "ctl_accept_failed",
+            # fix6: the daemon's, and the lifecycle's own (daemon_lock_probe
+            # names the probe in use; routine_watch_pid_mismatch a wrapped PID).
+            "control_file_unremovable", "event_log_rotation_deferred", "profile_state_unreadable",
+            "config_forgotten", "service_degraded", "service_degraded_cleared",
+            "api_server_respawn_held", "api_server_respawn_released",
+            "api_server_identity_unavailable", "daemon_lock_probe", "routine_watch_pid_mismatch",
         ]
         helper = self.root / "daemon-events-helper.sh"
         helper.write_text(
