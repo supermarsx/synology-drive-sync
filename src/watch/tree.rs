@@ -612,11 +612,9 @@ impl TreeWatch {
     /// when its call returns, if it ever does, and releases what it armed.
     fn walk_bounded(&self, starts: Vec<Start>, already: u64) -> Result<Vec<Walked>, WatchError> {
         // H9: abandoned walks are capped process-wide, shared with the daemon's other walks.
-        let slot = super::walk_slot().map_err(|live| WatchError::Setup {
+        let slot = super::walk_slot().map_err(|live| WatchError::WalkCap {
             path: self.root.clone(),
-            detail: format!(
-                "{live} earlier directory walks are still blocked in the filesystem; not starting another"
-            ),
+            live,
         })?;
         let (sender, receiver) = mpsc::channel();
         let cancel = Arc::new(AtomicBool::new(false));

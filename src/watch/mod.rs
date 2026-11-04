@@ -51,6 +51,19 @@ impl Drop for WalkSlot {
     }
 }
 
+/// Why a walk was refused a place: the cap is the process's, not a verdict on the filesystem.
+///
+/// The old wording said the earlier walks were "still blocked in the filesystem", which was false
+/// whenever more than [`MAX_LIVE_WALKS`] routines armed at once: those walks are healthy and
+/// short-lived, and a retry a few seconds later succeeds.
+pub fn walk_cap_refusal(live: usize) -> String {
+    format!(
+        "the process-wide cap of {MAX_LIVE_WALKS} concurrent directory walks is reached \
+         ({live} live: other routines are arming or walking, or walks abandoned on a stalled \
+         disk have not returned); this walk was not started"
+    )
+}
+
 /// A place for one more directory walk, or `Err(live)` when [`MAX_LIVE_WALKS`] are live.
 pub fn walk_slot() -> Result<WalkSlot, usize> {
     let live = LIVE_WALKS.fetch_add(1, Ordering::SeqCst);
@@ -118,6 +131,9 @@ pub enum WatchError {
     Deadline { path: PathBuf, deadline: Duration },
     /// A directory could not be watched or listed.
     Setup { path: PathBuf, detail: String },
+    /// The process-wide cap on concurrent walks ([`MAX_LIVE_WALKS`]) was reached, so no walk
+    /// was started. Transient by nature: the caller retries soon, not after a long backoff.
+    WalkCap { path: PathBuf, live: usize },
     /// The event marker could not be written.
     Output(String),
 }
@@ -146,6 +162,7 @@ impl WatchError {
             | Self::Rules(_)
             | Self::Deadline { .. }
             | Self::Setup { .. }
+            | Self::WalkCap { .. }
             | Self::Output(_) => "watch_setup_failed",
         }
     }
@@ -158,6 +175,7 @@ impl WatchError {
             Self::SourceMissing { .. } | Self::SourceGone { .. } => 66,
             Self::Unavailable(_) => 69,
             Self::Setup { .. } => 71,
+            Self::WalkCap { .. } => 75,
             Self::Deadline { .. } => 72,
             Self::Limit(_) => 73,
             Self::Output(_) => 74,
@@ -219,6 +237,12 @@ impl fmt::Display for WatchError {
             Self::Setup { path, detail } => {
                 write!(formatter, "{reason}: {detail}; path={}", path.display())
             }
+            Self::WalkCap { path, live } => write!(
+                formatter,
+                "{reason} walk_cap: {}; path={}",
+                walk_cap_refusal(*live),
+                path.display()
+            ),
             Self::Output(detail) => write!(formatter, "{reason} output: {detail}"),
         }
     }
@@ -579,6 +603,10 @@ mod tests {
             WatchError::Setup {
                 path: "/s".into(),
                 detail: "x".into(),
+            },
+            WatchError::WalkCap {
+                path: "/s".into(),
+                live: 16,
             },
             WatchError::Output("x".into()),
         ];
