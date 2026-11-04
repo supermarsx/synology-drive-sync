@@ -20772,12 +20772,18 @@ fi
         api_socket.chmod(0o000)
         if os.getuid() == 0:
             os.chown(api_socket, self.drop_uid, self.drop_gid)
-        self.assertEqual(self.shell(self.lifecycle, "status").returncode, 2)
-        refused_orphan = self.shell(self.lifecycle, "start")
-        self.assertEqual(refused_orphan.returncode, 1, refused_orphan.stderr)
-        self.assertTrue(stat.S_ISSOCK(api_socket.lstat().st_mode))
-        self.assertEqual(api_socket.lstat().st_mode & 0o7777, 0o000)
-        api_socket.unlink()
+        # A prepared socket with no api.pid is recoverable once nothing can own
+        # it: no api.pid, nobody holding daemon.lock. It is then stale -- status
+        # reports it (1), start removes it by name and goes on -- where it used
+        # to be inconsistent for good. A live api.pid or a held lock keeps the
+        # refusal (test_a_prepared_api_socket_is_kept_while_a_daemon_or_an_api_server_may_own_it).
+        self.assertEqual(self.shell(self.lifecycle, "status").returncode, 1)
+        recovered_orphan = self.shell(self.lifecycle, "start", timeout=60)
+        self.assertEqual(recovered_orphan.returncode, 0, recovered_orphan.stdout + recovered_orphan.stderr)
+        self.assertIn(f"removed stale API socket {self.fhs / 'var/run/api.sock'}", recovered_orphan.stdout)
+        stopped_orphan = self.shell(self.lifecycle, "stop", timeout=60)
+        self.assertEqual(stopped_orphan.returncode, 0, stopped_orphan.stdout + stopped_orphan.stderr)
+        self.assertFalse(api_socket.exists())
 
         api_pid_file = self.real_var / "run/api.pid"
         api_pid_file.symlink_to(outside)
