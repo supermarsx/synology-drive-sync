@@ -132,6 +132,15 @@ lists its own commits.
 
 ## DSM package
 
+- **Saving the performance level works again.** `sdsync-dsm configure-performance` (and the dashboard's
+  performance setting) failed every time with exit `73`, `mandatory audit outbox could not be
+  prepared`, before it changed anything: the bridge did not accept the `performance-policy` audit
+  operation the manager records. It now does, filed under the configuration category, and a test checks
+  that the bridge accepts every operation the manager can audit.
+- **The realtime watcher honours a profile's excludes.** The watcher read `excludes` from the top of the
+  profile fragment, but the manager writes the profile as a `[profiles.<name>]` table, so it found none
+  and a change to an excluded path raised an event and started a run that had nothing to do. It reads
+  the profile's own table now (a fragment holding two profiles is refused by name, not guessed at).
 - **`sdsync-dsm resync` runs again.** The previous release shipped it unable to start: every resync,
   a plan or a `--confirm`, from the command line or from the dashboard, stopped with `mandatory audit
   execution phase could not be recorded` (exit `64`) before the engine ran, and nothing was uploaded.
