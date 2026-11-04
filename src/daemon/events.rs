@@ -142,14 +142,61 @@ pub(crate) struct FileSink {
     controller_log: PathBuf,
     activity_log: PathBuf,
     lock: Mutex<()>,
+    /// The shell's `var/run/event-log.lock`, taken around a rotation so a
+    /// shell writer (sdsync-dsm, still appending to activity.log) and the
+    /// daemon never rotate the same set at once.
+    event_lock: PathBuf,
+    /// `var/state/log-rotation.failed`, the shell's marker for a rotation that
+    /// could not be made (the line is still appended).
+    rotation_marker: PathBuf,
 }
+
+/// Every daemon sink rotates under this, whichever instance it is.
+static ROTATION: Mutex<()> = Mutex::new(());
+
+/// How long a rotation waits for the shell's event-log lock (the shell's own
+/// bound: ten one-second tries).
+const EVENT_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
 
 impl FileSink {
     pub(crate) fn new(log_root: &Path) -> Self {
+        let var = log_root.parent().unwrap_or(log_root);
         Self {
             controller_log: log_root.join("controller.log"),
             activity_log: log_root.join("activity.log"),
             lock: Mutex::new(()),
+            event_lock: var.join("run/event-log.lock"),
+            rotation_marker: var.join("state/log-rotation.failed"),
+        }
+    }
+
+    /// Rotate under the shell's event-log lock. A rotation that cannot be made
+    /// keeps the line (appended past the limit, as the shell does) and leaves
+    /// the shell's marker naming the file and the cause.
+    fn rotate_locked(&self, path: &Path, keep: usize) {
+        let _all = ROTATION.lock();
+        // The guard lives until the rotation is done, then releases the lock.
+        let outcome = event_lock::take(&self.event_lock, EVENT_LOCK_WAIT)
+            .and_then(|_guard| rotate(path, keep).map_err(|error| format!("rotate: {error}")));
+        match outcome {
+            Ok(()) => {
+                let _ = fs::remove_file(&self.rotation_marker);
+            }
+            Err(cause) => {
+                let epoch = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|age| age.as_secs())
+                    .unwrap_or(0);
+                let _ = super::state::atomic_write(
+                    &self.rotation_marker,
+                    format!(
+                        "epoch={epoch}\npath={}\ncause={}\n",
+                        path.display(),
+                        one_line(&cause)
+                    )
+                    .as_bytes(),
+                );
+            }
         }
     }
 
@@ -169,7 +216,7 @@ impl FileSink {
                 ));
             }
             if metadata.len() >= limit {
-                rotate(path, keep).map_err(|error| named("rotate", error))?;
+                self.rotate_locked(path, keep);
             }
         }
         let mut options = OpenOptions::new();
@@ -185,6 +232,99 @@ impl FileSink {
         // One write: O_APPEND keeps concurrent lines whole.
         file.write_all(record.as_bytes())
             .map_err(|error| named("write", error))
+    }
+}
+
+/// The shell's private lock directory (`acquire_event_log_lock`): `mkdir`,
+/// then a `pid` file of pid, start tick and boot id; only `pid` inside it.
+#[cfg(target_os = "linux")]
+mod event_lock {
+    use std::fs;
+    use std::io::Write as _;
+    use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+    use std::path::{Path, PathBuf};
+    use std::time::{Duration, Instant};
+
+    pub(super) struct Guard(PathBuf);
+
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            let _ = fs::remove_file(self.0.join("pid"));
+            let _ = fs::remove_dir(&self.0);
+        }
+    }
+
+    /// A lock whose `pid` names a process that is gone (three well-formed
+    /// lines, this boot or another): safe to clear. Anything else (a live
+    /// owner, a torn record a shell writer is still filling in) is waited for.
+    fn stale(lock: &Path) -> bool {
+        let Ok(text) = fs::read_to_string(lock.join("pid")) else {
+            return false;
+        };
+        let lines: Vec<&str> = text.lines().collect();
+        lines.len() == 3
+            && lines[0].parse::<u32>().is_ok_and(|pid| pid > 1)
+            && lines[1].parse::<u64>().is_ok()
+            && super::super::state::private_lock_owner(lock).is_none()
+    }
+
+    pub(super) fn take(lock: &Path, wait: Duration) -> Result<Guard, String> {
+        let deadline = Instant::now() + wait;
+        loop {
+            match fs::DirBuilder::new().mode(0o700).create(lock) {
+                Ok(()) => {
+                    let pid = std::process::id();
+                    let start = super::super::super::linux_files::process_start(pid).unwrap_or(0);
+                    let boot =
+                        fs::read_to_string("/proc/sys/kernel/random/boot_id").unwrap_or_default();
+                    let written = fs::OpenOptions::new()
+                        .write(true)
+                        .create_new(true)
+                        .mode(0o600)
+                        .open(lock.join("pid"))
+                        .and_then(|mut file| {
+                            file.write_all(format!("{pid}\n{start}\n{}\n", boot.trim()).as_bytes())
+                        });
+                    return match written {
+                        Ok(()) => Ok(Guard(lock.to_owned())),
+                        Err(error) => {
+                            let _ = fs::remove_file(lock.join("pid"));
+                            let _ = fs::remove_dir(lock);
+                            Err(format!("{}: {error}", lock.display()))
+                        }
+                    };
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                    if stale(lock) {
+                        let _ = fs::remove_file(lock.join("pid"));
+                        let _ = fs::remove_dir(lock);
+                        continue;
+                    }
+                }
+                Err(error) => return Err(format!("{}: {error}", lock.display())),
+            }
+            if Instant::now() >= deadline {
+                return Err(format!(
+                    "{} was held for more than {} s",
+                    lock.display(),
+                    wait.as_secs()
+                ));
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+}
+
+/// Without the shell (tests on other platforms) there is no shell writer.
+#[cfg(not(target_os = "linux"))]
+mod event_lock {
+    use std::path::Path;
+    use std::time::Duration;
+
+    pub(super) struct Guard;
+
+    pub(super) fn take(_: &Path, _: Duration) -> Result<Guard, String> {
+        Ok(Guard)
     }
 }
 
@@ -282,6 +422,53 @@ mod tests {
         assert_eq!(value["event"], "run_stalled");
         assert_eq!(value["detail"], "profile=a phase=scan");
         assert!(!line.contains('\n'));
+    }
+
+    /// The shell's event-log lock: a live holder is waited for and named when
+    /// it outlasts the wait; a dead holder's lock is cleared; the lock is the
+    /// shell's shape (a directory holding only `pid`) and is released.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_event_log_lock_is_the_shells_and_never_stolen() {
+        use std::time::Duration;
+        let dir = std::env::temp_dir().join(format!("sdsyncd-evlock-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let lock = dir.join("event-log.lock");
+        let boot = fs::read_to_string("/proc/sys/kernel/random/boot_id").unwrap();
+        let mut holder = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let start = super::super::super::linux_files::process_start(holder.id()).unwrap();
+        fs::create_dir_all(&lock).unwrap();
+        fs::write(
+            lock.join("pid"),
+            format!("{}\n{start}\n{}\n", holder.id(), boot.trim()),
+        )
+        .unwrap();
+        let error = match event_lock::take(&lock, Duration::from_millis(300)) {
+            Ok(_) => panic!("a live holder's lock was taken"),
+            Err(error) => error,
+        };
+        assert!(error.contains("held for more than"), "{error}");
+        let _ = holder.kill();
+        let _ = holder.wait();
+        {
+            let _guard = event_lock::take(&lock, Duration::from_secs(2)).unwrap();
+            let names: Vec<_> = fs::read_dir(&lock)
+                .unwrap()
+                .map(|e| e.unwrap().file_name())
+                .collect();
+            assert_eq!(names, ["pid"]);
+            let pid = fs::read_to_string(lock.join("pid")).unwrap();
+            assert!(
+                pid.starts_with(&format!("{}\n", std::process::id())),
+                "{pid}"
+            );
+        }
+        assert!(!lock.exists(), "released");
+        let _ = fs::remove_dir_all(&dir);
     }
 
     /// I-14: rotation renames whole files and never drops a line.
