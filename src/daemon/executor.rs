@@ -118,9 +118,13 @@ impl AuditStep {
             .begin(self.operation, &self.scope, self.origin)
             .map_err(|cause| format!("the run's audit could not be opened: {cause}"))?;
         if let Err(cause) = self.audit.execute(&transaction) {
-            let _ = self.audit.complete(&transaction, "failed");
+            // S3-7: a completion that fails too is part of the cause.
+            let completed = match self.audit.complete(&transaction, "failed") {
+                Ok(()) => String::new(),
+                Err(also) => format!("; completing it as failed failed too: {also}"),
+            };
             return Err(format!(
-                "the run's audit could not record its start: {cause}"
+                "the run's audit could not record its start: {cause}{completed}"
             ));
         }
         Ok(transaction)
@@ -716,10 +720,38 @@ mod process {
                 last_phase: None,
             })));
         };
+        // H8: a cancel or stop that arrived before the core is spawned is
+        // honoured then: the core never starts.
+        let stopped_before_start = |requests: &mpsc::Receiver<StopCause>| match requests.try_recv()
+        {
+            Ok(cause) => Some(cause),
+            Err(mpsc::TryRecvError::Disconnected) => Some(StopCause::Shutdown),
+            Err(mpsc::TryRecvError::Empty) => None,
+        };
+        let never_started = |cause: StopCause| {
+            sink(ExecEvent::Finished(Box::new(RunReport {
+                exit: 130,
+                ending: Ending::Stopped {
+                    cause,
+                    forced: false,
+                },
+                stderr_tail: Vec::new(),
+                records: Vec::new(),
+                record_error: None,
+                oom_proven: None,
+                memory_note: None,
+                audit_error: None,
+                last_phase: None,
+            })));
+        };
         if let Some(PreflightStep(check)) = &spec.preflight
             && let Err((reason, cause)) = check()
         {
             refused(reason, cause);
+            return;
+        }
+        if let Some(cause) = stopped_before_start(&requests) {
+            never_started(cause);
             return;
         }
         // I-7: the audit is opened before the core starts; a run whose audit
@@ -749,8 +781,29 @@ mod process {
             if let (Some(step), Some(transaction)) = (&spec.audit, &transaction) {
                 report.audit_error = step.close(transaction, &report);
             }
+            // The progress record is the run's own; it goes with it.
+            if let Some(path) = &spec.progress_record {
+                let _ = fs::remove_file(path);
+            }
             sink(ExecEvent::Finished(Box::new(report)));
         };
+        // H8: the audit is open; a stop that came meanwhile still ends the run
+        // before the core starts (the audit is completed as failed).
+        if let Some(cause) = stopped_before_start(&requests) {
+            finished(
+                130,
+                Ending::Stopped {
+                    cause,
+                    forced: false,
+                },
+                Vec::new(),
+                Vec::new(),
+                None,
+                None,
+                None,
+            );
+            return;
+        }
         let mut command = Command::new(&spec.program);
         command
             .args(&spec.args)
@@ -1081,6 +1134,43 @@ mod process {
                 origin: crate::dsm_api::daemon::audit::AuditOrigin::Scheduler,
             });
             (spec, audit)
+        }
+
+        /// H8: a cancel or stop that arrives while the preflight (or the audit)
+        /// runs is honoured before the core is spawned: the core never starts,
+        /// and the run ends as stopped at once rather than as an unkillable
+        /// core the shutdown waited for.
+        #[test]
+        fn a_stop_during_preflight_never_spawns_the_core() {
+            let dir = scratch("stop-preflight");
+            let marker = dir.join("ran");
+            let mut spec = sh(&format!("touch {}", marker.display()), fast());
+            spec.preflight = Some(PreflightStep(Arc::new(|| {
+                thread::sleep(Duration::from_millis(400));
+                Ok(())
+            })));
+            let (handle, events) = run(spec);
+            thread::sleep(Duration::from_millis(100));
+            handle.stop(StopCause::Cancel);
+            let (report, seen) = finish(&events, Duration::from_secs(10));
+            assert!(
+                matches!(
+                    report.ending,
+                    Ending::Stopped {
+                        cause: StopCause::Cancel,
+                        forced: false
+                    }
+                ),
+                "{:?}",
+                report.ending
+            );
+            assert!(
+                !seen.iter().any(|e| matches!(e, ExecEvent::Started { .. })),
+                "{seen:?}"
+            );
+            thread::sleep(Duration::from_millis(200));
+            assert!(!marker.exists(), "the core was spawned after the stop");
+            let _ = fs::remove_dir_all(&dir);
         }
 
         /// I-7: the audit is opened before the core starts and completed with

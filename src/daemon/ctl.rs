@@ -11,34 +11,48 @@
 //! {"verb":"mutate","op":"configure-profile","profile":"photos","args":[...]}
 //! ```
 //!
-//! Every wait is bounded: a connection that sends nothing is dropped after its
-//! read deadline, and a control thread that does not answer in time yields a
-//! named `daemon_busy` rather than a hang. Linux only.
+//! Every wait is bounded: a connection has one deadline for its whole request
+//! line (a client trickling bytes is cut at it, H5), a client connect has a
+//! timeout, and a control thread that does not answer in time yields a named
+//! `daemon_busy` rather than a hang. Long verbs (`wait`, `mutate`, `stop`) have
+//! slots of their own, so CLI waiters never leave `ping` or `status` without
+//! one (F6s). Linux only.
 
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::Sender;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 
 use super::control::{Msg, Mutation, Request, ask};
-use super::routines::{Action, valid_name};
+use super::routines::{Action, Level, valid_name};
 use super::sys;
+
+/// Where the listener's own failures go: level, event, detail.
+pub(crate) type CtlLog = Arc<dyn Fn(Level, &'static str, String) + Send + Sync>;
 
 /// The largest request line accepted.
 const MAX_REQUEST_BYTES: u64 = 64 * 1024;
-/// How long a client has to send its request.
+/// How long a client has to send its whole request line.
 const READ_DEADLINE: Duration = Duration::from_secs(5);
 /// How long a quick verb may wait for the control thread.
 const ANSWER_DEADLINE: Duration = Duration::from_secs(5);
 /// Connections served at once; more are refused by name.
-const MAX_CONNECTIONS: usize = 16;
+const MAX_CONNECTIONS: usize = 32;
+/// Of those, how many may be long verbs waiting on the control thread
+/// (`wait`, `mutate`, `stop`); the rest stay free for quick ones (F6s).
+const MAX_LONG_REQUESTS: usize = 16;
+/// How long a client waits for its connection to be accepted.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+/// After a failed accept (EMFILE, ENFILE, ENOMEM), the listener pauses this
+/// long instead of spinning (S3-4).
+const ACCEPT_BACKOFF: Duration = Duration::from_millis(200);
 
 /// Parse one request line into a control request and its answer deadline.
 pub(crate) fn parse_request(
@@ -135,7 +149,57 @@ fn answer(stream: &mut UnixStream, value: &Value) {
     let _ = stream.write_all(line.as_bytes());
 }
 
-fn serve(mut stream: UnixStream, uid: u32, tx: &Sender<Msg>, mutation_deadline: Duration) {
+/// A verb that waits on the control thread for long.
+fn is_long(request: &Request) -> bool {
+    matches!(
+        request,
+        Request::Wait { .. } | Request::Mutate(_) | Request::Stop
+    )
+}
+
+/// Read one request line within one deadline for the whole line (H5): each
+/// read gets only what is left of it. `Ok("")` at end of input.
+fn read_request_line(stream: &mut UnixStream, within: Duration) -> io::Result<String> {
+    let deadline = Instant::now() + within;
+    let mut bytes = Vec::new();
+    let mut chunk = [0_u8; 4096];
+    loop {
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return Err(io::Error::new(io::ErrorKind::TimedOut, "request deadline"));
+        }
+        stream.set_read_timeout(Some(left))?;
+        let read = match stream.read(&mut chunk) {
+            Ok(read) => read,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error),
+        };
+        if read == 0 {
+            break;
+        }
+        if let Some(end) = chunk[..read].iter().position(|b| *b == b'\n') {
+            bytes.extend_from_slice(&chunk[..end]);
+            break;
+        }
+        bytes.extend_from_slice(&chunk[..read]);
+        if bytes.len() as u64 > MAX_REQUEST_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("the request is over {MAX_REQUEST_BYTES} bytes"),
+            ));
+        }
+    }
+    String::from_utf8(bytes)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "the request is not UTF-8"))
+}
+
+fn serve(
+    mut stream: UnixStream,
+    uid: u32,
+    tx: &Sender<Msg>,
+    mutation_deadline: Duration,
+    long: &AtomicUsize,
+) {
     match sys::peer_uid(&stream) {
         Ok(peer) if peer == uid => {}
         Ok(peer) => {
@@ -153,16 +217,24 @@ fn serve(mut stream: UnixStream, uid: u32, tx: &Sender<Msg>, mutation_deadline: 
             return;
         }
     }
-    let _ = stream.set_read_timeout(Some(READ_DEADLINE));
     let _ = stream.set_write_timeout(Some(READ_DEADLINE));
-    let mut line = String::new();
-    let read = match stream.try_clone() {
-        Ok(reader) => BufReader::new(reader.take(MAX_REQUEST_BYTES)).read_line(&mut line),
-        Err(error) => Err(error),
-    };
-    let reply = match read {
-        Ok(0) => json!({"ok": false, "code": "empty_request", "detail": "no request line"}),
-        Ok(_) => match parse_request(line.trim_end(), mutation_deadline) {
+    let reply = match read_request_line(&mut stream, READ_DEADLINE) {
+        Ok(line) if line.trim().is_empty() => {
+            json!({"ok": false, "code": "empty_request", "detail": "no request line"})
+        }
+        Ok(line) => match parse_request(line.trim_end(), mutation_deadline) {
+            Ok((request, deadline)) if is_long(&request) => {
+                if long.fetch_add(1, Ordering::SeqCst) >= MAX_LONG_REQUESTS {
+                    long.fetch_sub(1, Ordering::SeqCst);
+                    json!({"ok": false, "code": "ctl_busy", "detail": format!(
+                        "{MAX_LONG_REQUESTS} long requests (wait, mutate, stop) are already waiting"
+                    )})
+                } else {
+                    let reply = ask(tx, request, deadline);
+                    long.fetch_sub(1, Ordering::SeqCst);
+                    reply
+                }
+            }
             Ok((request, deadline)) => ask(tx, request, deadline),
             Err(detail) => json!({"ok": false, "code": "bad_request", "detail": detail}),
         },
@@ -172,7 +244,7 @@ fn serve(mut stream: UnixStream, uid: u32, tx: &Sender<Msg>, mutation_deadline: 
                 io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
             ) =>
         {
-            json!({"ok": false, "code": "request_timeout", "detail": "no request within 5 s"})
+            json!({"ok": false, "code": "request_timeout", "detail": "no whole request line within 5 s"})
         }
         Err(error) => json!({"ok": false, "code": "bad_request", "detail": error.to_string()}),
     };
@@ -186,6 +258,7 @@ pub(crate) fn listen(
     uid: u32,
     tx: Sender<Msg>,
     mutation_deadline: Duration,
+    log: CtlLog,
 ) -> io::Result<thread::JoinHandle<()>> {
     match std::fs::symlink_metadata(path) {
         Ok(_) => std::fs::remove_file(path)?,
@@ -195,12 +268,45 @@ pub(crate) fn listen(
     let listener = UnixListener::bind(path)?;
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
     let busy = Arc::new(AtomicUsize::new(0));
+    let long = Arc::new(AtomicUsize::new(0));
+    let socket = path.to_path_buf();
     thread::Builder::new()
         .name("sdsyncd-ctl".into())
         .spawn(move || {
+            // S3-4: an accept or spawn failure is named once per episode and
+            // the listener pauses rather than spinning on it.
+            let accept_failing = AtomicBool::new(false);
+            let spawn_failing = AtomicBool::new(false);
             for stream in listener.incoming() {
-                let Ok(mut stream) = stream else { continue };
+                let mut stream = match stream {
+                    Ok(stream) => {
+                        if accept_failing.swap(false, Ordering::SeqCst) {
+                            log(
+                                Level::Info,
+                                "ctl_accept_recovered",
+                                format!("path={}", socket.display()),
+                            );
+                        }
+                        stream
+                    }
+                    Err(error) => {
+                        if !accept_failing.swap(true, Ordering::SeqCst) {
+                            log(
+                                Level::Error,
+                                "ctl_accept_failed",
+                                format!(
+                                    "path={} cause={error} retry_ms={}",
+                                    socket.display(),
+                                    ACCEPT_BACKOFF.as_millis()
+                                ),
+                            );
+                        }
+                        thread::sleep(ACCEPT_BACKOFF);
+                        continue;
+                    }
+                };
                 if busy.load(Ordering::SeqCst) >= MAX_CONNECTIONS {
+                    let _ = stream.set_write_timeout(Some(READ_DEADLINE));
                     answer(
                         &mut stream,
                         &json!({"ok": false, "code": "ctl_busy", "detail": "too many connections"}),
@@ -210,14 +316,39 @@ pub(crate) fn listen(
                 busy.fetch_add(1, Ordering::SeqCst);
                 let tx = tx.clone();
                 let counter = Arc::clone(&busy);
+                let long = Arc::clone(&long);
+                let refused = stream.try_clone();
                 let spawned = thread::Builder::new()
                     .name("sdsyncd-ctl-conn".into())
                     .spawn(move || {
-                        serve(stream, uid, &tx, mutation_deadline);
+                        serve(stream, uid, &tx, mutation_deadline, &long);
                         counter.fetch_sub(1, Ordering::SeqCst);
                     });
-                if spawned.is_err() {
-                    busy.fetch_sub(1, Ordering::SeqCst);
+                match spawned {
+                    Ok(_) => {
+                        spawn_failing.store(false, Ordering::SeqCst);
+                    }
+                    Err(error) => {
+                        busy.fetch_sub(1, Ordering::SeqCst);
+                        if !spawn_failing.swap(true, Ordering::SeqCst) {
+                            log(
+                                Level::Error,
+                                "ctl_accept_failed",
+                                format!(
+                                    "path={} cause=a connection thread could not start: {error}",
+                                    socket.display()
+                                ),
+                            );
+                        }
+                        if let Ok(mut stream) = refused {
+                            let _ = stream.set_write_timeout(Some(READ_DEADLINE));
+                            answer(
+                                &mut stream,
+                                &json!({"ok": false, "code": "ctl_busy", "detail": format!("no thread to serve it: {error}")}),
+                            );
+                        }
+                        thread::sleep(ACCEPT_BACKOFF);
+                    }
                 }
             }
         })
@@ -225,8 +356,11 @@ pub(crate) fn listen(
 
 /// The client side: send one request, wait at most `deadline` for the reply.
 pub(crate) fn request(path: &Path, request: &Value, deadline: Duration) -> Result<Value, String> {
-    let mut stream = UnixStream::connect(path)
-        .map_err(|error| format!("cannot connect to {}: {error}", path.display()))?;
+    // A connect is bounded too: a listener whose backlog is full would hold a
+    // blocking connect (H5).
+    let mut stream =
+        super::super::linux_socket::connect_with_timeout(path, CONNECT_TIMEOUT.min(deadline))
+            .map_err(|error| format!("cannot connect to {}: {error}", path.display()))?;
     stream
         .set_read_timeout(Some(deadline))
         .and_then(|()| stream.set_write_timeout(Some(deadline)))
@@ -372,7 +506,14 @@ mod tests {
                 }
             }
         });
-        listen(&path, sys::geteuid(), tx, Duration::from_secs(1)).unwrap();
+        listen(
+            &path,
+            sys::geteuid(),
+            tx,
+            Duration::from_secs(1),
+            Arc::new(|_, _, _| {}),
+        )
+        .unwrap();
         let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600);
         let start = Instant::now();
@@ -389,6 +530,109 @@ mod tests {
         let mut text = String::new();
         BufReader::new(&mut silent).read_line(&mut text).unwrap();
         assert!(text.contains("request_timeout"), "{text}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A stand-in control thread: answers pings at once and holds every other
+    /// request's reply (a CLI `wait` on a long run).
+    fn holding_control() -> Sender<Msg> {
+        let (tx, rx) = mpsc::channel::<Msg>();
+        thread::spawn(move || {
+            let mut held = Vec::new();
+            for message in rx {
+                if let Msg::Ctl(request, reply) = message {
+                    if request == Request::Ping {
+                        let _ = reply.send(json!({"ok": true, "pong": true}));
+                    } else {
+                        held.push(reply);
+                    }
+                }
+            }
+        });
+        tx
+    }
+
+    fn socket_dir(label: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("sdsyncd-ctl-{label}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn quiet_log() -> CtlLog {
+        Arc::new(|_, _, _| {})
+    }
+
+    /// H5: the request deadline is one per connection, not one per read: a
+    /// client trickling a byte a second is cut at the deadline, not served
+    /// for as long as it keeps trickling.
+    #[test]
+    fn a_trickling_client_is_cut_at_one_deadline() {
+        let dir = socket_dir("trickle");
+        let path = dir.join("ctl.sock");
+        listen(
+            &path,
+            sys::geteuid(),
+            holding_control(),
+            Duration::from_secs(1),
+            quiet_log(),
+        )
+        .unwrap();
+        let mut slow = UnixStream::connect(&path).unwrap();
+        slow.set_read_timeout(Some(Duration::from_millis(100)))
+            .unwrap();
+        let started = Instant::now();
+        let mut answered = String::new();
+        while started.elapsed() < Duration::from_secs(12) {
+            let mut chunk = [0_u8; 512];
+            match slow.read(&mut chunk) {
+                Ok(0) => break,
+                Ok(n) => {
+                    answered.push_str(&String::from_utf8_lossy(&chunk[..n]));
+                    break;
+                }
+                Err(_) => {}
+            }
+            // One byte a second: each read on the server side succeeds well
+            // within its own timeout.
+            let _ = slow.write_all(b" ");
+            thread::sleep(Duration::from_millis(900));
+        }
+        let took = started.elapsed();
+        assert!(
+            took < READ_DEADLINE + Duration::from_secs(2),
+            "served for {took:?}"
+        );
+        assert!(answered.contains("request_timeout"), "{answered:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// F6s: CLI waiters cannot take every slot: ping (and status, stop)
+    /// still answer while the long verbs wait.
+    #[test]
+    fn ping_answers_while_waiters_hold_their_slots() {
+        let dir = socket_dir("waiters");
+        let path = dir.join("ctl.sock");
+        listen(
+            &path,
+            sys::geteuid(),
+            holding_control(),
+            Duration::from_secs(1),
+            quiet_log(),
+        )
+        .unwrap();
+        let mut waiters = Vec::new();
+        for _ in 0..20 {
+            let mut stream = UnixStream::connect(&path).unwrap();
+            stream
+                .write_all(b"{\"verb\":\"wait\",\"id\":1,\"wait_s\":60}\n")
+                .unwrap();
+            waiters.push(stream);
+        }
+        thread::sleep(Duration::from_millis(300));
+        let reply = request(&path, &json!({"verb":"ping"}), Duration::from_secs(5)).unwrap();
+        assert_eq!(reply["pong"], true, "{reply}");
+        drop(waiters);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

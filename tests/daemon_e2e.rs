@@ -432,25 +432,25 @@ fn launch_returns_when_ready_and_a_clean_stop_ends_the_supervisor() {
     );
     assert!(start.elapsed() < Duration::from_secs(30));
     assert_eq!(package.ask(json!({"verb": "ping"}))["ok"], true);
-    let pid: u32 = fs::read_to_string(package.p("var/run/daemon.pid"))
-        .unwrap()
-        .trim()
-        .parse()
-        .unwrap();
-    assert!(launch().status.success(), "start is idempotent");
-    assert_eq!(
+    // daemon.pid: pid, start tick, boot id (line 1 is what PID readers take).
+    let first_line = || {
         fs::read_to_string(package.p("var/run/daemon.pid"))
-            .unwrap()
-            .trim(),
-        pid.to_string()
-    );
+            .unwrap_or_default()
+            .lines()
+            .next()
+            .unwrap_or_default()
+            .to_owned()
+    };
+    let pid: u32 = first_line().parse().unwrap();
+    assert!(launch().status.success(), "start is idempotent");
+    assert_eq!(first_line(), pid.to_string());
     // A crash is restarted by the supervisor and named.
     crash(pid);
     let deadline = Instant::now() + Duration::from_secs(20);
     loop {
-        let now_pid = fs::read_to_string(package.p("var/run/daemon.pid")).unwrap_or_default();
-        if !now_pid.trim().is_empty()
-            && now_pid.trim() != pid.to_string()
+        let now_pid = first_line();
+        if !now_pid.is_empty()
+            && now_pid != pid.to_string()
             && package.try_ask(&json!({"verb": "ping"})).is_some()
         {
             break;
@@ -522,4 +522,302 @@ fn a_clean_run_is_recorded_like_the_shell_runner_did() {
         "{activity}"
     );
     package.stop(Duration::from_secs(5));
+}
+
+// ---------------------------------------------------------------- fix5: records and the supervisor
+
+fn launch_command(package: &Package, core: &Path) -> Command {
+    let mut command = Command::new(DAEMON);
+    command
+        .arg("--launch-daemon")
+        .args(["--home".as_ref(), package.p("home").as_os_str()])
+        .args(["--var".as_ref(), package.p("var").as_os_str()])
+        .args(["--core".as_ref(), core.as_os_str()])
+        .env("PATH", "/usr/bin:/bin");
+    command
+}
+
+/// The parent of `pid` from /proc, when it is a `--supervise` process.
+fn supervisor_of(pid: u32) -> Option<u32> {
+    let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let ppid: u32 = stat
+        .rsplit_once(") ")?
+        .1
+        .split_whitespace()
+        .nth(1)?
+        .parse()
+        .ok()?;
+    let cmdline = fs::read(format!("/proc/{ppid}/cmdline")).ok()?;
+    cmdline
+        .split(|b| *b == 0)
+        .any(|arg| arg == b"--supervise")
+        .then_some(ppid)
+}
+
+/// Live and not a zombie.
+fn process_live(pid: u32) -> bool {
+    fs::read_to_string(format!("/proc/{pid}/stat")).is_ok_and(|stat| {
+        stat.rsplit_once(") ")
+            .and_then(|(_, rest)| rest.split_whitespace().next())
+            .is_some_and(|state| !matches!(state, "Z" | "X" | "x"))
+    })
+}
+
+fn identity_lines(path: &Path) -> Vec<String> {
+    fs::read_to_string(path)
+        .unwrap_or_default()
+        .lines()
+        .map(str::to_owned)
+        .collect()
+}
+
+/// Every live `--supervise` process whose arguments name `var`.
+fn supervisors_of_tree(var: &Path) -> Vec<u32> {
+    let var = var.display().to_string();
+    fs::read_dir("/proc")
+        .unwrap()
+        .flatten()
+        .filter_map(|e| e.file_name().to_str()?.parse::<u32>().ok())
+        .filter(|pid| {
+            process_live(*pid)
+                && fs::read(format!("/proc/{pid}/cmdline")).is_ok_and(|c| {
+                    let text = String::from_utf8_lossy(&c);
+                    text.contains("--supervise") && text.contains(&var)
+                })
+        })
+        .collect()
+}
+
+/// S1-c2: daemon.pid names the daemon by its whole identity (pid, start tick,
+/// boot id), as daemon.ready does, so a reused PID is never mistaken for it.
+#[test]
+fn daemon_pid_carries_the_start_and_boot_identity() {
+    let mut package = Package::new("pid-identity");
+    let core = script(&package.p("core"), "exit 0");
+    package.start(&core, &[]);
+    let pid = identity_lines(&package.p("var/run/daemon.pid"));
+    let ready = identity_lines(&package.p("var/run/daemon.ready"));
+    assert_eq!(pid.len(), 3, "{pid:?}");
+    assert_eq!(pid, ready, "daemon.pid and daemon.ready name one process");
+    assert_eq!(
+        pid[0],
+        package.daemon.as_ref().unwrap().id().to_string(),
+        "{pid:?}"
+    );
+    package.stop(Duration::from_secs(5));
+}
+
+/// S1-c2: a daemon.ready that cannot be written is fatal: the daemon says so,
+/// removes its records and exits, rather than serving a daemon that every stop
+/// must refuse (it has no readiness identity).
+#[test]
+fn a_failed_ready_write_stops_the_daemon_and_removes_its_records() {
+    let package = Package::new("ready-unwritable");
+    let core = script(&package.p("core"), "exit 0");
+    private_dir(&package.p("@appdata/run"));
+    // A directory where daemon.ready goes: the atomic write refuses it.
+    private_dir(&package.p("@appdata/run/daemon.ready"));
+    let manager = script(&package.p("manager"), "exit 0");
+    let stderr = fs::File::create(package.p("daemon.stderr")).unwrap();
+    let mut child = Command::new(DAEMON)
+        .arg("--daemon")
+        .args(["--home".as_ref(), package.p("home").as_os_str()])
+        .args(["--var".as_ref(), package.p("var").as_os_str()])
+        .args(["--core".as_ref(), core.as_os_str()])
+        .args(["--manager".as_ref(), manager.as_os_str()])
+        .env("PATH", "/usr/bin:/bin")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(stderr)
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!(
+                "the daemon kept serving without daemon.ready: {}",
+                package.stderr()
+            );
+        }
+        thread::sleep(Duration::from_millis(50));
+    };
+    assert_eq!(status.code(), Some(1), "{}", package.stderr());
+    assert!(
+        package.stderr().contains("daemon.ready"),
+        "{}",
+        package.stderr()
+    );
+    for gone in ["var/run/ctl.sock", "var/run/daemon.pid"] {
+        assert!(!package.p(gone).exists(), "{gone} left behind");
+    }
+    let log = package.log();
+    assert!(
+        log.contains("\"event\":\"service_start_failed\"") && log.contains("step=daemon.ready"),
+        "{log}"
+    );
+}
+
+/// S1-c2 trigger A: a supervisor whose restart budget is spent removes the
+/// records of the daemon that died, and its own, so start and stop never
+/// refuse over a dead daemon whose PID was reused.
+#[test]
+fn a_supervisor_that_gives_up_removes_the_daemon_records() {
+    let package = Package::new("gives-up");
+    let core = script(&package.p("core"), "exit 0");
+    let launched = launch_command(&package, &core).output().unwrap();
+    assert!(
+        launched.status.success(),
+        "{}",
+        String::from_utf8_lossy(&launched.stderr)
+    );
+    let read_pid = || -> Option<u32> {
+        fs::read_to_string(package.p("var/run/daemon.pid"))
+            .ok()?
+            .lines()
+            .next()?
+            .parse()
+            .ok()
+    };
+    let first = read_pid().unwrap();
+    let supervisor = supervisor_of(first).expect("the daemon runs under --supervise");
+    assert_eq!(
+        identity_lines(&package.p("var/run/supervisor.pid"))
+            .first()
+            .map(String::as_str),
+        Some(supervisor.to_string().as_str()),
+        "supervisor.pid names the supervisor"
+    );
+    let mut current = first;
+    // Five restarts are allowed in ten minutes; the sixth crash ends it.
+    for round in 0..6 {
+        crash(current);
+        if round == 5 {
+            break;
+        }
+        let deadline = Instant::now() + Duration::from_secs(20);
+        loop {
+            if let Some(next) = read_pid()
+                && next != current
+                && package.try_ask(&json!({"verb": "ping"})).is_some()
+            {
+                current = next;
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "round {round}: no restart: {}",
+                package.log()
+            );
+            thread::sleep(Duration::from_millis(50));
+        }
+    }
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while process_live(supervisor) {
+        assert!(Instant::now() < deadline, "the supervisor did not give up");
+        thread::sleep(Duration::from_millis(50));
+    }
+    for gone in [
+        "var/run/daemon.pid",
+        "var/run/daemon.ready",
+        "var/run/ctl.sock",
+        "var/run/supervisor.pid",
+    ] {
+        assert!(!package.p(gone).exists(), "{gone} left behind");
+    }
+    let log = package.log();
+    assert!(
+        log.contains("restarts_exhausted=true")
+            && log.contains("\"event\":\"service_records_removed\""),
+        "{log}"
+    );
+}
+
+/// F4: the shell's `flock -n daemon.lock true` probe holds the lock for a
+/// moment; a daemon starting then waits it out instead of exiting 75.
+#[test]
+fn a_lock_held_for_a_moment_does_not_refuse_the_daemon() {
+    let mut package = Package::new("lock-moment");
+    let core = script(&package.p("core"), "exit 0");
+    private_dir(&package.p("@appdata/run"));
+    let lock = package.p("@appdata/run/daemon.lock");
+    fs::write(&lock, b"").unwrap();
+    fs::set_permissions(&lock, fs::Permissions::from_mode(0o600)).unwrap();
+    let mut holder = Command::new("flock")
+        .arg("-x")
+        .arg(&lock)
+        .args(["sleep", "1"])
+        .spawn()
+        .unwrap();
+    // Let flock take it.
+    thread::sleep(Duration::from_millis(200));
+    package.start(&core, &[]);
+    let _ = holder.wait();
+    package.stop(Duration::from_secs(5));
+}
+
+/// F4: a supervisor whose daemon finds another daemon serving says so and
+/// leaves (exit 0), never silently.
+#[test]
+fn a_supervisor_beside_a_serving_daemon_says_it_is_superseded() {
+    let mut package = Package::new("superseded");
+    let core = script(&package.p("core"), "exit 0");
+    package.start(&core, &[]);
+    let started = Instant::now();
+    let supervise = Command::new(DAEMON)
+        .arg("--supervise")
+        .args(["--home".as_ref(), package.p("home").as_os_str()])
+        .args(["--var".as_ref(), package.p("var").as_os_str()])
+        .args(["--core".as_ref(), core.as_os_str()])
+        .env("PATH", "/usr/bin:/bin")
+        .output()
+        .unwrap();
+    assert!(started.elapsed() < Duration::from_secs(15));
+    assert!(supervise.status.success(), "{supervise:?}");
+    let log = package.log();
+    assert!(log.contains("\"event\":\"service_superseded\""), "{log}");
+    assert!(
+        !package.p("var/run/supervisor.pid").exists(),
+        "the superseded supervisor removed its record"
+    );
+    package.stop(Duration::from_secs(5));
+}
+
+/// F3: a launch that times out stops the supervisor it started and says why
+/// the daemon never answered, with the daemon's own last words.
+#[test]
+fn a_launch_that_times_out_stops_its_supervisor_and_names_the_cause() {
+    let package = Package::new("launch-timeout");
+    let core = script(&package.p("core"), "exit 0");
+    private_dir(&package.p("@appdata/run"));
+    // ctl.sock cannot be bound: every daemon exits 1 naming it.
+    private_dir(&package.p("@appdata/run/ctl.sock"));
+    fs::write(package.p("@appdata/run/ctl.sock/keep"), b"x").unwrap();
+    let started = Instant::now();
+    let launched = launch_command(&package, &core)
+        .args(["--ready-within-seconds", "3"])
+        .output()
+        .unwrap();
+    assert!(started.elapsed() < Duration::from_secs(15));
+    assert_eq!(launched.status.code(), Some(1));
+    let said = String::from_utf8_lossy(&launched.stderr);
+    assert!(said.contains("ctl.sock"), "{said}");
+    // Nothing of this tree keeps running.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let left = supervisors_of_tree(&package.p("var"));
+        if left.is_empty() {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the supervisor outlived the launch: {left:?}"
+        );
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert!(!package.p("var/run/supervisor.pid").exists());
 }

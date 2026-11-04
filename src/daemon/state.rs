@@ -87,6 +87,22 @@ pub(crate) fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), WriteError> 
         std::process::id(),
         TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed)
     ));
+    let result = write_private_file(&temporary, bytes, path)
+        .and_then(|()| fs::rename(&temporary, path).map_err(|error| fail("rename", &error)));
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    result
+}
+
+/// Create `temporary` (never through a symlink: `O_CREAT|O_EXCL`), `0600`,
+/// and write and flush `bytes`. Errors name `target`, the file it stands in for.
+fn write_private_file(temporary: &Path, bytes: &[u8], target: &Path) -> Result<(), WriteError> {
+    let fail = |step: &'static str, error: &io::Error| WriteError {
+        path: target.to_path_buf(),
+        step,
+        cause: io_cause(error),
+    };
     let mut options = OpenOptions::new();
     // create_new is O_CREAT|O_EXCL: it never follows a symlink planted at the
     // temporary name.
@@ -97,35 +113,33 @@ pub(crate) fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), WriteError> 
         options.mode(0o600);
     }
     let mut file = options
-        .open(&temporary)
+        .open(temporary)
         .map_err(|error| fail("create", &error))?;
-    let result = (|| {
-        file.write_all(bytes)
-            .map_err(|error| fail("write", &error))?;
-        file.sync_data().map_err(|error| fail("sync", &error))?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(&temporary, fs::Permissions::from_mode(0o600))
-                .map_err(|error| fail("chmod", &error))?;
-        }
-        drop(file);
-        fs::rename(&temporary, path).map_err(|error| fail("rename", &error))
-    })();
-    if result.is_err() {
-        let _ = fs::remove_file(&temporary);
+    file.write_all(bytes)
+        .map_err(|error| fail("write", &error))?;
+    file.sync_data().map_err(|error| fail("sync", &error))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(temporary, fs::Permissions::from_mode(0o600))
+            .map_err(|error| fail("chmod", &error))?;
     }
-    result
+    Ok(())
 }
 
 /// The default bound on one state write (design §2.5, layer 4).
 pub(crate) const STATE_WRITE_DEADLINE: Duration = Duration::from_secs(10);
 
-type WriteJob = (PathBuf, Vec<u8>, mpsc::Sender<Result<(), WriteError>>);
+/// One piece of disk work for the writer thread.
+pub(crate) type DiskJob = Box<dyn FnOnce() -> Result<(), WriteError> + Send>;
 
-/// Writes state files on a thread of its own, so the control thread waits at
-/// most a deadline for a volume that stopped answering. A write that times out
-/// is still in flight; the caller holds the record and writes it again later.
+type WriteJob = (DiskJob, mpsc::Sender<Result<(), WriteError>>);
+
+/// Writes state files (and runs the other disk work whose syncs could stall:
+/// publishing and removing `run.lock`, H7) on a thread of its own, so the
+/// control thread waits at most a deadline for a volume that stopped
+/// answering. Jobs run in order. A job that times out is still in flight; the
+/// caller holds the record and writes it again later, or queues the undo.
 pub(crate) struct StateWriter {
     jobs: mpsc::Sender<WriteJob>,
 }
@@ -136,8 +150,8 @@ impl StateWriter {
         thread::Builder::new()
             .name("sdsyncd-state".into())
             .spawn(move || {
-                for (path, bytes, reply) in receiver {
-                    let _ = reply.send(atomic_write(&path, &bytes));
+                for (job, reply) in receiver {
+                    let _ = reply.send(job());
                 }
             })?;
         Ok(Self { jobs })
@@ -149,6 +163,22 @@ impl StateWriter {
         bytes: Vec<u8>,
         deadline: Duration,
     ) -> Result<(), WriteError> {
+        let target = path.to_path_buf();
+        self.run(
+            path,
+            Box::new(move || atomic_write(&target, &bytes)),
+            deadline,
+        )
+    }
+
+    /// Run `job` on the writer thread and wait at most `deadline` for it;
+    /// errors name `path`.
+    pub(crate) fn run(
+        &self,
+        path: &Path,
+        job: DiskJob,
+        deadline: Duration,
+    ) -> Result<(), WriteError> {
         let (reply, answer) = mpsc::channel();
         let gone = |cause: &str| WriteError {
             path: path.to_path_buf(),
@@ -156,7 +186,7 @@ impl StateWriter {
             cause: cause.into(),
         };
         self.jobs
-            .send((path.to_path_buf(), bytes, reply))
+            .send((job, reply))
             .map_err(|_| gone("the state writer thread is gone"))?;
         match answer.recv_timeout(deadline) {
             Ok(result) => result,
@@ -828,6 +858,7 @@ pub(crate) fn publish_run_lock(run_dir: &Path, profiles: &[String]) -> Result<()
             format!("run.lock is held by live process {owner}, not this daemon"),
         ));
     }
+    sweep_lock_staging(run_dir)?;
     atomic_write(
         &run_dir.join("run.scope"),
         format!("{pid}\n{start}\n{boot}\nprofiles={}\n", profiles.join(",")).as_bytes(),
@@ -861,12 +892,70 @@ pub(crate) fn publish_run_lock(run_dir: &Path, profiles: &[String]) -> Result<()
     }
     fs::set_permissions(&lock, fs::Permissions::from_mode(0o700))
         .map_err(|error| fail("chmod", io_cause(&error)))?;
-    atomic_write(
-        &lock.join("pid"),
+    // S1-c1: the lock directory holds exactly `pid`, at every instant. The
+    // owner file is written and flushed beside the lock, then linked in (the
+    // shell's claim -> ln), so no temporary ever appears inside it, and a crash
+    // leaves a dot-file in run/ (swept above), never an unprovable lock.
+    let staged = run_dir.join(format!(
+        "{LOCK_PID_STAGING}{pid}.{}",
+        TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+    ));
+    let target = lock.join("pid");
+    let linked = write_private_file(
+        &staged,
         format!("{pid}\n{start}\n{boot}\n").as_bytes(),
-    )?;
-    // atomic_write leaves its temporary beside the target only on failure; the
-    // lock directory must hold exactly `pid`.
+        &target,
+    )
+    .and_then(|()| {
+        fs::hard_link(&staged, &target).map_err(|error| WriteError {
+            path: target.clone(),
+            step: "link",
+            cause: io_cause(&error),
+        })
+    });
+    let unstaged = fs::remove_file(&staged);
+    linked?;
+    unstaged.map_err(|error| WriteError {
+        path: staged.clone(),
+        step: "unstage",
+        cause: io_cause(&error),
+    })
+}
+
+/// The prefix of `publish_run_lock`'s staging file in `run/`.
+#[cfg(target_os = "linux")]
+const LOCK_PID_STAGING: &str = ".run.lock.pid.";
+
+/// Remove what an earlier publish left in `run/` when it died between writing
+/// its staging file and removing it. The daemon holds `daemon.lock` and is the
+/// only writer of these, so every one of them is stale.
+#[cfg(target_os = "linux")]
+fn sweep_lock_staging(run_dir: &Path) -> Result<(), WriteError> {
+    let entries = fs::read_dir(run_dir).map_err(|error| WriteError {
+        path: run_dir.to_path_buf(),
+        step: "sweep",
+        cause: io_cause(&error),
+    })?;
+    for entry in entries.flatten() {
+        if !entry
+            .file_name()
+            .to_string_lossy()
+            .starts_with(LOCK_PID_STAGING)
+        {
+            continue;
+        }
+        match fs::remove_file(entry.path()) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(WriteError {
+                    path: entry.path(),
+                    step: "sweep",
+                    cause: io_cause(&error),
+                });
+            }
+        }
+    }
     Ok(())
 }
 
@@ -1048,6 +1137,43 @@ mod tests {
                 .starts_with("state=running\npid=7\n")
         );
         fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// H7: disk work run through the writer is bounded by its deadline even
+    /// when the volume stalls, and jobs keep their order (an undo queued after
+    /// a slow publish runs after it).
+    #[test]
+    fn writer_jobs_are_bounded_and_ordered() {
+        let writer = StateWriter::spawn().unwrap();
+        let order = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let first = std::sync::Arc::clone(&order);
+        let started = std::time::Instant::now();
+        let error = writer
+            .run(
+                Path::new("/run.lock"),
+                Box::new(move || {
+                    thread::sleep(Duration::from_millis(500));
+                    first.lock().unwrap().push("publish");
+                    Ok(())
+                }),
+                Duration::from_millis(50),
+            )
+            .unwrap_err();
+        assert!(started.elapsed() < Duration::from_millis(400));
+        assert_eq!(error.step, "timeout");
+        assert_eq!(error.path, Path::new("/run.lock"));
+        let second = std::sync::Arc::clone(&order);
+        writer
+            .run(
+                Path::new("/run.lock"),
+                Box::new(move || {
+                    second.lock().unwrap().push("remove");
+                    Ok(())
+                }),
+                Duration::from_secs(5),
+            )
+            .unwrap();
+        assert_eq!(*order.lock().unwrap(), ["publish", "remove"]);
     }
 
     #[test]
@@ -1544,6 +1670,80 @@ mod tests {
             remove_run_lock(&run_dir).unwrap();
         }
 
+        /// S1-c1 (review-int sec probe): `run.lock/` never holds anything but
+        /// `pid`, not even for an instant. The shell's
+        /// `private_event_lock_directory` refuses any other entry (every save
+        /// exits 73), and a temporary left there by a crash wedged start and
+        /// stop for good. The owner file is written beside the lock and
+        /// linked in.
+        #[test]
+        fn run_lock_never_holds_an_entry_but_pid_while_published() {
+            use std::sync::Arc;
+            use std::sync::atomic::AtomicBool;
+            let tree = Tree::new("lock-only-pid");
+            let run_dir = tree.p("var/run");
+            let done = Arc::new(AtomicBool::new(false));
+            let observer = {
+                let done = Arc::clone(&done);
+                let lock = run_dir.join("run.lock");
+                thread::spawn(move || {
+                    let mut foreign = std::collections::BTreeSet::new();
+                    while !done.load(Ordering::SeqCst) {
+                        if let Ok(entries) = fs::read_dir(&lock) {
+                            for entry in entries.flatten() {
+                                let name = entry.file_name().to_string_lossy().into_owned();
+                                if name != "pid" {
+                                    foreign.insert(name);
+                                }
+                            }
+                        }
+                    }
+                    foreign
+                })
+            };
+            for _ in 0..2000 {
+                publish_run_lock(&run_dir, &["photos".to_owned()]).unwrap();
+                remove_run_lock(&run_dir).unwrap();
+            }
+            done.store(true, Ordering::SeqCst);
+            let foreign = observer.join().unwrap();
+            assert!(foreign.is_empty(), "run.lock held {foreign:?}");
+            // Nothing is left beside it either.
+            let left: Vec<_> = fs::read_dir(&run_dir)
+                .unwrap()
+                .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+                .collect();
+            assert!(left.is_empty(), "{left:?}");
+        }
+
+        /// A temporary a crash left beside the lock is swept by the next
+        /// publish (the daemon holds daemon.lock, so it is its own).
+        #[test]
+        fn a_crashed_publish_leaves_nothing_inside_the_lock_and_is_swept() {
+            use std::os::unix::fs::MetadataExt;
+            let tree = Tree::new("lock-swept");
+            let run_dir = tree.p("var/run");
+            fs::write(run_dir.join(".run.lock.pid.4242.7"), b"4242\n1\nx\n").unwrap();
+            publish_run_lock(&run_dir, &["photos".to_owned()]).unwrap();
+            assert!(!run_dir.join(".run.lock.pid.4242.7").exists());
+            let names: Vec<_> = fs::read_dir(run_dir.join("run.lock"))
+                .unwrap()
+                .map(|e| e.unwrap().file_name())
+                .collect();
+            assert_eq!(names, ["pid"]);
+            let mode = fs::metadata(run_dir.join("run.lock/pid"))
+                .unwrap()
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o777, 0o600);
+            assert_eq!(
+                fs::metadata(run_dir.join("run.lock/pid")).unwrap().nlink(),
+                1,
+                "the staging name is gone: one link"
+            );
+            remove_run_lock(&run_dir).unwrap();
+        }
+
         /// The index line reads back through the bridge as `index`, a corrupt
         /// index named with its path and cause, and a profile without one as null.
         #[test]
@@ -1593,6 +1793,43 @@ mod tests {
                 index["issue_detail"],
                 "/var/state/cache/pairs/photos.redb: integrity check failed"
             );
+            // RI-2: the warning codes fix5-index added travel the whole way,
+            // from the core's result record (an info code beside them) to
+            // the bridge's outcomes, so a future allowlist cannot drop them.
+            for code in [
+                "pair-index-writeback-unknown",
+                "pair-index-writeback-unbounded",
+                "pair-index-nas-clock-skewed",
+                "pair-index-cleanup-failed",
+            ] {
+                let facts = IndexFacts::from_value(&json!({
+                    "state": "warm",
+                    "entries": 10,
+                    "served": 4,
+                    "verified_live": 6,
+                    "canary_checked": 1,
+                    "issues": [
+                        {"code": "pair-index-retired", "severity": "info", "path": "", "cause": ""},
+                        {"code": code, "severity": "warning", "path": "/volume1/photos/a.jpg", "cause": "named"}
+                    ]
+                }))
+                .expect("the record reads");
+                assert_eq!(
+                    facts.issue.as_deref(),
+                    Some(code),
+                    "{code}: the warning ranks first"
+                );
+                profile.facts.index = Some(facts);
+                tree.private(
+                    "var/state/profiles/photos.state",
+                    &render_profile_state(&profile, "sync", None).unwrap(),
+                );
+                let outcomes = tree.outcomes();
+                assert_eq!(outcomes["errors"], json!([]), "{code}: {outcomes}");
+                let index = &outcomes["profiles"][0]["index"];
+                assert_eq!(index["issue"], code, "{outcomes}");
+                assert_eq!(index["issue_detail"], "/volume1/photos/a.jpg: named");
+            }
             profile.facts.index = None;
             tree.private(
                 "var/state/profiles/photos.state",

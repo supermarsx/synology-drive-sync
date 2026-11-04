@@ -34,7 +34,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::thread::{self, JoinHandle};
@@ -51,11 +51,6 @@ const SKIP_SAMPLE: usize = 3;
 const SLICE: Duration = Duration::from_millis(250);
 /// How often a waiting poller looks at `stop` while a walk runs.
 const WALK_SLICE: Duration = Duration::from_millis(50);
-/// The most abandoned (still blocked) walkers the process tolerates before it
-/// refuses to start another, so a dying disk cannot pile up threads.
-const MAX_LIVE_WALKERS: usize = 16;
-
-static LIVE_WALKERS: AtomicUsize = AtomicUsize::new(0);
 
 /// One reading of a source tree.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -369,14 +364,6 @@ enum Waited {
     Stopped,
 }
 
-struct LiveGuard;
-
-impl Drop for LiveGuard {
-    fn drop(&mut self) {
-        LIVE_WALKERS.fetch_sub(1, Ordering::SeqCst);
-    }
-}
-
 /// Run one walk on a helper thread and wait for it at most `deadline`, looking
 /// at `stop` (when given) while it waits.
 fn wait_walk(
@@ -386,32 +373,33 @@ fn wait_walk(
     deadline: Duration,
     stop: Option<&AtomicBool>,
 ) -> Waited {
-    let live = LIVE_WALKERS.load(Ordering::SeqCst);
-    if live >= MAX_LIVE_WALKERS {
-        return Waited::Done(Err(PollError::Unreadable {
-            path: root,
-            detail: format!(
-                "{live} earlier directory walks are still blocked in the filesystem; not starting another"
-            ),
-        }));
-    }
+    // The cap is the process's, shared with the native watch's walks (H9).
+    let slot = match synology_drive_sync::watch::walk_slot() {
+        Ok(slot) => slot,
+        Err(live) => {
+            return Waited::Done(Err(PollError::Unreadable {
+                path: root,
+                detail: format!(
+                    "{live} earlier directory walks are still blocked in the filesystem; not starting another"
+                ),
+            }));
+        }
+    };
     let current = Arc::new(Mutex::new(String::new()));
     let cancel = Arc::new(AtomicBool::new(false));
     let (sender, receiver) = mpsc::channel();
-    LIVE_WALKERS.fetch_add(1, Ordering::SeqCst);
     let spawned = thread::Builder::new()
         .name("sdsyncd-poll-walk".to_owned())
         .spawn({
             let (current, cancel, root) = (Arc::clone(&current), Arc::clone(&cancel), root.clone());
             move || {
-                let _live = LiveGuard;
+                let _slot = slot;
                 let result = walk(source.as_ref(), &root, &filter, &current, &cancel);
                 // The receiver is gone once the deadline passed; nothing to report then.
                 let _ = sender.send(result);
             }
         });
     if let Err(error) = spawned {
-        LIVE_WALKERS.fetch_sub(1, Ordering::SeqCst);
         return Waited::Done(Err(PollError::Unreadable {
             path: root,
             detail: format!("cannot start the directory walk thread: {error}"),
@@ -474,8 +462,13 @@ pub(crate) fn read_with_deadline(
 pub(crate) struct PollConfig {
     /// Pause between the end of one reading and the start of the next.
     pub(crate) interval: Duration,
-    /// The longest one walk may take.
+    /// The longest the first walk may take.
     pub(crate) walk_deadline: Duration,
+    /// How far the walk deadline may grow when walks keep giving up (H4).
+    pub(crate) walk_deadline_max: Duration,
+    /// While no walk finishes, the tree is synced whole at most this often
+    /// (the routine's poll floor, at most an hour).
+    pub(crate) degraded_every: Duration,
     /// Why polling: `WatchLimit`, `WatchSetupFailed` or `WatchUnavailable`.
     pub(crate) reason: BackendReason,
     /// The watcher's own account of why, reported with every `Backend` event.
@@ -494,9 +487,14 @@ struct State {
     /// Changes during a gap are unknown: the next baseline comes with an overflow.
     gap: bool,
     reported_skips: (usize, Vec<String>),
+    /// The walk deadline in force: it grows when walks give up (H4).
+    walk_deadline: Option<Duration>,
+    /// When the last whole-tree run was asked for because no walk finished.
+    degraded_overflow: Option<Instant>,
 }
 
 struct Poller {
+    source: Arc<dyn DirSource>,
     routine: String,
     root: PathBuf,
     filter: Arc<Filter>,
@@ -553,13 +551,16 @@ impl Poller {
         if !self.backend(self.config.reason, self.config.detail.clone()) {
             return;
         }
-        let mut state = State::default();
+        let mut state = State {
+            walk_deadline: Some(self.config.walk_deadline),
+            ..State::default()
+        };
         while !self.stopped() {
             let waited = wait_walk(
-                Arc::new(FsSource),
+                Arc::clone(&self.source),
                 self.root.clone(),
                 Arc::clone(&self.filter),
-                self.config.walk_deadline,
+                state.walk_deadline.unwrap_or(self.config.walk_deadline),
                 Some(&self.stop),
             );
             let keep_going = match waited {
@@ -634,6 +635,9 @@ impl Poller {
     }
 
     fn on_error(&self, state: &mut State, error: &PollError) -> bool {
+        if let PollError::Deadline { path, deadline } = error {
+            return self.on_deadline(state, path, *deadline);
+        }
         let reason = error.reason();
         if state.failed != Some(reason) {
             state.failed = Some(reason);
@@ -657,6 +661,62 @@ impl Poller {
     }
 }
 
+impl Poller {
+    /// A walk gave up (H4): the deadline grows, named, up to its cap, so a
+    /// large tree is read eventually instead of never; while no walk
+    /// finishes, nothing can be compared, so the tree is synced whole at most
+    /// once per `degraded_every`, and the first walk that finishes is a fresh
+    /// baseline that comes with an overflow (unknown is not unchanged).
+    fn on_deadline(&self, state: &mut State, path: &Path, gave_up_after: Duration) -> bool {
+        let reason = BackendReason::WatchSetupFailed;
+        let current = state.walk_deadline.unwrap_or(self.config.walk_deadline);
+        let next = (current.saturating_mul(2))
+            .min(self.config.walk_deadline_max)
+            .max(current);
+        let grew = next != current || state.failed != Some(reason);
+        state.walk_deadline = Some(next);
+        state.failed = Some(reason);
+        if grew {
+            let capped = if next >= self.config.walk_deadline_max {
+                " (the cap)"
+            } else {
+                ""
+            };
+            let detail = format!(
+                "{}{}walk_deadline_exceeded: the walk gave up after {}s in {}; \
+                 next_walk_deadline_seconds={}{capped}; the tree is synced whole \
+                 at most every {} s until a walk finishes",
+                self.config.detail,
+                if self.config.detail.is_empty() {
+                    ""
+                } else {
+                    "; "
+                },
+                gave_up_after.as_secs_f64(),
+                path.display(),
+                next.as_secs(),
+                self.config.degraded_every.as_secs()
+            );
+            if !self.backend(reason, detail) {
+                return false;
+            }
+        }
+        if state.baseline.is_none() {
+            state.gap = true;
+        }
+        let due = state
+            .degraded_overflow
+            .is_none_or(|at| at.elapsed() >= self.config.degraded_every);
+        if due {
+            state.degraded_overflow = Some(Instant::now());
+            return self.send(ChangeEvent::Overflow {
+                routine: Some(self.routine.clone()),
+            });
+        }
+        true
+    }
+}
+
 /// Start the polling worker of `routine` on `root`. It reports through `emit`
 /// (which returns `false` to end it) and ends within 250 ms of `stop` being set.
 pub(crate) fn spawn_poller(
@@ -667,7 +727,29 @@ pub(crate) fn spawn_poller(
     stop: Arc<AtomicBool>,
     emit: Box<dyn Fn(ChangeEvent) -> bool + Send>,
 ) -> io::Result<JoinHandle<()>> {
+    spawn_poller_from(
+        Arc::new(FsSource),
+        routine,
+        root,
+        filter,
+        config,
+        stop,
+        emit,
+    )
+}
+
+/// [`spawn_poller`] reading the tree through `source`.
+pub(crate) fn spawn_poller_from(
+    source: Arc<dyn DirSource>,
+    routine: String,
+    root: PathBuf,
+    filter: Arc<Filter>,
+    config: PollConfig,
+    stop: Arc<AtomicBool>,
+    emit: Box<dyn Fn(ChangeEvent) -> bool + Send>,
+) -> io::Result<JoinHandle<()>> {
     let poller = Poller {
+        source,
         routine,
         root,
         filter,
@@ -683,7 +765,7 @@ pub(crate) fn spawn_poller(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::AtomicU32;
+    use std::sync::atomic::{AtomicU32, AtomicUsize};
     use std::sync::mpsc::Receiver;
 
     struct TempDir(PathBuf);
@@ -1033,6 +1115,8 @@ mod tests {
             PollConfig {
                 interval: Duration::from_millis(100),
                 walk_deadline: Duration::from_secs(5),
+                walk_deadline_max: Duration::from_secs(5),
+                degraded_every: Duration::from_secs(60),
                 reason: BackendReason::WatchLimit,
                 detail: "limit 8".to_owned(),
             },
@@ -1208,6 +1292,86 @@ mod tests {
             )
         );
         harness.finish();
+    }
+
+    /// H4: a tree that cannot be walked within the deadline was never read,
+    /// so realtime never dispatched anything. The deadline now grows (named)
+    /// up to its cap; while no walk finishes the tree is synced whole at most
+    /// once per floor; and once one finishes, changes are seen again.
+    #[test]
+    fn a_tree_too_slow_to_walk_grows_its_deadline_and_is_synced_whole_meanwhile() {
+        struct Slow;
+        impl DirSource for Slow {
+            fn list(&self, dir: &Path) -> io::Result<Vec<Listed>> {
+                if dir.ends_with("slow") {
+                    thread::sleep(Duration::from_millis(400));
+                }
+                FsSource.list(dir)
+            }
+        }
+        let dir = TempDir::new("grow");
+        dir.write("slow/f", "f");
+        dir.write("a/f", "f");
+        let (sender, events) = mpsc::channel();
+        let stop = Arc::new(AtomicBool::new(false));
+        let handle = spawn_poller_from(
+            Arc::new(Slow),
+            "r".to_owned(),
+            dir.path().to_path_buf(),
+            filter(dir.path(), &[]),
+            PollConfig {
+                interval: Duration::from_millis(20),
+                walk_deadline: Duration::from_millis(100),
+                walk_deadline_max: Duration::from_secs(2),
+                degraded_every: Duration::from_secs(30),
+                reason: BackendReason::WatchSetupFailed,
+                detail: "arm gave up".to_owned(),
+            },
+            Arc::clone(&stop),
+            Box::new(move |event| sender.send(event).is_ok()),
+        )
+        .unwrap();
+        let mut seen = Vec::new();
+        let deadline = Instant::now() + Duration::from_secs(15);
+        // Until a change made after the first finished walk is reported.
+        let mut written = false;
+        loop {
+            assert!(Instant::now() < deadline, "{seen:#?}");
+            let Ok(event) = events.recv_timeout(Duration::from_millis(100)) else {
+                continue;
+            };
+            if !written
+                && matches!(&event, ChangeEvent::Backend { detail, .. } if detail == "arm gave up")
+                && seen.len() > 1
+            {
+                // The walk finished (the backend is reported clean again).
+                dir.write("a/new", "n");
+                written = true;
+            }
+            let done = matches!(&event, ChangeEvent::Changed { dir, .. } if dir == "a");
+            seen.push(event);
+            if done {
+                break;
+            }
+        }
+        stop.store(true, Ordering::SeqCst);
+        let grown = seen
+            .iter()
+            .filter(|e| matches!(e, ChangeEvent::Backend { detail, .. }
+                if detail.contains("walk_deadline_exceeded") && detail.contains("next_walk_deadline_seconds=")))
+            .count();
+        assert!(grown >= 1, "the growth is named: {seen:#?}");
+        let overflows = seen
+            .iter()
+            .filter(|e| matches!(e, ChangeEvent::Overflow { .. }))
+            .count();
+        // One whole-tree run while degraded (the floor is 30 s), and one for
+        // the gap when the first walk finishes: never one per walk.
+        assert_eq!(
+            overflows, 2,
+            "whole tree once per floor while degraded: {seen:#?}"
+        );
+        let _ = handle.join();
     }
 
     #[test]

@@ -235,6 +235,111 @@ pub(crate) fn zone_name(epoch: i64) -> Option<String> {
     }
 }
 
+// ---------------------------------------------------------------- children (safe helpers)
+
+/// Reap `child` within `within` (it was sent KILL): `true` once reaped.
+pub(crate) fn reap_within(child: &mut std::process::Child, within: std::time::Duration) -> bool {
+    let deadline = std::time::Instant::now() + within;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => return true,
+            Ok(None) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            _ => return false,
+        }
+    }
+}
+
+/// Reaper threads alive: each waits on one child that outlived KILL (a
+/// process in uninterruptible sleep). Capped, so a wedged volume cannot grow
+/// them without bound; past the cap the child is left a zombie until the
+/// daemon exits, which the caller has already named.
+static REAPERS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+const MAX_REAPERS: usize = 16;
+
+/// Hand a child that outlived KILL to a reaper thread, so the caller's slot
+/// is free. Returns how it was handed off, for the caller's log line.
+pub(crate) fn abandon_to_reaper(mut child: std::process::Child) -> &'static str {
+    use std::sync::atomic::Ordering;
+    if REAPERS.fetch_add(1, Ordering::SeqCst) >= MAX_REAPERS {
+        REAPERS.fetch_sub(1, Ordering::SeqCst);
+        return "left_unreaped";
+    }
+    let spawned = std::thread::Builder::new()
+        .name("sdsyncd-reaper".into())
+        .spawn(move || {
+            let _ = child.wait();
+            REAPERS.fetch_sub(1, Ordering::SeqCst);
+        });
+    if spawned.is_err() {
+        REAPERS.fetch_sub(1, Ordering::SeqCst);
+        return "left_unreaped";
+    }
+    "reaper"
+}
+
+/// The last `limit` bytes a child wrote to a pipe, read on a thread of its own
+/// so the child never blocks on a full pipe.
+pub(crate) struct Tail {
+    bytes: std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<u8>>>,
+    reader: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Tail {
+    pub(crate) fn start(pipe: Option<impl io::Read + Send + 'static>, limit: usize) -> Self {
+        let bytes = std::sync::Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new()));
+        let reader = pipe.and_then(|mut pipe| {
+            let bytes = std::sync::Arc::clone(&bytes);
+            std::thread::Builder::new()
+                .name("sdsyncd-tail".into())
+                .spawn(move || {
+                    let mut buffer = [0_u8; 1024];
+                    while let Ok(read) = pipe.read(&mut buffer) {
+                        if read == 0 {
+                            break;
+                        }
+                        if let Ok(mut tail) = bytes.lock() {
+                            tail.extend(&buffer[..read]);
+                            while tail.len() > limit {
+                                tail.pop_front();
+                            }
+                        }
+                    }
+                })
+                .ok()
+        });
+        Self { bytes, reader }
+    }
+
+    /// The non-empty lines (at most `count`, the newest), once the writer is
+    /// gone or `within` has passed (a grandchild holding the pipe open cannot
+    /// hold the caller).
+    pub(crate) fn lines(self, count: usize, within: std::time::Duration) -> Vec<String> {
+        if let Some(reader) = self.reader {
+            let deadline = std::time::Instant::now() + within;
+            while !reader.is_finished() && std::time::Instant::now() < deadline {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        }
+        let bytes: Vec<u8> = self
+            .bytes
+            .lock()
+            .map(|tail| tail.iter().copied().collect())
+            .unwrap_or_default();
+        let text = String::from_utf8_lossy(&bytes);
+        let mut lines: Vec<String> = text
+            .lines()
+            .rev()
+            .filter(|line| !line.trim().is_empty())
+            .take(count)
+            .map(|line| super::state::sanitize_detail(line, 240))
+            .collect();
+        lines.reverse();
+        lines
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

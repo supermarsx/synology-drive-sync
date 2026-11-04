@@ -316,6 +316,15 @@ reason `consumer_timeout`. The daemon logs `control_consumer_failed` and
 it refused to read (not a private regular file, or over 64 KiB) and
 `control_file_expired` for an old request or response it removed.
 
+A worker that outlives its KILL by 10 seconds (a process stuck in the kernel on a dying disk) frees
+its lane: it is named `consumer_unkillable` (job, operation, PID, path), handed to a reaper, and its
+job is answered as above. What a worker writes on standard error reaches `controller.log` as
+`consumer_stderr` lines naming the job. Before admitting jobs the queue reconciles the audit outbox.
+A reconcile that fails is named once (`audit_reconcile_failed`, with an Activity `bridge.failed`
+row) and retried with a backoff of up to a minute. Its recovery is named too
+(`audit_reconcile_recovered`). Jobs wait meanwhile; after 30 seconds of failure they are answered
+`audit_unavailable` (never started) instead of waiting forever.
+
 **Shell engine.** The controller has one work slot:
 
 | Class | Jobs | May run beside |
@@ -563,6 +572,18 @@ knowing when reading it:
 | `control_consumer_failed` / `control_consumer_outcome_unknown` | A dashboard job's worker died or passed its lane deadline: the operation was answered `consumer_failed` / left outcome-unknown because it may have committed (see [Named terminal failures](troubleshooting.md#named-terminal-failures)) |
 | `control_request_rejected` / `control_file_expired` | A queue request file was refused (not a private regular file, or over 64 KiB) / an old request or response was removed |
 | `api_server_exited` / `api_server_restarted` | `error` / `warn`. The daemon's API service child exited (`status=`, `served_seconds=`, `cause=`: its last stderr line) / was started again (`attempt=`, `after_seconds=`) |
+| `api_socket_stale_removed` / `api_socket_stale_kept` | `warn` / `error`. Before starting its API service, the daemon removed an `api.sock` left by a server that is gone: one killed between bind and activation (`mode=0000`), or one nobody accepts on. Or it kept the socket and named why (another live server, or not a socket of this package) |
+| `api_server_unwaitable` | `error`. The API service child could not be waited for, so it was KILLed and reaped (`pid=`, `killed=`, `reaped=`) before a restart |
+| `service_start_failed` | `error`, with Activity `service.start_failed`. Either the daemon did not start (`step=` `daemon.pid`, `daemon.ready`, `ctl_socket`, `api_server`, `queue`, … `path=`, `cause=`), and its records were removed; or the supervisor gave up (`exit=`, `last_stderr=`, `restarts_exhausted=`) |
+| `service_restarted` | `warn`. The supervisor restarted a crashed daemon (`exit=`, `last_stderr=`; `cause=daemon_lock_held` for a daemon that found `daemon.lock` held and no daemon answering) |
+| `service_superseded` | `info`. A supervisor left because another daemon (or supervisor) already serves |
+| `service_records_removed` / `service_records_kept` | `warn` / `error`. A supervisor that gave up removed the dead daemon's `daemon.pid`, `daemon.ready` and `ctl.sock` (`paths=`), or could not (`cause=`) |
+| `daemon_stderr_unavailable` | `error`. The supervisor could not open `log/daemon-stderr.log` (`cause=`); the daemon's stderr is discarded |
+| `config_unreadable` / `config_recovered` | `error` / `info`. A configuration or state file could not be read (`path=`, `cause=`): permissions, an I/O error, or over 1 MiB. It is never read as absent; the last configuration read stays in force, and a routine with none is skipped as `field=unreadable`. Listed in `ctl status` (`config_unreadable`). Once per episode |
+| `audit_reconcile_failed` / `audit_reconcile_recovered` / `audit_unavailable` | `error` / `info` / `error`. The dashboard queue could not reconcile the audit outbox (once per episode, with `retry_seconds=`) / it could again / a waiting job was answered `audit_unavailable` after the bound (`id=`, `op=`) |
+| `consumer_unkillable` / `consumer_unwaitable` / `consumer_stderr` | `error` / `error` / `warn` or `error`. A dashboard job's worker outlived KILL and its slot was freed / could not be waited for / wrote this line on stderr (`id=`, `op=`, `exit=`, `path=`, `line=`) |
+| `event_log_lock_stale` / `event_log_rotation_failed` / `event_log_rotation_recovered` | `warn` / `error` / `info`. A rotation cleared a dead or torn `event-log.lock` owner / could not be made (`path=`, `cause=`, `retry_seconds=`) / succeeded again |
+| `ctl_accept_failed` / `ctl_accept_recovered` | `error` / `info`. The control socket could not accept a connection or start a thread for it (`path=`, `cause=`); the listener pauses 200 ms instead of spinning. Once per episode |
 
 Re-levelled from `warn` to `error` because each records a failed write or delivery:
 `activity_append_failed`, `alert_unavailable`, `observability_write_failed` (which now carries the
@@ -574,9 +595,13 @@ refused).
 A log rotation that fails never drops the line: it is appended to the still-valid active file past the
 size limit, and the failure is recorded once per episode on standard error and in
 `var/state/log-rotation.failed` (package-owned `0600`: `epoch=`, `path=`, `cause=`), which the next
-successful rotation of that log removes. The daemon takes the same `event-log.lock` as the shell
-writers for every append and rotation, so the two cannot interleave. The marker is on-disk evidence
-only; the dashboard does not display it. An unsafe rotation set is still refused with exit `73` and nothing is written to it.
+successful rotation of that log removes. Lines are single `O_APPEND` writes, which never interleave.
+The daemon rotates under the same `event-log.lock` as the shell writers, taken by the shell's own
+claim-and-link protocol. An empty lock directory is free. An owner that is gone, or a torn record
+from before this boot, is cleared and named (`event_log_lock_stale`). A live owner is never waited
+for: the rotation is skipped, the line is kept, the failure is named once
+(`event_log_rotation_failed`), and that log is not tried again for a minute. The marker is on-disk
+evidence only; the dashboard does not display it. An unsafe rotation set is still refused with exit `73` and nothing is written to it.
 
 ### Dashboard requests the service could not serve
 

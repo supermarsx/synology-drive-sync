@@ -26,10 +26,40 @@ pub use tree::{TreeWatch, WatchOptions, held_watches_of_current_user};
 
 use std::fmt;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use crate::local::{DEFAULT_IGNORE_FILE, IgnoreRules};
 use crate::path::is_dsm_managed;
+
+/// The most directory walks that may be live at once in this process: the native watch's walks
+/// and every other walk that shares the cap ([`walk_slot`]). A walk on a disk that stopped
+/// answering cannot be interrupted, only abandoned, and an abandoned walk holds its thread until
+/// its call returns; past this many, a new walk is refused by name rather than piling up threads.
+pub const MAX_LIVE_WALKS: usize = 16;
+
+static LIVE_WALKS: AtomicUsize = AtomicUsize::new(0);
+
+/// One live walk's place under [`MAX_LIVE_WALKS`]; released when dropped (when the walk's thread
+/// ends, however long after it was abandoned).
+#[derive(Debug)]
+pub struct WalkSlot(());
+
+impl Drop for WalkSlot {
+    fn drop(&mut self) {
+        LIVE_WALKS.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// A place for one more directory walk, or `Err(live)` when [`MAX_LIVE_WALKS`] are live.
+pub fn walk_slot() -> Result<WalkSlot, usize> {
+    let live = LIVE_WALKS.fetch_add(1, Ordering::SeqCst);
+    if live >= MAX_LIVE_WALKS {
+        LIVE_WALKS.fetch_sub(1, Ordering::SeqCst);
+        return Err(live);
+    }
+    Ok(WalkSlot(()))
+}
 
 /// How long arming a tree, or any later walk of part of it, may take before the watcher gives up
 /// and names the directory it was stuck on. Long enough for a hibernating disk to spin up.

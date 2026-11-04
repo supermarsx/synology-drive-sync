@@ -269,7 +269,8 @@ export const QUEUED_TERMINAL_FAILURE_CODES = Object.freeze([
   "classification_failed",
   "secret_claim_failed",
   "consumer_failed",
-  "consumer_wrote_no_result"
+  "consumer_wrote_no_result",
+  "audit_unavailable"
 ]);
 
 /**

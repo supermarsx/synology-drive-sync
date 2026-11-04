@@ -178,6 +178,25 @@ production, for the API socket), and admission is opened only then. A failed lau
 closed, records `service_start_failed` with the launcher's cause, stops anything it half started,
 and exits `1`. Start refuses while shell-engine services are live.
 
+What the daemon engine keeps under `var/run`, and when each goes:
+
+| Record | What it holds | Removed |
+| --- | --- | --- |
+| `daemon.lock` | an `flock` held by the live `--daemon` process | never; only a live holder means a daemon runs |
+| `daemon.pid`, `daemon.ready` | the daemon's PID, `/proc` start time and boot id, one per line (`daemon.ready` once it answers) | by a clean stop; by a start that fails once it holds `daemon.lock` (named `service_start_failed step=… path=… cause=…`, including a `daemon.ready` that cannot be written); by the supervisor when it gives up |
+| `supervisor.pid`, `supervisor.lock` | the `--supervise` process's PID, start time and boot id; an `flock` held for its life (one supervisor per package) | `supervisor.pid` when the supervisor exits |
+
+The supervisor restarts a daemon that crashes at most 5 times in 10 minutes. When it gives up, it
+removes the dead daemon's `daemon.pid`, `daemon.ready` and `ctl.sock` under `daemon.lock`
+(`service_records_removed`, or `service_records_kept` with the cause). A daemon that finds
+`daemon.lock` held waits up to 2 s before it exits `75`. The supervisor then leaves
+(`service_superseded`) if another daemon answers, and otherwise counts it as a crash
+(`cause=daemon_lock_held`). `--launch-daemon` stops the supervisor it started when the daemon does
+not answer within 30 s. The daemon's own stderr is kept in `log/daemon-stderr.log`, capped at
+1 MiB with one rotation and shown first in the controller log source. Its last line is relayed into
+`service_restarted` and `service_start_failed` as `last_stderr=`, and into the launcher's failure
+line.
+
 Daemon stop asks the daemon to stop (`ctl stop`, which lets a running sync end within its cancel
 grace). A daemon that does not answer, or outlasts `SDSYNC_DSM_STOP_TIMEOUT` (default 120 s), is
 sent TERM and then KILL, together with its supervisor, but only after its identity is proven from

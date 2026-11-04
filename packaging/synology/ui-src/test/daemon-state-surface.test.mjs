@@ -84,7 +84,12 @@ const ISSUES = {
   "pair-index-directory-unusable": /folder/i,
   "pair-index-unbound": /different/i,
   "pair-index-format-unsupported": /version|format/i,
-  "pair-index-canary-mismatch": /disagreed/i
+  "pair-index-canary-mismatch": /disagreed/i,
+  "pair-index-writeback-unknown": /writeback setting could not be read/i,
+  "pair-index-writeback-unbounded": /writeback is switched off/i,
+  "pair-index-nas-clock-skewed": /clock .*more than 20 seconds/i,
+  "pair-index-cleanup-failed": /could not be removed/i,
+  "pair-index-remote-ctime-static": /change time/i
 };
 
 for (const [issue, words] of Object.entries(ISSUES)) {

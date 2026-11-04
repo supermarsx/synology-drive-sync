@@ -448,7 +448,8 @@ test("each named queued failure renders its cause and its next step", () => {
     classification_failed: [/could not determine what kind of operation/, /submit the request again/],
     secret_claim_failed: [/could not be claimed/, /never started/, /submit the request again/],
     consumer_failed: [/exited before it finished/, /out-of-memory killer/],
-    consumer_wrote_no_result: [/wrote no result/, /unconfirmed/]
+    consumer_wrote_no_result: [/wrote no result/, /unconfirmed/],
+    audit_unavailable: [/audit log/, /Nothing ran/, /submit the request again/]
   };
   for (const [code, patterns] of Object.entries(expectations)) {
     const context = reportContext();

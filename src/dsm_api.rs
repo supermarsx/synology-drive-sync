@@ -5927,7 +5927,7 @@ mod linux_socket {
         fs::remove_file(path).map_err(|_| BridgeError::unsafe_runtime())
     }
 
-    fn connect_with_timeout(path: &Path, timeout: Duration) -> io::Result<UnixStream> {
+    pub(crate) fn connect_with_timeout(path: &Path, timeout: Duration) -> io::Result<UnixStream> {
         let path_bytes = path.as_os_str().as_bytes();
         // sockaddr_un paths are NUL-terminated. Abstract sockets are outside the
         // fixed filesystem contract used by this bridge.
@@ -8384,6 +8384,9 @@ enum ControllerFailureCause {
     SecretClaimFailed,
     ConsumerFailed,
     ConsumerWroteNoResult,
+    /// The daemon's queue could not reconcile the audit outbox for longer than
+    /// its bound, so the job was answered instead of held (never started).
+    AuditUnavailable,
 }
 
 impl ControllerFailureCause {
@@ -8393,6 +8396,7 @@ impl ControllerFailureCause {
             "secret_claim_failed" => Some(Self::SecretClaimFailed),
             "consumer_failed" => Some(Self::ConsumerFailed),
             "consumer_wrote_no_result" => Some(Self::ConsumerWroteNoResult),
+            "audit_unavailable" => Some(Self::AuditUnavailable),
             _ => None,
         }
     }
@@ -8403,6 +8407,7 @@ impl ControllerFailureCause {
             Self::SecretClaimFailed => "secret_claim_failed",
             Self::ConsumerFailed => "consumer_failed",
             Self::ConsumerWroteNoResult => "consumer_wrote_no_result",
+            Self::AuditUnavailable => "audit_unavailable",
         }
     }
 
@@ -8417,6 +8422,9 @@ impl ControllerFailureCause {
             Self::ConsumerFailed => "The operation was terminated before it finished.",
             Self::ConsumerWroteNoResult => {
                 "The operation ended without recording a result of its own."
+            }
+            Self::AuditUnavailable => {
+                "The package audit log could not be reconciled, so this request was never started."
             }
         }
     }
@@ -8433,11 +8441,12 @@ impl ControllerFailureCause {
     }
 }
 
-const CONTROLLER_FAILURE_CODES: [&str; 4] = [
+const CONTROLLER_FAILURE_CODES: [&str; 5] = [
     "classification_failed",
     "secret_claim_failed",
     "consumer_failed",
     "consumer_wrote_no_result",
+    "audit_unavailable",
 ];
 
 /// Every code the package itself can publish as the cause of a terminal failure.
@@ -18740,10 +18749,20 @@ fn log_source_files(log_root: &Path, source: LogSource) -> Vec<PathBuf> {
         LogSource::RunStderr => ("run-stderr.log", 3),
         LogSource::All => return Vec::new(),
     };
-    let mut files = (1..=rotations)
-        .rev()
-        .map(|index| log_root.join(format!("{name}.{index}")))
-        .collect::<Vec<_>>();
+    let mut files = Vec::new();
+    if source == LogSource::Controller {
+        // The daemon engine's own stderr (`--supervise` keeps it, 1 MiB and one
+        // rotation): raw lines, which read as errors. Placed before the
+        // controller's own generations, as the oldest; the supervisor relays a
+        // dying daemon's last line into controller.log too (`last_stderr=`).
+        files.push(log_root.join("daemon-stderr.log.1"));
+        files.push(log_root.join("daemon-stderr.log"));
+    }
+    files.extend(
+        (1..=rotations)
+            .rev()
+            .map(|index| log_root.join(format!("{name}.{index}"))),
+    );
     files.push(log_root.join(name));
     files
 }
@@ -21328,6 +21347,7 @@ mod tests {
             ("secret_claim_failed", false),
             ("consumer_failed", true),
             ("consumer_wrote_no_result", true),
+            ("audit_unavailable", false),
         ] {
             let cause = ControllerFailureCause::parse(word).expect("declared causes parse");
             assert_eq!(

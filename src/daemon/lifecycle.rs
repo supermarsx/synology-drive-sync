@@ -52,6 +52,9 @@ pub(crate) struct Options {
     /// `--serve-api`: keep the dashboard's API server (`--serve`, api.sock)
     /// running as a child; the daemon is not ready until it answers.
     pub(crate) serve_api: bool,
+    /// `--ready-within-seconds`: how long `--launch-daemon` waits for the
+    /// daemon to answer `ctl ping` (default 30 s).
+    pub(crate) ready_within: Duration,
 }
 
 impl Options {
@@ -64,6 +67,7 @@ impl Options {
             manager: PathBuf::from(super::super::MANAGER_PATH),
             timings: executor::Timings::default(),
             serve_api: false,
+            ready_within: Duration::from_secs(30),
         };
         let mut rest = Vec::new();
         let mut items = arguments.iter();
@@ -93,6 +97,10 @@ impl Options {
                 }
                 "--serve-api" => {
                     options.serve_api = true;
+                    continue;
+                }
+                "--ready-within-seconds" => {
+                    options.ready_within = seconds(items.next())?.min(Duration::from_secs(300));
                     continue;
                 }
                 _ => {}
@@ -294,7 +302,13 @@ pub(crate) fn ensure_layout(var: &Path, uid: u32) -> Result<(), String> {
 /// the process dies, so there is no stale-lock recovery. `Ok(None)` when another
 /// daemon holds it.
 pub(crate) fn acquire_singleton(var: &Path) -> Result<Option<File>, String> {
-    let path = var.join("run").join("daemon.lock");
+    acquire_lock_file(var, "daemon.lock")
+}
+
+/// `flock(LOCK_EX|LOCK_NB)` on `var/run/<name>` (created `0600`, never through
+/// a symlink). `Ok(None)` when another process holds it.
+fn acquire_lock_file(var: &Path, name: &str) -> Result<Option<File>, String> {
+    let path = var.join("run").join(name);
     let file = OpenOptions::new()
         .read(true)
         .write(true)
@@ -308,6 +322,85 @@ pub(crate) fn acquire_singleton(var: &Path) -> Result<Option<File>, String> {
         Ok(true) => Ok(Some(file)),
         Ok(false) => Ok(None),
         Err(error) => Err(format!("{}: {error}", path.display())),
+    }
+}
+
+/// How long a starting daemon rides out a held `daemon.lock` before it calls
+/// itself a second daemon (F4): the shell's `flock -n daemon.lock true` probe
+/// holds the lock for the life of one `true`.
+pub(crate) const SINGLETON_WAIT: Duration = Duration::from_secs(2);
+
+/// [`acquire_singleton`], retried every 100 ms for at most `wait`.
+pub(crate) fn acquire_singleton_within(var: &Path, wait: Duration) -> Result<Option<File>, String> {
+    let deadline = Instant::now() + wait;
+    loop {
+        match acquire_singleton(var)? {
+            Some(lock) => return Ok(Some(lock)),
+            None if Instant::now() >= deadline => return Ok(None),
+            None => thread::sleep(Duration::from_millis(100)),
+        }
+    }
+}
+
+/// The identity triple of process `pid` (pid, `/proc` start tick, boot id),
+/// one per line: the format of `daemon.pid`, `daemon.ready`, `supervisor.pid`
+/// and `run.lock/pid` (scratchpad fix5 contract §0).
+pub(crate) fn identity_record(pid: u32) -> Result<String, String> {
+    let start = super::super::linux_files::process_start(pid)
+        .map_err(|_| format!("the /proc start tick of PID {pid} cannot be read"))?;
+    let boot = fs::read_to_string("/proc/sys/kernel/random/boot_id")
+        .map_err(|error| format!("/proc/sys/kernel/random/boot_id: {error}"))?;
+    Ok(format!(
+        "{pid}
+{start}
+{}
+",
+        boot.trim()
+    ))
+}
+
+/// Remove `path` only while it still holds exactly `record` (our own).
+fn remove_own_record(path: &Path, record: &str) -> Result<(), String> {
+    match fs::read_to_string(path) {
+        Ok(text) if text == record => {
+            fs::remove_file(path).map_err(|error| format!("{}: {error}", path.display()))
+        }
+        Ok(_) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(format!("{}: {error}", path.display())),
+    }
+}
+
+/// Write one controller.log event; when the log itself fails, stderr (which
+/// the supervisor keeps in `daemon-stderr.log`) gets the event and why (S3-1).
+pub(crate) fn log_or_stderr(
+    sink: &dyn EventSink,
+    level: Level,
+    event: &'static str,
+    detail: String,
+) {
+    let record = LogEvent {
+        level,
+        category: "controller",
+        event,
+        detail,
+    };
+    if let Err(cause) = sink.log(epoch().unwrap_or(0), &record) {
+        say(&format!(
+            "controller log event {event} could not be written ({cause}): level={} {}",
+            level.as_str(),
+            record.detail
+        ));
+    }
+}
+
+/// An Activity row; when it cannot be written, stderr says so.
+fn activity_or_stderr(sink: &dyn EventSink, row: &ActivityRow) {
+    if let Err(cause) = sink.activity(epoch().unwrap_or(0), row) {
+        say(&format!(
+            "activity row {} could not be written ({cause}): {}",
+            row.code, row.message
+        ));
     }
 }
 
@@ -428,11 +521,69 @@ impl MutationRunner for ManagerMutations {
 
 // ---------------------------------------------------------------- --daemon
 
-fn remove_if_ours(path: &Path) {
-    if let Ok(metadata) = fs::symlink_metadata(path)
-        && !metadata.is_dir()
-    {
-        let _ = fs::remove_file(path);
+/// Remove one of the daemon's records (`ctl.sock`, `daemon.ready`,
+/// `daemon.pid`). A directory there is not ours and is left. `Ok(true)` when
+/// something was removed.
+fn remove_record(path: &Path) -> Result<bool, String> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.is_dir() => Err(format!(
+            "{}: a directory, not a record of the daemon; left in place",
+            path.display()
+        )),
+        Ok(_) => match fs::remove_file(path) {
+            Ok(()) => Ok(true),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+            Err(error) => Err(format!("{}: {error}", path.display())),
+        },
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(format!("{}: {error}", path.display())),
+    }
+}
+
+/// Remove the daemon's records, saying (stderr) what could not be removed.
+/// Returns the paths removed and the failures.
+fn remove_records(paths: &[&Path]) -> (Vec<String>, Vec<String>) {
+    let mut removed = Vec::new();
+    let mut failed = Vec::new();
+    for path in paths {
+        match remove_record(path) {
+            Ok(true) => removed.push(path.display().to_string()),
+            Ok(false) => {}
+            Err(cause) => {
+                say(&format!("cannot remove a daemon record: {cause}"));
+                failed.push(cause);
+            }
+        }
+    }
+    (removed, failed)
+}
+
+/// The daemon's records under `run/`, in the order a clean stop removes them.
+fn daemon_records(var: &Path) -> [PathBuf; 3] {
+    let run = var.join("run");
+    [
+        ctl::socket_path(var),
+        run.join("daemon.ready"),
+        run.join("daemon.pid"),
+    ]
+}
+
+/// Wait at most `within` for `handle`; a thread that does not end is named
+/// (stderr) and abandoned: the process is exiting.
+fn join_within(handle: thread::JoinHandle<()>, name: &str, within: Duration) {
+    let deadline = Instant::now() + within;
+    while !handle.is_finished() && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(20));
+    }
+    if handle.is_finished() {
+        if handle.join().is_err() {
+            say(&format!("the {name} thread panicked"));
+        }
+    } else {
+        say(&format!(
+            "the {name} thread did not end within {} s; abandoned",
+            within.as_secs()
+        ));
     }
 }
 
@@ -457,10 +608,13 @@ pub(crate) fn run_daemon(options: &Options) -> ExitCode {
         say(&format!("refused: {cause}"));
         return ExitCode::from(78);
     }
-    let _lock = match acquire_singleton(&options.var) {
+    let _lock = match acquire_singleton_within(&options.var, SINGLETON_WAIT) {
         Ok(Some(lock)) => lock,
         Ok(None) => {
-            say("already running (daemon.lock is held)");
+            say(&format!(
+                "already running (daemon.lock is held after {} s)",
+                SINGLETON_WAIT.as_secs()
+            ));
             return ExitCode::from(75);
         }
         Err(cause) => {
@@ -472,22 +626,62 @@ pub(crate) fn run_daemon(options: &Options) -> ExitCode {
     let pid = std::process::id();
     let pid_file = run_dir.join("daemon.pid");
     let ready_file = run_dir.join("daemon.ready");
-    remove_if_ours(&ready_file);
-    if let Err(error) = super::state::atomic_write(&pid_file, format!("{pid}\n").as_bytes()) {
-        say(&format!("cannot publish daemon.pid: {error}"));
-        return ExitCode::from(1);
-    }
+    let socket = options.socket();
+    let records = [socket.as_path(), ready_file.as_path(), pid_file.as_path()];
     let log_root = options.var.join("log");
     let sink = FileSink::new(&log_root);
+    // A start that fails once this process holds daemon.lock: named in
+    // controller.log and Activity, then every record of this daemon is removed
+    // (S1-c2), so nothing names a daemon that is not there.
+    let start_failed = |step: &str, path: &Path, cause: &str| {
+        say(&format!(
+            "the daemon did not start: step={step} path={} cause={cause}",
+            path.display()
+        ));
+        log_or_stderr(
+            &sink,
+            Level::Error,
+            "service_start_failed",
+            format!(
+                "step={step} path={} cause={}",
+                path.display(),
+                sanitize_detail(cause, 240)
+            ),
+        );
+        activity_or_stderr(
+            &sink,
+            &ActivityRow {
+                code: "service.start_failed",
+                profile: "none".into(),
+                state: "failed",
+                category: "controller",
+                level: Level::Error,
+                message: format!("The sync service did not start ({step}: {cause})"),
+            },
+        );
+    };
+    // This process holds daemon.lock: any readiness record is a dead daemon's.
+    if let Err(cause) = remove_record(&ready_file) {
+        start_failed("daemon.ready", &ready_file, &cause);
+        remove_records(&records);
+        return ExitCode::from(1);
+    }
+    // daemon.pid carries the whole identity (S1-c2): a reader never mistakes
+    // a reused PID for this daemon.
+    let published = identity_record(pid).and_then(|identity| {
+        super::state::atomic_write(&pid_file, identity.as_bytes()).map_err(|error| error.cause)
+    });
+    if let Err(cause) = published {
+        start_failed("daemon.pid", &pid_file, &cause);
+        remove_records(&records);
+        return ExitCode::from(1);
+    }
     let zone = sys::zone_name(epoch().unwrap_or(0) as i64).unwrap_or_else(|| "unknown".into());
-    let _ = sink.log(
-        epoch().unwrap_or(0),
-        &LogEvent {
-            level: Level::Info,
-            category: "controller",
-            event: "service_clock",
-            detail: format!("zone={zone} tz={}", std::env::var("TZ").unwrap_or_default()),
-        },
+    log_or_stderr(
+        &sink,
+        Level::Info,
+        "service_clock",
+        format!("zone={zone} tz={}", std::env::var("TZ").unwrap_or_default()),
     );
     // Which engine the package is set to, said once at start: the daemon runs
     // whatever the file says (it was started), but a disagreement is named.
@@ -515,35 +709,24 @@ pub(crate) fn run_daemon(options: &Options) -> ExitCode {
             ),
         },
     };
-    let _ = sink.log(
-        epoch().unwrap_or(0),
-        &LogEvent {
-            level,
-            category: "controller",
-            event: "service_engine",
-            detail,
-        },
-    );
+    log_or_stderr(&sink, level, "service_engine", detail);
     // The roots as named and as they resolve (DSM's aliases), once.
     let resolved = |root: &Path| {
         resolve_root(root, uid)
             .map(|path| path.display().to_string())
             .unwrap_or_else(|cause| format!("unresolved ({cause})"))
     };
-    let _ = sink.log(
-        epoch().unwrap_or(0),
-        &LogEvent {
-            level: Level::Info,
-            category: "controller",
-            event: "service_layout",
-            detail: format!(
-                "home={} resolved={} var={} resolved={}",
-                options.home.display(),
-                resolved(&options.home),
-                options.var.display(),
-                resolved(&options.var)
-            ),
-        },
+    log_or_stderr(
+        &sink,
+        Level::Info,
+        "service_layout",
+        format!(
+            "home={} resolved={} var={} resolved={}",
+            options.home.display(),
+            resolved(&options.home),
+            options.var.display(),
+            resolved(&options.var)
+        ),
     );
     let child_env = executor::allowlisted_env(std::env::vars_os());
     let api_env = child_env.clone();
@@ -570,36 +753,38 @@ pub(crate) fn run_daemon(options: &Options) -> ExitCode {
     } else {
         Arc::new(super::audit::NoAudit)
     };
-    let _ = sink.log(
-        epoch().unwrap_or(0),
-        &LogEvent {
-            level: if audited { Level::Info } else { Level::Warn },
-            category: "controller",
-            event: "service_audit",
-            detail: if audited {
-                "runs=audited".to_owned()
-            } else {
-                format!(
-                    "runs=unaudited cause={} is not the package's var ({})",
-                    options.var.display(),
-                    super::super::PACKAGE_VAR
-                )
-            },
+    log_or_stderr(
+        &sink,
+        if audited { Level::Info } else { Level::Warn },
+        "service_audit",
+        if audited {
+            "runs=audited".to_owned()
+        } else {
+            format!(
+                "runs=unaudited cause={} is not the package's var ({})",
+                options.var.display(),
+                super::super::PACKAGE_VAR
+            )
         },
     );
     // Alerts go through the package's own sdsync-common (its alert policy,
     // ledgers and notifiers), which lives at the package paths only.
     let alert_sink = FileSink::new(&log_root);
     let alert_log: super::alerts::AlertLog = Arc::new(move |level, event, detail| {
-        let _ = alert_sink.log(
+        if let Err(cause) = alert_sink.log(
             epoch().unwrap_or(0),
             &LogEvent {
                 level,
                 category: "scheduler",
                 event,
-                detail,
+                detail: detail.clone(),
             },
-        );
+        ) {
+            say(&format!(
+                "scheduler log event {event} could not be written ({cause}): level={} {detail}",
+                level.as_str()
+            ));
+        }
     });
     let alerts: Arc<dyn super::alerts::Alerts> = if audited {
         Arc::new(super::alerts::ShellAlerts {
@@ -633,7 +818,7 @@ pub(crate) fn run_daemon(options: &Options) -> ExitCode {
                 super::watch_source::WatchSettings::default(),
             )) as Box<dyn super::changes::ChangeSource>
         })),
-        sink: Box::new(sink),
+        sink: Box::new(FileSink::new(&log_root)),
         clock: Box::new(sys::LibcLocalClock),
         wall: Box::new(epoch),
         pid,
@@ -641,7 +826,8 @@ pub(crate) fn run_daemon(options: &Options) -> ExitCode {
     let (tx, control) = match control::spawn(parts) {
         Ok(spawned) => spawned,
         Err(error) => {
-            say(&format!("cannot start the control thread: {error}"));
+            start_failed("control_thread", &pid_file, &error.to_string());
+            remove_records(&records);
             return ExitCode::from(1);
         }
     };
@@ -663,10 +849,21 @@ pub(crate) fn run_daemon(options: &Options) -> ExitCode {
                 }
             }
         });
+    // Every early exit below stops what was started, in reverse order, and
+    // removes this daemon's records.
+    let stop_control = |tx: &std::sync::mpsc::Sender<Msg>| {
+        let reply = control::ask(tx, control::Request::Stop, Duration::from_secs(60));
+        if reply["ok"] == false {
+            say(&format!(
+                "the control thread did not confirm the stop: {reply}"
+            ));
+        }
+    };
     if let Err(error) = signal_thread {
-        say(&format!("cannot start the signal thread: {error}"));
-        let _ = control::ask(&tx, control::Request::Stop, Duration::from_secs(60));
-        let _ = control.join();
+        start_failed("signal_thread", &pid_file, &error.to_string());
+        stop_control(&tx);
+        join_within(control, "control", Duration::from_secs(10));
+        remove_records(&records);
         return ExitCode::from(1);
     }
     // The dashboard's server first: a daemon whose dashboard cannot answer is
@@ -674,15 +871,7 @@ pub(crate) fn run_daemon(options: &Options) -> ExitCode {
     let api = if options.serve_api {
         let api_sink = FileSink::new(&log_root);
         let log: super::api_server::KeeperLog = Arc::new(move |level, event, detail| {
-            let _ = api_sink.log(
-                epoch().unwrap_or(0),
-                &LogEvent {
-                    level,
-                    category: "controller",
-                    event,
-                    detail,
-                },
-            );
+            log_or_stderr(&api_sink, level, event, detail);
         });
         let started = std::env::current_exe()
             .map_err(|error| format!("cannot find this executable: {error}"))
@@ -690,6 +879,7 @@ pub(crate) fn run_daemon(options: &Options) -> ExitCode {
                 super::api_server::ApiKeeper::start(
                     exe,
                     PathBuf::from(super::super::API_SOCKET_PATH),
+                    run_dir.join("api.pid"),
                     api_env.clone(),
                     log,
                     Duration::from_secs(15),
@@ -698,10 +888,14 @@ pub(crate) fn run_daemon(options: &Options) -> ExitCode {
         match started {
             Ok(keeper) => Some(keeper),
             Err(cause) => {
-                say(&format!("the dashboard API server did not start: {cause}"));
-                let _ = control::ask(&tx, control::Request::Stop, Duration::from_secs(60));
-                let _ = control.join();
-                remove_if_ours(&pid_file);
+                start_failed(
+                    "api_server",
+                    Path::new(super::super::API_SOCKET_PATH),
+                    &cause,
+                );
+                stop_control(&tx);
+                join_within(control, "control", Duration::from_secs(10));
+                remove_records(&records);
                 return ExitCode::from(1);
             }
         }
@@ -713,13 +907,19 @@ pub(crate) fn run_daemon(options: &Options) -> ExitCode {
     let queue = if api.is_some() {
         let queue_sink = FileSink::new(&log_root);
         let log: super::queue::QueueLog = Arc::new(move |level, event, detail| {
-            let _ = queue_sink.log(
-                epoch().unwrap_or(0),
-                &LogEvent {
+            log_or_stderr(&queue_sink, level, event, detail);
+        });
+        let activity_sink = FileSink::new(&log_root);
+        let activity: super::queue::QueueActivity = Arc::new(move |code, level, message| {
+            activity_or_stderr(
+                &activity_sink,
+                &ActivityRow {
+                    code,
+                    profile: "none".into(),
+                    state: "failed",
+                    category: "bridge",
                     level,
-                    category: "controller",
-                    event,
-                    detail,
+                    message,
                 },
             );
         });
@@ -730,57 +930,77 @@ pub(crate) fn run_daemon(options: &Options) -> ExitCode {
                 api_env.clone(),
                 super::queue::QueueSettings::default(),
                 log,
+                activity,
             )
         }) {
             Ok(queue) => Some(queue),
             Err(error) => {
-                say(&format!("the dashboard queue did not start: {error}"));
-                let _ = control::ask(&tx, control::Request::Stop, Duration::from_secs(60));
-                let _ = control.join();
+                start_failed("queue", &options.var.join("control"), &error.to_string());
+                stop_control(&tx);
+                join_within(control, "control", Duration::from_secs(10));
                 if let Some(api) = api {
                     api.stop(Duration::from_secs(5));
                 }
-                remove_if_ours(&pid_file);
+                remove_records(&records);
                 return ExitCode::from(1);
             }
         }
     } else {
         None
     };
-    let socket = options.socket();
-    if let Err(error) = ctl::listen(&socket, uid, tx.clone(), mutation_deadline) {
-        say(&format!("cannot serve {}: {error}", socket.display()));
-        let _ = control::ask(&tx, control::Request::Stop, Duration::from_secs(60));
-        let _ = control.join();
+    // `bounded`: a failed start waits a bounded time for the control thread;
+    // a clean stop waits for it (it ends once stopped, within the grace).
+    let stop_all = |control: thread::JoinHandle<()>,
+                    queue: Option<super::queue::QueueConsumer>,
+                    api: Option<super::api_server::ApiKeeper>,
+                    bounded: bool| {
+        if bounded {
+            join_within(control, "control", Duration::from_secs(10));
+        } else if control.join().is_err() {
+            say("the control thread panicked");
+        }
         if let Some(queue) = queue {
             queue.stop(Duration::from_secs(15));
         }
         if let Some(api) = api {
             api.stop(Duration::from_secs(5));
         }
-        remove_if_ours(&pid_file);
+    };
+    let ctl_sink = FileSink::new(&log_root);
+    let ctl_log: ctl::CtlLog = Arc::new(move |level, event, detail| {
+        log_or_stderr(&ctl_sink, level, event, detail);
+    });
+    if let Err(error) = ctl::listen(&socket, uid, tx.clone(), mutation_deadline, ctl_log) {
+        start_failed("ctl_socket", &socket, &error.to_string());
+        stop_control(&tx);
+        stop_all(control, queue, api, true);
+        remove_records(&records);
         return ExitCode::from(1);
     }
-    // Ready: the control thread runs and the socket answers.
-    let start = super::super::linux_files::process_start(pid).unwrap_or(0);
-    let boot = fs::read_to_string("/proc/sys/kernel/random/boot_id").unwrap_or_default();
-    if let Err(error) = super::state::atomic_write(
-        &ready_file,
-        format!("{pid}\n{start}\n{}\n", boot.trim()).as_bytes(),
-    ) {
-        say(&format!("cannot publish daemon.ready: {error}"));
+    // Ready: the control thread runs and the socket answers. A daemon without
+    // its readiness record is one no stop can prove, so a failed write is
+    // fatal (S1-c2): the start fails by name and the records go.
+    let published = identity_record(pid).and_then(|ready| {
+        super::state::atomic_write(&ready_file, ready.as_bytes()).map_err(|error| error.cause)
+    });
+    if let Err(cause) = published {
+        start_failed("daemon.ready", &ready_file, &cause);
+        stop_control(&tx);
+        stop_all(control, queue, api, true);
+        remove_records(&records);
+        return ExitCode::from(1);
     }
     drop(tx);
-    let _ = control.join();
-    if let Some(queue) = queue {
-        queue.stop(Duration::from_secs(15));
-    }
-    if let Some(api) = api {
-        api.stop(Duration::from_secs(5));
-    }
+    stop_all(control, queue, api, false);
     // Clean stop: nothing an older pre-hook checks for is left behind (§3.4).
-    for path in [&socket, &ready_file, &pid_file] {
-        remove_if_ours(path);
+    let (_, failed) = remove_records(&records);
+    if !failed.is_empty() {
+        log_or_stderr(
+            &sink,
+            Level::Error,
+            "service_records_kept",
+            format!("cause={}", failed.join("; ")),
+        );
     }
     ExitCode::SUCCESS
 }
@@ -824,8 +1044,74 @@ pub(crate) fn run_ctl(options: &Options, rest: &[String]) -> ExitCode {
 
 // ---------------------------------------------------------------- --launch-daemon / --supervise
 
+/// Where the supervisor keeps the daemon's (and its own) stderr.
+fn stderr_log(var: &Path) -> PathBuf {
+    var.join("log").join("daemon-stderr.log")
+}
+
+/// `daemon-stderr.log` is kept to this size: past it, it becomes `.1` (one
+/// generation) before the next daemon starts.
+const STDERR_LOG_LIMIT: u64 = 1024 * 1024;
+
+/// Open `daemon-stderr.log` for appending, rotating it first when it is over
+/// its limit. Every failure is returned by name.
+fn open_stderr_log(var: &Path) -> Result<File, String> {
+    let path = stderr_log(var);
+    match fs::symlink_metadata(&path) {
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
+            return Err(format!("{}: not a regular file", path.display()));
+        }
+        Ok(metadata) if metadata.len() > STDERR_LOG_LIMIT => {
+            let old = var.join("log").join("daemon-stderr.log.1");
+            fs::rename(&path, &old)
+                .map_err(|error| format!("{} -> {}: {error}", path.display(), old.display()))?;
+        }
+        _ => {}
+    }
+    OpenOptions::new()
+        .append(true)
+        .create(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(&path)
+        .map_err(|error| format!("{}: {error}", path.display()))
+}
+
+/// The length of `daemon-stderr.log` now: what was written after it is new.
+fn stderr_mark(var: &Path) -> u64 {
+    fs::metadata(stderr_log(var)).map_or(0, |m| m.len())
+}
+
+/// The last non-empty line written to `daemon-stderr.log` after `mark` (at
+/// most its last 8 KiB), sanitized; empty when there is none.
+fn stderr_since(var: &Path, mark: u64) -> String {
+    use std::io::{Seek, SeekFrom};
+    let Ok(mut file) = File::open(stderr_log(var)) else {
+        return String::new();
+    };
+    let length = file.metadata().map_or(0, |m| m.len());
+    // A rotation since the mark: the file is new, read it from its start.
+    let from = if length < mark { 0 } else { mark };
+    let from = from.max(length.saturating_sub(8 * 1024));
+    if file.seek(SeekFrom::Start(from)).is_err() {
+        return String::new();
+    }
+    let mut bytes = Vec::new();
+    if file.take(8 * 1024).read_to_end(&mut bytes).is_err() {
+        return String::new();
+    }
+    String::from_utf8_lossy(&bytes)
+        .lines()
+        .rev()
+        .find(|line| !line.trim().is_empty())
+        .map(|line| sanitize_detail(line, 240))
+        .unwrap_or_default()
+}
+
 /// `--launch-daemon`: start the supervisor detached (`setsid`) and wait for
-/// `ctl ping` (≤ 30 s). Exit 0 once it answers; 1 with a named cause otherwise.
+/// `ctl ping` (`--ready-within-seconds`, 30 s by default). Exit 0 once it
+/// answers; 1 with a named cause otherwise, after stopping the supervisor it
+/// started (F3), with the daemon's own last words.
 pub(crate) fn run_launch(options: &Options) -> ExitCode {
     if ctl::request(
         &options.socket(),
@@ -837,11 +1123,31 @@ pub(crate) fn run_launch(options: &Options) -> ExitCode {
         // Start is idempotent.
         return ExitCode::SUCCESS;
     }
+    // The supervisor writes under var/run and var/log: the same identity and
+    // layout checks as the daemon's, refused by name before anything starts.
+    if let Err(cause) =
+        check_identity(&options.home).and_then(|uid| ensure_layout(&options.var, uid))
+    {
+        say(&format!("refused: {cause}"));
+        return ExitCode::from(1);
+    }
     let exe = match std::env::current_exe() {
         Ok(exe) => exe,
         Err(error) => {
             say(&format!("cannot find this executable: {error}"));
             return ExitCode::from(1);
+        }
+    };
+    // The supervisor's own words (a refused start, a record it cannot
+    // write) go where the daemon's do, so they can be relayed.
+    let mark = stderr_mark(&options.var);
+    let supervisor_stderr = match open_stderr_log(&options.var) {
+        Ok(file) => Stdio::from(file),
+        Err(cause) => {
+            say(&format!(
+                "warning: the supervisor's stderr is discarded: {cause}"
+            ));
+            Stdio::null()
         }
     };
     let mut command = Command::new(exe);
@@ -850,7 +1156,7 @@ pub(crate) fn run_launch(options: &Options) -> ExitCode {
         .args(options.forward())
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null());
+        .stderr(supervisor_stderr);
     // SAFETY: setsid is async-signal-safe.
     unsafe {
         command.pre_exec(|| {
@@ -867,13 +1173,29 @@ pub(crate) fn run_launch(options: &Options) -> ExitCode {
             return ExitCode::from(1);
         }
     };
-    let deadline = Instant::now() + Duration::from_secs(30);
+    let last_words = |var: &Path| {
+        let last = stderr_since(var, mark);
+        if last.is_empty() {
+            String::new()
+        } else {
+            format!("; the daemon said: {last}")
+        }
+    };
+    let deadline = Instant::now() + options.ready_within;
     while Instant::now() < deadline {
-        if let Ok(Some(status)) = child.try_wait() {
-            say(&format!(
-                "the supervisor exited before the daemon was ready ({status})"
-            ));
-            return ExitCode::from(1);
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                say(&format!(
+                    "the supervisor exited before the daemon was ready ({status}){}",
+                    last_words(&options.var)
+                ));
+                return ExitCode::from(1);
+            }
+            Ok(None) => {}
+            Err(error) => {
+                say(&format!("the supervisor cannot be waited for: {error}"));
+                break;
+            }
         }
         if ctl::request(
             &options.socket(),
@@ -886,8 +1208,45 @@ pub(crate) fn run_launch(options: &Options) -> ExitCode {
         }
         thread::sleep(Duration::from_millis(200));
     }
-    say("the daemon did not answer ctl ping within 30 s");
+    // Not ready in time: the supervisor (and through it, its daemon) is
+    // stopped, so a failed start leaves nothing running that start-stop-status
+    // cannot see (F3). TERM first (it forwards to the daemon), KILL after 5 s
+    // (the daemon dies with it: parent-death signal).
+    let stopped = stop_child(&mut child, Duration::from_secs(5));
+    say(&format!(
+        "the daemon did not answer ctl ping within {} s; the supervisor (PID {}) was {}{}",
+        options.ready_within.as_secs(),
+        child.id(),
+        stopped,
+        last_words(&options.var)
+    ));
     ExitCode::from(1)
+}
+
+/// TERM `child`, KILL it after `grace`, and reap it (bounded). Says how it
+/// ended.
+fn stop_child(child: &mut std::process::Child, grace: Duration) -> &'static str {
+    let pid = child.id();
+    let _ = sys::kill_process(pid, libc::SIGTERM);
+    let reaped = |child: &mut std::process::Child, within: Duration| {
+        let deadline = Instant::now() + within;
+        loop {
+            match child.try_wait() {
+                Ok(Some(_)) => return true,
+                Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(50)),
+                _ => return false,
+            }
+        }
+    };
+    if reaped(child, grace) {
+        return "stopped";
+    }
+    let _ = sys::kill_process(pid, libc::SIGKILL);
+    if reaped(child, Duration::from_secs(5)) {
+        "killed"
+    } else {
+        "signalled but could not be reaped"
+    }
 }
 
 /// The restart budget of the respawning parent (R5).
@@ -923,12 +1282,86 @@ impl RestartBudget {
     }
 }
 
+/// The supervisor's end: its own record goes (only while it names this
+/// process), and a failure to remove it is named.
+fn supervisor_exit(sink: &FileSink, record_path: &Path, record: &str, code: u8) -> ExitCode {
+    if let Err(cause) = remove_own_record(record_path, record) {
+        log_or_stderr(
+            sink,
+            Level::Error,
+            "service_records_kept",
+            format!("path={} cause={cause}", record_path.display()),
+        );
+    }
+    ExitCode::from(code)
+}
+
+/// Remove the records of a daemon that is gone (the supervisor gave up after
+/// it died): only while `daemon.lock` is free, which proves no daemon runs,
+/// and under that lock so none can start meanwhile (S1-c2).
+fn remove_dead_daemon_records(sink: &FileSink, var: &Path) {
+    match acquire_singleton(var) {
+        Ok(Some(lock)) => {
+            let paths = daemon_records(var);
+            let (removed, failed) =
+                remove_records(&paths.iter().map(PathBuf::as_path).collect::<Vec<_>>());
+            drop(lock);
+            if failed.is_empty() {
+                log_or_stderr(
+                    sink,
+                    Level::Warn,
+                    "service_records_removed",
+                    format!(
+                        "paths={} cause=the daemon is gone and was not restarted",
+                        if removed.is_empty() {
+                            "none".to_owned()
+                        } else {
+                            removed.join(",")
+                        }
+                    ),
+                );
+            } else {
+                log_or_stderr(
+                    sink,
+                    Level::Error,
+                    "service_records_kept",
+                    format!("cause={}", failed.join("; ")),
+                );
+            }
+        }
+        Ok(None) => log_or_stderr(
+            sink,
+            Level::Error,
+            "service_records_kept",
+            format!(
+                "path={} cause=daemon.lock is held, so a daemon still runs",
+                var.join("run/daemon.lock").display()
+            ),
+        ),
+        Err(cause) => log_or_stderr(
+            sink,
+            Level::Error,
+            "service_records_kept",
+            format!("cause=daemon.lock cannot be probed: {cause}"),
+        ),
+    }
+}
+
 /// `--supervise`: run `--daemon` and restart it after a crash (not after a
 /// clean stop), at most 5 times in 10 minutes. TERM/INT are forwarded.
+/// Publishes `supervisor.pid` (pid, start tick, boot id) for its life; when it
+/// gives up it removes the dead daemon's records too.
 pub(crate) fn run_supervise(options: &Options) -> ExitCode {
     if let Err(error) = sys::block_daemon_signals() {
         say(&format!("cannot block signals: {error}"));
         return ExitCode::from(1);
+    }
+    sys::set_umask(0o077);
+    if let Err(cause) =
+        check_identity(&options.home).and_then(|uid| ensure_layout(&options.var, uid))
+    {
+        say(&format!("refused: {cause}"));
+        return ExitCode::from(78);
     }
     let exe = match std::env::current_exe() {
         Ok(exe) => exe,
@@ -937,12 +1370,43 @@ pub(crate) fn run_supervise(options: &Options) -> ExitCode {
             return ExitCode::from(1);
         }
     };
+    let sink = FileSink::new(&options.var.join("log"));
+    // One supervisor per package: a second one (two starts at once) leaves,
+    // named, before it writes anything.
+    let _single = match acquire_lock_file(&options.var, "supervisor.lock") {
+        Ok(Some(lock)) => lock,
+        Ok(None) => {
+            log_or_stderr(
+                &sink,
+                Level::Info,
+                "service_superseded",
+                "cause=supervisor.lock is held by another supervisor; this one leaves".into(),
+            );
+            return ExitCode::SUCCESS;
+        }
+        Err(cause) => {
+            say(&format!("cannot take the supervisor lock: {cause}"));
+            return ExitCode::from(1);
+        }
+    };
+    let record_path = options.var.join("run").join("supervisor.pid");
+    let record = match identity_record(std::process::id()).and_then(|record| {
+        super::state::atomic_write(&record_path, record.as_bytes())
+            .map(|()| record)
+            .map_err(|error| error.to_string())
+    }) {
+        Ok(record) => record,
+        Err(cause) => {
+            say(&format!("cannot publish supervisor.pid: {cause}"));
+            return ExitCode::from(1);
+        }
+    };
     let child_pid = Arc::new(AtomicU32::new(0));
     let stopping = Arc::new(std::sync::atomic::AtomicBool::new(false));
     {
         let child_pid = Arc::clone(&child_pid);
         let stopping = Arc::clone(&stopping);
-        let _ = thread::Builder::new()
+        let spawned = thread::Builder::new()
             .name("sdsyncd-supervise-signals".into())
             .spawn(move || {
                 while let Ok(signal) = sys::wait_signal() {
@@ -955,17 +1419,31 @@ pub(crate) fn run_supervise(options: &Options) -> ExitCode {
                     }
                 }
             });
+        if let Err(error) = spawned {
+            say(&format!("cannot start the signal thread: {error}"));
+            return supervisor_exit(&sink, &record_path, &record, 1);
+        }
     }
-    let sink = FileSink::new(&options.var.join("log"));
     let mut budget = RestartBudget::new(5, Duration::from_secs(600));
     loop {
-        let stderr = OpenOptions::new()
-            .append(true)
-            .create(true)
-            .mode(0o600)
-            .open(options.var.join("log").join("daemon-stderr.log"))
-            .map(Stdio::from)
-            .unwrap_or_else(|_| Stdio::null());
+        // A stop that arrived between two daemons is not a reason to start
+        // another (F3).
+        if stopping.load(Ordering::SeqCst) {
+            return supervisor_exit(&sink, &record_path, &record, 0);
+        }
+        let mark = stderr_mark(&options.var);
+        let stderr = match open_stderr_log(&options.var) {
+            Ok(file) => Stdio::from(file),
+            Err(cause) => {
+                log_or_stderr(
+                    &sink,
+                    Level::Error,
+                    "daemon_stderr_unavailable",
+                    format!("cause={cause} the daemon's stderr is discarded"),
+                );
+                Stdio::null()
+            }
+        };
         let mut command = Command::new(&exe);
         command
             .arg("--daemon")
@@ -981,6 +1459,11 @@ pub(crate) fn run_supervise(options: &Options) -> ExitCode {
         let status = match command.spawn() {
             Ok(mut child) => {
                 child_pid.store(child.id(), Ordering::SeqCst);
+                // A TERM that landed before the PID was published was not
+                // forwarded: forward it now.
+                if stopping.load(Ordering::SeqCst) {
+                    let _ = sys::kill_process(child.id(), libc::SIGTERM);
+                }
                 let status = child.wait();
                 child_pid.store(0, Ordering::SeqCst);
                 status
@@ -994,27 +1477,51 @@ pub(crate) fn run_supervise(options: &Options) -> ExitCode {
                 .unwrap_or(-1),
             Err(_) => -1,
         };
-        // A clean stop, or another daemon already serving: done.
-        if code == 0 || code == 75 || stopping.load(Ordering::SeqCst) {
-            return ExitCode::SUCCESS;
+        // A clean stop, or a stop asked of the supervisor: done.
+        if code == 0 || stopping.load(Ordering::SeqCst) {
+            return supervisor_exit(&sink, &record_path, &record, 0);
         }
-        let now = epoch().unwrap_or(0);
+        let last = stderr_since(&options.var, mark);
+        let said = if last.is_empty() {
+            String::new()
+        } else {
+            format!(" last_stderr={last}")
+        };
+        // 75: daemon.lock was held for the whole of the daemon's wait. Another
+        // daemon serving is not a failure; anything else holding it is (F4).
+        if code == 75 {
+            let serving = ctl::request(
+                &options.socket(),
+                &json!({"verb": "ping"}),
+                Duration::from_secs(2),
+            )
+            .is_ok_and(|reply| reply["ok"] == true);
+            if serving {
+                log_or_stderr(
+                    &sink,
+                    Level::Info,
+                    "service_superseded",
+                    "cause=daemon.lock is held by a serving daemon; this supervisor leaves".into(),
+                );
+                return supervisor_exit(&sink, &record_path, &record, 0);
+            }
+        }
         let cause = match &status {
-            Ok(_) => format!("exit={code}"),
+            Ok(_) if code == 75 => format!(
+                "exit=75 cause=daemon_lock_held: daemon.lock is held but no daemon answers{said}"
+            ),
+            Ok(_) => format!("exit={code}{said}"),
             Err(error) => format!("spawn_failed cause={error}"),
         };
         if code == 78 || !budget.allow(Instant::now()) {
-            let _ = sink.log(
-                now,
-                &LogEvent {
-                    level: Level::Error,
-                    category: "controller",
-                    event: "service_start_failed",
-                    detail: format!("{cause} restarts_exhausted={}", code != 78),
-                },
+            log_or_stderr(
+                &sink,
+                Level::Error,
+                "service_start_failed",
+                format!("{cause} restarts_exhausted={}", code != 78),
             );
-            let _ = sink.activity(
-                now,
+            activity_or_stderr(
+                &sink,
                 &ActivityRow {
                     code: "service.start_failed",
                     profile: "none".into(),
@@ -1024,19 +1531,12 @@ pub(crate) fn run_supervise(options: &Options) -> ExitCode {
                     message: format!("The sync service stopped and was not restarted ({cause})"),
                 },
             );
-            return ExitCode::from(1);
+            remove_dead_daemon_records(&sink, &options.var);
+            return supervisor_exit(&sink, &record_path, &record, 1);
         }
-        let _ = sink.log(
-            now,
-            &LogEvent {
-                level: Level::Warn,
-                category: "controller",
-                event: "service_restarted",
-                detail: cause.clone(),
-            },
-        );
-        let _ = sink.activity(
-            now,
+        log_or_stderr(&sink, Level::Warn, "service_restarted", cause.clone());
+        activity_or_stderr(
+            &sink,
             &ActivityRow {
                 code: "service.restarted",
                 profile: "none".into(),
@@ -1048,7 +1548,11 @@ pub(crate) fn run_supervise(options: &Options) -> ExitCode {
                 ),
             },
         );
-        thread::sleep(Duration::from_secs(1));
+        // One second between daemons, cut short by a stop.
+        let pause = Instant::now() + Duration::from_secs(1);
+        while Instant::now() < pause && !stopping.load(Ordering::SeqCst) {
+            thread::sleep(Duration::from_millis(50));
+        }
     }
 }
 

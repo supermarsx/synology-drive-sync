@@ -136,9 +136,19 @@ mod bridge {
                 }
                 if started.elapsed() >= AUDIT_STEP_DEADLINE {
                     let _ = child.kill();
-                    let _ = child.wait();
+                    // H3: the wait after KILL is bounded too; a child in
+                    // uninterruptible sleep goes to a reaper, named.
+                    let pid = child.id();
+                    let handed = if super::super::sys::reap_within(
+                        &mut child,
+                        std::time::Duration::from_secs(5),
+                    ) {
+                        "reaped"
+                    } else {
+                        super::super::sys::abandon_to_reaper(child)
+                    };
                     return Err(format!(
-                        "--audit-transaction {} gave no answer within {} s",
+                        "--audit-transaction {} gave no answer within {} s (pid={pid} {handed})",
                         arguments[0],
                         AUDIT_STEP_DEADLINE.as_secs()
                     ));
