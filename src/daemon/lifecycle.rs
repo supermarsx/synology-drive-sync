@@ -966,7 +966,11 @@ pub(crate) fn run_daemon(options: &Options) -> ExitCode {
             api.stop(Duration::from_secs(5));
         }
     };
-    if let Err(error) = ctl::listen(&socket, uid, tx.clone(), mutation_deadline) {
+    let ctl_sink = FileSink::new(&log_root);
+    let ctl_log: ctl::CtlLog = Arc::new(move |level, event, detail| {
+        log_or_stderr(&ctl_sink, level, event, detail);
+    });
+    if let Err(error) = ctl::listen(&socket, uid, tx.clone(), mutation_deadline, ctl_log) {
         start_failed("ctl_socket", &socket, &error.to_string());
         stop_control(&tx);
         stop_all(control, queue, api, true);

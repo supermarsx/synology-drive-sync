@@ -5927,7 +5927,7 @@ mod linux_socket {
         fs::remove_file(path).map_err(|_| BridgeError::unsafe_runtime())
     }
 
-    fn connect_with_timeout(path: &Path, timeout: Duration) -> io::Result<UnixStream> {
+    pub(crate) fn connect_with_timeout(path: &Path, timeout: Duration) -> io::Result<UnixStream> {
         let path_bytes = path.as_os_str().as_bytes();
         // sockaddr_un paths are NUL-terminated. Abstract sockets are outside the
         // fixed filesystem contract used by this bridge.
