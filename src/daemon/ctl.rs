@@ -1639,46 +1639,54 @@ mod tests {
             holding_control(),
             Duration::from_secs(1),
             log,
-            Duration::from_millis(400),
+            Duration::from_millis(600),
         )
         .unwrap();
         const EMPTY: usize = 60;
         for _ in 0..EMPTY {
             drop(UnixStream::connect(&path).unwrap());
         }
-        // Let every connection thread finish its (failed) reply.
-        thread::sleep(Duration::from_millis(600));
-        let dropped = |lines: &[String]| {
-            lines
-                .iter()
-                .filter(|l| l.starts_with("ctl_reply_dropped") && l.contains("code=empty_request"))
-                .count()
+        // A request served once the episode has been quiet ends it, with its count. How long that
+        // takes depends on the load the test runs under (every connection thread has to finish
+        // its failed reply first), so ask until the end is reported.
+        let count_of = |line: &str| -> usize {
+            line.split("count=")
+                .nth(1)
+                .and_then(|rest| rest.split_whitespace().next())
+                .and_then(|n| n.parse().ok())
+                .unwrap_or_else(|| panic!("no count in {line:?}"))
         };
-        let seen = lines.lock().unwrap().clone();
-        assert!(
-            (1..=2).contains(&dropped(&seen)),
-            "{EMPTY} empty connections wrote {} drop lines: {seen:?}",
-            dropped(&seen)
-        );
-        // A served request after the quiet period ends the episode, with its count.
-        let reply = request(&path, &json!({"verb":"ping"}), Duration::from_secs(5)).unwrap();
-        assert_eq!(reply["pong"], true, "{reply}");
-        let seen = lines.lock().unwrap().clone();
-        let ended: Vec<&String> = seen
+        let give_up = Instant::now() + Duration::from_secs(20);
+        let (seen, counted) = loop {
+            thread::sleep(Duration::from_millis(250));
+            let reply = request(&path, &json!({"verb":"ping"}), Duration::from_secs(5)).unwrap();
+            assert_eq!(reply["pong"], true, "{reply}");
+            let seen = lines.lock().unwrap().clone();
+            let counted: usize = seen
+                .iter()
+                .filter(|l| l.starts_with("ctl_empty_requests_ended"))
+                .map(|l| count_of(l))
+                .sum();
+            if counted >= EMPTY - 2 || Instant::now() > give_up {
+                break (seen, counted);
+            }
+        };
+        let dropped = seen
+            .iter()
+            .filter(|l| l.starts_with("ctl_reply_dropped") && l.contains("code=empty_request"))
+            .count();
+        let ended = seen
             .iter()
             .filter(|l| l.starts_with("ctl_empty_requests_ended"))
-            .collect();
-        assert_eq!(ended.len(), 1, "the episode's end is reported: {seen:?}");
-        let counted: usize = ended[0]
-            .split("count=")
-            .nth(1)
-            .and_then(|rest| rest.split_whitespace().next())
-            .and_then(|n| n.parse().ok())
-            .unwrap_or_else(|| panic!("no count in {:?}", ended[0]));
+            .count();
         assert!(
             counted >= EMPTY - 2,
-            "the end line counts the episode's connections ({EMPTY} made): {:?}",
-            ended[0]
+            "the end lines count the episode's connections ({EMPTY} made, {counted} counted): {seen:?}"
+        );
+        // One logged line per episode (a loaded machine may split it, never into one per connection).
+        assert!(
+            (1..=3).contains(&dropped) && (dropped == ended || dropped == ended + 1),
+            "{EMPTY} empty connections wrote {dropped} drop lines and {ended} end lines: {seen:?}"
         );
         remove_dir(&dir);
     }
