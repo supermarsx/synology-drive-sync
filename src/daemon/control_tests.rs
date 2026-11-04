@@ -1898,6 +1898,113 @@ fn status_carries_the_backends_detail() {
     }
 }
 
+/// S3-12: `backend_detail` is cut at 240 bytes, and it was cut from the end,
+/// which lost `next_walk_deadline_seconds=N`, the one number the dashboard
+/// points at. The tail is kept.
+#[test]
+fn a_long_backend_detail_keeps_its_tail() {
+    let h = realtime_harness("backend-tail");
+    h.wait_for("arm", Duration::from_secs(5), |h| {
+        armed_generation(h, "docs").is_some()
+    });
+    let long = format!(
+        "inotify unavailable: {}; walk_deadline_exceeded: the walk gave up after 120s in /x; \
+         next_walk_deadline_seconds=240",
+        "the watcher's own account of why, which goes on and on, ".repeat(8)
+    );
+    assert!(long.len() > 240);
+    h.tx.send(Msg::Change(ChangeEvent::Backend {
+        routine: "docs".into(),
+        backend: Backend::Polling,
+        reason: BackendReason::WatchSetupFailed,
+        detail: long,
+    }))
+    .unwrap();
+    let detail = |h: &Harness| {
+        h.ask(Request::Status)["routines"]
+            .as_array()
+            .and_then(|list| list.iter().find(|r| r["profile"] == "docs").cloned())
+            .and_then(|r| r["backend_detail"].as_str().map(str::to_owned))
+            .unwrap_or_default()
+    };
+    h.wait_for("the detail in status", Duration::from_secs(5), |h| {
+        !detail(h).is_empty()
+    });
+    let kept = detail(&h);
+    assert!(kept.len() <= 240, "{} bytes: {kept}", kept.len());
+    assert!(
+        kept.ends_with("next_walk_deadline_seconds=240"),
+        "the tail is kept: {kept}"
+    );
+    assert!(
+        kept.starts_with("inotify unavailable"),
+        "the head is kept: {kept}"
+    );
+}
+
+/// S3-12: a polling tree whose skipped-entry count changes on every reading
+/// reported a new backend account each time, and each was a `routine_backend`
+/// line. One cause is one episode: the first report is logged, the rest are
+/// counted, and the report that ends the episode carries the count.
+#[test]
+fn a_flapping_backend_cause_is_logged_once_per_episode() {
+    let h = realtime_harness("backend-episode");
+    h.wait_for("arm", Duration::from_secs(5), |h| {
+        armed_generation(h, "docs").is_some()
+    });
+    let report = |backend: Backend, reason: BackendReason, detail: String| {
+        h.tx.send(Msg::Change(ChangeEvent::Backend {
+            routine: "docs".into(),
+            backend,
+            reason,
+            detail,
+        }))
+        .unwrap();
+    };
+    const FLAPS: usize = 40;
+    for skipped in 1..=FLAPS {
+        report(
+            Backend::Polling,
+            BackendReason::WatchSetupFailed,
+            format!(
+                "inotify watch limit reached; {skipped} entries skipped: a/{skipped} (PermissionDenied)"
+            ),
+        );
+    }
+    report(
+        Backend::Inotify,
+        BackendReason::Ok,
+        "12 directories watched".into(),
+    );
+    h.wait_for("the recovery line", Duration::from_secs(5), |h| {
+        h.logs()
+            .iter()
+            .any(|l| l.starts_with("routine_backend ") && l.contains("reason=ok"))
+    });
+    let lines: Vec<String> = h
+        .logs()
+        .into_iter()
+        .filter(|l| l.starts_with("routine_backend "))
+        .collect();
+    assert_eq!(
+        lines.len(),
+        2,
+        "{FLAPS} reports of one cause are one line, then the recovery: {lines:#?}"
+    );
+    assert!(
+        lines[0].contains("reason=watch_setup_failed") && lines[0].contains("1 entries skipped"),
+        "the first report of the episode is logged whole: {}",
+        lines[0]
+    );
+    assert!(
+        lines[1].contains("reason=ok")
+            && lines[1].contains(&format!("suppressed_reports={}", FLAPS - 1))
+            && lines[1].contains("previous_reason=watch_setup_failed"),
+        "the recovery line counts what the episode did not log: {}",
+        lines[1]
+    );
+}
+
 /// The paths `ctl status` lists as `config_unreadable`.
 fn unreadable_paths(h: &Harness) -> Vec<String> {
     h.ask(Request::Status)["config_unreadable"]

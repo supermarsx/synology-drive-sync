@@ -215,6 +215,98 @@ impl DirtySet {
     }
 }
 
+/// `text` cut to at most `max` bytes with its tail kept (S3-12). The detail's
+/// last words are the ones the dashboard points at (`next_walk_deadline_seconds=N`
+/// and what happens next), so the middle goes, marked with `...`. `text` is the
+/// sanitized, ASCII-only line, so every byte is a character (counted in
+/// characters, so a stray multi-byte one cannot split).
+pub(crate) fn bound_detail(text: &str, max: usize) -> String {
+    const GAP: &str = "...";
+    let chars: Vec<char> = text.chars().collect();
+    if chars.len() <= max || max <= GAP.len() {
+        return chars.into_iter().take(max).collect();
+    }
+    let head = (max - GAP.len()) / 3;
+    let tail = max - GAP.len() - head;
+    let mut bounded: String = chars[..head].iter().collect();
+    bounded.push_str(GAP);
+    bounded.extend(&chars[chars.len() - tail..]);
+    bounded
+}
+
+/// What a backend report is about, apart from numbers that change on every
+/// reading: the detail without its skipped-entries account (`3 entries
+/// skipped: a, b, c`), whose count and sample differ from one poll to the next
+/// while the cause stays the same.
+fn backend_cause(detail: &str) -> &str {
+    let at = [" entries skipped: ", " entry skipped: "]
+        .iter()
+        .filter_map(|marker| detail.find(marker))
+        .min();
+    match at {
+        Some(at) => detail[..at]
+            .trim_end_matches(|c: char| c.is_ascii_digit())
+            .trim_end_matches("; ")
+            .trim_end(),
+        None => detail,
+    }
+}
+
+/// What the scheduler logs of one routine's backend reports (S3-12). The change
+/// sources send a report whenever their account changes, and a polling tree
+/// whose skipped entries differ on every reading changes it on every reading. A
+/// run of reports with one backend, reason and cause is one episode: the first
+/// is logged whole and the rest are counted; the report that ends the episode
+/// carries the count. The latest detail is always in `ctl status`.
+#[derive(Debug, Default)]
+pub(crate) struct BackendReports {
+    last: Option<(Backend, BackendReason, String)>,
+    suppressed: u64,
+}
+
+/// What to do with one backend report.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum Admit {
+    /// Log it. `previous` is the episode it ends, with the reports that
+    /// episode did not log.
+    Log {
+        previous: Option<(Backend, BackendReason, u64)>,
+    },
+    /// The episode goes on: counted, not logged.
+    Suppress,
+}
+
+impl BackendReports {
+    pub(crate) fn admit(&mut self, backend: Backend, reason: BackendReason, detail: &str) -> Admit {
+        let cause = backend_cause(detail);
+        if self
+            .last
+            .as_ref()
+            .is_some_and(|(b, r, c)| *b == backend && *r == reason && c == cause)
+        {
+            self.suppressed += 1;
+            return Admit::Suppress;
+        }
+        let ended = self.last.replace((backend, reason, cause.to_owned()));
+        let suppressed = std::mem::take(&mut self.suppressed);
+        Admit::Log {
+            previous: ended
+                .filter(|_| suppressed > 0)
+                .map(|(b, r, _)| (b, r, suppressed)),
+        }
+    }
+
+    /// The routine is re-armed or disarmed: the episode is over. Returns the
+    /// reports it did not log, so the caller can say so.
+    pub(crate) fn end(&mut self) -> Option<(Backend, BackendReason, u64)> {
+        let suppressed = std::mem::take(&mut self.suppressed);
+        self.last
+            .take()
+            .filter(|_| suppressed > 0)
+            .map(|(b, r, _)| (b, r, suppressed))
+    }
+}
+
 /// A change source for tests: records what it was asked, emits nothing by itself.
 #[cfg(test)]
 #[derive(Clone, Default)]
@@ -293,6 +385,82 @@ mod tests {
             set.mark(&format!("d{n}"), now);
         }
         assert!(set.whole_tree && set.dirs.is_empty());
+    }
+
+    #[test]
+    fn a_bounded_detail_keeps_its_tail() {
+        let text = format!("{}tail=1", "x".repeat(400));
+        let bounded = bound_detail(&text, 240);
+        assert_eq!(bounded.len(), 240, "{bounded}");
+        assert!(
+            bounded.ends_with("tail=1") && bounded.contains("..."),
+            "{bounded}"
+        );
+        assert_eq!(bound_detail("short", 240), "short");
+        assert_eq!(bound_detail("abcdef", 3), "abc");
+    }
+
+    #[test]
+    fn the_skip_account_is_not_part_of_the_cause() {
+        assert_eq!(
+            backend_cause("watch limit; 12 entries skipped: a, b, and 9 more"),
+            "watch limit"
+        );
+        assert_eq!(backend_cause("1 entry skipped: a (PermissionDenied)"), "");
+        assert_eq!(backend_cause("watch limit"), "watch limit");
+        assert_eq!(
+            backend_cause("walk_deadline_exceeded: next_walk_deadline_seconds=240"),
+            "walk_deadline_exceeded: next_walk_deadline_seconds=240"
+        );
+    }
+
+    #[test]
+    fn backend_reports_are_counted_per_episode() {
+        use Backend::{Inotify, Polling};
+        use BackendReason::{Ok as Fine, WatchLimit, WatchSetupFailed};
+        let mut reports = BackendReports::default();
+        assert_eq!(
+            reports.admit(Polling, WatchLimit, "limit; 1 entry skipped: a"),
+            Admit::Log { previous: None }
+        );
+        assert_eq!(
+            reports.admit(Polling, WatchLimit, "limit; 2 entries skipped: a, b"),
+            Admit::Suppress
+        );
+        assert_eq!(reports.admit(Polling, WatchLimit, "limit"), Admit::Suppress);
+        // A new cause under the same reason is a new episode, and says what the old one hid.
+        assert_eq!(
+            reports.admit(Polling, WatchLimit, "limit; walk_deadline_exceeded"),
+            Admit::Log {
+                previous: Some((Polling, WatchLimit, 2))
+            }
+        );
+        assert_eq!(
+            reports.admit(Polling, WatchSetupFailed, "limit; walk_deadline_exceeded"),
+            Admit::Log { previous: None },
+            "an episode that hid nothing says nothing"
+        );
+        assert_eq!(
+            reports.admit(Polling, WatchSetupFailed, "limit; walk_deadline_exceeded"),
+            Admit::Suppress
+        );
+        assert_eq!(
+            reports.admit(Inotify, Fine, "3 directories watched"),
+            Admit::Log {
+                previous: Some((Polling, WatchSetupFailed, 1))
+            }
+        );
+        // A re-arm ends an episode and hands back what it hid.
+        assert_eq!(
+            reports.admit(Inotify, Fine, "3 directories watched"),
+            Admit::Suppress
+        );
+        assert_eq!(reports.end(), Some((Inotify, Fine, 1)));
+        assert_eq!(reports.end(), None);
+        assert!(matches!(
+            reports.admit(Inotify, Fine, "3 directories watched"),
+            Admit::Log { previous: None }
+        ));
     }
 
     #[test]
