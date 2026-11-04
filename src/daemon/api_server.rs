@@ -588,16 +588,19 @@ mod tests {
             !still_running(pid, Some(start + 1)),
             "another start tick is another process"
         );
-        assert_eq!(
-            signal_if_same(pid, start + 1, libc::SIGKILL).unwrap(),
-            false
+        assert!(
+            !signal_if_same(pid, start + 1, libc::SIGKILL).unwrap(),
+            "not the process recorded"
         );
         thread::sleep(Duration::from_millis(100));
         assert!(
             other.try_wait().unwrap().is_none(),
             "a reused pid was signalled"
         );
-        assert_eq!(signal_if_same(pid, start, libc::SIGKILL).unwrap(), true);
+        assert!(
+            signal_if_same(pid, start, libc::SIGKILL).unwrap(),
+            "the process recorded is signalled"
+        );
         let status = other.wait().unwrap();
         assert_eq!(status.signal(), Some(libc::SIGKILL));
         assert!(!still_running(pid, Some(start)), "reaped: gone");
