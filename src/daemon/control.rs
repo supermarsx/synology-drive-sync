@@ -490,6 +490,45 @@ impl Control {
         now
     }
 
+    /// Publish `run.lock` (and `run.scope`) on the writer thread, bounded
+    /// (H7): its syncs never hold the control thread past the deadline. A
+    /// publish that times out is undone by a removal queued behind it, so a
+    /// late publish never leaves a lock naming a run that did not start.
+    #[cfg(target_os = "linux")]
+    fn publish_run_lock(&mut self, profiles: &[String]) -> Result<(), WriteError> {
+        let run_dir = self.paths.run_dir.clone();
+        let names = profiles.to_vec();
+        let result = self.writer.run(
+            &run_dir.join("run.lock"),
+            Box::new(move || super::state::publish_run_lock(&run_dir, &names)),
+            STATE_WRITE_DEADLINE,
+        );
+        if matches!(&result, Err(error) if error.step == "timeout") {
+            self.remove_run_lock("publish_timeout");
+        }
+        result
+    }
+
+    /// Remove `run.lock` and `run.scope` on the writer thread, bounded; a
+    /// failure or timeout is named with why it was being removed.
+    #[cfg(target_os = "linux")]
+    fn remove_run_lock(&mut self, why: &str) {
+        let run_dir = self.paths.run_dir.clone();
+        let result = self.writer.run(
+            &run_dir.join("run.lock"),
+            Box::new(move || super::state::remove_run_lock(&run_dir)),
+            STATE_WRITE_DEADLINE,
+        );
+        if let Err(error) = result {
+            self.log(
+                Level::Error,
+                "controller",
+                "run_lock_unremovable",
+                format!("{error} when={why}"),
+            );
+        }
+    }
+
     /// Read a configuration or state document. `Ok(None)` only when it is
     /// absent; anything else that keeps it from being read (permissions, an
     /// I/O error, a document past its size bound) is `Err`, named once per
@@ -612,7 +651,7 @@ impl Control {
         let _ = self.write_state(&path, render_run_state(&record, Some(&previous)));
         #[cfg(target_os = "linux")]
         if self.settings.publish_run_lock {
-            let _ = super::state::remove_run_lock(&self.paths.run_dir);
+            self.remove_run_lock("reconcile");
         }
         self.log(
             Level::Warn,
@@ -1821,7 +1860,7 @@ impl Control {
         #[cfg(target_os = "linux")]
         if failure.is_none()
             && self.settings.publish_run_lock
-            && let Err(error) = super::state::publish_run_lock(&self.paths.run_dir, &profiles)
+            && let Err(error) = self.publish_run_lock(&profiles)
         {
             if error.step == "busy" {
                 // Another live process holds run.lock: never taken over.
@@ -1843,7 +1882,7 @@ impl Control {
             && let Some(owner) =
                 super::state::private_lock_owner(&self.paths.run_dir.join("management.lock"))
         {
-            let _ = super::state::remove_run_lock(&self.paths.run_dir);
+            self.remove_run_lock("management_lock");
             let _ = self.write_state(&run_state_path, previous.clone().unwrap_or_default());
             self.defer_busy(
                 request,
@@ -2307,15 +2346,8 @@ impl Control {
         let previous = self.read_or_default(&path);
         let _ = self.write_state(&path, render_run_state(&record, previous.as_deref()));
         #[cfg(target_os = "linux")]
-        if self.settings.publish_run_lock
-            && let Err(error) = super::state::remove_run_lock(&self.paths.run_dir)
-        {
-            self.log(
-                Level::Error,
-                "controller",
-                "run_lock_unremovable",
-                error.to_string(),
-            );
+        if self.settings.publish_run_lock {
+            self.remove_run_lock("run_finished");
         }
 
         let elapsed = active.started.elapsed().as_secs();

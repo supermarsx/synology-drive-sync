@@ -130,11 +130,16 @@ fn write_private_file(temporary: &Path, bytes: &[u8], target: &Path) -> Result<(
 /// The default bound on one state write (design §2.5, layer 4).
 pub(crate) const STATE_WRITE_DEADLINE: Duration = Duration::from_secs(10);
 
-type WriteJob = (PathBuf, Vec<u8>, mpsc::Sender<Result<(), WriteError>>);
+/// One piece of disk work for the writer thread.
+pub(crate) type DiskJob = Box<dyn FnOnce() -> Result<(), WriteError> + Send>;
 
-/// Writes state files on a thread of its own, so the control thread waits at
-/// most a deadline for a volume that stopped answering. A write that times out
-/// is still in flight; the caller holds the record and writes it again later.
+type WriteJob = (DiskJob, mpsc::Sender<Result<(), WriteError>>);
+
+/// Writes state files (and runs the other disk work whose syncs could stall:
+/// publishing and removing `run.lock`, H7) on a thread of its own, so the
+/// control thread waits at most a deadline for a volume that stopped
+/// answering. Jobs run in order. A job that times out is still in flight; the
+/// caller holds the record and writes it again later, or queues the undo.
 pub(crate) struct StateWriter {
     jobs: mpsc::Sender<WriteJob>,
 }
@@ -145,8 +150,8 @@ impl StateWriter {
         thread::Builder::new()
             .name("sdsyncd-state".into())
             .spawn(move || {
-                for (path, bytes, reply) in receiver {
-                    let _ = reply.send(atomic_write(&path, &bytes));
+                for (job, reply) in receiver {
+                    let _ = reply.send(job());
                 }
             })?;
         Ok(Self { jobs })
@@ -158,6 +163,22 @@ impl StateWriter {
         bytes: Vec<u8>,
         deadline: Duration,
     ) -> Result<(), WriteError> {
+        let target = path.to_path_buf();
+        self.run(
+            path,
+            Box::new(move || atomic_write(&target, &bytes)),
+            deadline,
+        )
+    }
+
+    /// Run `job` on the writer thread and wait at most `deadline` for it;
+    /// errors name `path`.
+    pub(crate) fn run(
+        &self,
+        path: &Path,
+        job: DiskJob,
+        deadline: Duration,
+    ) -> Result<(), WriteError> {
         let (reply, answer) = mpsc::channel();
         let gone = |cause: &str| WriteError {
             path: path.to_path_buf(),
@@ -165,7 +186,7 @@ impl StateWriter {
             cause: cause.into(),
         };
         self.jobs
-            .send((path.to_path_buf(), bytes, reply))
+            .send((job, reply))
             .map_err(|_| gone("the state writer thread is gone"))?;
         match answer.recv_timeout(deadline) {
             Ok(result) => result,
@@ -1116,6 +1137,43 @@ mod tests {
                 .starts_with("state=running\npid=7\n")
         );
         fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// H7: disk work run through the writer is bounded by its deadline even
+    /// when the volume stalls, and jobs keep their order (an undo queued after
+    /// a slow publish runs after it).
+    #[test]
+    fn writer_jobs_are_bounded_and_ordered() {
+        let writer = StateWriter::spawn().unwrap();
+        let order = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let first = std::sync::Arc::clone(&order);
+        let started = std::time::Instant::now();
+        let error = writer
+            .run(
+                Path::new("/run.lock"),
+                Box::new(move || {
+                    thread::sleep(Duration::from_millis(500));
+                    first.lock().unwrap().push("publish");
+                    Ok(())
+                }),
+                Duration::from_millis(50),
+            )
+            .unwrap_err();
+        assert!(started.elapsed() < Duration::from_millis(400));
+        assert_eq!(error.step, "timeout");
+        assert_eq!(error.path, Path::new("/run.lock"));
+        let second = std::sync::Arc::clone(&order);
+        writer
+            .run(
+                Path::new("/run.lock"),
+                Box::new(move || {
+                    second.lock().unwrap().push("remove");
+                    Ok(())
+                }),
+                Duration::from_secs(5),
+            )
+            .unwrap();
+        assert_eq!(*order.lock().unwrap(), ["publish", "remove"]);
     }
 
     #[test]
