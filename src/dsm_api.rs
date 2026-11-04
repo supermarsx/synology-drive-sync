@@ -5960,24 +5960,51 @@ mod linux_socket {
             *destination = *source as libc::c_char;
         }
 
-        // SAFETY: address is initialized, the descriptor is live, and the full
-        // Linux sockaddr_un size includes the terminating zero from initialization.
-        let connected = unsafe {
-            libc::connect(
-                stream.as_raw_fd(),
-                (&address as *const libc::sockaddr_un).cast(),
-                mem::size_of::<libc::sockaddr_un>() as libc::socklen_t,
-            )
-        };
-        if connected != 0 {
-            let error = io::Error::last_os_error();
-            if !matches!(
-                error.raw_os_error(),
-                Some(libc::EINPROGRESS | libc::EAGAIN | libc::EALREADY)
-            ) {
-                return Err(error);
+        let deadline = Instant::now()
+            .checked_add(timeout)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "invalid timeout"))?;
+        let mut pause = Duration::from_millis(5);
+        loop {
+            // SAFETY: address is initialized, the descriptor is live, and the full
+            // Linux sockaddr_un size includes the terminating zero from initialization.
+            let connected = unsafe {
+                libc::connect(
+                    stream.as_raw_fd(),
+                    (&address as *const libc::sockaddr_un).cast(),
+                    mem::size_of::<libc::sockaddr_un>() as libc::socklen_t,
+                )
+            };
+            if connected == 0 {
+                break;
             }
-            wait_for_connect(&stream, timeout)?;
+            let error = io::Error::last_os_error();
+            match error.raw_os_error() {
+                Some(libc::EINPROGRESS | libc::EALREADY) => {
+                    wait_for_connect(&stream, timeout)?;
+                    break;
+                }
+                // N-D12: on a Unix socket EAGAIN is the listener's backlog being full, and the
+                // connect has not started: there is nothing in progress to wait for, and the
+                // socket is still unconnected (taking it for connected made the first write
+                // fail as "Transport endpoint is not connected"). Tried again until the
+                // deadline, then named for what it is.
+                Some(libc::EAGAIN) => {
+                    let now = Instant::now();
+                    if now >= deadline {
+                        return Err(io::Error::new(
+                            io::ErrorKind::TimedOut,
+                            format!(
+                                "{}: the listener's backlog stayed full for {} ms (connect: {error})",
+                                path.display(),
+                                timeout.as_millis()
+                            ),
+                        ));
+                    }
+                    std::thread::sleep(pause.min(deadline.duration_since(now)));
+                    pause = (pause * 2).min(Duration::from_millis(50));
+                }
+                _ => return Err(error),
+            }
         }
         stream.set_nonblocking(false)?;
         Ok(stream)
@@ -6135,6 +6162,99 @@ mod linux_socket {
 
     fn same_inode(first: &fs::Metadata, second: &fs::Metadata) -> bool {
         first.st_dev() == second.st_dev() && first.st_ino() == second.st_ino()
+    }
+
+    #[cfg(test)]
+    mod connect_tests {
+        use super::*;
+
+        /// A listener that never accepts, with a backlog of one.
+        fn deaf_listener(path: &Path) -> std::os::fd::OwnedFd {
+            use std::os::fd::FromRawFd as _;
+            let path_bytes = path.as_os_str().as_bytes();
+            // SAFETY: zero is a valid initial representation for sockaddr_un.
+            let mut address = unsafe { mem::zeroed::<libc::sockaddr_un>() };
+            address.sun_family = libc::AF_UNIX as libc::sa_family_t;
+            for (destination, source) in address.sun_path.iter_mut().zip(path_bytes) {
+                *destination = *source as libc::c_char;
+            }
+            // SAFETY: plain socket calls on a descriptor this function owns.
+            unsafe {
+                let fd = libc::socket(libc::AF_UNIX, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0);
+                assert!(fd >= 0, "socket: {}", io::Error::last_os_error());
+                let fd = std::os::fd::OwnedFd::from_raw_fd(fd);
+                assert_eq!(
+                    libc::bind(
+                        fd.as_raw_fd(),
+                        (&address as *const libc::sockaddr_un).cast(),
+                        mem::size_of::<libc::sockaddr_un>() as libc::socklen_t,
+                    ),
+                    0,
+                    "bind: {}",
+                    io::Error::last_os_error()
+                );
+                assert_eq!(
+                    libc::listen(fd.as_raw_fd(), 1),
+                    0,
+                    "listen: {}",
+                    io::Error::last_os_error()
+                );
+                fd
+            }
+        }
+
+        /// N-D12: a listener whose backlog is full answers a non-blocking
+        /// connect with EAGAIN, and the connect has not started. It was taken
+        /// for one in progress, so an unconnected stream came back and the
+        /// first write failed as "Transport endpoint is not connected". It is
+        /// retried within the timeout and then named for what it is.
+        #[test]
+        fn a_full_backlog_is_named_never_an_unconnected_stream() {
+            let dir = std::env::temp_dir().join(format!(
+                "sdsync-backlog-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            fs::create_dir_all(&dir).unwrap();
+            let path = dir.join("deaf.sock");
+            let _listener = deaf_listener(&path);
+            let mut kept = Vec::new();
+            let mut refused = None;
+            for attempt in 0..64 {
+                let began = Instant::now();
+                match connect_with_timeout(&path, Duration::from_millis(300)) {
+                    Ok(stream) => {
+                        let peer = stream.peer_addr();
+                        assert!(
+                            peer.is_ok(),
+                            "connect {attempt} returned a stream that is not connected: {peer:?}"
+                        );
+                        kept.push(stream);
+                    }
+                    Err(error) => {
+                        refused = Some((attempt, error, began.elapsed()));
+                        break;
+                    }
+                }
+            }
+            let (attempt, error, took) =
+                refused.expect("a backlog of one is full within 64 connects");
+            eprintln!("connect {attempt} refused after {took:?}: {error} ({:?})", error.kind());
+            assert_eq!(error.kind(), io::ErrorKind::TimedOut, "{error}");
+            assert!(
+                error.to_string().contains("backlog") && error.to_string().contains("deaf.sock"),
+                "the cause and the path are named: {error}"
+            );
+            assert!(
+                took >= Duration::from_millis(250) && took < Duration::from_secs(3),
+                "retried within the timeout, then refused: {took:?}"
+            );
+            drop(kept);
+            let _ = fs::remove_dir_all(&dir);
+        }
     }
 }
 
