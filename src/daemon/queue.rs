@@ -508,6 +508,28 @@ impl Consumer {
         classified
     }
 
+    /// Remove one of a job's control files. Absent is done; any other failure
+    /// is named with the job, the kind of file, its path and the cause (N-D9:
+    /// a `secret` sidecar may hold a credential, so one left behind must be
+    /// findable). `true` once the file is gone.
+    fn remove_control_file(&self, id: &str, kind: &str, path: &Path) -> bool {
+        match fs::remove_file(path) {
+            Ok(()) => true,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => true,
+            Err(error) => {
+                self.log(
+                    Level::Error,
+                    "control_file_unremovable",
+                    format!(
+                        "id={id} kind={kind} path={} cause={error}",
+                        path.display()
+                    ),
+                );
+                false
+            }
+        }
+    }
+
     fn report_once(&mut self, key: String, event: &'static str, detail: String) {
         if self.reported.insert(key) {
             self.log(Level::Warn, event, detail);
@@ -634,9 +656,9 @@ impl Consumer {
                 "control_response_rejected",
                 format!("id={id} cause=a response already exists"),
             );
-            let _ = fs::remove_file(&processing);
-            let _ = fs::remove_file(&queued_secret);
-            let _ = fs::remove_file(&secret);
+            self.remove_control_file(id, "processing", &processing);
+            self.remove_control_file(id, "secret", &queued_secret);
+            self.remove_control_file(id, "secret", &secret);
             return;
         }
         let mut terminal = terminal;
@@ -655,9 +677,9 @@ impl Consumer {
         }
         if let Some((cause, exit)) = terminal {
             self.publish_failure(id, &processing, &response, cause, exit);
-            let _ = fs::remove_file(&queued_secret);
-            let _ = fs::remove_file(&secret);
-            let _ = fs::remove_file(&processing);
+            self.remove_control_file(id, "secret", &queued_secret);
+            self.remove_control_file(id, "secret", &secret);
+            self.remove_control_file(id, "processing", &processing);
             return;
         }
         let child = self
@@ -701,8 +723,8 @@ impl Consumer {
                     format!("id={id} op={} cause=spawn: {error}", or_unknown(&operation)),
                 );
                 self.publish_failure(id, &processing, &response, "consumer_failed", 69);
-                let _ = fs::remove_file(&secret);
-                let _ = fs::remove_file(&processing);
+                self.remove_control_file(id, "secret", &secret);
+                self.remove_control_file(id, "processing", &processing);
             }
         }
     }
@@ -900,9 +922,33 @@ impl Consumer {
                 );
             }
         }
-        let _ = fs::remove_file(&job.processing);
-        if fs::symlink_metadata(&job.secret).is_ok_and(|m| !m.file_type().is_symlink()) {
-            let _ = fs::remove_file(&job.secret);
+        self.remove_control_file(&job.id, "processing", &job.processing);
+        match fs::symlink_metadata(&job.secret) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                // Not the queue's own file: left in place, and named.
+                self.log(
+                    Level::Error,
+                    "control_file_unremovable",
+                    format!(
+                        "id={} kind=secret path={} cause=a symbolic link, not the queue's file; left in place",
+                        job.id,
+                        job.secret.display()
+                    ),
+                );
+            }
+            Ok(_) => {
+                self.remove_control_file(&job.id, "secret", &job.secret);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => self.log(
+                Level::Error,
+                "control_file_unremovable",
+                format!(
+                    "id={} kind=secret path={} cause={error}",
+                    job.id,
+                    job.secret.display()
+                ),
+            ),
         }
         if self
             .last_reconcile
@@ -968,8 +1014,10 @@ impl Consumer {
                 if let Some(mtime) = private_control_file(&path)
                     && mtime <= now
                     && now - mtime > max_age
+                    && self.remove_control_file(id, kind, &path)
                 {
-                    let _ = fs::remove_file(&path);
+                    // Only a file that is gone has expired; one that stayed
+                    // was named by remove_control_file.
                     self.log(
                         level,
                         "control_file_expired",
@@ -1001,7 +1049,11 @@ impl Consumer {
         responses.sort();
         let excess = responses.len() - self.settings.max_responses;
         for path in responses.into_iter().take(excess) {
-            let _ = fs::remove_file(path);
+            let id = path
+                .file_stem()
+                .map(|stem| stem.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            self.remove_control_file(&id, "response", &path);
         }
     }
 
@@ -1078,6 +1130,8 @@ case $1 in
     # Out of reach of the queue's signals: as a consumer in D state is.
     [ "$answer" = stubborn ] && exec perl -e 'setpgrp(0, getpgrp(getppid())); $SIG{TERM} = "IGNORE"; open(my $f, ">", $ARGV[0]); print $f "$$\n"; close($f); sleep 30' "$(dirname "$0")/stubborn.pid"
     [ "$answer" = noisy ] && { echo "boom: /volume1/share is gone" >&2; exit 1; }
+    # A secret sidecar that cannot be removed (a directory in its place).
+    [ "$answer" = plantdir ] && { rm -f "${2%.json}.secret"; mkdir "${2%.json}.secret"; }
     sleep "$sleep"
     [ "$answer" = answer ] && { umask 077; echo '{}' > "$3"; }
     exit 0 ;;
@@ -1100,6 +1154,12 @@ exit 64
 
     impl Fixture {
         fn new(label: &str, settings: QueueSettings) -> Self {
+            Self::prepared(label, settings, |_| {})
+        }
+
+        /// [`Fixture::new`] with `setup` run on the tree before the consumer
+        /// starts.
+        fn prepared(label: &str, settings: QueueSettings, setup: impl FnOnce(&Path)) -> Self {
             let dir = std::env::temp_dir().join(format!(
                 "sdsyncd-queue-{label}-{}-{}",
                 std::process::id(),
@@ -1110,6 +1170,7 @@ exit 64
                 fs::create_dir_all(dir.join("var/control").join(sub)).unwrap();
             }
             let bridge = fake_bridge(&dir);
+            setup(&dir);
             let events = Arc::new(Mutex::new(Vec::new()));
             let sink = Arc::clone(&events);
             let log: QueueLog = Arc::new(move |_, event, detail| {
@@ -1365,9 +1426,117 @@ exit 64
                 && e.contains("pid=")),
             "{events:?}"
         );
-        if let Ok(pid) = fs::read_to_string(f.dir.join("stubborn.pid")) {
-            let _ = sys::kill_process(pid.trim().parse().unwrap_or(0), libc::SIGKILL);
+        kill_recorded(&f.dir.join("stubborn.pid"));
+    }
+
+    /// N-D10: KILL the process a test recorded, and only a real one: a pid of
+    /// 0 is this process group and -1 is every process the user owns, so an
+    /// unparseable record is a test failure, never a signal.
+    fn kill_recorded(path: &Path) {
+        let text = match fs::read_to_string(path) {
+            Ok(text) => text,
+            // The process never got as far as recording itself.
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return,
+            Err(error) => panic!("{}: {error}", path.display()),
+        };
+        let pid = recorded_pid(&text)
+            .unwrap_or_else(|| panic!("{} holds no usable pid: {text:?}", path.display()));
+        if let Err(error) = sys::kill_process(pid, libc::SIGKILL) {
+            eprintln!("KILL {pid} from {}: {error}", path.display());
         }
+    }
+
+    fn recorded_pid(text: &str) -> Option<u32> {
+        text.trim().parse::<u32>().ok().filter(|pid| *pid > 1)
+    }
+
+    #[test]
+    fn a_recorded_pid_is_never_a_group_or_init() {
+        assert_eq!(recorded_pid("4242\n"), Some(4242));
+        for bad in ["", "0", "1", "-1", "garbage", "12 13"] {
+            assert_eq!(recorded_pid(bad), None, "{bad:?}");
+        }
+    }
+
+    /// N-D9: a secret sidecar the queue cannot remove is named with its path
+    /// and cause (it may hold a credential); it was dropped without a word.
+    #[test]
+    fn an_unremovable_secret_is_named() {
+        let f = Fixture::new("secret-stays", fast());
+        let secret = f.dir.join("var/control/requests").join(format!("{A}.secret"));
+        fs::write(&secret, b"hunter2").unwrap();
+        fs::set_permissions(&secret, fs::Permissions::from_mode(0o600)).unwrap();
+        f.enqueue(A, "concurrent 0 plantdir\n");
+        f.wait("the job finished", Duration::from_secs(10), |f| {
+            f.events
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|e| e.starts_with("control_file_unremovable"))
+        });
+        let events = f.events.lock().unwrap().clone();
+        eprintln!("{events:#?}");
+        let named = events
+            .iter()
+            .find(|e| e.starts_with("control_file_unremovable"))
+            .unwrap();
+        assert!(
+            named.contains(&format!("id={A}"))
+                && named.contains("kind=secret")
+                && named.contains(&format!("processing/{A}.secret"))
+                && named.contains("cause="),
+            "{named}"
+        );
+    }
+
+    /// N-D9: an expired control file that cannot be removed is named as
+    /// such; it was logged `control_file_expired` as if it had gone.
+    #[test]
+    fn an_expired_file_that_stays_is_not_called_expired() {
+        let f = Fixture::prepared("prune-stays", fast(), |dir| {
+            let responses = dir.join("var/control/responses");
+            let old = responses.join(format!("{A}.json"));
+            fs::write(&old, b"{}").unwrap();
+            fs::set_permissions(&old, fs::Permissions::from_mode(0o600)).unwrap();
+            fs::File::options()
+                .write(true)
+                .open(&old)
+                .unwrap()
+                .set_modified(UNIX_EPOCH + Duration::from_secs(1_000_000))
+                .unwrap();
+            fs::set_permissions(&responses, fs::Permissions::from_mode(0o500)).unwrap();
+        });
+        let responses = f.dir.join("var/control/responses");
+        let probe = responses.join("probe");
+        if fs::write(&probe, b"").is_ok() {
+            eprintln!(
+                "SKIP an_expired_file_that_stays_is_not_called_expired: {} is writable at mode 0500 (running as root)",
+                responses.display()
+            );
+            fs::set_permissions(&responses, fs::Permissions::from_mode(0o700)).unwrap();
+            return;
+        }
+        f.wait("the prune named", Duration::from_secs(10), |f| {
+            f.events
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|e| e.contains(A) && e.starts_with("control_file_"))
+        });
+        thread::sleep(Duration::from_millis(200));
+        fs::set_permissions(&responses, fs::Permissions::from_mode(0o700)).unwrap();
+        let events = f.events.lock().unwrap().clone();
+        eprintln!("{events:#?}");
+        assert!(
+            !events.iter().any(|e| e.starts_with("control_file_expired")),
+            "a file that is still there did not expire: {events:#?}"
+        );
+        assert!(
+            events.iter().any(|e| e.starts_with("control_file_unremovable")
+                && e.contains("kind=response")
+                && e.contains("ermission denied")),
+            "{events:#?}"
+        );
     }
 
     /// S2-1: what a consumer says on stderr reaches controller.log, named
