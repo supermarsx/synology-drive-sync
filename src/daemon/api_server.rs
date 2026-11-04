@@ -214,6 +214,23 @@ impl Keeper {
                 }
             };
             self.child.store(child.id(), Ordering::SeqCst);
+            // The child's identity, so it is never mistaken for a process that
+            // reused its pid (S3-5).
+            let start = match super::super::linux_files::process_start(child.id()) {
+                Ok(start) => Some(start),
+                Err(_) => {
+                    (self.log)(
+                        Level::Warn,
+                        "api_server_identity_unavailable",
+                        format!(
+                            "pid={} cause=its start tick could not be read; it is told apart from a reused pid only while unreaped",
+                            child.id()
+                        ),
+                    );
+                    None
+                }
+            };
+            let identity = (child.id(), start);
             let started = Instant::now();
             let status = loop {
                 match child.try_wait() {
@@ -221,7 +238,11 @@ impl Keeper {
                     Ok(None) => {}
                     Err(error) => {
                         // S3-5: never respawn over a child that may live on.
-                        self.put_down(&mut child, &error);
+                        if !self.put_down(&mut child, identity, &error)
+                            && self.hold_until_gone(identity)
+                        {
+                            return;
+                        }
                         break None;
                     }
                 }
@@ -302,28 +323,63 @@ impl Keeper {
     }
 
     /// A child that cannot be waited for: KILL it and reap it within a bound,
-    /// each step named, so a respawn never runs beside it unawares.
-    fn put_down(&self, child: &mut Child, error: &io::Error) {
-        let pid = child.id();
-        let killed = sys::kill_process(pid, libc::SIGKILL);
-        let deadline = Instant::now() + Duration::from_secs(5);
-        let reaped = loop {
-            match child.try_wait() {
-                Ok(Some(_)) => break true,
-                Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(50)),
-                _ => break false,
+    /// each step named, so a respawn never runs beside it unawares. `true`
+    /// once it is proven gone.
+    ///
+    /// S3-5 residue: after ECHILD the child was reaped elsewhere, so its pid
+    /// may already name another process: it is never signalled then. A KILL
+    /// is sent only to the process that still has the child's start tick.
+    fn put_down(&self, child: &mut Child, identity: (u32, Option<u64>), error: &io::Error) -> bool {
+        let (pid, start) = identity;
+        let reaped_elsewhere = error.raw_os_error() == Some(libc::ECHILD);
+        let killed = if reaped_elsewhere {
+            "skipped (ECHILD: it was reaped elsewhere and its pid may be reused)".to_owned()
+        } else {
+            match start {
+                Some(start) => match signal_if_same(pid, start, libc::SIGKILL) {
+                    Ok(true) => "yes".to_owned(),
+                    Ok(false) => "skipped (the pid no longer names the server)".to_owned(),
+                    Err(cause) => cause.to_string(),
+                },
+                // No start tick was read at spawn. Still ours and unreaped (no
+                // ECHILD), so the pid cannot have been reused.
+                None => sys::kill_process(pid, libc::SIGKILL)
+                    .map_or_else(|e| e.to_string(), |()| "yes".into()),
             }
         };
+        let reaped = !reaped_elsewhere && sys::reap_within(child, Duration::from_secs(5));
+        let gone = reaped || !still_running(pid, start);
         (self.log)(
             Level::Error,
             "api_server_unwaitable",
+            format!("pid={pid} cause={error} killed={killed} reaped={reaped} gone={gone}"),
+        );
+        gone
+    }
+
+    /// The previous server could not be proven gone: no respawn beside it.
+    /// Checked again on the backoff, named once, until it is gone (`false`)
+    /// or the keeper is stopped (`true`).
+    fn hold_until_gone(&self, identity: (u32, Option<u64>)) -> bool {
+        let (pid, start) = identity;
+        (self.log)(
+            Level::Error,
+            "api_server_respawn_held",
             format!(
-                "pid={pid} cause={error} killed={} reaped={reaped}",
-                killed
-                    .as_ref()
-                    .map_or_else(|e| e.to_string(), |()| "yes".into())
+                "pid={pid} cause=the previous API server could not be proven gone; no new one is started beside it"
             ),
         );
+        while still_running(pid, start) {
+            if self.pause(BACKOFF_MAX) {
+                return true;
+            }
+        }
+        (self.log)(
+            Level::Info,
+            "api_server_respawn_released",
+            format!("pid={pid} cause=the previous API server is gone"),
+        );
+        false
     }
 
     /// Remove `api.sock` when it is provably stale (F8): this daemon holds
@@ -437,6 +493,38 @@ fn activated_since(path: &Path, before: Option<(u64, u64)>) -> bool {
     })
 }
 
+/// Whether `pid` still names a live (not zombie) process with start tick
+/// `start` (any start tick when it is unknown).
+fn still_running(pid: u32, start: Option<u64>) -> bool {
+    let Ok(stat) = fs::read_to_string(format!("/proc/{pid}/stat")) else {
+        // No such process (or no procfs entry for it): gone.
+        return false;
+    };
+    let state = stat
+        .rsplit_once(") ")
+        .and_then(|(_, after)| after.split_whitespace().next());
+    if matches!(state, Some("Z" | "X" | "x")) {
+        return false;
+    }
+    match start {
+        Some(start) => super::super::linux_files::process_start(pid).is_ok_and(|now| now == start),
+        None => true,
+    }
+}
+
+/// Send `signal` to `pid` only while it is the process that had start tick
+/// `start`: `Ok(false)` when the pid now names another process (or none).
+fn signal_if_same(pid: u32, start: u64, signal: libc::c_int) -> io::Result<bool> {
+    if !still_running(pid, Some(start)) {
+        return Ok(false);
+    }
+    match sys::kill_process(pid, signal) {
+        Ok(()) => Ok(true),
+        Err(error) if error.raw_os_error() == Some(libc::ESRCH) => Ok(false),
+        Err(error) => Err(error),
+    }
+}
+
 /// The PID in the shell engine's `api.pid` when it names a live process.
 fn live_shell_server(api_pid: &Path) -> Option<u32> {
     let text = fs::read_to_string(api_pid).ok()?;
@@ -482,6 +570,62 @@ mod tests {
         let listener = UnixListener::bind(socket).unwrap();
         fs::set_permissions(socket, fs::Permissions::from_mode(0o600)).unwrap();
         listener
+    }
+
+    /// S3-5 residue: a pid is signalled only while it is the process that had
+    /// the recorded start tick; a pid that now names another process (as one
+    /// can after ECHILD) is left alone.
+    #[test]
+    fn a_reused_pid_is_never_signalled() {
+        let mut other = std::process::Command::new("sleep").arg("30").spawn().unwrap();
+        let pid = other.id();
+        let start = super::super::super::linux_files::process_start(pid).unwrap();
+        assert!(still_running(pid, Some(start)));
+        assert!(!still_running(pid, Some(start + 1)), "another start tick is another process");
+        assert_eq!(signal_if_same(pid, start + 1, libc::SIGKILL).unwrap(), false);
+        thread::sleep(Duration::from_millis(100));
+        assert!(other.try_wait().unwrap().is_none(), "a reused pid was signalled");
+        assert_eq!(signal_if_same(pid, start, libc::SIGKILL).unwrap(), true);
+        let status = other.wait().unwrap();
+        assert_eq!(status.signal(), Some(libc::SIGKILL));
+        assert!(!still_running(pid, Some(start)), "reaped: gone");
+    }
+
+    /// S3-5 residue: a child reaped elsewhere (ECHILD) is not signalled by
+    /// pid, is proven gone, and the respawn may go ahead.
+    #[test]
+    fn an_echild_child_is_not_signalled_and_reads_gone() {
+        let (exe, dir) = script("echild", "exit 0");
+        let (log, events) = quiet();
+        let keeper = Keeper {
+            exe: exe.clone(),
+            socket: dir.join("api.sock"),
+            api_pid: dir.join("api.pid"),
+            env: Vec::new(),
+            log,
+            stop: Arc::new(AtomicBool::new(false)),
+            child: Arc::new(AtomicU32::new(0)),
+        };
+        let mut child = std::process::Command::new("sleep").arg("30").spawn().unwrap();
+        let pid = child.id();
+        let start = super::super::super::linux_files::process_start(pid).unwrap();
+        // Reaped behind std's back, as SIGCHLD=SIG_IGN or another waiter would.
+        sys::kill_process(pid, libc::SIGKILL).unwrap();
+        let mut status = 0;
+        // SAFETY: waitpid on our own child, with a live out-parameter.
+        assert_eq!(unsafe { libc::waitpid(pid as libc::pid_t, &mut status, 0) }, pid as libc::pid_t);
+        let error = child.try_wait().unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(libc::ECHILD), "{error}");
+        assert!(keeper.put_down(&mut child, (pid, Some(start)), &error), "proven gone");
+        let events = events.lock().unwrap().clone();
+        eprintln!("{events:#?}");
+        assert!(
+            events.iter().any(|e| e.starts_with("api_server_unwaitable")
+                && e.contains("killed=skipped (ECHILD")
+                && e.contains("gone=true")),
+            "{events:#?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A server that dies before it binds fails the start with its own words.
