@@ -30,7 +30,7 @@ use std::time::{Duration, UNIX_EPOCH};
 use synology_drive_sync::watch::{Filter, WatchError, profile_excludes};
 
 use super::changes::{ArmSpec, ChangeEvent, ChangeSink, ChangeSource};
-use super::poll::{PollConfig, spawn_poller};
+use super::poll::{PollConfig, SharedCarry, new_carry, spawn_poller};
 use super::routines::{Backend, BackendReason, SourceStatus};
 
 /// Timing of the change source. Tests shorten it.
@@ -55,6 +55,13 @@ pub(crate) struct WatchSettings {
     pub(crate) native: bool,
     /// The longest the safety-net floor waits under a healthy native watch.
     pub(crate) floor_max: Duration,
+    /// N-D6: while no walk of a tree finishes, it is synced whole at most this
+    /// often, or every floor if that is longer. A tree that cannot be walked is
+    /// one that is expensive to sync: not once a minute.
+    pub(crate) degraded_min: Duration,
+    /// How soon an arm that was refused by the process-wide walk cap is tried
+    /// again (a crowd of routines arming together, not a broken tree).
+    pub(crate) walk_cap_retry: Duration,
 }
 
 impl Default for WatchSettings {
@@ -69,6 +76,8 @@ impl Default for WatchSettings {
             slice: Duration::from_millis(500),
             native: cfg!(target_os = "linux"),
             floor_max: Duration::from_secs(3600),
+            degraded_min: Duration::from_secs(15 * 60),
+            walk_cap_retry: Duration::from_secs(15),
         }
     }
 }
@@ -99,6 +108,7 @@ impl ChangeSource for WatchSource {
             stop: Arc::clone(&stop),
             sink: Arc::clone(&self.sink),
             settings: self.settings.clone(),
+            carry: new_carry(),
         };
         let spawned = thread::Builder::new()
             .name(format!("sdsyncd-watch-{}", spec.routine))
@@ -143,6 +153,9 @@ struct Worker {
     stop: Arc<AtomicBool>,
     sink: ChangeSink,
     settings: WatchSettings,
+    /// What the pollers of this arming hand to each other (N-D6): `poll_for`
+    /// builds a new poller on every native retry.
+    carry: SharedCarry,
 }
 
 /// How one native attempt ended.
@@ -193,21 +206,60 @@ impl Worker {
     }
 
     fn run(self) {
+        self.run_with(|worker, source_missing, caught_up, setup_deadline| {
+            if worker.settings.native {
+                worker.native(source_missing, caught_up, setup_deadline)
+            } else {
+                Attempt::Failed(WatchError::Unavailable(
+                    "inotify is available on Linux only".to_owned(),
+                ))
+            }
+        });
+    }
+
+    /// The arming loop, with the native attempt supplied (tests supply one).
+    fn run_with(self, mut attempt: impl FnMut(&Worker, &mut bool, &mut bool, Duration) -> Attempt) {
         let mut source_missing = false;
         let mut caught_up = false;
         let mut rearm_wait = self.settings.rearm_first;
         // H4: a tree too large to arm within the deadline is given longer on
         // each retry, up to the cap, and the growth is named.
         let mut setup_deadline = self.settings.setup_deadline;
+        // The walk cap is named once per episode, not on every quick retry.
+        let mut cap_reported = false;
         while !self.stopped() {
-            let failure = if self.settings.native {
-                match self.native(&mut source_missing, &mut caught_up, setup_deadline) {
-                    Attempt::Stopped => return,
-                    Attempt::Failed(error) => error,
-                }
-            } else {
-                WatchError::Unavailable("inotify is available on Linux only".to_owned())
+            let failure = match attempt(&self, &mut source_missing, &mut caught_up, setup_deadline)
+            {
+                Attempt::Stopped => return,
+                Attempt::Failed(error) => error,
             };
+            // H9: an attempt that ended because the routine was disarmed is not
+            // a failure to report, and there is nothing left to poll for.
+            if self.stopped() {
+                return;
+            }
+            if matches!(failure, WatchError::WalkCap { .. }) {
+                // The process-wide walk cap is a transient crowd, not a verdict
+                // on this tree: say so once, and retry soon rather than after
+                // the long polling backoff.
+                if !std::mem::replace(&mut cap_reported, true)
+                    && !self.backend(
+                        Backend::Polling,
+                        BackendReason::WatchSetupFailed,
+                        format!(
+                            "{failure}; retrying every {} s",
+                            self.settings.walk_cap_retry.as_secs()
+                        ),
+                    )
+                {
+                    return;
+                }
+                if self.pause(self.settings.walk_cap_retry) {
+                    return;
+                }
+                continue;
+            }
+            cap_reported = false;
             match failure.reason() {
                 "source_missing" => {
                     if !source_missing {
@@ -294,6 +346,9 @@ impl Worker {
         {
             return Attempt::Stopped;
         }
+        // The native watch is the report now: a poller that follows a later
+        // failure opens with its own account again.
+        super::poll::native_reported(&self.carry);
         let mut detail = format!("{} directories watched", tree.watch_count());
         if let Some(note) = tree.limit_note() {
             detail.push_str("; ");
@@ -377,6 +432,14 @@ impl Worker {
             .poll
             .clamp(Duration::from_secs(60), Duration::from_secs(3600))
             .min(self.settings.floor_max)
+    }
+
+    /// N-D6: how often a tree no walk of which finishes is synced whole. The
+    /// floor, but never under [`WatchSettings::degraded_min`]: it was the poll
+    /// interval's floor (a minute at the default 30 s poll), which synced an
+    /// unwalkable tree whole every minute. At most an hour, like the floor.
+    fn degraded_every(&self) -> Duration {
+        self.floor().max(self.settings.degraded_min)
     }
 
     #[cfg(not(target_os = "linux"))]
@@ -557,9 +620,10 @@ impl Worker {
                 interval: self.spec.poll,
                 walk_deadline: self.settings.walk_deadline,
                 walk_deadline_max: self.settings.walk_deadline_max,
-                degraded_every: self.floor(),
+                degraded_every: self.degraded_every(),
                 reason,
                 detail,
+                carry: Arc::clone(&self.carry),
             },
             Arc::clone(&poll_stop),
             Box::new(move |event| sink(generation, event)),
@@ -633,14 +697,17 @@ impl Floor {
             Ok(filter) => (Some(Arc::new(filter)), None),
             Err(error) => (None, Some(format!("filter: {error}"))),
         };
+        // H9: a disarm ends this walk at once; a stopped walk is nothing to report.
         let (baseline, failure) = match &filter {
-            Some(filter) => match super::poll::read_with_deadline(
+            Some(filter) => match super::poll::read_until_stopped(
                 worker.spec.source.clone(),
                 Arc::clone(filter),
                 worker.settings.walk_deadline,
+                &worker.stop,
             ) {
-                Ok(reading) => (Some(reading), failure),
-                Err(error) => (None, Some(error.to_string())),
+                Some(Ok(reading)) => (Some(reading), failure),
+                Some(Err(error)) => (None, Some(error.to_string())),
+                None => (None, failure),
             },
             None => (None, failure),
         };
@@ -678,14 +745,14 @@ impl Floor {
     fn read(&mut self, worker: &Worker) -> Option<Result<super::poll::Reading, String>> {
         self.next = std::time::Instant::now() + self.every;
         let filter = self.filter.as_ref()?;
-        Some(
-            super::poll::read_with_deadline(
-                worker.spec.source.clone(),
-                Arc::clone(filter),
-                worker.settings.walk_deadline,
-            )
-            .map_err(|error| error.to_string()),
+        // H9: a disarm ends the floor's walk at once (`None`: nothing to compare).
+        super::poll::read_until_stopped(
+            worker.spec.source.clone(),
+            Arc::clone(filter),
+            worker.settings.walk_deadline,
+            &worker.stop,
         )
+        .map(|result| result.map_err(|error| error.to_string()))
     }
 
     /// Whether inotify reported `dir`'s change: the directory itself, the
@@ -780,7 +847,10 @@ fn newest_change(
     stop: Option<&AtomicBool>,
 ) -> Result<TreeFacts, String> {
     let slot = synology_drive_sync::watch::walk_slot().map_err(|live| {
-        format!("walker_unavailable: {live} earlier directory walks are still blocked")
+        format!(
+            "walker_unavailable: {}",
+            synology_drive_sync::watch::walk_cap_refusal(live)
+        )
     })?;
     let current = Arc::new(std::sync::Mutex::new(String::new()));
     let cancel = Arc::new(AtomicBool::new(false));
@@ -998,6 +1068,8 @@ mod tests {
             slice: Duration::from_millis(100),
             native,
             floor_max: Duration::from_secs(3600),
+            degraded_min: Duration::from_secs(900),
+            walk_cap_retry: Duration::from_millis(100),
         }
     }
 
@@ -1154,7 +1226,10 @@ mod tests {
         )
         .unwrap();
         let filter = Arc::new(Filter::build(&root.join("source"), Vec::new()).unwrap());
-        if std::fs::read_dir(root.join("source/locked")).is_err() {
+        if !super::super::testkit::permissions_do_not_bind(
+            "the_catch_up_walk_names_its_skips_and_honours_a_stop",
+            &root.join("source/locked"),
+        ) {
             let facts = newest_change(
                 root.join("source"),
                 Arc::clone(&filter),
@@ -1195,6 +1270,7 @@ mod tests {
             stop: Arc::new(AtomicBool::new(false)),
             sink,
             settings: settings(false),
+            carry: new_carry(),
         };
         let reading = |pairs: &[(&str, u64)]| Reading {
             dirs: pairs.iter().map(|(d, h)| ((*d).to_owned(), *h)).collect(),
@@ -1321,6 +1397,157 @@ mod tests {
         std::fs::write(root.join("source/docs/after.txt"), "x").unwrap();
         thread::sleep(Duration::from_millis(800));
         assert_eq!(recorder.events.lock().unwrap().len(), before);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    fn worker(root: &Path, poll: Duration, sink: ChangeSink, settings: WatchSettings) -> Worker {
+        let mut arm = spec(root, 1, None);
+        arm.poll = poll;
+        Worker {
+            spec: arm,
+            stop: Arc::new(AtomicBool::new(false)),
+            sink,
+            settings,
+            carry: new_carry(),
+        }
+    }
+
+    /// N-D6: an unwalkable tree is synced whole at most every fifteen minutes
+    /// (or every floor, if that is longer), not every minute.
+    #[test]
+    fn the_degraded_whole_tree_cadence_is_the_floor_but_never_under_fifteen_minutes() {
+        let root = temp_tree("cadence");
+        let (_, sink) = Recorder::new();
+        let at = |poll_s: u64| {
+            worker(
+                &root,
+                Duration::from_secs(poll_s),
+                Arc::clone(&sink),
+                WatchSettings::default(),
+            )
+            .degraded_every()
+        };
+        // The default 30 s poll: the floor is a minute, the cadence 15 minutes.
+        assert_eq!(at(30), Duration::from_secs(15 * 60));
+        assert_eq!(at(60), Duration::from_secs(15 * 60));
+        // A longer poll interval keeps its own floor, up to the hour.
+        assert_eq!(at(30 * 60), Duration::from_secs(30 * 60));
+        assert_eq!(at(10 * 3600), Duration::from_secs(3600));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// H9: the floor's baseline walk ends at once when the routine is already
+    /// disarmed, and says nothing: a stopped walk is not a failed one.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_floors_walk_honours_a_disarm() {
+        let root = temp_tree("floor-stop");
+        let (recorder, sink) = Recorder::new();
+        let mut settings = settings(true);
+        // A walk that can never finish in time: only the stop can end it first.
+        settings.walk_deadline = Duration::ZERO;
+        let worker = worker(&root, Duration::from_secs(60), sink, settings);
+        worker.stop.store(true, Ordering::SeqCst);
+        let started = Instant::now();
+        let mut floor = Floor::start(&worker);
+        assert!(floor.read(&worker).is_none());
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert!(
+            recorder.events.lock().unwrap().is_empty(),
+            "a disarm is not a floor failure: {:?}",
+            recorder.events.lock().unwrap()
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// H9: when the routine was disarmed during the arm, the failed attempt is
+    /// not polled through: no poller, no report for a routine that is gone.
+    #[test]
+    fn a_failure_after_a_disarm_does_not_start_a_poller() {
+        let root = temp_tree("stop-then-fail");
+        let (recorder, sink) = Recorder::new();
+        let worker = worker(&root, Duration::from_millis(150), sink, settings(true));
+        let stop = Arc::clone(&worker.stop);
+        let finished = Arc::new(AtomicBool::new(false));
+        let done = Arc::clone(&finished);
+        let handle = thread::spawn(move || {
+            worker.run_with(move |worker, _, _, _| {
+                // The disarm lands while the arm walk is running, which then fails.
+                stop.store(true, Ordering::SeqCst);
+                Attempt::Failed(WatchError::Setup {
+                    path: worker.spec.source.clone(),
+                    detail: "the watch was stopped during its directory walk".to_owned(),
+                })
+            });
+            done.store(true, Ordering::SeqCst);
+        });
+        let until = Instant::now() + Duration::from_secs(5);
+        while !finished.load(Ordering::SeqCst) {
+            assert!(Instant::now() < until, "the worker did not end");
+            thread::sleep(Duration::from_millis(10));
+        }
+        handle.join().unwrap();
+        thread::sleep(Duration::from_millis(500));
+        assert!(
+            recorder.events.lock().unwrap().is_empty(),
+            "nothing is reported or polled after a disarm: {:?}",
+            recorder.events.lock().unwrap()
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// H9: the shared walk cap is named for what it is, and an arm it refused is
+    /// retried soon (it is a crowd of routines arming together), not after the
+    /// long polling backoff, and not by polling through it.
+    #[test]
+    fn the_walk_cap_is_named_honestly_and_retried_soon() {
+        let root = temp_tree("walk-cap");
+        let (recorder, sink) = Recorder::new();
+        let worker = worker(&root, Duration::from_millis(150), sink, settings(true));
+        let stop = Arc::clone(&worker.stop);
+        let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = Arc::clone(&attempts);
+        let handle = thread::spawn(move || {
+            worker.run_with(move |worker, _, _, _| {
+                if counted.fetch_add(1, Ordering::SeqCst) >= 4 {
+                    stop.store(true, Ordering::SeqCst);
+                    return Attempt::Stopped;
+                }
+                Attempt::Failed(WatchError::WalkCap {
+                    path: worker.spec.source.clone(),
+                    live: 16,
+                })
+            });
+        });
+        let started = Instant::now();
+        handle.join().unwrap();
+        // Four refusals at 100 ms: seconds, not the 400 ms-to-2 s polling backoff
+        // times the attempts, and certainly not 600 s.
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "retried after {:?}",
+            started.elapsed()
+        );
+        let events = recorder.events.lock().unwrap();
+        let named: Vec<&ChangeEvent> = events
+            .iter()
+            .map(|(_, e)| e)
+            .filter(|e| matches!(e, ChangeEvent::Backend { .. }))
+            .collect();
+        assert_eq!(named.len(), 1, "named once per episode: {events:?}");
+        let ChangeEvent::Backend { detail, reason, .. } = named[0] else {
+            unreachable!()
+        };
+        assert_eq!(*reason, BackendReason::WatchSetupFailed);
+        assert!(
+            detail.contains("process-wide cap of 16 concurrent directory walks")
+                && detail.contains("retrying every"),
+            "{detail}"
+        );
+        assert!(
+            !detail.contains("still blocked"),
+            "the cap is not a blocked filesystem: {detail}"
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 }

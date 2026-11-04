@@ -379,9 +379,7 @@ fn wait_walk(
         Err(live) => {
             return Waited::Done(Err(PollError::Unreadable {
                 path: root,
-                detail: format!(
-                    "{live} earlier directory walks are still blocked in the filesystem; not starting another"
-                ),
+                detail: synology_drive_sync::watch::walk_cap_refusal(live),
             }));
         }
     };
@@ -457,6 +455,21 @@ pub(crate) fn read_with_deadline(
     }
 }
 
+/// [`read_with_deadline`] that also ends the moment `stop` is set (H9: a disarmed
+/// routine does not wait out a walk on a disk that stopped answering): `None`
+/// when it was stopped, with the walk told to cancel.
+pub(crate) fn read_until_stopped(
+    root: PathBuf,
+    filter: Arc<Filter>,
+    deadline: Duration,
+    stop: &AtomicBool,
+) -> Option<Result<Reading, PollError>> {
+    match wait_walk(Arc::new(FsSource), root, filter, deadline, Some(stop)) {
+        Waited::Done(result) => Some(result),
+        Waited::Stopped => None,
+    }
+}
+
 /// How the poller runs.
 #[derive(Clone, Debug)]
 pub(crate) struct PollConfig {
@@ -467,12 +480,57 @@ pub(crate) struct PollConfig {
     /// How far the walk deadline may grow when walks keep giving up (H4).
     pub(crate) walk_deadline_max: Duration,
     /// While no walk finishes, the tree is synced whole at most this often
-    /// (the routine's poll floor, at most an hour).
+    /// (N-D6: the routine's poll floor, but never under fifteen minutes; at
+    /// most an hour).
     pub(crate) degraded_every: Duration,
     /// Why polling: `WatchLimit`, `WatchSetupFailed` or `WatchUnavailable`.
     pub(crate) reason: BackendReason,
     /// The watcher's own account of why, reported with every `Backend` event.
     pub(crate) detail: String,
+    /// What outlives this poller: the change source rebuilds the poller on
+    /// every native retry, and a tree it cannot walk must not start over each time.
+    pub(crate) carry: SharedCarry,
+}
+
+/// What a polling worker learned that its successor must not forget (N-D6): the
+/// grown walk deadline, when the tree was last synced whole because no walk
+/// finished, and the last backend report (so a successor with the same account
+/// does not repeat it).
+#[derive(Debug, Default)]
+pub(crate) struct PollCarry {
+    /// The walk deadline in force (H4); it only grows.
+    pub(crate) walk_deadline: Option<Duration>,
+    /// When the last whole-tree run was asked for because no walk finished.
+    pub(crate) degraded_overflow: Option<Instant>,
+    /// The `(reason, detail)` of the last `Backend` event this routine's pollers
+    /// sent; the change source clears it when the native watch reports in.
+    pub(crate) announced: Option<(BackendReason, String)>,
+    /// The watcher's own `(reason, detail)` the pollers last opened with.
+    pub(crate) account: Option<(BackendReason, String)>,
+}
+
+impl PollCarry {
+    /// The native watch took over: the next poller starts from a clean report.
+    pub(crate) fn native_reported(&mut self) {
+        self.announced = None;
+        self.account = None;
+    }
+}
+
+pub(crate) type SharedCarry = Arc<Mutex<PollCarry>>;
+
+/// A fresh carry for one arming.
+pub(crate) fn new_carry() -> SharedCarry {
+    Arc::new(Mutex::new(PollCarry::default()))
+}
+
+fn carried(carry: &SharedCarry) -> std::sync::MutexGuard<'_, PollCarry> {
+    carry.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// The native watch reported in: see [`PollCarry::native_reported`].
+pub(crate) fn native_reported(carry: &SharedCarry) {
+    carried(carry).native_reported();
 }
 
 type Emit = Box<dyn Fn(ChangeEvent) -> bool + Send>;
@@ -508,7 +566,21 @@ impl Poller {
         (self.emit)(event)
     }
 
+    /// Report the backend. The same account as the last one this routine's
+    /// pollers sent is not repeated: a poller rebuilt on a native retry would
+    /// otherwise announce the same cause again every time.
     fn backend(&self, reason: BackendReason, detail: String) -> bool {
+        {
+            let mut carry = carried(&self.config.carry);
+            if carry
+                .announced
+                .as_ref()
+                .is_some_and(|(r, d)| *r == reason && *d == detail)
+            {
+                return true;
+            }
+            carry.announced = Some((reason, detail.clone()));
+        }
         self.send(ChangeEvent::Backend {
             routine: self.routine.clone(),
             backend: Backend::Polling,
@@ -548,13 +620,29 @@ impl Poller {
     }
 
     fn run(self) {
-        if !self.backend(self.config.reason, self.config.detail.clone()) {
-            return;
-        }
-        let mut state = State {
-            walk_deadline: Some(self.config.walk_deadline),
-            ..State::default()
+        let mut state = {
+            let carry = carried(&self.config.carry);
+            State {
+                walk_deadline: Some(carry.walk_deadline.unwrap_or(self.config.walk_deadline)),
+                degraded_overflow: carry.degraded_overflow,
+                ..State::default()
+            }
         };
+        self.serve(&mut state);
+        // N-D6: what was learned outlives this poller.
+        self.persist(&state);
+    }
+
+    fn serve(&self, state: &mut State) {
+        // The watcher's account of why polling is announced once per arming: a
+        // successor with the same account stays quiet (N-D6).
+        let account = (self.config.reason, self.config.detail.clone());
+        if carried(&self.config.carry).account.as_ref() != Some(&account) {
+            if !self.backend(account.0, account.1.clone()) {
+                return;
+            }
+            carried(&self.config.carry).account = Some(account);
+        }
         while !self.stopped() {
             let waited = wait_walk(
                 Arc::clone(&self.source),
@@ -565,13 +653,21 @@ impl Poller {
             );
             let keep_going = match waited {
                 Waited::Stopped => return,
-                Waited::Done(Ok(reading)) => self.on_reading(&mut state, reading),
-                Waited::Done(Err(error)) => self.on_error(&mut state, &error),
+                Waited::Done(Ok(reading)) => self.on_reading(state, reading),
+                Waited::Done(Err(error)) => self.on_error(state, &error),
             };
+            self.persist(state);
             if !keep_going || !self.pause() {
                 return;
             }
         }
+    }
+
+    /// Hand what this poller has learned to its successor (N-D6).
+    fn persist(&self, state: &State) {
+        let mut carry = carried(&self.config.carry);
+        carry.walk_deadline = state.walk_deadline;
+        carry.degraded_overflow = state.degraded_overflow;
     }
 
     /// Sleep one interval in slices; `false` when `stop` was set meanwhile.
@@ -599,12 +695,14 @@ impl Poller {
             }
         }
         let skips = (reading.skipped, reading.skip_sample.clone());
-        if state.failed.take().is_some() || skips != state.reported_skips {
-            let detail = self.detail_with(&skips);
-            state.reported_skips = skips;
-            if !self.backend(self.config.reason, detail) {
-                return false;
-            }
+        // A reading that finished clears any failure account; `backend` sends
+        // only what differs from the last report, so a clean tree is silent and
+        // a poller rebuilt after a failure still retracts it.
+        state.failed = None;
+        let detail = self.detail_with(&skips);
+        state.reported_skips = skips;
+        if !self.backend(self.config.reason, detail) {
+            return false;
         }
         match state.baseline.replace(reading) {
             None => {
@@ -942,8 +1040,10 @@ mod tests {
         dir.write("locked/secret.txt", "s");
         let filter = filter(dir.path(), &[]);
         fs::set_permissions(dir.path().join("locked"), fs::Permissions::from_mode(0o000)).unwrap();
-        if fs::read_dir(dir.path().join("locked")).is_ok() {
-            eprintln!("skipped: running as a user that ignores directory modes (root)");
+        if super::super::testkit::permissions_do_not_bind(
+            "an_unreadable_subdirectory_is_a_named_skip_and_the_rest_is_read",
+            &dir.path().join("locked"),
+        ) {
             return;
         }
         let before = read(dir.path(), &filter);
@@ -1119,6 +1219,7 @@ mod tests {
                 degraded_every: Duration::from_secs(60),
                 reason: BackendReason::WatchLimit,
                 detail: "limit 8".to_owned(),
+                carry: new_carry(),
             },
             Arc::clone(&stop),
             Box::new(move |event| {
@@ -1230,9 +1331,17 @@ mod tests {
             backend(BackendReason::WatchLimit, "limit 8")
         );
         harness.quiet(Duration::from_millis(250));
-        fs::remove_dir_all(&root).unwrap();
-        let ChangeEvent::Backend { reason, detail, .. } = harness.next() else {
-            panic!("expected the failure");
+        // Out of the poller's sight in one step. `remove_dir_all` takes the tree
+        // apart entry by entry, and a reading that lands in the middle of that
+        // (slow filesystems: macOS x86_64 runners) correctly reports the
+        // half-removed tree as changed (`Changed`), or an entry that vanished
+        // under the walk as a named skip; neither is what this test is about.
+        let gone = dir.path().join("src.gone");
+        fs::rename(&root, &gone).unwrap();
+        fs::remove_dir_all(&gone).unwrap();
+        let failure = harness.next();
+        let ChangeEvent::Backend { reason, detail, .. } = failure else {
+            panic!("expected the failure, got {failure:?}");
         };
         assert_eq!(reason, BackendReason::SourceMissing);
         assert!(detail.ends_with(&root.display().to_string()), "{detail}");
@@ -1245,7 +1354,12 @@ mod tests {
         );
         // Once per transition, not every interval.
         harness.quiet(Duration::from_millis(450));
-        fs::create_dir_all(root.join("b")).unwrap();
+        // The source returns whole: built beside it and renamed into place, so no
+        // reading sees it half-built (that would be a legitimate `Changed` after
+        // the fresh baseline, and a second event this test does not expect).
+        let fresh = dir.path().join("src.new");
+        fs::create_dir_all(fresh.join("b")).unwrap();
+        fs::rename(&fresh, &root).unwrap();
         assert_eq!(
             harness.next(),
             ChangeEvent::Source {
@@ -1275,8 +1389,10 @@ mod tests {
         dir.write("open/f", "f");
         dir.write("locked/s", "s");
         fs::set_permissions(dir.path().join("locked"), fs::Permissions::from_mode(0o000)).unwrap();
-        if fs::read_dir(dir.path().join("locked")).is_ok() {
-            eprintln!("skipped: running as a user that ignores directory modes (root)");
+        if super::super::testkit::permissions_do_not_bind(
+            "skipped_entries_are_named_in_the_backend_detail",
+            &dir.path().join("locked"),
+        ) {
             return;
         }
         let harness = start(dir.path(), &[], None);
@@ -1326,6 +1442,7 @@ mod tests {
                 degraded_every: Duration::from_secs(30),
                 reason: BackendReason::WatchSetupFailed,
                 detail: "arm gave up".to_owned(),
+                carry: new_carry(),
             },
             Arc::clone(&stop),
             Box::new(move |event| sender.send(event).is_ok()),
@@ -1372,6 +1489,121 @@ mod tests {
             "whole tree once per floor while degraded: {seen:#?}"
         );
         let _ = handle.join();
+    }
+
+    /// N-D6: the change source rebuilds the poller on every native retry. A
+    /// tree it cannot walk used to start over each time: the deadline back to
+    /// its first value, and the tree synced whole at once. What the first poller
+    /// learned (the grown deadline, when the tree was last synced whole, what it
+    /// last reported) now outlives it.
+    #[test]
+    fn a_restarted_poller_keeps_the_growth_and_the_whole_tree_cadence() {
+        struct Stuck;
+        impl DirSource for Stuck {
+            fn list(&self, dir: &Path) -> io::Result<Vec<Listed>> {
+                thread::sleep(Duration::from_millis(400));
+                FsSource.list(dir)
+            }
+        }
+        let dir = TempDir::new("restart");
+        dir.write("f", "f");
+        let carry = new_carry();
+        let run_one = |label: &str, watch_for: Duration| {
+            let (sender, events) = mpsc::channel();
+            let stop = Arc::new(AtomicBool::new(false));
+            let handle = spawn_poller_from(
+                Arc::new(Stuck),
+                "r".to_owned(),
+                dir.path().to_path_buf(),
+                filter(dir.path(), &[]),
+                PollConfig {
+                    interval: Duration::from_millis(20),
+                    walk_deadline: Duration::from_millis(60),
+                    walk_deadline_max: Duration::from_millis(240),
+                    degraded_every: Duration::from_secs(30),
+                    reason: BackendReason::WatchSetupFailed,
+                    detail: "arm gave up".to_owned(),
+                    carry: Arc::clone(&carry),
+                },
+                Arc::clone(&stop),
+                Box::new(move |event| sender.send(event).is_ok()),
+            )
+            .unwrap();
+            let mut seen = Vec::new();
+            let until = Instant::now() + watch_for;
+            while Instant::now() < until {
+                if let Ok(event) = events.recv_timeout(Duration::from_millis(20)) {
+                    seen.push(event);
+                }
+            }
+            stop.store(true, Ordering::SeqCst);
+            handle
+                .join()
+                .unwrap_or_else(|_| panic!("{label}: the poller panicked"));
+            seen
+        };
+        let first = run_one("first", Duration::from_millis(700));
+        let overflows = |seen: &[ChangeEvent]| {
+            seen.iter()
+                .filter(|e| matches!(e, ChangeEvent::Overflow { .. }))
+                .count()
+        };
+        assert_eq!(
+            overflows(&first),
+            1,
+            "the first poller syncs whole once: {first:#?}"
+        );
+        let grown = carry.lock().unwrap().walk_deadline;
+        assert!(
+            grown > Some(Duration::from_millis(60)),
+            "the deadline grew and was handed on: {grown:?}"
+        );
+        // A successor with the same account: no second whole-tree run inside
+        // the cadence, no repeat of the opening report, and it starts from the
+        // grown deadline.
+        let second = run_one("second", Duration::from_millis(700));
+        assert_eq!(
+            overflows(&second),
+            0,
+            "the restart must not sync the tree whole again: {second:#?}"
+        );
+        assert!(
+            !second.iter().any(
+                |e| matches!(e, ChangeEvent::Backend { detail, .. } if detail == "arm gave up")
+            ),
+            "the same account is not announced again: {second:#?}"
+        );
+        assert!(
+            carry.lock().unwrap().walk_deadline >= grown,
+            "a deadline never shrinks across restarts"
+        );
+    }
+
+    /// H9: a disarmed routine's floor walk ends at once, not at its deadline.
+    #[test]
+    fn a_walk_waited_for_with_a_stop_flag_ends_when_it_is_set() {
+        let dir = TempDir::new("untilstop");
+        dir.write("f", "f");
+        let stop = AtomicBool::new(true);
+        let started = Instant::now();
+        let outcome = read_until_stopped(
+            dir.path().to_path_buf(),
+            filter(dir.path(), &[]),
+            Duration::ZERO,
+            &stop,
+        );
+        assert!(outcome.is_none(), "stopped, not a deadline: {outcome:?}");
+        assert!(started.elapsed() < Duration::from_secs(1));
+        let running = AtomicBool::new(false);
+        let read = read_until_stopped(
+            dir.path().to_path_buf(),
+            filter(dir.path(), &[]),
+            Duration::from_secs(5),
+            &running,
+        )
+        .expect("not stopped")
+        .expect("a small tree reads");
+        assert!(read.dirs.contains_key(""));
     }
 
     #[test]

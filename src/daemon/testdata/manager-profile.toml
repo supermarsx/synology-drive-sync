@@ -1,0 +1,27 @@
+[profiles.@NAME@]
+source = "@SOURCE@"
+remote = "/home/Drive/@NAME@"
+url = "http://127.0.0.1:9"
+username = "operator"
+password-file = "@ROOT@/home/secrets/@NAME@.password"
+totp-secret-file = "@ROOT@/home/secrets/@NAME@.totp"
+no-vault = true
+compare = "content"
+jobs = 2
+excludes = ["@eaDir/", "**/@eaDir/", "#recycle/", "#snapshot/"]
+delete = false
+allow-empty-source = false
+max-delete = 100
+retries = 2
+timeout = 7200
+connect-timeout = 15
+allow-http = true
+danger-accept-invalid-certs = false
+verbose = 0
+quiet = false
+log-level = "info"
+log-format = "json"
+remote-log-mode = "best-effort"
+log-file = "@ROOT@/var/log/sync.log"
+progress = "never"
+output = "human"

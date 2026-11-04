@@ -2823,14 +2823,16 @@ impl Control {
                 reason,
                 detail,
             } => {
-                let changed = self
-                    .routines
-                    .get_mut(&routine)
-                    .map(|entry| {
-                        entry.backend.replace((backend, reason)) != Some((backend, reason))
-                    })
-                    .unwrap_or(false);
-                if changed {
+                // N-D5: every report is logged, not only a change of backend or
+                // reason. The change sources send a `Backend` event only when
+                // their account changed (a new cause, a grown walk deadline, the
+                // entries skipped), and that account is the one thing the log
+                // carries: logging on (backend, reason) alone dropped
+                // `walk_deadline_exceeded`, the token the dashboard points at.
+                let known = self.routines.get_mut(&routine).map(|entry| {
+                    entry.backend.replace((backend, reason));
+                });
+                if known.is_some() {
                     let level = if reason == BackendReason::Ok {
                         Level::Info
                     } else {

@@ -14,9 +14,19 @@
 //! Every wait is bounded: a connection has one deadline for its whole request
 //! line (a client trickling bytes is cut at it, H5), a client connect has a
 //! timeout, and a control thread that does not answer in time yields a named
-//! `daemon_busy` rather than a hang. Long verbs (`wait`, `mutate`, `stop`) have
-//! slots of their own, so CLI waiters never leave `ping` or `status` without
-//! one (F6s). Linux only.
+//! `daemon_busy` rather than a hang. Slots (F6s):
+//!
+//! - a connection that has not yet sent its verb takes only a cheap "unread"
+//!   place (its thread, cut at the read deadline), never a verb slot, so idle
+//!   connections cannot make `ping` fail;
+//! - once the verb is parsed it takes a slot by class: `ping`, `status` and
+//!   `stop` have reserved slots that nothing else can use, `wait` and `mutate`
+//!   are capped within the general slots, and everything else takes a general
+//!   one;
+//! - a verb waiting on the control thread watches its peer: a client that has
+//!   gone away frees its slot, and the listener logs `ctl_peer_gone`.
+//!
+//! Linux only.
 
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::os::unix::fs::PermissionsExt;
@@ -24,13 +34,13 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::mpsc::Sender;
+use std::sync::mpsc::{self, RecvTimeoutError, Sender};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 
-use super::control::{Msg, Mutation, Request, ask};
+use super::control::{Msg, Mutation, Request};
 use super::routines::{Action, Level, valid_name};
 use super::sys;
 
@@ -43,11 +53,20 @@ const MAX_REQUEST_BYTES: u64 = 64 * 1024;
 const READ_DEADLINE: Duration = Duration::from_secs(5);
 /// How long a quick verb may wait for the control thread.
 const ANSWER_DEADLINE: Duration = Duration::from_secs(5);
-/// Connections served at once; more are refused by name.
+/// General verbs served at once (parsed, waiting on the control thread); more
+/// are refused by name.
 const MAX_CONNECTIONS: usize = 32;
-/// Of those, how many may be long verbs waiting on the control thread
-/// (`wait`, `mutate`, `stop`); the rest stay free for quick ones (F6s).
+/// Of those, how many may be long verbs (`wait`, `mutate`); the rest stay free
+/// for quick ones (F6s).
 const MAX_LONG_REQUESTS: usize = 16;
+/// Slots only `ping`, `status` and `stop` can use, beyond the general ones, so
+/// neither CLI waiters nor a flood of other verbs can starve them (F6s).
+const MAX_PRIORITY_REQUESTS: usize = 8;
+/// Connections that have not yet sent a whole request line. Each is a thread
+/// cut at [`READ_DEADLINE`]; more are refused by name.
+const MAX_UNREAD_CONNECTIONS: usize = 128;
+/// How often a verb waiting on the control thread looks at its peer.
+const PEER_CHECK: Duration = Duration::from_millis(250);
 /// How long a client waits for its connection to be accepted.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 /// After a failed accept (EMFILE, ENFILE, ENOMEM), the listener pauses this
@@ -142,22 +161,209 @@ pub(crate) fn parse_request(
     Ok((request, ANSWER_DEADLINE))
 }
 
-fn answer(stream: &mut UnixStream, value: &Value) {
+fn answer(stream: &mut UnixStream, value: &Value, log: &CtlLog) {
     let mut line = value.to_string();
     line.push('\n');
-    // A client that went away is not an error worth more than a dropped reply.
-    let _ = stream.write_all(line.as_bytes());
+    // A client that went away loses its reply, but the loss is named.
+    if let Err(error) = stream.write_all(line.as_bytes()) {
+        log(
+            Level::Info,
+            "ctl_reply_dropped",
+            format!(
+                "code={} cause={error}",
+                value["code"].as_str().unwrap_or("ok")
+            ),
+        );
+    }
 }
 
-/// A verb that waits on the control thread for long.
-fn is_long(request: &Request) -> bool {
-    matches!(
-        request,
-        Request::Wait { .. } | Request::Mutate(_) | Request::Stop
-    )
+/// Where a connection stands, and so which places it holds.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Place {
+    /// Connected, verb not yet parsed.
+    Unread,
+    /// `ping`, `status`, `stop`: reserved slots.
+    Priority,
+    /// `wait`, `mutate`: a general slot and a long one.
+    Long,
+    /// Everything else: a general slot.
+    General,
 }
 
-/// Read one request line within one deadline for the whole line (H5): each
+fn place_of(request: &Request) -> Place {
+    match request {
+        Request::Ping | Request::Status | Request::Stop => Place::Priority,
+        Request::Wait { .. } | Request::Mutate(_) => Place::Long,
+        _ => Place::General,
+    }
+}
+
+/// The verb's word, for the log.
+fn verb_word(request: &Request) -> &'static str {
+    match request {
+        Request::Ping => "ping",
+        Request::Status => "status",
+        Request::Stop => "stop",
+        Request::Wait { .. } => "wait",
+        Request::Mutate(_) => "mutate",
+        Request::Reload => "reload",
+        Request::Wake => "wake",
+        Request::Cancel { .. } => "cancel",
+        Request::Run { .. } => "run",
+        Request::RoutineNow { .. } => "routine-now",
+    }
+}
+
+/// How many places each kind holds right now.
+#[derive(Default)]
+struct Slots {
+    unread: AtomicUsize,
+    general: AtomicUsize,
+    long: AtomicUsize,
+    priority: AtomicUsize,
+}
+
+/// One more in `counter` if it is under `cap`.
+fn increment(counter: &AtomicUsize, cap: usize) -> bool {
+    if counter.fetch_add(1, Ordering::SeqCst) >= cap {
+        counter.fetch_sub(1, Ordering::SeqCst);
+        return false;
+    }
+    true
+}
+
+impl Slots {
+    /// The places for `place`, all or none; they are given back when the
+    /// returned guard drops.
+    fn take(self: &Arc<Self>, place: Place) -> Option<Held> {
+        let taken = match place {
+            Place::Unread => increment(&self.unread, MAX_UNREAD_CONNECTIONS),
+            Place::Priority => increment(&self.priority, MAX_PRIORITY_REQUESTS),
+            Place::General => increment(&self.general, MAX_CONNECTIONS),
+            Place::Long => {
+                if increment(&self.general, MAX_CONNECTIONS) {
+                    if increment(&self.long, MAX_LONG_REQUESTS) {
+                        true
+                    } else {
+                        self.general.fetch_sub(1, Ordering::SeqCst);
+                        false
+                    }
+                } else {
+                    false
+                }
+            }
+        };
+        taken.then(|| Held {
+            slots: Arc::clone(self),
+            place,
+        })
+    }
+}
+
+/// Places taken for one connection, given back when it drops.
+struct Held {
+    slots: Arc<Slots>,
+    place: Place,
+}
+
+impl Drop for Held {
+    fn drop(&mut self) {
+        let slots = &self.slots;
+        match self.place {
+            Place::Unread => slots.unread.fetch_sub(1, Ordering::SeqCst),
+            Place::Priority => slots.priority.fetch_sub(1, Ordering::SeqCst),
+            Place::General => slots.general.fetch_sub(1, Ordering::SeqCst),
+            Place::Long => {
+                slots.long.fetch_sub(1, Ordering::SeqCst);
+                slots.general.fetch_sub(1, Ordering::SeqCst)
+            }
+        };
+    }
+}
+
+/// Why a verb of `place` was refused.
+fn full_detail(place: Place) -> String {
+    match place {
+        Place::Unread => format!(
+            "{MAX_UNREAD_CONNECTIONS} connections are already waiting to send their request"
+        ),
+        Place::Priority => {
+            format!("{MAX_PRIORITY_REQUESTS} ping, status or stop requests are already waiting")
+        }
+        Place::Long => format!(
+            "{MAX_LONG_REQUESTS} long requests (wait, mutate) are already waiting, or \
+             {MAX_CONNECTIONS} requests are already being served"
+        ),
+        Place::General => format!("{MAX_CONNECTIONS} requests are already being served"),
+    }
+}
+
+/// Ask the control thread for `request`, watching `stream`'s peer while waiting.
+/// `None` when the peer hung up first: nobody is left to answer, and the caller
+/// gives the slot back (the request itself stays with the control thread).
+fn ask_while_connected(
+    stream: &UnixStream,
+    tx: &Sender<Msg>,
+    request: Request,
+    deadline: Duration,
+    log: &CtlLog,
+) -> Option<Value> {
+    let verb = verb_word(&request);
+    let (reply, answer) = mpsc::channel();
+    if tx.send(Msg::Ctl(request, reply)).is_err() {
+        return Some(
+            json!({"ok": false, "code": "daemon_stopped", "detail": "the control thread is gone"}),
+        );
+    }
+    let started = Instant::now();
+    let give_up = started + deadline;
+    let mut watching = true;
+    loop {
+        let left = give_up.saturating_duration_since(Instant::now());
+        match answer.recv_timeout(left.min(PEER_CHECK)) {
+            Ok(value) => return Some(value),
+            Err(RecvTimeoutError::Disconnected) => {
+                return Some(json!({"ok": false, "code": "daemon_stopped", "detail":
+                    "the control thread stopped before answering"}));
+            }
+            Err(RecvTimeoutError::Timeout) => {}
+        }
+        if left <= PEER_CHECK {
+            return Some(json!({"ok": false, "code": "daemon_busy", "detail":
+                format!("no answer within {} ms", deadline.as_millis())}));
+        }
+        if !watching {
+            continue;
+        }
+        match sys::peer_hung_up(stream) {
+            Ok(false) => {}
+            Ok(true) => {
+                log(
+                    Level::Info,
+                    "ctl_peer_gone",
+                    format!(
+                        "verb={verb} waited_ms={} cause=the client closed the connection before \
+                         the reply; its slot is free",
+                        started.elapsed().as_millis()
+                    ),
+                );
+                return None;
+            }
+            Err(error) => {
+                // Cannot tell whether the client is there: keep serving it (the
+                // deadline still bounds the wait), but say that it is unwatched.
+                watching = false;
+                log(
+                    Level::Warn,
+                    "ctl_peer_unchecked",
+                    format!("verb={verb} cause={error}; this wait cannot notice a client hang-up"),
+                );
+            }
+        }
+    }
+}
+
+// Read one request line within one deadline for the whole line (H5): each
 /// read gets only what is left of it. `Ok("")` at end of input.
 fn read_request_line(stream: &mut UnixStream, within: Duration) -> io::Result<String> {
     let deadline = Instant::now() + within;
@@ -193,12 +399,19 @@ fn read_request_line(stream: &mut UnixStream, within: Duration) -> io::Result<St
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "the request is not UTF-8"))
 }
 
+/// One connection: verify the peer, read its request line, take the slot its
+/// verb needs, ask the control thread and write the reply. `unread` is the
+/// connection's place before its verb is known; it is given back the moment the
+/// request line is parsed (or has failed), so an idle connection never holds a
+/// verb slot.
 fn serve(
     mut stream: UnixStream,
     uid: u32,
     tx: &Sender<Msg>,
     mutation_deadline: Duration,
-    long: &AtomicUsize,
+    slots: &Arc<Slots>,
+    log: &CtlLog,
+    unread: Held,
 ) {
     match sys::peer_uid(&stream) {
         Ok(peer) if peer == uid => {}
@@ -206,6 +419,7 @@ fn serve(
             answer(
                 &mut stream,
                 &json!({"ok": false, "code": "peer_refused", "detail": format!("uid {peer} is not the package uid")}),
+                log,
             );
             return;
         }
@@ -213,42 +427,55 @@ fn serve(
             answer(
                 &mut stream,
                 &json!({"ok": false, "code": "peer_unverified", "detail": error.to_string()}),
+                log,
             );
             return;
         }
     }
-    let _ = stream.set_write_timeout(Some(READ_DEADLINE));
-    let reply = match read_request_line(&mut stream, READ_DEADLINE) {
+    if let Err(error) = stream.set_write_timeout(Some(READ_DEADLINE)) {
+        log(
+            Level::Warn,
+            "ctl_socket_option_failed",
+            format!("option=write_timeout cause={error}; a reply to this client may block"),
+        );
+    }
+    let line = read_request_line(&mut stream, READ_DEADLINE);
+    let parsed = match &line {
         Ok(line) if line.trim().is_empty() => {
-            json!({"ok": false, "code": "empty_request", "detail": "no request line"})
+            Err(json!({"ok": false, "code": "empty_request", "detail": "no request line"}))
         }
-        Ok(line) => match parse_request(line.trim_end(), mutation_deadline) {
-            Ok((request, deadline)) if is_long(&request) => {
-                if long.fetch_add(1, Ordering::SeqCst) >= MAX_LONG_REQUESTS {
-                    long.fetch_sub(1, Ordering::SeqCst);
-                    json!({"ok": false, "code": "ctl_busy", "detail": format!(
-                        "{MAX_LONG_REQUESTS} long requests (wait, mutate, stop) are already waiting"
-                    )})
-                } else {
-                    let reply = ask(tx, request, deadline);
-                    long.fetch_sub(1, Ordering::SeqCst);
-                    reply
-                }
-            }
-            Ok((request, deadline)) => ask(tx, request, deadline),
-            Err(detail) => json!({"ok": false, "code": "bad_request", "detail": detail}),
-        },
+        Ok(line) => parse_request(line.trim_end(), mutation_deadline)
+            .map_err(|detail| json!({"ok": false, "code": "bad_request", "detail": detail})),
         Err(error)
             if matches!(
                 error.kind(),
                 io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
             ) =>
         {
-            json!({"ok": false, "code": "request_timeout", "detail": "no whole request line within 5 s"})
+            Err(
+                json!({"ok": false, "code": "request_timeout", "detail": "no whole request line within 5 s"}),
+            )
         }
-        Err(error) => json!({"ok": false, "code": "bad_request", "detail": error.to_string()}),
+        Err(error) => Err(json!({"ok": false, "code": "bad_request", "detail": error.to_string()})),
     };
-    answer(&mut stream, &reply);
+    // The verb is known (or the request has failed): the connection no longer
+    // takes an unread place, and takes the slot its verb needs instead.
+    drop(unread);
+    let reply = match parsed {
+        Err(reply) => Some(reply),
+        Ok((request, deadline)) => {
+            let place = place_of(&request);
+            match slots.take(place) {
+                Some(_held) => ask_while_connected(&stream, tx, request, deadline, log),
+                None => {
+                    Some(json!({"ok": false, "code": "ctl_busy", "detail": full_detail(place)}))
+                }
+            }
+        }
+    };
+    if let Some(reply) = reply {
+        answer(&mut stream, &reply, log);
+    }
 }
 
 /// Bind `path` (removing a stale socket: the caller holds the daemon lock, so
@@ -267,8 +494,7 @@ pub(crate) fn listen(
     }
     let listener = UnixListener::bind(path)?;
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
-    let busy = Arc::new(AtomicUsize::new(0));
-    let long = Arc::new(AtomicUsize::new(0));
+    let slots = Arc::new(Slots::default());
     let socket = path.to_path_buf();
     thread::Builder::new()
         .name("sdsyncd-ctl".into())
@@ -305,31 +531,47 @@ pub(crate) fn listen(
                         continue;
                     }
                 };
-                if busy.load(Ordering::SeqCst) >= MAX_CONNECTIONS {
-                    let _ = stream.set_write_timeout(Some(READ_DEADLINE));
+                // A connection that has not sent its verb takes an unread place,
+                // never a verb slot (F6s).
+                let Some(unread) = slots.take(Place::Unread) else {
+                    if let Err(error) = stream.set_write_timeout(Some(READ_DEADLINE)) {
+                        log(
+                            Level::Warn,
+                            "ctl_socket_option_failed",
+                            format!("option=write_timeout cause={error}"),
+                        );
+                    }
                     answer(
                         &mut stream,
-                        &json!({"ok": false, "code": "ctl_busy", "detail": "too many connections"}),
+                        &json!({"ok": false, "code": "ctl_busy", "detail": full_detail(Place::Unread)}),
+                        &log,
                     );
                     continue;
-                }
-                busy.fetch_add(1, Ordering::SeqCst);
+                };
                 let tx = tx.clone();
-                let counter = Arc::clone(&busy);
-                let long = Arc::clone(&long);
+                let thread_slots = Arc::clone(&slots);
+                let thread_log = Arc::clone(&log);
                 let refused = stream.try_clone();
                 let spawned = thread::Builder::new()
                     .name("sdsyncd-ctl-conn".into())
                     .spawn(move || {
-                        serve(stream, uid, &tx, mutation_deadline, &long);
-                        counter.fetch_sub(1, Ordering::SeqCst);
+                        serve(
+                            stream,
+                            uid,
+                            &tx,
+                            mutation_deadline,
+                            &thread_slots,
+                            &thread_log,
+                            unread,
+                        );
                     });
                 match spawned {
                     Ok(_) => {
                         spawn_failing.store(false, Ordering::SeqCst);
                     }
                     Err(error) => {
-                        busy.fetch_sub(1, Ordering::SeqCst);
+                        // The closure (and the unread place it owned) is gone
+                        // with the failed spawn.
                         if !spawn_failing.swap(true, Ordering::SeqCst) {
                             log(
                                 Level::Error,
@@ -340,12 +582,29 @@ pub(crate) fn listen(
                                 ),
                             );
                         }
-                        if let Ok(mut stream) = refused {
-                            let _ = stream.set_write_timeout(Some(READ_DEADLINE));
-                            answer(
-                                &mut stream,
-                                &json!({"ok": false, "code": "ctl_busy", "detail": format!("no thread to serve it: {error}")}),
-                            );
+                        match refused {
+                            Ok(mut stream) => {
+                                if let Err(option) = stream.set_write_timeout(Some(READ_DEADLINE)) {
+                                    log(
+                                        Level::Warn,
+                                        "ctl_socket_option_failed",
+                                        format!("option=write_timeout cause={option}"),
+                                    );
+                                }
+                                answer(
+                                    &mut stream,
+                                    &json!({"ok": false, "code": "ctl_busy", "detail": format!("no thread to serve it: {error}")}),
+                                    &log,
+                                );
+                            }
+                            Err(clone) => log(
+                                Level::Error,
+                                "ctl_accept_failed",
+                                format!(
+                                    "path={} cause=the refused connection could not be answered: {clone}",
+                                    socket.display()
+                                ),
+                            ),
                         }
                         thread::sleep(ACCEPT_BACKOFF);
                     }
@@ -354,7 +613,7 @@ pub(crate) fn listen(
         })
 }
 
-/// The client side: send one request, wait at most `deadline` for the reply.
+// The client side: send one request, wait at most `deadline` for the reply.
 pub(crate) fn request(path: &Path, request: &Value, deadline: Duration) -> Result<Value, String> {
     // A connect is bounded too: a listener whose backlog is full would hold a
     // blocking connect (H5).
@@ -426,8 +685,8 @@ pub(crate) fn socket_path(var: &Path) -> PathBuf {
 
 #[cfg(test)]
 mod tests {
+    use super::super::control::ask;
     use super::*;
-    use std::sync::mpsc;
     use std::time::Instant;
 
     #[test]
@@ -533,15 +792,15 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// A stand-in control thread: answers pings at once and holds every other
-    /// request's reply (a CLI `wait` on a long run).
+    /// A stand-in control thread: answers ping, status and stop at once and
+    /// holds every other request's reply (a CLI `wait` on a long run).
     fn holding_control() -> Sender<Msg> {
         let (tx, rx) = mpsc::channel::<Msg>();
         thread::spawn(move || {
             let mut held = Vec::new();
             for message in rx {
                 if let Msg::Ctl(request, reply) = message {
-                    if request == Request::Ping {
+                    if matches!(request, Request::Ping | Request::Status | Request::Stop) {
                         let _ = reply.send(json!({"ok": true, "pong": true}));
                     } else {
                         held.push(reply);
@@ -552,11 +811,32 @@ mod tests {
         tx
     }
 
+    /// A log that records `event detail` lines.
+    fn recording_log() -> (CtlLog, Arc<std::sync::Mutex<Vec<String>>>) {
+        let lines = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = Arc::clone(&lines);
+        let log: CtlLog = Arc::new(move |_, event, detail| {
+            sink.lock().unwrap().push(format!("{event} {detail}"));
+        });
+        (log, lines)
+    }
+
+    fn wait_line() -> &'static [u8] {
+        b"{\"verb\":\"wait\",\"id\":1,\"wait_s\":60}\n"
+    }
+
     fn socket_dir(label: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("sdsyncd-ctl-{label}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    /// Remove a test directory; a failure is printed, not swallowed.
+    fn remove_dir(dir: &Path) {
+        if let Err(error) = std::fs::remove_dir_all(dir) {
+            eprintln!("could not remove {}: {error}", dir.display());
+        }
     }
 
     fn quiet_log() -> CtlLog {
@@ -634,6 +914,185 @@ mod tests {
         assert_eq!(reply["pong"], true, "{reply}");
         drop(waiters);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// F6s: `stop` was in the long class, so sixteen CLI waiters left the one
+    /// verb that ends the daemon answering `ctl_busy`. Ping, status and stop have
+    /// slots of their own.
+    #[test]
+    fn stop_status_and_ping_answer_while_every_long_slot_is_taken() {
+        let dir = socket_dir("reserved");
+        let path = dir.join("ctl.sock");
+        listen(
+            &path,
+            sys::geteuid(),
+            holding_control(),
+            Duration::from_secs(1),
+            quiet_log(),
+        )
+        .unwrap();
+        let mut waiters = Vec::new();
+        for _ in 0..MAX_LONG_REQUESTS + 4 {
+            let mut stream = UnixStream::connect(&path).unwrap();
+            stream.write_all(wait_line()).unwrap();
+            waiters.push(stream);
+        }
+        thread::sleep(Duration::from_millis(300));
+        for verb in [
+            json!({"verb":"ping"}),
+            json!({"verb":"status"}),
+            json!({"verb":"stop","wait_s":5}),
+        ] {
+            let reply = request(&path, &verb, Duration::from_secs(5)).unwrap();
+            assert_eq!(reply["pong"], true, "{verb}: {reply}");
+        }
+        // The waiters beyond the long cap were refused by name, not held.
+        let mut refused = 0;
+        for waiter in &mut waiters {
+            waiter
+                .set_read_timeout(Some(Duration::from_millis(50)))
+                .unwrap();
+            let mut text = String::new();
+            if BufReader::new(&*waiter).read_line(&mut text).is_ok() && text.contains("ctl_busy") {
+                refused += 1;
+            }
+        }
+        assert_eq!(
+            refused, 4,
+            "{MAX_LONG_REQUESTS} waiters fit, the rest are told so"
+        );
+        drop(waiters);
+        remove_dir(&dir);
+    }
+
+    /// F6s: a slot was taken at accept, before the verb was read, so forty idle
+    /// connections made `ping` fail for the five seconds they were allowed to
+    /// sit silent. A connection counts once its verb is parsed.
+    #[test]
+    fn idle_connections_do_not_take_a_verb_slot() {
+        let dir = socket_dir("idle");
+        let path = dir.join("ctl.sock");
+        listen(
+            &path,
+            sys::geteuid(),
+            holding_control(),
+            Duration::from_secs(1),
+            quiet_log(),
+        )
+        .unwrap();
+        let idle: Vec<UnixStream> = (0..MAX_CONNECTIONS + 8)
+            .map(|_| UnixStream::connect(&path).unwrap())
+            .collect();
+        thread::sleep(Duration::from_millis(200));
+        let started = Instant::now();
+        let reply = request(&path, &json!({"verb":"ping"}), Duration::from_secs(5)).unwrap();
+        assert_eq!(reply["pong"], true, "{reply} after {:?}", started.elapsed());
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "ping waited {:?} behind idle connections",
+            started.elapsed()
+        );
+        drop(idle);
+        remove_dir(&dir);
+    }
+
+    /// F6s: a `wait` whose client died kept its slot for the whole wait (up to
+    /// an hour). The listener notices the hang-up, frees the slot and says so.
+    #[test]
+    fn a_waiter_whose_peer_hung_up_frees_its_slot() {
+        let dir = socket_dir("hangup");
+        let path = dir.join("ctl.sock");
+        let (log, lines) = recording_log();
+        listen(
+            &path,
+            sys::geteuid(),
+            holding_control(),
+            Duration::from_secs(1),
+            log,
+        )
+        .unwrap();
+        let mut waiters = Vec::new();
+        for _ in 0..MAX_LONG_REQUESTS {
+            let mut stream = UnixStream::connect(&path).unwrap();
+            stream.write_all(wait_line()).unwrap();
+            waiters.push(stream);
+        }
+        thread::sleep(Duration::from_millis(300));
+        drop(waiters);
+        // A new waiter is admitted (and then held) once the dead ones are freed:
+        // it must not be told `ctl_busy`.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut kept = Vec::new();
+        loop {
+            let mut stream = UnixStream::connect(&path).unwrap();
+            stream.write_all(wait_line()).unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_millis(600)))
+                .unwrap();
+            let mut text = String::new();
+            let busy = BufReader::new(&stream).read_line(&mut text).is_ok();
+            if !busy {
+                kept.push(stream);
+                break;
+            }
+            assert!(text.contains("ctl_busy"), "{text}");
+            assert!(
+                Instant::now() < deadline,
+                "dead waiters still hold the long slots after 5 s: {:?}",
+                lines.lock().unwrap()
+            );
+        }
+        let seen = lines.lock().unwrap().clone();
+        assert!(
+            seen.iter()
+                .any(|l| l.starts_with("ctl_peer_gone") && l.contains("verb=wait")),
+            "the abandoned waiters are named: {seen:?}"
+        );
+        remove_dir(&dir);
+    }
+
+    /// A client that sends its request and half-closes (`shutdown(WR)`, as a
+    /// shell `socat` or a script would) still awaits the reply: that is not a
+    /// hang-up, and the listener must not drop it.
+    #[test]
+    fn a_half_closed_client_still_gets_its_reply() {
+        let dir = socket_dir("halfclose");
+        let path = dir.join("ctl.sock");
+        let (log, lines) = recording_log();
+        // A control thread that answers after a delay longer than the peer check.
+        let (tx, rx) = mpsc::channel::<Msg>();
+        thread::spawn(move || {
+            for message in rx {
+                if let Msg::Ctl(_, reply) = message {
+                    thread::sleep(PEER_CHECK * 3);
+                    reply.send(json!({"ok": true, "late": true})).unwrap();
+                }
+            }
+        });
+        listen(&path, sys::geteuid(), tx, Duration::from_secs(1), log).unwrap();
+        let mut stream = UnixStream::connect(&path).unwrap();
+        stream.write_all(b"{\"verb\":\"status\"}\n").unwrap();
+        stream.shutdown(std::net::Shutdown::Write).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let mut text = String::new();
+        BufReader::new(&stream).read_line(&mut text).unwrap();
+        assert!(
+            text.contains("\"late\":true"),
+            "{text} {:?}",
+            lines.lock().unwrap()
+        );
+        assert!(
+            !lines
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|l| l.starts_with("ctl_peer_gone")),
+            "{:?}",
+            lines.lock().unwrap()
+        );
+        remove_dir(&dir);
     }
 
     /// A control thread that never answers yields `daemon_busy`, never a hang.
