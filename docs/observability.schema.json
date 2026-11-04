@@ -63,7 +63,8 @@
                   "pair-index-remote-ctime-unavailable",
                   "pair-index-writeback-unknown",
                   "pair-index-writeback-unbounded",
-                  "pair-index-nas-clock-skewed"
+                  "pair-index-nas-clock-skewed",
+                  "pair-index-cleanup-failed"
                 ]
               },
               "severity": { "enum": ["info", "warning"] },

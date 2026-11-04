@@ -90,7 +90,7 @@ and a fully live run. None fails a run or makes it partial.
 | --- | --- |
 | `pair-index-locked` | Another process held the file for more than 30 s. |
 | `pair-index-readonly` | The file or its volume does not let this account write. |
-| `pair-index-corrupt` | The file failed its integrity check, or redb repaired damage. A damaged file is set aside as `<profile>.redb.corrupt-<epoch>` (one copy, swept after 7 days); repaired evidence is cleared. The index is rebuilt from this run. |
+| `pair-index-corrupt` | The file failed its integrity check (on the run's first open, or on a reopen that found it changed), redb repaired damage in it, a stored record, path or `meta` value does not decode, or a previous run stopped inside redb on it (`<profile>.redb.panicked`). The file is set aside as `<profile>.redb.corrupt-<epoch>` (one copy, swept after 7 days), nothing from it is served, and the index is rebuilt from this run. |
 | `pair-index-format-unsupported` | The file is in a format this build's redb does not read; set aside and rebuilt. |
 | `pair-index-store-failed` | The end-of-run write failed (a full volume); the previous evidence stays valid. |
 | `pair-index-unsafe` | The file is a link, not a regular file, owned by someone else, or shared with group or other. |
@@ -98,6 +98,7 @@ and a fully live run. None fails a run or makes it partial.
 | `pair-index-unbound` | File Station did not name the host serving the run, which the index binds to. |
 | `pair-index-writeback-unknown` | `/proc/sys/vm/dirty_expire_centisecs` or `dirty_writeback_centisecs` could not be read (path and cause named); the local racy window is 60 s. |
 | `pair-index-writeback-unbounded` | Periodic writeback is switched off (`dirty_writeback_centisecs` = 0), so no window bounds a mapped write: nothing local is served and every pair is verified live. |
+| `pair-index-cleanup-failed` | A file the index set aside or no longer needs (a quarantined copy, a panic record) could not be removed; the path and cause are named. |
 | `pair-index-nas-clock-skewed` | The NAS clock (`Date` of an `MD5.start`) stood more than 20 s outside this host's clock while the pass read; evidence it proved is stored racy and verified live next run. Fix the NAS's (or a proxy's) time. |
 | `pair-index-retired` (info) | The index was bound to another profile, source, remote root or NAS, or an older comparison semantics; it was cleared. Semantics epoch 1 (the two-second racy window) is retired by name. |
 | `pair-index-not-applicable` (info) | The run does not compare content, so it neither reads nor writes the index. |
@@ -110,8 +111,17 @@ The index is a cache: deleting the directory is always safe and only costs one f
 One file per profile, `DIR/<profile>.redb` (redb 4.4), mode 0600, in a 0700 directory claimed by a
 `.sdsync-pair-index` marker. A directory holding anything else is refused. The file is held only in
 two short windows: after the listing (one read pass) and at the end of the run (one write
-transaction), so a dashboard read is never queued behind a sync. Every open runs redb's
-`check_integrity()` before any read. An interrupted write leaves the last complete commit.
+transaction), so a dashboard read is never queued behind a sync. The first open of every run runs
+redb's `check_integrity()` before any read. A reopen later in the same run skips it only when the
+file is exactly as this process closed it: same device, inode, length, modification and change
+time, and the same redb header, which every commit by any writer rewrites. Anything else is
+verified again. This keeps one full read of the file per run instead of four or five. An
+interrupted write leaves the last complete commit.
+
+redb 4.4 can panic while it opens a file with a damaged allocator-state page, before any check
+can run; a release build stops there. A panic inside redb on an index file is recorded beside it
+as `<profile>.redb.panicked`, and the next run sets the file aside instead of opening it, so one
+crashed run heals the index.
 
 Size is about 340 bytes per pair at 100,000 pairs and 270 at a million; redb's page cache is held at
 8 MiB, so memory does not grow with the share. When the file grows past twice its contents plus

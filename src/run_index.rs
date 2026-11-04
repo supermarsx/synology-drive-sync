@@ -135,9 +135,6 @@ pub(crate) fn open(
                 },
                 std::time::SystemTime::now(),
             );
-            if opened.clear {
-                session.discard_evidence();
-            }
             session.report.issues.splice(0..0, opened.issues);
             Ok(Some(session))
         }

@@ -1043,3 +1043,80 @@ impl PairIndex for SharedIndex {
         self.0.borrow_mut().stored_pairs()
     }
 }
+
+/// A backend that finds its file damaged on the read of `damaged_at` (a reopen that verified it
+/// again, a record that does not decode) and sets the evidence aside, the way the redb backend
+/// does: that read and every later one find nothing.
+struct DamagedOnRead {
+    inner: SharedIndex,
+    damaged_at: &'static str,
+    discarded: bool,
+    set_aside: bool,
+}
+
+impl PairIndex for DamagedOnRead {
+    fn meta(&mut self) -> Result<Option<IndexMeta>, IndexIssue> {
+        self.inner.meta()
+    }
+    fn get(&mut self, key: &str) -> Result<Option<StoredPair>, IndexIssue> {
+        if key == self.damaged_at && !self.set_aside {
+            self.set_aside = true;
+            self.discarded = true;
+            let mut index = self.inner.0.borrow_mut();
+            index.pairs.clear();
+            index.meta = None;
+        }
+        if self.set_aside {
+            return Ok(None);
+        }
+        self.inner.get(key)
+    }
+    fn for_each_key(&mut self, visit: &mut dyn FnMut(&str)) -> Result<(), IndexIssue> {
+        self.inner.for_each_key(visit)
+    }
+    fn commit(&mut self, commit: IndexCommit) -> Result<(), IndexIssue> {
+        self.inner.commit(commit)
+    }
+    fn take_discarded(&mut self) -> bool {
+        std::mem::take(&mut self.discarded)
+    }
+}
+
+/// D4: evidence read before the damage showed is not served either: the whole vouch is dropped,
+/// the run reports a cold index, and its commit starts from empty.
+#[test]
+fn evidence_set_aside_mid_read_serves_nothing_and_the_commit_starts_from_empty() {
+    let shared = std::rc::Rc::new(std::cell::RefCell::new(proven(&[
+        ("a.jpg", facts()),
+        ("b.jpg", facts()),
+        ("c.jpg", facts()),
+    ])));
+    let backend = DamagedOnRead {
+        inner: SharedIndex(shared.clone()),
+        damaged_at: "b.jpg",
+        discarded: false,
+        set_aside: false,
+    };
+    let mut session = IndexSession::open(Box::new(backend), binding(), options(0), at(NOW));
+    let (local, remote) = tree(&[
+        ("a.jpg", facts(), None),
+        ("b.jpg", facts(), None),
+        ("c.jpg", facts(), None),
+    ]);
+    let vouched = session.vouch(
+        &local,
+        &remote,
+        &keys(&remote),
+        &BTreeSet::new(),
+        &BTreeMap::new(),
+    );
+    assert!(
+        vouched.served.is_empty() && vouched.canaries.is_empty(),
+        "a.jpg was read before the damage showed, and is not served either"
+    );
+    assert_eq!(session.report.state, IndexState::Cold);
+    assert!(session.clear);
+    let report = session.commit(Some(&local), None, true);
+    assert_eq!(report.state, IndexState::Cold);
+    assert_eq!(shared.borrow().commits, 1);
+}

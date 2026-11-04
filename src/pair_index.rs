@@ -199,6 +199,7 @@ pub const ISSUE_CODES: &[&str] = &[
     "pair-index-writeback-unknown",
     "pair-index-writeback-unbounded",
     "pair-index-nas-clock-skewed",
+    "pair-index-cleanup-failed",
 ];
 
 impl IndexIssue {
@@ -255,6 +256,12 @@ pub trait PairIndex {
     /// Conditions the backend met that the run should name (a repair, a compaction).
     fn take_notes(&mut self) -> Vec<IndexIssue> {
         Vec::new()
+    }
+    /// The backend set its stored evidence aside since this was last asked (damage found on a
+    /// reopen, a record that does not decode): nothing read from it before may be served, and
+    /// the commit starts from empty. The backend names the cause in its notes.
+    fn take_discarded(&mut self) -> bool {
+        false
     }
 }
 
@@ -484,6 +491,13 @@ impl IndexSession {
                 report.issues.push(issue);
             }
         }
+        if !broken && backend.take_discarded() {
+            // Reading `meta` found damage and the backend set the file aside: start from empty.
+            clear = true;
+            if report.state == IndexState::Warm {
+                report.state = IndexState::Cold;
+            }
+        }
         if options.refresh && !broken {
             clear = true;
             serving = false;
@@ -602,8 +616,8 @@ impl IndexSession {
         self.serving = false;
     }
 
-    /// Serve nothing from the stored evidence and clear it in this run's commit: the backend
-    /// found damage it repaired, so none of it is trusted. The issue is the backend's to name.
+    /// Serve nothing from the stored evidence and clear it in this run's commit: the backend set
+    /// it aside as damaged, so none of it is trusted. The issue is the backend's to name.
     pub fn discard_evidence(&mut self) {
         self.discard();
         if self.report.state == IndexState::Warm {
@@ -740,6 +754,7 @@ impl IndexSession {
             self.report.state = IndexState::LocalOnly;
         }
         if self.broken {
+            self.report.issues.extend(self.backend.take_notes());
             return self.report;
         }
         let mut remove = Vec::new();
@@ -766,8 +781,16 @@ impl IndexSession {
             };
             if let Err(issue) = self.backend.for_each_key(&mut visit) {
                 self.mark_broken(issue);
+                self.report.issues.extend(self.backend.take_notes());
                 return self.report;
             }
+        }
+        if self.backend.take_discarded() {
+            // The walk met damage and the backend set the file aside: the commit starts from
+            // empty and writes this run's live evidence.
+            self.clear = true;
+            remove.clear();
+            self.demote_to_cold();
         }
         self.backend.finish_reads();
         let stored = self.upserts.len();
@@ -794,8 +817,18 @@ impl IndexSession {
                 self.report.issues.push(issue);
             }
         }
+        if self.backend.take_discarded() {
+            self.demote_to_cold();
+        }
         self.report.issues.extend(self.backend.take_notes());
         self.report
+    }
+
+    /// Evidence was set aside: whatever the run served before, the index now holds none of it.
+    fn demote_to_cold(&mut self) {
+        if matches!(self.report.state, IndexState::Warm | IndexState::LocalOnly) {
+            self.report.state = IndexState::Cold;
+        }
     }
 
     /// The run did not finish its digest pass (a breaker trip, a failed run): nothing is written,
@@ -803,6 +836,9 @@ impl IndexSession {
     pub fn abandon(mut self) -> IndexReport {
         self.backend.finish_reads();
         self.report.entries = self.backend.stored_pairs();
+        if self.backend.take_discarded() {
+            self.demote_to_cold();
+        }
         self.report.remote_signal = Some(self.signal);
         self.report.issues.extend(self.backend.take_notes());
         self.report
@@ -967,6 +1003,13 @@ impl EvidenceSource for IndexSession {
             });
         }
         self.backend.finish_reads();
+        if self.backend.take_discarded() {
+            // A reopen found the file damaged (or repaired it), or a record did not decode, and
+            // the backend set the file aside: nothing gathered from it is served, including what
+            // was read before the damage showed.
+            self.discard_evidence();
+            return Vouched::default();
+        }
         let vouched = split_canaries(eligible, self.options.canary, self.seed);
         if !vouched.canaries.is_empty() {
             self.canary_at = self.now;

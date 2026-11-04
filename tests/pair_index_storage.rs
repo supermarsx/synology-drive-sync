@@ -197,10 +197,7 @@ fn assert_survives(dir: &Dir, case: &str) {
         }
     } else {
         assert_eq!(codes, vec!["pair-index-corrupt"], "{case}");
-        assert!(
-            pairs.is_empty() || opened.clear,
-            "{case}: damaged evidence is never served"
-        );
+        assert!(pairs.is_empty(), "{case}: damaged evidence is never served");
         let set_aside = fs::read_dir(&dir.0)
             .unwrap()
             .flatten()
@@ -457,7 +454,7 @@ fn kill_nine_mid_commit_leaves_all_old_or_all_new() {
         );
         let mut backend = opened.backend.expect("usable after a kill");
         let pairs = read_all(&mut backend);
-        if opened.clear || pairs.is_empty() {
+        if pairs.is_empty() {
             continue;
         }
         let generations: std::collections::BTreeSet<i64> = pairs
@@ -514,4 +511,205 @@ fn a_full_volume_fails_the_store_by_name_and_keeps_the_previous_commit() {
     let mut backend = opened.backend.expect("the previous commit is intact");
     let pairs = read_all(&mut backend);
     assert_eq!(pairs[&key(5)].record, record(5, 1));
+}
+
+/// D4: the first open of a run verifies the file; a reopen of the file exactly as this process
+/// left it does not. One run (read `meta`, read pairs, walk the keys, commit, count) is one full
+/// verification, not one per window.
+#[test]
+fn one_run_verifies_the_file_once() {
+    let dir = Dir::new("verify-once");
+    write(&dir, 2_000, 1);
+    let opened = RedbPairIndex::open(paths(&dir), 8);
+    let mut backend = opened.backend.expect("usable");
+    assert_eq!(backend.integrity_checks(), 1, "the first open verifies");
+    assert_eq!(backend.meta().unwrap(), Some(meta()));
+    backend.finish_reads();
+    for index in 0..100 {
+        assert!(backend.get(&key(index)).unwrap().is_some());
+    }
+    backend.finish_reads();
+    let mut keys = 0;
+    backend.for_each_key(&mut |_| keys += 1).unwrap();
+    assert_eq!(keys, 2_000);
+    backend.finish_reads();
+    backend
+        .commit(IndexCommit {
+            remove: vec![key(0)],
+            ..IndexCommit::default()
+        })
+        .unwrap();
+    assert_eq!(backend.stored_pairs(), Some(1_999));
+    assert_eq!(
+        backend.integrity_checks(),
+        1,
+        "reopens of an unchanged file"
+    );
+}
+
+/// D4: a reopen that finds the file changed since this process closed it verifies it again; one
+/// that is damaged is set aside, nothing from it is served, and the run goes on with a new file.
+#[test]
+fn a_reopen_of_a_changed_file_verifies_it_and_damage_sets_it_aside() {
+    let dir = Dir::new("reopen-damaged");
+    write(&dir, 2_000, 1);
+    let mut backend = RedbPairIndex::open(paths(&dir), 8).backend.expect("usable");
+    assert_eq!(backend.meta().unwrap(), Some(meta()));
+    backend.finish_reads();
+    // Between the windows, something else cuts the file short.
+    let length = fs::metadata(database(&dir)).unwrap().len();
+    fs::OpenOptions::new()
+        .write(true)
+        .open(database(&dir))
+        .unwrap()
+        .set_len(length / 2)
+        .unwrap();
+    assert_eq!(backend.get(&key(7)).unwrap(), None, "nothing is served");
+    assert!(backend.take_discarded(), "the session is told");
+    assert!(
+        backend.integrity_checks() >= 2,
+        "the changed file was verified"
+    );
+    let notes = backend.take_notes();
+    assert_eq!(notes.len(), 1, "{notes:?}");
+    assert_eq!(notes[0].code, "pair-index-corrupt");
+    assert!(
+        notes[0].cause.contains("set aside as"),
+        "{}",
+        notes[0].cause
+    );
+    backend.finish_reads();
+    backend
+        .commit(IndexCommit {
+            upsert: vec![(
+                key(1),
+                StoredPair {
+                    record: record(1, 2),
+                    remote_spelling: None,
+                },
+            )],
+            meta: Some(meta()),
+            ..IndexCommit::default()
+        })
+        .unwrap();
+    // The next run reads only what this run wrote.
+    let mut next = RedbPairIndex::open(paths(&dir), 8).backend.expect("usable");
+    let pairs = read_all(&mut next);
+    assert_eq!(pairs.keys().cloned().collect::<Vec<_>>(), vec![key(1)]);
+}
+
+/// D4: one record that does not decode used to leave the index unusable on every run until the
+/// file was deleted by hand. The file is set aside, named, and rebuilt.
+#[test]
+fn an_undecodable_record_sets_the_file_aside_instead_of_failing_every_run() {
+    let dir = Dir::new("undecodable");
+    write(&dir, 10, 1);
+    {
+        let raw = redb::Database::open(database(&dir)).unwrap();
+        let write = raw.begin_write().unwrap();
+        {
+            let mut pairs = write
+                .open_table(redb::TableDefinition::<&[u8], &[u8]>::new("pairs"))
+                .unwrap();
+            pairs
+                .insert(key(3).as_bytes(), b"not a record".as_slice())
+                .unwrap();
+        }
+        write.commit().unwrap();
+    }
+    for run in 0..2 {
+        let opened = RedbPairIndex::open(paths(&dir), 8);
+        assert!(opened.issues.is_empty(), "run {run}: {:?}", opened.issues);
+        let mut backend = opened.backend.expect("usable");
+        assert_eq!(backend.get(&key(3)).unwrap(), None, "run {run}");
+        let discarded = backend.take_discarded();
+        let notes = backend.take_notes();
+        if run == 0 {
+            assert!(discarded);
+            assert_eq!(notes.len(), 1, "{notes:?}");
+            assert_eq!(notes[0].code, "pair-index-corrupt");
+            assert!(
+                notes[0].cause.contains("is not a valid pair record")
+                    && notes[0].cause.contains("set aside as"),
+                "{}",
+                notes[0].cause
+            );
+        } else {
+            assert!(
+                !discarded && notes.is_empty(),
+                "the next run is clean: {notes:?}"
+            );
+        }
+        backend.finish_reads();
+    }
+}
+
+/// The panic record, read: a file a previous run's redb panicked on is set aside before redb
+/// opens it again, and the record goes with it.
+#[test]
+fn a_recorded_panic_sets_the_file_aside_before_redb_opens_it() {
+    let dir = Dir::new("panic-record");
+    write(&dir, 10, 1);
+    let record_path = dir.0.join("photos.redb.panicked");
+    fs::write(&record_path, "index out of range in btree_cursor.rs\n").unwrap();
+    let opened = RedbPairIndex::open(paths(&dir), 8);
+    let codes: Vec<&str> = opened.issues.iter().map(|issue| issue.code).collect();
+    assert_eq!(codes, vec!["pair-index-corrupt"]);
+    assert!(
+        opened.issues[0].cause.contains("stopped inside redb")
+            && opened.issues[0].cause.contains("btree_cursor"),
+        "{}",
+        opened.issues[0].cause
+    );
+    assert!(!record_path.exists(), "the record goes with the file");
+    let mut backend = opened.backend.expect("a new, empty index");
+    assert!(read_all(&mut backend).is_empty());
+}
+
+/// The panic record, written: redb 4.4 panics inside `create_file` on some corruptions of its
+/// saved allocator state, before any check can run, and a release build aborts. Each page of a
+/// real file is damaged in turn until one makes the open panic; the hook must have recorded it,
+/// and the next open must set the file aside instead of panicking again.
+#[test]
+fn a_panic_inside_redb_is_recorded_and_the_next_open_heals() {
+    let dir = Dir::new("panic-heal");
+    write(&dir, 2_000, 1);
+    let original = fs::read(database(&dir)).unwrap();
+    let record_path = dir.0.join("photos.redb.panicked");
+    let mut panicked_at = None;
+    for page in 1..(original.len() / 4096) {
+        let mut damaged = original.clone();
+        damaged[page * 4096] ^= 0x01;
+        fs::write(database(&dir), &damaged).unwrap();
+        let attempt =
+            std::panic::catch_unwind(|| RedbPairIndex::open(paths(&dir), 8).backend.is_some());
+        if attempt.is_err() {
+            panicked_at = Some(page * 4096);
+            break;
+        }
+        // Damage caught by name was set aside: put the file back for the next page.
+        for entry in fs::read_dir(&dir.0).unwrap().flatten() {
+            if entry
+                .file_name()
+                .to_string_lossy()
+                .contains(".redb.corrupt-")
+            {
+                fs::remove_file(entry.path()).unwrap();
+            }
+        }
+    }
+    let Some(position) = panicked_at else {
+        eprintln!("no single-byte page damage made redb panic: nothing to heal");
+        return;
+    };
+    assert!(
+        record_path.is_file(),
+        "the panic at {position} was recorded"
+    );
+    let opened = RedbPairIndex::open(paths(&dir), 8);
+    let codes: Vec<&str> = opened.issues.iter().map(|issue| issue.code).collect();
+    assert_eq!(codes, vec!["pair-index-corrupt"], "{:?}", opened.issues);
+    assert!(!record_path.exists());
+    let mut backend = opened.backend.expect("healed");
+    assert!(read_all(&mut backend).is_empty());
 }
