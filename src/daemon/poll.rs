@@ -507,6 +507,12 @@ pub(crate) struct PollCarry {
     pub(crate) announced: Option<(BackendReason, String)>,
     /// The watcher's own `(reason, detail)` the pollers last opened with.
     pub(crate) account: Option<(BackendReason, String)>,
+    /// Changes during a gap are unknown and the baseline that ends it is owed an overflow. A
+    /// successor starts in the gap its predecessor left (between pollers nothing watches), so
+    /// this is the predecessor's unpaid debt, handed on.
+    pub(crate) gap: bool,
+    /// A poller has run for this routine: whoever runs next starts in a gap.
+    pub(crate) earlier: bool,
 }
 
 impl PollCarry {
@@ -621,10 +627,15 @@ impl Poller {
 
     fn run(self) {
         let mut state = {
-            let carry = carried(&self.config.carry);
+            let mut carry = carried(&self.config.carry);
+            // A successor's first baseline may hold changes nobody saw: it owes an overflow,
+            // as one whose predecessor already owed one and never paid it.
+            let gap = carry.gap || carry.earlier;
+            carry.earlier = true;
             State {
                 walk_deadline: Some(carry.walk_deadline.unwrap_or(self.config.walk_deadline)),
                 degraded_overflow: carry.degraded_overflow,
+                gap,
                 ..State::default()
             }
         };
@@ -668,6 +679,7 @@ impl Poller {
         let mut carry = carried(&self.config.carry);
         carry.walk_deadline = state.walk_deadline;
         carry.degraded_overflow = state.degraded_overflow;
+        carry.gap = state.gap;
     }
 
     /// Sleep one interval in slices; `false` when `stop` was set meanwhile.
@@ -1496,6 +1508,69 @@ mod tests {
     /// its first value, and the tree synced whole at once. What the first poller
     /// learned (the grown deadline, when the tree was last synced whole, what it
     /// last reported) now outlives it.
+    /// A change made while no poller walks (between a poller and its successor) is unknown
+    /// to the successor, whose first finished walk becomes its baseline: without a gap carried
+    /// over, a file created in that gap ends up in the baseline and nothing is ever reported for
+    /// it. The successor owes an overflow for the first baseline of a routine that had a poller.
+    #[test]
+    fn a_successor_poller_owes_an_overflow_for_what_changed_between_pollers() {
+        struct Stuck;
+        impl DirSource for Stuck {
+            fn list(&self, _dir: &Path) -> io::Result<Vec<Listed>> {
+                thread::sleep(Duration::from_millis(400));
+                Ok(Vec::new())
+            }
+        }
+        let dir = TempDir::new("gap-between");
+        dir.write("f", "f");
+        let carry = new_carry();
+        let run_one = |source: Arc<dyn DirSource>, watch_for: Duration| {
+            let (sender, events) = mpsc::channel();
+            let stop = Arc::new(AtomicBool::new(false));
+            let handle = spawn_poller_from(
+                source,
+                "r".to_owned(),
+                dir.path().to_path_buf(),
+                filter(dir.path(), &[]),
+                PollConfig {
+                    interval: Duration::from_millis(20),
+                    walk_deadline: Duration::from_millis(60),
+                    walk_deadline_max: Duration::from_millis(240),
+                    degraded_every: Duration::from_secs(30),
+                    reason: BackendReason::WatchSetupFailed,
+                    detail: "arm gave up".to_owned(),
+                    carry: Arc::clone(&carry),
+                },
+                Arc::clone(&stop),
+                Box::new(move |event| sender.send(event).is_ok()),
+            )
+            .unwrap();
+            let mut seen = Vec::new();
+            let until = Instant::now() + watch_for;
+            while Instant::now() < until {
+                if let Ok(event) = events.recv_timeout(Duration::from_millis(20)) {
+                    seen.push(event);
+                }
+            }
+            stop.store(true, Ordering::SeqCst);
+            handle.join().expect("the poller panicked");
+            seen
+        };
+        // The first poller never finishes a walk; then a file appears in the gap.
+        let first = run_one(Arc::new(Stuck), Duration::from_millis(700));
+        assert!(!first.is_empty(), "the first poller reported nothing");
+        dir.write("created-in-the-gap", "g");
+        let second = run_one(Arc::new(FsSource), Duration::from_millis(600));
+        let overflows = second
+            .iter()
+            .filter(|event| matches!(event, ChangeEvent::Overflow { .. }))
+            .count();
+        assert_eq!(
+            overflows, 1,
+            "the successor's first baseline owes one overflow for the gap: {second:#?}"
+        );
+    }
+
     #[test]
     fn a_restarted_poller_keeps_the_growth_and_the_whole_tree_cadence() {
         struct Stuck;
