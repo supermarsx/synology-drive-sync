@@ -358,6 +358,8 @@ fn install_ring_provider_once() -> core::result::Result<(), &'static str> {
 /// The daemon's unit-test helpers that are not about the daemon: a test that needs a mode-000 path
 /// to refuse reads skips loudly where the user ignores modes (root), never in silence.
 #[cfg(all(test, unix))]
+// The file is shared with the daemon's tests; which helpers a platform's library tests use differs.
+#[allow(dead_code)]
 #[path = "daemon/testkit.rs"]
 pub(crate) mod testkit;
 
