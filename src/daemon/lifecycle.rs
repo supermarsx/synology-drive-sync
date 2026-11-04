@@ -1668,6 +1668,7 @@ mod tests {
         let script = dir.join("sdsync-dsm");
         fs::write(&script, format!("#!/bin/sh\n{body}\n")).unwrap();
         fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+        super::super::testkit::settle_for_exec(&script);
         let runner = ManagerMutations {
             manager: script,
             env: vec![("PATH".into(), "/usr/bin:/bin".into())],

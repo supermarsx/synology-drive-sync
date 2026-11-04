@@ -23,6 +23,12 @@ use serde_json::{Value, json};
 mod dsm_package;
 use dsm_package::DsmPackage;
 
+// The daemon's unit-test helpers: `settle_for_exec` keeps a script this test wrote from being
+// "Text file busy" when the daemon (or the fixture) runs it a moment later.
+#[path = "../src/daemon/testkit.rs"]
+#[allow(dead_code)]
+mod testkit;
+
 const DAEMON: &str = env!("CARGO_BIN_EXE_sdsync-dsm-api");
 const CORE: &str = env!("CARGO_BIN_EXE_synology-drive-sync");
 
@@ -42,6 +48,7 @@ fn private_dir(path: &Path) {
 fn script(path: &Path, body: &str) -> PathBuf {
     fs::write(path, format!("#!/bin/sh\n{body}\n")).unwrap();
     fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
+    testkit::settle_for_exec(path);
     path.to_path_buf()
 }
 

@@ -553,6 +553,7 @@ mod tests {
         let exe = dir.join("server");
         std::fs::write(&exe, format!("#!/bin/sh\n{body}\n")).unwrap();
         std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+        super::super::testkit::settle_for_exec(&exe);
         (exe, dir)
     }
 

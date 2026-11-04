@@ -1292,6 +1292,7 @@ exit 64
         )
         .unwrap();
         fs::set_permissions(&bridge, fs::Permissions::from_mode(0o755)).unwrap();
+        super::super::testkit::settle_for_exec(&bridge);
         bridge
     }
 
