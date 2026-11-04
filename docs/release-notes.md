@@ -169,6 +169,31 @@ lists its own commits.
 - **`sdsync-dsm-api --daemon-lock-probe <path>`** answers what `flock -n` does on `daemon.lock` (0 free,
   3 held, 1 cannot probe, named on stderr) for a NAS whose BusyBox has no `flock`.
 
+### Lifecycle script fixes from the second review
+
+- **The shell engine no longer starts beside a daemon it cannot see.** When `daemon.lock` cannot be
+  probed, start and status ask the identity check on the daemon's records, as stop does: a live
+  daemon, or one the check cannot rule out, blocks, and the refusal says why.
+- **A unit without `flock(1)` still sees the daemon.** The lock is probed with
+  `sdsync-dsm-api --daemon-lock-probe <path>`, and the probe in use is named once per change in
+  `controller.log` (`daemon_lock_probe`). Status names why a lock could not be probed.
+- **A malformed or unreadable `supervisor.pid` no longer reads as "no supervisor".**
+  `supervisor.lock`, which the supervisor holds for its life, is the second witness; start, the
+  hooks and stop refuse naming it, and a stale record's removal names why it could not be trusted.
+- **The controller signals only its own watcher.** A pid file naming another child of the controller
+  (a wrapped PID) is left alone and named (`routine_watch_pid_mismatch`, or `pid_reused` in the
+  failure detail).
+- **A stop without a readable clock has one deadline.** Each phase is charged what it can take
+  against `SDSYNC_DSM_STOP_TIMEOUT`, so the worst case is the same as with a clock.
+- **A shell-engine stop that outlasts `SDSYNC_DSM_STOP_TIMEOUT` kills what is left** (the runner and
+  its children, the API service, then the controller), logs `service_stop_forced` and names each KILL,
+  instead of exiting `1` with the services running.
+- **A stop no longer leaves a realtime poll's scratch directory** (`run/fingerprint.<pid>.<n>`).
+- **Recovering a dead `run.lock` owner removes the daemon's staged owner file** (`run/.run.lock.pid.<pid>.<n>`)
+  and names it.
+- **The shell snapshot carries `controller.degraded`** (`reason`, `since_epoch`, `cause`) from the
+  daemon's three optional `controller.state` lines, and refuses a malformed set as `corrupt_state`.
+
 ### Verified-pair index: correctness fixes
 
 - **A write through a shared memory mapping is no longer missed.** Linux moves a file's times only

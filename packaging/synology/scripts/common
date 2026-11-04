@@ -960,21 +960,57 @@ daemon_artifacts_present() {
 # 0 when supervisor.pid, the identity triple (pid, /proc start time, boot id)
 # the --supervise parent publishes before it spawns its first daemon, names a
 # process that is still that process: alive, not a zombie, same start time and
-# boot. 1 for no record, an unreadable or malformed one, a dead process or a
-# reused PID. Self-contained (the hooks source only this file); the lifecycle
-# signals only after its own full identity check.
+# boot. 1 for no record, an unusable one, a dead process or a reused PID.
+# supervisor_record_problem says which: empty for no record or a record that
+# names a process that is gone (an ordinary stale record), otherwise why the
+# record could not be read as one -- not a regular file, unreadable, malformed
+# -- which is not the same as "no supervisor" (daemon_supervisor_witness asks
+# supervisor.lock). Self-contained (the hooks source only this file); the
+# lifecycle signals only after its own full identity check.
 daemon_supervisor_record_live() {
-    [ -f "$supervisor_pid_file" ] && [ ! -L "$supervisor_pid_file" ] || return 1
+    supervisor_record_problem=
     supervisor_record_pid= supervisor_record_start= supervisor_record_boot=
+    if [ ! -e "$supervisor_pid_file" ] && [ ! -L "$supervisor_pid_file" ]; then
+        return 1
+    fi
+    if [ ! -f "$supervisor_pid_file" ] || [ -L "$supervisor_pid_file" ]; then
+        supervisor_record_problem="is not a regular file"
+        return 1
+    fi
+    if [ ! -r "$supervisor_pid_file" ]; then
+        supervisor_record_problem="cannot be read by this user"
+        return 1
+    fi
     {
-        IFS= read -r supervisor_record_pid || return 1
-        IFS= read -r supervisor_record_start || return 1
-        IFS= read -r supervisor_record_boot || return 1
-    } < "$supervisor_pid_file" 2>/dev/null || return 1
-    case $supervisor_record_pid in ''|*[!0-9]*) return 1 ;; esac
-    case $supervisor_record_start in ''|*[!0-9]*|0) return 1 ;; esac
-    [ "$supervisor_record_pid" -gt 1 ] 2>/dev/null || return 1
-    IFS= read -r supervisor_current_boot < /proc/sys/kernel/random/boot_id 2>/dev/null || return 1
+        IFS= read -r supervisor_record_pid || :
+        IFS= read -r supervisor_record_start || :
+        IFS= read -r supervisor_record_boot || :
+    } 2>/dev/null < "$supervisor_pid_file" || {
+        supervisor_record_problem="cannot be read (it vanished or the read failed)"
+        return 1
+    }
+    case $supervisor_record_pid in ''|*[!0-9]*)
+        supervisor_record_problem="is malformed (its first line is not a PID)"
+        return 1
+        ;;
+    esac
+    case $supervisor_record_start in ''|*[!0-9]*|0)
+        supervisor_record_problem="is malformed (its second line is not a /proc start time)"
+        return 1
+        ;;
+    esac
+    [ "$supervisor_record_pid" -gt 1 ] 2>/dev/null || {
+        supervisor_record_problem="is malformed (PID $supervisor_record_pid)"
+        return 1
+    }
+    [ -n "$supervisor_record_boot" ] || {
+        supervisor_record_problem="is malformed (its third line, the boot id, is missing)"
+        return 1
+    }
+    IFS= read -r supervisor_current_boot 2>/dev/null < /proc/sys/kernel/random/boot_id || {
+        supervisor_record_problem="cannot be compared with this boot (/proc/sys/kernel/random/boot_id is unreadable)"
+        return 1
+    }
     [ "$supervisor_current_boot" = "$supervisor_record_boot" ] || return 1
     supervisor_stat_tail=$(sed -n 's/^.*) //p' "/proc/$supervisor_record_pid/stat" 2>/dev/null) || return 1
     [ -n "$supervisor_stat_tail" ] || return 1
@@ -984,27 +1020,147 @@ daemon_supervisor_record_live() {
     [ "${20:-}" = "$supervisor_record_start" ]
 }
 
-# 0 when a process holds daemon.lock, 1 when none does or the file is absent,
-# 2 when it cannot be told (no flock(1), or the probe itself failed), 3 when it
-# was not probed: a live supervisor (supervisor.pid) is between its daemon's
-# death and the respawn, or serving it, and a probe taking the free lock then
-# would make the respawning daemon exit 75. Callers read 3 as "a daemon may
-# hold it". The probe opens the existing file only; it never creates it. It
-# holds the lock for one flock(1) call and no child process: flock -n on an
-# inherited descriptor, closed as the group ends. flock -n exits 1 exactly
-# when the lock is taken (util-linux and BusyBox alike); the file is checked
-# readable first so a failed open is not mistaken for a holder.
-daemon_lock_held_status() {
-    [ -e "$daemon_lock_file" ] || [ -L "$daemon_lock_file" ] || return 1
-    [ -f "$daemon_lock_file" ] && [ ! -L "$daemon_lock_file" ] || return 2
-    command -v flock >/dev/null 2>&1 || return 2
-    [ -r "$daemon_lock_file" ] || return 2
-    ! daemon_supervisor_record_live || return 3
-    daemon_lock_probe_status=0
-    { { flock -n 8; } 8< "$daemon_lock_file"; } 2>/dev/null || daemon_lock_probe_status=$?
-    case $daemon_lock_probe_status in
-        0) return 1 ;;
-        1) return 0 ;;
-        *) return 2 ;;
+supervisor_lock_file=$runtime_root/supervisor.lock
+
+# The supervisor holds supervisor.lock for its whole life (one per package).
+# 0 held, 1 free or absent, 2 cannot be told (daemon_lock_probe_cause).
+daemon_supervisor_lock_status() {
+    [ -e "$supervisor_lock_file" ] || [ -L "$supervisor_lock_file" ] || return 1
+    [ -f "$supervisor_lock_file" ] && [ ! -L "$supervisor_lock_file" ] || {
+        daemon_lock_probe_cause="$supervisor_lock_file is not a regular file"
+        return 2
+    }
+    lock_file_probe "$supervisor_lock_file"
+}
+
+# Whether a supervisor may be running: 0 when supervisor.pid proves one live,
+# or, when it does not, supervisor.lock is held -- the second witness for a
+# record that is malformed, unreadable, missing under a live supervisor, or not
+# yet published. Also 0 when the record is unusable and the lock cannot be
+# probed: a supervisor cannot be ruled out. Then supervisor_witness_cause names
+# what was found; it is empty when the record itself proves the supervisor.
+# 1 when nothing says a supervisor runs. A supervisor that only the lock
+# shows cannot be identified, so nothing is signalled on it (see
+# capture_supervisor_record); what it blocks is a probe, a start and a cleanup.
+daemon_supervisor_witness() {
+    supervisor_witness_cause=
+    daemon_supervisor_record_live && return 0
+    supervisor_witness_record=${supervisor_record_problem:-names no live supervisor}
+    supervisor_witness_lock=0
+    daemon_supervisor_lock_status || supervisor_witness_lock=$?
+    case $supervisor_witness_lock in
+        0)
+            supervisor_witness_cause="$supervisor_pid_file $supervisor_witness_record, but $supervisor_lock_file is held: a supervisor runs that the record does not identify"
+            return 0
+            ;;
+        2)
+            [ -n "$supervisor_record_problem" ] || return 1
+            supervisor_witness_cause="$supervisor_pid_file $supervisor_witness_record and $supervisor_lock_file cannot be probed (${daemon_lock_probe_cause:-unknown cause}): a supervisor cannot be ruled out"
+            return 0
+            ;;
     esac
+    return 1
+}
+
+# Whether a process holds the flock on file $1, without creating it and
+# without keeping it: 0 held, 1 free, 2 cannot be told (the cause in
+# daemon_lock_probe_cause). flock(1) when it is installed -- flock -n on an
+# inherited descriptor, closed as the group ends, which exits 1 exactly when the
+# lock is taken (util-linux and BusyBox alike) -- and otherwise the bridge's own
+# `--daemon-lock-probe <path>` (exit 0 free, 3 held, 1 cannot probe, with one
+# `daemon-lock-probe: <path>: <cause>` line on stderr), which does the same
+# flock(LOCK_EX|LOCK_NB) on a read-only descriptor. A unit without flock(1)
+# used to be a permanent "cannot be told". Sets lock_probe_tool to the one it
+# used (flock, daemon-lock-probe, or none) and says so once per change
+# (daemon_lock_probe_announce); daemon_lock_probe_unavailable is true when
+# there was no tool at all, as opposed to one that failed. The file is checked readable first so a failed
+# open is not mistaken for a holder.
+lock_file_probe() {
+    lock_probe_path=$1
+    daemon_lock_probe_cause=
+    daemon_lock_probe_unavailable=false
+    [ -r "$lock_probe_path" ] || {
+        lock_probe_tool=none
+        daemon_lock_probe_cause="$lock_probe_path is not readable by this user"
+        return 2
+    }
+    lock_probe_status=0
+    if command -v flock >/dev/null 2>&1; then
+        lock_probe_tool=flock
+        lock_probe_output=$({ { flock -n 8; } 8< "$lock_probe_path"; } 2>&1) || lock_probe_status=$?
+        daemon_lock_probe_announce flock
+        case $lock_probe_status in
+            0) return 1 ;;
+            1) return 0 ;;
+        esac
+        daemon_lock_probe_cause="flock -n exited $lock_probe_status${lock_probe_output:+: $lock_probe_output}"
+        return 2
+    fi
+    if [ -f "$api_server" ] && [ -x "$api_server" ]; then
+        lock_probe_tool=daemon-lock-probe
+        lock_probe_output=$("$api_server" --daemon-lock-probe "$lock_probe_path" 2>&1) || lock_probe_status=$?
+        daemon_lock_probe_announce daemon-lock-probe
+        case $lock_probe_status in
+            0) return 1 ;;
+            3) return 0 ;;
+        esac
+        daemon_lock_probe_cause="flock(1) is not installed and $api_server --daemon-lock-probe exited $lock_probe_status${lock_probe_output:+: $lock_probe_output}"
+        return 2
+    fi
+    lock_probe_tool=none
+    daemon_lock_probe_unavailable=true
+    daemon_lock_probe_cause="flock(1) is not installed and $api_server is not an executable file to probe with"
+    return 2
+}
+
+# Say which probe is in use: once per process (a note on stderr for the
+# fallback), and in controller.log once per change -- the last tool is kept in
+# run/daemon-lock-probe.tool -- so a unit that probes with the bridge because it
+# has no flock(1) shows that in the log. The hooks, which have no event log,
+# keep only the stderr note.
+daemon_lock_probe_noted=
+daemon_lock_probe_announce() {
+    [ "$daemon_lock_probe_noted" != "$1" ] || return 0
+    daemon_lock_probe_noted=$1
+    if [ "$1" = daemon-lock-probe ]; then
+        echo "note: flock(1) is not installed; $daemon_lock_file is probed with $api_server --daemon-lock-probe" >&2
+    fi
+    command -v append_controller_log_event >/dev/null 2>&1 || return 0
+    lock_probe_marker=$runtime_root/daemon-lock-probe.tool
+    lock_probe_previous=
+    if [ -f "$lock_probe_marker" ] && [ ! -L "$lock_probe_marker" ]; then
+        { IFS= read -r lock_probe_previous; } < "$lock_probe_marker" || lock_probe_previous=
+    fi
+    [ "$lock_probe_previous" != "$1" ] || return 0
+    lock_probe_detail="tool=$1 path=$daemon_lock_file"
+    [ "$1" = flock ] || lock_probe_detail="$lock_probe_detail flock=absent"
+    append_controller_log_event info daemon_lock_probe "$lock_probe_detail" >/dev/null 2>&1 || {
+        echo "warning: the daemon_lock_probe event could not be written to the controller log" >&2
+        return 0
+    }
+    { printf '%s\n' "$1" > "$lock_probe_marker.tmp.$$" && mv -f "$lock_probe_marker.tmp.$$" "$lock_probe_marker"; } || {
+        rm -f "$lock_probe_marker.tmp.$$"
+        echo "warning: $lock_probe_marker could not be written; the probe in use will be logged again" >&2
+    }
+    return 0
+}
+
+# 0 when a process holds daemon.lock, 1 when none does or the file is absent,
+# 2 when it cannot be told (neither flock(1) nor the bridge's probe works, or
+# the probe itself failed; daemon_lock_probe_cause says why), 3 when it was not
+# probed: a live supervisor (supervisor.pid) is between its daemon's death and
+# the respawn, or serving it, and a probe taking the free lock then would make
+# the respawning daemon exit 75. Callers read 3 as "a daemon may hold it".
+# The probe opens the existing file only; it never creates it
+# (lock_file_probe).
+daemon_lock_held_status() {
+    daemon_lock_probe_cause=
+    daemon_lock_probe_unavailable=false
+    [ -e "$daemon_lock_file" ] || [ -L "$daemon_lock_file" ] || return 1
+    [ -f "$daemon_lock_file" ] && [ ! -L "$daemon_lock_file" ] || {
+        daemon_lock_probe_cause="$daemon_lock_file is not a regular file"
+        return 2
+    }
+    ! daemon_supervisor_witness || return 3
+    lock_file_probe "$daemon_lock_file"
 }

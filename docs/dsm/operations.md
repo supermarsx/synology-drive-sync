@@ -144,7 +144,7 @@ holds the run lock, so every routine waits behind it. To make that visible the r
 deliberately throttled run is not called stuck). Those counters follow reads and writes over NFS and
 CIFS too, which block-device counters would miss. `heartbeat_source` is `io`, or `liveness` where the
 kernel hides the counters: a `liveness` record is written **without** an epoch, because it only proves
-the core is alive. A progress record no longer counts as a signal (a batch run has none, and a refresh
+the core is alive. A progress record no longer counts as a signal (a batch run's record restarts per profile, and a refresh
 moves its modification time). If the counters become unreadable during a run the runner logs
 `run_stall_detection_unavailable` once (`warn`, scheduler; `scope=`, `pid=`, `cause=`). The snapshot reports `outcomes.run.heartbeat_epoch` and `stalled`: `true` when the heartbeat is
 more than 30 minutes old (adding the warning token `stalled`), `false` while it is recent, and `null`
@@ -216,7 +216,11 @@ died without finishing” with a stale outcome. The bridge applies the same rule
 verdict does not wait for the controller (or survives a stopped one). An owner file that fails its
 ownership or mode check is *not* declared stale, because death cannot be proven. An owner record that
 was torn before the last boot (power loss mid-write) is recovered as dead rather than ending the
-controller.
+controller. The daemon publishes `run.lock/pid` by linking a staging file `run/.run.lock.pid.<pid>.<n>`
+and unlinking it; killed between the two, the owner file has two names. That reads as the owner's
+record, and recovering the dead owner removes the staging names that are the same inode and says so on
+stderr (`removed the staged lock owner record a crashed owner left beside …`); a file of another inode
+is left.
 
 A package **stop** is not a died run. The controller waits up to 60 seconds for a running sync to cancel
 cooperatively (`SDSYNC_DSM_RUNNER_STOP_GRACE`, 1 to 110 seconds, inside the 120-second lifecycle
@@ -225,6 +229,14 @@ budget; dashboard jobs still get 3 seconds). If the runner still has to be kille
 and exit `137`, with an `info` Activity `run.cancelled` row (state `cancelled`), no alert and no
 `runner_died`. A cancellation the runner itself observes, before the core starts or before it
 completes, writes the same `run.cancelled` row; cancellations no longer appear as `run.failed`.
+
+The shell engine's stop has one budget, `SDSYNC_DSM_STOP_TIMEOUT` (default and maximum 120 seconds),
+for the controller's whole shutdown, not only the runner's grace. If it ends with services still
+live, the stop does not exit `1` with them running: it says `graceful stop timed out after N seconds;
+killing what is left`, logs `service_stop_forced` (`error`, `engine=shell`), kills the runner (found
+by its verified identity) with its direct children and the API service, gives the controller 5 more
+seconds to record the run and exit, and kills it too, naming each KILL. A service that is still live
+10 seconds after KILL fails the stop. A run ended this way is not a clean cancellation.
 
 A run read as stale is never reported as running anywhere in the snapshot: the legacy `run.state`,
 `outcomes.run.state` and every covered routine's state read `failed` (`outcomes.run.outcome` stays
@@ -559,6 +571,7 @@ knowing when reading it:
 | `controller_found_dead` | `warn`, category controller. The controller is gone while its API service is still running: `phase=status` (written once per dead controller and API instance, which is the record a SIGKILL never wrote) or `phase=start` (written whenever Start repairs it); `pid=` the controller's recorded pid or `none`, `api_pid=` the service. Start then stops the service and starts both again, and writes an Activity `service.restarted` (`warn`) saying so |
 | `core_killed` | `error`, scheduler. The sync core was killed (`exit=137`) without reporting an error and the run was not a cancellation. `scope=`, `oom_kill=<before>-><after>`, `proven=true\|false`: `proven=true` when this cgroup's out-of-memory kill counter moved across the run. The profile and run detail then say "killed by the out-of-memory killer" (or, unproven, "killed (SIGKILL, exit 137) without reporting an error; out of memory? check the DSM system log"); the reason is `core_oom_killed` when proven and `core_killed` otherwise, never `core_failed`. The detail also names the memory a run could use. Under the daemon `core_oom_killed` holds the profile ([lasting block](#lasting-block-after-an-out-of-memory-kill)). The package does not read `dmesg`, which is privileged |
 | `realtime_watcher_command` | Which watcher realtime routines use, once per controller start: `path=` and `kind=native` (the package's `sdsync-dsm-api --watch`) or `kind=inotifywait` (`info`); `warn` with `path=none kind=none` when neither passed the executable checks and every realtime routine is polled (`backend_reason=watch_unavailable`) |
+| `routine_watch_pid_mismatch` | `warn`. A routine's `watch-<profile>.pid` named a live child of the controller that is not its watcher (a wrapped PID: `profile=`, `pid=`, `reason=not_the_watcher`, `cmd=` its argv[0]); it was not signalled or adopted and the stale file was removed |
 | `routine_watch_failed` / `routine_watch_limit` | `warn`. A native watcher exited (`profile=`, `consecutive=`, `detail=` its first stderr line: the reason, then the cause, then the path) / a source does not fit the per-user inotify watch budget (`dirs=`, `budget=`, `limit=` from the controller's own count, or `source=watcher detail=watch_limit dirs=… budget=… limit=… held=…` from the watcher's) |
 | `routine_watch_limit_unchecked` | `warn`. The inotify watch limit could not be checked for a routine (`profile=`, `cause=absent\|not_a_file\|unreadable\|malformed\|count_failed\|cache_unsafe\|cache_unwritable`, sometimes `path=`); logged once per controller lifetime, and the watcher is started anyway |
 | `run_stall_detection_unavailable` | `warn`, scheduler. The core's I/O counters stopped being readable mid-run (`scope=`, `pid=`, `cause=`), so hang detection is unavailable for the rest of that run; the heartbeat becomes `liveness` and `stalled` reads `null`. Once per run |

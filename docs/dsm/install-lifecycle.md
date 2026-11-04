@@ -172,8 +172,10 @@ lifecycle command:
 The shell engine steps aside from a daemon: while a process holds `daemon.lock`, or a live
 supervisor (`run/supervisor.pid`) is about to respawn one, start refuses ("refusing to start the shell
 engine: the sync daemon (PID n) holds ...") and status reports `2` with the same line on stderr.
-Stop the package first, or remove `var/state/engine` to run the daemon engine. A lock `flock` cannot
-probe is said on stderr and does not block.
+Stop the package first, or remove `var/state/engine` to run the daemon engine. A lock that cannot be
+probed (see below) is decided by the identity check on the daemon's records, the one stop uses: a
+live daemon, or one the check cannot rule out, blocks, and the refusal says the lock could not be
+probed and why; only "no record names a live daemon" goes on, with a warning on stderr.
 
 Under the shell engine, profiles the daemon held for a lasting condition (`state/lasting/<p>.state`)
 are not held: start says so once (`lasting_blocks_not_applied`, with the count).
@@ -209,7 +211,10 @@ the figure the shell engine's stop has always had; the Package Center's own stop
 documented by Synology and was not verified on a unit): `ctl stop` waits at most the budget less a
 sixth of it (at least 2 s) and 5 s, the daemon then gets the rest less that sixth to end, and TERM gets
 whatever remains. KILL's own 10 s wait is the only margin on top, so the worst case is the budget plus
-about 10 s. A daemon that does not
+about 10 s. Without a readable clock (`date +%s` fails) the stop says so and charges each phase what it
+can take against the same budget -- `ctl stop` its whole wait, a wait the seconds it slept -- so the
+worst case is the same; the cost is that a `ctl stop` that failed at once still leaves the later phases
+only the rest of the budget. A daemon that does not
 answer, or outlasts the budget, is sent TERM and then KILL, together with its supervisor, but only
 after its identity is proven from
 `run/daemon.ready` (PID, `/proc` start time, boot id, package uid, `--daemon` argv); an unprovable
@@ -217,14 +222,30 @@ one is refused and named. Stop leaves no `daemon.pid`, `daemon.ready` or `ctl.so
 stays; only a live holder of it means a daemon runs). When nobody holds `daemon.lock`, no daemon
 exists: whatever `daemon.pid`, `daemon.ready` and `ctl.sock` say is stale even if the PID they name
 now belongs to another process, and stop and start remove them and name each path (`removed stale
-daemon record <path>`). A held lock keeps the strict identity check above; without `flock(1)` the
-lock cannot be probed, so that check applies too and a refusal names its cause. The probe itself
-holds the lock for one `flock -n` call, and it is never made while `run/supervisor.pid` (the
+daemon record <path>`). A held lock keeps the strict identity check above. The lock is probed with
+`flock -n`, or, on a unit without `flock(1)`, with the bridge's own `sdsync-dsm-api --daemon-lock-probe
+<path>` (the same non-blocking `flock`, read-only, released at once; exit `0` free, `3` held, `1` cannot
+probe, with a `daemon-lock-probe: <path>: <cause>` line on stderr). The probe in use is named once
+per change in `controller.log` (`info` `daemon_lock_probe`, `tool=flock` or `tool=daemon-lock-probe
+flock=absent`; the last tool is kept in `run/daemon-lock-probe.tool`) and, for the bridge's, in a
+`note:` line on stderr. Only when neither can run (no `flock(1)` and no executable bridge, or the
+probe fails) is the lock "cannot be told": the strict identity check applies, status reports `2` and
+names why on stderr, and the pre-upgrade and pre-uninstall hooks refuse unless the cause is that no
+tool exists at all (then the records they also check decide, with a warning). The probe itself
+holds the lock for one call, and it is never made while `run/supervisor.pid` (the
 supervisor's own pid, start time and boot id) names a live supervisor: between a daemon's death and
 its respawn nobody holds the lock, and a probe that took it would make the respawning daemon give
 up. Status then reports `2`, the hooks refuse naming `supervisor.pid`, and stop signals that
 supervisor (TERM, then KILL after the grace) even when `daemon.ready` is absent, before it removes
-any record. A `supervisor.pid` naming no live supervisor is a stale record like the others. Stop stops whichever engine's processes are
+any record. A `supervisor.pid` naming no live supervisor is a stale record like the others, but one
+that cannot be read as a record at all -- malformed, unreadable, not a regular file -- is not "no
+supervisor": `run/supervisor.lock`, which the supervisor holds for its whole life, is the second
+witness. Held (or unprobeable beside such a record), a supervisor runs that the record does not
+identify: status reports `2`, the hooks and the shell engine's start refuse, and stop keeps every
+record ("refusing to clean daemon records: ..."), each naming what was wrong with the record and
+that the lock is held. Nothing is signalled on a supervisor only the lock shows; a daemon's own parent
+can still prove it. With the lock free the record is stale, and the removal names why it could not
+be trusted. Stop stops whichever engine's processes are
 present, both after an engine switch made while one was running. Status is `0` when the daemon
 answers `ctl ping` with admission open, `3` with no daemon records, and `1` when records of a daemon
 that is gone remain (named on stderr).
