@@ -1505,7 +1505,7 @@ stop_daemon_engine() {
     daemon_stop_began=$(date +%s 2>/dev/null || true)
     case $daemon_stop_began in ''|*[!0-9]*)
         daemon_stop_began=
-        package_message "warning: the clock cannot be read; each stop phase is charged what it can take against the $daemon_grace s budget (ctl stop its wait, a wait the time it slept), so the stop still ends within it"
+        package_message "warning: the clock cannot be read; each stop phase is charged what it can take against the $daemon_grace s budget (ctl stop its wait, a wait the time it slept), so the stop ends within it plus KILL's 10 s margin"
         ;;
     esac
     # The supervisor is found through its own record first: between a daemon's
@@ -2476,6 +2476,15 @@ case ${1:-} in
         fi
         timeout=${SDSYNC_DSM_STOP_TIMEOUT:-120}
         case $timeout in ''|*[!0-9]*) timeout=120 ;; esac
+        # One budget for every engine: 1 to 120 s, as the daemon engine's stop and
+        # the documentation have it (a larger one outlasts the Package Center).
+        if [ "$timeout" -gt 120 ]; then
+            package_message "SDSYNC_DSM_STOP_TIMEOUT=$timeout is above the 120 s maximum; using 120 s"
+            timeout=120
+        elif [ "$timeout" -lt 1 ]; then
+            package_message "SDSYNC_DSM_STOP_TIMEOUT=$timeout is below the 1 s minimum; using 1 s"
+            timeout=1
+        fi
         # Poll bucket A. The budget and the message the operator sees stay in
         # seconds; only the sampling is finer.
         load_poll_resolution

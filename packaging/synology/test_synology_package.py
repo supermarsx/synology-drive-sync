@@ -14079,6 +14079,8 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
         self.assertIn("the clock cannot be read", stopped.stdout)
         self.assertNotIn("its own share", stopped.stdout, "the message still promises what it does not do")
         self.assertIn("charged", stopped.stdout)
+        # Not "ends within it": KILL's own 10 s wait comes on top, and the message names it.
+        self.assertIn("KILL's 10 s margin", stopped.stdout)
         self.assertIsNotNone(daemon.poll(), "the daemon survived stop")
         self.assertIsNotNone(supervisor.poll(), "the supervisor survived stop")
         self.assertEqual(
@@ -25688,6 +25690,19 @@ fi
             os.kill(core_pid, 0)
         self.assertNotIn("exit=137", " ".join(str(r.get("detail")) for r in self.ctl_runs("slow")), self.ctl_dump())
         self.ctl_assert_stop_was_a_cancellation(env)
+
+    def test_the_shell_engine_stop_budget_is_clamped_to_its_maximum_and_says_so(self) -> None:
+        # S3-19. The docs say the budget is "default and maximum 120 s"; the daemon engine's
+        # stop clamped it but the shell engine's used any number it was given (a 999 s budget
+        # outlasts the Package Center's patience). The stop uses 120 and says why.
+        env, _ = self.ctl_world("c6clamp", 830000)
+        self.ctl_start(env)
+        stopped = self.shell(
+            self.lifecycle, "stop", timeout=90, extra_environment={"SDSYNC_DSM_STOP_TIMEOUT": "999"},
+        )
+        report = stopped.stdout + stopped.stderr + self.ctl_dump()
+        self.assertEqual(stopped.returncode, 0, report)
+        self.assertIn("SDSYNC_DSM_STOP_TIMEOUT=999 is above the 120 s maximum", stopped.stdout + stopped.stderr, report)
 
     def test_a_package_stop_that_outlasts_its_budget_kills_what_is_left_and_says_so(self) -> None:
         # The shell engine's stop waited for the controller up to

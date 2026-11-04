@@ -254,8 +254,12 @@ that is gone remain (named on stderr).
 
 Stop requests cooperative termination of the verified API service, controller, and any verified
 active runner. The lifecycle script validates recorded PIDs and the fixed socket before cleanup,
-waits for shutdown, and refuses to signal an untrusted PID or force-kill after a timeout. Profile,
-secret, routine, and schedule mutations are serialized and refuse to race an active Plan or Run.
+waits for shutdown, and refuses to signal an untrusted PID. The wait is bounded by
+`SDSYNC_DSM_STOP_TIMEOUT` (default and maximum 120 s; a larger value is clamped and named); past
+it the stop kills what is left, by verified identity (the runner and its children, the API service,
+then the controller), logs `service_stop_forced` and says so, instead of exiting `1` with services
+running. Profile, secret, routine, and schedule mutations are serialized and refuse to race an active
+Plan or Run.
 
 ## Upgrade, rollback, and uninstall
 
