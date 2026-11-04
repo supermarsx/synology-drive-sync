@@ -886,6 +886,41 @@ pub(crate) fn remove_run_lock(run_dir: &Path) -> Result<(), WriteError> {
     }
 }
 
+/// Whether the package admits runs: `var/run/service.closed` absent (the
+/// lifecycle closes it while starting, stopping, upgrading) and
+/// `var/run/package.transition` absent (an upgrade or uninstall). A marker
+/// that is not exactly what the lifecycle writes reads closed: never guessed
+/// open.
+pub(crate) fn admission(run_dir: &Path) -> Result<(), String> {
+    let marker = |name: &str, expected: &[&[u8]]| -> Result<Option<String>, String> {
+        let path = run_dir.join(name);
+        match fs::symlink_metadata(&path) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(format!("{}: {error}", path.display())),
+            Ok(metadata) if !metadata.file_type().is_file() => {
+                Err(format!("{} is not a regular file", path.display()))
+            }
+            Ok(_) => match fs::read(&path) {
+                Ok(bytes) if expected.contains(&bytes.as_slice()) => {
+                    Ok(Some(String::from_utf8_lossy(&bytes).trim().to_owned()))
+                }
+                Ok(_) => Err(format!(
+                    "{} does not hold a lifecycle marker",
+                    path.display()
+                )),
+                Err(error) => Err(format!("{}: {error}", path.display())),
+            },
+        }
+    };
+    if let Some(kind) = marker("package.transition", &[b"upgrade\n", b"uninstall\n"])? {
+        return Err(format!("the package {kind} is in progress"));
+    }
+    if marker("service.closed", &[b"closed\n"])?.is_some() {
+        return Err("the package service is stopped or starting; run admission is closed".into());
+    }
+    Ok(())
+}
+
 /// The live owner of a private lock directory (`run.lock`, `management.lock`):
 /// its `pid` file's three lines (pid, start tick, boot id) naming a process
 /// that still runs with that start tick in this boot. A one-line legacy

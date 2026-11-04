@@ -1332,6 +1332,32 @@ fn an_armed_realtime_routine_syncs_its_whole_tree_once_a_period() {
     );
 }
 
+/// No run while service admission is closed: a requested run is refused
+/// with a named code; a routine is deferred, named, and runs once it opens.
+#[test]
+fn runs_wait_for_service_admission() {
+    let h = Harness::new("admission", |home, var| {
+        due_alpha(home, var);
+        fs::write(var.join("run/service.closed"), "closed\n").unwrap();
+    });
+    h.wait_for("the deferral", Duration::from_secs(5), |h| {
+        h.logs()
+            .iter()
+            .any(|l| l.starts_with("run_deferred ") && l.contains("reason=admission_refused"))
+    });
+    let refused = h.ask(run("alpha"));
+    assert_eq!(refused["code"], "admission_closed", "{refused}");
+    assert_eq!(refused["exit"], 75);
+    assert_eq!(h.launched(), 0);
+    fs::remove_file(h.var.join("run/service.closed")).unwrap();
+    // A marker that is not the lifecycle's own reads closed, never open.
+    fs::write(h.var.join("run/package.transition"), "junk\n").unwrap();
+    assert_eq!(h.ask(run("alpha"))["code"], "admission_closed");
+    fs::remove_file(h.var.join("run/package.transition")).unwrap();
+    assert_eq!(h.ask(run("alpha"))["ok"], true);
+    h.wait_for("the run", Duration::from_secs(5), |h| h.launched() >= 1);
+}
+
 /// Every plan and sync gets the verified-pair index directory.
 #[test]
 fn runs_are_given_the_pair_index_directory() {

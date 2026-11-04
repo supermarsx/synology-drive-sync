@@ -1582,6 +1582,13 @@ impl Control {
         } else {
             vec![request.scope.clone()]
         };
+        // No run while the package's service admission is closed (a start
+        // that has not committed, a stop, an upgrade or uninstall), as the
+        // shell runner refused one.
+        if let Err(cause) = super::state::admission(&self.paths.run_dir) {
+            self.defer(request, now, "admission_refused", &cause);
+            return;
+        }
         // A configuration change in flight (management.lock) is never run
         // beside: its commit is several renames, and a run starting between
         // them would read a torn set. Checked again once run.lock is published,
@@ -1757,12 +1764,18 @@ impl Control {
     /// and tried again after the retry floor, as the shell runner's exit 75.
     /// A requested run is not repeated: the operator is told to run it again.
     fn defer_busy(&mut self, request: RunRequest, now: u64, cause: &str) {
+        self.defer(request, now, "lock_busy", cause);
+    }
+
+    /// [`Self::defer_busy`] with the reason named: `lock_busy` or
+    /// `admission_refused` (the package's service admission is closed).
+    fn defer(&mut self, request: RunRequest, now: u64, reason: &'static str, cause: &str) {
         self.log(
             Level::Warn,
             "scheduler",
             "run_deferred",
             format!(
-                "id={} scope={} reason=lock_busy cause={cause}",
+                "id={} scope={} reason={reason} cause={cause}",
                 request.id, request.scope
             ),
         );
@@ -1786,7 +1799,7 @@ impl Control {
                     if let Ok(state) = entry.state.as_mut() {
                         state.state = RoutineRunState::Deferred;
                         state.defer_reason = routines::DeferReason::Busy;
-                        state.last_reason = "lock_busy".into();
+                        state.last_reason = reason.into();
                         state.next_run = now + routines::RETRY_FLOOR_SECONDS;
                     }
                 }
@@ -2485,6 +2498,11 @@ impl Control {
                     .is_file())
         {
             return refusal("scope_not_found", "no profile has that name");
+        }
+        if let Err(cause) = super::state::admission(&self.paths.run_dir) {
+            let mut answer = refusal("admission_closed", &cause);
+            answer["exit"] = json!(75);
+            return answer;
         }
         // Run now is how an operator lifts a lasting block (and if the run is
         // killed again, it records red and blocks again).
