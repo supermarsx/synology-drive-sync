@@ -154,6 +154,13 @@ static NEXT: AtomicU64 = AtomicU64::new(0);
 
 const T0: u64 = 1_780_000_000;
 
+/// How long a test that waits on a real debounce (a second of wall clock) or a real
+/// run waits for it. A wait only costs this long when it is about to fail, and the
+/// control thread of a loaded runner (twelve busy loops beside the whole suite)
+/// has been seen not to log its first line within five seconds: the waits in
+/// `failed_partial_busy_cancelled_runs_keep_the_change_pending` were that flake.
+const PATIENT: Duration = Duration::from_secs(30);
+
 fn grace() -> Duration {
     Duration::from_millis(300)
 }
@@ -487,6 +494,57 @@ fn write_atomic(path: &Path, contents: impl AsRef<[u8]>) {
             path.display()
         )
     });
+}
+
+/// The property the re-arm flake lacked: a reader that opens the path at any moment sees
+/// one whole document, never an empty or half-written file. (With `fs::write`, which
+/// truncates and then writes, the same reader sees both within a few hundred rewrites.)
+#[test]
+fn write_atomic_never_shows_a_reader_a_torn_document() {
+    let dir = std::env::temp_dir().join(format!(
+        "sdsyncd-atomic-{}-{}",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::SeqCst)
+    ));
+    fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("fragment.toml");
+    let documents = [
+        format!("# a\n{}", "a = 1\n".repeat(2000)),
+        format!("# b\n{}", "b = 2\n".repeat(3000)),
+    ];
+    write_atomic(&path, &documents[0]);
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let reader = {
+        let (path, stop, documents) = (path.clone(), Arc::clone(&stop), documents.clone());
+        thread::spawn(move || {
+            let mut torn = Vec::new();
+            let mut reads = 0_u64;
+            while !stop.load(Ordering::SeqCst) {
+                let text = fs::read_to_string(&path)
+                    .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+                reads += 1;
+                if !documents.contains(&text) && torn.len() < 3 {
+                    torn.push(format!(
+                        "{} bytes starting {:?}",
+                        text.len(),
+                        &text[..text.len().min(12)]
+                    ));
+                }
+            }
+            (reads, torn)
+        })
+    };
+    for round in 0..400 {
+        write_atomic(&path, &documents[round % 2]);
+    }
+    stop.store(true, Ordering::SeqCst);
+    let (reads, torn) = reader.join().unwrap();
+    fs::remove_dir_all(&dir).unwrap();
+    assert!(reads > 0, "the reader never ran");
+    assert!(
+        torn.is_empty(),
+        "{reads} reads, torn documents seen: {torn:?}"
+    );
 }
 
 fn run(scope: &str) -> Request {
@@ -846,10 +904,8 @@ fn failed_partial_busy_cancelled_runs_keep_the_change_pending() {
             stop_takes: Duration::ZERO,
         };
         change(&h, "a");
-        h.wait_for("the dispatch", Duration::from_secs(5), |h| {
-            h.launched() == 1
-        });
-        h.wait_for("idle", Duration::from_secs(5), Harness::idle);
+        h.wait_for("the dispatch", PATIENT, |h| h.launched() == 1);
+        h.wait_for("idle", PATIENT, Harness::idle);
         let status = h.ask(Request::Status);
         assert_eq!(
             status["routines"][0]["pending_change"], true,
@@ -864,11 +920,9 @@ fn failed_partial_busy_cancelled_runs_keep_the_change_pending() {
         stop_takes: Duration::ZERO,
     };
     change(&h, "a");
-    h.wait_for("the dispatch", Duration::from_secs(5), |h| {
-        h.launched() == 1
-    });
+    h.wait_for("the dispatch", PATIENT, |h| h.launched() == 1);
     h.ask(Request::Cancel { id: None });
-    h.wait_for("idle", Duration::from_secs(5), Harness::idle);
+    h.wait_for("idle", PATIENT, Harness::idle);
     assert_eq!(
         h.ask(Request::Status)["routines"][0]["pending_change"],
         true
@@ -887,13 +941,9 @@ fn failed_partial_busy_cancelled_runs_keep_the_change_pending() {
         stop_takes: Duration::ZERO,
     };
     change(&h, "a");
-    h.wait_for("the first run", Duration::from_secs(5), |h| {
-        h.launched() == 1
-    });
+    h.wait_for("the first run", PATIENT, |h| h.launched() == 1);
     change(&h, "b");
-    h.wait_for("the second run", Duration::from_secs(8), |h| {
-        h.launched() == 2
-    });
+    h.wait_for("the second run", PATIENT, |h| h.launched() == 2);
     let args = h.world.lock().unwrap().launched[1]
         .args
         .iter()
@@ -1127,14 +1177,14 @@ fn a_no_op_save_keeps_the_block_and_a_real_change_lifts_it() {
     h.wait_for("the hold", Duration::from_secs(5), |h| {
         suppressed_logs(h) == 1
     });
-    fs::write(&fragment, alpha_fragment(&h.root, &[])).unwrap();
+    write_atomic(&fragment, alpha_fragment(&h.root, &[]));
     let _ = h.ask(Request::Reload);
     assert_eq!(
         h.ask(Request::Status)["lasting"]["alpha"]["reason"],
         "core_oom_killed"
     );
     assert!(h.var.join("state/lasting/alpha.state").exists());
-    fs::write(&fragment, alpha_fragment(&h.root, &[("max-delete", "50")])).unwrap();
+    write_atomic(&fragment, alpha_fragment(&h.root, &[("max-delete", "50")]));
     let _ = h.ask(Request::Reload);
     h.wait_for("the run", Duration::from_secs(5), |h| h.launched() == 1);
     assert!(!h.var.join("state/lasting/alpha.state").exists());
@@ -1311,15 +1361,17 @@ fn an_edited_realtime_source_is_rearmed_and_old_events_are_dropped() {
     });
     let first = armed_generation(&h, "docs").unwrap();
     let moved = h.root.join("sysroot/volume2/docs");
-    fs::write(
-        h.root.join("home/config/profiles.d/docs.toml"),
+    // Whole or not at all, as the manager replaces a fragment: the daemon reads it
+    // on its own schedule, and a plain `fs::write` truncates first, so a read in
+    // between parsed a torn fragment (`routine_invalid field=profile_max_delete`).
+    write_atomic(
+        &h.root.join("home/config/profiles.d/docs.toml"),
         fragment(
             &h.root,
             "docs",
             &[("source", &format!("\"{}\"", slashed(&moved)))],
         ),
-    )
-    .unwrap();
+    );
     let _ = h.ask(Request::Reload);
     h.wait_for("re-arm", Duration::from_secs(5), |h| {
         h.changes
