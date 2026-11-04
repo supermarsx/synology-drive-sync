@@ -419,7 +419,10 @@ mod event_lock {
     /// A torn owner record (it does not parse) seen earlier, by identity: one
     /// unchanged for [`TORN_SETTLED`] is stale, as nothing writes `pid` in
     /// place (it is linked in whole).
-    static TORN_SEEN: Mutex<Option<((u64, u64, u64, i64), Instant)>> = Mutex::new(None);
+    static TORN_SEEN: Mutex<Option<(RecordIdentity, Instant)>> = Mutex::new(None);
+
+    /// A record's device, inode, size and mtime.
+    type RecordIdentity = (u64, u64, u64, i64);
     const TORN_SETTLED: Duration = Duration::from_secs(2);
 
     fn boot_epoch() -> Option<i64> {
