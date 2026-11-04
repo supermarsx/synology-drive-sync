@@ -7999,8 +7999,24 @@ fn validate_set_secret_manager_result(value: &Value) -> BridgeResult<()> {
         "has_totp",
         "has_remote_log_token",
     ];
-    if root.len() != EXACT_FIELDS.len()
-        || root.keys().any(|key| !EXACT_FIELDS.contains(&key.as_str()))
+    // One optional member: the warnings a committed save carries (it was saved
+    // while that profile syncs, `applies_next_run`; a `warning:` line the
+    // manager printed; a reload that did not land), held to the same grammar
+    // and bounds as every other result's. Refusing them would turn a committed
+    // save into a 503. Their text cannot carry the secret: the manager's whole
+    // output is refused if it holds it (`parse_manager_result`).
+    let warnings = match root.get("warnings") {
+        None => 0,
+        Some(Value::Array(_)) => {
+            validate_result_warnings(root)?;
+            1
+        }
+        Some(_) => return Err(BridgeError::new(ErrorKind::Unavailable)),
+    };
+    if root.len() != EXACT_FIELDS.len() + warnings
+        || root
+            .keys()
+            .any(|key| !EXACT_FIELDS.contains(&key.as_str()) && key != "warnings")
         || root.get("schema").and_then(Value::as_str) != Some("sdsync.dsm-result.v1")
         || root.get("ok").and_then(Value::as_bool) != Some(true)
         || root.get("message").and_then(Value::as_str) != Some("secret state updated")
@@ -33382,11 +33398,40 @@ mod tests {
         // A future token the shell learns is not a 503.
         let future = entry(json!("audit_reconciliation_pending"), json!("later"));
         assert!(parse_manager_result(&serde_json::to_vec(&future).unwrap(), None).is_ok());
-        // The secret-shaped exact result does not grow the member.
-        let secret = json!({"schema":"sdsync.dsm-result.v1","ok":true,"message":"secret state updated",
+        // The secret-shaped exact result grows only by `warnings`: a committed
+        // save's warnings reach the dashboard, never a 503.
+        let with = |warnings: Value| {
+            json!({"schema":"sdsync.dsm-result.v1","ok":true,"message":"secret state updated",
+                   "has_password":true,"has_totp":false,"has_remote_log_token":false,
+                   "warnings":warnings})
+        };
+        for warnings in [
+            json!([{"code":"manager_warning","message":"warning: the old token file was kept"}]),
+            json!([{"code":"controller_reload_failed","message":"not reloaded"}]),
+            json!([{"code":"manager_warning","message":"warning: kept"},
+                   {"code":"controller_reload_failed","message":"not reloaded"},
+                   {"code":"applies_next_run","message":"takes effect on its next run"}]),
+        ] {
+            validate_set_secret_manager_result(&with(warnings.clone())).unwrap();
+        }
+        // Held to the warnings grammar: not a list, empty, or a bad code is refused.
+        for bad in [
+            json!("text"),
+            json!([]),
+            json!([{"code":"Not A Token","message":"x"}]),
+        ] {
+            assert!(validate_set_secret_manager_result(&with(bad)).is_err());
+        }
+        let during_a_sync = json!({"schema":"sdsync.dsm-result.v1","ok":true,"message":"secret state updated",
                             "has_password":true,"has_totp":false,"has_remote_log_token":false,
-                            "warnings":[{"code":"manager_warning","message":"text"}]});
-        assert!(validate_set_secret_manager_result(&secret).is_err());
+                            "warnings":[{"code":"applies_next_run",
+                                         "message":"profile nightly is syncing now; this change takes effect on its next run"}]});
+        validate_set_secret_manager_result(&during_a_sync).unwrap();
+        let mixed = json!({"schema":"sdsync.dsm-result.v1","ok":true,"message":"secret state updated",
+                            "has_password":true,"has_totp":false,"has_remote_log_token":false,
+                            "warnings":[{"code":"applies_next_run","message":"later"},
+                                        {"code":"manager_warning","message":"text"}]});
+        validate_set_secret_manager_result(&mixed).unwrap();
     }
 
     /// The reader accepts every operation the writer can put on a queued response envelope.
