@@ -12972,6 +12972,7 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
                 state / f"lasting/{name}.state",
                 state / f"cache/pairs/{name}.redb",
                 state / f"cache/pairs/{name}.redb.corrupt-123",
+                state / f"cache/pairs/{name}.redb.panicked",
             ]
 
         for name, source, default in (
@@ -13010,6 +13011,88 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
                 self.assertFalse(path.exists(), path)
         for path in leftovers("kept"):
             self.assertTrue(path.is_file(), path)
+
+    def _profile_with_a_long_name(self, name: str, source: Path, default: bool) -> None:
+        """A profile named over 64 characters. New names are capped at 64 (valid_new_name),
+        so one that long can only be a fragment an older package wrote: configure a short
+        profile and rename its fragment."""
+        short = "zzlongsource"
+        configured = self.configure(short, source, f"/home/Drive/{short}", default)
+        self.assertEqual(configured.returncode, 0, configured.stdout + configured.stderr)
+        profiles = self.real_home / "config/profiles.d"
+        text = (profiles / f"{short}.toml").read_text(encoding="utf-8").replace(short, name)
+        (profiles / f"{short}.toml").unlink()
+        renamed = profiles / f"{name}.toml"
+        renamed.write_text(text, encoding="utf-8")
+        renamed.chmod(0o600)
+        if os.getuid() == 0:
+            os.chown(renamed, self.drop_uid, self.drop_gid)
+        if default:
+            default_file = self.real_home / "config/default-profile"
+            if default_file.exists():
+                default_file.write_text(f"{name}\n", encoding="utf-8")
+
+    def test_remove_profile_removes_the_hashed_index_files_of_a_long_name(self) -> None:
+        # A name over 64 characters names its pair index by a stem: its first 48
+        # characters, a dash and the first 16 hex digits of the SHA-256 of the
+        # whole name (src/pair_index_redb.rs file_stem). Removal must remove
+        # exactly that stem's files, and never a second long profile's that
+        # shares the 48-character prefix.
+        state = self.real_var / "state"
+        pairs = state / "cache/pairs"
+        pairs.mkdir(parents=True, exist_ok=True, mode=0o700)
+        gone_name = "p" * 70
+        other_name = "p" * 69 + "q"
+        stems = {gone_name: "p" * 48 + "-d79ad4b575f328af", other_name: "p" * 48 + "-5b37311183a27028"}
+
+        def index_files(name: str) -> list[Path]:
+            stem = stems[name]
+            return [
+                pairs / f"{stem}.redb",
+                pairs / f"{stem}.redb.corrupt-123",
+                pairs / f"{stem}.redb.panicked",
+            ]
+
+        for name, source in ((gone_name, self.source_one), (other_name, self.source_two)):
+            self._profile_with_a_long_name(name, source, name == gone_name)
+            for path in index_files(name):
+                path.write_text("state\n", encoding="utf-8")
+                path.chmod(0o600)
+        # The raw-name file is not this profile's index file name and stays.
+        raw = pairs / f"{gone_name}.redb"
+        raw.write_text("not an index file name\n", encoding="utf-8")
+        raw.chmod(0o600)
+        removed = self.shell(self.manager, "remove-profile", gone_name)
+        self.assertEqual(removed.returncode, 0, removed.stdout + removed.stderr)
+        self.assertNotIn("warning:", removed.stderr)
+        for path in index_files(gone_name):
+            self.assertFalse(path.exists(), path)
+        for path in index_files(other_name) + [raw]:
+            self.assertTrue(path.is_file(), path)
+
+    def test_remove_profile_names_an_index_it_cannot_locate_without_sha256sum(self) -> None:
+        # No stem without a digest, and no glob on the 48-character prefix
+        # (it could match another long profile's index): the warning names the
+        # profile, the directory and the cause, and the profile is still removed.
+        pairs = self.real_var / "state/cache/pairs"
+        pairs.mkdir(parents=True, exist_ok=True, mode=0o700)
+        name = "r" * 70
+        self._profile_with_a_long_name(name, self.source_one, True)
+        farm = self.root / "no-sha256sum-bin"
+        farm.mkdir(mode=0o700)
+        for directory in ("/usr/local/sbin", "/usr/local/bin", "/usr/sbin", "/usr/bin", "/sbin", "/bin"):
+            for entry in Path(directory).iterdir():
+                if entry.name != "sha256sum" and not (farm / entry.name).exists():
+                    (farm / entry.name).symlink_to(entry)
+        result = self.shell(
+            self.manager, "remove-profile", name,
+            extra_environment={"PATH": f"{self.fake_system_bin}:{farm}"},
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("warning:", result.stderr)
+        self.assertIn(str(self.fhs / "var/state/cache/pairs"), result.stderr)
+        self.assertIn("sha256sum is not available", result.stderr)
+        self.assertFalse((self.real_home / f"config/profiles.d/{name}.toml").exists())
 
     def test_runner_refuses_while_package_configuration_is_being_changed(self) -> None:
         # The run side of the two-lock exclusion: a save holds management.lock

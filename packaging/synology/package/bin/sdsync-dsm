@@ -1393,16 +1393,55 @@ configure_profile() {
     echo "next: set its password, run doctor, review plan, then enable the schedule"
 }
 
+# The pair index is named by a stem (src/pair_index_redb.rs file_stem): the
+# profile name itself up to 64 characters, longer ones their first 48 characters,
+# a dash and the first 16 hex digits of the SHA-256 of the whole name. A profile
+# name is [A-Za-z0-9_-], so characters and bytes agree. Sets pair_index_stem_value,
+# or returns 1 with pair_index_stem_cause; never a glob on the prefix, which
+# could match another long profile's index.
+pair_index_stem() {
+    pair_index_stem_value=
+    pair_index_stem_cause=
+    stem_name=$1
+    if [ "${#stem_name}" -le 64 ]; then
+        pair_index_stem_value=$stem_name
+        return 0
+    fi
+    command -v sha256sum >/dev/null 2>&1 || {
+        pair_index_stem_cause="sha256sum is not available"
+        return 1
+    }
+    stem_hash=$(printf '%s' "$stem_name" | sha256sum 2>/dev/null) || {
+        pair_index_stem_cause="sha256sum failed"
+        return 1
+    }
+    stem_hash=$(printf '%s' "$stem_hash" | cut -c1-16)
+    case $stem_hash in ''|*[!0-9a-f]*)
+        pair_index_stem_cause="sha256sum printed no digest"
+        return 1
+        ;;
+    esac
+    stem_prefix=$(printf '%s' "$stem_name" | cut -c1-48)
+    pair_index_stem_value=$stem_prefix-$stem_hash
+}
+
 # State the profile's own runs left beside its configuration: the alert counter
 # (never removed before, so a profile recreated under the name inherited its
-# failure streak), the verified-pair index and its quarantined copies, and the
-# daemon's lasting condition. The configuration is already gone by now, so one
-# that cannot be removed does not undo the removal: it is named with its path
-# and cause as a warning, which `api` returns as the result's warning.
+# failure streak), the verified-pair index, its quarantined copies and its panic
+# record (by the stem above), and the daemon's lasting condition. The
+# configuration is already gone by now, so one that cannot be removed does not
+# undo the removal: it is named with its path and cause as a warning, which
+# `api` returns as the result's warning.
 remove_profile_leftovers() {
     leftover_profile=$1
-    set -- "$state_root/alerts-$leftover_profile.state" "$state_root/lasting/$leftover_profile.state" \
-        "$cache_root/pairs/$leftover_profile.redb" "$cache_root/pairs/$leftover_profile.redb.corrupt-"*
+    set -- "$state_root/alerts-$leftover_profile.state" "$state_root/lasting/$leftover_profile.state"
+    if pair_index_stem "$leftover_profile"; then
+        set -- "$@" "$cache_root/pairs/$pair_index_stem_value.redb" \
+            "$cache_root/pairs/$pair_index_stem_value.redb.corrupt-"* \
+            "$cache_root/pairs/$pair_index_stem_value.redb.panicked"
+    else
+        echo "warning: the pair index files of profile $leftover_profile in $cache_root/pairs were not removed: $pair_index_stem_cause" >&2
+    fi
     for leftover_path in "$@"; do
         [ -e "$leftover_path" ] || [ -L "$leftover_path" ] || continue
         leftover_parent=${leftover_path%/*}
