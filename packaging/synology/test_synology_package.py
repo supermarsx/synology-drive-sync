@@ -423,9 +423,38 @@ class BuilderTests(unittest.TestCase):
                 current.append(header.group(2))
             elif current is not None:
                 current.append(line)
+        # Each of these opens the audited path in begin_admitted: begin_mutation
+        # with the management lock, begin_operation without it (Doctor, a resync
+        # plan), and forward_run_to_daemon through begin_operation (plan and run
+        # under the daemon engine).
+        begins = ("begin_mutation", "begin_operation", "forward_run_to_daemon")
         dispatched_with_begin = {
-            name for name, body in arms.items() if any("begin_mutation" in part for part in body)
+            name
+            for name, body in arms.items()
+            if any(begin in part for part in body for begin in begins)
         }
+        # No helper is accepted on its name alone: each must reach the one
+        # mandatory audit step, audit_outbox_begin in begin_admitted.
+        def body(function: str) -> str:
+            header = f"\n{function}() {{\n"
+            self.assertEqual(source.count(header), 1, function)
+            return source.split(header, 1)[1].split("\n}\n", 1)[0]
+
+        self.assertIn(
+            'audit_outbox_begin "$direct_audit_operation" "$direct_audit_profile"',
+            body("begin_admitted"),
+        )
+        reaches_audit = {"begin_admitted"}
+        for helper, calls in (
+            ("begin_mutation", "begin_admitted"),
+            ("begin_operation", "begin_admitted"),
+            ("forward_run_to_daemon", "begin_operation"),
+        ):
+            helper_body = body(helper)
+            self.assertIn(f'    {calls} "$@"\n', helper_body + "\n", helper)
+            self.assertIn(calls, reaches_audit, helper)
+            reaches_audit.add(helper)
+        self.assertEqual(set(begins) - reaches_audit, set())
 
         marker = "    mutation_commit_started=false\n    case ${command_name:-} in\n"
         self.assertEqual(source.count(marker), 1)
