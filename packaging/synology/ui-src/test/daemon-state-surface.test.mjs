@@ -80,7 +80,9 @@ const ISSUES = {
   "pair-index-locked": /another process|in use|locked/i,
   "pair-index-readonly": /read-only/i,
   "pair-index-store-failed": /could not be saved/i,
-  "pair-index-unsafe": /ownership or mode/i,
+  // S3-21: the code is also named for a panic record or a file that could not be examined at all,
+  // so the copy must not claim only an ownership or mode check.
+  "pair-index-unsafe": /could not be examined or failed its safety check/i,
   "pair-index-directory-unusable": /folder/i,
   "pair-index-unbound": /different/i,
   "pair-index-format-unsupported": /version|format/i,
@@ -88,7 +90,8 @@ const ISSUES = {
   "pair-index-writeback-unknown": /writeback setting could not be read/i,
   "pair-index-writeback-unbounded": /writeback is switched off/i,
   "pair-index-nas-clock-skewed": /clock .*more than 20 seconds/i,
-  "pair-index-cleanup-failed": /could not be removed/i,
+  // S3-21: also named for a crash record, a listing and an unreadable age, not only a copy that stays.
+  "pair-index-cleanup-failed": /could not be cleaned up/i,
   "pair-index-remote-ctime-static": /change time/i
 };
 
@@ -105,7 +108,7 @@ for (const [issue, words] of Object.entries(ISSUES)) {
 }
 
 test("info-level index codes never produce an item", () => {
-  for (const issue of ["pair-index-retired", "pair-index-not-applicable", "pair-index-unsupported-platform", "pair-index-plan-clock-unbounded"]) {
+  for (const issue of ["pair-index-retired", "pair-index-not-applicable", "pair-index-unsupported-platform", "pair-index-plan-clock-unbounded", "pair-index-compaction-failed", "pair-index-link-guard-unchecked"]) {
     assert.deepEqual(indexItems(withIndex({ issue })), [], issue);
   }
 });
@@ -122,6 +125,16 @@ test("a retired index explains itself in the status line, with the detail, and r
   assert.match(indexLine(normalizeOutcomes(withIndex({ state: "warm", issue: "pair-index-plan-clock-unbounded" })).profiles[0].index), /checked live again because the destination's clock is more than 20 seconds/);
   // A warning-level issue is an item, not a line note.
   assert.doesNotMatch(indexLine(normalizeOutcomes(withIndex({ issue: "pair-index-corrupt" })).profiles[0].index), /corrupt|damaged/);
+});
+
+test("the two info notes a run can name beyond the first four explain themselves in the status line, never as an unknown code", () => {
+  // S3-21: both were missing, so a published one read as an amber "unknown index issue".
+  const compaction = indexLine(normalizeOutcomes(withIndex({ state: "warm", issue: "pair-index-compaction-failed", issue_detail: "/p/photos.redb: disk full" })).profiles[0].index);
+  assert.match(compaction, /could not be compacted/);
+  assert.match(compaction, /photos\.redb: disk full/);
+  const guard = indexLine(normalizeOutcomes(withIndex({ state: "warm", issue: "pair-index-link-guard-unchecked" })).profiles[0].index);
+  assert.match(guard, /without a real path/);
+  for (const line of [compaction, guard]) assert.doesNotMatch(line, /unknown/);
 });
 
 test("an index issue code this UI has never heard of is amber and names the code", () => {

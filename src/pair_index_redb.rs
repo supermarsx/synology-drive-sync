@@ -550,7 +550,10 @@ fn sweep_quarantine_with(
         let entry = match entry {
             Ok(entry) => entry,
             Err(error) => {
-                failures.add(directory, format!("an entry could not be read: {error}"));
+                failures.add(
+                    directory,
+                    format!("an entry could not be read for the weekly sweep: {error}"),
+                );
                 continue;
             }
         };
@@ -568,7 +571,9 @@ fn sweep_quarantine_with(
                 // Left alone, and named: a copy whose age is unknowable is one that piles up.
                 failures.add(
                     &entry.path(),
-                    format!("its age could not be read for the weekly sweep: {error}"),
+                    format!(
+                        "a quarantined copy's age could not be read for the weekly sweep, so it was left alone: {error}"
+                    ),
                 );
                 continue;
             }
@@ -578,13 +583,18 @@ fn sweep_quarantine_with(
             .duration_since(modified)
             .is_ok_and(|age| age > QUARANTINE_AGE);
         if old && let Err(error) = fs::remove_file(entry.path()) {
-            failures.add(&entry.path(), error.to_string());
+            failures.add(
+                &entry.path(),
+                format!("a quarantined copy older than 7 days could not be removed: {error}"),
+            );
         }
     }
-    failures.issue("a quarantined copy older than 7 days could not be removed")
+    failures.issue()
 }
 
-/// Removals that failed, named once: the first path and cause, and how many more.
+/// Cleanup steps that failed, named once: the first path and its whole sentence, and how many
+/// more. Each failure carries its own complete sentence, because one summary cannot be true of
+/// every kind of failure (an unreadable age is not a copy "older than 7 days").
 #[derive(Default)]
 struct Failures {
     first: Option<(PathBuf, String)>,
@@ -592,15 +602,15 @@ struct Failures {
 }
 
 impl Failures {
-    fn add(&mut self, path: &Path, cause: String) {
+    fn add(&mut self, path: &Path, sentence: String) {
         self.count += 1;
         if self.first.is_none() {
-            self.first = Some((path.to_path_buf(), cause));
+            self.first = Some((path.to_path_buf(), sentence));
         }
     }
 
-    fn issue(self, what: &str) -> Option<IndexIssue> {
-        let (path, cause) = self.first?;
+    fn issue(self) -> Option<IndexIssue> {
+        let (path, sentence) = self.first?;
         let more = match self.count {
             1 => String::new(),
             count => format!(" ({} more failed the same way or another)", count - 1),
@@ -608,7 +618,7 @@ impl Failures {
         Some(IndexIssue::warning(
             "pair-index-cleanup-failed",
             path.display().to_string(),
-            format!("{what}: {cause}{more}"),
+            format!("{sentence}{more}"),
         ))
     }
 }
@@ -697,24 +707,29 @@ fn quarantine(paths: &IndexPaths) -> Result<Quarantined, String> {
                             .is_some_and(|name| name.starts_with(&prefix)) =>
                     {
                         if let Err(error) = fs::remove_file(entry.path()) {
-                            failures.add(&entry.path(), error.to_string());
+                            failures.add(
+                                &entry.path(),
+                                format!("an earlier quarantined copy could not be removed: {error}"),
+                            );
                         }
                     }
                     Ok(_) => {}
                     Err(error) => failures.add(
                         &paths.directory,
-                        format!("an entry could not be read: {error}"),
+                        format!(
+                            "an entry could not be read, so earlier quarantined copies may not all have been removed: {error}"
+                        ),
                     ),
                 }
             }
         }
         Err(error) => failures.add(
             &paths.directory,
-            format!("earlier copies could not be listed: {error}"),
+            format!("earlier quarantined copies could not be listed, so none was removed: {error}"),
         ),
     }
     let stuck = failures.count;
-    let cleanup = failures.issue("an earlier quarantined copy could not be removed");
+    let cleanup = failures.issue();
     let kept = if stuck >= MAX_STUCK_COPIES {
         // Copies that cannot be removed would pile up, one per damaged file: past the bound the
         // damaged file is deleted instead of kept, and the cleanup failure says why.
@@ -1729,6 +1744,39 @@ mod tests {
         assert!(issue.path.contains("photos.redb.corrupt-"), "{issue:?}");
         assert!(issue.cause.contains("denied by the test"), "{issue:?}");
         assert!(copy.exists(), "an unexaminable copy is left alone");
+        fs::remove_dir_all(&directory).unwrap();
+    }
+
+    /// S3-21: one summary was put in front of every failure the weekly sweep names, so a
+    /// copy whose age could not be read was reported as "a quarantined copy older than 7 days
+    /// could not be removed: its age could not be read": a claim of its age and of its
+    /// unknowability in one breath. Each failure now carries a sentence that is true of it.
+    #[test]
+    fn a_sweep_failure_is_never_described_by_another_failures_sentence() {
+        let directory = scratch("sweep-words");
+        // A directory named like a copy: `remove_file` cannot remove it.
+        fs::create_dir(directory.join("photos.redb.corrupt-1")).unwrap();
+        let old = SystemTime::now() - Duration::from_secs(8 * 86_400);
+        let removal = sweep_quarantine_with(&directory, |_| Ok(old)).expect("the failure is named");
+        assert!(
+            removal.cause.contains("older than 7 days")
+                && removal.cause.contains("could not be removed"),
+            "{removal:?}"
+        );
+        let unknown = sweep_quarantine_with(&directory, |_| {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "denied by the test",
+            ))
+        })
+        .expect("the failure is named");
+        assert!(
+            unknown.cause.contains("age could not be read")
+                && unknown.cause.contains("left alone")
+                && !unknown.cause.contains("older than 7 days")
+                && !unknown.cause.contains("could not be removed"),
+            "an unreadable age is described as an unreadable age: {unknown:?}"
+        );
         fs::remove_dir_all(&directory).unwrap();
     }
 

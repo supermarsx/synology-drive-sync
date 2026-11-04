@@ -297,8 +297,9 @@ pub(crate) struct IndexFacts {
     pub(crate) canary_mismatches: u64,
     /// The most serious issue the run named (`pair-index-corrupt`, ...), with
     /// its path and cause on one line. Of the info-level notes only
-    /// `pair-index-retired` and `pair-index-plan-clock-unbounded` are kept, when
-    /// nothing worse was named.
+    /// `pair-index-retired`, `pair-index-plan-clock-unbounded`,
+    /// `pair-index-compaction-failed` and `pair-index-link-guard-unchecked` are
+    /// kept, when nothing worse was named.
     pub(crate) issue: Option<String>,
     pub(crate) issue_detail: Option<String>,
 }
@@ -320,7 +321,10 @@ impl IndexFacts {
             "info"
                 if matches!(
                     code,
-                    "pair-index-retired" | "pair-index-plan-clock-unbounded"
+                    "pair-index-retired"
+                        | "pair-index-plan-clock-unbounded"
+                        | "pair-index-compaction-failed"
+                        | "pair-index-link-guard-unchecked"
                 ) =>
             {
                 1
@@ -2016,6 +2020,34 @@ mod tests {
                 facts.issue_detail.as_deref(),
                 Some(": 3 pairs were not carried")
             );
+            // S3-21: the other two info notes a run can name were dropped on the way
+            // to the dashboard (no rank), so the line never said the index was not
+            // served this run, or that its compaction failed. Each is kept when
+            // nothing worse is named, and a warning still outranks it.
+            for code in [
+                "pair-index-compaction-failed",
+                "pair-index-link-guard-unchecked",
+            ] {
+                let facts = IndexFacts::from_value(&json!({
+                    "state": "warm",
+                    "entries": 10,
+                    "issues": [
+                        {"code": code, "severity": "info", "path": "/volume1/photos", "cause": "named"}
+                    ]
+                }))
+                .expect("the record reads");
+                assert_eq!(facts.issue.as_deref(), Some(code), "{code}: kept as a note");
+                let worse = IndexFacts::from_value(&json!({
+                    "state": "warm",
+                    "entries": 10,
+                    "issues": [
+                        {"code": code, "severity": "info", "path": "", "cause": ""},
+                        {"code": "pair-index-corrupt", "severity": "warning", "path": "", "cause": ""}
+                    ]
+                }))
+                .expect("the record reads");
+                assert_eq!(worse.issue.as_deref(), Some("pair-index-corrupt"), "{code}");
+            }
             profile.facts.index = None;
             tree.private(
                 "var/state/profiles/photos.state",
