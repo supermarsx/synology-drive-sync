@@ -406,6 +406,45 @@ fn two_runs_never_overlap_across_routine_dashboard_and_cli() {
     assert!(argv.iter().all(|a| a.starts_with("--config ")));
 }
 
+/// H6: the core publishes its progress record and the watchdog reads it:
+/// network IO does not move rchar/wchar, so I/O counters alone call a busy
+/// upload stalled.
+#[test]
+fn runs_publish_a_progress_record_the_watchdog_reads() {
+    let h = Harness::new("progress", |home, _| profile(home, "alpha"));
+    assert_eq!(h.ask(run("alpha"))["ok"], true);
+    h.wait_for("the run", Duration::from_secs(5), |h| h.launched() == 1);
+    let world = h.world.lock().unwrap();
+    let spec = &world.launched[0];
+    let record = spec
+        .progress_record
+        .clone()
+        .expect("a progress record for the watchdog");
+    let args: Vec<String> = spec
+        .args
+        .iter()
+        .map(|a| a.to_string_lossy().into_owned())
+        .collect();
+    let at = args
+        .iter()
+        .position(|a| a == "--progress-record")
+        .expect("the core is told where to write it");
+    assert_eq!(args[at + 1], record.display().to_string());
+    // The core's own naming rule: <request id>.<job id>.json, lowercase hex.
+    let name = record.file_name().unwrap().to_string_lossy().into_owned();
+    let stem = name.strip_suffix(".json").unwrap();
+    let (request, job) = stem.split_once('.').unwrap();
+    for part in [request, job] {
+        assert!(
+            !part.is_empty()
+                && part
+                    .bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)),
+            "{name}"
+        );
+    }
+}
+
 /// The hang fix: status answers in under a second and a mutation completes in
 /// under two while a run is in flight; only removing the running profile is
 /// refused (R6).

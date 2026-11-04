@@ -1717,12 +1717,15 @@ impl Control {
         request: &RunRequest,
         profiles: &[String],
         result_record: &Path,
+        progress_record: &Path,
     ) -> Vec<std::ffi::OsString> {
         let mut args: Vec<std::ffi::OsString> = vec![
             "--config".into(),
             self.paths.config_file.clone().into(),
             "--result-record".into(),
             result_record.into(),
+            "--progress-record".into(),
+            progress_record.into(),
             "--output".into(),
             "ndjson".into(),
             request.action.as_str().into(),
@@ -1858,9 +1861,18 @@ impl Control {
             .run_dir
             .join(format!("core-result.{}", request.id));
         let _ = fs::remove_file(&result_record);
+        // H6: the core's progress record is what the watchdog sees move while
+        // the core talks to the network (rchar/wchar do not count sockets).
+        // Named by the core's own rule: <request id>.<job id>.json, hex.
+        let progress_record = self.paths.run_dir.join(format!(
+            "{:032x}.{:016x}.json",
+            u128::from(self.pid),
+            request.id
+        ));
+        let _ = fs::remove_file(&progress_record);
         let spec = RunSpec {
             program: self.paths.core_binary.clone(),
-            args: self.core_args(&request, &profiles, &result_record),
+            args: self.core_args(&request, &profiles, &result_record, &progress_record),
             env: self.settings.child_env.clone(),
             nice: match self.settings.core_nice {
                 Some(nice) => Some(nice),
@@ -1872,7 +1884,7 @@ impl Control {
                 }
             },
             result_record: Some(result_record),
-            progress_record: None,
+            progress_record: Some(progress_record),
             timings: self.settings.timings,
             preflight: self.preflight(&request, &profiles),
             audit: Some(super::executor::AuditStep {

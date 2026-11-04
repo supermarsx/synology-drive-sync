@@ -636,7 +636,7 @@ mod tests {
         // 0600 and refused: stale too.
         drop(activate(&socket));
         keeper.clear_stale_socket();
-        assert!(!socket.exists());
+        assert!(!socket.exists(), "{:?}", events.lock().unwrap());
         // 0000 while api.pid names a live shell-engine server: kept, named.
         drop(UnixListener::bind(&socket).unwrap());
         fs::set_permissions(&socket, fs::Permissions::from_mode(0o000)).unwrap();
