@@ -1212,6 +1212,11 @@ const QUEUED_FAILURE_COPY = Object.freeze({
     title: "Queued operation reported nothing",
     cause: "The worker exited cleanly but wrote no result, so how far it got cannot be established from the queue.",
     next: "Treat this operation as unconfirmed. Review Activity and the current state before submitting it again."
+  }),
+  audit_unavailable: Object.freeze({
+    title: "Queued operation was refused: the audit log is unavailable",
+    cause: "The package could not reconcile its audit log, so it did not start this operation rather than run it unrecorded.",
+    next: "Nothing ran and nothing was changed. Review Logs for audit_reconcile_failed and its cause, then submit the request again once it has recovered."
   })
 });
 

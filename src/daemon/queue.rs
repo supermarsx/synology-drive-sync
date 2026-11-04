@@ -41,6 +41,10 @@ use super::sys;
 /// Where the consumer's events go: level, event name, detail.
 pub(crate) type QueueLog = Arc<dyn Fn(Level, &'static str, String) + Send + Sync>;
 
+/// Where the consumer's Activity rows go (what the dashboard shows): code,
+/// level, message. Profile `none`, category `bridge`, state `failed`.
+pub(crate) type QueueActivity = Arc<dyn Fn(&'static str, Level, String) + Send + Sync>;
+
 /// A job's class, as the bridge's classifier names it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) enum Lane {
@@ -98,6 +102,14 @@ pub(crate) struct QueueSettings {
     pub(crate) claim_max_age: u64,
     pub(crate) response_max_age: u64,
     pub(crate) max_responses: usize,
+    /// How long the audit reconcile may keep failing before waiting jobs are
+    /// answered `audit_unavailable` (they never ran).
+    pub(crate) audit_unavailable_after: Duration,
+    /// The longest wait between two reconcile attempts while it fails.
+    pub(crate) reconcile_backoff_max: Duration,
+    /// After KILL, how long a consumer may take to be reaped before its slot
+    /// is freed and it is handed to a reaper.
+    pub(crate) reap_bound: Duration,
 }
 
 impl Default for QueueSettings {
@@ -113,6 +125,9 @@ impl Default for QueueSettings {
             claim_max_age: 3_600,
             response_max_age: 3_600,
             max_responses: 256,
+            audit_unavailable_after: Duration::from_secs(30),
+            reconcile_backoff_max: Duration::from_secs(60),
+            reap_bound: Duration::from_secs(10),
         }
     }
 }
@@ -131,6 +146,7 @@ impl QueueConsumer {
         env: Vec<(OsString, OsString)>,
         settings: QueueSettings,
         log: QueueLog,
+        activity: QueueActivity,
     ) -> std::io::Result<Self> {
         let stop = Arc::new(AtomicBool::new(false));
         let consumer = Consumer {
@@ -139,9 +155,11 @@ impl QueueConsumer {
             env,
             settings,
             log,
+            activity,
             stop: Arc::clone(&stop),
             running: BTreeMap::new(),
             last_reconcile: None,
+            reconcile: ReconcileEpisode::default(),
             classified: BTreeMap::new(),
             reported: std::collections::BTreeSet::new(),
         };
@@ -165,14 +183,29 @@ impl QueueConsumer {
     }
 }
 
+/// A failing audit reconcile: since when, how many tries, the next one.
+#[derive(Default)]
+struct ReconcileEpisode {
+    failing_since: Option<Instant>,
+    attempts: u32,
+    next_try: Option<Instant>,
+    cause: String,
+}
+
 struct Running {
     id: String,
     lane: Lane,
     operation: String,
-    child: Child,
+    /// `None` once handed to a reaper (it outlived KILL).
+    child: Option<Child>,
+    pid: u32,
+    /// The consumer's stderr, which the shell kept in controller.log (S2-1).
+    stderr: Option<sys::Tail>,
     started: Instant,
     deadline: Duration,
     stopping: Option<Instant>,
+    /// When KILL was first sent.
+    killed: Option<Instant>,
     processing: PathBuf,
     secret: PathBuf,
     response: PathBuf,
@@ -185,9 +218,12 @@ struct Consumer {
     env: Vec<(OsString, OsString)>,
     settings: QueueSettings,
     log: QueueLog,
+    activity: QueueActivity,
     stop: Arc<AtomicBool>,
     running: BTreeMap<String, Running>,
     last_reconcile: Option<Instant>,
+    /// The audit reconcile's failure episode (H2).
+    reconcile: ReconcileEpisode,
     /// Each waiting job is classified once, not every tick.
     classified: BTreeMap<String, Classified>,
     /// Files named once as unusable (a rejected request, a collision).
@@ -249,14 +285,23 @@ impl Consumer {
     }
 
     /// A short helper child, bounded: its exit code and stdout, or why not.
+    /// A non-zero exit carries the helper's last stderr line (S2-1).
     fn helper(&self, arguments: &[OsString]) -> Result<(i32, String), String> {
         let mut child = self
             .command(arguments)
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
+            .stderr(Stdio::piped())
             .spawn()
             .map_err(|error| format!("{}: {error}", self.bridge.display()))?;
+        let stderr = sys::Tail::start(child.stderr.take(), 4096);
         let started = Instant::now();
+        let said = |stderr: sys::Tail| {
+            stderr
+                .lines(1, Duration::from_millis(200))
+                .pop()
+                .map(|line| format!(" stderr={line}"))
+                .unwrap_or_default()
+        };
         loop {
             match child.try_wait() {
                 Ok(Some(status)) => {
@@ -268,44 +313,108 @@ impl Consumer {
                         .code()
                         .or_else(|| status.signal().map(|n| 128 + n))
                         .unwrap_or(-1);
+                    if code != 0 {
+                        // The exit and the helper's own words, for the caller's log line.
+                        return Ok((code, format!("{out}{}", said(stderr))));
+                    }
                     return Ok((code, out));
                 }
                 Ok(None) => {}
-                Err(error) => return Err(format!("wait failed: {error}")),
+                Err(error) => {
+                    let _ = sys::kill_group(child.id(), libc::SIGKILL);
+                    if !sys::reap_within(&mut child, Duration::from_secs(5)) {
+                        sys::abandon_to_reaper(child);
+                    }
+                    return Err(format!("wait failed: {error}"));
+                }
             }
             if started.elapsed() >= self.settings.helper_deadline {
                 let _ = sys::kill_group(child.id(), libc::SIGKILL);
-                let _ = child.wait();
+                // H3: never an unbounded wait after the KILL.
+                let reaped = sys::reap_within(&mut child, Duration::from_secs(5));
+                let pid = child.id();
+                let handed = if reaped {
+                    "reaped"
+                } else {
+                    sys::abandon_to_reaper(child)
+                };
                 return Err(format!(
-                    "no answer within {} s",
-                    self.settings.helper_deadline.as_secs()
+                    "no answer within {} s (pid={pid} {handed}){}",
+                    self.settings.helper_deadline.as_secs(),
+                    said(stderr)
                 ));
             }
             thread::sleep(Duration::from_millis(20));
         }
     }
 
+    /// Reconcile the audit outbox. A failure opens an episode: named once
+    /// (controller.log and an Activity row the dashboard shows), tried again
+    /// after a backoff that doubles to `reconcile_backoff_max`, and its
+    /// recovery is named too (H2). `false` while it fails or waits to retry.
     fn reconcile_audit(&mut self) -> bool {
-        self.last_reconcile = Some(Instant::now());
-        match self.helper(&["--audit-transaction".into(), "reconcile".into()]) {
-            Ok((0, _)) => true,
-            Ok((code, _)) => {
-                self.log(
-                    Level::Error,
-                    "audit_reconcile_failed",
-                    format!("phase=queue_turn exit={code}"),
-                );
-                false
-            }
-            Err(cause) => {
-                self.log(
-                    Level::Error,
-                    "audit_reconcile_failed",
-                    format!("phase=queue_turn cause={cause}"),
-                );
-                false
-            }
+        let now = Instant::now();
+        if self.reconcile.next_try.is_some_and(|at| now < at) {
+            return false;
         }
+        self.last_reconcile = Some(now);
+        let failure = match self.helper(&["--audit-transaction".into(), "reconcile".into()]) {
+            Ok((0, _)) => None,
+            Ok((code, said)) => Some(format!("exit={code}{}", said.trim_end())),
+            Err(cause) => Some(format!("cause={cause}")),
+        };
+        let Some(cause) = failure else {
+            if let Some(since) = self.reconcile.failing_since.take() {
+                self.log(
+                    Level::Info,
+                    "audit_reconcile_recovered",
+                    format!(
+                        "phase=queue_turn attempts={} failing_seconds={}",
+                        self.reconcile.attempts,
+                        since.elapsed().as_secs()
+                    ),
+                );
+            }
+            self.reconcile = ReconcileEpisode::default();
+            return true;
+        };
+        let cause = cause.replace(['\n', '\r'], " ");
+        self.reconcile.attempts += 1;
+        let backoff = Duration::from_secs(1)
+            .saturating_mul(1 << self.reconcile.attempts.saturating_sub(1).min(16))
+            .min(self.settings.reconcile_backoff_max);
+        self.reconcile.next_try = Some(now + backoff);
+        if self.reconcile.failing_since.is_none() {
+            self.reconcile.failing_since = Some(now);
+            self.log(
+                Level::Error,
+                "audit_reconcile_failed",
+                format!(
+                    "phase=queue_turn {cause} retry_seconds={} unavailable_after_seconds={}",
+                    backoff.as_secs(),
+                    self.settings.audit_unavailable_after.as_secs()
+                ),
+            );
+            (self.activity)(
+                "bridge.failed",
+                Level::Error,
+                format!(
+                    "The package audit log could not be reconciled ({cause}); dashboard operations \
+                     wait for it and are refused after {} s if it does not recover. Review Logs.",
+                    self.settings.audit_unavailable_after.as_secs()
+                ),
+            );
+        }
+        self.reconcile.cause = cause;
+        false
+    }
+
+    /// Whether the reconcile has failed for longer than the bound: waiting
+    /// jobs are then answered rather than held.
+    fn audit_unavailable(&self) -> bool {
+        self.reconcile
+            .failing_since
+            .is_some_and(|since| since.elapsed() >= self.settings.audit_unavailable_after)
     }
 
     fn run(mut self) {
@@ -463,7 +572,32 @@ impl Consumer {
             // per pass, as the shell did at the top of every queue turn.
             if !reconciled {
                 if !self.reconcile_audit() {
-                    return;
+                    if !self.audit_unavailable() {
+                        // Held, not dropped: retried after the backoff.
+                        return;
+                    }
+                    // H2: past the bound, a job is answered by name. It never
+                    // ran, so the answer is exact.
+                    self.log(
+                        Level::Error,
+                        "audit_unavailable",
+                        format!(
+                            "id={id} op={} cause={} failing_seconds={}",
+                            or_unknown(&operation),
+                            self.reconcile.cause,
+                            self.reconcile
+                                .failing_since
+                                .map_or(0, |since| since.elapsed().as_secs())
+                        ),
+                    );
+                    self.classified.remove(&id);
+                    self.claim(
+                        &id,
+                        lane,
+                        operation,
+                        Some(terminal.unwrap_or(("audit_unavailable", 69))),
+                    );
+                    continue;
                 }
                 reconciled = true;
             }
@@ -533,20 +667,25 @@ impl Consumer {
                 response.clone().into(),
             ])
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            .stderr(Stdio::piped())
             .spawn();
         match child {
-            Ok(child) => {
+            Ok(mut child) => {
+                let stderr = Some(sys::Tail::start(child.stderr.take(), 8192));
+                let pid = child.id();
                 self.running.insert(
                     id.to_owned(),
                     Running {
                         id: id.to_owned(),
                         lane,
                         operation,
-                        child,
+                        child: Some(child),
+                        pid,
+                        stderr,
                         started: Instant::now(),
                         deadline: lane.deadline(&self.settings),
                         stopping: None,
+                        killed: None,
                         processing,
                         secret,
                         response,
@@ -601,12 +740,21 @@ impl Consumer {
         }
     }
 
-    /// Collect finished consumers; stop the ones past their deadline.
+    /// Collect finished consumers; stop the ones past their deadline; give up
+    /// on one that outlives KILL by `reap_bound` (H3: its slot is freed, it is
+    /// named with its pid and handed to a reaper, and its job is answered as
+    /// any stopped consumer's is).
     fn reap(&mut self) {
         let now = Instant::now();
         let mut done = Vec::new();
+        let mut unkillable = Vec::new();
+        let mut unwaitable = Vec::new();
         for (id, job) in &mut self.running {
-            match job.child.try_wait() {
+            let Some(child) = job.child.as_mut() else {
+                unkillable.push(id.clone());
+                continue;
+            };
+            match child.try_wait() {
                 Ok(Some(status)) => {
                     let code = status
                         .code()
@@ -618,26 +766,99 @@ impl Consumer {
                     if job.stopping.is_none() && now.duration_since(job.started) >= job.deadline {
                         job.cause = Some("deadline");
                         job.stopping = Some(now);
-                        let _ = sys::kill_group(job.child.id(), libc::SIGTERM);
+                        let _ = sys::kill_group(job.pid, libc::SIGTERM);
                     } else if job
                         .stopping
                         .is_some_and(|at| now.duration_since(at) >= self.settings.kill_grace)
                     {
-                        let _ = sys::kill_group(job.child.id(), libc::SIGKILL);
+                        if job.killed.is_none() {
+                            job.killed = Some(now);
+                        }
+                        if job
+                            .killed
+                            .is_some_and(|at| now.duration_since(at) >= self.settings.reap_bound)
+                        {
+                            unkillable.push(id.clone());
+                        } else {
+                            let _ = sys::kill_group(job.pid, libc::SIGKILL);
+                        }
                     }
                 }
-                Err(_) => done.push((id.clone(), -1)),
+                Err(error) => {
+                    // Cannot be waited for: stopped as an unkillable one is.
+                    job.cause.get_or_insert("deadline");
+                    let _ = sys::kill_group(job.pid, libc::SIGKILL);
+                    unwaitable.push(format!("id={id} cause={error}"));
+                    unkillable.push(id.clone());
+                }
             }
+        }
+        for detail in unwaitable {
+            self.log(Level::Error, "consumer_unwaitable", detail);
         }
         for (id, code) in done {
             if let Some(job) = self.running.remove(&id) {
                 self.finished(job, code);
             }
         }
+        for id in unkillable {
+            if let Some(mut job) = self.running.remove(&id) {
+                self.give_up(&mut job);
+                self.finished(job, -1);
+            }
+        }
+    }
+
+    /// The consumer outlived KILL: name it, free its slot, hand it to a
+    /// reaper. Its child handle is replaced by nothing the caller waits on.
+    fn give_up(&self, job: &mut Running) {
+        let pid = job.pid;
+        let killed_for = job.killed.map_or(0, |at| at.elapsed().as_millis());
+        self.log(
+            Level::Error,
+            "consumer_unkillable",
+            format!(
+                "id={} op={} pid={pid} lane={} path={} cause=still running {killed_for} ms after KILL; its slot is freed",
+                job.id,
+                or_unknown(&job.operation),
+                job.lane.as_str(),
+                job.processing.display()
+            ),
+        );
+        job.cause = Some("unkillable");
+        if let Some(child) = job.child.take() {
+            // Our own unreaped child (its pid cannot be reused): KILL it by
+            // pid too, in case it left its process group.
+            let _ = sys::kill_process(pid, libc::SIGKILL);
+            let handed = sys::abandon_to_reaper(child);
+            if handed != "reaper" {
+                self.log(
+                    Level::Error,
+                    "consumer_unkillable",
+                    format!("id={} pid={pid} cause=handed={handed}", job.id),
+                );
+            }
+        }
     }
 
     /// The shell's post-consumer rules, word for word in effect.
-    fn finished(&mut self, job: Running, code: i32) {
+    fn finished(&mut self, mut job: Running, code: i32) {
+        // S2-1: what the consumer said reaches controller.log, with its job.
+        if let Some(stderr) = job.stderr.take() {
+            let level = if code == 0 { Level::Warn } else { Level::Error };
+            for line in stderr.lines(8, Duration::from_millis(500)) {
+                self.log(
+                    level,
+                    "consumer_stderr",
+                    format!(
+                        "id={} op={} exit={code} path={} line={line}",
+                        job.id,
+                        or_unknown(&job.operation),
+                        job.processing.display()
+                    ),
+                );
+            }
+        }
         let published = private_control_file(&job.response).is_some()
             && fs::metadata(&job.response)
                 .map(|m| m.len())
@@ -790,7 +1011,7 @@ impl Consumer {
         for job in self.running.values_mut() {
             job.cause = Some("service_stopping");
             job.stopping = Some(now);
-            let _ = sys::kill_group(job.child.id(), libc::SIGTERM);
+            let _ = sys::kill_group(job.pid, libc::SIGTERM);
         }
         let deadline = now + self.settings.kill_grace;
         while !self.running.is_empty() && Instant::now() < deadline {
@@ -798,19 +1019,23 @@ impl Consumer {
             thread::sleep(Duration::from_millis(20));
         }
         for job in self.running.values() {
-            let _ = sys::kill_group(job.child.id(), libc::SIGKILL);
+            let _ = sys::kill_group(job.pid, libc::SIGKILL);
         }
         let end = Instant::now() + Duration::from_secs(2);
         while !self.running.is_empty() && Instant::now() < end {
             self.reap();
             thread::sleep(Duration::from_millis(20));
         }
-        for job in self.running.values() {
-            self.log(
-                Level::Error,
-                "control_consumer_unkillable",
-                format!("id={} pid={}", job.id, job.child.id()),
-            );
+        let left: Vec<String> = self.running.keys().cloned().collect();
+        for id in left {
+            if let Some(mut job) = self.running.remove(&id) {
+                self.log(
+                    Level::Error,
+                    "control_consumer_unkillable",
+                    format!("id={} pid={}", job.id, job.pid),
+                );
+                self.give_up(&mut job);
+            }
         }
     }
 }
@@ -844,12 +1069,15 @@ mod tests {
 log="$(dirname "$0")/calls"
 echo "$*" >> "$log"
 case $1 in
-  --audit-transaction) exit 0 ;;
+  --audit-transaction) [ -e "$(dirname "$0")/audit-fails" ] && exit 73; exit 0 ;;
   --classify-queued-job)
     read class sleep answer < "$(dirname "$0")/var/control/requests/$2.json"
     echo "$class op-$class"; exit 0 ;;
   --consume-job)
     read class sleep answer < "$2"
+    # Out of reach of the queue's signals: as a consumer in D state is.
+    [ "$answer" = stubborn ] && exec perl -e 'setpgrp(0, getpgrp(getppid())); $SIG{TERM} = "IGNORE"; open(my $f, ">", $ARGV[0]); print $f "$$\n"; close($f); sleep 30' "$(dirname "$0")/stubborn.pid"
+    [ "$answer" = noisy ] && { echo "boom: /volume1/share is gone" >&2; exit 1; }
     sleep "$sleep"
     [ "$answer" = answer ] && { umask 077; echo '{}' > "$3"; }
     exit 0 ;;
@@ -867,6 +1095,7 @@ exit 64
         dir: PathBuf,
         consumer: Option<QueueConsumer>,
         events: Arc<Mutex<Vec<String>>>,
+        rows: Arc<Mutex<Vec<String>>>,
     }
 
     impl Fixture {
@@ -886,18 +1115,25 @@ exit 64
             let log: QueueLog = Arc::new(move |_, event, detail| {
                 sink.lock().unwrap().push(format!("{event} {detail}"));
             });
+            let rows = Arc::new(Mutex::new(Vec::new()));
+            let row_sink = Arc::clone(&rows);
+            let activity: QueueActivity = Arc::new(move |code, _, message| {
+                row_sink.lock().unwrap().push(format!("{code} {message}"));
+            });
             let consumer = QueueConsumer::start(
                 bridge,
                 dir.join("var"),
                 vec![("PATH".into(), "/usr/bin:/bin".into())],
                 settings,
                 log,
+                activity,
             )
             .unwrap();
             Self {
                 dir,
                 consumer: Some(consumer),
                 events,
+                rows,
             }
         }
 
@@ -1037,6 +1273,116 @@ exit 64
                 .any(|e| e.contains(&format!("id={A}")) && e.contains("cause=deadline")),
             "{events:?}"
         );
+    }
+
+    /// H2 (review-int hang probe): an audit reconcile that keeps failing is
+    /// named once per episode and tried with a growing backoff, not four
+    /// times a second; past the bound, waiting jobs are answered by name
+    /// (`audit_unavailable`, they never ran) instead of never; once it
+    /// recovers, jobs run again.
+    #[test]
+    fn a_failing_audit_reconcile_backs_off_and_answers_waiting_jobs() {
+        let settings = QueueSettings {
+            audit_unavailable_after: Duration::from_millis(800),
+            ..fast()
+        };
+        let f = Fixture::new("audit-fails", settings);
+        fs::write(f.dir.join("audit-fails"), b"").unwrap();
+        f.enqueue(A, "concurrent 0 answer\n");
+        f.wait("the job answered by name", Duration::from_secs(10), |f| {
+            f.response(A)
+                .is_some_and(|r| r.contains("audit_unavailable"))
+        });
+        thread::sleep(Duration::from_secs(2));
+        let calls = fs::read_to_string(f.dir.join("calls")).unwrap();
+        let reconciles = calls
+            .lines()
+            .filter(|l| l.starts_with("--audit-transaction"))
+            .count();
+        assert!(reconciles <= 8, "{reconciles} reconciles in about 3 s");
+        {
+            let events = f.events.lock().unwrap();
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|e| e.starts_with("audit_reconcile_failed"))
+                    .count(),
+                1,
+                "{events:?}"
+            );
+            assert!(
+                events
+                    .iter()
+                    .any(|e| e.starts_with("audit_unavailable") && e.contains(A)),
+                "{events:?}"
+            );
+        }
+        assert!(
+            f.rows
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|r| r.starts_with("bridge.failed")),
+            "the dashboard is told: {:?}",
+            f.rows.lock().unwrap()
+        );
+        fs::remove_file(f.dir.join("audit-fails")).unwrap();
+        f.enqueue(B, "concurrent 0 answer\n");
+        f.wait("the next job run", Duration::from_secs(70), |f| {
+            f.response(B).is_some_and(|r| r.trim() == "{}")
+        });
+        assert!(
+            f.events
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|e| e.starts_with("audit_reconcile_recovered")),
+            "{:?}",
+            f.events.lock().unwrap()
+        );
+    }
+
+    /// H3: a consumer that outlives KILL (D state; here: out of the queue's
+    /// reach) frees its slot after a bound, named with its pid; its job is
+    /// answered and the lane runs the next job.
+    #[test]
+    fn an_unkillable_consumer_frees_its_slot_by_name() {
+        let settings = QueueSettings {
+            serialized_deadline: Duration::from_millis(500),
+            reap_bound: Duration::from_millis(500),
+            ..fast()
+        };
+        let f = Fixture::new("unkillable", settings);
+        f.enqueue(A, "serialized 0 stubborn\n");
+        f.enqueue(B, "serialized 0 answer\n");
+        f.wait("the slot freed", Duration::from_secs(10), |f| {
+            f.response(B).is_some()
+        });
+        let events = f.events.lock().unwrap().clone();
+        assert!(
+            events.iter().any(|e| e.starts_with("consumer_unkillable")
+                && e.contains(A)
+                && e.contains("pid=")),
+            "{events:?}"
+        );
+        if let Ok(pid) = fs::read_to_string(f.dir.join("stubborn.pid")) {
+            let _ = sys::kill_process(pid.trim().parse().unwrap_or(0), libc::SIGKILL);
+        }
+    }
+
+    /// S2-1: what a consumer says on stderr reaches controller.log, named
+    /// with its job, as it did under the shell controller.
+    #[test]
+    fn a_consumers_stderr_is_logged_with_its_job() {
+        let f = Fixture::new("stderr", fast());
+        f.enqueue(A, "concurrent 0 noisy\n");
+        f.wait("the stderr logged", Duration::from_secs(10), |f| {
+            f.events.lock().unwrap().iter().any(|e| {
+                e.starts_with("consumer_stderr")
+                    && e.contains(A)
+                    && e.contains("boom: /volume1/share is gone")
+            })
+        });
     }
 
     /// A request that is not a private file is named and left alone.

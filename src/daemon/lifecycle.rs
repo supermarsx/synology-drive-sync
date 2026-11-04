@@ -909,6 +909,20 @@ pub(crate) fn run_daemon(options: &Options) -> ExitCode {
         let log: super::queue::QueueLog = Arc::new(move |level, event, detail| {
             log_or_stderr(&queue_sink, level, event, detail);
         });
+        let activity_sink = FileSink::new(&log_root);
+        let activity: super::queue::QueueActivity = Arc::new(move |code, level, message| {
+            activity_or_stderr(
+                &activity_sink,
+                &ActivityRow {
+                    code,
+                    profile: "none".into(),
+                    state: "failed",
+                    category: "bridge",
+                    level,
+                    message,
+                },
+            );
+        });
         match std::env::current_exe().and_then(|exe| {
             super::queue::QueueConsumer::start(
                 exe,
@@ -916,6 +930,7 @@ pub(crate) fn run_daemon(options: &Options) -> ExitCode {
                 api_env.clone(),
                 super::queue::QueueSettings::default(),
                 log,
+                activity,
             )
         }) {
             Ok(queue) => Some(queue),

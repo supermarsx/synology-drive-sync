@@ -8384,6 +8384,9 @@ enum ControllerFailureCause {
     SecretClaimFailed,
     ConsumerFailed,
     ConsumerWroteNoResult,
+    /// The daemon's queue could not reconcile the audit outbox for longer than
+    /// its bound, so the job was answered instead of held (never started).
+    AuditUnavailable,
 }
 
 impl ControllerFailureCause {
@@ -8393,6 +8396,7 @@ impl ControllerFailureCause {
             "secret_claim_failed" => Some(Self::SecretClaimFailed),
             "consumer_failed" => Some(Self::ConsumerFailed),
             "consumer_wrote_no_result" => Some(Self::ConsumerWroteNoResult),
+            "audit_unavailable" => Some(Self::AuditUnavailable),
             _ => None,
         }
     }
@@ -8403,6 +8407,7 @@ impl ControllerFailureCause {
             Self::SecretClaimFailed => "secret_claim_failed",
             Self::ConsumerFailed => "consumer_failed",
             Self::ConsumerWroteNoResult => "consumer_wrote_no_result",
+            Self::AuditUnavailable => "audit_unavailable",
         }
     }
 
@@ -8417,6 +8422,9 @@ impl ControllerFailureCause {
             Self::ConsumerFailed => "The operation was terminated before it finished.",
             Self::ConsumerWroteNoResult => {
                 "The operation ended without recording a result of its own."
+            }
+            Self::AuditUnavailable => {
+                "The package audit log could not be reconciled, so this request was never started."
             }
         }
     }
@@ -8433,11 +8441,12 @@ impl ControllerFailureCause {
     }
 }
 
-const CONTROLLER_FAILURE_CODES: [&str; 4] = [
+const CONTROLLER_FAILURE_CODES: [&str; 5] = [
     "classification_failed",
     "secret_claim_failed",
     "consumer_failed",
     "consumer_wrote_no_result",
+    "audit_unavailable",
 ];
 
 /// Every code the package itself can publish as the cause of a terminal failure.
@@ -21338,6 +21347,7 @@ mod tests {
             ("secret_claim_failed", false),
             ("consumer_failed", true),
             ("consumer_wrote_no_result", true),
+            ("audit_unavailable", false),
         ] {
             let cause = ControllerFailureCause::parse(word).expect("declared causes parse");
             assert_eq!(
