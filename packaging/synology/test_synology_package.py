@@ -22531,7 +22531,7 @@ fi
             fields = self.wait_for_state(run_state, lambda f: f.get("state") == "running", timeout=30)
             self.assertIn("heartbeat_epoch", fields)
             self.assertEqual(fields["heartbeat_epoch"], fields["started_epoch"], fields)
-            stalled = self.wait_for_controller_event("run_stalled")
+            stalled = self.wait_for_controller_event("run_stalled", timeout=60)
             self.assertEqual(stalled[0]["level"], "error")
             self.assertIn("scope=alpha", str(stalled[0]["detail"]))
             fields = self.state_fields(run_state)
