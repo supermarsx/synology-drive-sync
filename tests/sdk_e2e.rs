@@ -777,3 +777,68 @@ fn the_sdk_reports_no_unchecked_folders_when_real_paths_are_reported() {
     assert_eq!(outcome.link_guard_unchecked(), 0);
     assert_eq!(outcome.plan().link_guard_unchecked(), 0);
 }
+
+/// The refusal breaker decides when the share is certain to refuse, not when the thread that
+/// reports progress gets round to it. Every refused upload here is answered at once, while the
+/// observer that receives each deferral takes 150 ms: a verdict taken on the reporting thread
+/// arrives 21 observer calls late, by which time the four workers have sent all 40 uploads. The
+/// bound is the 21st refusal plus the at most three peers in flight beside the worker that saw
+/// it: 24, however slow the reporting is. A starved CI runner makes the same lag by accident.
+#[test]
+fn a_slow_progress_observer_cannot_let_workers_outrun_the_refusal_breaker() {
+    const UPLOAD: &str = "SYNO.FileStation.Upload.upload";
+    let server = MockFileStation::start();
+    server.add_directory("/team/sdk");
+    let source = TestDir::new("sdk-breaker-lag");
+    for index in 0..40 {
+        source.write(&format!("f{index:02}.txt"), b"payload");
+    }
+    server.fail_api_operation_times(UPLOAD, 407, 1_000);
+    let request = SyncRequest::builder(server.base_url(), "e2e-user", source.path(), "/team/sdk")
+        .allow_http(true)
+        .jobs(4)
+        .build()
+        .expect("build SDK request");
+    let mut secrets = FixedSecrets::new();
+
+    let error = Engine
+        .run(
+            &request,
+            &mut secrets,
+            &CancellationToken::default(),
+            |_| PlanDecision::Apply,
+            |event| {
+                if matches!(
+                    event,
+                    SdkEvent::Mutation {
+                        mutation: MutationEvent::PathDeferred { .. }
+                    }
+                ) {
+                    std::thread::sleep(std::time::Duration::from_millis(150));
+                }
+                EventControl::Continue
+            },
+        )
+        .expect_err("a share that refuses every upload fails the run");
+
+    assert_eq!(error.code(), ErrorCode::Remote, "{}", error.message());
+    assert!(
+        error.message().contains("remote-refused-share-wide"),
+        "{}",
+        error.message()
+    );
+    assert!(
+        !error.message().to_lowercase().contains("cancelled"),
+        "{}",
+        error.message()
+    );
+    let uploads = server
+        .requests()
+        .iter()
+        .filter(|request| request.operation() == UPLOAD)
+        .count();
+    assert!(
+        (21..=24).contains(&uploads),
+        "21 refusals trip the breaker; at most 3 peers are in flight: {uploads} uploads"
+    );
+}

@@ -276,7 +276,13 @@ fn a_share_wide_upload_refusal_with_parallel_workers_reports_the_breaker() {
     fixture.server.fail_api_operation_times(UPLOAD, 407, 1_000);
     let output = fixture.sync("/team/bk4j", &["--jobs", "4"]);
     assert_share_wide(&output, "permission");
-    assert!(fixture.count(UPLOAD) <= 24, "{}", fixture.count(UPLOAD));
+    // Exact, not a margin: the 21st refusal trips the breaker, and the worker that sees it sets the
+    // stop before any peer starts another upload, so only the other three workers' requests, each
+    // issued before the trip, can follow it. The verdict is taken by the workers, not by the thread
+    // that reports progress, so how slow that thread is cannot move this bound (see
+    // `tests/sdk_e2e.rs`, which makes it slow on purpose).
+    let uploads = fixture.count(UPLOAD);
+    assert!((21..=24).contains(&uploads), "{uploads}");
     assert!(
         !stderr(&output).to_lowercase().contains("cancelled"),
         "{}",

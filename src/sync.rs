@@ -1814,11 +1814,22 @@ fn execute_with_observer<O: SyncOperations>(
         let queue = Arc::new(Mutex::new(uploads));
         let stop = Arc::new(AtomicBool::new(false));
         let (sender, receiver) = mpsc::channel();
+        // The breaker is judged by the workers, under this lock and in the order DSM answered, and
+        // never by the collector below. The collector also runs the progress observer, which may
+        // block on a full pipe or a slow embedder; a verdict that waited for it let every worker
+        // send its next upload while the share's refusals queued up unjudged (34 and 38 uploads of
+        // 40 where the bound is 24, on a loaded runner). Here the 21st refusal sets `stop` before
+        // its worker looks for more work, and a peer checks `stop` right before each request, so
+        // at most the other `jobs - 1` workers have one request in flight when the verdict falls.
+        let judge = Mutex::new(&mut breaker);
+        let tripped: Mutex<Option<Error>> = Mutex::new(None);
 
         thread::scope(|scope| {
             for _ in 0..worker_count {
                 let queue = Arc::clone(&queue);
                 let stop = Arc::clone(&stop);
+                let judge = &judge;
+                let tripped = &tripped;
                 let sender = sender.clone();
                 let worker_client = (*client).clone();
                 let observer_factory = Arc::clone(&observer_factory);
@@ -1859,6 +1870,13 @@ fn execute_with_observer<O: SyncOperations>(
                             ),
                             Err(error) => UploadOutcome::Failed(error),
                             Ok(true) => {
+                                // The last look before the request, after the precondition's own
+                                // round trip: a verdict reached meanwhile is honoured here. The
+                                // file is then never sent, and is counted by the breaker as not
+                                // attempted, like the rest of the queue.
+                                if stop.load(Ordering::Acquire) || cancellation.is_cancelled() {
+                                    break;
+                                }
                                 let user_observer = observer_factory(&action.local);
                                 let cancellation_for_observer = cancellation.clone();
                                 // `thread::scope` cannot return until every in-flight upload
@@ -1898,8 +1916,37 @@ fn execute_with_observer<O: SyncOperations>(
                                 }
                             }
                         };
-                        if matches!(outcome, UploadOutcome::Failed(_)) {
-                            stop.store(true, Ordering::Release);
+                        match &outcome {
+                            UploadOutcome::Failed(_) => stop.store(true, Ordering::Release),
+                            UploadOutcome::Uploaded | UploadOutcome::Deferred(..) => {
+                                let Ok(mut breaker) = judge.lock() else {
+                                    // Nothing can be judged any more: stop, and say so.
+                                    stop.store(true, Ordering::Release);
+                                    let _ = sender.send((
+                                        relative,
+                                        size,
+                                        UploadOutcome::Failed(Error::Message(
+                                            "upload refusal breaker was poisoned".to_owned(),
+                                        )),
+                                    ));
+                                    break;
+                                };
+                                match &outcome {
+                                    UploadOutcome::Deferred(_, _, refusal) => {
+                                        breaker.settled_as(refusal.clone(), &relative);
+                                    }
+                                    _ => breaker.accepted(),
+                                }
+                                // Known now: stop sending writes the share will refuse. Peers
+                                // interrupted mid-request answer `Cancelled`, which never
+                                // replaces this as the run's error.
+                                if let Err(error) = breaker.check() {
+                                    stop.store(true, Ordering::Release);
+                                    if let Ok(mut tripped) = tripped.lock() {
+                                        tripped.get_or_insert(error);
+                                    }
+                                }
+                            }
                         }
                         if sender.send((relative, size, outcome)).is_err() {
                             break;
@@ -1913,7 +1960,6 @@ fn execute_with_observer<O: SyncOperations>(
             for (relative, size, outcome) in receiver {
                 match outcome {
                     UploadOutcome::Uploaded => {
-                        breaker.accepted();
                         completed.uploaded += 1;
                         completed.uploaded_bytes = completed.uploaded_bytes.saturating_add(size);
                         // Counted on completion, in the collector, rather than in each worker:
@@ -1925,23 +1971,20 @@ fn execute_with_observer<O: SyncOperations>(
                             bytes: size,
                         });
                     }
-                    UploadOutcome::Deferred(reason, detail, refusal) => {
-                        breaker.settled_as(refusal, &relative);
+                    UploadOutcome::Deferred(reason, detail, _) => {
                         completed.defer(&mut deferrals, &relative, reason, detail, &mut report);
-                        // Known now: stop sending writes the share will refuse. Interrupted peers
-                        // answer `Cancelled`, which never replaces this as the run's error.
-                        if let Err(error) = breaker.check() {
-                            stop.store(true, Ordering::Release);
-                            record_worker_error(&mut first_error, error);
-                        }
                     }
                     UploadOutcome::Failed(error) => record_worker_error(&mut first_error, error),
                 }
             }
+            // Every worker has finished: the verdict, if one fell, is complete.
+            if let Some(error) = tripped.lock().ok().and_then(|mut tripped| tripped.take()) {
+                record_worker_error(&mut first_error, error);
+            }
             if let Some(error) = first_error {
                 return Err(error);
             }
-            breaker.check()
+            Ok(())
         })?;
     }
     // Once more, whatever the run held: a run of only folders or only copies is judged too, and
