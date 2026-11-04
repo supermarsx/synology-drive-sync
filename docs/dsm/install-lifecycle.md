@@ -179,8 +179,14 @@ closed, records `service_start_failed` with the launcher's cause, stops anything
 and exits `1`. Start refuses while shell-engine services are live.
 
 Daemon stop asks the daemon to stop (`ctl stop`, which lets a running sync end within its cancel
-grace). A daemon that does not answer, or outlasts `SDSYNC_DSM_STOP_TIMEOUT` (default 120 s), is
-sent TERM and then KILL, together with its supervisor, but only after its identity is proven from
+grace). The whole stop runs on one budget, `SDSYNC_DSM_STOP_TIMEOUT` (default and maximum 120 s,
+the figure the shell engine's stop has always had; the Package Center's own stop deadline is not
+documented by Synology and was not verified on a unit): `ctl stop` waits at most the budget less a
+sixth of it (at least 2 s) and 5 s, the daemon then gets the rest less that sixth to end, and TERM gets
+whatever remains. KILL's own 10 s wait is the only margin on top, so the worst case is the budget plus
+about 10 s. A daemon that does not
+answer, or outlasts the budget, is sent TERM and then KILL, together with its supervisor, but only
+after its identity is proven from
 `run/daemon.ready` (PID, `/proc` start time, boot id, package uid, `--daemon` argv); an unprovable
 one is refused and named. Stop leaves no `daemon.pid`, `daemon.ready` or `ctl.sock` (`daemon.lock`
 stays; only a live holder of it means a daemon runs). When nobody holds `daemon.lock`, no daemon

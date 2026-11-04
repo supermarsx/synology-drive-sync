@@ -1260,6 +1260,20 @@ daemon_wait_gone() {
     done
 }
 
+# Sets daemon_stop_left_s to the whole seconds left of the stop budget
+# (daemon_grace, counted from daemon_stop_began), never below 0. Without a
+# readable clock it is the whole budget, which the caller has announced.
+daemon_stop_left() {
+    daemon_stop_left_s=$daemon_grace
+    [ -n "$daemon_stop_began" ] || return 0
+    daemon_stop_now=$(date +%s 2>/dev/null || true)
+    case $daemon_stop_now in ''|*[!0-9]*) return 0 ;; esac
+    daemon_stop_used=$((daemon_stop_now - daemon_stop_began))
+    [ "$daemon_stop_used" -ge 0 ] || daemon_stop_used=0
+    daemon_stop_left_s=$((daemon_grace - daemon_stop_used))
+    [ "$daemon_stop_left_s" -ge 0 ] || daemon_stop_left_s=0
+}
+
 # A live supervisor with no daemon to ask: it is between its daemon's death and
 # the respawn (or its daemon's records are unusable). TERM stops it and, with
 # it, anything it would respawn; KILL after the grace. Waits for the supervisor
@@ -1271,8 +1285,11 @@ stop_orphan_supervisor() {
         return 1
     }
     daemon_live_pid= daemon_live_start=
-    if ! daemon_wait_gone "$daemon_grace"; then
-        package_message "the daemon supervisor (PID $daemon_supervisor_pid) outlasted its $daemon_grace s grace after TERM; killing it"
+    daemon_stop_left
+    daemon_phase_budget=$daemon_stop_left_s
+    [ "$daemon_phase_budget" -ge 2 ] || daemon_phase_budget=2
+    if ! daemon_wait_gone "$daemon_phase_budget"; then
+        package_message "the daemon supervisor (PID $daemon_supervisor_pid) outlasted its $daemon_grace s stop budget after TERM; killing it"
         append_controller_log_event error service_stop_forced \
             "engine=daemon supervisor_pid=$daemon_supervisor_pid grace_s=$daemon_grace" >/dev/null 2>&1 || true
         daemon_signal_exact "$daemon_supervisor_pid" KILL "$daemon_supervisor_start" || true
@@ -1296,6 +1313,21 @@ stop_daemon_engine() {
     case $daemon_grace in ''|*[!0-9]*) daemon_grace=120 ;; esac
     [ "$daemon_grace" -ge 1 ] || daemon_grace=1
     [ "$daemon_grace" -le 120 ] || daemon_grace=120
+    # One budget covers every phase below: ctl stop, the wait after it, TERM
+    # and its wait. Each of them used to get the whole grace, which made the
+    # worst case ctl 125 s + 120 s + 120 s (+ KILL's 10 s) against the 120 s the
+    # shell engine's stop has. KILL's own wait is the margin on top. The TERM
+    # phase keeps a sixth of the budget (at least 2 s) in reserve from the start.
+    daemon_term_share=$((daemon_grace / 6))
+    [ "$daemon_term_share" -ge 2 ] || daemon_term_share=2
+    daemon_ctl_wait=$((daemon_grace - daemon_term_share - 5))
+    [ "$daemon_ctl_wait" -ge 1 ] || daemon_ctl_wait=1
+    daemon_stop_began=$(date +%s 2>/dev/null || true)
+    case $daemon_stop_began in ''|*[!0-9]*)
+        daemon_stop_began=
+        package_message "warning: the clock cannot be read; each stop phase gets its own share of the $daemon_grace s budget"
+        ;;
+    esac
     # The supervisor is found through its own record first: between a daemon's
     # death and the respawn there is no daemon.ready to find it by, and a
     # record removed under a live supervisor is recreated by the next respawn.
@@ -1324,7 +1356,7 @@ stop_daemon_engine() {
     daemon_ctl_status=69
     if [ "$daemon_identity" -eq 0 ] || api_path_exists "$daemon_socket"; then
         daemon_ctl_status=0
-        daemon_ctl_reply=$(daemon_ctl stop "wait_s=$daemon_grace" 2>&1) || daemon_ctl_status=$?
+        daemon_ctl_reply=$(daemon_ctl stop "wait_s=$daemon_ctl_wait" 2>&1) || daemon_ctl_status=$?
         if [ "$daemon_ctl_status" -ne 0 ] && [ "$daemon_identity" -eq 0 ]; then
             if [ "$daemon_ctl_status" -eq 69 ]; then
                 package_message "warning: the daemon (PID $daemon_live_pid) did not answer ctl stop; signalling it"
@@ -1333,12 +1365,17 @@ stop_daemon_engine() {
             fi
         fi
     fi
-    # After an accepted ctl stop the daemon gets the whole grace to end on its
-    # own; one that did not answer is signalled at once.
+    # After an accepted ctl stop the daemon gets what is left of the budget,
+    # less the TERM share, to end on its own; one that did not answer is
+    # signalled at once.
     daemon_settled=false
-    if [ "$daemon_identity" -eq 0 ] && [ "$daemon_ctl_status" -eq 0 ] \
-        && daemon_wait_gone "$daemon_grace"; then
-        daemon_settled=true
+    if [ "$daemon_identity" -eq 0 ] && [ "$daemon_ctl_status" -eq 0 ]; then
+        daemon_stop_left
+        daemon_phase_budget=$((daemon_stop_left_s - daemon_term_share))
+        [ "$daemon_phase_budget" -ge 0 ] || daemon_phase_budget=0
+        if daemon_wait_gone "$daemon_phase_budget"; then
+            daemon_settled=true
+        fi
     fi
     if [ "$daemon_identity" -eq 0 ] && [ "$daemon_settled" != true ]; then
         if [ -n "$daemon_supervisor_pid" ]; then
@@ -1351,8 +1388,11 @@ stop_daemon_engine() {
             package_message "the daemon (PID $daemon_live_pid) could not be signalled"
             return 1
         }
-        if ! daemon_wait_gone "$daemon_grace"; then
-            package_message "the daemon (PID $daemon_live_pid) outlasted its $daemon_grace s grace after TERM; killing it"
+        daemon_stop_left
+        daemon_phase_budget=$daemon_stop_left_s
+        [ "$daemon_phase_budget" -ge 2 ] || daemon_phase_budget=2
+        if ! daemon_wait_gone "$daemon_phase_budget"; then
+            package_message "the daemon (PID $daemon_live_pid) outlasted its $daemon_grace s stop budget after TERM; killing it"
             append_controller_log_event error service_stop_forced \
                 "engine=daemon pid=$daemon_live_pid grace_s=$daemon_grace" >/dev/null 2>&1 || true
             [ -z "$daemon_supervisor_pid" ] \

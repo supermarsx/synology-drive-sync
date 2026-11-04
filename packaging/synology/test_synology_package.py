@@ -13559,6 +13559,56 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
         self.assertIn(f"removed stale daemon record {self.fhs / 'var/run/supervisor.pid'}", stopped.stdout)
         self.assertFalse((run / "supervisor.pid").exists())
 
+    def test_daemon_stop_has_one_deadline_across_ctl_stop_term_and_kill(self) -> None:
+        # ctl stop waited the whole grace, the wait after it another, the wait
+        # after TERM a third, then KILL: about 6 minutes at the default 120 s
+        # against the old 120. One deadline now covers all of it; KILL's own
+        # wait is the small margin on top.
+        self._daemon_engine(None)
+        budget = 8
+        bridge = self.real_target / "bin/sdsync-dsm-api"
+        source = bridge.read_text(encoding="utf-8")
+        needle = "if len(sys.argv) >= 2 and sys.argv[1] in ('--launch-daemon'"
+        self.assertEqual(source.count(needle), 1, "the mock's daemon passthrough changed")
+        bridge.write_text(
+            source.replace(
+                needle,
+                "if len(sys.argv) >= 3 and sys.argv[1] == '--ctl' and sys.argv[2] == 'stop':\n"
+                "    _wait = [a[7:] for a in sys.argv if a.startswith('wait_s=')]\n"
+                "    time.sleep(int(_wait[0]))\n"
+                "    raise SystemExit(0)\n" + needle,
+                1,
+            ),
+            encoding="utf-8",
+        )
+        self._free_daemon_lock()
+        daemon = self._spawn_fake("--daemon", hold_lock=True, ignore_term=True)
+        supervisor = self._spawn_fake("--supervise", ignore_term=True)
+        self._write_run_record("daemon.ready", self._identity_triple(daemon.pid))
+        self._write_run_record("daemon.pid", self._identity_triple(daemon.pid))
+        self._write_run_record("supervisor.pid", self._identity_triple(supervisor.pid))
+        self._bind_dead_socket(self.real_var / "run/ctl.sock", 0o600)
+        began = time.monotonic()
+        stopped = self.shell(
+            self.lifecycle, "stop", timeout=120,
+            extra_environment={"SDSYNC_DSM_STOP_TIMEOUT": str(budget)},
+        )
+        elapsed = time.monotonic() - began
+        self.assertEqual(stopped.returncode, 0, stopped.stdout + stopped.stderr)
+        self.assertLessEqual(
+            elapsed, budget + 10 + 4,
+            f"stop took {elapsed:.1f} s against a {budget} s budget plus KILL's 10 s margin\n"
+            + stopped.stdout + stopped.stderr,
+        )
+        self.assertGreaterEqual(elapsed, budget - 2, "the daemon was killed before it had its grace")
+        self.assertIsNotNone(daemon.poll(), "the daemon survived stop")
+        self.assertIsNotNone(supervisor.poll(), "the supervisor survived stop")
+        self.assertEqual(
+            self._daemon_records(), {"daemon.pid": False, "daemon.ready": False, "ctl.sock": False}
+        )
+        self.assertFalse((self.real_var / "run/supervisor.pid").exists())
+        self.assertIn("service_stop_forced", (self.real_var / "log/controller.log").read_text(encoding="utf-8"))
+
     def test_postupgrade_removes_shell_leftovers_only_under_the_daemon_engine(self) -> None:
         leftovers = [
             self.real_var / "state/controller-reload.pending",
