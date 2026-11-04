@@ -13356,6 +13356,153 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
                 self.assertIn(f"not fully stopped: {self.fhs / 'var/run' / record}", refused.stdout, hook)
             (run / record).unlink()
 
+    # -- stale daemon records, supervisor.pid, and the lock probe (fix5) ------
+    #
+    # Fake processes stand in for the daemon, its supervisor and a process
+    # that reused a recorded PID. They are plain python children of the test
+    # whose argv carries the exact flag the lifecycle's identity checks look
+    # for (--daemon / --supervise), so every identity rule the real daemon
+    # meets is met here too, without a real daemon.
+
+    def _spawn_fake(
+        self, flag: str, *, hold_lock: bool = False, ignore_term: bool = False
+    ) -> subprocess.Popen[str]:
+        code = (
+            "import fcntl, os, signal, sys, time\n"
+            "if sys.argv[2] == 'ignore':\n"
+            "    signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+            "if sys.argv[3] != '-':\n"
+            "    fd = os.open(sys.argv[3], os.O_RDWR | os.O_CREAT, 0o600)\n"
+            "    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)\n"
+            "print('up', flush=True)\n"
+            "time.sleep(600)\n"
+        )
+        lock = str(self.real_var / "run/daemon.lock") if hold_lock else "-"
+        process = subprocess.Popen(
+            [sys.executable, "-c", code, flag, "ignore" if ignore_term else "default", lock],
+            stdout=subprocess.PIPE,
+            text=True,
+            preexec_fn=(
+                (lambda: (os.setgroups([]), os.setgid(self.drop_gid), os.setuid(self.drop_uid)))
+                if os.getuid() == 0
+                else None
+            ),
+        )
+        self.addCleanup(self._reap_fake, process)
+        assert process.stdout is not None
+        self.assertEqual(process.stdout.readline().strip(), "up")
+        return process
+
+    @staticmethod
+    def _reap_fake(process: subprocess.Popen[str]) -> None:
+        if process.poll() is None:
+            process.kill()
+        process.wait(timeout=10)
+        if process.stdout is not None:
+            process.stdout.close()
+
+    @staticmethod
+    def _identity_triple(pid: int, *, start_delta: int = 0) -> str:
+        stat_text = Path(f"/proc/{pid}/stat").read_text(encoding="ascii")
+        start = int(stat_text.rsplit(")", 1)[1].split()[19]) + start_delta
+        boot = Path("/proc/sys/kernel/random/boot_id").read_text(encoding="ascii").strip()
+        return f"{pid}\n{start}\n{boot}\n"
+
+    def _write_run_record(self, name: str, text: str) -> Path:
+        record = self.real_var / "run" / name
+        record.write_text(text, encoding="ascii")
+        record.chmod(0o600)
+        if os.getuid() == 0:
+            os.chown(record, self.drop_uid, self.drop_gid)
+        return record
+
+    def _free_daemon_lock(self) -> Path:
+        return self._write_run_record("daemon.lock", "")
+
+    def _seed_reused_pid_daemon_records(self, pid: int, *, legacy_pid_file: bool = False) -> None:
+        """daemon.pid, daemon.ready and ctl.sock as a dead daemon left them,
+        with its PID now held by the live process `pid` (start time differs)."""
+        reused = self._identity_triple(pid, start_delta=-1)
+        self._write_run_record("daemon.ready", reused)
+        self._write_run_record("daemon.pid", f"{pid}\n" if legacy_pid_file else reused)
+        self._bind_dead_socket(self.real_var / "run/ctl.sock", 0o600)
+
+    def _bind_dead_socket(self, path: Path, mode: int) -> None:
+        path.unlink(missing_ok=True)
+        listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
+            listener.bind(str(path))
+        finally:
+            listener.close()
+        path.chmod(mode)
+
+    def test_stale_daemon_records_naming_a_reused_pid_are_removed_while_the_lock_is_free(self) -> None:
+        # daemon.lock is a flock the kernel releases on death. Free, no daemon
+        # exists, whatever PID the records name: the identity check used to
+        # return 73 for a reused PID, and start and stop refused for good.
+        self._daemon_engine(None)
+        run = self.real_var / "run"
+        self._free_daemon_lock()
+        reused = self._spawn_fake("--sleeper")
+        for legacy_pid_file in (False, True):
+            with self.subTest(legacy_pid_file=legacy_pid_file):
+                self._seed_reused_pid_daemon_records(reused.pid, legacy_pid_file=legacy_pid_file)
+                status = self.shell(self.lifecycle, "status")
+                self.assertEqual(status.returncode, 1, status.stdout + status.stderr)
+                self.assertIn("stale daemon record of a daemon that is gone", status.stderr)
+                stopped = self.shell(self.lifecycle, "stop", timeout=60)
+                self.assertEqual(stopped.returncode, 0, stopped.stdout + stopped.stderr)
+                for record in ("daemon.pid", "daemon.ready", "ctl.sock"):
+                    self.assertIn(
+                        f"removed stale daemon record {self.fhs / 'var/run' / record}",
+                        stopped.stdout, stopped.stdout + stopped.stderr,
+                    )
+                    self.assertFalse((run / record).exists(), record)
+                self.assertIsNone(reused.poll(), "stop signalled the process that reused the PID")
+        # Start over the same stale records starts a daemon.
+        self._seed_reused_pid_daemon_records(reused.pid)
+        self._start_daemon()
+        self.assertEqual(self.shell(self.lifecycle, "status").returncode, 0)
+        self.assertIsNone(reused.poll(), "start signalled the process that reused the PID")
+        stopped = self.shell(self.lifecycle, "stop", timeout=60)
+        self.assertEqual(stopped.returncode, 0, stopped.stdout + stopped.stderr)
+
+    def test_a_held_daemon_lock_keeps_the_strict_identity_check_for_reused_pids(self) -> None:
+        self._daemon_engine(None)
+        run = self.real_var / "run"
+        holder = self._spawn_fake("--daemon", hold_lock=True)
+        self._seed_reused_pid_daemon_records(holder.pid)
+        status = self.shell(self.lifecycle, "status")
+        self.assertEqual(status.returncode, 2, status.stdout + status.stderr)
+        stopped = self.shell(self.lifecycle, "stop", timeout=60)
+        self.assertEqual(stopped.returncode, 1, stopped.stdout + stopped.stderr)
+        self.assertIn("refusing to stop an unverified daemon", stopped.stdout)
+        self.assertIn("start_mismatch", stopped.stdout)
+        for record in ("daemon.pid", "daemon.ready", "ctl.sock"):
+            self.assertTrue((run / record).exists(), f"{record} was removed while the lock is held")
+        self.assertIsNone(holder.poll())
+
+    def test_a_missing_flock_keeps_the_strict_identity_check_and_names_the_cause(self) -> None:
+        self._daemon_engine(None)
+        run = self.real_var / "run"
+        self._free_daemon_lock()
+        reused = self._spawn_fake("--sleeper")
+        self._seed_reused_pid_daemon_records(reused.pid)
+        farm = self.root / "no-flock-bin"
+        farm.mkdir(mode=0o700)
+        for directory in ("/usr/local/sbin", "/usr/local/bin", "/usr/sbin", "/usr/bin", "/sbin", "/bin"):
+            for entry in Path(directory).iterdir():
+                if entry.name != "flock" and not (farm / entry.name).exists():
+                    (farm / entry.name).symlink_to(entry)
+        environment = {"PATH": f"{self.fake_system_bin}:{farm}"}
+        status = self.shell(self.lifecycle, "status", extra_environment=environment)
+        self.assertEqual(status.returncode, 2, status.stdout + status.stderr)
+        stopped = self.shell(self.lifecycle, "stop", timeout=60, extra_environment=environment)
+        self.assertEqual(stopped.returncode, 1, stopped.stdout + stopped.stderr)
+        self.assertIn("refusing to stop an unverified daemon", stopped.stdout)
+        self.assertTrue((run / "daemon.ready").exists())
+        self.assertIsNone(reused.poll())
+
     def test_postupgrade_removes_shell_leftovers_only_under_the_daemon_engine(self) -> None:
         leftovers = [
             self.real_var / "state/controller-reload.pending",

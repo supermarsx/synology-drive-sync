@@ -1098,9 +1098,19 @@ daemon_answers_ping() {
 # daemon.pid names. Sets daemon_live_pid/start/boot. 1 when no daemon process
 # exists (no records, or records naming a process that is gone). 73 when that
 # cannot be proven, with the cause in daemon_identity_cause.
+#
+# daemon.lock decides first. The daemon holds it for its whole life and the
+# kernel drops it on any death, so a lock nobody holds means no daemon
+# process exists, whatever the records say: a crash leaves them behind, and
+# the PID they name may belong to an unrelated process by the time anyone
+# looks. That used to be a permanent 73 (start_mismatch). A held lock, or one
+# that cannot be probed (no flock(1)), keeps the strict identity check below.
 daemon_identity_status() {
     daemon_live_pid= daemon_live_start= daemon_live_boot= daemon_identity_cause=
     daemon_recorded_pid=
+    daemon_identity_lock=0
+    daemon_lock_held_status || daemon_identity_lock=$?
+    [ "$daemon_identity_lock" -ne 1 ] || return 1
     if api_path_exists "$daemon_pid_file"; then
         daemon_recorded_pid=$(script_pid "$daemon_pid_file" 2>/dev/null || true)
         [ -n "$daemon_recorded_pid" ] || {
@@ -1302,6 +1312,7 @@ stop_daemon_engine() {
             package_message "stale daemon record $daemon_record could not be removed"
             return 1
         }
+        package_message "removed stale daemon record $daemon_record"
     done
 }
 

@@ -183,7 +183,11 @@ grace). A daemon that does not answer, or outlasts `SDSYNC_DSM_STOP_TIMEOUT` (de
 sent TERM and then KILL, together with its supervisor, but only after its identity is proven from
 `run/daemon.ready` (PID, `/proc` start time, boot id, package uid, `--daemon` argv); an unprovable
 one is refused and named. Stop leaves no `daemon.pid`, `daemon.ready` or `ctl.sock` (`daemon.lock`
-stays; only a live holder of it means a daemon runs). Stop stops whichever engine's processes are
+stays; only a live holder of it means a daemon runs). When nobody holds `daemon.lock`, no daemon
+exists: whatever `daemon.pid`, `daemon.ready` and `ctl.sock` say is stale even if the PID they name
+now belongs to another process, and stop and start remove them and name each path (`removed stale
+daemon record <path>`). A held lock keeps the strict identity check above; without `flock(1)` the
+lock cannot be probed, so that check applies too and a refusal names its cause. Stop stops whichever engine's processes are
 present, both after an engine switch made while one was running. Status is `0` when the daemon
 answers `ctl ping` with admission open, `3` with no daemon records, and `1` when records of a daemon
 that is gone remain (named on stderr).
