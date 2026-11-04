@@ -995,16 +995,29 @@ daemon_supervisor_record_live() {
 # when the lock is taken (util-linux and BusyBox alike); the file is checked
 # readable first so a failed open is not mistaken for a holder.
 daemon_lock_held_status() {
+    daemon_lock_probe_cause=
     [ -e "$daemon_lock_file" ] || [ -L "$daemon_lock_file" ] || return 1
-    [ -f "$daemon_lock_file" ] && [ ! -L "$daemon_lock_file" ] || return 2
-    command -v flock >/dev/null 2>&1 || return 2
-    [ -r "$daemon_lock_file" ] || return 2
+    [ -f "$daemon_lock_file" ] && [ ! -L "$daemon_lock_file" ] || {
+        daemon_lock_probe_cause="it is not a regular file"
+        return 2
+    }
+    command -v flock >/dev/null 2>&1 || {
+        daemon_lock_probe_cause="flock(1) is not installed"
+        return 2
+    }
+    [ -r "$daemon_lock_file" ] || {
+        daemon_lock_probe_cause="it is not readable by this user"
+        return 2
+    }
     ! daemon_supervisor_record_live || return 3
     daemon_lock_probe_status=0
     { { flock -n 8; } 8< "$daemon_lock_file"; } 2>/dev/null || daemon_lock_probe_status=$?
     case $daemon_lock_probe_status in
         0) return 1 ;;
         1) return 0 ;;
-        *) return 2 ;;
+        *)
+            daemon_lock_probe_cause="flock -n exited $daemon_lock_probe_status"
+            return 2
+            ;;
     esac
 }

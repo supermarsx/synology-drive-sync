@@ -13663,19 +13663,30 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
             self.assertTrue((run / record).exists(), f"{record} was removed while the lock is held")
         self.assertIsNone(holder.poll())
 
+    #: The environment of a unit without flock(1) whose bridge cannot probe
+    #: the lock either: the lifecycle's last fallback, the strict identity
+    #: check on the records. (The mock honours the variable; the real
+    #: bridge's own failures are exercised through an unreadable lock.)
+    NO_LOCK_PROBE = {"SDSYNC_TEST_LOCK_PROBE_FAIL": "1"}
+
+    def _no_flock_environment(self, **extra: str) -> dict[str, str]:
+        """PATH in front of which flock(1) does not exist (a farm of symlinks)."""
+        farm = self.root / "no-flock-bin"
+        if not farm.exists():
+            farm.mkdir(mode=0o700)
+            for directory in ("/usr/local/sbin", "/usr/local/bin", "/usr/sbin", "/usr/bin", "/sbin", "/bin"):
+                for entry in Path(directory).iterdir():
+                    if entry.name != "flock" and not (farm / entry.name).exists():
+                        (farm / entry.name).symlink_to(entry)
+        return {"PATH": f"{self.fake_system_bin}:{farm}", **extra}
+
     def test_a_missing_flock_keeps_the_strict_identity_check_and_names_the_cause(self) -> None:
         self._daemon_engine(None)
         run = self.real_var / "run"
         self._free_daemon_lock()
         reused = self._spawn_fake("--sleeper")
         self._seed_reused_pid_daemon_records(reused.pid)
-        farm = self.root / "no-flock-bin"
-        farm.mkdir(mode=0o700)
-        for directory in ("/usr/local/sbin", "/usr/local/bin", "/usr/sbin", "/usr/bin", "/sbin", "/bin"):
-            for entry in Path(directory).iterdir():
-                if entry.name != "flock" and not (farm / entry.name).exists():
-                    (farm / entry.name).symlink_to(entry)
-        environment = {"PATH": f"{self.fake_system_bin}:{farm}"}
+        environment = self._no_flock_environment(**self.NO_LOCK_PROBE)
         status = self.shell(self.lifecycle, "status", extra_environment=environment)
         self.assertEqual(status.returncode, 2, status.stdout + status.stderr)
         stopped = self.shell(self.lifecycle, "stop", timeout=60, extra_environment=environment)
@@ -13896,6 +13907,50 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
         self.assertEqual(started.returncode, 1, started.stdout + started.stderr)
         self.assertIn(f"the sync daemon supervisor (PID {supervisor.pid})", started.stdout)
         self.assertFalse((self.real_var / "run/controller.pid").exists())
+
+    def test_shell_engine_start_falls_back_to_the_identity_check_when_the_lock_cannot_be_probed(self) -> None:
+        # With no flock(1) (and no probe in its place) daemon_lock_held_status
+        # says 2 "cannot be told", and daemon_beside_shell_engine warned and
+        # went on: `start` beside a live daemon started a second set of
+        # services (fix5 review N-S2). On 2 it asks daemon_identity_status
+        # instead; a live daemon (0) and one it cannot rule out (73) both block.
+        run = self.real_var / "run"
+        environment = self._no_flock_environment(**self.NO_LOCK_PROBE)
+        holder = self._spawn_fake("--daemon", hold_lock=True)
+        self._write_run_record("daemon.pid", self._identity_triple(holder.pid))
+        self._write_run_record("daemon.ready", self._identity_triple(holder.pid))
+        lock = self.fhs / "var/run/daemon.lock"
+        started = self.shell(self.lifecycle, "start", timeout=60, extra_environment=environment)
+        self.assertEqual(started.returncode, 1, started.stdout + started.stderr)
+        self.assertIn(f"the sync daemon (PID {holder.pid})", started.stdout)
+        self.assertIn("refusing to start the shell engine", started.stdout)
+        self.assertIn(f"{lock} cannot be probed", started.stdout + started.stderr)
+        for record in ("controller.pid", "api.pid", "controller.starting"):
+            self.assertFalse((run / record).exists(), f"start launched services: {record}")
+        status = self.shell(self.lifecycle, "status", extra_environment=environment)
+        self.assertEqual(status.returncode, 2, status.stdout + status.stderr)
+        # Records that name a process other than the one they were written for
+        # (a reused PID, start time differs): the identity check cannot rule a
+        # daemon out (73), so it blocks as well, with its cause.
+        self._write_run_record("daemon.ready", self._identity_triple(holder.pid, start_delta=-1))
+        self._write_run_record("daemon.pid", self._identity_triple(holder.pid, start_delta=-1))
+        started = self.shell(self.lifecycle, "start", timeout=60, extra_environment=environment)
+        self.assertEqual(started.returncode, 1, started.stdout + started.stderr)
+        self.assertIn("refusing to start the shell engine", started.stdout)
+        self.assertIn("start_mismatch", started.stdout)
+        self.assertFalse((run / "controller.pid").exists(), "start launched services beside an unprovable daemon")
+        self.assertIsNone(holder.poll())
+        # No record of a daemon at all: nothing to step aside from. The start
+        # goes on, and says once that a daemon would not have been seen.
+        for record in ("daemon.pid", "daemon.ready"):
+            (run / record).unlink()
+        holder.kill()
+        holder.wait(timeout=10)
+        started = self.shell(self.lifecycle, "start", timeout=60, extra_environment=environment)
+        self.assertEqual(started.returncode, 0, started.stdout + started.stderr)
+        self.assertIn(f"{lock} cannot be probed", started.stdout + started.stderr)
+        stopped = self.shell(self.lifecycle, "stop", timeout=60, extra_environment=environment)
+        self.assertEqual(stopped.returncode, 0, stopped.stdout + stopped.stderr)
 
     def test_postupgrade_removes_shell_leftovers_only_under_the_daemon_engine(self) -> None:
         leftovers = [

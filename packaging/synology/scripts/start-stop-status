@@ -1129,7 +1129,10 @@ note_lasting_blocks_under_shell() {
 # 0 when a daemon of the daemon engine may be running, for the shell engine to
 # step aside from: a holder of daemon.lock, or a live supervisor that is about to
 # respawn one. Sets shell_engine_daemon_note, naming it. 1 otherwise. A lock that
-# cannot be probed is said, once, and does not block.
+# cannot be probed (no flock(1) and no probe in its place) is decided by the
+# identity check on the daemon's records, the same one stop uses: a live daemon
+# (0) and one it cannot rule out (73) both block, and the note says the lock
+# could not be probed. Only "no daemon process exists" (1) goes on, and says so.
 daemon_beside_shell_engine() {
     shell_engine_daemon_note=
     shell_engine_daemon_lock=0
@@ -1145,7 +1148,23 @@ daemon_beside_shell_engine() {
             return 0
             ;;
         2)
-            echo "warning: $daemon_lock_file cannot be probed (flock is unavailable or failed); a running daemon would not be seen" >&2
+            shell_engine_probe_cause="$daemon_lock_file cannot be probed (${daemon_lock_probe_cause:-unknown cause})"
+            shell_engine_identity=0
+            daemon_identity_status || shell_engine_identity=$?
+            case $shell_engine_identity in
+                0)
+                    shell_engine_daemon_note="the sync daemon (PID $daemon_live_pid) is live and $shell_engine_probe_cause"
+                    return 0
+                    ;;
+                1)
+                    echo "warning: $shell_engine_probe_cause; no record names a live daemon, so none is assumed" >&2
+                    return 1
+                    ;;
+                *)
+                    shell_engine_daemon_note="a sync daemon cannot be ruled out: $shell_engine_probe_cause, and $daemon_identity_cause"
+                    return 0
+                    ;;
+            esac
             ;;
     esac
     return 1
