@@ -1666,6 +1666,62 @@ fn an_unreadable_profile_state_is_kept_not_reset() {
     );
 }
 
+/// H2 amber: the queue's audit health reaches controller.state as
+/// `degraded=`, `degraded_since=`, `degraded_cause=` while it lasts, each
+/// change named, and the keys go when it recovers.
+#[test]
+fn the_audit_health_is_published_in_controller_state() {
+    let h = Harness::new("audit-health", |home, _| profile(home, "alpha"));
+    h.wait_for("the first controller.state", Duration::from_secs(5), |h| {
+        h.state("controller.state").starts_with("state=running\n")
+    });
+    let degraded = super::super::state::ControllerDegraded {
+        reason: "audit_unavailable",
+        since: T0 - 40,
+        cause: "the audit log could not be reconciled (exit=73)".into(),
+    };
+    h.tx.send(Msg::AuditHealth(Some(degraded.clone()))).unwrap();
+    h.wait_for("the degradation written", Duration::from_secs(5), |h| {
+        h.state("controller.state").contains("degraded=audit_unavailable\n")
+    });
+    let state = h.state("controller.state");
+    eprintln!("{state}");
+    assert!(
+        state.contains(&format!("degraded_since={}\n", T0 - 40))
+            && state.contains("degraded_cause=the audit log could not be reconciled (exit=73)\n"),
+        "{state}"
+    );
+    // Every later rewrite keeps it while it lasts (here: a run's end).
+    h.advance(1);
+    h.ask(run("alpha"));
+    h.wait_for("the run", Duration::from_secs(5), |h| {
+        h.launched() == 1 && h.idle()
+    });
+    h.wait_for("the rewrite keeps it", Duration::from_secs(5), |h| {
+        let state = h.state("controller.state");
+        state.contains(&format!("updated_epoch={}\n", T0 + 1))
+            && state.contains("degraded=audit_unavailable\n")
+    });
+    h.tx.send(Msg::AuditHealth(None)).unwrap();
+    h.wait_for("the degradation cleared", Duration::from_secs(5), |h| {
+        !h.state("controller.state").contains("degraded")
+    });
+    let logs = h.logs();
+    eprintln!("{logs:#?}");
+    assert_eq!(
+        logs.iter()
+            .filter(|l| l.starts_with("service_degraded reason=audit_unavailable"))
+            .count(),
+        1,
+        "{logs:#?}"
+    );
+    assert!(
+        logs.iter()
+            .any(|l| l.starts_with("service_degraded_cleared reason=audit_unavailable")),
+        "{logs:#?}"
+    );
+}
+
 /// The paths `ctl status` lists as `config_unreadable`.
 fn unreadable_paths(h: &Harness) -> Vec<String> {
     h.ask(Request::Status)["config_unreadable"]

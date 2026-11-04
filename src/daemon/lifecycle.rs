@@ -976,6 +976,14 @@ pub(crate) fn run_daemon(options: &Options) -> ExitCode {
                 },
             );
         });
+        // H2: the audit's health reaches controller.state through the control
+        // thread, its only writer.
+        let health_tx = tx.clone();
+        let health: super::queue::QueueHealth = Arc::new(move |degraded| {
+            if health_tx.send(Msg::AuditHealth(degraded)).is_err() {
+                say("the control thread is gone; the audit's health cannot be published in controller.state");
+            }
+        });
         match std::env::current_exe().and_then(|exe| {
             super::queue::QueueConsumer::start(
                 exe,
@@ -984,6 +992,7 @@ pub(crate) fn run_daemon(options: &Options) -> ExitCode {
                 super::queue::QueueSettings::default(),
                 log,
                 activity,
+                health,
             )
         }) {
             Ok(queue) => Some(queue),

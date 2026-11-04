@@ -47,9 +47,9 @@ use super::routines::{
     valid_name,
 };
 use super::state::{
-    ProfileOutcome, ProfileRecord, RunOutcome, RunRecord, RunStatus, STATE_WRITE_DEADLINE,
-    StateWriter, WriteError, render_controller_state, render_profile_state, render_run_state,
-    render_schedule_state, sanitize_detail,
+    ControllerDegraded, DEGRADED_CAUSE_MAX, ProfileOutcome, ProfileRecord, RunOutcome, RunRecord,
+    RunStatus, STATE_WRITE_DEADLINE, StateWriter, WriteError, render_controller_state,
+    render_profile_state, render_run_state, render_schedule_state, sanitize_detail,
 };
 use super::window::{LocalClock, window_state};
 
@@ -143,6 +143,9 @@ pub(crate) enum Msg {
     MutationDone(u64, MutationOutcome),
     /// An event from a change source, tagged with the arming it belongs to.
     Armed(u64, ChangeEvent),
+    /// The dashboard queue's audit reconcile has failed past its bound
+    /// (`Some`), or recovered (`None`): published in controller.state (H2).
+    AuditHealth(Option<ControllerDegraded>),
     /// An untagged change event (tests drive the control thread with these).
     #[cfg(test)]
     Change(ChangeEvent),
@@ -365,6 +368,8 @@ pub(crate) struct Control {
     /// Configuration and state documents that could not be read, with the
     /// cause: each named once per episode, and its recovery named (S2-2).
     unreadable: BTreeMap<PathBuf, String>,
+    /// The service's degradation, published in controller.state (H2).
+    audit_degraded: Option<ControllerDegraded>,
     last_controller_write: Option<Instant>,
     wall_unavailable: bool,
     turn_now: bool,
@@ -433,6 +438,7 @@ impl Control {
             suppressed_logged: std::collections::HashMap::new(),
             lasting_reported: HashSet::new(),
             unreadable: BTreeMap::new(),
+            audit_degraded: None,
             last_controller_write: None,
             wall_unavailable: false,
             turn_now: true,
@@ -799,9 +805,44 @@ impl Control {
                     self.change(event);
                 }
             }
+            Msg::AuditHealth(degraded) => self.audit_health(degraded),
             #[cfg(test)]
             Msg::Change(event) => self.change(event),
         }
+    }
+
+    /// H2: the service is degraded while the audit reconcile fails past its
+    /// bound (queued dashboard jobs are refused `audit_unavailable`):
+    /// controller.state carries it, so the dashboard shows it as amber, and
+    /// the keys go once it recovers. Each change is named.
+    fn audit_health(&mut self, degraded: Option<ControllerDegraded>) {
+        if degraded == self.audit_degraded {
+            return;
+        }
+        match &degraded {
+            Some(now) => self.log(
+                Level::Warn,
+                "controller",
+                "service_degraded",
+                format!(
+                    "reason={} since={} cause={}",
+                    now.reason,
+                    now.since,
+                    sanitize_detail(&now.cause, DEGRADED_CAUSE_MAX)
+                ),
+            ),
+            None => {
+                let reason = self.audit_degraded.as_ref().map_or("none", |was| was.reason);
+                self.log(
+                    Level::Info,
+                    "controller",
+                    "service_degraded_cleared",
+                    format!("reason={reason}"),
+                );
+            }
+        }
+        self.audit_degraded = degraded;
+        self.write_controller_state(!self.shutdown);
     }
 
     // ------------------------------------------------------------ records
@@ -909,7 +950,15 @@ impl Control {
         let path = self.paths.state_dir.join("controller.state");
         let _ = self.write_state(
             &path,
-            render_controller_state(running, self.pid, next, active, updated),
+            render_controller_state(
+                running,
+                self.pid,
+                next,
+                active,
+                updated,
+                // A stopped service publishes no degradation of its own.
+                self.audit_degraded.as_ref().filter(|_| running),
+            ),
         );
         self.last_controller_write = Some(Instant::now());
     }

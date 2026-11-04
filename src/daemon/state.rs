@@ -796,19 +796,45 @@ pub(crate) fn render_profile_state(
 
 // ---------------------------------------------------------------- controller / schedule
 
-/// `write_controller_state STATUS PID NEXT ACTIVE`.
+/// A degradation of the whole service, published in `controller.state` (H2):
+/// `degraded=<reason>`, `degraded_since=<epoch>`, `degraded_cause=<text>`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ControllerDegraded {
+    /// A lowercase token: `audit_unavailable`.
+    pub(crate) reason: &'static str,
+    /// When the condition began (epoch seconds).
+    pub(crate) since: u64,
+    /// Why, one line, at most [`DEGRADED_CAUSE_MAX`] bytes.
+    pub(crate) cause: String,
+}
+
+/// The longest `degraded_cause=` the daemon writes.
+pub(crate) const DEGRADED_CAUSE_MAX: usize = 240;
+
+/// `write_controller_state STATUS PID NEXT ACTIVE`, plus the service's
+/// degradation while there is one (H2).
 pub(crate) fn render_controller_state(
     running: bool,
     pid: u32,
     next_run: u64,
     active_pid: u32,
     updated: u64,
+    degraded: Option<&ControllerDegraded>,
 ) -> Vec<u8> {
-    format!(
+    let mut out = format!(
         "state={}\npid={pid}\nnext_run_epoch={next_run}\nactive_pid={active_pid}\nupdated_epoch={updated}\n",
         if running { "running" } else { "stopped" }
-    )
-    .into_bytes()
+    );
+    if let Some(degraded) = degraded {
+        let cause = sanitize_detail(&degraded.cause, DEGRADED_CAUSE_MAX);
+        out.push_str(&format!(
+            "degraded={}\ndegraded_since={}\ndegraded_cause={}\n",
+            degraded.reason,
+            degraded.since,
+            if cause.is_empty() { "none" } else { &cause }
+        ));
+    }
+    out.into_bytes()
 }
 
 /// `save_schedule_deadline`.
@@ -1146,7 +1172,7 @@ mod tests {
         writer
             .write(
                 &path,
-                render_controller_state(true, 7, 0, 0, 1),
+                render_controller_state(true, 7, 0, 0, 1, None),
                 STATE_WRITE_DEADLINE,
             )
             .unwrap();
@@ -1585,7 +1611,7 @@ mod tests {
             let tree = Tree::new("run");
             tree.private(
                 "var/state/controller.state",
-                &render_controller_state(true, 4242, 1_800_000_000, 4343, 1_700_000_000),
+                &render_controller_state(true, 4242, 1_800_000_000, 4343, 1_700_000_000, None),
             );
             tree.private(
                 "var/state/schedule.state",
@@ -1614,6 +1640,63 @@ mod tests {
                 "no progress for 45 min in phase upload"
             );
             assert_eq!(outcomes["run"]["aggregate"]["outcome"], "failed");
+        }
+
+        /// H2: the degradation the daemon writes into controller.state reads
+        /// back through the bridge snapshot as `controller.degraded`, and a
+        /// controller.state without it has no such member.
+        #[test]
+        fn a_degraded_controller_reads_back_through_the_bridge() {
+            let tree = Tree::new("degraded");
+            let degraded = ControllerDegraded {
+                reason: "audit_unavailable",
+                since: 1_700_000_000,
+                cause: "exit=73 audit outbox: Permission denied\nsecond line".into(),
+            };
+            let bytes = render_controller_state(true, 4242, 0, 0, 1_700_000_100, Some(&degraded));
+            assert_eq!(
+                String::from_utf8_lossy(&bytes),
+                "state=running\npid=4242\nnext_run_epoch=0\nactive_pid=0\nupdated_epoch=1700000100\n\
+                 degraded=audit_unavailable\ndegraded_since=1700000000\n\
+                 degraded_cause=exit=73 audit outbox: Permission denied\n"
+            );
+            tree.private("var/state/controller.state", &bytes);
+            let snapshot = tree.snapshot();
+            eprintln!("{:#}", snapshot["controller"]);
+            assert_eq!(
+                snapshot["controller"]["degraded"],
+                json!({
+                    "reason": "audit_unavailable",
+                    "since_epoch": 1_700_000_000_u64,
+                    "cause": "exit=73 audit outbox: Permission denied",
+                })
+            );
+            tree.private(
+                "var/state/controller.state",
+                &render_controller_state(true, 4242, 0, 0, 1_700_000_100, None),
+            );
+            let snapshot = tree.snapshot();
+            assert!(
+                snapshot["controller"].get("degraded").is_none(),
+                "{:#}",
+                snapshot["controller"]
+            );
+            // A malformed set is refused by name, never shown half-read.
+            for bad in [
+                "degraded=audit_unavailable\n",
+                "degraded=Audit\ndegraded_since=1\ndegraded_cause=x\n",
+                "degraded=audit_unavailable\ndegraded_since=soon\ndegraded_cause=x\n",
+                "degraded_since=1\ndegraded_cause=x\n",
+            ] {
+                let mut text =
+                    String::from_utf8(render_controller_state(true, 4242, 0, 0, 1, None)).unwrap();
+                text.push_str(bad);
+                tree.private("var/state/controller.state", text.as_bytes());
+                let refused = tree.with_paths(|paths| {
+                    snapshot_document(paths, tree.uid(), &SecurityPolicyArgs::default())
+                });
+                assert!(refused.is_err(), "{bad:?} was read");
+            }
         }
 
         /// A daemon run in flight reads as running, not as a dead runner, and

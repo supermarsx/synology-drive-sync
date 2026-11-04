@@ -17033,6 +17033,28 @@ fn snapshot_document(
     let controller_next = manager_kv(controller, "next_run_epoch", "0")?;
     let controller_active = manager_kv(controller, "active_pid", "0")?;
     let controller_updated = manager_kv(controller, "updated_epoch", "0")?;
+    // H2: the service's degradation (`degraded=`, `degraded_since=`, `degraded_cause=`), all
+    // three or none. Absent is no member; a partial or malformed set is corrupt, never shown
+    // half-read.
+    let controller_degraded = manager_kv_optional(controller, "degraded", "")?;
+    let controller_degraded_since = manager_kv_optional(controller, "degraded_since", "")?;
+    let controller_degraded_cause = manager_kv_optional(controller, "degraded_cause", "")?;
+    let degraded_present = [
+        &controller_degraded,
+        &controller_degraded_since,
+        &controller_degraded_cause,
+    ]
+    .map(|value| !value.is_empty());
+    if degraded_present.iter().any(|present| *present)
+        && (!degraded_present.iter().all(|present| *present)
+            || !controller_degraded
+                .iter()
+                .all(|byte| byte.is_ascii_lowercase() || *byte == b'_')
+            || !digits(&controller_degraded_since)
+            || controller_degraded_cause.len() > 512)
+    {
+        return Err(PACKAGE_STATE_CORRUPT);
+    }
     if !matches!(controller_status.as_slice(), b"running" | b"stopped")
         || ![
             &controller_pid,
@@ -17154,6 +17176,15 @@ fn snapshot_document(
     push_raw_member(&mut document, "active_pid", &controller_active);
     document.push(b',');
     push_raw_member(&mut document, "updated_epoch", &controller_updated);
+    if !controller_degraded.is_empty() {
+        document.extend_from_slice(b",\"degraded\":{");
+        push_quoted_member(&mut document, "reason", &controller_degraded);
+        document.push(b',');
+        push_raw_member(&mut document, "since_epoch", &controller_degraded_since);
+        document.push(b',');
+        push_quoted_member(&mut document, "cause", &controller_degraded_cause);
+        document.push(b'}');
+    }
     document.extend_from_slice(b"},\"run\":{");
     push_quoted_member(&mut document, "state", &run_status);
     document.push(b',');

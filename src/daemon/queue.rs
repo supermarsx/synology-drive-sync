@@ -45,6 +45,12 @@ pub(crate) type QueueLog = Arc<dyn Fn(Level, &'static str, String) + Send + Sync
 /// level, message. Profile `none`, category `bridge`, state `failed`.
 pub(crate) type QueueActivity = Arc<dyn Fn(&'static str, Level, String) + Send + Sync>;
 
+/// Where the consumer says the audit reconcile has failed past its bound
+/// (`Some`) or recovered (`None`), on each change: the daemon publishes it in
+/// controller.state (H2).
+pub(crate) type QueueHealth =
+    Arc<dyn Fn(Option<super::state::ControllerDegraded>) + Send + Sync>;
+
 /// A job's class, as the bridge's classifier names it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) enum Lane {
@@ -107,9 +113,10 @@ pub(crate) struct QueueSettings {
     pub(crate) audit_unavailable_after: Duration,
     /// The longest wait between two reconcile attempts while it fails.
     pub(crate) reconcile_backoff_max: Duration,
-    /// Past `audit_unavailable_after`, a job is refused only after one fresh
-    /// reconcile when the last attempt is older than this (N-D1): a recovered
-    /// audit is not refused for the rest of a long backoff.
+    /// Past `audit_unavailable_after`, a job is refused only on a reconcile
+    /// attempt made after it came: one is made once the last attempt is older
+    /// than this, and the job is held until then (N-D1). A recovered audit is
+    /// not refused for the rest of a long backoff.
     pub(crate) reconcile_recheck: Duration,
     /// After KILL, how long a consumer may take to be reaped before its slot
     /// is freed and it is handed to a reaper.
@@ -152,6 +159,7 @@ impl QueueConsumer {
         settings: QueueSettings,
         log: QueueLog,
         activity: QueueActivity,
+        health: QueueHealth,
     ) -> std::io::Result<Self> {
         let stop = Arc::new(AtomicBool::new(false));
         let consumer = Consumer {
@@ -161,6 +169,8 @@ impl QueueConsumer {
             settings,
             log,
             activity,
+            health,
+            health_published: false,
             stop: Arc::clone(&stop),
             running: BTreeMap::new(),
             last_reconcile: None,
@@ -188,10 +198,24 @@ impl QueueConsumer {
     }
 }
 
+/// What the audit gate does with a waiting job.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Gate {
+    /// The audit is reconciled: the job runs.
+    Admit,
+    /// Held, tried again later.
+    Hold,
+    /// Past the bound, and a fresh attempt made since the job came failed:
+    /// answered `audit_unavailable`.
+    Refuse,
+}
+
 /// A failing audit reconcile: since when, how many tries, the next one.
 #[derive(Default)]
 struct ReconcileEpisode {
     failing_since: Option<Instant>,
+    /// The same moment on the wall clock, for controller.state.
+    failing_since_epoch: u64,
     attempts: u32,
     next_try: Option<Instant>,
     cause: String,
@@ -224,6 +248,9 @@ struct Consumer {
     settings: QueueSettings,
     log: QueueLog,
     activity: QueueActivity,
+    health: QueueHealth,
+    /// The degradation was published and not yet cleared.
+    health_published: bool,
     stop: Arc<AtomicBool>,
     running: BTreeMap<String, Running>,
     last_reconcile: Option<Instant>,
@@ -392,6 +419,7 @@ impl Consumer {
         self.reconcile.next_try = Some(now + backoff);
         if self.reconcile.failing_since.is_none() {
             self.reconcile.failing_since = Some(now);
+            self.reconcile.failing_since_epoch = epoch_now();
             self.log(
                 Level::Error,
                 "audit_reconcile_failed",
@@ -415,20 +443,35 @@ impl Consumer {
         false
     }
 
-    /// N-D1: past the bound, before a job is refused, one fresh reconcile when
-    /// the last attempt is older than `reconcile_recheck`. Without it a
+    /// N-D1: the audit gate in front of a waiting job. Without the recheck a
     /// recovered audit was refused for the rest of the backoff (up to 60 s).
-    /// `true` when it reconciled; within the bound, or right after an attempt,
-    /// nothing is tried and the caller holds or refuses as before.
-    fn recheck_before_refusing(&mut self) -> bool {
-        if !self.audit_unavailable()
-            || self
-                .last_reconcile
-                .is_some_and(|at| at.elapsed() < self.settings.reconcile_recheck)
-        {
-            return false;
+    fn audit_gate(&mut self) -> Gate {
+        let before = self.last_reconcile;
+        if self.reconcile_audit(false) {
+            return Gate::Admit;
         }
-        self.reconcile_audit(true)
+        if !self.audit_unavailable() {
+            // Within the bound: held, retried after the backoff.
+            return Gate::Hold;
+        }
+        if self.last_reconcile != before {
+            // An attempt was just made, after the job arrived, and failed.
+            return Gate::Refuse;
+        }
+        if self
+            .last_reconcile
+            .is_some_and(|at| at.elapsed() < self.settings.reconcile_recheck)
+        {
+            // The last attempt is too recent to retry: held until it is old
+            // enough, so no job is refused on an attempt made before it came.
+            return Gate::Hold;
+        }
+        // Past the bound and inside the backoff: one fresh try before refusing.
+        if self.reconcile_audit(true) {
+            Gate::Admit
+        } else {
+            Gate::Refuse
+        }
     }
 
     /// Whether the reconcile has failed for longer than the bound: waiting
@@ -437,6 +480,25 @@ impl Consumer {
         self.reconcile
             .failing_since
             .is_some_and(|since| since.elapsed() >= self.settings.audit_unavailable_after)
+    }
+
+    /// H2: tell the daemon when the audit reconcile has failed past the
+    /// bound (jobs are refused `audit_unavailable` from then on) and when it
+    /// recovers, once per change.
+    fn publish_health(&mut self) {
+        let unavailable = self.audit_unavailable();
+        if unavailable == self.health_published {
+            return;
+        }
+        self.health_published = unavailable;
+        (self.health)(unavailable.then(|| super::state::ControllerDegraded {
+            reason: "audit_unavailable",
+            since: self.reconcile.failing_since_epoch,
+            cause: format!(
+                "the audit log could not be reconciled ({}); dashboard operations are refused until it recovers",
+                self.reconcile.cause
+            ),
+        }));
     }
 
     fn run(mut self) {
@@ -448,6 +510,18 @@ impl Consumer {
                 self.prune();
             }
             self.dispatch();
+            // An open episode is retried on its backoff even with nothing
+            // waiting, so a recovery is seen (and the amber cleared) without
+            // a job to drive it.
+            if self.reconcile.failing_since.is_some()
+                && self
+                    .reconcile
+                    .next_try
+                    .is_none_or(|at| Instant::now() >= at)
+            {
+                self.reconcile_audit(false);
+            }
+            self.publish_health();
             thread::sleep(self.settings.tick);
         }
         self.shutdown();
@@ -566,7 +640,9 @@ impl Consumer {
         if pending.is_empty() {
             return;
         }
-        let mut reconciled = false;
+        // The audit gate, decided once per pass (N-D1): every job of the pass
+        // is admitted, or every one refused, on the same attempt.
+        let mut gate: Option<Gate> = None;
         // Per lane, the first job still waiting; later jobs of a lane wait for
         // it (order within a lane), other lanes go on.
         let mut blocked: Vec<Lane> = Vec::new();
@@ -614,12 +690,15 @@ impl Consumer {
             }
             // The audit outbox is reconciled before anything is admitted, once
             // per pass, as the shell did at the top of every queue turn.
-            if !reconciled {
-                if !self.reconcile_audit(false) && !self.recheck_before_refusing() {
-                    if !self.audit_unavailable() {
-                        // Held, not dropped: retried after the backoff.
-                        return;
-                    }
+            let decided = match gate {
+                Some(decided) => decided,
+                None => *gate.insert(self.audit_gate()),
+            };
+            match decided {
+                // Held, not dropped: retried after the backoff.
+                Gate::Hold => return,
+                Gate::Admit => {}
+                Gate::Refuse => {
                     // H2: past the bound, a job is answered by name. It never
                     // ran, so the answer is exact.
                     self.log(
@@ -643,7 +722,6 @@ impl Consumer {
                     );
                     continue;
                 }
-                reconciled = true;
             }
             self.classified.remove(&id);
             self.claim(&id, lane, operation, terminal);
@@ -1173,6 +1251,8 @@ exit 64
         consumer: Option<QueueConsumer>,
         events: Arc<Mutex<Vec<String>>>,
         rows: Arc<Mutex<Vec<String>>>,
+        /// What the consumer published for controller.state, in order.
+        health: Arc<Mutex<Vec<Option<super::super::state::ControllerDegraded>>>>,
     }
 
     impl Fixture {
@@ -1204,6 +1284,11 @@ exit 64
             let activity: QueueActivity = Arc::new(move |code, _, message| {
                 row_sink.lock().unwrap().push(format!("{code} {message}"));
             });
+            let health = Arc::new(Mutex::new(Vec::new()));
+            let health_sink = Arc::clone(&health);
+            let published: QueueHealth = Arc::new(move |degraded| {
+                health_sink.lock().unwrap().push(degraded);
+            });
             let consumer = QueueConsumer::start(
                 bridge,
                 dir.join("var"),
@@ -1211,6 +1296,7 @@ exit 64
                 settings,
                 log,
                 activity,
+                published,
             )
             .unwrap();
             Self {
@@ -1218,6 +1304,7 @@ exit 64
                 consumer: Some(consumer),
                 events,
                 rows,
+                health,
             }
         }
 
@@ -1427,10 +1514,11 @@ exit 64
     }
 
     /// N-D1: once the bound has passed, a recovered audit is not refused for
-    /// the rest of a long backoff. A job that arrives when the last attempt
-    /// is more than two seconds old is given one fresh reconcile first: the
-    /// reviewer saw `{"failed":"audit_unavailable"}` 0.4 s after the fix,
-    /// with the next scheduled attempt up to 60 s away.
+    /// the rest of a long backoff. A job is refused only on an attempt made
+    /// after it arrived; one that arrives within two seconds of the last
+    /// attempt is held until a fresh one can be made: the reviewer saw
+    /// `{"failed":"audit_unavailable"}` 0.4 s after the fix, with the next
+    /// scheduled attempt up to 60 s away.
     #[test]
     fn a_recovered_audit_is_not_refused_for_the_rest_of_the_backoff() {
         let settings = QueueSettings {
@@ -1481,8 +1569,8 @@ exit 64
         );
         assert_eq!(answer.trim(), "{}", "the job ran, it was not refused");
         assert!(
-            asked.elapsed() < Duration::from_secs(2),
-            "answered within a tick or two, not after the backoff: {:?}",
+            asked.elapsed() < Duration::from_secs(3),
+            "answered within the 2 s recheck, not after the backoff: {:?}",
             asked.elapsed()
         );
         assert!(
@@ -1494,6 +1582,43 @@ exit 64
             "{:?}",
             f.events.lock().unwrap()
         );
+    }
+
+    /// H2 amber: once the reconcile has failed past the bound, the consumer
+    /// publishes the degradation (reason, since, cause) once; when it
+    /// recovers, with no job waiting to drive it, it publishes the clearing.
+    #[test]
+    fn a_failing_audit_is_published_and_cleared_for_controller_state() {
+        let settings = QueueSettings {
+            audit_unavailable_after: Duration::from_millis(800),
+            ..fast()
+        };
+        let f = Fixture::new("audit-amber", settings);
+        fs::write(f.dir.join("audit-fails"), b"").unwrap();
+        let before = epoch_now();
+        f.enqueue(A, "concurrent 0 answer\n");
+        f.wait("the degradation published", Duration::from_secs(10), |f| {
+            !f.health.lock().unwrap().is_empty()
+        });
+        let published = f.health.lock().unwrap().clone();
+        eprintln!("{published:#?}");
+        let degraded = published[0].clone().expect("the first change is a degradation");
+        assert_eq!(degraded.reason, "audit_unavailable");
+        assert!(
+            degraded.since >= before && degraded.since <= epoch_now(),
+            "{degraded:?}"
+        );
+        assert!(degraded.cause.contains("exit=73"), "{degraded:?}");
+        // Nothing waits now: the episode is retried on its own and clears.
+        fs::remove_file(f.dir.join("audit-fails")).unwrap();
+        f.wait("the clearing published", Duration::from_secs(20), |f| {
+            f.health.lock().unwrap().len() >= 2
+        });
+        thread::sleep(Duration::from_millis(300));
+        let published = f.health.lock().unwrap().clone();
+        eprintln!("{published:#?}");
+        assert_eq!(published.len(), 2, "once per change: {published:#?}");
+        assert_eq!(published[1], None);
     }
 
     /// H3: a consumer that outlives KILL (D state; here: out of the queue's

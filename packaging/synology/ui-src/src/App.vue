@@ -4517,12 +4517,29 @@ export default {
       // A defect in this window while applying a good snapshot is shown for as long
       // as it lasts, not only in a six-second toast.
       if (this.applyError) items.push({ id: "ui-apply-error", level: "warn", title: "This window failed to apply part of the package status", detail: `${this.applyError}. The package itself answered.` });
+      if (this.controllerDegradedItem) items.push(this.controllerDegradedItem);
       items.push(...this.realtimeAttentionItems);
       return this.retainedStale
         ? [{ id: "stale-poll", level: "unknown", title: "Showing a stale reading", detail: `${this.freshness} Rows below are history, not current status.` }].concat(items)
         : items;
     },
     serviceAttentionItem() { return this.snapshot ? serviceAttentionItem(this.snapshot, this.serviceState, packageGeneratedEpoch(this)) : null; },
+    // H2: the service publishes `controller.degraded` while its audit log cannot be
+    // reconciled past the bound, when every queued dashboard operation is refused
+    // `audit_unavailable`. One amber item for as long as it lasts, gone on recovery.
+    controllerDegradedItem() {
+      const controller = this.snapshot && this.snapshot.controller;
+      const degraded = controller && typeof controller === "object" && !Array.isArray(controller) ? controller.degraded : null;
+      if (!degraded || typeof degraded !== "object" || Array.isArray(degraded)) return null;
+      const reason = boundedText(degraded.reason, "unknown");
+      const since = numberOr(degraded.since_epoch, 0);
+      const when = since > 0 ? `Since ${formatDate(since)}${this.nasTimeSuffix(since)}: ` : "";
+      const cause = boundedText(degraded.cause, "no cause was recorded");
+      if (reason === "audit_unavailable") {
+        return { id: "controller-audit-unavailable", level: "warn", title: "Dashboard operations are refused: the audit log cannot be reconciled", detail: `${when}${cause}. Saves, tests and other queued operations are answered "audit log unavailable" without running until it recovers. Review Logs for audit_reconcile_failed.` };
+      }
+      return { id: `controller-degraded-${reason}`, level: "warn", title: `The sync service reports a degradation (${reason})`, detail: `${when}${cause}.` };
+    },
     // One amber item per enabled realtime routine whose native watcher is not in use,
     // named by its reason and carrying the same guidance as the routine editor.
     realtimeAttentionItems() {
