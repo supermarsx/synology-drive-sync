@@ -20,10 +20,8 @@ const BRIDGE: &str = env!("CARGO_BIN_EXE_sdsync-dsm-api");
 /// A DSM-shaped package root: `var` is a symlink to `@appdata`, as
 /// `/var/packages/<pkg>/var` is on the NAS, with a private `run/`.
 fn package_var(label: &str) -> (PathBuf, PathBuf) {
-    let root = std::env::temp_dir().join(format!(
-        "sdsync-lock-probe-{label}-{}",
-        std::process::id()
-    ));
+    let root =
+        std::env::temp_dir().join(format!("sdsync-lock-probe-{label}-{}", std::process::id()));
     let _ = fs::remove_dir_all(&root);
     let appdata = root.join("@appdata");
     fs::create_dir_all(appdata.join("run")).unwrap();
@@ -76,12 +74,19 @@ fn a_free_lock_is_0_and_left_free() {
         let (output, took) = probe(&lock);
         eprintln!("{} in {took:?}", shown(&output));
         assert_eq!(output.status.code(), Some(0), "{}", shown(&output));
-        assert!(output.stdout.is_empty() && output.stderr.is_empty(), "{}", shown(&output));
+        assert!(
+            output.stdout.is_empty() && output.stderr.is_empty(),
+            "{}",
+            shown(&output)
+        );
         assert!(took < Duration::from_secs(5));
     }
     // The probe released what it took.
     let file = fs::File::open(&lock).unwrap();
-    assert!(flock(&file, libc::LOCK_EX | libc::LOCK_NB), "the probe left the lock held");
+    assert!(
+        flock(&file, libc::LOCK_EX | libc::LOCK_NB),
+        "the probe left the lock held"
+    );
     let _ = fs::remove_dir_all(root);
 }
 
@@ -91,7 +96,11 @@ fn a_held_lock_is_3_and_never_waited_for() {
     let lock = var.join("run/daemon.lock");
     private_file(&lock);
     // Held as the daemon holds it: flock on its own open file description.
-    let holder = fs::OpenOptions::new().read(true).write(true).open(&lock).unwrap();
+    let holder = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&lock)
+        .unwrap();
     assert!(flock(&holder, libc::LOCK_EX | libc::LOCK_NB));
     let (output, took) = probe(&lock);
     eprintln!("{} in {took:?}", shown(&output));
@@ -100,7 +109,12 @@ fn a_held_lock_is_3_and_never_waited_for() {
     assert!(took < Duration::from_secs(5), "never waits: {took:?}");
     drop(holder);
     let (output, _) = probe(&lock);
-    assert_eq!(output.status.code(), Some(0), "free once released: {}", shown(&output));
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "free once released: {}",
+        shown(&output)
+    );
     let _ = fs::remove_dir_all(root);
 }
 
@@ -126,7 +140,10 @@ fn what_cannot_be_probed_is_1_and_named() {
         eprintln!("{}: {} in {took:?}", path.display(), shown(&output));
         assert_eq!(output.status.code(), Some(1), "{}", shown(&output));
         assert!(output.stdout.is_empty(), "{}", shown(&output));
-        assert!(took < Duration::from_secs(5), "a FIFO never blocks: {took:?}");
+        assert!(
+            took < Duration::from_secs(5),
+            "a FIFO never blocks: {took:?}"
+        );
         let stderr = String::from_utf8_lossy(&output.stderr);
         let expected = format!("daemon-lock-probe: {}: ", path.display());
         assert!(

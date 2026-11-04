@@ -264,7 +264,14 @@ fn a_batch_run_publishes_the_phase_it_reached() {
     keys.sort_unstable();
     assert_eq!(
         keys,
-        ["count", "job_id", "request_id", "schema", "section", "updated_at"],
+        [
+            "count",
+            "job_id",
+            "request_id",
+            "schema",
+            "section",
+            "updated_at"
+        ],
         "a batch record carries the same six keys"
     );
 }

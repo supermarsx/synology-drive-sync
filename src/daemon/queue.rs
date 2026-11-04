@@ -48,8 +48,7 @@ pub(crate) type QueueActivity = Arc<dyn Fn(&'static str, Level, String) + Send +
 /// Where the consumer says the audit reconcile has failed past its bound
 /// (`Some`) or recovered (`None`), on each change: the daemon publishes it in
 /// controller.state (H2).
-pub(crate) type QueueHealth =
-    Arc<dyn Fn(Option<super::state::ControllerDegraded>) + Send + Sync>;
+pub(crate) type QueueHealth = Arc<dyn Fn(Option<super::state::ControllerDegraded>) + Send + Sync>;
 
 /// A job's class, as the bridge's classifier names it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -616,10 +615,7 @@ impl Consumer {
                 self.log(
                     Level::Error,
                     "control_file_unremovable",
-                    format!(
-                        "id={id} kind={kind} path={} cause={error}",
-                        path.display()
-                    ),
+                    format!("id={id} kind={kind} path={} cause={error}", path.display()),
                 );
                 false
             }
@@ -1602,7 +1598,9 @@ exit 64
         });
         let published = f.health.lock().unwrap().clone();
         eprintln!("{published:#?}");
-        let degraded = published[0].clone().expect("the first change is a degradation");
+        let degraded = published[0]
+            .clone()
+            .expect("the first change is a degradation");
         assert_eq!(degraded.reason, "audit_unavailable");
         assert!(
             degraded.since >= before && degraded.since <= epoch_now(),
@@ -1681,7 +1679,10 @@ exit 64
     #[test]
     fn an_unremovable_secret_is_named() {
         let f = Fixture::new("secret-stays", fast());
-        let secret = f.dir.join("var/control/requests").join(format!("{A}.secret"));
+        let secret = f
+            .dir
+            .join("var/control/requests")
+            .join(format!("{A}.secret"));
         fs::write(&secret, b"hunter2").unwrap();
         fs::set_permissions(&secret, fs::Permissions::from_mode(0o600)).unwrap();
         f.enqueue(A, "concurrent 0 plantdir\n");
@@ -1750,9 +1751,11 @@ exit 64
             "a file that is still there did not expire: {events:#?}"
         );
         assert!(
-            events.iter().any(|e| e.starts_with("control_file_unremovable")
-                && e.contains("kind=response")
-                && e.contains("ermission denied")),
+            events
+                .iter()
+                .any(|e| e.starts_with("control_file_unremovable")
+                    && e.contains("kind=response")
+                    && e.contains("ermission denied")),
             "{events:#?}"
         );
     }

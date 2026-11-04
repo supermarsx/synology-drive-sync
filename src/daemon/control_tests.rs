@@ -1682,7 +1682,8 @@ fn the_audit_health_is_published_in_controller_state() {
     };
     h.tx.send(Msg::AuditHealth(Some(degraded.clone()))).unwrap();
     h.wait_for("the degradation written", Duration::from_secs(5), |h| {
-        h.state("controller.state").contains("degraded=audit_unavailable\n")
+        h.state("controller.state")
+            .contains("degraded=audit_unavailable\n")
     });
     let state = h.state("controller.state");
     eprintln!("{state}");
@@ -1769,7 +1770,11 @@ fn an_unreadable_dependency_state_is_named() {
         "{:#?}",
         h.logs()
     );
-    assert_eq!(h.launched(), 0, "a dependency that cannot be read is not met");
+    assert_eq!(
+        h.launched(),
+        0,
+        "a dependency that cannot be read is not met"
+    );
     fs::set_permissions(&state, fs::Permissions::from_mode(0o600)).unwrap();
     // The deferred routine is evaluated again at its next check.
     h.advance(3600);

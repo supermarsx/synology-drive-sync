@@ -574,6 +574,8 @@ impl Control {
     /// [`Control::read_document_keeping`] where the caller's documented
     /// default is the right reading of an unreadable document too: it is
     /// named, with `kept` saying what the caller does instead.
+    // Spelled out so the reader sees the error is named, not dropped.
+    #[allow(clippy::manual_unwrap_or_default)]
     fn read_or_default(&mut self, path: &Path, kept: &str) -> Option<Vec<u8>> {
         match self.read_document_keeping(path, kept) {
             Ok(bytes) => bytes,
@@ -728,7 +730,7 @@ impl Control {
                     &self.paths.state_dir.join("schedule.state"),
                     "the next scheduled run is computed afresh",
                 )
-                    .as_deref(),
+                .as_deref(),
             ),
         );
         if self.schedule.enabled {
@@ -832,7 +834,10 @@ impl Control {
                 ),
             ),
             None => {
-                let reason = self.audit_degraded.as_ref().map_or("none", |was| was.reason);
+                let reason = self
+                    .audit_degraded
+                    .as_ref()
+                    .map_or("none", |was| was.reason);
                 self.log(
                     Level::Info,
                     "controller",

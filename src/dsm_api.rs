@@ -6242,7 +6242,10 @@ mod linux_socket {
             }
             let (attempt, error, took) =
                 refused.expect("a backlog of one is full within 64 connects");
-            eprintln!("connect {attempt} refused after {took:?}: {error} ({:?})", error.kind());
+            eprintln!(
+                "connect {attempt} refused after {took:?}: {error} ({:?})",
+                error.kind()
+            );
             assert_eq!(error.kind(), io::ErrorKind::TimedOut, "{error}");
             assert!(
                 error.to_string().contains("backlog") && error.to_string().contains("deaf.sock"),

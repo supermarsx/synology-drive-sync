@@ -331,11 +331,7 @@ impl FileSink {
         let held_for = now.duration_since(since);
         if held_for >= ROTATION_BACKOFF {
             if !reported {
-                self.failed(
-                    path,
-                    now,
-                    &format!("{cause}, for {} s", held_for.as_secs()),
-                );
+                self.failed(path, now, &format!("{cause}, for {} s", held_for.as_secs()));
             }
             return;
         }
@@ -600,17 +596,15 @@ mod event_lock {
             && lines[1].parse::<u64>().is_ok_and(|start| start > 0)
             && !lines[2].is_empty();
         if well_formed {
-            return Ok(
-                if super::super::state::private_lock_owner(lock).is_some() {
-                    Owner::Held(format!(
-                        "{} is held by a live writer (PID {})",
-                        lock.display(),
-                        lines[0]
-                    ))
-                } else {
-                    Owner::Stale(format!("its owner PID {} is gone", lines[0]), recorded)
-                },
-            );
+            return Ok(if super::super::state::private_lock_owner(lock).is_some() {
+                Owner::Held(format!(
+                    "{} is held by a live writer (PID {})",
+                    lock.display(),
+                    lines[0]
+                ))
+            } else {
+                Owner::Stale(format!("its owner PID {} is gone", lines[0]), recorded)
+            });
         }
         // Torn: written before this boot, or unchanged across a settle.
         if boot_epoch().is_some_and(|boot| metadata.mtime() < boot) {
@@ -632,9 +626,9 @@ mod event_lock {
             metadata.len(),
             metadata.mtime(),
         );
-        let mut seen = TORN_SEEN.lock().map_err(|_| {
-            TakeError::Failed("the torn-record state is poisoned".to_owned())
-        })?;
+        let mut seen = TORN_SEEN
+            .lock()
+            .map_err(|_| TakeError::Failed("the torn-record state is poisoned".to_owned()))?;
         match *seen {
             Some((earlier, at)) if earlier == identity && at.elapsed() >= TORN_SETTLED => {
                 *seen = None;
@@ -690,7 +684,8 @@ mod event_lock {
                 return Err(format!("{}: not a directory", lock.display()).into());
             }
             // Only `pid` may be inside; anything else makes it unprovable.
-            for entry in fs::read_dir(lock).map_err(|error| format!("{}: {error}", lock.display()))?
+            for entry in
+                fs::read_dir(lock).map_err(|error| format!("{}: {error}", lock.display()))?
             {
                 let entry = entry.map_err(|error| format!("{}: {error}", lock.display()))?;
                 if entry.file_name() != "pid" {
@@ -768,7 +763,8 @@ mod event_lock {
             .map(|metadata| (metadata.dev(), metadata.ino()))
             .map_err(|error| format!("{}: {error}", recovery.display()))?;
         if renamed == judged {
-            fs::remove_file(recovery).map_err(|error| format!("{}: {error}", recovery.display()))?;
+            fs::remove_file(recovery)
+                .map_err(|error| format!("{}: {error}", recovery.display()))?;
             return Ok(true);
         }
         // Not the record judged: restored, and the lock is held by it.
@@ -1042,7 +1038,9 @@ mod tests {
         let path = root.join("log/activity.log");
         {
             let mut trouble = ROTATION_TROUBLE.lock().unwrap();
-            let trouble = trouble.get_mut(&path).expect("the deferral opened an episode");
+            let trouble = trouble
+                .get_mut(&path)
+                .expect("the deferral opened an episode");
             let past = Instant::now()
                 .checked_sub(ROTATION_BACKOFF + std::time::Duration::from_secs(1))
                 .expect("the monotonic clock is past one minute");

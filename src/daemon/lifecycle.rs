@@ -525,7 +525,9 @@ impl MutationRunner for ManagerMutations {
                     "consumer_timeout: {} did not finish within {} s and was stopped; its outcome is unknown{}",
                     mutation.op,
                     deadline.as_secs(),
-                    unwaited.map(|cause| format!(" ({cause})")).unwrap_or_default()
+                    unwaited
+                        .map(|cause| format!(" ({cause})"))
+                        .unwrap_or_default()
                 ),
             };
         }
@@ -981,7 +983,9 @@ pub(crate) fn run_daemon(options: &Options) -> ExitCode {
         let health_tx = tx.clone();
         let health: super::queue::QueueHealth = Arc::new(move |degraded| {
             if health_tx.send(Msg::AuditHealth(degraded)).is_err() {
-                say("the control thread is gone; the audit's health cannot be published in controller.state");
+                say(
+                    "the control thread is gone; the audit's health cannot be published in controller.state",
+                );
             }
         });
         match std::env::current_exe().and_then(|exe| {
@@ -1625,10 +1629,8 @@ mod tests {
     /// A manager script for [`ManagerMutations`], in a private directory.
     fn manager(label: &str, body: &str) -> (PathBuf, ManagerMutations) {
         use std::os::unix::fs::PermissionsExt;
-        let dir = std::env::temp_dir().join(format!(
-            "sdsyncd-mutation-{label}-{}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("sdsyncd-mutation-{label}-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         let script = dir.join("sdsync-dsm");
@@ -1672,10 +1674,7 @@ mod tests {
     /// collector (`collector.join()`) after the manager itself had exited.
     #[test]
     fn a_grandchild_holding_stderr_does_not_hold_the_mutation() {
-        let (dir, runner) = manager(
-            "grandchild",
-            "echo 'saved alpha' >&2\nsleep 30 &\nexit 0",
-        );
+        let (dir, runner) = manager("grandchild", "echo 'saved alpha' >&2\nsleep 30 &\nexit 0");
         let began = Instant::now();
         let outcome = runner.run(&mutation(), Duration::from_secs(10));
         let took = began.elapsed();

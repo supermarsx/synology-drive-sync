@@ -577,14 +577,26 @@ mod tests {
     /// can after ECHILD) is left alone.
     #[test]
     fn a_reused_pid_is_never_signalled() {
-        let mut other = std::process::Command::new("sleep").arg("30").spawn().unwrap();
+        let mut other = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
         let pid = other.id();
         let start = super::super::super::linux_files::process_start(pid).unwrap();
         assert!(still_running(pid, Some(start)));
-        assert!(!still_running(pid, Some(start + 1)), "another start tick is another process");
-        assert_eq!(signal_if_same(pid, start + 1, libc::SIGKILL).unwrap(), false);
+        assert!(
+            !still_running(pid, Some(start + 1)),
+            "another start tick is another process"
+        );
+        assert_eq!(
+            signal_if_same(pid, start + 1, libc::SIGKILL).unwrap(),
+            false
+        );
         thread::sleep(Duration::from_millis(100));
-        assert!(other.try_wait().unwrap().is_none(), "a reused pid was signalled");
+        assert!(
+            other.try_wait().unwrap().is_none(),
+            "a reused pid was signalled"
+        );
         assert_eq!(signal_if_same(pid, start, libc::SIGKILL).unwrap(), true);
         let status = other.wait().unwrap();
         assert_eq!(status.signal(), Some(libc::SIGKILL));
@@ -606,17 +618,26 @@ mod tests {
             stop: Arc::new(AtomicBool::new(false)),
             child: Arc::new(AtomicU32::new(0)),
         };
-        let mut child = std::process::Command::new("sleep").arg("30").spawn().unwrap();
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
         let pid = child.id();
         let start = super::super::super::linux_files::process_start(pid).unwrap();
         // Reaped behind std's back, as SIGCHLD=SIG_IGN or another waiter would.
         sys::kill_process(pid, libc::SIGKILL).unwrap();
         let mut status = 0;
         // SAFETY: waitpid on our own child, with a live out-parameter.
-        assert_eq!(unsafe { libc::waitpid(pid as libc::pid_t, &mut status, 0) }, pid as libc::pid_t);
+        assert_eq!(
+            unsafe { libc::waitpid(pid as libc::pid_t, &mut status, 0) },
+            pid as libc::pid_t
+        );
         let error = child.try_wait().unwrap_err();
         assert_eq!(error.raw_os_error(), Some(libc::ECHILD), "{error}");
-        assert!(keeper.put_down(&mut child, (pid, Some(start)), &error), "proven gone");
+        assert!(
+            keeper.put_down(&mut child, (pid, Some(start)), &error),
+            "proven gone"
+        );
         let events = events.lock().unwrap().clone();
         eprintln!("{events:#?}");
         assert!(
