@@ -858,6 +858,39 @@ fn a_script_that_is_briefly_busy_for_writing_is_run_once_it_is_free() {
     let _ = fs::remove_dir_all(&dir);
 }
 
+/// A `supervisor.lock` still held after the supervisor's wait is another supervisor (or a stuck
+/// probe): the supervisor leaves, and that is an error the log says by name, on stderr too, never a
+/// silent exit 0.
+#[test]
+fn a_supervisor_that_gives_up_on_the_lock_says_so_at_error_level() {
+    let package = Package::new("supervisor-lock-held");
+    let core = script(&package.p("core"), "exit 0");
+    let holder = hold_lock(&package.p("@appdata/run/supervisor.lock"), 6);
+    let began = Instant::now();
+    let supervise = Command::new(DAEMON)
+        .arg("--supervise")
+        .args(["--home".as_ref(), package.p("home").as_os_str()])
+        .args(["--var".as_ref(), package.p("var").as_os_str()])
+        .args(["--core".as_ref(), core.as_os_str()])
+        .env("PATH", "/usr/bin:/bin")
+        .output()
+        .unwrap();
+    assert!(began.elapsed() >= Duration::from_secs(2), "it did not wait");
+    assert!(supervise.status.success(), "{supervise:?}");
+    let said = String::from_utf8_lossy(&supervise.stderr);
+    assert!(said.contains("supervisor.lock is still held"), "{said}");
+    let log = package.log();
+    let line = log
+        .lines()
+        .find(|line| line.contains("\"event\":\"service_superseded\""))
+        .unwrap_or_else(|| panic!("no service_superseded line: {log}"));
+    assert!(line.contains("\"level\":\"error\""), "{line}");
+    assert!(line.contains("supervisor.lock"), "{line}");
+    let mut holder = holder;
+    let _ = holder.kill();
+    let _ = holder.wait();
+}
+
 /// F4: the shell's `flock -n daemon.lock true` probe holds the lock for a
 /// moment; a daemon starting then waits it out instead of exiting 75.
 #[test]

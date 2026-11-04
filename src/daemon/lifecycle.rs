@@ -1471,9 +1471,12 @@ pub(crate) fn run_supervise(options: &Options) -> ExitCode {
                 SINGLETON_WAIT.as_secs()
             );
             say(&cause);
+            // A lock still held after the wait is not a start that raced a probe: another
+            // supervisor, or a holder that never lets go, and no daemon comes of this
+            // start. It leaves exit 0 (a supervisor is already there to serve), by name.
             log_or_stderr(
                 &sink,
-                Level::Info,
+                Level::Error,
                 "service_superseded",
                 format!("cause={cause}"),
             );
