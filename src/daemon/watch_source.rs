@@ -40,6 +40,9 @@ pub(crate) struct WatchSettings {
     pub(crate) setup_deadline: Duration,
     /// Bound on one polling reading and on the start-up catch-up walk.
     pub(crate) walk_deadline: Duration,
+    /// How far the polling walk's deadline, and the native watch's setup
+    /// deadline, may grow on a tree too large to walk in time (H4).
+    pub(crate) walk_deadline_max: Duration,
     /// First wait before polling tries the native watch again; doubles up to
     /// `rearm_max` (a tree over the watch limit stays over it).
     pub(crate) rearm_first: Duration,
@@ -59,6 +62,7 @@ impl Default for WatchSettings {
         Self {
             setup_deadline: synology_drive_sync::watch::DEFAULT_SETUP_DEADLINE,
             walk_deadline: synology_drive_sync::watch::DEFAULT_SETUP_DEADLINE,
+            walk_deadline_max: Duration::from_secs(1800),
             rearm_first: Duration::from_secs(600),
             rearm_max: Duration::from_secs(6 * 3600),
             source_recheck: Duration::from_secs(30),
@@ -192,9 +196,12 @@ impl Worker {
         let mut source_missing = false;
         let mut caught_up = false;
         let mut rearm_wait = self.settings.rearm_first;
+        // H4: a tree too large to arm within the deadline is given longer on
+        // each retry, up to the cap, and the growth is named.
+        let mut setup_deadline = self.settings.setup_deadline;
         while !self.stopped() {
             let failure = if self.settings.native {
-                match self.native(&mut source_missing, &mut caught_up) {
+                match self.native(&mut source_missing, &mut caught_up, setup_deadline) {
                     Attempt::Stopped => return,
                     Attempt::Failed(error) => error,
                 }
@@ -222,12 +229,18 @@ impl Worker {
                         "watch_unavailable" => BackendReason::WatchUnavailable,
                         _ => BackendReason::WatchSetupFailed,
                     };
-                    match self.poll_for(
-                        reason,
-                        failure.to_string(),
-                        rearm_wait,
-                        &mut source_missing,
-                    ) {
+                    let mut detail = failure.to_string();
+                    if matches!(failure, WatchError::Deadline { .. }) {
+                        setup_deadline = setup_deadline
+                            .saturating_mul(2)
+                            .min(self.settings.walk_deadline_max)
+                            .max(setup_deadline);
+                        detail.push_str(&format!(
+                            "; next_setup_deadline_seconds={}",
+                            setup_deadline.as_secs()
+                        ));
+                    }
+                    match self.poll_for(reason, detail, rearm_wait, &mut source_missing) {
                         PollEnd::Stopped => return,
                         PollEnd::SourceMissing => {}
                         PollEnd::Retry => {
@@ -244,7 +257,12 @@ impl Worker {
 
     /// Arm the native watch and serve it until it fails or is stopped.
     #[cfg(target_os = "linux")]
-    fn native(&self, source_missing: &mut bool, caught_up: &mut bool) -> Attempt {
+    fn native(
+        &self,
+        source_missing: &mut bool,
+        caught_up: &mut bool,
+        setup_deadline: Duration,
+    ) -> Attempt {
         use synology_drive_sync::watch::{EventSet, LimitPolicy, TreeWatch, WatchOptions};
         let filter = match self.filter() {
             Ok(filter) => filter,
@@ -260,7 +278,7 @@ impl Worker {
                 filter,
                 events,
                 limit: LimitPolicy::System,
-                setup_deadline: self.settings.setup_deadline,
+                setup_deadline,
             },
         ) {
             Ok(tree) => tree,
@@ -360,7 +378,12 @@ impl Worker {
     }
 
     #[cfg(not(target_os = "linux"))]
-    fn native(&self, _source_missing: &mut bool, _caught_up: &mut bool) -> Attempt {
+    fn native(
+        &self,
+        _source_missing: &mut bool,
+        _caught_up: &mut bool,
+        _setup_deadline: Duration,
+    ) -> Attempt {
         Attempt::Failed(WatchError::Unavailable(
             "inotify is available on Linux only".to_owned(),
         ))
@@ -512,6 +535,8 @@ impl Worker {
             PollConfig {
                 interval: self.spec.poll,
                 walk_deadline: self.settings.walk_deadline,
+                walk_deadline_max: self.settings.walk_deadline_max,
+                degraded_every: self.floor(),
                 reason,
                 detail,
             },
@@ -877,6 +902,7 @@ mod tests {
         WatchSettings {
             setup_deadline: Duration::from_secs(10),
             walk_deadline: Duration::from_secs(10),
+            walk_deadline_max: Duration::from_secs(10),
             rearm_first: Duration::from_millis(400),
             rearm_max: Duration::from_secs(2),
             source_recheck: Duration::from_millis(200),
