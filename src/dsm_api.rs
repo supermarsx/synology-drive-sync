@@ -18740,10 +18740,20 @@ fn log_source_files(log_root: &Path, source: LogSource) -> Vec<PathBuf> {
         LogSource::RunStderr => ("run-stderr.log", 3),
         LogSource::All => return Vec::new(),
     };
-    let mut files = (1..=rotations)
-        .rev()
-        .map(|index| log_root.join(format!("{name}.{index}")))
-        .collect::<Vec<_>>();
+    let mut files = Vec::new();
+    if source == LogSource::Controller {
+        // The daemon engine's own stderr (`--supervise` keeps it, 1 MiB and one
+        // rotation): raw lines, which read as errors. Placed before the
+        // controller's own generations, as the oldest; the supervisor relays a
+        // dying daemon's last line into controller.log too (`last_stderr=`).
+        files.push(log_root.join("daemon-stderr.log.1"));
+        files.push(log_root.join("daemon-stderr.log"));
+    }
+    files.extend(
+        (1..=rotations)
+            .rev()
+            .map(|index| log_root.join(format!("{name}.{index}"))),
+    );
     files.push(log_root.join(name));
     files
 }
