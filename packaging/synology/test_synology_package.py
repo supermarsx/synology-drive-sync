@@ -23585,6 +23585,35 @@ fi
         self.assertIn("live=73", self.shell(probe).stdout)
         (lock / "pid").unlink()
 
+    def test_a_run_lock_owner_linked_from_the_daemons_staging_file_is_live(self) -> None:
+        # The daemon publishes run.lock/pid by linking `.run.lock.pid.<pid>.<n>`
+        # (a sibling of the lock, src/daemon/state.rs) and unlinking it. For that
+        # instant the owner file has two links; the reader must know the staging
+        # name as a companion instead of reading the lock as unverifiable (73).
+        self.configure_with_password("alpha", self.source_one, True)
+        probe = self._common_helper(
+            "staged-lock-helper.sh",
+            "umask 077\n"
+            'start=$(process_start_time "$$")\n'
+            "boot=$(boot_identity)\n"
+            'mkdir -p "$run_lock"\n'
+            'chmod 700 "$run_lock"\n'
+            'printf "%s\\n%s\\n%s\\n" "$$" "$start" "$boot" > "$run_lock/pid"\n'
+            'link=$runtime_root/.run.lock.stray\n'
+            '[ "$1" != staged ] || link=$runtime_root/.run.lock.pid.$$.7\n'
+            'ln "$run_lock/pid" "$link"\n'
+            "status=0\n"
+            'private_process_lock_is_live "$run_lock" || status=$?\n'
+            'echo "live=$status"\n'
+            'rm -f "$link" "$run_lock/pid"\n'
+            'rmdir "$run_lock"\n',
+        )
+        staged = self.shell(probe, "staged")
+        self.assertIn("live=0", staged.stdout, staged.stdout + staged.stderr)
+        # A second link under any other name is still a lock nobody can vouch for.
+        stray = self.shell(probe, "stray")
+        self.assertIn("live=73", stray.stdout, stray.stdout + stray.stderr)
+
     def _calendar_clock_bin(self, label: str, clock: Path) -> Path:
         """A fake date that answers every format from one epoch file, in UTC."""
         fake_bin = self.root / f"{label}-bin"

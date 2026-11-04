@@ -1335,10 +1335,16 @@ read_private_lock_owner() {
             lock_owner_identity=$(stat -c '%d:%i' "$lock_owner_path" 2>/dev/null || true)
             [ -n "$lock_owner_identity" ] || return 1
             lock_owner_topology_valid=false
+            # The daemon publishes run.lock/pid by linking a staging file named
+            # beside the lock (.run.lock.pid.<pid>.<n>, src/daemon/state.rs) and
+            # unlinking it; for that instant it is a companion like a claim.
+            lock_owner_staging_dir=${event_log_lock%/*}
+            lock_owner_staging_name=${event_log_lock##*/}
             for lock_owner_companion in \
                 "$event_log_lock.claim.$lock_owner_pid.$lock_owner_start.$lock_owner_boot" \
                 "$event_log_lock.pending.$lock_owner_pid.$lock_owner_start.$lock_owner_boot" \
-                "$event_log_lock/pid"; do
+                "$event_log_lock/pid" \
+                "$lock_owner_staging_dir/.$lock_owner_staging_name.pid.$lock_owner_pid."*; do
                 [ "$lock_owner_companion" != "$lock_owner_path" ] || continue
                 companion_identity=$(stat -c '%d:%i' "$lock_owner_companion" 2>/dev/null || true)
                 if [ -n "$companion_identity" ] && [ "$companion_identity" = "$lock_owner_identity" ]; then
