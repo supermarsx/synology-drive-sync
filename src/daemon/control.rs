@@ -1427,7 +1427,16 @@ impl Control {
                         .settings_fingerprint(&name)
                         .is_some_and(|now| now != lasting.fingerprint) =>
                 {
-                    self.remove_block_file(&name, "settings_changed");
+                    // The fragment is read twice (is_file above, the
+                    // fingerprint here): one removed in between reads as
+                    // changed settings, but the cause is its removal.
+                    let fragment = self.paths.profiles_dir.join(format!("{name}.toml"));
+                    let cause = if fragment.is_file() {
+                        "settings_changed"
+                    } else {
+                        "profile_removed"
+                    };
+                    self.remove_block_file(&name, cause);
                 }
                 Ok(lasting) => {
                     found.insert(name, Blocked::Lasting(lasting));
