@@ -165,19 +165,74 @@ pub(crate) fn check_identity(home: &Path) -> Result<u32, String> {
     if uid == 0 {
         return Err("refusing to run as root".into());
     }
-    let metadata =
-        fs::symlink_metadata(home).map_err(|error| format!("{}: {error}", home.display()))?;
-    if metadata.file_type().is_symlink() || !metadata.is_dir() {
-        return Err(format!("{} is not a directory", home.display()));
+    resolve_root(home, uid)?;
+    Ok(uid)
+}
+
+/// A package root (`home`, `var`), judged by what it points at.
+///
+/// On DSM `/var/packages/<pkg>/home` and `/var` are framework symlinks to
+/// `@apphome/<pkg>` and `@appdata/<pkg>`, and every script and profile names
+/// the alias, so the root is followed, one link only. The target must be a
+/// real directory owned by this uid that no group or other user may write.
+/// Below the roots nothing may be a link (`ensure_layout`). Every refusal
+/// names the alias, the target and the cause. Returns the resolved directory.
+pub(crate) fn resolve_root(root: &Path, uid: u32) -> Result<PathBuf, String> {
+    let link =
+        fs::symlink_metadata(root).map_err(|error| format!("{}: {error}", root.display()))?;
+    let resolved = if link.file_type().is_symlink() {
+        let target = fs::read_link(root)
+            .map_err(|error| format!("{}: the link cannot be read: {error}", root.display()))?;
+        let target = if target.is_absolute() {
+            target
+        } else {
+            root.parent().unwrap_or(Path::new("/")).join(target)
+        };
+        let target_link = fs::symlink_metadata(&target).map_err(|error| {
+            format!(
+                "{} -> {}: the target is unavailable: {error}",
+                root.display(),
+                target.display()
+            )
+        })?;
+        if target_link.file_type().is_symlink() {
+            return Err(format!(
+                "{} -> {}: the target is itself a link (one level only)",
+                root.display(),
+                target.display()
+            ));
+        }
+        target
+    } else {
+        root.to_path_buf()
+    };
+    let metadata = fs::symlink_metadata(&resolved)
+        .map_err(|error| format!("{}: {error}", resolved.display()))?;
+    let named = || {
+        if resolved == root {
+            root.display().to_string()
+        } else {
+            format!("{} -> {}", root.display(), resolved.display())
+        }
+    };
+    if !metadata.is_dir() {
+        return Err(format!("{} is not a directory", named()));
     }
     if metadata.uid() != uid {
         return Err(format!(
             "{} is owned by uid {}, not by this process (uid {uid})",
-            home.display(),
+            named(),
             metadata.uid()
         ));
     }
-    Ok(uid)
+    if metadata.mode() & 0o022 != 0 {
+        return Err(format!(
+            "{} is writable by group or others (mode {:o})",
+            named(),
+            metadata.mode() & 0o7777
+        ));
+    }
+    Ok(resolved)
 }
 
 /// `ensure_layout`: the daemon's private directories exist, are directories
@@ -196,6 +251,16 @@ pub(crate) fn ensure_layout(var: &Path, uid: u32) -> Result<(), String> {
         } else {
             var.join(relative)
         };
+        // The var root may be DSM's alias symlink (to `@appdata/<pkg>`): its
+        // target is judged, and left at the mode DSM gave it.
+        let root = relative.is_empty();
+        if root {
+            match resolve_root(&dir, uid) {
+                Ok(_) => continue,
+                Err(cause) if fs::symlink_metadata(&dir).is_ok() => return Err(cause),
+                Err(_) => {}
+            }
+        }
         match fs::symlink_metadata(&dir) {
             Ok(metadata) => {
                 if metadata.file_type().is_symlink() || !metadata.is_dir() {
@@ -208,7 +273,7 @@ pub(crate) fn ensure_layout(var: &Path, uid: u32) -> Result<(), String> {
                         metadata.uid()
                     ));
                 }
-                if metadata.mode() & 0o077 != 0 {
+                if !root && metadata.mode() & 0o077 != 0 {
                     fs::set_permissions(&dir, fs::Permissions::from_mode(0o700))
                         .map_err(|error| format!("{}: {error}", dir.display()))?;
                 }
@@ -457,6 +522,27 @@ pub(crate) fn run_daemon(options: &Options) -> ExitCode {
             category: "controller",
             event: "service_engine",
             detail,
+        },
+    );
+    // The roots as named and as they resolve (DSM's aliases), once.
+    let resolved = |root: &Path| {
+        resolve_root(root, uid)
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|cause| format!("unresolved ({cause})"))
+    };
+    let _ = sink.log(
+        epoch().unwrap_or(0),
+        &LogEvent {
+            level: Level::Info,
+            category: "controller",
+            event: "service_layout",
+            detail: format!(
+                "home={} resolved={} var={} resolved={}",
+                options.home.display(),
+                resolved(&options.home),
+                options.var.display(),
+                resolved(&options.var)
+            ),
         },
     );
     let child_env = executor::allowlisted_env(std::env::vars_os());
@@ -1003,6 +1089,84 @@ mod tests {
                 .contains("not a directory")
         );
         assert!(check_identity(&var.join("log")).is_err());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// DSM's alias roots: `/var/packages/<pkg>/home` and `/var` are symlinks
+    /// to `@apphome`/`@appdata`, and every script and profile names the alias.
+    /// The roots are judged by their targets (and the var target keeps the
+    /// mode DSM gave it); below them nothing may be a link.
+    #[test]
+    fn alias_roots_are_refused_by_name_when_their_target_is_not_ours() {
+        let dir = std::env::temp_dir().join(format!("sdsyncd-alias-bad-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let uid = sys::geteuid();
+        // Another owner's directory (root's /tmp, also world-writable).
+        std::os::unix::fs::symlink("/tmp", dir.join("foreign")).unwrap();
+        let error = resolve_root(&dir.join("foreign"), uid).unwrap_err();
+        assert!(
+            error.contains("-> /tmp") && error.contains("owned by uid 0"),
+            "{error}"
+        );
+        // A dangling root.
+        std::os::unix::fs::symlink(dir.join("gone"), dir.join("dangling")).unwrap();
+        let error = resolve_root(&dir.join("dangling"), uid).unwrap_err();
+        assert!(
+            error.contains("dangling -> ") && error.contains("unavailable"),
+            "{error}"
+        );
+        // A writable target.
+        fs::create_dir_all(dir.join("open")).unwrap();
+        fs::set_permissions(dir.join("open"), fs::Permissions::from_mode(0o777)).unwrap();
+        std::os::unix::fs::symlink(dir.join("open"), dir.join("var")).unwrap();
+        let error = ensure_layout(&dir.join("var"), uid).unwrap_err();
+        assert!(error.contains("writable by group or others"), "{error}");
+        // A link to a link.
+        std::os::unix::fs::symlink(dir.join("var"), dir.join("twice")).unwrap();
+        let error = resolve_root(&dir.join("twice"), uid).unwrap_err();
+        assert!(error.contains("one level only"), "{error}");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn dsm_alias_roots_are_followed_and_nothing_below_them() {
+        let dir = std::env::temp_dir().join(format!("sdsyncd-alias-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join("@apphome")).unwrap();
+        fs::create_dir_all(dir.join("@appdata")).unwrap();
+        fs::set_permissions(dir.join("@appdata"), fs::Permissions::from_mode(0o755)).unwrap();
+        std::os::unix::fs::symlink(dir.join("@apphome"), dir.join("home")).unwrap();
+        std::os::unix::fs::symlink(dir.join("@appdata"), dir.join("var")).unwrap();
+        let uid = check_identity(&dir.join("home")).unwrap();
+        ensure_layout(&dir.join("var"), uid).unwrap();
+        assert!(dir.join("@appdata/run").is_dir() && dir.join("@appdata/state/routines").is_dir());
+        // A link below the root is still refused.
+        fs::remove_dir(dir.join("@appdata/log")).unwrap();
+        std::os::unix::fs::symlink(dir.join("@apphome"), dir.join("@appdata/log")).unwrap();
+        assert!(
+            ensure_layout(&dir.join("var"), uid)
+                .unwrap_err()
+                .contains("not a directory")
+        );
+        fs::remove_file(dir.join("@appdata/log")).unwrap();
+        assert_eq!(
+            fs::metadata(dir.join("@appdata"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o755,
+            "DSM's directory is left as DSM made it"
+        );
+        // An alias to a file is not a home.
+        fs::write(dir.join("file"), "x").unwrap();
+        std::os::unix::fs::symlink(dir.join("file"), dir.join("not-home")).unwrap();
+        assert!(
+            check_identity(&dir.join("not-home"))
+                .unwrap_err()
+                .contains("not a directory")
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 

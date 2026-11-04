@@ -48,23 +48,29 @@ impl Package {
             NEXT.fetch_add(1, Ordering::SeqCst)
         ));
         let _ = fs::remove_dir_all(&root);
+        // Shaped like DSM: home and var are the framework's symlinks to
+        // @apphome and @appdata, which is what the scripts pass the daemon.
         for dir in [
             "",
-            "home",
-            "home/config",
-            "home/config/profiles.d",
-            "home/config/routines.d",
-            "home/secrets",
-            "var",
+            "@apphome",
+            "@apphome/config",
+            "@apphome/config/profiles.d",
+            "@apphome/config/routines.d",
+            "@apphome/secrets",
+            "@appdata",
         ] {
             private_dir(&root.join(dir));
         }
+        std::os::unix::fs::symlink(root.join("@apphome"), root.join("home")).unwrap();
+        std::os::unix::fs::symlink(root.join("@appdata"), root.join("var")).unwrap();
         // As the package writes them: the daemon holds every run to the
         // runner's pre-core checks (the url, the policy, the password file).
         fs::write(
             root.join("home/config/profiles.d/alpha.toml"),
-            "source = \"/volume1/alpha\"\nurl = \"http://127.0.0.1:9\"\ndelete = false\n\
-             max-delete = 100\n",
+            "[profiles.alpha]\nsource = \"/volume1/alpha\"\nremote = \"/home/Drive/alpha\"\n\
+             url = \"http://127.0.0.1:9\"\nusername = \"operator\"\nexcludes = []\n\
+             delete = false\nallow-empty-source = false\nmax-delete = 100\n\
+             allow-http = true\ndanger-accept-invalid-certs = false\n",
         )
         .unwrap();
         let password = root.join("home/secrets/alpha.password");
