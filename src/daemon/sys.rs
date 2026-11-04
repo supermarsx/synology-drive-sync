@@ -57,12 +57,22 @@ pub(crate) fn wait_signal() -> io::Result<libc::c_int> {
     }
 }
 
+/// The refusal of a pid that must never be signalled, named.
+fn refused_pid(pid: u32) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidInput,
+        format!(
+            "refusing to signal pid {pid}: 0 and 1 name the caller's process group and init, and a pid above i32::MAX names nothing"
+        ),
+    )
+}
+
 /// Send `signal` to the process group `pgid` (I-10: only our own child's group).
 pub(crate) fn kill_group(pgid: u32, signal: libc::c_int) -> io::Result<()> {
     let pgid = libc::pid_t::try_from(pgid)
         .ok()
         .filter(|pgid| *pgid > 1)
-        .ok_or_else(|| io::Error::from_raw_os_error(libc::EINVAL))?;
+        .ok_or_else(|| refused_pid(pgid))?;
     // SAFETY: kill has no pointer arguments; a negative pid names a group.
     if unsafe { libc::kill(-pgid, signal) } == 0 {
         return Ok(());
@@ -78,7 +88,12 @@ pub(crate) fn kill_group(pgid: u32, signal: libc::c_int) -> io::Result<()> {
 
 /// Send `signal` to one process.
 pub(crate) fn kill_process(pid: u32, signal: libc::c_int) -> io::Result<()> {
-    let pid = libc::pid_t::try_from(pid).map_err(|_| io::Error::from_raw_os_error(libc::EINVAL))?;
+    // 0 is the caller's own process group and 1 is init: whatever record a pid came from, these
+    // two never reach kill(2) (kill_group has always refused them).
+    let pid = libc::pid_t::try_from(pid)
+        .ok()
+        .filter(|pid| *pid > 1)
+        .ok_or_else(|| refused_pid(pid))?;
     // SAFETY: kill has no pointer arguments.
     if unsafe { libc::kill(pid, signal) } == 0 {
         Ok(())
@@ -366,6 +381,23 @@ impl Tail {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `kill(0, sig)` signals the caller's own process group and `kill(1, sig)` init: a pid that
+    /// came out of a record as 0 or 1 must never reach them. The probe signal 0 delivers nothing,
+    /// so an unguarded call answers Ok and the refusal is what is under test.
+    #[test]
+    fn a_signal_to_pid_zero_or_one_is_refused_by_name() {
+        for pid in [0_u32, 1] {
+            let process = kill_process(pid, 0).expect_err("refused");
+            assert_eq!(process.kind(), io::ErrorKind::InvalidInput, "{pid}");
+            assert!(
+                process.to_string().contains(&format!("pid {pid}")),
+                "{process}"
+            );
+            let group = kill_group(pid, 0).expect_err("refused");
+            assert!(group.to_string().contains(&format!("pid {pid}")), "{group}");
+        }
+    }
 
     #[test]
     fn the_c_library_clock_agrees_with_utc_arithmetic_under_tz_utc() {
