@@ -217,6 +217,11 @@ failing poll leaves it holding whatever it last reported rather than updating to
 Overview and Routines surface both the backend and, when it is not `ok`, the reason explicitly. Do
 not infer native realtime support from the requested `mode=realtime` alone.
 
+Under the daemon engine, `sdsync-dsm-api --ctl status` carries the cause behind the reason: each entry of
+`routines` has `backend_detail`, the detail of the routine's latest backend report (at most 240 bytes,
+`null` when there is none, cleared when the routine is armed or disarmed), and every report is also a
+`routine_backend` line in `controller.log`.
+
 ## Retry and backoff
 
 Profile **Retries** handle eligible network operations inside one engine run. Routine **Retry
