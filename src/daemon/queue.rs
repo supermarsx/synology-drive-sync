@@ -107,6 +107,10 @@ pub(crate) struct QueueSettings {
     pub(crate) audit_unavailable_after: Duration,
     /// The longest wait between two reconcile attempts while it fails.
     pub(crate) reconcile_backoff_max: Duration,
+    /// Past `audit_unavailable_after`, a job is refused only after one fresh
+    /// reconcile when the last attempt is older than this (N-D1): a recovered
+    /// audit is not refused for the rest of a long backoff.
+    pub(crate) reconcile_recheck: Duration,
     /// After KILL, how long a consumer may take to be reaped before its slot
     /// is freed and it is handed to a reaper.
     pub(crate) reap_bound: Duration,
@@ -127,6 +131,7 @@ impl Default for QueueSettings {
             max_responses: 256,
             audit_unavailable_after: Duration::from_secs(30),
             reconcile_backoff_max: Duration::from_secs(60),
+            reconcile_recheck: Duration::from_secs(2),
             reap_bound: Duration::from_secs(10),
         }
     }
@@ -351,10 +356,11 @@ impl Consumer {
     /// Reconcile the audit outbox. A failure opens an episode: named once
     /// (controller.log and an Activity row the dashboard shows), tried again
     /// after a backoff that doubles to `reconcile_backoff_max`, and its
-    /// recovery is named too (H2). `false` while it fails or waits to retry.
-    fn reconcile_audit(&mut self) -> bool {
+    /// recovery is named too (H2). `false` while it fails or waits to retry;
+    /// `force` tries now, inside the backoff (N-D1).
+    fn reconcile_audit(&mut self, force: bool) -> bool {
         let now = Instant::now();
-        if self.reconcile.next_try.is_some_and(|at| now < at) {
+        if !force && self.reconcile.next_try.is_some_and(|at| now < at) {
             return false;
         }
         self.last_reconcile = Some(now);
@@ -407,6 +413,22 @@ impl Consumer {
         }
         self.reconcile.cause = cause;
         false
+    }
+
+    /// N-D1: past the bound, before a job is refused, one fresh reconcile when
+    /// the last attempt is older than `reconcile_recheck`. Without it a
+    /// recovered audit was refused for the rest of the backoff (up to 60 s).
+    /// `true` when it reconciled; within the bound, or right after an attempt,
+    /// nothing is tried and the caller holds or refuses as before.
+    fn recheck_before_refusing(&mut self) -> bool {
+        if !self.audit_unavailable()
+            || self
+                .last_reconcile
+                .is_some_and(|at| at.elapsed() < self.settings.reconcile_recheck)
+        {
+            return false;
+        }
+        self.reconcile_audit(true)
     }
 
     /// Whether the reconcile has failed for longer than the bound: waiting
@@ -593,7 +615,7 @@ impl Consumer {
             // The audit outbox is reconciled before anything is admitted, once
             // per pass, as the shell did at the top of every queue turn.
             if !reconciled {
-                if !self.reconcile_audit() {
+                if !self.reconcile_audit(false) && !self.recheck_before_refusing() {
                     if !self.audit_unavailable() {
                         // Held, not dropped: retried after the backoff.
                         return;
@@ -954,7 +976,8 @@ impl Consumer {
             .last_reconcile
             .is_none_or(|at| at.elapsed() >= Duration::from_secs(5))
         {
-            let _ = self.reconcile_audit();
+            // A failure opens (or continues) the episode, named there.
+            self.reconcile_audit(false);
         }
         self.prune_responses();
     }
@@ -1392,6 +1415,76 @@ exit 64
         f.wait("the next job run", Duration::from_secs(70), |f| {
             f.response(B).is_some_and(|r| r.trim() == "{}")
         });
+        assert!(
+            f.events
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|e| e.starts_with("audit_reconcile_recovered")),
+            "{:?}",
+            f.events.lock().unwrap()
+        );
+    }
+
+    /// N-D1: once the bound has passed, a recovered audit is not refused for
+    /// the rest of a long backoff. A job that arrives when the last attempt
+    /// is more than two seconds old is given one fresh reconcile first: the
+    /// reviewer saw `{"failed":"audit_unavailable"}` 0.4 s after the fix,
+    /// with the next scheduled attempt up to 60 s away.
+    #[test]
+    fn a_recovered_audit_is_not_refused_for_the_rest_of_the_backoff() {
+        let settings = QueueSettings {
+            audit_unavailable_after: Duration::from_millis(800),
+            ..fast()
+        };
+        let f = Fixture::new("audit-recovers", settings);
+        fs::write(f.dir.join("audit-fails"), b"").unwrap();
+        let calls = || {
+            fs::read_to_string(f.dir.join("calls"))
+                .unwrap_or_default()
+                .lines()
+                .filter(|l| l.starts_with("--audit-transaction"))
+                .count()
+        };
+        // Keep a job waiting until the episode has backed off to 8 s: the
+        // attempts come at 0, 1, 3 and 7 s; the next is due at 15 s.
+        let mut n = 0_u64;
+        while calls() < 4 {
+            n += 1;
+            let id = format!("{n:048x}");
+            f.enqueue(&id, "concurrent 0 answer\n");
+            f.wait(&format!("job {n} answered"), Duration::from_secs(20), |f| {
+                f.response(&id).is_some()
+            });
+            assert!(
+                f.response(&id).unwrap().contains("audit_unavailable"),
+                "job {n} is refused while the audit fails"
+            );
+            thread::sleep(Duration::from_millis(200));
+        }
+        let before = calls();
+        // The audit recovers; the last attempt is now older than the recheck.
+        thread::sleep(Duration::from_millis(2500));
+        fs::remove_file(f.dir.join("audit-fails")).unwrap();
+        const D: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa4";
+        let asked = Instant::now();
+        f.enqueue(D, "concurrent 0 answer\n");
+        f.wait("the job after recovery", Duration::from_secs(20), |f| {
+            f.response(D).is_some()
+        });
+        let answer = f.response(D).unwrap();
+        eprintln!(
+            "answer after {:?}: {answer:?}; reconciles before={before} after={}; events: {:#?}",
+            asked.elapsed(),
+            calls(),
+            f.events.lock().unwrap()
+        );
+        assert_eq!(answer.trim(), "{}", "the job ran, it was not refused");
+        assert!(
+            asked.elapsed() < Duration::from_secs(2),
+            "answered within a tick or two, not after the backoff: {:?}",
+            asked.elapsed()
+        );
         assert!(
             f.events
                 .lock()
