@@ -2645,7 +2645,11 @@ pub fn populate_plan_digests_evidenced(
             );
             let mut evidence = evidence;
             let vouched = match evidence.as_deref_mut() {
-                Some(source) => source.vouch(local, remote, &comparison, &strong, &spellings),
+                Some(source) => {
+                    let vouched = source.vouch(local, remote, &comparison, &strong, &spellings);
+                    report.plan_clock_unbounded = source.plan_clock_unbounded();
+                    vouched
+                }
                 None => crate::digest_evidence::Vouched::default(),
             };
             crate::digest_evidence::apply_vouched(local, remote, &mut comparison, &vouched.served);

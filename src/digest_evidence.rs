@@ -94,6 +94,12 @@ pub trait EvidenceSource {
 
     /// What the pass did with this source's evidence, canary verdict included.
     fn conclude(&mut self, _report: &EvidenceReport) {}
+
+    /// How many pairs this source declined to vouch for because the NAS clock it judged them by
+    /// is not one this host's clock bounds. Zero for a source with no such rule.
+    fn plan_clock_unbounded(&self) -> usize {
+        0
+    }
 }
 
 /// Reconciliation's evidence: the SC-3 carry (unless `--reconcile full`), plus a store that
@@ -116,6 +122,10 @@ impl EvidenceSource for ReconcileEvidence<'_, '_> {
             Some(carry) => carry.vouch(local, remote, comparison, strong, spellings),
             None => Vouched::default(),
         }
+    }
+
+    fn plan_clock_unbounded(&self) -> usize {
+        self.carry.as_ref().map_or(0, PlanCarry::plan_clock_unbounded)
     }
 
     fn observe_live(
@@ -160,6 +170,9 @@ pub struct EvidenceReport {
     pub canary_mismatch: Option<CanaryMismatch>,
     /// True when a canary disagreement made this pass re-verify every vouched pair live.
     pub fell_back: bool,
+    /// Pairs the carry did not serve because the NAS clock of the plan pass was not one this
+    /// host's clock bounds (`pair-index-plan-clock-unbounded`).
+    pub plan_clock_unbounded: usize,
 }
 
 /// Fill the digests `served` vouches for, and take each fully vouched pair out of `comparison`
@@ -422,9 +435,18 @@ pub struct PlanCarry<'plan> {
     pub read_started: std::time::SystemTime,
     /// The racy windows ([`crate::pair_index::RacyWindows::for_host`] outside tests).
     pub racy: crate::pair_index::RacyWindows,
+    /// Pairs the carry would have served but for a NAS clock this host's clock does not bound
+    /// (see [`PlanCarry::nas_clock_is_bounded`]); counted by [`EvidenceSource::vouch`] and read
+    /// back with [`EvidenceSource::plan_clock_unbounded`].
+    pub clock_unbounded: std::cell::Cell<usize>,
 }
 
 impl PlanCarry<'_> {
+    /// Pairs counted so far as declined for want of a bounded NAS clock.
+    pub fn plan_clock_unbounded(&self) -> usize {
+        self.clock_unbounded.get()
+    }
+
     /// Whether the plan's digests of this pair were taken while a write could still hide from
     /// its facts: locally a change time within the window of the run's start (no later than the
     /// read), on the NAS one within the window of the plan's own `MD5.start` clock, or no such
@@ -440,8 +462,12 @@ impl PlanCarry<'_> {
         let local_racy = local.times.ctime_ns > read_ns.saturating_sub(self.racy.local_ns);
         let remote_racy = match (remote.ctime_seconds, remote.digest_nas_time) {
             (Some(ctime), Some(clock)) => {
-                !self.nas_clock_is_bounded(clock, read_ns)
-                    || ctime > clock.saturating_sub(self.racy.remote_seconds)
+                if self.nas_clock_is_bounded(clock, read_ns) {
+                    ctime > clock.saturating_sub(self.racy.remote_seconds)
+                } else {
+                    self.clock_unbounded.set(self.clock_unbounded.get() + 1);
+                    true
+                }
             }
             _ => true,
         };
@@ -653,6 +679,7 @@ mod tests {
             seed: 0,
             read_started: plan_read_started(),
             racy: windows(),
+            clock_unbounded: Default::default(),
         };
         let comparison: BTreeSet<String> = fresh_remote
             .entries
@@ -683,6 +710,7 @@ mod tests {
             seed: 0,
             read_started: plan_read_started(),
             racy: windows(),
+            clock_unbounded: Default::default(),
         };
         let comparison = BTreeSet::from(["x".to_owned()]);
         let vouched = carry.vouch(
@@ -712,6 +740,7 @@ mod tests {
             seed: 0,
             read_started: plan_read_started(),
             racy: windows(),
+            clock_unbounded: Default::default(),
         };
         let comparison = BTreeSet::from(["x".to_owned()]);
         let vouched = carry.vouch(
@@ -756,6 +785,7 @@ mod tests {
             seed: 0,
             read_started: plan_read_started(),
             racy: windows(),
+            clock_unbounded: Default::default(),
         };
         let vouched = carry.vouch(
             &fresh_local,
@@ -822,6 +852,7 @@ mod tests {
             seed: 0,
             read_started,
             racy: windows(),
+            clock_unbounded: Default::default(),
         };
         let vouched = carry.vouch(
             &fresh_local,
@@ -837,6 +868,8 @@ mod tests {
             vec!["barely-ahead", "barely-behind", "in-bounds"],
             "a clock more than {TOLERANCE} s outside the pass is not one to judge by"
         );
+        // The two it could not judge are counted, so the run can name them.
+        assert_eq!(carry.plan_clock_unbounded(), 2);
     }
 
     #[test]
@@ -854,6 +887,7 @@ mod tests {
             seed: 0,
             read_started: plan_read_started(),
             racy: windows(),
+            clock_unbounded: Default::default(),
         };
         let comparison = BTreeSet::from(["x".to_owned()]);
         assert!(
@@ -882,6 +916,7 @@ mod tests {
             seed: 0,
             read_started: plan_read_started(),
             racy: windows(),
+            clock_unbounded: Default::default(),
         };
         let comparison = BTreeSet::from(["x".to_owned()]);
         let strong = comparison.clone();

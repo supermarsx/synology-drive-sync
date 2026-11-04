@@ -200,6 +200,7 @@ pub const ISSUE_CODES: &[&str] = &[
     "pair-index-writeback-unbounded",
     "pair-index-nas-clock-skewed",
     "pair-index-cleanup-failed",
+    "pair-index-plan-clock-unbounded",
 ];
 
 impl IndexIssue {
@@ -540,6 +541,27 @@ impl IndexSession {
     pub fn suspend_serving(&mut self, issue: IndexIssue) {
         self.serving = false;
         self.report.issues.push(issue);
+    }
+
+    /// The run's carry did not serve `count` pairs because the NAS clock of the plan pass was not
+    /// one this host's clock bounds (`pair-index-plan-clock-unbounded`, information): they were
+    /// verified live. Nothing is named for zero.
+    pub fn note_plan_clock_unbounded(&mut self, count: usize) {
+        if count == 0 {
+            return;
+        }
+        self.report.issues.push(IndexIssue::info(
+            "pair-index-plan-clock-unbounded",
+            &self.binding.remote,
+            format!(
+                "{count} {} not carried from the plan pass: the NAS clock (the Date header of \
+                 its MD5.start) stood more than {NAS_CLOCK_TOLERANCE_SECONDS} s outside this \
+                 host's clock, so it cannot show whether a NAS change time was settled; they \
+                 were verified live. Check the time settings of the NAS, and of any proxy in \
+                 front of it",
+                if count == 1 { "pair was" } else { "pairs were" }
+            ),
+        ));
     }
 
     /// Decide whether the remote change time can be trusted this run, from the fresh listing.

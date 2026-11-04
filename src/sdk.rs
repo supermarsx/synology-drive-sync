@@ -1095,6 +1095,9 @@ pub struct ReconciliationSummary {
     pub canary_mismatch: Option<String>,
     /// True when a canary disagreement made reconciliation re-verify every carried pair live.
     pub fell_back_to_full: bool,
+    /// Pairs not carried because the NAS clock of the plan pass was not one this host's clock
+    /// bounds (`pair-index-plan-clock-unbounded`); they were verified live.
+    pub plan_clock_unbounded: usize,
 }
 
 impl ReconciliationSummary {
@@ -1109,6 +1112,7 @@ impl ReconciliationSummary {
                 .as_ref()
                 .map(|mismatch| mismatch.path.clone()),
             fell_back_to_full: report.fell_back,
+            plan_clock_unbounded: report.plan_clock_unbounded,
         }
     }
 }
@@ -1497,6 +1501,7 @@ impl Engine {
                         .map_or(0, |elapsed| elapsed.as_nanos() as u64),
                     read_started: started_at,
                     racy: crate::pair_index::RacyWindows::for_host(),
+                    clock_unbounded: Default::default(),
                 };
                 let (rebuilt, reconciliation_deferred, evidence) = reconciliation_plan(
                     &client,

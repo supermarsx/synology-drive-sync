@@ -105,7 +105,7 @@ for (const [issue, words] of Object.entries(ISSUES)) {
 }
 
 test("info-level index codes never produce an item", () => {
-  for (const issue of ["pair-index-retired", "pair-index-not-applicable", "pair-index-unsupported-platform"]) {
+  for (const issue of ["pair-index-retired", "pair-index-not-applicable", "pair-index-unsupported-platform", "pair-index-plan-clock-unbounded"]) {
     assert.deepEqual(indexItems(withIndex({ issue })), [], issue);
   }
 });
@@ -119,6 +119,7 @@ test("a retired index explains itself in the status line, with the detail, and r
   assert.match(indexLine(normalizeOutcomes(withIndex({ state: "cold", issue: "pair-index-retired" })).profiles[0].index), /rebuilt, it belonged to another source or remote$/);
   assert.match(indexLine(normalizeOutcomes(withIndex({ state: "off", issue: "pair-index-not-applicable" })).profiles[0].index), /not used for this profile/);
   assert.match(indexLine(normalizeOutcomes(withIndex({ state: "off", issue: "pair-index-unsupported-platform" })).profiles[0].index), /not supported on this platform/);
+  assert.match(indexLine(normalizeOutcomes(withIndex({ state: "warm", issue: "pair-index-plan-clock-unbounded" })).profiles[0].index), /checked live again because the destination's clock is more than 20 seconds/);
   // A warning-level issue is an item, not a line note.
   assert.doesNotMatch(indexLine(normalizeOutcomes(withIndex({ issue: "pair-index-corrupt" })).profiles[0].index), /corrupt|damaged/);
 });

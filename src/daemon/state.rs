@@ -297,7 +297,8 @@ pub(crate) struct IndexFacts {
     pub(crate) canary_mismatches: u64,
     /// The most serious issue the run named (`pair-index-corrupt`, ...), with
     /// its path and cause on one line. Of the info-level notes only
-    /// `pair-index-retired` is kept, when nothing worse was named.
+    /// `pair-index-retired` and `pair-index-plan-clock-unbounded` are kept, when
+    /// nothing worse was named.
     pub(crate) issue: Option<String>,
     pub(crate) issue_detail: Option<String>,
 }
@@ -316,7 +317,14 @@ impl IndexFacts {
         let rank = |severity: &str, code: &str| match severity {
             "error" => 3,
             "warning" => 2,
-            "info" if code == "pair-index-retired" => 1,
+            "info"
+                if matches!(
+                    code,
+                    "pair-index-retired" | "pair-index-plan-clock-unbounded"
+                ) =>
+            {
+                1
+            }
             _ => 0,
         };
         let worst = value
@@ -1973,6 +1981,20 @@ mod tests {
                 assert_eq!(index["issue"], code, "{outcomes}");
                 assert_eq!(index["issue_detail"], "/volume1/photos/a.jpg: named");
             }
+            // The info note the carry's skew bound raises is kept, when nothing worse is named.
+            let facts = IndexFacts::from_value(&json!({
+                "state": "warm",
+                "entries": 10,
+                "issues": [
+                    {"code": "pair-index-plan-clock-unbounded", "severity": "info", "path": "", "cause": "3 pairs were not carried"}
+                ]
+            }))
+            .expect("the record reads");
+            assert_eq!(
+                facts.issue.as_deref(),
+                Some("pair-index-plan-clock-unbounded")
+            );
+            assert_eq!(facts.issue_detail.as_deref(), Some(": 3 pairs were not carried"));
             profile.facts.index = None;
             tree.private(
                 "var/state/profiles/photos.state",

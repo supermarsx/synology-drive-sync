@@ -3277,6 +3277,7 @@ fn prepare_and_run_sync_reporting(
             seed: canary_seed(started_at),
             read_started: started_at,
             racy: synology_drive_sync::pair_index::RacyWindows::for_host(),
+            clock_unbounded: Default::default(),
         });
         let carrying = carry.is_some();
         let (reconciliation, reconciliation_deferred, evidence) = build_reconciliation_plan(
@@ -3298,6 +3299,10 @@ fn prepare_and_run_sync_reporting(
             .as_mut()
             .expect("the completion was recorded before reconciliation");
         warn_reconcile_canary(&settings.output, &evidence);
+        warn_plan_clock_unbounded(&settings.output, &evidence);
+        if let Some(session) = index_session.as_mut() {
+            session.note_plan_clock_unbounded(evidence.plan_clock_unbounded);
+        }
         log_reconcile_evidence(logger.as_ref(), profile, &evidence)?;
         completion.reconciliation = Some(ReconciliationEvidence {
             mode: if carrying { "carry" } else { "full" },
@@ -3804,6 +3809,21 @@ fn warn_reconcile_canary(output: &config::ResolvedOutput, evidence: &EvidenceRep
     if let Some(mismatch) = &evidence.canary_mismatch {
         eprintln!("warning: {}", reconcile_canary_text(mismatch));
     }
+}
+
+/// Pairs the carry could not serve for want of a NAS clock this host's clock bounds were verified
+/// live; with the index on, the same count is `pair-index-plan-clock-unbounded` in its issues.
+fn warn_plan_clock_unbounded(output: &config::ResolvedOutput, evidence: &EvidenceReport) {
+    if output.quiet || evidence.plan_clock_unbounded == 0 {
+        return;
+    }
+    eprintln!(
+        "warning: pair-index-plan-clock-unbounded: {} pair(s) were not carried from the plan pass \
+         because the NAS clock (the Date header of its MD5.start) is more than {} s from this \
+         host's clock; they were verified live",
+        evidence.plan_clock_unbounded,
+        synology_drive_sync::pair_index::NAS_CLOCK_TOLERANCE_SECONDS
+    );
 }
 
 fn reconcile_canary_text(mismatch: &digest_evidence::CanaryMismatch) -> String {
@@ -9133,6 +9153,7 @@ fn reconciliation_value(reconciliation: &ReconciliationEvidence) -> Value {
             "remote_md5_prefix": mismatch.remote,
         })),
         "fell_back_to_full": evidence.fell_back,
+        "plan_clock_unbounded": evidence.plan_clock_unbounded,
     })
 }
 

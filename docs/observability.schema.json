@@ -64,7 +64,8 @@
                   "pair-index-writeback-unknown",
                   "pair-index-writeback-unbounded",
                   "pair-index-nas-clock-skewed",
-                  "pair-index-cleanup-failed"
+                  "pair-index-cleanup-failed",
+                  "pair-index-plan-clock-unbounded"
                 ]
               },
               "severity": { "enum": ["info", "warning"] },
@@ -947,7 +948,8 @@
                     }
                   ]
                 },
-                "fell_back_to_full": { "type": "boolean" }
+                "fell_back_to_full": { "type": "boolean" },
+                "plan_clock_unbounded": { "description": "Pairs not carried because the NAS clock of the plan pass (the `Date` header of its `MD5.start`) was not one this host's clock bounds; they were verified live (`pair-index-plan-clock-unbounded`).", "$ref": "#/$defs/nonNegativeInteger" }
               }
             }
           ]

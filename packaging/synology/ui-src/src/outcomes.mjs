@@ -160,11 +160,12 @@ const RECORD_ERROR_COPY = Object.freeze({
 // The verified-pair (checksum) index a profile's last run used. States are the closed list the
 // package writes; the issue codes below are the warning-level ones it names, in plain words.
 const INDEX_STATES = Object.freeze(["off", "cold", "warm", "refreshed", "unusable", "local-only"]);
-const INDEX_INFO_ISSUES = Object.freeze(["pair-index-retired", "pair-index-not-applicable", "pair-index-unsupported-platform"]);
+const INDEX_INFO_ISSUES = Object.freeze(["pair-index-retired", "pair-index-not-applicable", "pair-index-unsupported-platform", "pair-index-plan-clock-unbounded"]);
 const INDEX_INFO_NOTES = Object.freeze({
   "pair-index-retired": "rebuilt, it belonged to another source or remote",
   "pair-index-not-applicable": "not used for this profile",
-  "pair-index-unsupported-platform": "not supported on this platform"
+  "pair-index-unsupported-platform": "not supported on this platform",
+  "pair-index-plan-clock-unbounded": "some files were checked live again because the destination's clock is more than 20 seconds from this NAS's; check the time settings"
 });
 const INDEX_ISSUE_COPY =Object.freeze({
   "pair-index-corrupt": "the checksum index was damaged; it was set aside and rebuilt from this run, so every file was checked live",

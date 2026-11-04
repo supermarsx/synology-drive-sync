@@ -127,6 +127,7 @@ and a fully live run. None fails a run or makes it partial.
 | `pair-index-writeback-unbounded` | Periodic writeback is switched off (`dirty_writeback_centisecs` = 0), so no window bounds a mapped write: nothing local is served and every pair is verified live. |
 | `pair-index-cleanup-failed` | A file the index set aside or no longer needs (a quarantined copy, a panic record) could not be removed; the path and cause are named. |
 | `pair-index-nas-clock-skewed` | The NAS clock (`Date` of an `MD5.start`) stood more than 20 s outside this host's clock while the pass read; evidence it proved is stored racy and verified live next run. Fix the NAS's (or a proxy's) time. |
+| `pair-index-plan-clock-unbounded` (info) | The run's carry from the plan pass did not serve some pairs because the NAS clock of the plan pass (`Date` of an `MD5.start`) stood more than 20 s outside this host's clock, so it could not show whether a NAS change time was settled. The count is in the cause, and the pairs were verified live. Fix the NAS's (or a proxy's) time. |
 | `pair-index-retired` (info) | The index was bound to another profile, source, remote root or NAS, or an older comparison semantics; it was cleared. Semantics epoch 1 (the two-second racy window) is retired by name. |
 | `pair-index-not-applicable` (info) | The run does not compare content, so it neither reads nor writes the index. |
 | `pair-index-unsupported-platform` (info) | Windows: a directory walk exposes no status-change time or file identity, so the index is never used there. |

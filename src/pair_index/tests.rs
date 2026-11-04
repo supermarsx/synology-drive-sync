@@ -343,6 +343,34 @@ fn a_nas_clock_that_disagrees_with_the_local_clock_makes_the_record_racy() {
     assert!(named[0].cause.contains("Date"), "{}", named[0].cause);
 }
 
+/// The carry's skew bound (N-I4) demotes pairs without the index knowing; the run hands the count
+/// to the session, which names it once as information.
+#[test]
+fn pairs_the_plan_clock_could_not_vouch_for_are_named_with_their_count() {
+    let mut session = IndexSession::open(
+        Box::new(MemoryPairIndex::default()),
+        binding(),
+        options(0),
+        SystemTime::now(),
+    );
+    session.note_plan_clock_unbounded(0);
+    assert!(
+        session.report.issues.is_empty(),
+        "{:?}",
+        session.report.issues
+    );
+    session.note_plan_clock_unbounded(3);
+    let named: Vec<&IndexIssue> = session
+        .report
+        .issues
+        .iter()
+        .filter(|issue| issue.code == "pair-index-plan-clock-unbounded")
+        .collect();
+    assert_eq!(named.len(), 1, "{:?}", session.report.issues);
+    assert_eq!(named[0].severity, Severity::Info);
+    assert!(named[0].cause.contains("3 "), "{}", named[0].cause);
+}
+
 /// No NAS clock from `MD5.start` means the remote side's racy window cannot be ruled out.
 #[test]
 fn evidence_without_a_nas_clock_is_racy() {
@@ -702,6 +730,7 @@ fn a_canary_disagreement_discards_the_whole_index_and_is_named() {
             remote: Some("bbbbbbbbbbbb".to_owned()),
         }),
         fell_back: true,
+        plan_clock_unbounded: 0,
     };
     // The fallback re-read every pair live; both proved equal under the new digest.
     let (fresh_local, fresh_remote) = tree(&[
