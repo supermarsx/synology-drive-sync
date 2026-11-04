@@ -206,6 +206,8 @@ pub(crate) struct Settings {
     pub(crate) pair_index_dir: Option<PathBuf>,
     /// Publish `run.lock` for the bridge and shell readers (Linux).
     pub(crate) publish_run_lock: bool,
+    /// How often an armed realtime routine syncs its whole tree anyway.
+    pub(crate) full_reconcile_every: Duration,
     /// The child's base environment (already allowlisted).
     pub(crate) child_env: Vec<(std::ffi::OsString, std::ffi::OsString)>,
 }
@@ -219,6 +221,7 @@ impl Default for Settings {
             core_nice: None,
             pair_index_dir: None,
             publish_run_lock: cfg!(target_os = "linux"),
+            full_reconcile_every: Duration::from_secs(24 * 3600),
             child_env: allowlisted_env(std::env::vars_os()),
         }
     }
@@ -273,6 +276,9 @@ struct Entry {
     backend: Option<(Backend, BackendReason)>,
     /// What the change source is watching for this routine, if anything.
     armed: Option<ArmSpec>,
+    /// When the safety-net whole-tree run is next due (design §2.3: inotify
+    /// misses some writes, e.g. mmap without close, other mount namespaces).
+    full_due: Option<Instant>,
 }
 
 /// Why a profile's automatic runs are held (daemon/lasting.rs).
@@ -841,6 +847,7 @@ impl Control {
                 source: SourceStatus::Ok,
                 backend: None,
                 armed: None,
+                full_due: None,
             });
             entry.state = state;
             let realtime =
@@ -1277,6 +1284,34 @@ impl Control {
     }
 
     fn evaluate_routines(&mut self, now: u64) {
+        // The daily safety net of every armed realtime routine: the whole tree
+        // once a day, whatever the watcher saw.
+        let instant = Instant::now();
+        let every = self.settings.full_reconcile_every;
+        let mut marked = Vec::new();
+        for (name, entry) in &mut self.routines {
+            if entry.armed.is_none() {
+                entry.full_due = None;
+                continue;
+            }
+            match entry.full_due {
+                None => entry.full_due = Some(instant + every),
+                Some(due) if instant >= due => {
+                    entry.dirty.mark_whole_tree(instant);
+                    entry.full_due = Some(instant + every);
+                    marked.push(name.clone());
+                }
+                Some(_) => {}
+            }
+        }
+        for name in marked {
+            self.log(
+                Level::Info,
+                "scheduler",
+                "routine_full_reconcile",
+                format!("profile={name} every_seconds={}", every.as_secs()),
+            );
+        }
         let names: Vec<String> = self.routines.keys().cloned().collect();
         for name in names {
             if self.shutdown {

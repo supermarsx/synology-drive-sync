@@ -1286,6 +1286,52 @@ fn alerts_follow_the_runners_rules_and_escalations_their_cooldown() {
     assert_eq!(escalations, 1);
 }
 
+/// The daily safety net: an armed realtime routine syncs its whole tree once
+/// per period whatever the watcher saw (inotify misses some writes).
+#[test]
+fn an_armed_realtime_routine_syncs_its_whole_tree_once_a_period() {
+    let h = Harness::tuned(
+        "full",
+        |home, _| {
+            profile(home, "docs");
+            routine(
+                home,
+                "docs",
+                "enabled=true\nmode=realtime\ndebounce_seconds=1\nretry_backoff_seconds=10\n",
+            );
+        },
+        |settings| settings.full_reconcile_every = Duration::from_secs(2),
+    );
+    h.wait_for("arm", Duration::from_secs(5), |h| {
+        armed_generation(h, "docs").is_some()
+    });
+    let _ = h.tx.send(Msg::Change(ChangeEvent::Backend {
+        routine: "docs".into(),
+        backend: Backend::Inotify,
+        reason: BackendReason::Ok,
+        detail: "armed".into(),
+    }));
+    h.wait_for("the safety-net run", Duration::from_secs(10), |h| {
+        h.launched() >= 1
+    });
+    let args = h.world.lock().unwrap().launched[0]
+        .args
+        .iter()
+        .map(|a| a.to_string_lossy().into_owned())
+        .collect::<Vec<_>>();
+    assert!(
+        !args.iter().any(|a| a == "--scope"),
+        "a whole-tree run: {args:?}"
+    );
+    assert!(
+        h.logs()
+            .iter()
+            .any(|l| l.starts_with("routine_full_reconcile profile=docs")),
+        "{:?}",
+        h.logs()
+    );
+}
+
 /// Every plan and sync gets the verified-pair index directory.
 #[test]
 fn runs_are_given_the_pair_index_directory() {
