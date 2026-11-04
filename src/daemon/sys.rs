@@ -177,6 +177,29 @@ pub(crate) fn peer_uid(stream: &UnixStream) -> io::Result<u32> {
     Ok(unsafe { credentials.assume_init() }.uid)
 }
 
+/// Whether the peer has closed its end of `stream` entirely (`POLLHUP`, or
+/// `POLLERR`), without reading or consuming anything. A peer that only shut down
+/// its writing half (a client that sent its request and half-closed to say so)
+/// is NOT hung up: it still waits for the reply.
+pub(crate) fn peer_hung_up(stream: &UnixStream) -> io::Result<bool> {
+    let mut poll = libc::pollfd {
+        fd: stream.as_raw_fd(),
+        events: 0,
+        revents: 0,
+    };
+    loop {
+        // SAFETY: one valid pollfd; a zero timeout returns at once.
+        let status = unsafe { libc::poll(&mut poll, 1, 0) };
+        if status >= 0 {
+            return Ok(poll.revents & (libc::POLLHUP | libc::POLLERR) != 0);
+        }
+        let error = io::Error::last_os_error();
+        if error.kind() != io::ErrorKind::Interrupted {
+            return Err(error);
+        }
+    }
+}
+
 /// Local time from the C library (musl reads `TZ` or `/etc/localtime`).
 /// `tzset` runs before each conversion so a zone change is picked up where the
 /// C library supports it.
@@ -369,6 +392,19 @@ mod tests {
         drop(first);
         assert!(try_lock_exclusive(&second).unwrap());
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_closed_peer_is_hung_up_and_a_half_closed_one_is_not() {
+        let (left, right) = UnixStream::pair().unwrap();
+        assert!(!peer_hung_up(&left).unwrap());
+        right.shutdown(std::net::Shutdown::Write).unwrap();
+        assert!(
+            !peer_hung_up(&left).unwrap(),
+            "a client that half-closed after its request still awaits the reply"
+        );
+        drop(right);
+        assert!(peer_hung_up(&left).unwrap());
     }
 
     #[test]
