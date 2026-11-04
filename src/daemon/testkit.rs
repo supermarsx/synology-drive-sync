@@ -24,12 +24,51 @@ pub(crate) fn permissions_do_not_bind(test: &str, path: &Path) -> bool {
     if !readable {
         return false;
     }
-    let notice = format!(
-        "SKIPPED {test}: {} is still readable at mode 000, so this user ignores permission bits \
-         (root); the test proves nothing here and did not run its assertions. Run the suite as an \
-         unprivileged user.",
-        path.display()
-    );
+    skip_loudly(
+        test,
+        &format!(
+            "SKIPPED {test}: {} is still readable at mode 000, so this user ignores permission \
+             bits (root); the test proves nothing here and did not run its assertions. Run the \
+             suite as an unprivileged user.",
+            path.display()
+        ),
+    )
+}
+
+/// [`permissions_do_not_bind`] for a test that has just made directory `dir` read-only (mode
+/// 0500) and needs creating a file in it to be refused: `true` (after the same loud notice) when
+/// a file can be created there anyway.
+pub(crate) fn write_permissions_do_not_bind(test: &str, dir: &Path) -> bool {
+    let probe = dir.join(".sdsyncd-permission-probe");
+    match fs::File::create_new(&probe) {
+        Ok(_) => {
+            fs::remove_file(&probe).unwrap_or_else(|error| {
+                panic!(
+                    "{test}: cannot remove its probe {}: {error}",
+                    probe.display()
+                )
+            });
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => return false,
+        Err(error) => panic!(
+            "{test}: probing {} for write permission failed for another reason: {error}",
+            dir.display()
+        ),
+    }
+    skip_loudly(
+        test,
+        &format!(
+            "SKIPPED {test}: a file can be created in {} at mode 0500, so this user ignores \
+             permission bits (root); the test proves nothing here and did not run its assertions. \
+             Run the suite as an unprivileged user.",
+            dir.display()
+        ),
+    )
+}
+
+/// The one way a permission test skips: a `SKIPPED` line on the process's real stderr, or a
+/// failure when `SDSYNC_REQUIRE_PERMISSION_TESTS` is set. Always `true`.
+fn skip_loudly(test: &str, notice: &str) -> bool {
     assert!(
         std::env::var_os("SDSYNC_REQUIRE_PERMISSION_TESTS").is_none(),
         "{notice} (SDSYNC_REQUIRE_PERMISSION_TESTS is set)"
@@ -117,6 +156,64 @@ fn writers_of(path: &Path) -> Vec<String> {
 mod tests {
     use super::*;
     use std::time::{Duration, Instant};
+
+    /// A permission test that skips for root says so loudly, through this module, or
+    /// fails when `SDSYNC_REQUIRE_PERMISSION_TESTS` is set. A private copy of the skip
+    /// (an `eprintln!` the harness captures, a `return` with no word) passes in
+    /// silence on a root runner, so none may exist outside this file.
+    #[test]
+    fn no_test_skips_for_root_in_silence() {
+        fn sources(dir: &Path, found: &mut Vec<std::path::PathBuf>) {
+            for entry in fs::read_dir(dir).unwrap_or_else(|e| panic!("{}: {e}", dir.display())) {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    sources(&path, found);
+                } else if path.extension().is_some_and(|e| e == "rs") {
+                    found.push(path);
+                }
+            }
+        }
+        let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut files = Vec::new();
+        sources(&src, &mut files);
+        let marker = ["running as", "root"].join(" ");
+        let private: Vec<String> = files
+            .iter()
+            .filter(|path| !path.ends_with("daemon/testkit.rs"))
+            .filter(|path| {
+                fs::read_to_string(path)
+                    .unwrap_or_else(|e| panic!("{}: {e}", path.display()))
+                    .contains(&marker)
+            })
+            .map(|path| path.display().to_string())
+            .collect();
+        assert!(
+            private.is_empty(),
+            "these files skip for root on their own instead of through testkit: {private:#?}"
+        );
+    }
+
+    /// The write-side probe: a directory made read-only refuses it (unless this user is
+    /// root, which says so), and the probe leaves nothing behind either way.
+    #[test]
+    fn a_read_only_directory_refuses_the_write_probe() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("sdsyncd-writeprobe-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o500)).unwrap();
+        let skipped =
+            write_permissions_do_not_bind("a_read_only_directory_refuses_the_write_probe", &dir);
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
+        let left: Vec<_> = fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        fs::remove_dir_all(&dir).unwrap();
+        assert!(
+            left.is_empty(),
+            "the probe left {left:?} behind (the user ignores permission bits: {skipped})"
+        );
+    }
 
     #[test]
     fn settling_waits_for_a_write_descriptor_to_close() {

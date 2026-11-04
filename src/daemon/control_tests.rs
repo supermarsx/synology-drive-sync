@@ -1832,20 +1832,6 @@ fn an_unreadable_routine_state_is_held_not_reset() {
 
 // ---------------------------------------------------------------- fix6-core
 
-/// Whether permissions bind for this process. As root they do not, and a test
-/// that needs an unreadable file says so on stderr instead of passing quietly.
-#[cfg(unix)]
-fn permissions_bind(path: &Path, test: &str) -> bool {
-    if fs::read(path).is_ok() {
-        eprintln!(
-            "SKIP {test}: {} is readable at mode 000 (running as root); nothing is proved",
-            path.display()
-        );
-        return false;
-    }
-    true
-}
-
 /// N-D3: an unreadable profile state is never rewritten from nothing. Read as
 /// absent, a failed run reset `consecutive_failures` 7 to 1 and
 /// `last_success_epoch` to 0, and the log said the last configuration was
@@ -1865,7 +1851,10 @@ fn an_unreadable_profile_state_is_kept_not_reset() {
         fs::set_permissions(&state, fs::Permissions::from_mode(0o000)).unwrap();
     });
     let state = h.var.join("state/profiles/alpha.state");
-    if !permissions_bind(&state, "an_unreadable_profile_state_is_kept_not_reset") {
+    if super::super::testkit::permissions_do_not_bind(
+        "an_unreadable_profile_state_is_kept_not_reset",
+        &state,
+    ) {
         return;
     }
     *h.plan.lock().unwrap() = Plan {
@@ -2079,7 +2068,10 @@ fn an_unreadable_dependency_state_is_named() {
         fs::set_permissions(&state, fs::Permissions::from_mode(0o000)).unwrap();
     });
     let state = h.var.join("state/profiles/beta.state");
-    if !permissions_bind(&state, "an_unreadable_dependency_state_is_named") {
+    if super::super::testkit::permissions_do_not_bind(
+        "an_unreadable_dependency_state_is_named",
+        &state,
+    ) {
         return;
     }
     h.wait_for("the dependency named", Duration::from_secs(5), |h| {
@@ -2125,7 +2117,10 @@ fn a_removed_routines_unreadable_record_is_forgotten() {
         fs::set_permissions(&state, fs::Permissions::from_mode(0o000)).unwrap();
     });
     let state = h.var.join("state/routines/alpha.state");
-    if !permissions_bind(&state, "a_removed_routines_unreadable_record_is_forgotten") {
+    if super::super::testkit::permissions_do_not_bind(
+        "a_removed_routines_unreadable_record_is_forgotten",
+        &state,
+    ) {
         return;
     }
     h.wait_for("the state named", Duration::from_secs(5), |h| {
@@ -2268,11 +2263,10 @@ fn status_names_an_unreadable_profile_directory() {
     });
     let dir = h.root.join("home/config/profiles.d");
     fs::set_permissions(&dir, fs::Permissions::from_mode(0o000)).unwrap();
-    if fs::read_dir(&dir).is_ok() {
-        eprintln!(
-            "SKIP status_names_an_unreadable_profile_directory: {} is readable at mode 000 (running as root)",
-            dir.display()
-        );
+    if super::super::testkit::permissions_do_not_bind(
+        "status_names_an_unreadable_profile_directory",
+        &dir,
+    ) {
         fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
         return;
     }

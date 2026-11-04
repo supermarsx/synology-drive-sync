@@ -1959,12 +1959,10 @@ exit 64
             fs::set_permissions(&responses, fs::Permissions::from_mode(0o500)).unwrap();
         });
         let responses = f.dir.join("var/control/responses");
-        let probe = responses.join("probe");
-        if fs::write(&probe, b"").is_ok() {
-            eprintln!(
-                "SKIP an_expired_file_that_stays_is_not_called_expired: {} is writable at mode 0500 (running as root)",
-                responses.display()
-            );
+        if super::super::testkit::write_permissions_do_not_bind(
+            "an_expired_file_that_stays_is_not_called_expired",
+            &responses,
+        ) {
             fs::set_permissions(&responses, fs::Permissions::from_mode(0o700)).unwrap();
             return;
         }
