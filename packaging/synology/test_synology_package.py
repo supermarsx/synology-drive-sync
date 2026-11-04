@@ -13503,6 +13503,62 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
         self.assertTrue((run / "daemon.ready").exists())
         self.assertIsNone(reused.poll())
 
+    def _flock_probe_log(self) -> Path:
+        """A flock shim in front of the real one that logs every call."""
+        real = shutil.which("flock", path=os.environ["PATH"])
+        self.assertIsNotNone(real, "flock(1) is required by the daemon-engine tests")
+        log = self.root / "flock-calls.log"
+        shim = self.fake_system_bin / "flock"
+        shim.write_text(
+            f'#!/bin/sh\nprintf \'%s\\n\' "$*" >> {shlex.quote(str(log))}\nexec {shlex.quote(str(real))} "$@"\n',
+            encoding="utf-8",
+        )
+        shim.chmod(0o755)
+        return log
+
+    def test_the_lock_probe_never_runs_while_a_live_supervisor_restarts_the_daemon(self) -> None:
+        # Between a daemon's death and its respawn nobody holds daemon.lock;
+        # a shell probe there can take it from the respawning daemon, which
+        # then exits 75. With supervisor.pid naming a live supervisor the
+        # probe is not made at all.
+        self._daemon_engine(None)
+        run = self.real_var / "run"
+        self._free_daemon_lock()
+        calls = self._flock_probe_log()
+        supervisor = self._spawn_fake("--supervise")
+        self._write_run_record("supervisor.pid", self._identity_triple(supervisor.pid))
+        status = self.shell(self.lifecycle, "status")
+        self.assertEqual(status.returncode, 2, status.stdout + status.stderr)
+        for hook in ("preuninst", "preupgrade"):
+            refused = self.shell(self.lifecycle_dir / hook)
+            self.assertEqual(refused.returncode, 1, f"{hook}: {refused.stdout}{refused.stderr}")
+            self.assertIn(f"{self.fhs / 'var/run/supervisor.pid'}", refused.stdout, hook)
+        self.assertFalse(calls.exists() and calls.read_text(encoding="utf-8").strip(),
+                         "the lock was probed beside a live supervisor: " + (calls.read_text() if calls.exists() else ""))
+        # Stop signals the supervisor found through supervisor.pid even though
+        # there is no daemon.ready, and only then removes the records.
+        stopped = self.shell(self.lifecycle, "stop", timeout=60)
+        self.assertEqual(stopped.returncode, 0, stopped.stdout + stopped.stderr)
+        self._wait_for(lambda: supervisor.poll() is not None, "stop left the supervisor running", timeout=10)
+        self.assertFalse((run / "supervisor.pid").exists())
+        self.assertIn(f"removed stale daemon record {self.fhs / 'var/run/supervisor.pid'}", stopped.stdout)
+
+    def test_a_supervisor_record_naming_no_live_supervisor_is_stale(self) -> None:
+        self._daemon_engine(None)
+        run = self.real_var / "run"
+        self._free_daemon_lock()
+        gone = self._spawn_fake("--supervise")
+        record = self._identity_triple(gone.pid)
+        gone.kill()
+        gone.wait(timeout=10)
+        self._write_run_record("supervisor.pid", record)
+        status = self.shell(self.lifecycle, "status")
+        self.assertEqual(status.returncode, 1, status.stdout + status.stderr)
+        stopped = self.shell(self.lifecycle, "stop", timeout=60)
+        self.assertEqual(stopped.returncode, 0, stopped.stdout + stopped.stderr)
+        self.assertIn(f"removed stale daemon record {self.fhs / 'var/run/supervisor.pid'}", stopped.stdout)
+        self.assertFalse((run / "supervisor.pid").exists())
+
     def test_postupgrade_removes_shell_leftovers_only_under_the_daemon_engine(self) -> None:
         leftovers = [
             self.real_var / "state/controller-reload.pending",

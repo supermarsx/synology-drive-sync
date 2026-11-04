@@ -187,7 +187,13 @@ stays; only a live holder of it means a daemon runs). When nobody holds `daemon.
 exists: whatever `daemon.pid`, `daemon.ready` and `ctl.sock` say is stale even if the PID they name
 now belongs to another process, and stop and start remove them and name each path (`removed stale
 daemon record <path>`). A held lock keeps the strict identity check above; without `flock(1)` the
-lock cannot be probed, so that check applies too and a refusal names its cause. Stop stops whichever engine's processes are
+lock cannot be probed, so that check applies too and a refusal names its cause. The probe itself
+holds the lock for one `flock -n` call, and it is never made while `run/supervisor.pid` (the
+supervisor's own pid, start time and boot id) names a live supervisor: between a daemon's death and
+its respawn nobody holds the lock, and a probe that took it would make the respawning daemon give
+up. Status then reports `2`, the hooks refuse naming `supervisor.pid`, and stop signals that
+supervisor (TERM, then KILL after the grace) even when `daemon.ready` is absent, before it removes
+any record. A `supervisor.pid` naming no live supervisor is a stale record like the others. Stop stops whichever engine's processes are
 present, both after an engine switch made while one was running. Status is `0` when the daemon
 answers `ctl ping` with admission open, `3` with no daemon records, and `1` when records of a daemon
 that is gone remain (named on stderr).

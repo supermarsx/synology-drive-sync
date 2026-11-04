@@ -908,6 +908,7 @@ daemon_pid_file=$runtime_root/daemon.pid
 daemon_ready_file=$runtime_root/daemon.ready
 daemon_lock_file=$runtime_root/daemon.lock
 daemon_socket=$runtime_root/ctl.sock
+supervisor_pid_file=$runtime_root/supervisor.pid
 service_engine_file=$package_var/state/engine
 
 # Sets service_engine (daemon or shell) and service_engine_problem: empty, or
@@ -944,9 +945,10 @@ resolve_service_engine() {
 }
 
 # Any record a daemon leaves while it runs. A clean daemon stop removes all
-# three; daemon.lock stays, and only a live holder of it means a daemon runs.
+# four; daemon.lock stays, and only a live holder of it means a daemon runs.
 daemon_artifacts_present() {
-    for daemon_artifact in "$daemon_socket" "$daemon_ready_file" "$daemon_pid_file"; do
+    for daemon_artifact in "$daemon_socket" "$daemon_ready_file" "$daemon_pid_file" \
+        "$supervisor_pid_file"; do
         if [ -e "$daemon_artifact" ] || [ -L "$daemon_artifact" ]; then
             daemon_present_artifact=$daemon_artifact
             return 0
@@ -955,16 +957,51 @@ daemon_artifacts_present() {
     return 1
 }
 
+# 0 when supervisor.pid, the identity triple (pid, /proc start time, boot id)
+# the --supervise parent publishes before it spawns its first daemon, names a
+# process that is still that process: alive, not a zombie, same start time and
+# boot. 1 for no record, an unreadable or malformed one, a dead process or a
+# reused PID. Self-contained (the hooks source only this file); the lifecycle
+# signals only after its own full identity check.
+daemon_supervisor_record_live() {
+    [ -f "$supervisor_pid_file" ] && [ ! -L "$supervisor_pid_file" ] || return 1
+    supervisor_record_pid= supervisor_record_start= supervisor_record_boot=
+    {
+        IFS= read -r supervisor_record_pid || return 1
+        IFS= read -r supervisor_record_start || return 1
+        IFS= read -r supervisor_record_boot || return 1
+    } < "$supervisor_pid_file" 2>/dev/null || return 1
+    case $supervisor_record_pid in ''|*[!0-9]*) return 1 ;; esac
+    case $supervisor_record_start in ''|*[!0-9]*|0) return 1 ;; esac
+    [ "$supervisor_record_pid" -gt 1 ] 2>/dev/null || return 1
+    IFS= read -r supervisor_current_boot < /proc/sys/kernel/random/boot_id 2>/dev/null || return 1
+    [ "$supervisor_current_boot" = "$supervisor_record_boot" ] || return 1
+    supervisor_stat_tail=$(sed -n 's/^.*) //p' "/proc/$supervisor_record_pid/stat" 2>/dev/null) || return 1
+    [ -n "$supervisor_stat_tail" ] || return 1
+    # Fields 3 onward: the state is the first, the start time (field 22) the 20th.
+    set -- $supervisor_stat_tail
+    case ${1:-} in ''|Z|X|x) return 1 ;; esac
+    [ "${20:-}" = "$supervisor_record_start" ]
+}
+
 # 0 when a process holds daemon.lock, 1 when none does or the file is absent,
-# 2 when it cannot be told (no flock(1), or the probe itself failed). The probe
-# opens the existing file only; it never creates it. flock -n exits 1 exactly
-# when the lock is taken (util-linux and BusyBox alike).
+# 2 when it cannot be told (no flock(1), or the probe itself failed), 3 when it
+# was not probed: a live supervisor (supervisor.pid) is between its daemon's
+# death and the respawn, or serving it, and a probe taking the free lock then
+# would make the respawning daemon exit 75. Callers read 3 as "a daemon may
+# hold it". The probe opens the existing file only; it never creates it. It
+# holds the lock for one flock(1) call and no child process: flock -n on an
+# inherited descriptor, closed as the group ends. flock -n exits 1 exactly
+# when the lock is taken (util-linux and BusyBox alike); the file is checked
+# readable first so a failed open is not mistaken for a holder.
 daemon_lock_held_status() {
     [ -e "$daemon_lock_file" ] || [ -L "$daemon_lock_file" ] || return 1
     [ -f "$daemon_lock_file" ] && [ ! -L "$daemon_lock_file" ] || return 2
     command -v flock >/dev/null 2>&1 || return 2
+    [ -r "$daemon_lock_file" ] || return 2
+    ! daemon_supervisor_record_live || return 3
     daemon_lock_probe_status=0
-    flock -n "$daemon_lock_file" true 2>/dev/null || daemon_lock_probe_status=$?
+    { { flock -n 8; } 8< "$daemon_lock_file"; } 2>/dev/null || daemon_lock_probe_status=$?
     case $daemon_lock_probe_status in
         0) return 1 ;;
         1) return 0 ;;
