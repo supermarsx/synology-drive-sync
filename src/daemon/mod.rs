@@ -27,6 +27,20 @@ pub(crate) mod sys;
 pub(crate) mod watch_source;
 pub(crate) mod window;
 
+/// The engine `var/state/engine` names: `daemon` or `shell`, one word with an
+/// optional trailing newline. Anything else is named, never guessed.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(crate) fn engine_word(bytes: &[u8]) -> Result<&'static str, String> {
+    match bytes.strip_suffix(b"\n").unwrap_or(bytes) {
+        b"daemon" => Ok("daemon"),
+        b"shell" => Ok("shell"),
+        other => Err(format!(
+            "state/engine holds {:?}, not daemon or shell; the daemon runs",
+            String::from_utf8_lossy(&other[..other.len().min(32)])
+        )),
+    }
+}
+
 /// The daemon's flags of `sdsync-dsm-api`: `--daemon`, `--launch-daemon`,
 /// `--supervise` and `--ctl`. `None` for any other invocation, which the bridge
 /// handles as before.
@@ -62,5 +76,32 @@ pub(crate) fn dispatch(arguments: &[std::ffi::OsString]) -> Option<std::process:
     {
         eprintln!("sdsyncd: {flag} is only available on Linux");
         Some(std::process::ExitCode::from(69))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn the_engine_file_is_one_known_word_or_named() {
+        assert_eq!(
+            super::engine_word(
+                b"shell
+"
+            ),
+            Ok("shell")
+        );
+        assert_eq!(super::engine_word(b"daemon"), Ok("daemon"));
+        for bad in [
+            &b""[..],
+            b"Shell
+",
+            b"shell
+
+",
+            b"legacy",
+        ] {
+            let error = super::engine_word(bad).unwrap_err();
+            assert!(error.contains("the daemon runs"), "{error}");
+        }
     }
 }

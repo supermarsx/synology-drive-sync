@@ -410,6 +410,41 @@ pub(crate) fn run_daemon(options: &Options) -> ExitCode {
             detail: format!("zone={zone} tz={}", std::env::var("TZ").unwrap_or_default()),
         },
     );
+    // Which engine the package is set to, said once at start: the daemon runs
+    // whatever the file says (it was started), but a disagreement is named.
+    let engine_path = options.var.join("state/engine");
+    let (level, detail) = match fs::read(&engine_path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            (Level::Info, "engine=daemon file=absent".to_owned())
+        }
+        Err(error) => (
+            Level::Warn,
+            format!(
+                "engine=daemon file=unreadable path={} cause={error}",
+                engine_path.display()
+            ),
+        ),
+        Ok(bytes) => match super::engine_word(&bytes) {
+            Ok("shell") => (
+                Level::Warn,
+                "engine=daemon file=shell cause=the daemon was started although the package is set to the shell engine".to_owned(),
+            ),
+            Ok(word) => (Level::Info, format!("engine=daemon file={word}")),
+            Err(cause) => (
+                Level::Warn,
+                format!("engine=daemon file=invalid path={} cause={cause}", engine_path.display()),
+            ),
+        },
+    };
+    let _ = sink.log(
+        epoch().unwrap_or(0),
+        &LogEvent {
+            level,
+            category: "controller",
+            event: "service_engine",
+            detail,
+        },
+    );
     let child_env = executor::allowlisted_env(std::env::vars_os());
     let settings = Settings {
         child_env: child_env.clone(),

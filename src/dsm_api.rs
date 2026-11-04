@@ -10114,6 +10114,20 @@ mod linux_files {
         }
     }
 
+    /// The daemon's `daemon.ready` (pid, start tick, boot id, published once its
+    /// control thread runs and `ctl.sock` answers): `Some((pid, live))` when a
+    /// record is published, `live` only when that exact process still runs.
+    pub(super) fn daemon_identity(
+        path: &Path,
+        package_uid: u32,
+    ) -> BridgeResult<Option<(u32, bool)>> {
+        let Some(identity) = read_published_identity(path, package_uid, true)? else {
+            return Ok(None);
+        };
+        let live = process_identity_is_live(identity.pid, identity.start, &identity.boot)?;
+        Ok(Some((identity.pid, live)))
+    }
+
     /// `private_process_lock_is_live`: whether the private lock directory names
     /// a live owner.
     ///
@@ -16168,6 +16182,14 @@ fn snapshot_service_identity(
     paths: &PackagePaths<'_>,
     package_uid: u32,
 ) -> BridgeResult<(&'static str, u32)> {
+    // The daemon engine: `daemon.ready` names the exact process (pid, start
+    // tick, boot). A record whose process is gone falls through to the shell
+    // controller's proof, which then reads stopped unless that one runs.
+    if let Some((pid, true)) =
+        linux_files::daemon_identity(&paths.run_dir.join("daemon.ready"), package_uid)?
+    {
+        return Ok(("running", pid));
+    }
     let pid_file = paths.run_dir.join("controller.pid");
     let Some(pid) = linux_files::controller_pid_file_value(&pid_file, package_uid)? else {
         return Ok(("stopped", 0));
@@ -18048,6 +18070,7 @@ fn outcomes_value(paths: &PackagePaths<'_>, package_uid: u32) -> Value {
         .collect::<Vec<_>>();
     let routines = routine_outcomes_value(paths, package_uid, &mut errors);
     let lasting = lasting_outcomes_value(paths, package_uid, &names, &mut errors);
+    let engine = engine_outcome_value(paths, package_uid, &mut errors);
     let cache = status_cache_health_value(paths, &names, &mut errors);
     let controller_reload = controller_reload_value(paths, package_uid, &mut errors);
     json!({
@@ -18058,6 +18081,7 @@ fn outcomes_value(paths: &PackagePaths<'_>, package_uid: u32) -> Value {
         "profiles": profiles,
         "routines": routines,
         "lasting": lasting,
+        "engine": engine,
         "status_cache_health": cache,
         "errors": errors.into_value(),
     })
@@ -18114,6 +18138,43 @@ fn lasting_outcomes_value(
         });
     }
     Value::Array(held)
+}
+
+/// Which service engine `start` runs: the Rust daemon unless `state/engine` says `shell` (the
+/// one-release fallback). A file that says anything else is named and the daemon runs; it is
+/// never silently read as either.
+#[cfg(target_os = "linux")]
+fn engine_outcome_value(
+    paths: &PackagePaths<'_>,
+    package_uid: u32,
+    errors: &mut OutcomeErrors,
+) -> Value {
+    let (file, detail) = match linux_files::read_optional_private_document(
+        &paths.state_dir.join("engine"),
+        package_uid,
+        64,
+    ) {
+        Ok(None) => ("absent", None),
+        Ok(Some(bytes)) => match daemon::engine_word(&bytes) {
+            Ok(word) => (word, None),
+            Err(cause) => {
+                errors.push("engine", "malformed");
+                ("invalid", Some(sanitize_outcome_line(&cause)))
+            }
+        },
+        Err(_) => {
+            errors.push("engine", "unsafe_file");
+            (
+                "invalid",
+                Some("state/engine is not a private package file".to_owned()),
+            )
+        }
+    };
+    json!({
+        "active": if file == "shell" { "shell" } else { "daemon" },
+        "file": file,
+        "detail": detail,
+    })
 }
 
 /// One printable line of at most 240 bytes, for text that reaches the dashboard verbatim.

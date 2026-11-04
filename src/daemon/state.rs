@@ -1473,6 +1473,52 @@ mod tests {
             );
         }
 
+        /// The snapshot proves a running daemon by `daemon.ready` (exact pid,
+        /// start tick, boot), and a record whose process is gone reads stopped.
+        #[test]
+        fn a_running_daemon_is_the_running_service() {
+            let tree = Tree::new("service");
+            let pid = std::process::id();
+            let start = super::super::super::super::linux_files::process_start(pid).unwrap();
+            let boot = fs::read_to_string("/proc/sys/kernel/random/boot_id").unwrap();
+            tree.private(
+                "var/run/daemon.ready",
+                format!("{pid}\n{start}\n{}\n", boot.trim()).as_bytes(),
+            );
+            let snapshot = tree.snapshot();
+            assert_eq!(snapshot["service"]["state"], "running", "{snapshot}");
+            assert_eq!(snapshot["service"]["pid"], pid);
+            tree.private(
+                "var/run/daemon.ready",
+                format!("{pid}\n{}\n{}\n", start + 1, boot.trim()).as_bytes(),
+            );
+            assert_eq!(tree.snapshot()["service"]["state"], "stopped");
+        }
+
+        /// The engine the package is set to, and a file that says anything
+        /// else named rather than guessed.
+        #[test]
+        fn the_engine_setting_reads_back_and_a_bad_one_is_named() {
+            let tree = Tree::new("engine");
+            let engine = |tree: &Tree| tree.outcomes()["engine"].clone();
+            assert_eq!(
+                engine(&tree),
+                json!({"active": "daemon", "file": "absent", "detail": null})
+            );
+            tree.private("var/state/engine", b"shell\n");
+            assert_eq!(
+                engine(&tree),
+                json!({"active": "shell", "file": "shell", "detail": null})
+            );
+            tree.private("var/state/engine", b"legacy\n");
+            let bad = engine(&tree);
+            assert_eq!(
+                (bad["active"].as_str(), bad["file"].as_str()),
+                (Some("daemon"), Some("invalid"))
+            );
+            assert!(bad["detail"].as_str().unwrap().contains("legacy"), "{bad}");
+        }
+
         #[test]
         fn every_run_outcome_reads_back_as_itself() {
             let tree = Tree::new("outcomes");
