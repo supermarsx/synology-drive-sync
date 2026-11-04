@@ -13439,6 +13439,76 @@ fn record_pre_relay_activity(stage: &str, code: &str, status: u16) -> BridgeResu
     }
 }
 
+/// `--daemon-lock-probe <path>`: what `{ flock -n 8; } 8< <path>` answers, for a shell without
+/// flock(1) (N-S5). The path is opened read-only, never created and never through a symlink
+/// (`O_RDONLY|O_CLOEXEC|O_NOFOLLOW`, plus `O_NONBLOCK` so a FIFO planted there cannot hold the
+/// probe), must be a regular file, and is tried with `flock(LOCK_EX|LOCK_NB)`; a lock taken is
+/// released at once (`LOCK_UN`, then the close).
+///
+/// Exit 0: free. Exit 3: held (`EWOULDBLOCK`). Exit 1: it cannot be probed (absent, not a
+/// regular file, a symlink, denied, any other error), with one stderr line
+/// `daemon-lock-probe: <path>: <cause>`. Nothing is written to stdout.
+fn daemon_lock_probe(arguments: &[OsString]) -> ExitCode {
+    let [path] = arguments else {
+        eprintln!(
+            "daemon-lock-probe: usage: sdsync-dsm-api --daemon-lock-probe <path> (given {} arguments)",
+            arguments.len()
+        );
+        return ExitCode::from(1);
+    };
+    let path = Path::new(path);
+    let refuse = |cause: &str| {
+        eprintln!(
+            "daemon-lock-probe: {}: {}",
+            path.display(),
+            cause.replace(['\n', '\r'], " ")
+        );
+        ExitCode::from(1)
+    };
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::fd::AsRawFd;
+        use std::os::unix::fs::OpenOptionsExt;
+        let file = match fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
+            .open(path)
+        {
+            Ok(file) => file,
+            Err(error) if error.raw_os_error() == Some(libc::ELOOP) => {
+                return refuse(&format!("a symbolic link, not followed ({error})"));
+            }
+            Err(error) => return refuse(&error.to_string()),
+        };
+        match file.metadata() {
+            Ok(metadata) if metadata.file_type().is_file() => {}
+            Ok(_) => return refuse("not a regular file"),
+            Err(error) => return refuse(&error.to_string()),
+        }
+        // SAFETY: flock on a live descriptor this function owns, with fixed operations.
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+            // SAFETY: as above. Closing the descriptor releases it as well; an error here is
+            // named because the shell must not be told "free" for a lock this probe still holds.
+            if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_UN) } != 0 {
+                return refuse(&format!(
+                    "the probe's own lock could not be released: {}",
+                    io::Error::last_os_error()
+                ));
+            }
+            return ExitCode::SUCCESS;
+        }
+        let error = io::Error::last_os_error();
+        if error.raw_os_error() == Some(libc::EWOULDBLOCK) {
+            return ExitCode::from(3);
+        }
+        refuse(&error.to_string())
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        refuse("only available on Linux")
+    }
+}
+
 pub(crate) fn main_entry() -> ExitCode {
     // The realtime watcher and its probe touch no network and no package state, so they are
     // dispatched before anything else this process sets up.
@@ -13449,6 +13519,11 @@ pub(crate) fn main_entry() -> ExitCode {
         }
         Some(mode) if mode == "--watch-probe" => {
             return synology_drive_sync::watch::cli::probe_main(&early.collect::<Vec<_>>());
+        }
+        // The shell's `flock -n` probe of daemon.lock where BusyBox has no flock(1) (N-S5): no
+        // config, no password, no network, so nothing else is set up for it either.
+        Some(mode) if mode == "--daemon-lock-probe" => {
+            return daemon_lock_probe(&early.collect::<Vec<_>>());
         }
         _ => {}
     }
