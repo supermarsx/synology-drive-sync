@@ -48,6 +48,8 @@ const REASONS = Object.freeze({
   run_stalled: ["the run made no progress for 30 minutes and was stopped", "Review Logs; check the source and target are reachable, then run again."],
   launch_failed: ["the sync core could not be started", "Review Logs for the cause, then run again; repair the package if it repeats."],
   consumer_timeout: ["the dashboard request did not finish within its deadline, so its outcome is unknown", "Try again; review Logs if it repeats."],
+  consumer_unwaitable: ["the dashboard request's worker was started but could not be waited for, so how it ended is unknown", "Check the current state before trying again; review Logs if it repeats."],
+  control_dir_unreadable: ["the service cannot read the dashboard's request queue, so requests are not seen", "Review Logs for control_dir_unreadable; repair the package if it repeats."],
   lasting_state_unreadable: ["the record that holds this profile's automatic runs could not be read, so automatic runs stay held", "Click Run now to clear it; repair the package if it repeats."],
   identity_failed: ["the runner could not record its own identity before the core started", "Review Logs and run again; repair the package if it repeats."],
   profile_unreadable: ["the profile file could not be read", "Save the profile again on the Profiles page, or repair the package."],
