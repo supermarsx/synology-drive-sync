@@ -195,12 +195,12 @@ pub(crate) struct Settings {
     pub(crate) mutation_deadline: Duration,
     /// The performance level's nice value for the core.
     pub(crate) core_nice: Option<i32>,
-    /// Phase 3 hook (perf design §2.2): `var/state/cache/pairs`, passed to the
-    /// core as `--pair-cache DIR` once the core accepts it. `None` keeps today's
-    /// argv. The daemon never opens the index itself: only the sync child does,
-    /// briefly, and runs stay child processes (redb can abort a process on some
-    /// damaged files).
-    pub(crate) pair_cache_dir: Option<PathBuf>,
+    /// The verified-pair index directory (`var/state/cache/pairs`), passed to
+    /// every plan and sync as `--pair-index DIR`. `None` runs without it. The
+    /// daemon never opens the index itself: only the run's child does, briefly,
+    /// and runs stay child processes (redb can abort a process on some damaged
+    /// files).
+    pub(crate) pair_index_dir: Option<PathBuf>,
     /// Publish `run.lock` for the bridge and shell readers (Linux).
     pub(crate) publish_run_lock: bool,
     /// The child's base environment (already allowlisted).
@@ -214,7 +214,7 @@ impl Default for Settings {
             wake_cap: Duration::from_secs(30),
             mutation_deadline: Duration::from_secs(120),
             core_nice: None,
-            pair_cache_dir: None,
+            pair_index_dir: None,
             publish_run_lock: cfg!(target_os = "linux"),
             child_env: allowlisted_env(std::env::vars_os()),
         }
@@ -1253,8 +1253,8 @@ impl Control {
             args.push("--scope".into());
             args.push(scope.into());
         }
-        if let Some(dir) = &self.settings.pair_cache_dir {
-            args.push("--pair-cache".into());
+        if let Some(dir) = &self.settings.pair_index_dir {
+            args.push("--pair-index".into());
             args.push(dir.into());
         }
         args
@@ -2219,6 +2219,32 @@ impl Control {
                 })
             })
             .collect();
+        // `index:` per profile: what the last run's verified-pair index did, or
+        // `busy` while a run holds it (a status read never waits on it).
+        let busy: Vec<String> = self
+            .active
+            .as_ref()
+            .map(|a| a.profiles.clone())
+            .unwrap_or_default();
+        let index: serde_json::Map<String, Value> = self
+            .profile_names()
+            .into_iter()
+            .map(|name| {
+                let value = if busy.contains(&name) {
+                    json!({"state": "busy"})
+                } else {
+                    let path = self.paths.profile_state_dir.join(format!("{name}.state"));
+                    match fs::read(&path) {
+                        Ok(bytes) => super::state::index_status_value(&bytes),
+                        Err(error) if error.kind() == io::ErrorKind::NotFound => Value::Null,
+                        Err(error) => {
+                            json!({"error": format!("{}: {error}", path.display())})
+                        }
+                    }
+                };
+                (name, value)
+            })
+            .collect();
         let mutations: Vec<Value> = self
             .in_flight
             .values()
@@ -2238,6 +2264,7 @@ impl Control {
             // for these rather than waiting on the pair index (perf design §2.7).
             "busy_profiles": self.active.as_ref().map(|a| a.profiles.clone()).unwrap_or_default(),
             "routines": routines,
+            "index": index,
             "mutations": mutations,
             "held_outcome": self.held.as_ref().map(|(name, _)| name.clone()),
             "events": self.events.iter().rev().take(32).cloned().collect::<Vec<_>>(),

@@ -130,6 +130,15 @@ fn grace() -> Duration {
 
 impl Harness {
     fn new(label: &str, setup: impl FnOnce(&Path, &Path)) -> Self {
+        Self::tuned(label, setup, |_| {})
+    }
+
+    /// [`Harness::new`] with the settings adjusted before the daemon starts.
+    fn tuned(
+        label: &str,
+        setup: impl FnOnce(&Path, &Path),
+        tune: impl FnOnce(&mut Settings),
+    ) -> Self {
         let root = std::env::temp_dir().join(format!(
             "sdsyncd-control-{label}-{}-{}",
             std::process::id(),
@@ -166,6 +175,7 @@ impl Harness {
         settings.timings.kill_wait = Duration::from_millis(200);
         settings.wake_cap = Duration::from_millis(100);
         settings.publish_run_lock = false;
+        tune(&mut settings);
         let wall_reader = Arc::clone(&wall);
         let parts = Parts {
             paths: Paths::layout(&home, &var, PathBuf::from("/fake/synology-drive-sync")),
@@ -845,4 +855,71 @@ fn an_unchanged_reload_keeps_the_watch() {
         .filter(|c| c.starts_with("arm docs"))
         .count();
     assert_eq!(arms, 1);
+}
+
+/// `ctl status` names each profile's index: the counts, a corrupt index named,
+/// a malformed record named rather than read as "no index", and none at all as
+/// null.
+#[test]
+fn status_names_each_profiles_index() {
+    let h = Harness::new("index-status", |home, var| {
+        for name in ["alpha", "beta", "gamma", "delta"] {
+            profile(home, name);
+        }
+        fs::write(
+            var.join("state/profiles/alpha.state"),
+            "state=succeeded\nindex_state=warm\nindex_entries=1000\nindex_hits=975\n\
+             index_misses=25\nindex_canary_checked=25\nindex_canary_mismatches=0\n",
+        )
+        .unwrap();
+        fs::write(
+            var.join("state/profiles/beta.state"),
+            "state=succeeded\nindex_state=cold\nindex_entries=60\nindex_hits=0\nindex_misses=60\n\
+             index_issue=pair-index-corrupt\nindex_issue_detail=/p/beta.redb: set aside\n",
+        )
+        .unwrap();
+        fs::write(
+            var.join("state/profiles/gamma.state"),
+            "state=succeeded\nindex_state=lukewarm\n",
+        )
+        .unwrap();
+    });
+    let status = h.ask(Request::Status);
+    let index = &status["index"];
+    assert_eq!(index["alpha"]["state"], "warm", "{status}");
+    assert_eq!(index["alpha"]["entries"], 1000);
+    assert_eq!(index["alpha"]["hits"], 975);
+    assert_eq!(index["alpha"]["misses"], 25);
+    assert_eq!(index["alpha"]["refreshed"], false);
+    assert_eq!(index["beta"]["issue"], "pair-index-corrupt");
+    assert_eq!(index["beta"]["issue_detail"], "/p/beta.redb: set aside");
+    assert!(
+        index["gamma"]["error"]
+            .as_str()
+            .is_some_and(|e| e.contains("lukewarm")),
+        "{status}"
+    );
+    assert_eq!(index["delta"], Value::Null);
+}
+
+/// Every plan and sync gets the verified-pair index directory.
+#[test]
+fn runs_are_given_the_pair_index_directory() {
+    let h = Harness::tuned(
+        "pair-index",
+        |home, _| profile(home, "alpha"),
+        |settings| settings.pair_index_dir = Some(PathBuf::from("/var/state/cache/pairs")),
+    );
+    assert_eq!(h.ask(run("alpha"))["ok"], true);
+    h.wait_for("the run", Duration::from_secs(5), |h| h.launched() == 1);
+    let args = h.world.lock().unwrap().launched[0]
+        .args
+        .iter()
+        .map(|a| a.to_string_lossy().into_owned())
+        .collect::<Vec<_>>();
+    assert!(
+        args.windows(2)
+            .any(|w| w[0] == "--pair-index" && w[1] == "/var/state/cache/pairs"),
+        "{args:?}"
+    );
 }

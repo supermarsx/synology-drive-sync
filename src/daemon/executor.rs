@@ -24,7 +24,7 @@ use std::time::Duration;
 
 use serde_json::Value;
 
-use super::state::{ResultFacts, RunOutcome, RunStatus, sanitize_detail};
+use super::state::{IndexFacts, ResultFacts, RunOutcome, RunStatus, sanitize_detail};
 
 /// How much of the child's stderr is kept (matches `run-stderr.log`).
 pub(crate) const STDERR_TAIL_BYTES: usize = 16 * 1024;
@@ -199,6 +199,7 @@ pub(crate) fn parse_result_record(bytes: &[u8]) -> Result<Vec<JobRecord>, String
                 server_tasks_not_stopped: recovered["server_tasks_not_stopped"].as_u64(),
                 keepalive_failures: recovered["keepalive_failures"].as_u64(),
                 link_guard_unchecked: result["link_guard_unchecked"].as_u64(),
+                index: IndexFacts::from_value(&result["pair_index"]),
             },
         });
     }
@@ -1241,6 +1242,30 @@ mod tests {
         );
         assert_eq!(stderr_cause(b"one\ntwo\n\n"), "two");
         assert_eq!(stderr_cause(b""), "");
+    }
+
+    /// The index report of a run reaches the daemon: entries, hits, misses, the
+    /// canary, and the most serious issue named (a corrupt index set aside).
+    #[test]
+    fn the_pair_index_report_is_read_with_its_worst_issue() {
+        let records = parse_result_record(
+            br#"{"schema":"sdsync.result-record.v1","profile":"photos","status":"succeeded","error":null,"result":{"pair_index":{"state":"cold","served":0,"verified_live":60,"racy":0,"expired":0,"canary_checked":0,"canary_inconclusive":0,"canary_mismatches":0,"oldest_evidence_epoch":null,"remote_change_signal":"ctime","stored":60,"removed":0,"entries":60,"issues":[{"code":"pair-index-retired","severity":"info","path":"/x","cause":"bound elsewhere"},{"code":"pair-index-corrupt","severity":"warning","path":"/var/state/cache/pairs/photos.redb","cause":"integrity check failed; set aside as photos.redb.corrupt-1"}]}}}
+{"schema":"sdsync.result-record.v1","profile":"docs","status":"succeeded","error":null,"result":{}}
+"#,
+        )
+        .unwrap();
+        let index = records[0].facts.index.clone().unwrap();
+        assert_eq!(index.state, "cold");
+        assert_eq!((index.entries, index.hits, index.misses), (Some(60), 0, 60));
+        assert_eq!(index.issue.as_deref(), Some("pair-index-corrupt"));
+        assert!(
+            index
+                .issue_detail
+                .as_deref()
+                .is_some_and(|d| d.starts_with("/var/state/cache/pairs/photos.redb: integrity")),
+            "{index:?}"
+        );
+        assert_eq!(records[1].facts.index, None, "no index, no line");
     }
 
     #[test]

@@ -248,6 +248,141 @@ pub(crate) struct ResultFacts {
     pub(crate) server_tasks_not_stopped: Option<u64>,
     pub(crate) keepalive_failures: Option<u64>,
     pub(crate) link_guard_unchecked: Option<u64>,
+    /// What the verified-pair index did (`--pair-index`), when the run used it.
+    pub(crate) index: Option<IndexFacts>,
+}
+
+/// The verified-pair index line of a profile record (`index_*` keys): what the
+/// dashboard and `ctl status` show as `index:`.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct IndexFacts {
+    /// `off`, `cold`, `warm`, `refreshed`, `unusable` or `local-only`.
+    pub(crate) state: String,
+    /// Pairs the index holds after the run (unknown when it was never opened).
+    pub(crate) entries: Option<u64>,
+    /// Pairs served from the index / verified live.
+    pub(crate) hits: u64,
+    pub(crate) misses: u64,
+    pub(crate) canary_checked: u64,
+    pub(crate) canary_mismatches: u64,
+    /// The most serious issue the run named (`pair-index-corrupt`, ...), with
+    /// its path and cause on one line. Info-level notes are not issues here.
+    pub(crate) issue: Option<String>,
+    pub(crate) issue_detail: Option<String>,
+}
+
+impl IndexFacts {
+    /// From a result record's `pair_index` member; `None` when absent.
+    pub(crate) fn from_value(value: &serde_json::Value) -> Option<Self> {
+        let state = value.get("state")?.as_str()?;
+        if !valid_index_state(state) {
+            return None;
+        }
+        let number = |key: &str| value.get(key).and_then(serde_json::Value::as_u64);
+        let rank = |severity: &str| match severity {
+            "error" => 3,
+            "warning" => 2,
+            _ => 0,
+        };
+        let worst = value
+            .get("issues")
+            .and_then(serde_json::Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|issue| {
+                let code = issue.get("code")?.as_str()?;
+                let severity = rank(issue.get("severity")?.as_str()?);
+                (severity > 0 && index_issue_token(code)).then(|| {
+                    let text = |key: &str| {
+                        issue
+                            .get(key)
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or("")
+                    };
+                    let detail =
+                        sanitize_detail(&format!("{}: {}", text("path"), text("cause")), 160);
+                    (severity, code.to_owned(), detail)
+                })
+            })
+            .max_by_key(|(severity, _, _)| *severity);
+        Some(Self {
+            state: state.to_owned(),
+            entries: number("entries"),
+            hits: number("served").unwrap_or(0),
+            misses: number("verified_live").unwrap_or(0),
+            canary_checked: number("canary_checked").unwrap_or(0),
+            canary_mismatches: number("canary_mismatches").unwrap_or(0),
+            issue: worst.as_ref().map(|(_, code, _)| code.clone()),
+            issue_detail: worst.map(|(_, _, detail)| detail),
+        })
+    }
+
+    fn render(&self, out: &mut String) {
+        out.push_str(&format!("index_state={}\n", self.state));
+        if let Some(entries) = self.entries {
+            out.push_str(&format!("index_entries={entries}\n"));
+        }
+        out.push_str(&format!(
+            "index_hits={}\nindex_misses={}\nindex_canary_checked={}\nindex_canary_mismatches={}\n",
+            self.hits, self.misses, self.canary_checked, self.canary_mismatches
+        ));
+        if let Some(issue) = &self.issue {
+            out.push_str(&format!("index_issue={issue}\n"));
+        }
+        if let Some(detail) = self.issue_detail.as_deref().filter(|d| !d.is_empty()) {
+            out.push_str(&format!("index_issue_detail={detail}\n"));
+        }
+    }
+}
+
+/// `ctl status`'s `index:` entry of one profile, from its record: `null` when the
+/// last run did not use the index, the counts and the worst issue otherwise. A
+/// malformed line is named (`error`), never read as "no index".
+pub(crate) fn index_status_value(record: &[u8]) -> serde_json::Value {
+    use serde_json::{Value, json};
+    let text = String::from_utf8_lossy(record);
+    let mut keys: std::collections::BTreeMap<&str, &str> = std::collections::BTreeMap::new();
+    for line in text.lines().take(256) {
+        if let Some((key, value)) = line.split_once('=')
+            && key.starts_with("index_")
+            && !value.is_empty()
+        {
+            keys.entry(key).or_insert(value);
+        }
+    }
+    let Some(state) = keys.get("index_state").copied() else {
+        return Value::Null;
+    };
+    if !valid_index_state(state) {
+        return json!({"error": format!("index_state={state} is not an index state")});
+    }
+    let number = |key: &str| keys.get(key).and_then(|value| value.parse::<u64>().ok());
+    json!({
+        "state": state,
+        "entries": number("index_entries"),
+        "hits": number("index_hits"),
+        "misses": number("index_misses"),
+        "canary_checked": number("index_canary_checked"),
+        "canary_mismatches": number("index_canary_mismatches"),
+        "refreshed": state == "refreshed",
+        "issue": keys.get("index_issue").filter(|code| index_issue_token(code)),
+        "issue_detail": keys.get("index_issue_detail"),
+    })
+}
+
+/// The index states the core names.
+pub(crate) fn valid_index_state(state: &str) -> bool {
+    matches!(
+        state,
+        "off" | "cold" | "warm" | "refreshed" | "unusable" | "local-only"
+    )
+}
+
+/// An index issue code: `pair-index-` and lowercase words.
+pub(crate) fn index_issue_token(code: &str) -> bool {
+    code.len() <= 64
+        && code.starts_with("pair-index-")
+        && code.bytes().all(|b| b.is_ascii_lowercase() || b == b'-')
 }
 
 impl ResultFacts {
@@ -285,6 +420,9 @@ impl ResultFacts {
             if let Some(value) = value {
                 out.push_str(&format!("{key}={value}\n"));
             }
+        }
+        if let Some(index) = &self.index {
+            index.render(out);
         }
     }
 }
@@ -839,6 +977,45 @@ mod tests {
         assert!(text.contains("\ndetail=\n"));
     }
 
+    /// The index line is written into the profile record, every key named.
+    #[test]
+    fn a_profile_record_carries_the_index_line() {
+        let record = ProfileRecord {
+            outcome: ProfileOutcome::Succeeded,
+            exit: 0,
+            reason: "ok".into(),
+            finished: 500,
+            aggregate: false,
+            deferred: Some(0),
+            skipped: Some(0),
+            core_ran: true,
+            facts: ResultFacts {
+                index: Some(IndexFacts {
+                    state: "warm".into(),
+                    entries: Some(1000),
+                    hits: 975,
+                    misses: 25,
+                    canary_checked: 25,
+                    canary_mismatches: 0,
+                    issue: None,
+                    issue_detail: None,
+                }),
+                ..ResultFacts::default()
+            },
+            detail: None,
+            failed_path: None,
+        };
+        let text = String::from_utf8(render_profile_state(&record, "sync", None).unwrap()).unwrap();
+        assert!(
+            text.contains(
+                "index_state=warm\nindex_entries=1000\nindex_hits=975\nindex_misses=25\n\
+                 index_canary_checked=25\nindex_canary_mismatches=0\n"
+            ),
+            "{text}"
+        );
+        assert!(!text.contains("index_issue"), "{text}");
+    }
+
     #[test]
     fn profile_state_keeps_completion_semantics() {
         let record = ProfileRecord {
@@ -1202,6 +1379,64 @@ mod tests {
         }
 
         /// Each completed outcome the executor names reads back as itself.
+
+        /// The index line reads back through the bridge as `index`, a corrupt
+        /// index named with its path and cause, and a profile without one as null.
+        #[test]
+        fn the_index_line_reads_back_through_the_bridge() {
+            let tree = Tree::new("index");
+            tree.private("home/config/profiles.d/photos.toml", b"");
+            let mut profile = ProfileRecord {
+                outcome: ProfileOutcome::Succeeded,
+                exit: 0,
+                reason: "ok".into(),
+                finished: 1_700_000_100,
+                aggregate: false,
+                deferred: Some(0),
+                skipped: Some(0),
+                core_ran: true,
+                facts: ResultFacts {
+                    index: Some(IndexFacts {
+                        state: "cold".into(),
+                        entries: Some(60),
+                        hits: 0,
+                        misses: 60,
+                        canary_checked: 0,
+                        canary_mismatches: 0,
+                        issue: Some("pair-index-corrupt".into()),
+                        issue_detail: Some(
+                            "/var/state/cache/pairs/photos.redb: integrity check failed".into(),
+                        ),
+                    }),
+                    ..ResultFacts::default()
+                },
+                detail: None,
+                failed_path: None,
+            };
+            tree.private(
+                "var/state/profiles/photos.state",
+                &render_profile_state(&profile, "sync", None).unwrap(),
+            );
+            let outcomes = tree.outcomes();
+            assert_eq!(outcomes["errors"], json!([]), "{outcomes}");
+            let index = &outcomes["profiles"][0]["index"];
+            assert_eq!(index["state"], "cold", "{outcomes}");
+            assert_eq!(index["entries"], 60);
+            assert_eq!(index["misses"], 60);
+            assert_eq!(index["refreshed"], false);
+            assert_eq!(index["issue"], "pair-index-corrupt");
+            assert_eq!(
+                index["issue_detail"],
+                "/var/state/cache/pairs/photos.redb: integrity check failed"
+            );
+            profile.facts.index = None;
+            tree.private(
+                "var/state/profiles/photos.state",
+                &render_profile_state(&profile, "sync", None).unwrap(),
+            );
+            assert_eq!(tree.outcomes()["profiles"][0]["index"], Value::Null);
+        }
+
         #[test]
         fn every_run_outcome_reads_back_as_itself() {
             let tree = Tree::new("outcomes");

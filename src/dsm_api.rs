@@ -17851,9 +17851,59 @@ fn profile_outcome_value(
         "deferred_files": deferred,
         "warnings": warnings,
         "status_cache": trust,
+        "index": profile_index_value(&record, errors),
     });
     merge_facts(&mut value, facts);
     value
+}
+
+/// The verified-pair index line of a profile record (`index_*`, written by the daemon from the
+/// run's `pair_index` report), or `null` for a run that did not use the index (or an older
+/// writer). A key that is present but malformed is named, never shown.
+#[cfg(target_os = "linux")]
+fn profile_index_value(record: &OutcomeRecord<'_>, errors: &mut OutcomeErrors) -> Value {
+    let Some(state) = record.text("index_state", errors) else {
+        return Value::Null;
+    };
+    if !matches!(
+        state.as_slice(),
+        b"off" | b"cold" | b"warm" | b"refreshed" | b"unusable" | b"local-only"
+    ) {
+        errors.push(record.source, "malformed");
+        return Value::Null;
+    }
+    let issue = record.text("index_issue", errors).and_then(|code| {
+        let valid = code.len() <= 64
+            && code.starts_with(b"pair-index-")
+            && code.iter().all(|b| b.is_ascii_lowercase() || *b == b'-');
+        if valid {
+            String::from_utf8(code).ok()
+        } else {
+            errors.push(record.source, "malformed");
+            None
+        }
+    });
+    let issue_detail = record
+        .text("index_issue_detail", errors)
+        .and_then(|detail| {
+            if detail.len() <= 160 && detail.iter().all(|b| (b' '..=b'~').contains(b)) {
+                String::from_utf8(detail).ok()
+            } else {
+                errors.push(record.source, "malformed");
+                None
+            }
+        });
+    json!({
+        "state": String::from_utf8_lossy(&state),
+        "entries": record.number("index_entries", errors),
+        "hits": record.number("index_hits", errors),
+        "misses": record.number("index_misses", errors),
+        "canary_checked": record.number("index_canary_checked", errors),
+        "canary_mismatches": record.number("index_canary_mismatches", errors),
+        "refreshed": state.as_slice() == b"refreshed",
+        "issue": issue,
+        "issue_detail": issue_detail,
+    })
 }
 
 /// `detail=` in a profile record: the core's error line for that profile (S-18), written by the

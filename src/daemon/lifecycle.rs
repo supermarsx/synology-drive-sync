@@ -414,6 +414,9 @@ pub(crate) fn run_daemon(options: &Options) -> ExitCode {
     let settings = Settings {
         child_env: child_env.clone(),
         timings: options.timings,
+        // `$cache_root/pairs`: one `<profile>.redb` per profile; the core
+        // creates the directory 0700 and claims it with its marker.
+        pair_index_dir: Some(options.var.join("state/cache/pairs")),
         ..Settings::default()
     };
     let mutation_deadline = settings.mutation_deadline;
