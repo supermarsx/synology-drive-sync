@@ -8729,6 +8729,7 @@ fn valid_audit_operation(value: &str) -> bool {
             | "routine"
             | "remove-routine"
             | "alert-policy"
+            | "performance-policy"
             | "security-policy"
             | "interface-settings"
             | "session-notifications"
@@ -9616,7 +9617,7 @@ mod linux_files {
             serde_json::from_slice(line).map_err(|_| BridgeError::unsafe_runtime())?;
         let expected_category = match parsed.operation {
             "configure-profile" | "remove-profile" | "set-default" | "schedule"
-            | "alert-policy" | "interface-settings" => "configuration",
+            | "alert-policy" | "performance-policy" | "interface-settings" => "configuration",
             "set-secret"
             | "set-password"
             | "remove-password"
@@ -32831,6 +32832,53 @@ mod tests {
         // allowlist it passes through. This covers the two Rust-side lists;
         // the manager and sdsync-common hold the matching shell-side entries.
         assert!(valid_audit_operation("clear-logs"));
+        // Every operation the manager audits directly is one the outbox and
+        // the audit log accept: `configure-performance` audits as
+        // `performance-policy`, which neither accepted, so every performance
+        // save failed with exit 73 before it began.
+        let manager = include_str!("../packaging/synology/package/bin/sdsync-dsm");
+        let direct: Vec<&str> = manager
+            .lines()
+            .filter_map(|line| line.split("direct_audit_operation=").nth(1))
+            .filter_map(|rest| rest.split([' ', ';']).next())
+            .filter(|word| !word.is_empty() && !word.starts_with('$'))
+            .collect();
+        assert!(direct.contains(&"performance-policy"), "{direct:?}");
+        for operation in &direct {
+            assert!(valid_audit_operation(operation), "{operation}");
+        }
+        // The rest audit under their own command name (`*) direct_audit_operation=
+        // $command_name`), so the audited command list is itself a list of
+        // operations: `resync` was missing from the manager's and died before
+        // it ran, and a name added there that the bridge does not accept would
+        // fail the same way. Commands that audit under another name are the
+        // `direct` operations above and are listed here.
+        const RENAMED: [&str; 7] = [
+            "configure-routine",
+            "set-schedule",
+            "enable",
+            "disable",
+            "configure-alerts",
+            "configure-performance",
+            "configure-security-policy",
+        ];
+        let marker = "    mutation_commit_started=false\n    case ${command_name:-} in\n";
+        let listed = manager
+            .split(marker)
+            .nth(1)
+            .and_then(|rest| rest.split(")\n").next())
+            .expect("the manager's audited command list");
+        let commands: Vec<&str> = listed
+            .split(['|', '\\', '\n', ' '])
+            .filter(|word| !word.is_empty())
+            .collect();
+        assert!(commands.contains(&"resync"), "{commands:?}");
+        for renamed in RENAMED {
+            assert!(commands.contains(&renamed), "{renamed} / {commands:?}");
+        }
+        for command in commands.iter().filter(|command| !RENAMED.contains(command)) {
+            assert!(valid_audit_operation(command), "{command}");
+        }
         // A package log is not profile-scoped.
         assert_eq!(mutation_audit_profile(&parsed.mutation), "none");
     }
