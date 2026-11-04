@@ -553,10 +553,7 @@ impl Consumer {
                         self.log(
                             Level::Error,
                             "control_dir_unreadable",
-                            format!(
-                                "path={} cause={cause} was={earlier}",
-                                path.display()
-                            ),
+                            format!("path={} cause={cause} was={earlier}", path.display()),
                         );
                         self.unreadable.borrow_mut().insert(path, (since, cause));
                     }
@@ -1846,9 +1843,11 @@ exit 64
         assert_eq!(latest.reason, "control_dir_unreadable");
         assert_eq!(latest.since, first.since, "one episode keeps its start");
         assert!(
-            events.iter().any(|e| e.starts_with("control_dir_unreadable")
-                && e.contains("was=Permission denied")
-                && !e.contains("cause=Permission denied")),
+            events
+                .iter()
+                .any(|e| e.starts_with("control_dir_unreadable")
+                    && e.contains("was=Permission denied")
+                    && !e.contains("cause=Permission denied")),
             "the changed cause is named, with what it was: {events:#?}"
         );
     }

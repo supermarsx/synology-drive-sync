@@ -1837,11 +1837,7 @@ impl Control {
             for (path, read) in dependency_reads.take() {
                 match read {
                     Ok(()) => self.readable_again(&path),
-                    Err(cause) => self.unreadable_now_keeping(
-                        &path,
-                        &cause,
-                        KEPT_DEPENDENCY,
-                    ),
+                    Err(cause) => self.unreadable_now_keeping(&path, &cause, KEPT_DEPENDENCY),
                 }
             }
             match (&window, self.clock_episodes.contains(&name)) {

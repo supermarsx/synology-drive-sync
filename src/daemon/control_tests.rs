@@ -404,8 +404,13 @@ fn write_atomic(path: &Path, contents: impl AsRef<[u8]>) {
     let temporary = path.with_file_name(format!(".{name}.tmp{}", std::process::id()));
     fs::write(&temporary, contents)
         .unwrap_or_else(|e| panic!("write {}: {e}", temporary.display()));
-    fs::rename(&temporary, path)
-        .unwrap_or_else(|e| panic!("rename {} over {}: {e}", temporary.display(), path.display()));
+    fs::rename(&temporary, path).unwrap_or_else(|e| {
+        panic!(
+            "rename {} over {}: {e}",
+            temporary.display(),
+            path.display()
+        )
+    });
 }
 
 fn run(scope: &str) -> Request {
@@ -1921,9 +1926,11 @@ fn a_degradation_whose_cause_changes_is_republished() {
     for exit in ["exit=73", "exit=69"] {
         assert_eq!(
             logs.iter()
-                .filter(|l| l.starts_with("service_degraded reason=audit_unavailable")
-                    && l.contains(&format!("since={}", T0 - 40))
-                    && l.contains(exit))
+                .filter(
+                    |l| l.starts_with("service_degraded reason=audit_unavailable")
+                        && l.contains(&format!("since={}", T0 - 40))
+                        && l.contains(exit)
+                )
                 .count(),
             1,
             "{exit}: {logs:#?}"
