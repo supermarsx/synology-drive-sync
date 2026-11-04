@@ -22,6 +22,7 @@
 //! `--audit-transaction reconcile`): those entry points clear the process
 //! environment and assume they are alone, which a thread of the daemon is not.
 
+use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::fs;
@@ -169,7 +170,8 @@ impl QueueConsumer {
             log,
             activity,
             health,
-            health_published: false,
+            health_published: None,
+            unreadable: RefCell::new(BTreeMap::new()),
             stop: Arc::clone(&stop),
             running: BTreeMap::new(),
             last_reconcile: None,
@@ -248,8 +250,11 @@ struct Consumer {
     log: QueueLog,
     activity: QueueActivity,
     health: QueueHealth,
-    /// The degradation was published and not yet cleared.
-    health_published: bool,
+    /// The degradation last published and not yet cleared.
+    health_published: Option<super::state::ControllerDegraded>,
+    /// Control directories that could not be read, each with when that began and
+    /// why: named once per episode, and published as a degradation while any is.
+    unreadable: RefCell<BTreeMap<PathBuf, (u64, String)>>,
     stop: Arc<AtomicBool>,
     running: BTreeMap<String, Running>,
     last_reconcile: Option<Instant>,
@@ -485,19 +490,67 @@ impl Consumer {
     /// bound (jobs are refused `audit_unavailable` from then on) and when it
     /// recovers, once per change.
     fn publish_health(&mut self) {
-        let unavailable = self.audit_unavailable();
-        if unavailable == self.health_published {
+        let wanted = if self.audit_unavailable() {
+            Some(super::state::ControllerDegraded {
+                reason: "audit_unavailable",
+                since: self.reconcile.failing_since_epoch,
+                cause: format!(
+                    "the audit log could not be reconciled ({}); dashboard operations are refused until it recovers",
+                    self.reconcile.cause
+                ),
+            })
+        } else {
+            self.unreadable.borrow().iter().next().map(|(path, (since, cause))| {
+                super::state::ControllerDegraded {
+                    reason: "control_dir_unreadable",
+                    since: *since,
+                    cause: format!(
+                        "{} cannot be read ({cause}); dashboard operations cannot be seen until it can",
+                        path.display()
+                    ),
+                }
+            })
+        };
+        if wanted == self.health_published {
             return;
         }
-        self.health_published = unavailable;
-        (self.health)(unavailable.then(|| super::state::ControllerDegraded {
-            reason: "audit_unavailable",
-            since: self.reconcile.failing_since_epoch,
-            cause: format!(
-                "the audit log could not be reconciled ({}); dashboard operations are refused until it recovers",
-                self.reconcile.cause
-            ),
-        }));
+        self.health_published = wanted.clone();
+        (self.health)(wanted);
+    }
+
+    /// `read_dir` of a control directory. A failure used to read as an empty
+    /// directory and nothing said so: it is named once per episode with its path
+    /// and cause (`control_dir_unreadable`), kept in `unreadable` for the
+    /// degradation `publish_health` raises, and its end is named too
+    /// (`control_dir_recovered`).
+    fn read_control_dir(&self, dir: &str) -> Option<fs::ReadDir> {
+        let path = self.control.join(dir);
+        match fs::read_dir(&path) {
+            Ok(entries) => {
+                if self.unreadable.borrow_mut().remove(&path).is_some() {
+                    self.log(
+                        Level::Info,
+                        "control_dir_recovered",
+                        format!("path={}", path.display()),
+                    );
+                }
+                Some(entries)
+            }
+            Err(error) => {
+                let first = !self.unreadable.borrow().contains_key(&path);
+                if first {
+                    self.log(
+                        Level::Error,
+                        "control_dir_unreadable",
+                        format!("path={} cause={error}", path.display()),
+                    );
+                    self.unreadable
+                        .borrow_mut()
+                        .insert(path, (epoch_now(), error.to_string()));
+                }
+                None
+            }
+        }
     }
 
     fn run(mut self) {
@@ -528,7 +581,7 @@ impl Consumer {
 
     /// Requests waiting, oldest (lexical: the bridge's ids are monotonic) first.
     fn pending(&self) -> Vec<String> {
-        let Ok(entries) = fs::read_dir(self.control.join("requests")) else {
+        let Some(entries) = self.read_control_dir("requests") else {
             return Vec::new();
         };
         let mut ids: Vec<String> = entries
@@ -1084,7 +1137,7 @@ impl Consumer {
                 Level::Info,
             ),
         ] {
-            let Ok(entries) = fs::read_dir(self.control.join(dir)) else {
+            let Some(entries) = self.read_control_dir(dir) else {
                 continue;
             };
             for entry in entries.flatten() {
@@ -1126,7 +1179,7 @@ impl Consumer {
     }
 
     fn prune_responses(&self) {
-        let Ok(entries) = fs::read_dir(self.control.join("responses")) else {
+        let Some(entries) = self.read_control_dir("responses") else {
             return;
         };
         let mut responses: Vec<PathBuf> = entries
@@ -1617,6 +1670,68 @@ exit 64
         eprintln!("{published:#?}");
         assert_eq!(published.len(), 2, "once per change: {published:#?}");
         assert_eq!(published[1], None);
+    }
+
+    /// A control directory the daemon cannot read used to read as empty: no job
+    /// was ever seen and nothing said so. It is named once per episode, with its
+    /// path and cause, published to controller.state as a degradation, and its
+    /// recovery is named too.
+    #[test]
+    fn an_unreadable_control_directory_is_named_once_and_published() {
+        let requests = |dir: &Path| dir.join("var/control/requests");
+        let f = Fixture::prepared("unreadable-dir", fast(), |dir| {
+            fs::set_permissions(requests(dir), fs::Permissions::from_mode(0o000)).unwrap();
+        });
+        if super::super::testkit::permissions_do_not_bind(
+            "an_unreadable_control_directory_is_named_once_and_published",
+            &requests(&f.dir),
+        ) {
+            return;
+        }
+        f.wait("the dir named", Duration::from_secs(10), |f| {
+            f.events
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|e| e.starts_with("control_dir_unreadable"))
+        });
+        f.wait("the degradation published", Duration::from_secs(10), |f| {
+            !f.health.lock().unwrap().is_empty()
+        });
+        // Many ticks later: still one line, not one per tick.
+        thread::sleep(Duration::from_millis(400));
+        let named: Vec<String> = f
+            .events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|e| e.starts_with("control_dir_unreadable"))
+            .cloned()
+            .collect();
+        assert_eq!(named.len(), 1, "{named:#?}");
+        let path = requests(&f.dir).display().to_string();
+        assert!(named[0].contains(&format!("path={path}")), "{named:#?}");
+        assert!(named[0].contains("cause="), "{named:#?}");
+        let degraded = f.health.lock().unwrap()[0]
+            .clone()
+            .expect("the first change is a degradation");
+        assert_eq!(degraded.reason, "control_dir_unreadable");
+        assert!(degraded.cause.contains(&path), "{degraded:?}");
+        // Readable again: the recovery is named and the degradation clears.
+        fs::set_permissions(requests(&f.dir), fs::Permissions::from_mode(0o700)).unwrap();
+        f.wait("the clearing published", Duration::from_secs(10), |f| {
+            f.health.lock().unwrap().len() >= 2
+        });
+        assert_eq!(f.health.lock().unwrap()[1], None);
+        assert!(
+            f.events
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|e| e.starts_with("control_dir_recovered") && e.contains(&path)),
+            "{:?}",
+            f.events.lock().unwrap()
+        );
     }
 
     /// H3: a consumer that outlives KILL (D state; here: out of the queue's
