@@ -635,9 +635,12 @@ impl Control {
         if self.unreadable.is_empty() {
             return;
         }
-        let profiles: Option<HashSet<String>> = profile_names_in(&self.paths.profiles_dir)
-            .ok()
-            .map(|names| names.into_iter().collect());
+        // A listing that fails is named by `profile_list` (config_unreadable on the
+        // directory) and settles nothing here.
+        let profiles: Option<HashSet<String>> = match self.profile_list() {
+            Ok(names) => Some(names.into_iter().collect()),
+            Err(_) => None,
+        };
         let depended: HashSet<String> = self
             .routines
             .values()
