@@ -92,6 +92,7 @@ impl Launcher for FakeLauncher {
                 record_error: None,
                 oom_proven: oom.then_some(true),
                 memory_note: None,
+                audit_error: None,
                 last_phase: None,
             })));
         });
@@ -193,6 +194,7 @@ impl Harness {
                 grace: grace(),
             }),
             mutations: Arc::clone(&mutations) as Arc<dyn MutationRunner>,
+            audit: Arc::new(super::super::audit::NoAudit),
             changes: Some({
                 let source = changes.clone();
                 Box::new(move |_sink| Box::new(source) as Box<dyn ChangeSource>)

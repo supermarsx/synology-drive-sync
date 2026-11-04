@@ -12,6 +12,7 @@
 
 #[cfg(target_os = "linux")]
 pub(crate) mod api_server;
+pub(crate) mod audit;
 pub(crate) mod changes;
 pub(crate) mod control;
 #[cfg(target_os = "linux")]

@@ -307,6 +307,7 @@ pub(crate) struct Control {
     settings: Settings,
     launcher: Box<dyn Launcher>,
     mutations: Arc<dyn MutationRunner>,
+    audit: Arc<dyn super::audit::RunAudit>,
     changes: Option<Box<dyn ChangeSource>>,
     next_generation: u64,
     sink: Box<dyn EventSink>,
@@ -348,6 +349,8 @@ pub(crate) struct Parts {
     pub(crate) settings: Settings,
     pub(crate) launcher: Box<dyn Launcher>,
     pub(crate) mutations: Arc<dyn MutationRunner>,
+    /// The run audit (I-7); `NoAudit` in tests that are not about it.
+    pub(crate) audit: Arc<dyn super::audit::RunAudit>,
     pub(crate) changes: Option<ChangeSourceFactory>,
     pub(crate) sink: Box<dyn EventSink>,
     pub(crate) clock: Box<dyn LocalClock + Send>,
@@ -362,6 +365,7 @@ impl Control {
             settings: parts.settings,
             launcher: parts.launcher,
             mutations: parts.mutations,
+            audit: parts.audit,
             changes: parts.changes.map(|factory| {
                 let events = tx.clone();
                 let sink: ChangeSink = Arc::new(move |generation, event| {
@@ -1606,6 +1610,20 @@ impl Control {
             result_record: Some(result_record),
             progress_record: None,
             timings: self.settings.timings,
+            audit: Some(super::executor::AuditStep {
+                audit: Arc::clone(&self.audit),
+                operation: match request.action {
+                    Action::Plan => "plan",
+                    Action::Sync => "run",
+                },
+                scope: request.scope.clone(),
+                origin: match request.origin {
+                    Origin::Requested => super::audit::AuditOrigin::Manager,
+                    Origin::Routine { .. } | Origin::Aggregate => {
+                        super::audit::AuditOrigin::Scheduler
+                    }
+                },
+            }),
         };
         self.activity(
             "run.started",
@@ -1653,6 +1671,7 @@ impl Control {
                         record_error: None,
                         oom_proven: None,
                         memory_note: None,
+                        audit_error: None,
                         last_phase: None,
                     })),
                 ));
@@ -1824,6 +1843,21 @@ impl Control {
         let Some(mut active) = self.active.take() else {
             return;
         };
+        if let Some(cause) = &report.audit_error {
+            // The outbox still holds the run's record; the next reconciliation
+            // completes it. Named, never silent.
+            self.log(
+                Level::Error,
+                "controller",
+                "audit_complete_failed",
+                format!(
+                    "id={} scope={} cause={}",
+                    active.request.id,
+                    active.request.scope,
+                    sanitize_detail(cause, 200)
+                ),
+            );
+        }
         let verdict = classify(&report);
         let finished = (self.wall)()
             .unwrap_or(active.started_epoch)
@@ -2086,11 +2120,13 @@ impl Control {
             return;
         };
         let routine = routine.clone();
-        if let super::executor::Ending::SpawnFailed { .. } = report.ending {
+        if let super::executor::Ending::SpawnFailed { .. }
+        | super::executor::Ending::Refused { .. } = report.ending
+        {
             // Nothing ran: recorded, consumes no retry, tried again after the
             // floor (the shell's admission_failed).
             state.state = RoutineRunState::Failed;
-            state.last_reason = "launch_failed".into();
+            state.last_reason = verdict.reason.clone();
             state.last_exit = -1;
             state.next_run = finished + routines::RETRY_FLOOR_SECONDS;
             let snapshot = state.clone();

@@ -470,10 +470,42 @@ pub(crate) fn run_daemon(options: &Options) -> ExitCode {
         ..Settings::default()
     };
     let mutation_deadline = settings.mutation_deadline;
+    // The bridge's audit outbox lives at the package paths only: a daemon
+    // pointed at another tree (tests) runs unaudited, and says so.
+    let audited = options.var == Path::new(super::super::PACKAGE_VAR);
+    let audit: Arc<dyn super::audit::RunAudit> = if audited {
+        Arc::new(super::audit::BridgeAudit {
+            bridge: std::env::current_exe().unwrap_or_else(|_| {
+                PathBuf::from(super::super::PACKAGE_ROOT).join("bin/sdsync-dsm-api")
+            }),
+            env: api_env.clone(),
+            uid,
+        })
+    } else {
+        Arc::new(super::audit::NoAudit)
+    };
+    let _ = sink.log(
+        epoch().unwrap_or(0),
+        &LogEvent {
+            level: if audited { Level::Info } else { Level::Warn },
+            category: "controller",
+            event: "service_audit",
+            detail: if audited {
+                "runs=audited".to_owned()
+            } else {
+                format!(
+                    "runs=unaudited cause={} is not the package's var ({})",
+                    options.var.display(),
+                    super::super::PACKAGE_VAR
+                )
+            },
+        },
+    );
     let parts = Parts {
         paths: Paths::layout(&options.home, &options.var, options.core.clone()),
         settings,
         launcher: Box::new(ProcessLauncher),
+        audit,
         mutations: Arc::new(ManagerMutations {
             manager: options.manager.clone(),
             env: child_env,

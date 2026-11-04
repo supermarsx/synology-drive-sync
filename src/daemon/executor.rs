@@ -66,6 +66,64 @@ pub(crate) struct RunSpec {
     pub(crate) result_record: Option<PathBuf>,
     pub(crate) progress_record: Option<PathBuf>,
     pub(crate) timings: Timings,
+    /// The run's mandatory audit (I-7), opened by the supervisor before the
+    /// core starts and completed after it ends; `None` runs unaudited (tests).
+    pub(crate) audit: Option<AuditStep>,
+}
+
+/// What a run's audit records.
+#[derive(Clone)]
+pub(crate) struct AuditStep {
+    pub(crate) audit: std::sync::Arc<dyn super::audit::RunAudit>,
+    /// `run` or `plan`.
+    pub(crate) operation: &'static str,
+    pub(crate) scope: String,
+    pub(crate) origin: super::audit::AuditOrigin,
+}
+
+impl std::fmt::Debug for AuditStep {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "AuditStep({} {} {:?})",
+            self.operation, self.scope, self.origin
+        )
+    }
+}
+
+impl AuditStep {
+    /// Reconcile, begin and execute: the transaction id, or why the run must
+    /// not start.
+    pub(crate) fn open(&self) -> Result<String, String> {
+        self.audit
+            .reconcile()
+            .map_err(|cause| format!("the audit outbox could not be reconciled: {cause}"))?;
+        let transaction = self
+            .audit
+            .begin(self.operation, &self.scope, self.origin)
+            .map_err(|cause| format!("the run's audit could not be opened: {cause}"))?;
+        if let Err(cause) = self.audit.execute(&transaction) {
+            let _ = self.audit.complete(&transaction, "failed");
+            return Err(format!(
+                "the run's audit could not record its start: {cause}"
+            ));
+        }
+        Ok(transaction)
+    }
+
+    /// Complete with the run's final state; why not, when it could not be.
+    pub(crate) fn close(&self, transaction: &str, report: &RunReport) -> Option<String> {
+        let state = match report.ending {
+            // Abandoned: whether it changed anything more is not known.
+            Ending::Unkillable { .. } => "outcome_unknown",
+            _ if classify(report).status == RunStatus::Succeeded => "succeeded",
+            _ => "failed",
+        };
+        self.audit
+            .complete(transaction, state)
+            .err()
+            .map(|cause| format!("the run's audit could not be completed ({state}): {cause}"))
+    }
 }
 
 /// The variables a child may inherit from the daemon (I-9). Everything else,
@@ -106,6 +164,8 @@ pub(crate) enum Ending {
     Unkillable { after: Box<Ending> },
     /// It never started.
     SpawnFailed { cause: String },
+    /// It was not started, for a named reason (`audit_unavailable`).
+    Refused { reason: &'static str, cause: String },
 }
 
 /// One `sdsync.result-record.v1` line, as far as the daemon needs it.
@@ -137,6 +197,8 @@ pub(crate) struct RunReport {
     /// For an exit 137 the daemon did not cause: the memory a run could use
     /// when it was killed (the core's own budget probe), named in the detail.
     pub(crate) memory_note: Option<String>,
+    /// The run's audit could not be completed (named; reconciliation follows).
+    pub(crate) audit_error: Option<String>,
     /// The progress phase last seen in the progress record, if any.
     pub(crate) last_phase: Option<String>,
 }
@@ -301,6 +363,7 @@ fn ending_words(ending: &Ending, report: &RunReport) -> (RunOutcome, &'static st
             format!("the core could not be started: {cause}"),
             false,
         ),
+        Ending::Refused { reason, cause } => (RunOutcome::Failed, reason, cause.clone(), false),
         Ending::Exited => (RunOutcome::Failed, "core_failed", String::new(), false),
     }
 }
@@ -325,7 +388,10 @@ pub(crate) fn classify(report: &RunReport) -> Verdict {
     };
     if !matches!(report.ending, Ending::Exited) {
         let (outcome, reason, detail, cancelled) = ending_words(&report.ending, report);
-        let core_ran = !matches!(report.ending, Ending::SpawnFailed { .. });
+        let core_ran = !matches!(
+            report.ending,
+            Ending::SpawnFailed { .. } | Ending::Refused { .. }
+        );
         return verdict(
             RunStatus::Failed,
             outcome,
@@ -622,8 +688,33 @@ mod process {
     }
 
     fn supervise(spec: RunSpec, requests: mpsc::Receiver<StopCause>, sink: &dyn Fn(ExecEvent)) {
+        // I-7: the audit is opened before the core starts; a run whose audit
+        // cannot be opened does not start.
+        let transaction = match &spec.audit {
+            Some(step) => match step.open() {
+                Ok(transaction) => Some(transaction),
+                Err(cause) => {
+                    sink(ExecEvent::Finished(Box::new(RunReport {
+                        exit: -1,
+                        ending: Ending::Refused {
+                            reason: "audit_unavailable",
+                            cause,
+                        },
+                        stderr_tail: Vec::new(),
+                        records: Vec::new(),
+                        record_error: None,
+                        oom_proven: None,
+                        memory_note: None,
+                        audit_error: None,
+                        last_phase: None,
+                    })));
+                    return;
+                }
+            },
+            None => None,
+        };
         let finished = |exit, ending, tail: Vec<u8>, records, record_error, oom, phase| {
-            sink(ExecEvent::Finished(Box::new(RunReport {
+            let mut report = RunReport {
                 exit,
                 ending,
                 stderr_tail: tail,
@@ -631,8 +722,13 @@ mod process {
                 record_error,
                 oom_proven: oom,
                 memory_note: (exit == 137).then(memory_note),
+                audit_error: None,
                 last_phase: phase,
-            })));
+            };
+            if let (Some(step), Some(transaction)) = (&spec.audit, &transaction) {
+                report.audit_error = step.close(transaction, &report);
+            }
+            sink(ExecEvent::Finished(Box::new(report)));
         };
         let mut command = Command::new(&spec.program);
         command
@@ -875,6 +971,7 @@ mod process {
                 result_record: None,
                 progress_record: None,
                 timings,
+                audit: None,
             }
         }
 
@@ -908,6 +1005,127 @@ mod process {
                     Err(_) => panic!("no outcome within {within:?}; saw {seen:?}"),
                 }
             }
+        }
+
+        /// Records the audit steps; fails the one named in `fail`.
+        struct Recording {
+            calls: Mutex<Vec<String>>,
+            fail: &'static str,
+        }
+
+        impl crate::dsm_api::daemon::audit::RunAudit for Recording {
+            fn reconcile(&self) -> Result<(), String> {
+                self.step("reconcile".into())
+            }
+            fn begin(
+                &self,
+                operation: &str,
+                scope: &str,
+                origin: crate::dsm_api::daemon::audit::AuditOrigin,
+            ) -> Result<String, String> {
+                self.step(format!("begin {operation} {scope} {}", origin.origin()))
+                    .map(|()| "tx1".into())
+            }
+            fn execute(&self, transaction: &str) -> Result<(), String> {
+                self.step(format!("execute {transaction}"))
+            }
+            fn complete(&self, transaction: &str, state: &str) -> Result<(), String> {
+                self.step(format!("complete {transaction} {state}"))
+            }
+        }
+
+        impl Recording {
+            fn step(&self, call: String) -> Result<(), String> {
+                let failing = call.starts_with(self.fail);
+                self.calls.lock().unwrap().push(call);
+                if failing {
+                    Err("the outbox is unwritable".into())
+                } else {
+                    Ok(())
+                }
+            }
+        }
+
+        fn audited(script: &str, fail: &'static str) -> (RunSpec, Arc<Recording>) {
+            let audit = Arc::new(Recording {
+                calls: Mutex::new(Vec::new()),
+                fail,
+            });
+            let mut spec = sh(script, fast());
+            spec.audit = Some(AuditStep {
+                audit: audit.clone(),
+                operation: "run",
+                scope: "photos".into(),
+                origin: crate::dsm_api::daemon::audit::AuditOrigin::Scheduler,
+            });
+            (spec, audit)
+        }
+
+        /// I-7: the audit is opened before the core starts and completed with
+        /// the run's state; a run whose audit cannot be opened never starts.
+        #[test]
+        fn a_run_is_audited_and_never_starts_unaudited() {
+            let dir = scratch("audit");
+            let marker = dir.join("ran");
+            let script = format!("touch {}", marker.display());
+            let (spec, audit) = audited(&script, "none");
+            let (_handle, events) = run(spec);
+            let (report, _) = finish(&events, Duration::from_secs(10));
+            assert_eq!(report.exit, 0);
+            assert!(marker.exists());
+            assert_eq!(
+                *audit.calls.lock().unwrap(),
+                [
+                    "reconcile",
+                    "begin run photos scheduler",
+                    "execute tx1",
+                    "complete tx1 succeeded"
+                ]
+            );
+            fs::remove_file(&marker).unwrap();
+            let (spec, audit) = audited(&script, "begin");
+            let (_handle, events) = run(spec);
+            let (report, _) = finish(&events, Duration::from_secs(10));
+            let verdict = classify(&report);
+            assert_eq!(verdict.reason, "audit_unavailable");
+            assert!(
+                verdict.detail.contains("could not be opened"),
+                "{}",
+                verdict.detail
+            );
+            assert!(!verdict.core_ran);
+            assert!(!marker.exists(), "an unaudited run started");
+            assert!(
+                !audit
+                    .calls
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|c| c.starts_with("execute"))
+            );
+            // A failed execute step completes the begun record as failed.
+            let (spec, audit) = audited(&script, "execute");
+            let (_handle, events) = run(spec);
+            let (report, _) = finish(&events, Duration::from_secs(10));
+            assert_eq!(classify(&report).reason, "audit_unavailable");
+            assert!(!marker.exists());
+            assert_eq!(
+                audit.calls.lock().unwrap().last().map(String::as_str),
+                Some("complete tx1 failed")
+            );
+            // A failed completion is reported, not swallowed.
+            let (spec, _) = audited("exit 1", "complete");
+            let (_handle, events) = run(spec);
+            let (report, _) = finish(&events, Duration::from_secs(10));
+            assert!(
+                report
+                    .audit_error
+                    .as_deref()
+                    .is_some_and(|e| e.contains("(failed)")),
+                "{:?}",
+                report.audit_error
+            );
+            let _ = fs::remove_dir_all(&dir);
         }
 
         fn scratch(label: &str) -> std::path::PathBuf {
@@ -1157,6 +1375,7 @@ mod tests {
             record_error: None,
             oom_proven: None,
             memory_note: None,
+            audit_error: None,
             last_phase: None,
         }
     }
