@@ -1379,8 +1379,6 @@ mod tests {
             assert!(!run_dir.join("run.lock").exists());
         }
 
-        /// Each completed outcome the executor names reads back as itself.
-
         /// The index line reads back through the bridge as `index`, a corrupt
         /// index named with its path and cause, and a profile without one as null.
         #[test]
@@ -1519,6 +1517,7 @@ mod tests {
             assert!(bad["detail"].as_str().unwrap().contains("legacy"), "{bad}");
         }
 
+        /// Each completed outcome the executor names reads back as itself.
         #[test]
         fn every_run_outcome_reads_back_as_itself() {
             let tree = Tree::new("outcomes");
