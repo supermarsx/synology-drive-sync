@@ -460,51 +460,88 @@ impl MutationRunner for ManagerMutations {
             }
         };
         let pid = child.id();
-        let mut stderr = child.stderr.take();
-        let collector = thread::spawn(move || {
-            let mut text = Vec::new();
-            if let Some(pipe) = stderr.as_mut() {
-                let _ = pipe.take(64 * 1024).read_to_end(&mut text);
-            }
-            text
-        });
+        // H3 residue: the manager's stderr is read on a thread of its own and
+        // collected within a bound, so a grandchild that keeps the pipe open
+        // cannot hold this mutation after the manager has exited.
+        let stderr = sys::Tail::start(child.stderr.take(), 64 * 1024);
         let started = Instant::now();
         let mut killed = None;
+        // How the wait ended when it was not an exit: named in the outcome.
+        let mut unwaited: Option<String> = None;
         let status = loop {
             match child.try_wait() {
                 Ok(Some(status)) => break Some(status),
                 Ok(None) => {}
-                Err(_) => break None,
+                Err(error) => {
+                    unwaited = Some(format!(
+                        "{} (pid {pid}) cannot be waited for: {error}",
+                        mutation.op
+                    ));
+                    break None;
+                }
             }
             let elapsed = started.elapsed();
             match killed {
                 None if elapsed >= deadline => {
-                    let _ = sys::kill_group(pid, libc::SIGTERM);
+                    signal_or_name(pid, libc::SIGTERM, &mutation.op);
                     killed = Some(Instant::now());
                 }
-                Some(at) if at.elapsed() >= Duration::from_secs(3) => {
-                    let _ = sys::kill_group(pid, libc::SIGKILL);
-                    // Reaped below; KILL cannot be ignored.
-                    break child.wait().ok();
+                Some(at) if at.elapsed() >= MUTATION_KILL_AFTER => {
+                    signal_or_name(pid, libc::SIGKILL, &mutation.op);
+                    // H3 residue: the reap is bounded. A manager that left its
+                    // group missed the group KILL; it is our unreaped child, so
+                    // its pid cannot have been reused, and it is KILLed by pid.
+                    if let Err(error) = sys::kill_process(pid, libc::SIGKILL)
+                        && error.raw_os_error() != Some(libc::ESRCH)
+                    {
+                        say(&format!(
+                            "mutation {} (pid {pid}): KILL by pid failed: {error}",
+                            mutation.op
+                        ));
+                    }
+                    if sys::reap_within(&mut child, MUTATION_REAP_BOUND) {
+                        break None;
+                    }
+                    let handed = sys::abandon_to_reaper(child);
+                    unwaited = Some(format!(
+                        "{} (pid {pid}) was still running {} s after KILL (handed={handed})",
+                        mutation.op,
+                        MUTATION_REAP_BOUND.as_secs()
+                    ));
+                    break None;
                 }
                 _ => {}
             }
             thread::sleep(Duration::from_millis(25));
         };
-        let text = collector.join().unwrap_or_default();
-        let last = String::from_utf8_lossy(&text)
-            .lines()
-            .rev()
-            .find(|line| !line.trim().is_empty())
-            .map(|line| sanitize_detail(line, 240))
+        let last = stderr
+            .lines(1, Duration::from_millis(500))
+            .pop()
             .unwrap_or_default();
         if killed.is_some() {
             return MutationOutcome {
                 exit: 124,
                 detail: format!(
-                    "consumer_timeout: {} did not finish within {} s and was stopped; its outcome is unknown",
+                    "consumer_timeout: {} did not finish within {} s and was stopped; its outcome is unknown{}",
                     mutation.op,
-                    deadline.as_secs()
+                    deadline.as_secs(),
+                    unwaited
+                        .map(|cause| format!(" ({cause})"))
+                        .unwrap_or_default()
+                ),
+            };
+        }
+        if let Some(cause) = unwaited {
+            // Started and not seen to end: its outcome is unknown, never a guess.
+            return MutationOutcome {
+                exit: 70,
+                detail: format!(
+                    "consumer_unwaitable: {cause}; its outcome is unknown{}",
+                    if last.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" (it said: {last})")
+                    }
                 ),
             };
         }
@@ -516,6 +553,24 @@ impl MutationRunner for ManagerMutations {
             })
             .unwrap_or(-1);
         MutationOutcome { exit, detail: last }
+    }
+}
+
+/// TERM to KILL for a mutation past its deadline.
+const MUTATION_KILL_AFTER: Duration = Duration::from_secs(3);
+/// After KILL, how long a mutation may take to be reaped before it is handed
+/// to a reaper and named.
+const MUTATION_REAP_BOUND: Duration = Duration::from_secs(5);
+
+/// Signal a mutation's process group; a failure other than "already gone" is
+/// said on stderr (the supervisor keeps it), never dropped.
+fn signal_or_name(pid: u32, signal: libc::c_int, op: &str) {
+    if let Err(error) = sys::kill_group(pid, signal)
+        && error.raw_os_error() != Some(libc::ESRCH)
+    {
+        say(&format!(
+            "mutation {op} (pid {pid}): signal {signal} to its group failed: {error}"
+        ));
     }
 }
 
@@ -923,6 +978,16 @@ pub(crate) fn run_daemon(options: &Options) -> ExitCode {
                 },
             );
         });
+        // H2: the audit's health reaches controller.state through the control
+        // thread, its only writer.
+        let health_tx = tx.clone();
+        let health: super::queue::QueueHealth = Arc::new(move |degraded| {
+            if health_tx.send(Msg::AuditHealth(degraded)).is_err() {
+                say(
+                    "the control thread is gone; the audit's health cannot be published in controller.state",
+                );
+            }
+        });
         match std::env::current_exe().and_then(|exe| {
             super::queue::QueueConsumer::start(
                 exe,
@@ -931,6 +996,7 @@ pub(crate) fn run_daemon(options: &Options) -> ExitCode {
                 super::queue::QueueSettings::default(),
                 log,
                 activity,
+                health,
             )
         }) {
             Ok(queue) => Some(queue),
@@ -1559,6 +1625,65 @@ pub(crate) fn run_supervise(options: &Options) -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A manager script for [`ManagerMutations`], in a private directory.
+    fn manager(label: &str, body: &str) -> (PathBuf, ManagerMutations) {
+        use std::os::unix::fs::PermissionsExt;
+        let dir =
+            std::env::temp_dir().join(format!("sdsyncd-mutation-{label}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let script = dir.join("sdsync-dsm");
+        fs::write(&script, format!("#!/bin/sh\n{body}\n")).unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+        let runner = ManagerMutations {
+            manager: script,
+            env: vec![("PATH".into(), "/usr/bin:/bin".into())],
+        };
+        (dir, runner)
+    }
+
+    fn mutation() -> Mutation {
+        Mutation {
+            op: "configure-profile".into(),
+            profile: Some("alpha".into()),
+            args: Vec::new(),
+        }
+    }
+
+    /// H3 residue: a manager that leaves its process group and ignores TERM
+    /// was waited for without a bound after the group KILL missed it
+    /// (`child.wait()`). The wait is bounded and the ending named.
+    #[test]
+    fn a_mutation_that_outlives_its_kill_is_bounded() {
+        let (dir, runner) = manager(
+            "escapes",
+            "exec perl -e 'setpgrp(0, getpgrp(getppid())); $SIG{TERM} = \"IGNORE\"; sleep 30'",
+        );
+        let began = Instant::now();
+        let outcome = runner.run(&mutation(), Duration::from_millis(300));
+        let took = began.elapsed();
+        eprintln!("after {took:?}: {outcome:?}");
+        assert!(took < Duration::from_secs(12), "bounded: {took:?}");
+        assert_eq!(outcome.exit, 124, "{outcome:?}");
+        assert!(outcome.detail.contains("consumer_timeout"), "{outcome:?}");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// H3 residue: a grandchild that keeps the manager's stderr open held the
+    /// collector (`collector.join()`) after the manager itself had exited.
+    #[test]
+    fn a_grandchild_holding_stderr_does_not_hold_the_mutation() {
+        let (dir, runner) = manager("grandchild", "echo 'saved alpha' >&2\nsleep 30 &\nexit 0");
+        let began = Instant::now();
+        let outcome = runner.run(&mutation(), Duration::from_secs(10));
+        let took = began.elapsed();
+        eprintln!("after {took:?}: {outcome:?}");
+        assert!(took < Duration::from_secs(5), "bounded: {took:?}");
+        assert_eq!(outcome.exit, 0, "{outcome:?}");
+        assert_eq!(outcome.detail, "saved alpha", "{outcome:?}");
+        let _ = fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn the_restart_budget_allows_five_in_ten_minutes() {

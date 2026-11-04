@@ -796,19 +796,45 @@ pub(crate) fn render_profile_state(
 
 // ---------------------------------------------------------------- controller / schedule
 
-/// `write_controller_state STATUS PID NEXT ACTIVE`.
+/// A degradation of the whole service, published in `controller.state` (H2):
+/// `degraded=<reason>`, `degraded_since=<epoch>`, `degraded_cause=<text>`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ControllerDegraded {
+    /// A lowercase token: `audit_unavailable`.
+    pub(crate) reason: &'static str,
+    /// When the condition began (epoch seconds).
+    pub(crate) since: u64,
+    /// Why, one line, at most [`DEGRADED_CAUSE_MAX`] bytes.
+    pub(crate) cause: String,
+}
+
+/// The longest `degraded_cause=` the daemon writes.
+pub(crate) const DEGRADED_CAUSE_MAX: usize = 240;
+
+/// `write_controller_state STATUS PID NEXT ACTIVE`, plus the service's
+/// degradation while there is one (H2).
 pub(crate) fn render_controller_state(
     running: bool,
     pid: u32,
     next_run: u64,
     active_pid: u32,
     updated: u64,
+    degraded: Option<&ControllerDegraded>,
 ) -> Vec<u8> {
-    format!(
+    let mut out = format!(
         "state={}\npid={pid}\nnext_run_epoch={next_run}\nactive_pid={active_pid}\nupdated_epoch={updated}\n",
         if running { "running" } else { "stopped" }
-    )
-    .into_bytes()
+    );
+    if let Some(degraded) = degraded {
+        let cause = sanitize_detail(&degraded.cause, DEGRADED_CAUSE_MAX);
+        out.push_str(&format!(
+            "degraded={}\ndegraded_since={}\ndegraded_cause={}\n",
+            degraded.reason,
+            degraded.since,
+            if cause.is_empty() { "none" } else { &cause }
+        ));
+    }
+    out.into_bytes()
 }
 
 /// `save_schedule_deadline`.
@@ -893,33 +919,52 @@ pub(crate) fn publish_run_lock(run_dir: &Path, profiles: &[String]) -> Result<()
     fs::set_permissions(&lock, fs::Permissions::from_mode(0o700))
         .map_err(|error| fail("chmod", io_cause(&error)))?;
     // S1-c1: the lock directory holds exactly `pid`, at every instant. The
-    // owner file is written and flushed beside the lock, then linked in (the
-    // shell's claim -> ln), so no temporary ever appears inside it, and a crash
-    // leaves a dot-file in run/ (swept above), never an unprovable lock.
+    // owner file is written and flushed beside the lock, then renamed in, so
+    // no temporary ever appears inside it, and a crash leaves a dot-file in
+    // run/ (swept above), never an unprovable lock.
+    //
+    // R1: renamed, not linked then unlinked. Between a link and its unlink the
+    // record had two names, and a crash there left `run.lock/pid` with nlink 2,
+    // which the shell's private-file reader refuses as unprovable. A rename
+    // within one directory tree is atomic: the record has one name, before and
+    // after. (The shell still reads a same-inode staging sibling as a
+    // companion, as a defence for trees an older daemon left.)
     let staged = run_dir.join(format!(
         "{LOCK_PID_STAGING}{pid}.{}",
         TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed)
     ));
     let target = lock.join("pid");
-    let linked = write_private_file(
+    let placed = write_private_file(
         &staged,
         format!("{pid}\n{start}\n{boot}\n").as_bytes(),
         &target,
     )
     .and_then(|()| {
-        fs::hard_link(&staged, &target).map_err(|error| WriteError {
+        fs::rename(&staged, &target).map_err(|error| WriteError {
             path: target.clone(),
-            step: "link",
+            step: "rename",
             cause: io_cause(&error),
         })
     });
-    let unstaged = fs::remove_file(&staged);
-    linked?;
-    unstaged.map_err(|error| WriteError {
-        path: staged.clone(),
-        step: "unstage",
-        cause: io_cause(&error),
-    })
+    let Err(failure) = placed else {
+        return Ok(());
+    };
+    // The staging file may be left behind by a failed write or rename: it is
+    // removed now, and a removal that fails is named beside the first cause
+    // (the next publish sweeps it too).
+    match fs::remove_file(&staged) {
+        Ok(()) => Err(failure),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Err(failure),
+        Err(error) => Err(WriteError {
+            cause: format!(
+                "{}; the staging file {} could not be removed: {}",
+                failure.cause,
+                staged.display(),
+                io_cause(&error)
+            ),
+            ..failure
+        }),
+    }
 }
 
 /// The prefix of `publish_run_lock`'s staging file in `run/`.
@@ -1127,7 +1172,7 @@ mod tests {
         writer
             .write(
                 &path,
-                render_controller_state(true, 7, 0, 0, 1),
+                render_controller_state(true, 7, 0, 0, 1, None),
                 STATE_WRITE_DEADLINE,
             )
             .unwrap();
@@ -1566,7 +1611,7 @@ mod tests {
             let tree = Tree::new("run");
             tree.private(
                 "var/state/controller.state",
-                &render_controller_state(true, 4242, 1_800_000_000, 4343, 1_700_000_000),
+                &render_controller_state(true, 4242, 1_800_000_000, 4343, 1_700_000_000, None),
             );
             tree.private(
                 "var/state/schedule.state",
@@ -1595,6 +1640,63 @@ mod tests {
                 "no progress for 45 min in phase upload"
             );
             assert_eq!(outcomes["run"]["aggregate"]["outcome"], "failed");
+        }
+
+        /// H2: the degradation the daemon writes into controller.state reads
+        /// back through the bridge snapshot as `controller.degraded`, and a
+        /// controller.state without it has no such member.
+        #[test]
+        fn a_degraded_controller_reads_back_through_the_bridge() {
+            let tree = Tree::new("degraded");
+            let degraded = ControllerDegraded {
+                reason: "audit_unavailable",
+                since: 1_700_000_000,
+                cause: "exit=73 audit outbox: Permission denied\nsecond line".into(),
+            };
+            let bytes = render_controller_state(true, 4242, 0, 0, 1_700_000_100, Some(&degraded));
+            assert_eq!(
+                String::from_utf8_lossy(&bytes),
+                "state=running\npid=4242\nnext_run_epoch=0\nactive_pid=0\nupdated_epoch=1700000100\n\
+                 degraded=audit_unavailable\ndegraded_since=1700000000\n\
+                 degraded_cause=exit=73 audit outbox: Permission denied\n"
+            );
+            tree.private("var/state/controller.state", &bytes);
+            let snapshot = tree.snapshot();
+            eprintln!("{:#}", snapshot["controller"]);
+            assert_eq!(
+                snapshot["controller"]["degraded"],
+                json!({
+                    "reason": "audit_unavailable",
+                    "since_epoch": 1_700_000_000_u64,
+                    "cause": "exit=73 audit outbox: Permission denied",
+                })
+            );
+            tree.private(
+                "var/state/controller.state",
+                &render_controller_state(true, 4242, 0, 0, 1_700_000_100, None),
+            );
+            let snapshot = tree.snapshot();
+            assert!(
+                snapshot["controller"].get("degraded").is_none(),
+                "{:#}",
+                snapshot["controller"]
+            );
+            // A malformed set is refused by name, never shown half-read.
+            for bad in [
+                "degraded=audit_unavailable\n",
+                "degraded=Audit\ndegraded_since=1\ndegraded_cause=x\n",
+                "degraded=audit_unavailable\ndegraded_since=soon\ndegraded_cause=x\n",
+                "degraded_since=1\ndegraded_cause=x\n",
+            ] {
+                let mut text =
+                    String::from_utf8(render_controller_state(true, 4242, 0, 0, 1, None)).unwrap();
+                text.push_str(bad);
+                tree.private("var/state/controller.state", text.as_bytes());
+                let refused = tree.with_paths(|paths| {
+                    snapshot_document(paths, tree.uid(), &SecurityPolicyArgs::default())
+                });
+                assert!(refused.is_err(), "{bad:?} was read");
+            }
         }
 
         /// A daemon run in flight reads as running, not as a dead runner, and
@@ -1675,7 +1777,7 @@ mod tests {
         /// `private_event_lock_directory` refuses any other entry (every save
         /// exits 73), and a temporary left there by a crash wedged start and
         /// stop for good. The owner file is written beside the lock and
-        /// linked in.
+        /// renamed in.
         #[test]
         fn run_lock_never_holds_an_entry_but_pid_while_published() {
             use std::sync::Arc;
@@ -1714,6 +1816,47 @@ mod tests {
                 .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
                 .collect();
             assert!(left.is_empty(), "{left:?}");
+        }
+
+        /// R1: `run.lock/pid` never has a second name, at any instant. A
+        /// link-then-unlink publish had one between the two calls, and a crash
+        /// there left the owner record with nlink 2, which the shell's strict
+        /// private-file reader refuses. The record is renamed into place.
+        #[test]
+        fn run_lock_pid_never_has_a_second_link() {
+            use std::os::unix::fs::MetadataExt;
+            use std::sync::Arc;
+            use std::sync::atomic::AtomicBool;
+            let tree = Tree::new("lock-one-link");
+            let run_dir = tree.p("var/run");
+            let done = Arc::new(AtomicBool::new(false));
+            let observer = {
+                let done = Arc::clone(&done);
+                let pid = run_dir.join("run.lock/pid");
+                thread::spawn(move || {
+                    let (mut seen, mut doubled) = (0_u64, 0_u64);
+                    while !done.load(Ordering::SeqCst) {
+                        if let Ok(metadata) = fs::symlink_metadata(&pid) {
+                            seen += 1;
+                            // nlink 0 is a record caught mid-removal by
+                            // remove_run_lock; a second name is nlink 2.
+                            if metadata.nlink() > 1 {
+                                doubled += 1;
+                            }
+                        }
+                    }
+                    (seen, doubled)
+                })
+            };
+            for _ in 0..3000 {
+                publish_run_lock(&run_dir, &["photos".to_owned()]).unwrap();
+                remove_run_lock(&run_dir).unwrap();
+            }
+            done.store(true, Ordering::SeqCst);
+            let (seen, doubled) = observer.join().unwrap();
+            eprintln!("run.lock/pid observed {seen} times, {doubled} with nlink above 1");
+            assert!(seen > 0, "the observer never saw the owner record");
+            assert_eq!(doubled, 0, "run.lock/pid had a second link {doubled} times");
         }
 
         /// A temporary a crash left beside the lock is swept by the next

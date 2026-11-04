@@ -5960,24 +5960,51 @@ mod linux_socket {
             *destination = *source as libc::c_char;
         }
 
-        // SAFETY: address is initialized, the descriptor is live, and the full
-        // Linux sockaddr_un size includes the terminating zero from initialization.
-        let connected = unsafe {
-            libc::connect(
-                stream.as_raw_fd(),
-                (&address as *const libc::sockaddr_un).cast(),
-                mem::size_of::<libc::sockaddr_un>() as libc::socklen_t,
-            )
-        };
-        if connected != 0 {
-            let error = io::Error::last_os_error();
-            if !matches!(
-                error.raw_os_error(),
-                Some(libc::EINPROGRESS | libc::EAGAIN | libc::EALREADY)
-            ) {
-                return Err(error);
+        let deadline = Instant::now()
+            .checked_add(timeout)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "invalid timeout"))?;
+        let mut pause = Duration::from_millis(5);
+        loop {
+            // SAFETY: address is initialized, the descriptor is live, and the full
+            // Linux sockaddr_un size includes the terminating zero from initialization.
+            let connected = unsafe {
+                libc::connect(
+                    stream.as_raw_fd(),
+                    (&address as *const libc::sockaddr_un).cast(),
+                    mem::size_of::<libc::sockaddr_un>() as libc::socklen_t,
+                )
+            };
+            if connected == 0 {
+                break;
             }
-            wait_for_connect(&stream, timeout)?;
+            let error = io::Error::last_os_error();
+            match error.raw_os_error() {
+                Some(libc::EINPROGRESS | libc::EALREADY) => {
+                    wait_for_connect(&stream, timeout)?;
+                    break;
+                }
+                // N-D12: on a Unix socket EAGAIN is the listener's backlog being full, and the
+                // connect has not started: there is nothing in progress to wait for, and the
+                // socket is still unconnected (taking it for connected made the first write
+                // fail as "Transport endpoint is not connected"). Tried again until the
+                // deadline, then named for what it is.
+                Some(libc::EAGAIN) => {
+                    let now = Instant::now();
+                    if now >= deadline {
+                        return Err(io::Error::new(
+                            io::ErrorKind::TimedOut,
+                            format!(
+                                "{}: the listener's backlog stayed full for {} ms (connect: {error})",
+                                path.display(),
+                                timeout.as_millis()
+                            ),
+                        ));
+                    }
+                    std::thread::sleep(pause.min(deadline.duration_since(now)));
+                    pause = (pause * 2).min(Duration::from_millis(50));
+                }
+                _ => return Err(error),
+            }
         }
         stream.set_nonblocking(false)?;
         Ok(stream)
@@ -6135,6 +6162,102 @@ mod linux_socket {
 
     fn same_inode(first: &fs::Metadata, second: &fs::Metadata) -> bool {
         first.st_dev() == second.st_dev() && first.st_ino() == second.st_ino()
+    }
+
+    #[cfg(test)]
+    mod connect_tests {
+        use super::*;
+
+        /// A listener that never accepts, with a backlog of one.
+        fn deaf_listener(path: &Path) -> std::os::fd::OwnedFd {
+            use std::os::fd::FromRawFd as _;
+            let path_bytes = path.as_os_str().as_bytes();
+            // SAFETY: zero is a valid initial representation for sockaddr_un.
+            let mut address = unsafe { mem::zeroed::<libc::sockaddr_un>() };
+            address.sun_family = libc::AF_UNIX as libc::sa_family_t;
+            for (destination, source) in address.sun_path.iter_mut().zip(path_bytes) {
+                *destination = *source as libc::c_char;
+            }
+            // SAFETY: plain socket calls on a descriptor this function owns.
+            unsafe {
+                let fd = libc::socket(libc::AF_UNIX, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0);
+                assert!(fd >= 0, "socket: {}", io::Error::last_os_error());
+                let fd = std::os::fd::OwnedFd::from_raw_fd(fd);
+                assert_eq!(
+                    libc::bind(
+                        fd.as_raw_fd(),
+                        (&address as *const libc::sockaddr_un).cast(),
+                        mem::size_of::<libc::sockaddr_un>() as libc::socklen_t,
+                    ),
+                    0,
+                    "bind: {}",
+                    io::Error::last_os_error()
+                );
+                assert_eq!(
+                    libc::listen(fd.as_raw_fd(), 1),
+                    0,
+                    "listen: {}",
+                    io::Error::last_os_error()
+                );
+                fd
+            }
+        }
+
+        /// N-D12: a listener whose backlog is full answers a non-blocking
+        /// connect with EAGAIN, and the connect has not started. It was taken
+        /// for one in progress, so an unconnected stream came back and the
+        /// first write failed as "Transport endpoint is not connected". It is
+        /// retried within the timeout and then named for what it is.
+        #[test]
+        fn a_full_backlog_is_named_never_an_unconnected_stream() {
+            let dir = std::env::temp_dir().join(format!(
+                "sdsync-backlog-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            fs::create_dir_all(&dir).unwrap();
+            let path = dir.join("deaf.sock");
+            let _listener = deaf_listener(&path);
+            let mut kept = Vec::new();
+            let mut refused = None;
+            for attempt in 0..64 {
+                let began = Instant::now();
+                match connect_with_timeout(&path, Duration::from_millis(300)) {
+                    Ok(stream) => {
+                        let peer = stream.peer_addr();
+                        assert!(
+                            peer.is_ok(),
+                            "connect {attempt} returned a stream that is not connected: {peer:?}"
+                        );
+                        kept.push(stream);
+                    }
+                    Err(error) => {
+                        refused = Some((attempt, error, began.elapsed()));
+                        break;
+                    }
+                }
+            }
+            let (attempt, error, took) =
+                refused.expect("a backlog of one is full within 64 connects");
+            eprintln!(
+                "connect {attempt} refused after {took:?}: {error} ({:?})",
+                error.kind()
+            );
+            assert_eq!(error.kind(), io::ErrorKind::TimedOut, "{error}");
+            assert!(
+                error.to_string().contains("backlog") && error.to_string().contains("deaf.sock"),
+                "the cause and the path are named: {error}"
+            );
+            assert!(
+                took >= Duration::from_millis(250) && took < Duration::from_secs(3),
+                "retried within the timeout, then refused: {took:?}"
+            );
+            drop(kept);
+            let _ = fs::remove_dir_all(&dir);
+        }
     }
 }
 
@@ -13319,6 +13442,76 @@ fn record_pre_relay_activity(stage: &str, code: &str, status: u16) -> BridgeResu
     }
 }
 
+/// `--daemon-lock-probe <path>`: what `{ flock -n 8; } 8< <path>` answers, for a shell without
+/// flock(1) (N-S5). The path is opened read-only, never created and never through a symlink
+/// (`O_RDONLY|O_CLOEXEC|O_NOFOLLOW`, plus `O_NONBLOCK` so a FIFO planted there cannot hold the
+/// probe), must be a regular file, and is tried with `flock(LOCK_EX|LOCK_NB)`; a lock taken is
+/// released at once (`LOCK_UN`, then the close).
+///
+/// Exit 0: free. Exit 3: held (`EWOULDBLOCK`). Exit 1: it cannot be probed (absent, not a
+/// regular file, a symlink, denied, any other error), with one stderr line
+/// `daemon-lock-probe: <path>: <cause>`. Nothing is written to stdout.
+fn daemon_lock_probe(arguments: &[OsString]) -> ExitCode {
+    let [path] = arguments else {
+        eprintln!(
+            "daemon-lock-probe: usage: sdsync-dsm-api --daemon-lock-probe <path> (given {} arguments)",
+            arguments.len()
+        );
+        return ExitCode::from(1);
+    };
+    let path = Path::new(path);
+    let refuse = |cause: &str| {
+        eprintln!(
+            "daemon-lock-probe: {}: {}",
+            path.display(),
+            cause.replace(['\n', '\r'], " ")
+        );
+        ExitCode::from(1)
+    };
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::fd::AsRawFd;
+        use std::os::unix::fs::OpenOptionsExt;
+        let file = match fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
+            .open(path)
+        {
+            Ok(file) => file,
+            Err(error) if error.raw_os_error() == Some(libc::ELOOP) => {
+                return refuse(&format!("a symbolic link, not followed ({error})"));
+            }
+            Err(error) => return refuse(&error.to_string()),
+        };
+        match file.metadata() {
+            Ok(metadata) if metadata.file_type().is_file() => {}
+            Ok(_) => return refuse("not a regular file"),
+            Err(error) => return refuse(&error.to_string()),
+        }
+        // SAFETY: flock on a live descriptor this function owns, with fixed operations.
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+            // SAFETY: as above. Closing the descriptor releases it as well; an error here is
+            // named because the shell must not be told "free" for a lock this probe still holds.
+            if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_UN) } != 0 {
+                return refuse(&format!(
+                    "the probe's own lock could not be released: {}",
+                    io::Error::last_os_error()
+                ));
+            }
+            return ExitCode::SUCCESS;
+        }
+        let error = io::Error::last_os_error();
+        if error.raw_os_error() == Some(libc::EWOULDBLOCK) {
+            return ExitCode::from(3);
+        }
+        refuse(&error.to_string())
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        refuse("only available on Linux")
+    }
+}
+
 pub(crate) fn main_entry() -> ExitCode {
     // The realtime watcher and its probe touch no network and no package state, so they are
     // dispatched before anything else this process sets up.
@@ -13329,6 +13522,11 @@ pub(crate) fn main_entry() -> ExitCode {
         }
         Some(mode) if mode == "--watch-probe" => {
             return synology_drive_sync::watch::cli::probe_main(&early.collect::<Vec<_>>());
+        }
+        // The shell's `flock -n` probe of daemon.lock where BusyBox has no flock(1) (N-S5): no
+        // config, no password, no network, so nothing else is set up for it either.
+        Some(mode) if mode == "--daemon-lock-probe" => {
+            return daemon_lock_probe(&early.collect::<Vec<_>>());
         }
         _ => {}
     }
@@ -16838,6 +17036,28 @@ fn snapshot_document(
     let controller_next = manager_kv(controller, "next_run_epoch", "0")?;
     let controller_active = manager_kv(controller, "active_pid", "0")?;
     let controller_updated = manager_kv(controller, "updated_epoch", "0")?;
+    // H2: the service's degradation (`degraded=`, `degraded_since=`, `degraded_cause=`), all
+    // three or none. Absent is no member; a partial or malformed set is corrupt, never shown
+    // half-read.
+    let controller_degraded = manager_kv_optional(controller, "degraded", "")?;
+    let controller_degraded_since = manager_kv_optional(controller, "degraded_since", "")?;
+    let controller_degraded_cause = manager_kv_optional(controller, "degraded_cause", "")?;
+    let degraded_present = [
+        &controller_degraded,
+        &controller_degraded_since,
+        &controller_degraded_cause,
+    ]
+    .map(|value| !value.is_empty());
+    if degraded_present.iter().any(|present| *present)
+        && (!degraded_present.iter().all(|present| *present)
+            || !controller_degraded
+                .iter()
+                .all(|byte| byte.is_ascii_lowercase() || *byte == b'_')
+            || !digits(&controller_degraded_since)
+            || controller_degraded_cause.len() > 512)
+    {
+        return Err(PACKAGE_STATE_CORRUPT);
+    }
     if !matches!(controller_status.as_slice(), b"running" | b"stopped")
         || ![
             &controller_pid,
@@ -16959,6 +17179,15 @@ fn snapshot_document(
     push_raw_member(&mut document, "active_pid", &controller_active);
     document.push(b',');
     push_raw_member(&mut document, "updated_epoch", &controller_updated);
+    if !controller_degraded.is_empty() {
+        document.extend_from_slice(b",\"degraded\":{");
+        push_quoted_member(&mut document, "reason", &controller_degraded);
+        document.push(b',');
+        push_raw_member(&mut document, "since_epoch", &controller_degraded_since);
+        document.push(b',');
+        push_quoted_member(&mut document, "cause", &controller_degraded_cause);
+        document.push(b'}');
+    }
     document.extend_from_slice(b"},\"run\":{");
     push_quoted_member(&mut document, "state", &run_status);
     document.push(b',');

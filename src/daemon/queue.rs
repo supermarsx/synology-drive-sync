@@ -45,6 +45,11 @@ pub(crate) type QueueLog = Arc<dyn Fn(Level, &'static str, String) + Send + Sync
 /// level, message. Profile `none`, category `bridge`, state `failed`.
 pub(crate) type QueueActivity = Arc<dyn Fn(&'static str, Level, String) + Send + Sync>;
 
+/// Where the consumer says the audit reconcile has failed past its bound
+/// (`Some`) or recovered (`None`), on each change: the daemon publishes it in
+/// controller.state (H2).
+pub(crate) type QueueHealth = Arc<dyn Fn(Option<super::state::ControllerDegraded>) + Send + Sync>;
+
 /// A job's class, as the bridge's classifier names it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) enum Lane {
@@ -107,6 +112,11 @@ pub(crate) struct QueueSettings {
     pub(crate) audit_unavailable_after: Duration,
     /// The longest wait between two reconcile attempts while it fails.
     pub(crate) reconcile_backoff_max: Duration,
+    /// Past `audit_unavailable_after`, a job is refused only on a reconcile
+    /// attempt made after it came: one is made once the last attempt is older
+    /// than this, and the job is held until then (N-D1). A recovered audit is
+    /// not refused for the rest of a long backoff.
+    pub(crate) reconcile_recheck: Duration,
     /// After KILL, how long a consumer may take to be reaped before its slot
     /// is freed and it is handed to a reaper.
     pub(crate) reap_bound: Duration,
@@ -127,6 +137,7 @@ impl Default for QueueSettings {
             max_responses: 256,
             audit_unavailable_after: Duration::from_secs(30),
             reconcile_backoff_max: Duration::from_secs(60),
+            reconcile_recheck: Duration::from_secs(2),
             reap_bound: Duration::from_secs(10),
         }
     }
@@ -147,6 +158,7 @@ impl QueueConsumer {
         settings: QueueSettings,
         log: QueueLog,
         activity: QueueActivity,
+        health: QueueHealth,
     ) -> std::io::Result<Self> {
         let stop = Arc::new(AtomicBool::new(false));
         let consumer = Consumer {
@@ -156,6 +168,8 @@ impl QueueConsumer {
             settings,
             log,
             activity,
+            health,
+            health_published: false,
             stop: Arc::clone(&stop),
             running: BTreeMap::new(),
             last_reconcile: None,
@@ -183,10 +197,24 @@ impl QueueConsumer {
     }
 }
 
+/// What the audit gate does with a waiting job.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Gate {
+    /// The audit is reconciled: the job runs.
+    Admit,
+    /// Held, tried again later.
+    Hold,
+    /// Past the bound, and a fresh attempt made since the job came failed:
+    /// answered `audit_unavailable`.
+    Refuse,
+}
+
 /// A failing audit reconcile: since when, how many tries, the next one.
 #[derive(Default)]
 struct ReconcileEpisode {
     failing_since: Option<Instant>,
+    /// The same moment on the wall clock, for controller.state.
+    failing_since_epoch: u64,
     attempts: u32,
     next_try: Option<Instant>,
     cause: String,
@@ -219,6 +247,9 @@ struct Consumer {
     settings: QueueSettings,
     log: QueueLog,
     activity: QueueActivity,
+    health: QueueHealth,
+    /// The degradation was published and not yet cleared.
+    health_published: bool,
     stop: Arc<AtomicBool>,
     running: BTreeMap<String, Running>,
     last_reconcile: Option<Instant>,
@@ -351,10 +382,11 @@ impl Consumer {
     /// Reconcile the audit outbox. A failure opens an episode: named once
     /// (controller.log and an Activity row the dashboard shows), tried again
     /// after a backoff that doubles to `reconcile_backoff_max`, and its
-    /// recovery is named too (H2). `false` while it fails or waits to retry.
-    fn reconcile_audit(&mut self) -> bool {
+    /// recovery is named too (H2). `false` while it fails or waits to retry;
+    /// `force` tries now, inside the backoff (N-D1).
+    fn reconcile_audit(&mut self, force: bool) -> bool {
         let now = Instant::now();
-        if self.reconcile.next_try.is_some_and(|at| now < at) {
+        if !force && self.reconcile.next_try.is_some_and(|at| now < at) {
             return false;
         }
         self.last_reconcile = Some(now);
@@ -386,6 +418,7 @@ impl Consumer {
         self.reconcile.next_try = Some(now + backoff);
         if self.reconcile.failing_since.is_none() {
             self.reconcile.failing_since = Some(now);
+            self.reconcile.failing_since_epoch = epoch_now();
             self.log(
                 Level::Error,
                 "audit_reconcile_failed",
@@ -409,12 +442,62 @@ impl Consumer {
         false
     }
 
+    /// N-D1: the audit gate in front of a waiting job. Without the recheck a
+    /// recovered audit was refused for the rest of the backoff (up to 60 s).
+    fn audit_gate(&mut self) -> Gate {
+        let before = self.last_reconcile;
+        if self.reconcile_audit(false) {
+            return Gate::Admit;
+        }
+        if !self.audit_unavailable() {
+            // Within the bound: held, retried after the backoff.
+            return Gate::Hold;
+        }
+        if self.last_reconcile != before {
+            // An attempt was just made, after the job arrived, and failed.
+            return Gate::Refuse;
+        }
+        if self
+            .last_reconcile
+            .is_some_and(|at| at.elapsed() < self.settings.reconcile_recheck)
+        {
+            // The last attempt is too recent to retry: held until it is old
+            // enough, so no job is refused on an attempt made before it came.
+            return Gate::Hold;
+        }
+        // Past the bound and inside the backoff: one fresh try before refusing.
+        if self.reconcile_audit(true) {
+            Gate::Admit
+        } else {
+            Gate::Refuse
+        }
+    }
+
     /// Whether the reconcile has failed for longer than the bound: waiting
     /// jobs are then answered rather than held.
     fn audit_unavailable(&self) -> bool {
         self.reconcile
             .failing_since
             .is_some_and(|since| since.elapsed() >= self.settings.audit_unavailable_after)
+    }
+
+    /// H2: tell the daemon when the audit reconcile has failed past the
+    /// bound (jobs are refused `audit_unavailable` from then on) and when it
+    /// recovers, once per change.
+    fn publish_health(&mut self) {
+        let unavailable = self.audit_unavailable();
+        if unavailable == self.health_published {
+            return;
+        }
+        self.health_published = unavailable;
+        (self.health)(unavailable.then(|| super::state::ControllerDegraded {
+            reason: "audit_unavailable",
+            since: self.reconcile.failing_since_epoch,
+            cause: format!(
+                "the audit log could not be reconciled ({}); dashboard operations are refused until it recovers",
+                self.reconcile.cause
+            ),
+        }));
     }
 
     fn run(mut self) {
@@ -426,6 +509,18 @@ impl Consumer {
                 self.prune();
             }
             self.dispatch();
+            // An open episode is retried on its backoff even with nothing
+            // waiting, so a recovery is seen (and the amber cleared) without
+            // a job to drive it.
+            if self.reconcile.failing_since.is_some()
+                && self
+                    .reconcile
+                    .next_try
+                    .is_none_or(|at| Instant::now() >= at)
+            {
+                self.reconcile_audit(false);
+            }
+            self.publish_health();
             thread::sleep(self.settings.tick);
         }
         self.shutdown();
@@ -508,6 +603,25 @@ impl Consumer {
         classified
     }
 
+    /// Remove one of a job's control files. Absent is done; any other failure
+    /// is named with the job, the kind of file, its path and the cause (N-D9:
+    /// a `secret` sidecar may hold a credential, so one left behind must be
+    /// findable). `true` once the file is gone.
+    fn remove_control_file(&self, id: &str, kind: &str, path: &Path) -> bool {
+        match fs::remove_file(path) {
+            Ok(()) => true,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => true,
+            Err(error) => {
+                self.log(
+                    Level::Error,
+                    "control_file_unremovable",
+                    format!("id={id} kind={kind} path={} cause={error}", path.display()),
+                );
+                false
+            }
+        }
+    }
+
     fn report_once(&mut self, key: String, event: &'static str, detail: String) {
         if self.reported.insert(key) {
             self.log(Level::Warn, event, detail);
@@ -522,7 +636,9 @@ impl Consumer {
         if pending.is_empty() {
             return;
         }
-        let mut reconciled = false;
+        // The audit gate, decided once per pass (N-D1): every job of the pass
+        // is admitted, or every one refused, on the same attempt.
+        let mut gate: Option<Gate> = None;
         // Per lane, the first job still waiting; later jobs of a lane wait for
         // it (order within a lane), other lanes go on.
         let mut blocked: Vec<Lane> = Vec::new();
@@ -570,12 +686,15 @@ impl Consumer {
             }
             // The audit outbox is reconciled before anything is admitted, once
             // per pass, as the shell did at the top of every queue turn.
-            if !reconciled {
-                if !self.reconcile_audit() {
-                    if !self.audit_unavailable() {
-                        // Held, not dropped: retried after the backoff.
-                        return;
-                    }
+            let decided = match gate {
+                Some(decided) => decided,
+                None => *gate.insert(self.audit_gate()),
+            };
+            match decided {
+                // Held, not dropped: retried after the backoff.
+                Gate::Hold => return,
+                Gate::Admit => {}
+                Gate::Refuse => {
                     // H2: past the bound, a job is answered by name. It never
                     // ran, so the answer is exact.
                     self.log(
@@ -599,7 +718,6 @@ impl Consumer {
                     );
                     continue;
                 }
-                reconciled = true;
             }
             self.classified.remove(&id);
             self.claim(&id, lane, operation, terminal);
@@ -634,9 +752,9 @@ impl Consumer {
                 "control_response_rejected",
                 format!("id={id} cause=a response already exists"),
             );
-            let _ = fs::remove_file(&processing);
-            let _ = fs::remove_file(&queued_secret);
-            let _ = fs::remove_file(&secret);
+            self.remove_control_file(id, "processing", &processing);
+            self.remove_control_file(id, "secret", &queued_secret);
+            self.remove_control_file(id, "secret", &secret);
             return;
         }
         let mut terminal = terminal;
@@ -655,9 +773,9 @@ impl Consumer {
         }
         if let Some((cause, exit)) = terminal {
             self.publish_failure(id, &processing, &response, cause, exit);
-            let _ = fs::remove_file(&queued_secret);
-            let _ = fs::remove_file(&secret);
-            let _ = fs::remove_file(&processing);
+            self.remove_control_file(id, "secret", &queued_secret);
+            self.remove_control_file(id, "secret", &secret);
+            self.remove_control_file(id, "processing", &processing);
             return;
         }
         let child = self
@@ -701,8 +819,8 @@ impl Consumer {
                     format!("id={id} op={} cause=spawn: {error}", or_unknown(&operation)),
                 );
                 self.publish_failure(id, &processing, &response, "consumer_failed", 69);
-                let _ = fs::remove_file(&secret);
-                let _ = fs::remove_file(&processing);
+                self.remove_control_file(id, "secret", &secret);
+                self.remove_control_file(id, "processing", &processing);
             }
         }
     }
@@ -900,15 +1018,40 @@ impl Consumer {
                 );
             }
         }
-        let _ = fs::remove_file(&job.processing);
-        if fs::symlink_metadata(&job.secret).is_ok_and(|m| !m.file_type().is_symlink()) {
-            let _ = fs::remove_file(&job.secret);
+        self.remove_control_file(&job.id, "processing", &job.processing);
+        match fs::symlink_metadata(&job.secret) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                // Not the queue's own file: left in place, and named.
+                self.log(
+                    Level::Error,
+                    "control_file_unremovable",
+                    format!(
+                        "id={} kind=secret path={} cause=a symbolic link, not the queue's file; left in place",
+                        job.id,
+                        job.secret.display()
+                    ),
+                );
+            }
+            Ok(_) => {
+                self.remove_control_file(&job.id, "secret", &job.secret);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => self.log(
+                Level::Error,
+                "control_file_unremovable",
+                format!(
+                    "id={} kind=secret path={} cause={error}",
+                    job.id,
+                    job.secret.display()
+                ),
+            ),
         }
         if self
             .last_reconcile
             .is_none_or(|at| at.elapsed() >= Duration::from_secs(5))
         {
-            let _ = self.reconcile_audit();
+            // A failure opens (or continues) the episode, named there.
+            self.reconcile_audit(false);
         }
         self.prune_responses();
     }
@@ -968,8 +1111,10 @@ impl Consumer {
                 if let Some(mtime) = private_control_file(&path)
                     && mtime <= now
                     && now - mtime > max_age
+                    && self.remove_control_file(id, kind, &path)
                 {
-                    let _ = fs::remove_file(&path);
+                    // Only a file that is gone has expired; one that stayed
+                    // was named by remove_control_file.
                     self.log(
                         level,
                         "control_file_expired",
@@ -1001,7 +1146,11 @@ impl Consumer {
         responses.sort();
         let excess = responses.len() - self.settings.max_responses;
         for path in responses.into_iter().take(excess) {
-            let _ = fs::remove_file(path);
+            let id = path
+                .file_stem()
+                .map(|stem| stem.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            self.remove_control_file(&id, "response", &path);
         }
     }
 
@@ -1078,6 +1227,8 @@ case $1 in
     # Out of reach of the queue's signals: as a consumer in D state is.
     [ "$answer" = stubborn ] && exec perl -e 'setpgrp(0, getpgrp(getppid())); $SIG{TERM} = "IGNORE"; open(my $f, ">", $ARGV[0]); print $f "$$\n"; close($f); sleep 30' "$(dirname "$0")/stubborn.pid"
     [ "$answer" = noisy ] && { echo "boom: /volume1/share is gone" >&2; exit 1; }
+    # A secret sidecar that cannot be removed (a directory in its place).
+    [ "$answer" = plantdir ] && { rm -f "${2%.json}.secret"; mkdir "${2%.json}.secret"; }
     sleep "$sleep"
     [ "$answer" = answer ] && { umask 077; echo '{}' > "$3"; }
     exit 0 ;;
@@ -1096,10 +1247,18 @@ exit 64
         consumer: Option<QueueConsumer>,
         events: Arc<Mutex<Vec<String>>>,
         rows: Arc<Mutex<Vec<String>>>,
+        /// What the consumer published for controller.state, in order.
+        health: Arc<Mutex<Vec<Option<super::super::state::ControllerDegraded>>>>,
     }
 
     impl Fixture {
         fn new(label: &str, settings: QueueSettings) -> Self {
+            Self::prepared(label, settings, |_| {})
+        }
+
+        /// [`Fixture::new`] with `setup` run on the tree before the consumer
+        /// starts.
+        fn prepared(label: &str, settings: QueueSettings, setup: impl FnOnce(&Path)) -> Self {
             let dir = std::env::temp_dir().join(format!(
                 "sdsyncd-queue-{label}-{}-{}",
                 std::process::id(),
@@ -1110,6 +1269,7 @@ exit 64
                 fs::create_dir_all(dir.join("var/control").join(sub)).unwrap();
             }
             let bridge = fake_bridge(&dir);
+            setup(&dir);
             let events = Arc::new(Mutex::new(Vec::new()));
             let sink = Arc::clone(&events);
             let log: QueueLog = Arc::new(move |_, event, detail| {
@@ -1120,6 +1280,11 @@ exit 64
             let activity: QueueActivity = Arc::new(move |code, _, message| {
                 row_sink.lock().unwrap().push(format!("{code} {message}"));
             });
+            let health = Arc::new(Mutex::new(Vec::new()));
+            let health_sink = Arc::clone(&health);
+            let published: QueueHealth = Arc::new(move |degraded| {
+                health_sink.lock().unwrap().push(degraded);
+            });
             let consumer = QueueConsumer::start(
                 bridge,
                 dir.join("var"),
@@ -1127,6 +1292,7 @@ exit 64
                 settings,
                 log,
                 activity,
+                published,
             )
             .unwrap();
             Self {
@@ -1134,6 +1300,7 @@ exit 64
                 consumer: Some(consumer),
                 events,
                 rows,
+                health,
             }
         }
 
@@ -1342,6 +1509,116 @@ exit 64
         );
     }
 
+    /// N-D1: once the bound has passed, a recovered audit is not refused for
+    /// the rest of a long backoff. A job is refused only on an attempt made
+    /// after it arrived; one that arrives within two seconds of the last
+    /// attempt is held until a fresh one can be made: the reviewer saw
+    /// `{"failed":"audit_unavailable"}` 0.4 s after the fix, with the next
+    /// scheduled attempt up to 60 s away.
+    #[test]
+    fn a_recovered_audit_is_not_refused_for_the_rest_of_the_backoff() {
+        let settings = QueueSettings {
+            audit_unavailable_after: Duration::from_millis(800),
+            ..fast()
+        };
+        let f = Fixture::new("audit-recovers", settings);
+        fs::write(f.dir.join("audit-fails"), b"").unwrap();
+        let calls = || {
+            fs::read_to_string(f.dir.join("calls"))
+                .unwrap_or_default()
+                .lines()
+                .filter(|l| l.starts_with("--audit-transaction"))
+                .count()
+        };
+        // Keep a job waiting until the episode has backed off to 8 s: the
+        // attempts come at 0, 1, 3 and 7 s; the next is due at 15 s.
+        let mut n = 0_u64;
+        while calls() < 4 {
+            n += 1;
+            let id = format!("{n:048x}");
+            f.enqueue(&id, "concurrent 0 answer\n");
+            f.wait(&format!("job {n} answered"), Duration::from_secs(20), |f| {
+                f.response(&id).is_some()
+            });
+            assert!(
+                f.response(&id).unwrap().contains("audit_unavailable"),
+                "job {n} is refused while the audit fails"
+            );
+            thread::sleep(Duration::from_millis(200));
+        }
+        let before = calls();
+        // The audit recovers; the last attempt is now older than the recheck.
+        thread::sleep(Duration::from_millis(2500));
+        fs::remove_file(f.dir.join("audit-fails")).unwrap();
+        const D: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa4";
+        let asked = Instant::now();
+        f.enqueue(D, "concurrent 0 answer\n");
+        f.wait("the job after recovery", Duration::from_secs(20), |f| {
+            f.response(D).is_some()
+        });
+        let answer = f.response(D).unwrap();
+        eprintln!(
+            "answer after {:?}: {answer:?}; reconciles before={before} after={}; events: {:#?}",
+            asked.elapsed(),
+            calls(),
+            f.events.lock().unwrap()
+        );
+        assert_eq!(answer.trim(), "{}", "the job ran, it was not refused");
+        assert!(
+            asked.elapsed() < Duration::from_secs(3),
+            "answered within the 2 s recheck, not after the backoff: {:?}",
+            asked.elapsed()
+        );
+        assert!(
+            f.events
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|e| e.starts_with("audit_reconcile_recovered")),
+            "{:?}",
+            f.events.lock().unwrap()
+        );
+    }
+
+    /// H2 amber: once the reconcile has failed past the bound, the consumer
+    /// publishes the degradation (reason, since, cause) once; when it
+    /// recovers, with no job waiting to drive it, it publishes the clearing.
+    #[test]
+    fn a_failing_audit_is_published_and_cleared_for_controller_state() {
+        let settings = QueueSettings {
+            audit_unavailable_after: Duration::from_millis(800),
+            ..fast()
+        };
+        let f = Fixture::new("audit-amber", settings);
+        fs::write(f.dir.join("audit-fails"), b"").unwrap();
+        let before = epoch_now();
+        f.enqueue(A, "concurrent 0 answer\n");
+        f.wait("the degradation published", Duration::from_secs(10), |f| {
+            !f.health.lock().unwrap().is_empty()
+        });
+        let published = f.health.lock().unwrap().clone();
+        eprintln!("{published:#?}");
+        let degraded = published[0]
+            .clone()
+            .expect("the first change is a degradation");
+        assert_eq!(degraded.reason, "audit_unavailable");
+        assert!(
+            degraded.since >= before && degraded.since <= epoch_now(),
+            "{degraded:?}"
+        );
+        assert!(degraded.cause.contains("exit=73"), "{degraded:?}");
+        // Nothing waits now: the episode is retried on its own and clears.
+        fs::remove_file(f.dir.join("audit-fails")).unwrap();
+        f.wait("the clearing published", Duration::from_secs(20), |f| {
+            f.health.lock().unwrap().len() >= 2
+        });
+        thread::sleep(Duration::from_millis(300));
+        let published = f.health.lock().unwrap().clone();
+        eprintln!("{published:#?}");
+        assert_eq!(published.len(), 2, "once per change: {published:#?}");
+        assert_eq!(published[1], None);
+    }
+
     /// H3: a consumer that outlives KILL (D state; here: out of the queue's
     /// reach) frees its slot after a bound, named with its pid; its job is
     /// answered and the lane runs the next job.
@@ -1365,9 +1642,122 @@ exit 64
                 && e.contains("pid=")),
             "{events:?}"
         );
-        if let Ok(pid) = fs::read_to_string(f.dir.join("stubborn.pid")) {
-            let _ = sys::kill_process(pid.trim().parse().unwrap_or(0), libc::SIGKILL);
+        kill_recorded(&f.dir.join("stubborn.pid"));
+    }
+
+    /// N-D10: KILL the process a test recorded, and only a real one: a pid of
+    /// 0 is this process group and -1 is every process the user owns, so an
+    /// unparseable record is a test failure, never a signal.
+    fn kill_recorded(path: &Path) {
+        let text = match fs::read_to_string(path) {
+            Ok(text) => text,
+            // The process never got as far as recording itself.
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return,
+            Err(error) => panic!("{}: {error}", path.display()),
+        };
+        let pid = recorded_pid(&text)
+            .unwrap_or_else(|| panic!("{} holds no usable pid: {text:?}", path.display()));
+        if let Err(error) = sys::kill_process(pid, libc::SIGKILL) {
+            eprintln!("KILL {pid} from {}: {error}", path.display());
         }
+    }
+
+    fn recorded_pid(text: &str) -> Option<u32> {
+        text.trim().parse::<u32>().ok().filter(|pid| *pid > 1)
+    }
+
+    #[test]
+    fn a_recorded_pid_is_never_a_group_or_init() {
+        assert_eq!(recorded_pid("4242\n"), Some(4242));
+        for bad in ["", "0", "1", "-1", "garbage", "12 13"] {
+            assert_eq!(recorded_pid(bad), None, "{bad:?}");
+        }
+    }
+
+    /// N-D9: a secret sidecar the queue cannot remove is named with its path
+    /// and cause (it may hold a credential); it was dropped without a word.
+    #[test]
+    fn an_unremovable_secret_is_named() {
+        let f = Fixture::new("secret-stays", fast());
+        let secret = f
+            .dir
+            .join("var/control/requests")
+            .join(format!("{A}.secret"));
+        fs::write(&secret, b"hunter2").unwrap();
+        fs::set_permissions(&secret, fs::Permissions::from_mode(0o600)).unwrap();
+        f.enqueue(A, "concurrent 0 plantdir\n");
+        f.wait("the job finished", Duration::from_secs(10), |f| {
+            f.events
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|e| e.starts_with("control_file_unremovable"))
+        });
+        let events = f.events.lock().unwrap().clone();
+        eprintln!("{events:#?}");
+        let named = events
+            .iter()
+            .find(|e| e.starts_with("control_file_unremovable"))
+            .unwrap();
+        assert!(
+            named.contains(&format!("id={A}"))
+                && named.contains("kind=secret")
+                && named.contains(&format!("processing/{A}.secret"))
+                && named.contains("cause="),
+            "{named}"
+        );
+    }
+
+    /// N-D9: an expired control file that cannot be removed is named as
+    /// such; it was logged `control_file_expired` as if it had gone.
+    #[test]
+    fn an_expired_file_that_stays_is_not_called_expired() {
+        let f = Fixture::prepared("prune-stays", fast(), |dir| {
+            let responses = dir.join("var/control/responses");
+            let old = responses.join(format!("{A}.json"));
+            fs::write(&old, b"{}").unwrap();
+            fs::set_permissions(&old, fs::Permissions::from_mode(0o600)).unwrap();
+            fs::File::options()
+                .write(true)
+                .open(&old)
+                .unwrap()
+                .set_modified(UNIX_EPOCH + Duration::from_secs(1_000_000))
+                .unwrap();
+            fs::set_permissions(&responses, fs::Permissions::from_mode(0o500)).unwrap();
+        });
+        let responses = f.dir.join("var/control/responses");
+        let probe = responses.join("probe");
+        if fs::write(&probe, b"").is_ok() {
+            eprintln!(
+                "SKIP an_expired_file_that_stays_is_not_called_expired: {} is writable at mode 0500 (running as root)",
+                responses.display()
+            );
+            fs::set_permissions(&responses, fs::Permissions::from_mode(0o700)).unwrap();
+            return;
+        }
+        f.wait("the prune named", Duration::from_secs(10), |f| {
+            f.events
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|e| e.contains(A) && e.starts_with("control_file_"))
+        });
+        thread::sleep(Duration::from_millis(200));
+        fs::set_permissions(&responses, fs::Permissions::from_mode(0o700)).unwrap();
+        let events = f.events.lock().unwrap().clone();
+        eprintln!("{events:#?}");
+        assert!(
+            !events.iter().any(|e| e.starts_with("control_file_expired")),
+            "a file that is still there did not expire: {events:#?}"
+        );
+        assert!(
+            events
+                .iter()
+                .any(|e| e.starts_with("control_file_unremovable")
+                    && e.contains("kind=response")
+                    && e.contains("ermission denied")),
+            "{events:#?}"
+        );
     }
 
     /// S2-1: what a consumer says on stderr reaches controller.log, named

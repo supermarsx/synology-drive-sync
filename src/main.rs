@@ -188,6 +188,7 @@ fn dispatch(arguments: &cli::Cli) -> Result<ExitCode> {
                     sync.batch
                         .max_total_delete
                         .unwrap_or(config::DEFAULT_MAX_TOTAL_DELETE),
+                    arguments.global.output.progress_record.as_deref(),
                 )
             } else {
                 let job = resolved.remove(0);
@@ -234,6 +235,7 @@ fn dispatch(arguments: &cli::Cli) -> Result<ExitCode> {
                         .batch
                         .max_total_delete
                         .unwrap_or(config::DEFAULT_MAX_TOTAL_DELETE),
+                    arguments.global.output.progress_record.as_deref(),
                 )
             } else {
                 let job = resolved.remove(0);
@@ -792,11 +794,19 @@ fn run_sync_batch(
     plan_only: bool,
     changes_exit_code: bool,
     max_total_delete: usize,
+    record: Option<&Path>,
 ) -> Result<ExitCode> {
     jobs.sort_by(|left, right| left.name.cmp(&right.name));
     let output = common_batch_output(jobs.iter().map(|job| &job.settings.output))?;
     let validated = validate_sync_batch(&jobs)?;
-    let cancellation = install_cancellation_handler()?;
+    // N-D4: the batch publishes its record as a single run does. The daemon runs every scheduled
+    // `all` run this way, and the record's movement is the only progress its watchdog sees while
+    // the core talks to the network; without it a long batch could be stopped as stalled.
+    let cancellation = attach_progress_record(
+        install_cancellation_handler()?,
+        record,
+        if plan_only { "plan" } else { "run" },
+    );
 
     // Every target must produce a complete, non-mutating plan before any target is allowed to
     // mutate. Ordinary failures do not prevent the remaining preflights; cancellation does.
@@ -1620,11 +1630,12 @@ fn sync_batch_output(
 /// That is the whole contract: the record is something a supervisor may read, never something the
 /// operation depends on.
 ///
-/// Batch invocations deliberately publish nothing. Phases are reported as "step N of M" and that
-/// claim has to stay true; N profiles run in sequence through the same phase list, so a single
-/// record would count 1..M once per profile with no way to say which. Naming the profile would
-/// need a seventh field, and the dashboard validates the document by exact key count -- it would
-/// drop every record rather than render the extra one. The honest answer is to publish none.
+/// A sync or plan batch publishes too (N-D4), with the same six keys. Its profiles run in
+/// sequence through one phase list, so the record's "step N of M" is the step of the profile being
+/// worked on and starts again at the next profile; it does not name that profile (a seventh key
+/// would make the dashboard, which validates the document by exact key count, drop every record).
+/// Publishing nothing was worse: the daemon's watchdog reads the record's movement as progress, and
+/// a scheduled `all` run that talks to the network for a long time showed none at all.
 fn attach_progress_record(
     cancellation: CancellationToken,
     record: Option<&Path>,

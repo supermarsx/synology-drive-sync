@@ -1590,3 +1590,306 @@ fn an_unreadable_routine_state_is_held_not_reset() {
     thread::sleep(Duration::from_millis(300));
     assert_eq!(h.launched(), 0, "never run from a state it could not read");
 }
+
+// ---------------------------------------------------------------- fix6-core
+
+/// Whether permissions bind for this process. As root they do not, and a test
+/// that needs an unreadable file says so on stderr instead of passing quietly.
+#[cfg(unix)]
+fn permissions_bind(path: &Path, test: &str) -> bool {
+    if fs::read(path).is_ok() {
+        eprintln!(
+            "SKIP {test}: {} is readable at mode 000 (running as root); nothing is proved",
+            path.display()
+        );
+        return false;
+    }
+    true
+}
+
+/// N-D3: an unreadable profile state is never rewritten from nothing. Read as
+/// absent, a failed run reset `consecutive_failures` 7 to 1 and
+/// `last_success_epoch` to 0, and the log said the last configuration was
+/// kept. The record is left as it is, the run says `degraded=profile_state`,
+/// and the log names the path, the cause and what was kept.
+#[cfg(unix)]
+#[test]
+fn an_unreadable_profile_state_is_kept_not_reset() {
+    use std::os::unix::fs::PermissionsExt;
+    const STREAK: &str = "state=failed\nfinished_epoch=1779990000\nexit_code=1\naction=sync\n\
+        outcome=failed\nreason=core_failed\nscope=profile\noutcome_epoch=1779990000\n\
+        consecutive_failures=7\nlast_success_epoch=1779000000\n";
+    let h = Harness::new("profile-state-unreadable", |home, var| {
+        profile(home, "alpha");
+        let state = var.join("state/profiles/alpha.state");
+        fs::write(&state, STREAK).unwrap();
+        fs::set_permissions(&state, fs::Permissions::from_mode(0o000)).unwrap();
+    });
+    let state = h.var.join("state/profiles/alpha.state");
+    if !permissions_bind(&state, "an_unreadable_profile_state_is_kept_not_reset") {
+        return;
+    }
+    *h.plan.lock().unwrap() = Plan {
+        finish_after: Some(Duration::from_millis(20)),
+        exit: 1,
+        stop_takes: Duration::ZERO,
+    };
+    h.ask(run("alpha"));
+    h.wait_for("the run", Duration::from_secs(5), |h| {
+        h.launched() == 1 && h.idle() && h.state("run.state").contains("state=failed\n")
+    });
+    fs::set_permissions(&state, fs::Permissions::from_mode(0o600)).unwrap();
+    let kept = fs::read_to_string(&state).unwrap();
+    let run_state = h.state("run.state");
+    let logs = h.logs();
+    eprintln!("profile state: {kept:?}\nrun.state: {run_state:?}\nlogs: {logs:#?}");
+    assert_eq!(kept, STREAK, "the streak is kept, not reset");
+    assert!(
+        run_state.contains("degraded=profile_state\n"),
+        "the run says its profile record was not written: {run_state}"
+    );
+    let named = logs
+        .iter()
+        .find(|l| l.starts_with("profile_state_unreadable"))
+        .unwrap_or_else(|| panic!("the skipped write is named: {logs:#?}"));
+    assert!(
+        named.contains("profiles/alpha.state")
+            && named.contains("ermission denied")
+            && named.contains("kept=the record on disk"),
+        "{named}"
+    );
+    assert!(
+        !logs
+            .iter()
+            .any(|l| l.contains("alpha.state") && l.contains("kept=the last configuration read")),
+        "no false claim about a state file: {logs:#?}"
+    );
+}
+
+/// H2 amber: the queue's audit health reaches controller.state as
+/// `degraded=`, `degraded_since=`, `degraded_cause=` while it lasts, each
+/// change named, and the keys go when it recovers.
+#[test]
+fn the_audit_health_is_published_in_controller_state() {
+    let h = Harness::new("audit-health", |home, _| profile(home, "alpha"));
+    h.wait_for("the first controller.state", Duration::from_secs(5), |h| {
+        h.state("controller.state").starts_with("state=running\n")
+    });
+    let degraded = super::super::state::ControllerDegraded {
+        reason: "audit_unavailable",
+        since: T0 - 40,
+        cause: "the audit log could not be reconciled (exit=73)".into(),
+    };
+    h.tx.send(Msg::AuditHealth(Some(degraded.clone()))).unwrap();
+    h.wait_for("the degradation written", Duration::from_secs(5), |h| {
+        h.state("controller.state")
+            .contains("degraded=audit_unavailable\n")
+    });
+    let state = h.state("controller.state");
+    eprintln!("{state}");
+    assert!(
+        state.contains(&format!("degraded_since={}\n", T0 - 40))
+            && state.contains("degraded_cause=the audit log could not be reconciled (exit=73)\n"),
+        "{state}"
+    );
+    // Every later rewrite keeps it while it lasts (here: a run's end).
+    h.advance(1);
+    h.ask(run("alpha"));
+    h.wait_for("the run", Duration::from_secs(5), |h| {
+        h.launched() == 1 && h.idle()
+    });
+    h.wait_for("the rewrite keeps it", Duration::from_secs(5), |h| {
+        let state = h.state("controller.state");
+        state.contains(&format!("updated_epoch={}\n", T0 + 1))
+            && state.contains("degraded=audit_unavailable\n")
+    });
+    h.tx.send(Msg::AuditHealth(None)).unwrap();
+    h.wait_for("the degradation cleared", Duration::from_secs(5), |h| {
+        !h.state("controller.state").contains("degraded")
+    });
+    let logs = h.logs();
+    eprintln!("{logs:#?}");
+    assert_eq!(
+        logs.iter()
+            .filter(|l| l.starts_with("service_degraded reason=audit_unavailable"))
+            .count(),
+        1,
+        "{logs:#?}"
+    );
+    assert!(
+        logs.iter()
+            .any(|l| l.starts_with("service_degraded_cleared reason=audit_unavailable")),
+        "{logs:#?}"
+    );
+}
+
+/// N-D5 (status half, asked by fix6-watch): the change source's account of
+/// a degraded backend reaches `ctl status` as `backend_detail`, the latest
+/// one, even when backend and reason did not change.
+#[test]
+fn status_carries_the_backends_detail() {
+    let h = realtime_harness("backend-detail");
+    h.wait_for("arm", Duration::from_secs(5), |h| {
+        armed_generation(h, "docs").is_some()
+    });
+    let detail = |h: &Harness| {
+        h.ask(Request::Status)["routines"]
+            .as_array()
+            .and_then(|list| list.iter().find(|r| r["profile"] == "docs").cloned())
+            .map(|r| r["backend_detail"].clone())
+            .unwrap_or(Value::Null)
+    };
+    for account in [
+        "walk_deadline_exceeded seconds=120 path=/volume1/docs",
+        "walk_deadline_exceeded seconds=240 path=/volume1/docs",
+    ] {
+        h.tx.send(Msg::Change(ChangeEvent::Backend {
+            routine: "docs".into(),
+            backend: Backend::Polling,
+            reason: BackendReason::WatchSetupFailed,
+            detail: account.into(),
+        }))
+        .unwrap();
+        h.wait_for("the detail in status", Duration::from_secs(5), |h| {
+            detail(h) == account
+        });
+    }
+}
+
+/// The paths `ctl status` lists as `config_unreadable`.
+fn unreadable_paths(h: &Harness) -> Vec<String> {
+    h.ask(Request::Status)["config_unreadable"]
+        .as_array()
+        .map(|list| {
+            list.iter()
+                .map(|e| format!("{} {}", e["path"].as_str().unwrap_or(""), e["cause"]))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// N-D8: a dependency's profile state that cannot be read held the routine
+/// back without a word (`read_document(..).ok().flatten()`). It is named as
+/// `config_unreadable` with its path and cause, and its recovery too.
+#[cfg(unix)]
+#[test]
+fn an_unreadable_dependency_state_is_named() {
+    use std::os::unix::fs::PermissionsExt;
+    let h = Harness::new("dependency-unreadable", |home, var| {
+        profile(home, "beta");
+        due_alpha(home, var);
+        routine(
+            home,
+            "alpha",
+            "enabled=true\nmode=interval\ninterval_seconds=60\ndepends_on=beta\n",
+        );
+        let state = var.join("state/profiles/beta.state");
+        fs::write(&state, "state=succeeded\n").unwrap();
+        fs::set_permissions(&state, fs::Permissions::from_mode(0o000)).unwrap();
+    });
+    let state = h.var.join("state/profiles/beta.state");
+    if !permissions_bind(&state, "an_unreadable_dependency_state_is_named") {
+        return;
+    }
+    h.wait_for("the dependency named", Duration::from_secs(5), |h| {
+        unreadable_paths(h)
+            .iter()
+            .any(|p| p.contains("profiles/beta.state") && p.contains("ermission denied"))
+    });
+    assert!(
+        h.logs()
+            .iter()
+            .any(|l| l.starts_with("config_unreadable") && l.contains("profiles/beta.state")),
+        "{:#?}",
+        h.logs()
+    );
+    assert_eq!(
+        h.launched(),
+        0,
+        "a dependency that cannot be read is not met"
+    );
+    fs::set_permissions(&state, fs::Permissions::from_mode(0o600)).unwrap();
+    // The deferred routine is evaluated again at its next check.
+    h.advance(3600);
+    h.wait_for("the recovery", Duration::from_secs(5), |h| {
+        h.logs()
+            .iter()
+            .any(|l| l.starts_with("config_recovered") && l.contains("profiles/beta.state"))
+    });
+    h.wait_for("the run once it can be read", Duration::from_secs(5), |h| {
+        h.launched() == 1
+    });
+}
+
+/// N-D8: an unreadable record of a routine that was then removed was listed
+/// in `config_unreadable` for the life of the daemon. It is forgotten, named,
+/// with the routine.
+#[cfg(unix)]
+#[test]
+fn a_removed_routines_unreadable_record_is_forgotten() {
+    use std::os::unix::fs::PermissionsExt;
+    let h = Harness::new("removed-unreadable", |home, var| {
+        due_alpha(home, var);
+        let state = var.join("state/routines/alpha.state");
+        fs::set_permissions(&state, fs::Permissions::from_mode(0o000)).unwrap();
+    });
+    let state = h.var.join("state/routines/alpha.state");
+    if !permissions_bind(&state, "a_removed_routines_unreadable_record_is_forgotten") {
+        return;
+    }
+    h.wait_for("the state named", Duration::from_secs(5), |h| {
+        unreadable_paths(h)
+            .iter()
+            .any(|p| p.contains("routines/alpha.state"))
+    });
+    fs::remove_file(h.root.join("home/config/routines.d/alpha.conf")).unwrap();
+    let _ = h.ask(Request::Reload);
+    h.wait_for("the record forgotten", Duration::from_secs(5), |h| {
+        !unreadable_paths(h)
+            .iter()
+            .any(|p| p.contains("routines/alpha.state"))
+    });
+    let logs = h.logs();
+    eprintln!("{logs:#?}");
+    assert!(
+        logs.iter().any(|l| l.starts_with("config_forgotten")
+            && l.contains("routines/alpha.state")
+            && l.contains("routine was removed")),
+        "{logs:#?}"
+    );
+}
+
+/// N-D8: `ctl status` read an unreadable profiles.d as no profiles
+/// (`profile_names_in(..).unwrap_or_default()`), so `index` was silently
+/// empty. It says the index list is unavailable, with the path and cause.
+#[cfg(unix)]
+#[test]
+fn status_names_an_unreadable_profile_directory() {
+    use std::os::unix::fs::PermissionsExt;
+    let h = Harness::new("status-profiles-unreadable", |home, _| {
+        profile(home, "alpha");
+    });
+    let dir = h.root.join("home/config/profiles.d");
+    fs::set_permissions(&dir, fs::Permissions::from_mode(0o000)).unwrap();
+    if fs::read_dir(&dir).is_ok() {
+        eprintln!(
+            "SKIP status_names_an_unreadable_profile_directory: {} is readable at mode 000 (running as root)",
+            dir.display()
+        );
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
+        return;
+    }
+    let status = h.ask(Request::Status);
+    fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
+    eprintln!("{status:#}");
+    let unavailable = &status["index_unavailable"];
+    assert!(
+        unavailable["path"]
+            .as_str()
+            .is_some_and(|p| p.ends_with("profiles.d"))
+            && unavailable["cause"]
+                .as_str()
+                .is_some_and(|c| c.contains("ermission denied")),
+        "{status:#}"
+    );
+}
