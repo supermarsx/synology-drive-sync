@@ -229,6 +229,13 @@ test("About metadata, dependency versions, and update links match repository sou
     }
   }
   assert.deepEqual([...foundTargets].sort(), Object.keys(targetScopes).sort());
+  // `cfg(unix)` (redb, the verified-pair index) is Linux and macOS, as test_synology_ui.py maps it.
+  const unixSections = [...cargo.matchAll(/^\[target\.'cfg\(unix\)'\.dependencies\]\r?\n([\s\S]*?)(?=^\[|(?![\s\S]))/gm)];
+  assert.equal(unixSections.length, 1, "expected exactly one cfg(unix) dependency section");
+  for (const [name, values] of parseCargoSection(unixSections[0][1], "Linux and macOS")) {
+    assert.ok(!rustDependencies.has(name), `Duplicate direct Rust dependency ${name}`);
+    rustDependencies.set(name, values);
+  }
 
   const uiDependencies = new Map(Object.entries(uiPackage.devDependencies).map(([name, version]) => [
     name,
