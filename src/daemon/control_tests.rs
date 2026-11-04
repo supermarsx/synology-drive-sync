@@ -176,7 +176,10 @@ impl Harness {
                 grace: grace(),
             }),
             mutations: Arc::clone(&mutations) as Arc<dyn MutationRunner>,
-            changes: Some(Box::new(changes.clone())),
+            changes: Some({
+                let source = changes.clone();
+                Box::new(move |_sink| Box::new(source) as Box<dyn ChangeSource>)
+            }),
             sink: Box::new(Arc::clone(&sink)),
             clock: Box::new(FixedOffsetClock { offset_seconds: 0 }),
             wall: Box::new(move || Some(wall_reader.load(Ordering::SeqCst))),
@@ -490,7 +493,7 @@ fn a_realtime_change_dispatches_a_scoped_run_after_its_debounce() {
             .lock()
             .unwrap()
             .iter()
-            .any(|c| c == "arm docs /volume1/docs")
+            .any(|c| c.starts_with("arm docs /volume1/docs gen="))
     });
     let _ = h.tx.send(Msg::Change(ChangeEvent::Backend {
         routine: "docs".into(),
@@ -738,4 +741,108 @@ fn the_performance_level_sets_the_core_nice_value() {
     assert_eq!(performance_nice(Some(b"level=gentle\n")), 19);
     assert_eq!(performance_nice(Some(b"level=turbo\n")), 10);
     assert_eq!(performance_nice(None), 10);
+}
+
+/// The generation of the newest arming of `routine` the fake source saw.
+fn armed_generation(h: &Harness, routine: &str) -> Option<u64> {
+    h.changes
+        .calls
+        .lock()
+        .unwrap()
+        .iter()
+        .rev()
+        .find(|c| c.starts_with(&format!("arm {routine} ")))
+        .and_then(|c| c.rsplit("gen=").next())
+        .and_then(|g| g.parse().ok())
+}
+
+/// A realtime profile whose source (or exclude list) is edited is watched again
+/// on the new tree; the old watch is disarmed, and its late events are dropped.
+#[test]
+fn an_edited_realtime_source_is_rearmed_and_old_events_are_dropped() {
+    let h = realtime_harness("rearm");
+    h.wait_for("arm", Duration::from_secs(5), |h| {
+        armed_generation(h, "docs").is_some()
+    });
+    let first = armed_generation(&h, "docs").unwrap();
+    fs::write(
+        h.root.join("home/config/profiles.d/docs.toml"),
+        "source = \"/volume2/docs\"\nmax-delete = 100\n",
+    )
+    .unwrap();
+    let _ = h.ask(Request::Reload);
+    h.wait_for("re-arm", Duration::from_secs(5), |h| {
+        h.changes
+            .calls
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|c| c.starts_with("arm docs /volume2/docs gen="))
+    });
+    let second = armed_generation(&h, "docs").unwrap();
+    assert!(second > first, "{first} -> {second}");
+    {
+        let calls = h.changes.calls.lock().unwrap();
+        let disarm = calls.iter().position(|c| c == "disarm docs");
+        let rearm = calls
+            .iter()
+            .position(|c| c.starts_with("arm docs /volume2/docs"));
+        assert!(disarm.is_some() && disarm < rearm, "{calls:?}");
+    }
+    assert!(
+        h.logs()
+            .iter()
+            .any(|l| l.starts_with("routine_rearmed profile=docs")),
+        "{:?}",
+        h.logs()
+    );
+    // A change from the old watch: dropped. From the new one: dispatched.
+    let _ = h.tx.send(Msg::Armed(
+        first,
+        ChangeEvent::Changed {
+            routine: "docs".into(),
+            dir: "old".into(),
+        },
+    ));
+    thread::sleep(Duration::from_millis(1500));
+    assert_eq!(h.launched(), 0, "a stale event dispatched a run");
+    let _ = h.tx.send(Msg::Armed(
+        second,
+        ChangeEvent::Changed {
+            routine: "docs".into(),
+            dir: "new".into(),
+        },
+    ));
+    h.wait_for("the dispatch", Duration::from_secs(5), |h| {
+        h.launched() == 1
+    });
+    let args = h.world.lock().unwrap().launched[0]
+        .args
+        .iter()
+        .map(|a| a.to_string_lossy().into_owned())
+        .collect::<Vec<_>>();
+    assert!(
+        args.windows(2).any(|w| w[0] == "--scope" && w[1] == "new"),
+        "{args:?}"
+    );
+}
+
+/// An unchanged reload does not re-arm (a re-arm costs a whole-tree walk).
+#[test]
+fn an_unchanged_reload_keeps_the_watch() {
+    let h = realtime_harness("keep");
+    h.wait_for("arm", Duration::from_secs(5), |h| {
+        armed_generation(h, "docs").is_some()
+    });
+    let _ = h.ask(Request::Reload);
+    let _ = h.ask(Request::Reload);
+    let arms = h
+        .changes
+        .calls
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|c| c.starts_with("arm docs"))
+        .count();
+    assert_eq!(arms, 1);
 }

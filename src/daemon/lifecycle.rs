@@ -425,8 +425,13 @@ pub(crate) fn run_daemon(options: &Options) -> ExitCode {
             manager: options.manager.clone(),
             env: child_env,
         }),
-        // Phase 1's native watcher plugs in here.
-        changes: None,
+        // Native inotify per realtime routine, polling only as the fallback.
+        changes: Some(Box::new(|sink| {
+            Box::new(super::watch_source::WatchSource::new(
+                sink,
+                super::watch_source::WatchSettings::default(),
+            )) as Box<dyn super::changes::ChangeSource>
+        })),
         sink: Box::new(sink),
         clock: Box::new(sys::LibcLocalClock),
         wall: Box::new(epoch),

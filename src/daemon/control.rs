@@ -33,7 +33,9 @@ use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 
-use super::changes::{ChangeEvent, ChangeSource, DirtySet};
+use super::changes::{
+    ArmSpec, ChangeEvent, ChangeSink, ChangeSource, ChangeSourceFactory, DirtySet,
+};
 use super::events::{ActivityRow, EventSink, LogEvent};
 use super::executor::{
     ExecEvent, RunReport, RunSpec, StopCause, Timings, Verdict as RunVerdict, allowlisted_env,
@@ -132,7 +134,10 @@ pub(crate) enum Msg {
     Ctl(Request, Sender<Value>),
     Exec(u64, ExecEvent),
     MutationDone(u64, MutationOutcome),
-    #[allow(dead_code, reason = "sent by the Phase-1 change source")]
+    /// An event from a change source, tagged with the arming it belongs to.
+    Armed(u64, ChangeEvent),
+    /// An untagged change event (tests drive the control thread with these).
+    #[cfg(test)]
     Change(ChangeEvent),
 }
 
@@ -263,7 +268,8 @@ struct Entry {
     dirty: DirtySet,
     source: SourceStatus,
     backend: Option<(Backend, BackendReason)>,
-    armed: bool,
+    /// What the change source is watching for this routine, if anything.
+    armed: Option<ArmSpec>,
 }
 
 struct InFlightMutation {
@@ -279,6 +285,7 @@ pub(crate) struct Control {
     launcher: Box<dyn Launcher>,
     mutations: Arc<dyn MutationRunner>,
     changes: Option<Box<dyn ChangeSource>>,
+    next_generation: u64,
     sink: Box<dyn EventSink>,
     writer: StateWriter,
     clock: Box<dyn LocalClock + Send>,
@@ -315,7 +322,7 @@ pub(crate) struct Parts {
     pub(crate) settings: Settings,
     pub(crate) launcher: Box<dyn Launcher>,
     pub(crate) mutations: Arc<dyn MutationRunner>,
-    pub(crate) changes: Option<Box<dyn ChangeSource>>,
+    pub(crate) changes: Option<ChangeSourceFactory>,
     pub(crate) sink: Box<dyn EventSink>,
     pub(crate) clock: Box<dyn LocalClock + Send>,
     pub(crate) wall: WallClock,
@@ -329,7 +336,14 @@ impl Control {
             settings: parts.settings,
             launcher: parts.launcher,
             mutations: parts.mutations,
-            changes: parts.changes,
+            changes: parts.changes.map(|factory| {
+                let events = tx.clone();
+                let sink: ChangeSink = Arc::new(move |generation, event| {
+                    events.send(Msg::Armed(generation, event)).is_ok()
+                });
+                factory(sink)
+            }),
+            next_generation: 1,
             sink: parts.sink,
             writer: StateWriter::spawn()?,
             clock: parts.clock,
@@ -532,6 +546,19 @@ impl Control {
             Msg::Ctl(request, reply) => self.request(request, reply),
             Msg::Exec(id, event) => self.exec_event(id, event),
             Msg::MutationDone(id, outcome) => self.mutation_done(id, outcome),
+            Msg::Armed(generation, event) => {
+                // An event of an earlier arming (the routine was re-armed or
+                // removed since) describes a watch that no longer exists.
+                let current = self
+                    .routines
+                    .get(change_routine(&event))
+                    .and_then(|entry| entry.armed.as_ref())
+                    .is_some_and(|spec| spec.generation == generation);
+                if current {
+                    self.change(event);
+                }
+            }
+            #[cfg(test)]
             Msg::Change(event) => self.change(event),
         }
     }
@@ -741,7 +768,7 @@ impl Control {
             .collect();
         for name in gone {
             if let Some(entry) = self.routines.remove(&name)
-                && entry.armed
+                && entry.armed.is_some()
                 && let Some(changes) = self.changes.as_mut()
             {
                 changes.disarm(&name);
@@ -782,7 +809,7 @@ impl Control {
                 dirty: DirtySet::default(),
                 source: SourceStatus::Ok,
                 backend: None,
-                armed: false,
+                armed: None,
             });
             entry.state = state;
             let realtime =
@@ -790,17 +817,67 @@ impl Control {
             let source = facts.as_ref().ok().and_then(|f| f.source.clone());
             entry.routine = routine;
             entry.facts = facts;
-            match (realtime, entry.armed, self.changes.as_mut(), source) {
-                (true, false, Some(changes), Some(source)) => {
-                    changes.arm(&name, PathBuf::from(source));
-                    entry.armed = true;
+            let wanted = match (&entry.routine, &source) {
+                (Ok(Some(routine)), Some(source)) => match routine.mode {
+                    Mode::Realtime { poll, .. } => {
+                        let fragment = self.paths.profiles_dir.join(format!("{name}.toml"));
+                        Some(ArmSpec {
+                            routine: name.clone(),
+                            source: PathBuf::from(source),
+                            fragment_stamp: file_stamp(&fragment),
+                            fragment,
+                            poll: Duration::from_secs(poll.max(1)),
+                            last_success_epoch: entry
+                                .state
+                                .as_ref()
+                                .ok()
+                                .map(|state| state.last_success)
+                                .filter(|epoch| *epoch > 0),
+                            generation: 0,
+                        })
+                    }
+                    _ => None,
+                },
+                _ => None,
+            };
+            debug_assert_eq!(wanted.is_some(), realtime && source.is_some());
+            if self.changes.is_some() {
+                match (wanted, entry.armed.clone()) {
+                    (Some(wanted), Some(armed)) if wanted.same_target(&armed) => {}
+                    (Some(mut wanted), previous) => {
+                        wanted.generation = self.next_generation;
+                        self.next_generation += 1;
+                        if previous.is_some() {
+                            // A new source or exclude list is a new watch: the
+                            // old one would keep reporting the old tree.
+                            self.log(
+                                Level::Info,
+                                "scheduler",
+                                "routine_rearmed",
+                                format!(
+                                    "profile={name} source={} generation={}",
+                                    wanted.source.display(),
+                                    wanted.generation
+                                ),
+                            );
+                        }
+                        if let Some(changes) = self.changes.as_mut() {
+                            if previous.is_some() {
+                                changes.disarm(&name);
+                            }
+                            changes.arm(wanted.clone());
+                        }
+                        entry.armed = Some(wanted);
+                    }
+                    (None, Some(_)) => {
+                        if let Some(changes) = self.changes.as_mut() {
+                            changes.disarm(&name);
+                        }
+                        entry.armed = None;
+                        entry.dirty = DirtySet::default();
+                    }
+                    (None, None) => {}
                 }
-                (false, true, Some(changes), _) => {
-                    changes.disarm(&name);
-                    entry.armed = false;
-                    entry.dirty = DirtySet::default();
-                }
-                _ => {}
             }
             self.routines.insert(name, entry);
         }
@@ -1795,7 +1872,7 @@ impl Control {
             }
             ChangeEvent::Overflow { routine } => {
                 for (name, entry) in &mut self.routines {
-                    if routine.as_ref().is_none_or(|r| r == name) && entry.armed {
+                    if routine.as_ref().is_none_or(|r| r == name) && entry.armed.is_some() {
                         entry.dirty.mark_whole_tree(now);
                     }
                 }
@@ -1841,6 +1918,18 @@ impl Control {
                 if let Some(entry) = self.routines.get_mut(&routine) {
                     entry.source = status;
                 }
+            }
+            ChangeEvent::Notice {
+                routine,
+                warn,
+                detail,
+            } => {
+                self.log(
+                    if warn { Level::Warn } else { Level::Info },
+                    "scheduler",
+                    "routine_watch_notice",
+                    format!("profile={routine} {detail}"),
+                );
             }
         }
         self.turn_now = true;
@@ -2208,9 +2297,8 @@ impl Control {
         }
         if let Some(changes) = self.changes.as_mut() {
             for (name, entry) in &mut self.routines {
-                if entry.armed {
+                if entry.armed.take().is_some() {
                     changes.disarm(name);
-                    entry.armed = false;
                 }
             }
         }
@@ -2383,6 +2471,31 @@ fn conf_names(dir: &Path) -> Vec<String> {
 }
 
 /// Spawn the control thread and return its sender.
+/// The routine a change event concerns (`""` for an all-routine overflow).
+fn change_routine(event: &ChangeEvent) -> &str {
+    match event {
+        ChangeEvent::Changed { routine, .. }
+        | ChangeEvent::Backend { routine, .. }
+        | ChangeEvent::Source { routine, .. }
+        | ChangeEvent::Notice { routine, .. } => routine,
+        ChangeEvent::Overflow { routine } => routine.as_deref().unwrap_or(""),
+    }
+}
+
+/// A file's length and modification time (nanoseconds since the epoch), or
+/// `None` when it cannot be read: an unreadable fragment still arms, and the
+/// watcher names the failure when it reads the exclude rules.
+fn file_stamp(path: &Path) -> Option<(u64, u128)> {
+    let metadata = fs::metadata(path).ok()?;
+    let modified = metadata
+        .modified()
+        .ok()?
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_nanos();
+    Some((metadata.len(), modified))
+}
+
 pub(crate) fn spawn(parts: Parts) -> io::Result<(Sender<Msg>, thread::JoinHandle<()>)> {
     let (tx, rx) = mpsc::channel();
     let control = Control::new(parts, tx.clone())?;

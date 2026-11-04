@@ -21,10 +21,6 @@ use std::time::{Duration, Instant};
 use super::routines::{Backend, BackendReason, SourceStatus};
 
 /// What a change source reports. Delivered to the control thread as a message.
-#[allow(
-    dead_code,
-    reason = "constructed by the Phase-1 change source, which plugs in at integration"
-)]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum ChangeEvent {
     /// Something changed in `dir`, relative to the routine's source (`""` is the root).
@@ -45,12 +41,61 @@ pub(crate) enum ChangeEvent {
         routine: String,
         status: SourceStatus,
     },
+    /// Something the source decided that is worth a log line but changes no
+    /// state by itself: why a catch-up run was asked for, a degraded filter.
+    /// `warn` for a degradation, info otherwise.
+    Notice {
+        routine: String,
+        warn: bool,
+        detail: String,
+    },
 }
 
-/// A realtime change source (Phase 1 implements it). Non-blocking requests.
+/// What a routine is armed with. A change to any of it re-arms the routine.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ArmSpec {
+    pub(crate) routine: String,
+    /// The profile's `source`.
+    pub(crate) source: PathBuf,
+    /// The profile fragment, whose exclude rules the watch set follows.
+    pub(crate) fragment: PathBuf,
+    /// The fragment's length and modification time when armed: an edited
+    /// exclude list re-arms the routine.
+    pub(crate) fragment_stamp: Option<(u64, u128)>,
+    /// The routine's `poll` interval, for the polling fallback.
+    pub(crate) poll: Duration,
+    /// The last successful run (epoch seconds), for the start-up catch-up: a
+    /// tree that changed after it while nothing watched it is synced whole.
+    pub(crate) last_success_epoch: Option<u64>,
+    /// Which arming this is. Events from an older arming are dropped.
+    pub(crate) generation: u64,
+}
+
+impl ArmSpec {
+    /// Whether `other` watches the same thing (everything but the generation
+    /// and the catch-up epoch).
+    pub(crate) fn same_target(&self, other: &Self) -> bool {
+        self.routine == other.routine
+            && self.source == other.source
+            && self.fragment == other.fragment
+            && self.fragment_stamp == other.fragment_stamp
+            && self.poll == other.poll
+    }
+}
+
+/// Where a change source delivers its events: the arming's generation and the
+/// event. `false` means the control thread is gone and the source should stop.
+pub(crate) type ChangeSink = std::sync::Arc<dyn Fn(u64, ChangeEvent) -> bool + Send + Sync>;
+
+/// Builds the change source once the control thread's channel exists.
+pub(crate) type ChangeSourceFactory = Box<dyn FnOnce(ChangeSink) -> Box<dyn ChangeSource> + Send>;
+
+/// A realtime change source. Non-blocking requests: arming, walking and every
+/// failure happen on the source's own threads and come back as events.
 pub(crate) trait ChangeSource: Send {
-    /// Start watching `source` for `routine`; report the backend as a [`ChangeEvent::Backend`].
-    fn arm(&mut self, routine: &str, source: PathBuf);
+    /// Start watching for `spec.routine` (replacing an earlier arming of it);
+    /// report the backend as a [`ChangeEvent::Backend`].
+    fn arm(&mut self, spec: ArmSpec);
     /// Stop watching for `routine`.
     fn disarm(&mut self, routine: &str);
 }
@@ -179,11 +224,13 @@ pub(crate) struct FakeChangeSource {
 
 #[cfg(test)]
 impl ChangeSource for FakeChangeSource {
-    fn arm(&mut self, routine: &str, source: PathBuf) {
-        self.calls
-            .lock()
-            .unwrap()
-            .push(format!("arm {routine} {}", source.display()));
+    fn arm(&mut self, spec: ArmSpec) {
+        self.calls.lock().unwrap().push(format!(
+            "arm {} {} gen={}",
+            spec.routine,
+            spec.source.display(),
+            spec.generation
+        ));
     }
     fn disarm(&mut self, routine: &str) {
         self.calls.lock().unwrap().push(format!("disarm {routine}"));

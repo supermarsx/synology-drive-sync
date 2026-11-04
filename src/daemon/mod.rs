@@ -18,10 +18,12 @@ pub(crate) mod events;
 pub(crate) mod executor;
 #[cfg(target_os = "linux")]
 pub(crate) mod lifecycle;
+pub(crate) mod poll;
 pub(crate) mod routines;
 pub(crate) mod state;
 #[cfg(target_os = "linux")]
 pub(crate) mod sys;
+pub(crate) mod watch_source;
 pub(crate) mod window;
 
 /// The daemon's flags of `sdsync-dsm-api`: `--daemon`, `--launch-daemon`,
