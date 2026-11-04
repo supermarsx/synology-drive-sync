@@ -501,11 +501,41 @@ pub(crate) fn run_daemon(options: &Options) -> ExitCode {
             },
         },
     );
+    // Alerts go through the package's own sdsync-common (its alert policy,
+    // ledgers and notifiers), which lives at the package paths only.
+    let alert_sink = FileSink::new(&log_root);
+    let alert_log: super::alerts::AlertLog = Arc::new(move |level, event, detail| {
+        let _ = alert_sink.log(
+            epoch().unwrap_or(0),
+            &LogEvent {
+                level,
+                category: "scheduler",
+                event,
+                detail,
+            },
+        );
+    });
+    let alerts: Arc<dyn super::alerts::Alerts> = if audited {
+        Arc::new(super::alerts::ShellAlerts {
+            common: PathBuf::from(super::super::PACKAGE_ROOT).join("libexec/sdsync-common"),
+            env: api_env.clone(),
+            log: alert_log,
+        })
+    } else {
+        Arc::new(super::alerts::NoAlerts {
+            cause: format!(
+                "{} is not the package's var, whose alert policy and notifiers the alerts use",
+                options.var.display()
+            ),
+            log: alert_log,
+        })
+    };
     let parts = Parts {
         paths: Paths::layout(&options.home, &options.var, options.core.clone()),
         settings,
         launcher: Box::new(ProcessLauncher),
         audit,
+        alerts,
         mutations: Arc::new(ManagerMutations {
             manager: options.manager.clone(),
             env: child_env,

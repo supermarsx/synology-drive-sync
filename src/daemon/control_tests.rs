@@ -126,6 +126,28 @@ struct Harness {
     wall: Arc<AtomicU64>,
     changes: FakeChangeSource,
     mutations: Arc<SlowMutations>,
+    alerts: Arc<RecordingAlerts>,
+}
+
+/// Alerts the control thread asked for, in order.
+#[derive(Default)]
+struct RecordingAlerts {
+    calls: Mutex<Vec<String>>,
+}
+
+impl super::super::alerts::Alerts for RecordingAlerts {
+    fn run_result(&self, scope: &str, failed: bool, exit: i32) {
+        self.calls
+            .lock()
+            .unwrap()
+            .push(format!("result {scope} failed={failed} exit={exit}"));
+    }
+    fn escalate(&self, profile: &str, exit: i32) {
+        self.calls
+            .lock()
+            .unwrap()
+            .push(format!("escalate {profile} exit={exit}"));
+    }
 }
 
 static NEXT: AtomicU64 = AtomicU64::new(0);
@@ -175,6 +197,7 @@ impl Harness {
         let sink = Arc::new(MemorySink::default());
         let wall = Arc::new(AtomicU64::new(T0));
         let changes = FakeChangeSource::default();
+        let alerts = Arc::new(RecordingAlerts::default());
         let mutations = Arc::new(SlowMutations {
             calls: AtomicUsize::new(0),
         });
@@ -195,6 +218,7 @@ impl Harness {
             }),
             mutations: Arc::clone(&mutations) as Arc<dyn MutationRunner>,
             audit: Arc::new(super::super::audit::NoAudit),
+            alerts: Arc::clone(&alerts) as Arc<dyn super::super::alerts::Alerts>,
             changes: Some({
                 let source = changes.clone();
                 Box::new(move |_sink| Box::new(source) as Box<dyn ChangeSource>)
@@ -216,6 +240,7 @@ impl Harness {
             wall,
             changes,
             mutations,
+            alerts,
         }
     }
 
@@ -1194,6 +1219,71 @@ fn a_run_never_starts_while_management_lock_is_live() {
     );
     h.wait_for("idle", Duration::from_secs(5), Harness::idle);
     assert!(!run_dir.join("run.lock").exists() && !run_dir.join("run.scope").exists());
+}
+
+/// The runner's alert rules: a sync's result feeds the counter and channels;
+/// a cancelled one does not; an exhausted ladder escalates once per the
+/// policy's cooldown, the rest named as held by it.
+#[test]
+fn alerts_follow_the_runners_rules_and_escalations_their_cooldown() {
+    let h = Harness::new("alerts", |home, var| {
+        profile(home, "alpha");
+        routine(
+            home,
+            "alpha",
+            "enabled=true\nmode=interval\ninterval_seconds=60\nretry_count=1\nretry_backoff_seconds=10\n",
+        );
+        fs::write(
+            var.join("state/routines/alpha.state"),
+            format!("next_run_epoch={}\n", T0 - 5),
+        )
+        .unwrap();
+        fs::write(home.join("config/alerts.conf"), "cooldown_seconds=600\n").unwrap();
+    });
+    *h.plan.lock().unwrap() = Plan {
+        finish_after: Some(Duration::from_millis(20)),
+        exit: 1,
+        stop_takes: Duration::ZERO,
+    };
+    let launched = |n: usize| move |h: &Harness| h.launched() >= n && h.idle();
+    h.wait_for("the first failure", Duration::from_secs(5), launched(1));
+    h.advance(11);
+    h.wait_for("the first escalation", Duration::from_secs(5), |h| {
+        h.alerts
+            .calls
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|c| c == "escalate alpha exit=1")
+    });
+    assert!(
+        h.alerts
+            .calls
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|c| c == "result alpha failed=true exit=1")
+    );
+    // The next interval exhausts the ladder again inside the 600 s cooldown:
+    // no second escalation, and the hold is said.
+    h.wait_for("idle", Duration::from_secs(5), Harness::idle);
+    h.advance(61);
+    h.wait_for("the third run", Duration::from_secs(5), launched(3));
+    h.advance(11);
+    h.wait_for("the held escalation", Duration::from_secs(5), |h| {
+        h.logs()
+            .iter()
+            .any(|l| l.starts_with("routine_escalation_cooldown profile=alpha"))
+    });
+    let escalations = h
+        .alerts
+        .calls
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|c| c.starts_with("escalate"))
+        .count();
+    assert_eq!(escalations, 1);
 }
 
 /// Every plan and sync gets the verified-pair index directory.

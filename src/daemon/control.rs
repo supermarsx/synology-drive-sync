@@ -308,6 +308,7 @@ pub(crate) struct Control {
     launcher: Box<dyn Launcher>,
     mutations: Arc<dyn MutationRunner>,
     audit: Arc<dyn super::audit::RunAudit>,
+    alerts: Arc<dyn super::alerts::Alerts>,
     changes: Option<Box<dyn ChangeSource>>,
     next_generation: u64,
     sink: Box<dyn EventSink>,
@@ -351,6 +352,8 @@ pub(crate) struct Parts {
     pub(crate) mutations: Arc<dyn MutationRunner>,
     /// The run audit (I-7); `NoAudit` in tests that are not about it.
     pub(crate) audit: Arc<dyn super::audit::RunAudit>,
+    /// Failure alerts and escalations (daemon/alerts.rs).
+    pub(crate) alerts: Arc<dyn super::alerts::Alerts>,
     pub(crate) changes: Option<ChangeSourceFactory>,
     pub(crate) sink: Box<dyn EventSink>,
     pub(crate) clock: Box<dyn LocalClock + Send>,
@@ -366,6 +369,7 @@ impl Control {
             launcher: parts.launcher,
             mutations: parts.mutations,
             audit: parts.audit,
+            alerts: parts.alerts,
             changes: parts.changes.map(|factory| {
                 let events = tx.clone();
                 let sink: ChangeSink = Arc::new(move |generation, event| {
@@ -748,16 +752,9 @@ impl Control {
                     self.activity(code, name, state, "routines", level, message);
                 }
                 Effect::Escalate { exit } => {
-                    // The notifier and system-log channels are not ported to the
-                    // daemon yet (cut-over item); never silent.
-                    self.log(
-                        Level::Error,
-                        "scheduler",
-                        "alert_unavailable",
-                        format!(
-                            "profile={name} exit={exit} channel=desktop,system_log cause=the daemon does not deliver escalations yet"
-                        ),
-                    );
+                    // Cooldown already applied (finish_routine); delivery is
+                    // asynchronous and names its own failures.
+                    self.alerts.escalate(name, exit);
                 }
             }
         }
@@ -1947,19 +1944,19 @@ impl Control {
         if !self.activity(code, &request.scope, state, "sync", level, message) {
             push_degraded(&mut active.degraded, "activity");
         }
-        if sync && verdict.outcome == RunOutcome::Failed {
-            // The failure alert (counter, desktop notification, system log) is
-            // not ported to the daemon yet: say so, and mark the run's record.
-            self.log(
-                Level::Error,
-                "scheduler",
-                "alert_unavailable",
-                format!(
-                    "scope={} reason={} channel=desktop,system_log cause=the daemon does not deliver failure alerts yet",
-                    request.scope, verdict.reason
-                ),
+        // The failure counter, Log Center and the desktop notification, as the
+        // runner fed them: a sync that succeeded or failed; a cancelled or
+        // partial one reaches none of them.
+        if sync && !verdict.cancelled && verdict.outcome != RunOutcome::Partial {
+            self.alerts.run_result(
+                &request.scope,
+                verdict.outcome == RunOutcome::Failed,
+                if verdict.outcome == RunOutcome::Failed {
+                    report.exit.max(1)
+                } else {
+                    0
+                },
             );
-            push_degraded(&mut active.degraded, "alert");
         }
 
         // The core's stderr tail, kept where the dashboard's run-stderr source
@@ -2183,6 +2180,32 @@ impl Control {
             window_day.unwrap_or(&today),
             &mut effects,
         );
+        // An exhausted ladder escalates at most once per the alert policy's
+        // cooldown, per routine (escalated_epoch), as the shell did.
+        if let Some(position) = effects
+            .iter()
+            .position(|e| matches!(e, Effect::Escalate { .. }))
+        {
+            let cooldown = super::alerts::policy_cooldown(
+                read_small(&self.paths.config_dir.join("alerts.conf")).as_deref(),
+            );
+            if state.escalated > 0
+                && finished >= state.escalated
+                && finished - state.escalated < cooldown
+            {
+                effects.remove(position);
+                effects.push(Effect::Log {
+                    level: Level::Info,
+                    event: "routine_escalation_cooldown",
+                    detail: format!(
+                        "profile={name} last={} cooldown={cooldown}",
+                        state.escalated
+                    ),
+                });
+            } else {
+                state.escalated = finished;
+            }
+        }
         let snapshot = state.clone();
         effects.retain(|e| *e != Effect::Save);
         let path = self.routine_state_path(name);
