@@ -1075,6 +1075,31 @@ daemon_supervisor_witness() {
 # (daemon_lock_probe_announce); daemon_lock_probe_unavailable is true when
 # there was no tool at all, as opposed to one that failed. The file is checked readable first so a failed
 # open is not mistaken for a holder.
+#
+# Either tool runs under `timeout 5` when timeout(1) works here (lock_probe_limit
+# is "timeout 5", or empty): a probe wedged on a stuck filesystem used to hang
+# every status, hook and stop. A probe that outlasts it is 2 with the cause
+# "timed out after 5 s"; it is never read as held or free.
+lock_probe_limit_checked=false
+lock_probe_limit=
+lock_probe_limit_check() {
+    [ "$lock_probe_limit_checked" != true ] || return 0
+    lock_probe_limit_checked=true
+    command -v timeout >/dev/null 2>&1 || return 0
+    # A timeout(1) that does not take `timeout SECS COMMAND` (an old BusyBox
+    # reads it as a usage error and exits 1 -- which would read as "held") must
+    # not be used: it has to pass the command's own exit status through.
+    lock_probe_limit_status=0
+    timeout 5 sh -c 'exit 7' >/dev/null 2>&1 || lock_probe_limit_status=$?
+    [ "$lock_probe_limit_status" -ne 7 ] || lock_probe_limit="timeout 5"
+}
+
+lock_probe_timed_out() {
+    [ -n "$lock_probe_limit" ] || return 1
+    case $1 in 124|137|143) return 0 ;; esac
+    return 1
+}
+
 lock_file_probe() {
     lock_probe_path=$1
     daemon_lock_probe_cause=
@@ -1084,26 +1109,35 @@ lock_file_probe() {
         daemon_lock_probe_cause="$lock_probe_path is not readable by this user"
         return 2
     }
+    lock_probe_limit_check
     lock_probe_status=0
     if command -v flock >/dev/null 2>&1; then
         lock_probe_tool=flock
-        lock_probe_output=$({ { flock -n 8; } 8< "$lock_probe_path"; } 2>&1) || lock_probe_status=$?
+        lock_probe_output=$({ { $lock_probe_limit flock -n 8; } 8< "$lock_probe_path"; } 2>&1) || lock_probe_status=$?
         daemon_lock_probe_announce flock
         case $lock_probe_status in
             0) return 1 ;;
             1) return 0 ;;
         esac
+        if lock_probe_timed_out "$lock_probe_status"; then
+            daemon_lock_probe_cause="flock -n on $lock_probe_path timed out after 5 s (exit $lock_probe_status); the lock is neither known held nor free"
+            return 2
+        fi
         daemon_lock_probe_cause="flock -n exited $lock_probe_status${lock_probe_output:+: $lock_probe_output}"
         return 2
     fi
     if [ -f "$api_server" ] && [ -x "$api_server" ]; then
         lock_probe_tool=daemon-lock-probe
-        lock_probe_output=$("$api_server" --daemon-lock-probe "$lock_probe_path" 2>&1) || lock_probe_status=$?
+        lock_probe_output=$($lock_probe_limit "$api_server" --daemon-lock-probe "$lock_probe_path" 2>&1) || lock_probe_status=$?
         daemon_lock_probe_announce daemon-lock-probe
         case $lock_probe_status in
             0) return 1 ;;
             3) return 0 ;;
         esac
+        if lock_probe_timed_out "$lock_probe_status"; then
+            daemon_lock_probe_cause="flock(1) is not installed and $api_server --daemon-lock-probe timed out after 5 s (exit $lock_probe_status); the lock is neither known held nor free"
+            return 2
+        fi
         daemon_lock_probe_cause="flock(1) is not installed and $api_server --daemon-lock-probe exited $lock_probe_status${lock_probe_output:+: $lock_probe_output}"
         return 2
     fi
@@ -1134,6 +1168,7 @@ daemon_lock_probe_announce() {
     [ "$lock_probe_previous" != "$1" ] || return 0
     lock_probe_detail="tool=$1 path=$daemon_lock_file"
     [ "$1" = flock ] || lock_probe_detail="$lock_probe_detail flock=absent"
+    [ -n "$lock_probe_limit" ] || lock_probe_detail="$lock_probe_detail timeout=absent"
     append_controller_log_event info daemon_lock_probe "$lock_probe_detail" >/dev/null 2>&1 || {
         echo "warning: the daemon_lock_probe event could not be written to the controller log" >&2
         return 0

@@ -1816,6 +1816,8 @@ class RuntimeTests(unittest.TestCase):
             "    if os.environ.get('SDSYNC_TEST_LOCK_PROBE_FAIL'):\n"
             "        sys.stderr.write(f'daemon-lock-probe: {_probe_path}: test hook: the probe is disabled\\n')\n"
             "        raise SystemExit(1)\n"
+            "    if os.environ.get('SDSYNC_TEST_LOCK_PROBE_HANG'):\n"
+            "        time.sleep(120)\n"
             + real
             + "    try:\n"
             "        _probe_fd = os.open(_probe_path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)\n"
@@ -14372,6 +14374,45 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
         self.assertEqual(status.returncode, 2, status.stdout + status.stderr)
         self.assertFalse(calls.exists() and calls.read_text(encoding="utf-8").strip(),
                          "supervisor.lock was probed beside a record that proves the supervisor")
+
+    def test_a_lock_probe_that_hangs_is_cut_off_after_five_seconds_and_named(self) -> None:
+        # S3-15. Neither probe tool had a time limit: a flock(1) or a bridge
+        # probe wedged on a stuck filesystem hung every status, hook and stop.
+        # Both run under timeout(1) when it exists; on expiry the probe says 2
+        # ("cannot be told") and the cause names the tool and the limit.
+        self._daemon_engine(None)
+        self._free_daemon_lock()
+        reused = self._spawn_fake("--sleeper")
+        self._seed_reused_pid_daemon_records(reused.pid)
+        lock = self.fhs / "var/run/daemon.lock"
+        for label, environment in (
+            ("bridge probe", self._no_flock_environment(SDSYNC_TEST_LOCK_PROBE_HANG="1")),
+            ("flock", None),
+        ):
+            with self.subTest(tool=label):
+                if environment is None:
+                    # A flock(1) that never returns, in front of the real one.
+                    shim = self.fake_system_bin / "flock"
+                    shim.write_text("#!/bin/sh\nexec /bin/sleep 120\n", encoding="utf-8")
+                    shim.chmod(0o755)
+                    environment = {}
+                began = time.monotonic()
+                status = self.shell(self.lifecycle, "status", timeout=60, extra_environment=environment)
+                elapsed = time.monotonic() - began
+                report = status.stdout + status.stderr
+                self.assertEqual(status.returncode, 2, report)
+                self.assertLess(elapsed, 30, f"the probe was not cut off: {elapsed:.1f} s\n{report}")
+                self.assertGreaterEqual(elapsed, 4, f"the probe was cut off too early\n{report}")
+                self.assertIn(f"{lock} cannot be probed", status.stderr, report)
+                self.assertIn("timed out after 5 s", status.stderr, report)
+                self.assertIn("flock -n" if label == "flock" else "--daemon-lock-probe", status.stderr, report)
+                refused = self.shell(
+                    self.lifecycle_dir / "preuninst", timeout=60, extra_environment=environment
+                )
+                self.assertEqual(refused.returncode, 1, refused.stdout + refused.stderr)
+                self.assertIn("timed out after 5 s", refused.stdout + refused.stderr)
+        (self.fake_system_bin / "flock").unlink()  # the tearDown stop must not wait on it
+        self.assertIsNone(reused.poll())
 
     # -- scenarios against the REAL daemon (fix5 review N-S7) ------------------
     #
