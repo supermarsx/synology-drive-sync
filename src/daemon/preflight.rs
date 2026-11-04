@@ -41,6 +41,8 @@ pub(crate) fn profile_asks(name: &str, fragment: &[u8]) -> Result<ProfileAsks, R
     let text = std::str::from_utf8(fragment).map_err(|_| invalid("is not UTF-8".into()))?;
     let table: toml::Table =
         toml::from_str(text).map_err(|error| invalid(format!("does not parse: {error}")))?;
+    // The manager's fragments are one `[profiles.<name>]` table.
+    let table = synology_drive_sync::watch::profile_section(&table).map_err(invalid)?;
     let flag = |key: &str| -> Result<bool, Refusal> {
         match table.get(key) {
             None => Ok(false),
@@ -220,6 +222,36 @@ mod tests {
         }
         let asks = profile_asks("p", HTTPS).unwrap();
         assert_eq!(decide(closed, "p", &asks, false), Ok(()));
+    }
+
+    /// Exactly as `sdsync-dsm configure-profile` writes it.
+    #[test]
+    fn the_managers_own_fragment_is_read() {
+        let fragment = b"[profiles.watched]\nsource = \"/volume1/w\"\nremote = \"/home/Drive/w\"\n\
+            url = \"https://nas.example:5001\"\nusername = \"bot\"\n\
+            password-file = \"/var/packages/synology-drive-sync/home/secrets/watched.password\"\n\
+            totp-secret-file = \"/var/packages/synology-drive-sync/home/secrets/watched.totp\"\n\
+            no-vault = true\ncompare = \"content\"\njobs = 4\nexcludes = [\"*.tmp\"]\n\
+            delete = true\nallow-empty-source = false\nmax-delete = 100\nretries = 2\ntimeout = 7200\n\
+            connect-timeout = 15\nallow-http = false\ndanger-accept-invalid-certs = false\n\
+            verbose = 0\nquiet = false\nlog-level = \"info\"\nlog-format = \"text\"\n\
+            remote-log-mode = \"off\"\nlog-file = \"/x/sync.log\"\nprogress = \"off\"\noutput = \"ndjson\"\n";
+        let asks = profile_asks("watched", fragment).unwrap();
+        assert_eq!(
+            asks,
+            ProfileAsks {
+                http: false,
+                delete: true,
+                allow_empty_source: false,
+                invalid_tls: false,
+                remote_logging: false,
+            }
+        );
+        let closed = PolicyGates::default();
+        assert_eq!(
+            decide(closed, "watched", &asks, false).unwrap_err().0,
+            "policy_destructive"
+        );
     }
 
     #[test]
