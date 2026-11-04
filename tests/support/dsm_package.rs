@@ -71,6 +71,10 @@ fn copy_tree(from: &Path, to: &Path) -> io::Result<()> {
             copy_tree(&entry.path(), &target)?;
         } else {
             fs::copy(entry.path(), &target)?;
+            // The shipped scripts are not executable in the repository (the package build
+            // sets the bit), so a checkout that keeps modes, or one that does not, both
+            // need it set on the copy that is run.
+            fs::set_permissions(&target, fs::Permissions::from_mode(0o755))?;
         }
     }
     Ok(())

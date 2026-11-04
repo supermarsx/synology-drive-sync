@@ -746,6 +746,9 @@ fn a_supervisor_that_gives_up_removes_the_daemon_records() {
 
 /// Hold the flock on `lock` for `seconds` the way the shell's probe does, and return only once it
 /// is held (a `flock -n` of it reports it taken), so a test never races the holder's start.
+// The caller waits for the holder (the test ends with `wait()` on it); clippy cannot see that
+// across the return.
+#[allow(clippy::zombie_processes)]
 fn hold_lock(lock: &Path, seconds: u32) -> Child {
     private_dir(lock.parent().unwrap());
     fs::write(lock, b"").unwrap();
