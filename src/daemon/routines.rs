@@ -197,6 +197,10 @@ pub(crate) enum SkipField {
     PollSeconds,
     ProfileMaxDelete,
     TimeWindow,
+    /// The routine's conf or profile fragment cannot be read (named
+    /// `config_unreadable` with its path and cause), and nothing was read
+    /// before: never read as absent (S2-2).
+    Unreadable,
 }
 
 impl SkipField {
@@ -219,6 +223,7 @@ impl SkipField {
             Self::PollSeconds => "poll_seconds",
             Self::ProfileMaxDelete => "profile_max_delete",
             Self::TimeWindow => "time_window",
+            Self::Unreadable => "unreadable",
         }
     }
 }

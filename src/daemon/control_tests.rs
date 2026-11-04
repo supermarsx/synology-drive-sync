@@ -387,7 +387,13 @@ fn two_runs_never_overlap_across_routine_dashboard_and_cli() {
         .collect();
     assert!(
         argv.iter()
-            .any(|a| a.contains("--all-profiles --max-total-delete 100 --no-delete")),
+            .any(|a| a.contains("--profiles alpha,beta --max-total-delete 100 --no-delete")),
+        "{argv:?}"
+    );
+    // F5: an all run names the profiles run.scope lists; --all-profiles would
+    // also sync a profile saved while it ran, outside its published scope.
+    assert!(
+        argv.iter().all(|a| !a.contains("--all-profiles")),
         "{argv:?}"
     );
     assert!(
@@ -1428,4 +1434,120 @@ fn runs_are_given_the_pair_index_directory() {
             .any(|w| w[0] == "--pair-index" && w[1] == "/var/state/cache/pairs"),
         "{args:?}"
     );
+}
+
+/// S2-2: a configuration file that cannot be read is not an absent one. An
+/// unreadable routine conf used to read as `enabled=false` (realtime silently
+/// disarmed), an unreadable routines.d as no routines. Each is named once per
+/// episode with its path and cause, the last good configuration is kept, and
+/// the recovery is named.
+#[cfg(unix)]
+#[test]
+fn unreadable_configuration_is_named_and_never_read_as_absent() {
+    use std::os::unix::fs::PermissionsExt;
+    let h = realtime_harness("unreadable");
+    let armed = |h: &Harness| {
+        h.changes
+            .calls
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|c| c.starts_with("arm docs"))
+    };
+    h.wait_for("arm", Duration::from_secs(5), armed);
+    let conf = h.root.join("home/config/routines.d/docs.conf");
+    fs::set_permissions(&conf, fs::Permissions::from_mode(0o000)).unwrap();
+    if fs::read(&conf).is_ok() {
+        // Running as root: permissions do not bind; nothing to prove here.
+        return;
+    }
+    let named = |h: &Harness, needle: &str| {
+        h.logs()
+            .iter()
+            .filter(|l| l.starts_with("config_unreadable") && l.contains(needle))
+            .count()
+    };
+    let _ = h.ask(Request::Reload);
+    h.wait_for("the conf named", Duration::from_secs(5), |h| {
+        named(h, "docs.conf") == 1
+    });
+    for _ in 0..3 {
+        let _ = h.ask(Request::Wake);
+    }
+    thread::sleep(Duration::from_millis(300));
+    assert_eq!(named(&h, "docs.conf"), 1, "once per episode");
+    assert!(
+        h.logs()
+            .iter()
+            .any(|l| l.contains("docs.conf") && l.contains("ermission denied")),
+        "{:?}",
+        h.logs()
+    );
+    let disarmed = |h: &Harness| {
+        h.changes
+            .calls
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|c| c == "disarm docs")
+    };
+    assert!(
+        !disarmed(&h),
+        "an unreadable conf is not a disabled routine"
+    );
+    // The whole directory unreadable: not zero routines.
+    let dir = h.root.join("home/config/routines.d");
+    fs::set_permissions(&dir, fs::Permissions::from_mode(0o000)).unwrap();
+    let _ = h.ask(Request::Reload);
+    h.wait_for("the directory named", Duration::from_secs(5), |h| {
+        named(h, "routines.d cause=") == 1
+    });
+    assert!(!disarmed(&h), "an unreadable directory is not an empty one");
+    assert_eq!(
+        h.ask(Request::Status)["routines"].as_array().map(Vec::len),
+        Some(1)
+    );
+    fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
+    fs::set_permissions(&conf, fs::Permissions::from_mode(0o600)).unwrap();
+    let _ = h.ask(Request::Reload);
+    h.wait_for("the recovery named", Duration::from_secs(5), |h| {
+        h.logs()
+            .iter()
+            .any(|l| l.starts_with("config_recovered") && l.contains("docs.conf"))
+    });
+    assert!(!disarmed(&h));
+}
+
+/// S2-2: an unreadable routine state is held and named, never read as a
+/// fresh state (which reset the failure streak and the retry backoff).
+#[cfg(unix)]
+#[test]
+fn an_unreadable_routine_state_is_held_not_reset() {
+    use std::os::unix::fs::PermissionsExt;
+    let h = Harness::new("state-unreadable", |home, var| {
+        profile(home, "alpha");
+        routine(
+            home,
+            "alpha",
+            "enabled=true\nmode=interval\ninterval_seconds=60\n",
+        );
+        let state = var.join("state/routines/alpha.state");
+        fs::write(&state, format!("next_run_epoch={}\n", T0 - 5)).unwrap();
+        fs::set_permissions(&state, fs::Permissions::from_mode(0o000)).unwrap();
+    });
+    if fs::read(h.var.join("state/routines/alpha.state")).is_ok() {
+        return;
+    }
+    h.wait_for("the state named", Duration::from_secs(5), |h| {
+        h.logs()
+            .iter()
+            .any(|l| l.starts_with("config_unreadable") && l.contains("routines/alpha.state"))
+    });
+    h.wait_for("the hold named", Duration::from_secs(5), |h| {
+        h.logs()
+            .iter()
+            .any(|l| l.starts_with("routine_state_invalid profile=alpha field=unreadable"))
+    });
+    thread::sleep(Duration::from_millis(300));
+    assert_eq!(h.launched(), 0, "never run from a state it could not read");
 }

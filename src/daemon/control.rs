@@ -354,6 +354,9 @@ pub(crate) struct Control {
     waiters: Vec<(u64, Instant, Sender<Value>)>,
     suppressed_logged: std::collections::HashMap<String, Instant>,
     lasting_reported: HashSet<String>,
+    /// Configuration and state documents that could not be read, with the
+    /// cause: each named once per episode, and its recovery named (S2-2).
+    unreadable: BTreeMap<PathBuf, String>,
     last_controller_write: Option<Instant>,
     wall_unavailable: bool,
     turn_now: bool,
@@ -421,6 +424,7 @@ impl Control {
             waiters: Vec::new(),
             suppressed_logged: std::collections::HashMap::new(),
             lasting_reported: HashSet::new(),
+            unreadable: BTreeMap::new(),
             last_controller_write: None,
             wall_unavailable: false,
             turn_now: true,
@@ -486,11 +490,99 @@ impl Control {
         now
     }
 
+    /// Read a configuration or state document. `Ok(None)` only when it is
+    /// absent; anything else that keeps it from being read (permissions, an
+    /// I/O error, a document past its size bound) is `Err`, named once per
+    /// episode with the path and cause, and never read as absent (S2-2).
+    fn read_document(&mut self, path: &Path) -> Result<Option<Vec<u8>>, String> {
+        match read_document(path) {
+            Ok(bytes) => {
+                self.readable_again(path);
+                Ok(bytes)
+            }
+            Err(cause) => {
+                self.unreadable_now(path, &cause);
+                Err(cause)
+            }
+        }
+    }
+
+    /// [`Control::read_document`] where the caller's documented default is the
+    /// right reading of an unreadable document too (it is named either way).
+    fn read_or_default(&mut self, path: &Path) -> Option<Vec<u8>> {
+        self.read_document(path).ok().flatten()
+    }
+
+    fn unreadable_now(&mut self, path: &Path, cause: &str) {
+        if self
+            .unreadable
+            .insert(path.to_path_buf(), cause.to_owned())
+            .is_none()
+        {
+            self.log(
+                Level::Error,
+                "controller",
+                "config_unreadable",
+                format!(
+                    "path={} cause={cause} kept=the last configuration read",
+                    path.display()
+                ),
+            );
+        }
+    }
+
+    fn readable_again(&mut self, path: &Path) {
+        if self.unreadable.remove(path).is_some() {
+            self.log(
+                Level::Info,
+                "controller",
+                "config_recovered",
+                format!("path={}", path.display()),
+            );
+        }
+    }
+
+    /// Whether `profiles.d/<name>.toml` is there: `Err` when that cannot be
+    /// told (named), which is not a missing profile.
+    fn profile_exists(&mut self, name: &str) -> Result<bool, ()> {
+        let path = self.paths.profiles_dir.join(format!("{name}.toml"));
+        match fs::metadata(&path) {
+            Ok(metadata) => {
+                self.readable_again(&path);
+                Ok(metadata.is_file())
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                self.readable_again(&path);
+                Ok(false)
+            }
+            Err(error) => {
+                self.unreadable_now(&path, &error.to_string());
+                Err(())
+            }
+        }
+    }
+
+    /// The profiles `profiles.d` names, sorted; an unreadable directory is
+    /// named and is `Err`, never an empty list.
+    fn profile_list(&mut self) -> Result<Vec<String>, String> {
+        let dir = self.paths.profiles_dir.clone();
+        match profile_names_in(&dir) {
+            Ok(names) => {
+                self.readable_again(&dir);
+                Ok(names)
+            }
+            Err(cause) => {
+                self.unreadable_now(&dir, &cause);
+                Err(cause)
+            }
+        }
+    }
+
     /// A `running` run.state left by a daemon that died is a dead run: say so
     /// rather than leave it reading Running (or stale) forever.
     fn reconcile_dead_run(&mut self, now: u64) {
         let path = self.paths.state_dir.join("run.state");
-        let Some(previous) = read_small(&path) else {
+        let Some(previous) = self.read_or_default(&path) else {
             return;
         };
         let doc = routines::KvDocument::parse(&previous, 64);
@@ -540,7 +632,8 @@ impl Control {
             now,
             self.schedule.interval,
             routines::parse_schedule_deadline(
-                read_small(&self.paths.state_dir.join("schedule.state")).as_deref(),
+                self.read_or_default(&self.paths.state_dir.join("schedule.state"))
+                    .as_deref(),
             ),
         );
         if self.schedule.enabled {
@@ -787,9 +880,12 @@ impl Control {
 
     fn reload(&mut self, why: &str) {
         self.load_lasting();
-        let schedule = routines::parse_schedule(
-            read_small(&self.paths.config_dir.join("schedule.conf")).as_deref(),
-        );
+        let schedule_path = self.paths.config_dir.join("schedule.conf");
+        let schedule = match self.read_document(&schedule_path) {
+            Ok(bytes) => routines::parse_schedule(bytes.as_deref()),
+            // Named; the schedule last read stays in force.
+            Err(_) => self.schedule.clone(),
+        };
         if schedule.invalid_max_total && !self.schedule.invalid_max_total {
             self.log(
                 Level::Warn,
@@ -811,7 +907,30 @@ impl Control {
         }
         self.schedule = schedule;
 
-        let names = conf_names(&self.paths.routines_dir);
+        let routines_dir = self.paths.routines_dir.clone();
+        let names = match conf_names(&routines_dir) {
+            Ok(names) => {
+                self.readable_again(&routines_dir);
+                names
+            }
+            Err(cause) => {
+                // An unreadable directory is not an empty one: every routine
+                // already loaded stays as it is, named.
+                self.unreadable_now(&routines_dir, &cause);
+                if why != "turn" {
+                    self.log(
+                        Level::Info,
+                        "controller",
+                        "configuration_loaded",
+                        format!(
+                            "trigger={why} routines={} kept=unreadable",
+                            self.routines.len()
+                        ),
+                    );
+                }
+                return;
+            }
+        };
         let present: HashSet<String> = names.iter().cloned().collect();
         let gone: Vec<String> = self
             .routines
@@ -828,22 +947,27 @@ impl Control {
             }
         }
         for name in names {
-            let routine = if self
-                .paths
-                .profiles_dir
-                .join(format!("{name}.toml"))
-                .is_file()
-            {
-                routines::parse_routine(
-                    read_small(&self.paths.routines_dir.join(format!("{name}.conf"))).as_deref(),
-                )
-            } else {
-                Err(SkipField::ProfileMissing)
-            };
-            let facts = routines::parse_profile_facts(
-                read_small(&self.paths.profiles_dir.join(format!("{name}.toml"))).as_deref(),
-            );
             let existing = self.routines.remove(&name);
+            // What was read last stands for a document that cannot be read now
+            // (named by read_document); with nothing read yet, it is a skip.
+            let previous_routine = existing.as_ref().map(|e| e.routine.clone());
+            let previous_facts = existing.as_ref().map(|e| e.facts.clone());
+            let routine = match self.profile_exists(&name) {
+                Ok(true) => {
+                    let conf = self.paths.routines_dir.join(format!("{name}.conf"));
+                    match self.read_document(&conf) {
+                        Ok(bytes) => routines::parse_routine(bytes.as_deref()),
+                        Err(_) => previous_routine.unwrap_or(Err(SkipField::Unreadable)),
+                    }
+                }
+                Ok(false) => Err(SkipField::ProfileMissing),
+                Err(()) => previous_routine.unwrap_or(Err(SkipField::Unreadable)),
+            };
+            let fragment = self.paths.profiles_dir.join(format!("{name}.toml"));
+            let facts = match self.read_document(&fragment) {
+                Ok(bytes) => routines::parse_profile_facts(bytes.as_deref()),
+                Err(_) => previous_facts.unwrap_or(Err(SkipField::Unreadable)),
+            };
             let state = match &existing {
                 Some(entry) if entry.state.is_ok() => entry.state.clone(),
                 _ => {
@@ -851,7 +975,12 @@ impl Control {
                     if fs::symlink_metadata(&path).is_ok_and(|m| m.file_type().is_symlink()) {
                         Err("symlink")
                     } else {
-                        RoutineState::parse(read_small(&path).as_deref())
+                        match self.read_document(&path) {
+                            Ok(bytes) => RoutineState::parse(bytes.as_deref()),
+                            // Never a fresh state: that would reset the
+                            // failure streak and the retry backoff.
+                            Err(_) => Err("unreadable"),
+                        }
                     }
                 }
             };
@@ -1042,15 +1171,19 @@ impl Control {
                 .active
                 .as_ref()
                 .is_some_and(|a| a.request.origin == Origin::Aggregate);
-        if now >= self.schedule_deadline
-            && !pending
-            && self.held_back(&self.profile_names(), "schedule")
-        {
-            // A profile in a lasting block would be killed again by an
-            // all-profiles run; the next attempt is a whole interval away.
-            self.schedule_deadline = now + self.schedule.interval;
-            self.save_schedule();
-            return;
+        if now >= self.schedule_deadline && !pending {
+            let Ok(profiles) = self.profile_list() else {
+                // profiles.d cannot be read (named): no all-profiles run can
+                // be scoped; tried again next turn.
+                return;
+            };
+            if self.held_back(&profiles, "schedule") {
+                // A profile in a lasting block would be killed again by an
+                // all-profiles run; the next attempt is a whole interval away.
+                self.schedule_deadline = now + self.schedule.interval;
+                self.save_schedule();
+                return;
+            }
         }
         if now >= self.schedule_deadline && !pending {
             let id = self.take_id();
@@ -1070,11 +1203,19 @@ impl Control {
 
     /// The fingerprint a block is tied to: the profile fragment and the
     /// performance level, by content.
-    fn settings_fingerprint(&self, name: &str) -> u64 {
-        super::lasting::fingerprint(
-            read_small(&self.paths.profiles_dir.join(format!("{name}.toml"))).as_deref(),
-            read_small(&self.paths.config_dir.join("performance.conf")).as_deref(),
-        )
+    /// `None` when either document cannot be read (named): a block is then
+    /// neither cleared nor judged changed.
+    fn settings_fingerprint(&mut self, name: &str) -> Option<u64> {
+        let fragment = self
+            .read_document(&self.paths.profiles_dir.join(format!("{name}.toml")))
+            .ok()?;
+        let performance = self
+            .read_document(&self.paths.config_dir.join("performance.conf"))
+            .ok()?;
+        Some(super::lasting::fingerprint(
+            fragment.as_deref(),
+            performance.as_deref(),
+        ))
     }
 
     /// Read `var/state/lasting`: drop the block of a removed profile and of a
@@ -1128,7 +1269,11 @@ impl Control {
                 Err(error) => Err(error.to_string()),
             };
             match parsed {
-                Ok(lasting) if lasting.fingerprint != self.settings_fingerprint(&name) => {
+                Ok(lasting)
+                    if self
+                        .settings_fingerprint(&name)
+                        .is_some_and(|now| now != lasting.fingerprint) =>
+                {
                     self.remove_block_file(&name, "settings_changed");
                 }
                 Ok(lasting) => {
@@ -1190,7 +1335,9 @@ impl Control {
             reason: reason.to_owned(),
             detail: detail.to_owned(),
             since: finished,
-            fingerprint: self.settings_fingerprint(profile),
+            // Unreadable settings (named): 0 matches no real fingerprint,
+            // so the next readable change lifts the block, never a silence.
+            fingerprint: self.settings_fingerprint(profile).unwrap_or(0),
         };
         let dir = self.paths.lasting_dir.clone();
         let path = dir.join(format!("{profile}.state"));
@@ -1297,24 +1444,6 @@ impl Control {
         let id = self.next_id;
         self.next_id += 1;
         id
-    }
-
-    fn profile_names(&self) -> Vec<String> {
-        let mut names: Vec<String> = fs::read_dir(&self.paths.profiles_dir)
-            .map(|entries| {
-                entries
-                    .flatten()
-                    .filter_map(|e| {
-                        let name = e.file_name().to_string_lossy().into_owned();
-                        name.strip_suffix(".toml")
-                            .filter(|n| valid_name(n))
-                            .map(str::to_owned)
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
-        names.sort();
-        names
     }
 
     fn evaluate_routines(&mut self, now: u64) {
@@ -1432,7 +1561,10 @@ impl Control {
                     if fs::symlink_metadata(&path).ok()?.file_type().is_symlink() {
                         return None;
                     }
-                    read_small(&path).map(|bytes| routines::profile_completion_state(&bytes))
+                    read_document(&path)
+                        .ok()
+                        .flatten()
+                        .map(|bytes| routines::profile_completion_state(&bytes))
                 })
             };
             let inputs = Inputs {
@@ -1554,10 +1686,15 @@ impl Control {
             "deferred",
             "routines",
             Level::Warn,
-            format!(
-                "Routine skipped: its {} setting is invalid or its profile is missing",
-                field.as_str()
-            ),
+            if field == SkipField::Unreadable {
+                "Routine skipped: its configuration cannot be read; Logs name the file and the cause"
+                    .to_owned()
+            } else {
+                format!(
+                    "Routine skipped: its {} setting is invalid or its profile is missing",
+                    field.as_str()
+                )
+            },
         );
     }
 
@@ -1572,7 +1709,15 @@ impl Control {
         }
     }
 
-    fn core_args(&self, request: &RunRequest, result_record: &Path) -> Vec<std::ffi::OsString> {
+    /// The core's arguments. An `all` run names the profiles it was scoped to
+    /// (`--profiles`, the list `run.scope` publishes), never `--all-profiles`:
+    /// a profile added during the run is not synced outside its scope (F5).
+    fn core_args(
+        &self,
+        request: &RunRequest,
+        profiles: &[String],
+        result_record: &Path,
+    ) -> Vec<std::ffi::OsString> {
         let mut args: Vec<std::ffi::OsString> = vec![
             "--config".into(),
             self.paths.config_file.clone().into(),
@@ -1583,7 +1728,8 @@ impl Control {
             request.action.as_str().into(),
         ];
         if request.scope == "all" {
-            args.push("--all-profiles".into());
+            args.push("--profiles".into());
+            args.push(profiles.join(",").into());
             args.push("--max-total-delete".into());
             args.push(request.max_total_delete.unwrap_or(0).to_string().into());
         } else {
@@ -1612,7 +1758,24 @@ impl Control {
             return;
         }
         let profiles = if request.scope == "all" {
-            self.profile_names()
+            match self.profile_list() {
+                Ok(names) if names.is_empty() => {
+                    self.refuse_start(request, now, "no profiles are configured");
+                    return;
+                }
+                Ok(names) => names,
+                Err(cause) => {
+                    self.refuse_start(
+                        request,
+                        now,
+                        &format!(
+                            "{} cannot be read: {cause}",
+                            self.paths.profiles_dir.display()
+                        ),
+                    );
+                    return;
+                }
+            }
         } else {
             vec![request.scope.clone()]
         };
@@ -1641,7 +1804,7 @@ impl Control {
         }
         let operation = request.action.as_str();
         let run_state_path = self.paths.state_dir.join("run.state");
-        let previous = read_small(&run_state_path);
+        let previous = self.read_or_default(&run_state_path);
         let mut record = RunRecord::running(&request.scope, static_operation(request.action), now);
         record.heartbeat = Some(now);
         record.heartbeat_source = Some("io");
@@ -1697,13 +1860,17 @@ impl Control {
         let _ = fs::remove_file(&result_record);
         let spec = RunSpec {
             program: self.paths.core_binary.clone(),
-            args: self.core_args(&request, &result_record),
+            args: self.core_args(&request, &profiles, &result_record),
             env: self.settings.child_env.clone(),
-            nice: self.settings.core_nice.or_else(|| {
-                Some(performance_nice(
-                    read_small(&self.paths.config_dir.join("performance.conf")).as_deref(),
-                ))
-            }),
+            nice: match self.settings.core_nice {
+                Some(nice) => Some(nice),
+                None => {
+                    let performance = self.paths.config_dir.join("performance.conf");
+                    Some(performance_nice(
+                        self.read_or_default(&performance).as_deref(),
+                    ))
+                }
+            },
             result_record: Some(result_record),
             progress_record: None,
             timings: self.settings.timings,
@@ -1939,7 +2106,7 @@ impl Control {
         record.heartbeat = heartbeat;
         record.heartbeat_source = Some(active.heartbeat_source);
         let path = self.paths.state_dir.join("run.state");
-        let previous = read_small(&path);
+        let previous = self.read_or_default(&path);
         let _ = self.write_state(&path, render_run_state(&record, previous.as_deref()));
     }
 
@@ -2000,7 +2167,7 @@ impl Control {
                     .paths
                     .profile_state_dir
                     .join(format!("{profile}.state"));
-                let previous = read_small(&path);
+                let previous = self.read_or_default(&path);
                 if let Some(bytes) = render_profile_state(&record, "sync", previous.as_deref())
                     && self.write_state(&path, bytes).is_err()
                 {
@@ -2125,7 +2292,7 @@ impl Control {
             );
         }
         let path = self.paths.state_dir.join("run.state");
-        let previous = read_small(&path);
+        let previous = self.read_or_default(&path);
         let _ = self.write_state(&path, render_run_state(&record, previous.as_deref()));
         #[cfg(target_os = "linux")]
         if self.settings.publish_run_lock
@@ -2225,6 +2392,9 @@ impl Control {
             .fields(finished as i64)
             .map(|f| f.day)
             .unwrap_or_else(|| "none".into());
+        // Read before the routine is borrowed: an escalation's cooldown.
+        let alerts = self.paths.config_dir.join("alerts.conf");
+        let cooldown = super::alerts::policy_cooldown(self.read_or_default(&alerts).as_deref());
         let Some(entry) = self.routines.get_mut(name) else {
             self.log(
                 Level::Warn,
@@ -2290,9 +2460,6 @@ impl Control {
             .iter()
             .position(|e| matches!(e, Effect::Escalate { .. }))
         {
-            let cooldown = super::alerts::policy_cooldown(
-                read_small(&self.paths.config_dir.join("alerts.conf")).as_deref(),
-            );
             if state.escalated > 0
                 && finished >= state.escalated
                 && finished - state.escalated < cooldown
@@ -2789,8 +2956,8 @@ impl Control {
             .as_ref()
             .map(|a| a.profiles.clone())
             .unwrap_or_default();
-        let index: serde_json::Map<String, Value> = self
-            .profile_names()
+        let index: serde_json::Map<String, Value> = profile_names_in(&self.paths.profiles_dir)
+            .unwrap_or_default()
             .into_iter()
             .map(|name| {
                 let value = if busy.contains(&name) {
@@ -2828,6 +2995,12 @@ impl Control {
             "busy_profiles": self.active.as_ref().map(|a| a.profiles.clone()).unwrap_or_default(),
             "routines": routines,
             "index": index,
+            // Documents that cannot be read now, each with its cause (S2-2).
+            "config_unreadable": self
+                .unreadable
+                .iter()
+                .map(|(path, cause)| json!({"path": path.display().to_string(), "cause": cause}))
+                .collect::<Vec<Value>>(),
             "lasting": self
                 .blocked
                 .iter()
@@ -2943,7 +3116,7 @@ impl Control {
             record.detail = "run_unkillable: the core did not exit within the stop budget".into();
             record.outcome = Some(RunOutcome::Cancelled);
             let path = self.paths.state_dir.join("run.state");
-            let previous = read_small(&path);
+            let previous = self.read_or_default(&path);
             let _ = self.write_state(&path, render_run_state(&record, previous.as_deref()));
         }
         self.write_controller_state(false);
@@ -3066,32 +3239,60 @@ fn create_private_dir(dir: &Path) -> io::Result<()> {
     }
 }
 
-fn read_small(path: &Path) -> Option<Vec<u8>> {
+/// The largest configuration or state document read.
+const MAX_DOCUMENT_BYTES: u64 = 1024 * 1024;
+
+/// A configuration or state document: `Ok(None)` only when it is absent;
+/// every other way it cannot be read is `Err(cause)`, and one past its size
+/// bound is refused whole rather than read cut short (S2-2).
+fn read_document(path: &Path) -> Result<Option<Vec<u8>>, String> {
     use std::io::Read;
-    let file = fs::File::open(path).ok()?;
+    let file = match fs::File::open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.to_string()),
+    };
     let mut bytes = Vec::new();
-    file.take(1024 * 1024).read_to_end(&mut bytes).ok()?;
-    Some(bytes)
+    file.take(MAX_DOCUMENT_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| error.to_string())?;
+    if bytes.len() as u64 > MAX_DOCUMENT_BYTES {
+        return Err(format!("larger than {MAX_DOCUMENT_BYTES} bytes"));
+    }
+    Ok(Some(bytes))
 }
 
-/// Routine names from `routines.d/*.conf`, sorted, names validated.
-fn conf_names(dir: &Path) -> Vec<String> {
-    let mut names: Vec<String> = fs::read_dir(dir)
-        .map(|entries| {
-            entries
-                .flatten()
-                .filter(|e| e.file_type().is_ok_and(|t| t.is_file()))
-                .filter_map(|e| {
-                    let name = e.file_name().to_string_lossy().into_owned();
-                    name.strip_suffix(".conf")
-                        .filter(|n| valid_name(n))
-                        .map(str::to_owned)
-                })
-                .collect()
-        })
-        .unwrap_or_default();
+/// File names `<name><suffix>` in `dir`, sorted, names validated. An absent
+/// directory has none; one that cannot be read is `Err`, never empty.
+fn names_in(dir: &Path, suffix: &str) -> Result<Vec<String>, String> {
+    let entries = match fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error.to_string()),
+    };
+    let mut names = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(|error| error.to_string())?;
+        if !entry.file_type().is_ok_and(|t| t.is_file()) {
+            continue;
+        }
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if let Some(stem) = name.strip_suffix(suffix).filter(|n| valid_name(n)) {
+            names.push(stem.to_owned());
+        }
+    }
     names.sort();
-    names
+    Ok(names)
+}
+
+/// Routine names from `routines.d/*.conf`.
+fn conf_names(dir: &Path) -> Result<Vec<String>, String> {
+    names_in(dir, ".conf")
+}
+
+/// Profile names from `profiles.d/*.toml`.
+fn profile_names_in(dir: &Path) -> Result<Vec<String>, String> {
+    names_in(dir, ".toml")
 }
 
 /// Spawn the control thread and return its sender.
