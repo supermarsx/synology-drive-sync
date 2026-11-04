@@ -13442,6 +13442,20 @@ fn record_pre_relay_activity(stage: &str, code: &str, status: u16) -> BridgeResu
     }
 }
 
+/// `text` with every control character (newline, carriage return, escape, DEL, the C1 range)
+/// written as a visible escape, so it can sit on one stderr line.
+fn escape_control_bytes(text: &str) -> String {
+    text.chars()
+        .map(|c| {
+            if c.is_control() {
+                c.escape_default().to_string()
+            } else {
+                c.to_string()
+            }
+        })
+        .collect()
+}
+
 /// `--daemon-lock-probe <path>`: what `{ flock -n 8; } 8< <path>` answers, for a shell without
 /// flock(1) (N-S5). The path is opened read-only, never created and never through a symlink
 /// (`O_RDONLY|O_CLOEXEC|O_NOFOLLOW`, plus `O_NONBLOCK` so a FIFO planted there cannot hold the
@@ -13460,11 +13474,15 @@ fn daemon_lock_probe(arguments: &[OsString]) -> ExitCode {
         return ExitCode::from(1);
     };
     let path = Path::new(path);
+    // One line for the shell to read: the path comes from the caller and is
+    // not ours to trust, so a newline or another control byte in it is written
+    // as an escape (`\n`, `\u{1b}`), never raw (S3-7). A byte that is not UTF-8
+    // shows as U+FFFD.
     let refuse = |cause: &str| {
         eprintln!(
             "daemon-lock-probe: {}: {}",
-            path.display(),
-            cause.replace(['\n', '\r'], " ")
+            escape_control_bytes(&path.to_string_lossy()),
+            escape_control_bytes(cause)
         );
         ExitCode::from(1)
     };

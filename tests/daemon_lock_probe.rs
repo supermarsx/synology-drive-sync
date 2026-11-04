@@ -173,3 +173,41 @@ fn a_usage_error_is_1_and_named() {
         shown(&output)
     );
 }
+
+/// S3-7: the shell reads the probe's stderr as one line, so a path with a newline or another
+/// control byte in it (a name an attacker or a typo can plant) must not break that line or put
+/// a terminal escape in front of an operator: every control byte is written as an escape.
+#[test]
+fn a_path_with_control_bytes_is_named_on_one_escaped_line() {
+    use std::os::unix::ffi::OsStrExt;
+    let (root, var) = package_var("control-bytes");
+    let run = var.join("run");
+    let mut name = b"odd".to_vec();
+    name.extend_from_slice(b"\nforged: line\x1b[31m\x07\r\xff.lock");
+    let path = run.join(std::ffi::OsStr::from_bytes(&name));
+    let (output, _) = probe(&path);
+    eprintln!("{}", shown(&output));
+    assert_eq!(output.status.code(), Some(1), "{}", shown(&output));
+    assert!(output.stdout.is_empty(), "{}", shown(&output));
+    let stderr = output.stderr.clone();
+    let body = stderr
+        .strip_suffix(b"\n")
+        .unwrap_or_else(|| panic!("one newline-terminated line: {}", shown(&output)));
+    assert!(
+        body.iter().all(|byte| *byte >= 0x20 && *byte != 0x7f),
+        "a raw control byte reached stderr: {}",
+        shown(&output)
+    );
+    let text = String::from_utf8_lossy(body);
+    assert!(
+        text.starts_with("daemon-lock-probe: ") && text.contains("odd\\nforged: line\\u{1b}[31m"),
+        "the escaped path is named: {}",
+        shown(&output)
+    );
+    assert!(
+        text.contains("No such file"),
+        "the cause is named: {}",
+        shown(&output)
+    );
+    let _ = fs::remove_dir_all(root);
+}
