@@ -613,13 +613,24 @@ pub(crate) fn listen(
         })
 }
 
+/// "cannot connect to <path>: <cause>", the path said once: a full backlog already names the
+/// socket in its own words (`connect_with_timeout`), and repeating it read as two sockets.
+fn connect_failure(path: &Path, error: &io::Error) -> String {
+    let cause = error.to_string();
+    if cause.contains(&path.display().to_string()) {
+        format!("cannot connect: {cause}")
+    } else {
+        format!("cannot connect to {}: {cause}", path.display())
+    }
+}
+
 // The client side: send one request, wait at most `deadline` for the reply.
 pub(crate) fn request(path: &Path, request: &Value, deadline: Duration) -> Result<Value, String> {
     // A connect is bounded too: a listener whose backlog is full would hold a
     // blocking connect (H5).
     let mut stream =
         super::super::linux_socket::connect_with_timeout(path, CONNECT_TIMEOUT.min(deadline))
-            .map_err(|error| format!("cannot connect to {}: {error}", path.display()))?;
+            .map_err(|error| connect_failure(path, &error))?;
     stream
         .set_read_timeout(Some(deadline))
         .and_then(|()| stream.set_write_timeout(Some(deadline)))
@@ -688,6 +699,23 @@ mod tests {
     use super::super::control::ask;
     use super::*;
     use std::time::Instant;
+
+    #[test]
+    fn a_connect_failure_names_the_socket_path_once() {
+        let path = Path::new("/var/run/ctl.sock");
+        let refused = io::Error::from(io::ErrorKind::ConnectionRefused);
+        assert_eq!(
+            connect_failure(path, &refused),
+            format!("cannot connect to {}: {refused}", path.display())
+        );
+        let full = io::Error::new(
+            io::ErrorKind::TimedOut,
+            "/var/run/ctl.sock: the listener's backlog stayed full for 5000 ms (connect: x)",
+        );
+        let said = connect_failure(path, &full);
+        assert_eq!(said.matches("/var/run/ctl.sock").count(), 1, "{said}");
+        assert!(said.contains("backlog stayed full"), "{said}");
+    }
 
     #[test]
     fn requests_parse_into_bounded_verbs() {
