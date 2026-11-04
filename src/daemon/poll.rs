@@ -1331,9 +1331,17 @@ mod tests {
             backend(BackendReason::WatchLimit, "limit 8")
         );
         harness.quiet(Duration::from_millis(250));
-        fs::remove_dir_all(&root).unwrap();
-        let ChangeEvent::Backend { reason, detail, .. } = harness.next() else {
-            panic!("expected the failure");
+        // Out of the poller's sight in one step. `remove_dir_all` takes the tree
+        // apart entry by entry, and a reading that lands in the middle of that
+        // (slow filesystems: macOS x86_64 runners) correctly reports the
+        // half-removed tree as changed (`Changed`), or an entry that vanished
+        // under the walk as a named skip; neither is what this test is about.
+        let gone = dir.path().join("src.gone");
+        fs::rename(&root, &gone).unwrap();
+        fs::remove_dir_all(&gone).unwrap();
+        let failure = harness.next();
+        let ChangeEvent::Backend { reason, detail, .. } = failure else {
+            panic!("expected the failure, got {failure:?}");
         };
         assert_eq!(reason, BackendReason::SourceMissing);
         assert!(detail.ends_with(&root.display().to_string()), "{detail}");
@@ -1346,7 +1354,12 @@ mod tests {
         );
         // Once per transition, not every interval.
         harness.quiet(Duration::from_millis(450));
-        fs::create_dir_all(root.join("b")).unwrap();
+        // The source returns whole: built beside it and renamed into place, so no
+        // reading sees it half-built (that would be a legitimate `Changed` after
+        // the fresh baseline, and a second event this test does not expect).
+        let fresh = dir.path().join("src.new");
+        fs::create_dir_all(fresh.join("b")).unwrap();
+        fs::rename(&fresh, &root).unwrap();
         assert_eq!(
             harness.next(),
             ChangeEvent::Source {
