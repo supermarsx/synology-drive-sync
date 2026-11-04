@@ -109,7 +109,10 @@ The index is a cache: deleting the directory is always safe and only costs one f
 ## Where it lives
 
 One file per profile, `DIR/<profile>.redb` (redb 4.4), mode 0600, in a 0700 directory claimed by a
-`.sdsync-pair-index` marker. A directory holding anything else is refused. The file is held only in
+`.sdsync-pair-index` marker. A profile name longer than 64 characters cannot be a file name here,
+so its files are named by the first 48 characters, a hyphen and the first 16 hex digits of the
+name's SHA-256 (`printf '%s' "$name" | sha256sum | cut -c1-16`): `DIR/<first 48>-<hash>.redb`.
+Below, `<profile>` stands for that name where it applies. A directory holding anything else is refused. The file is held only in
 two short windows: after the listing (one read pass) and at the end of the run (one write
 transaction), so a dashboard read is never queued behind a sync. The first open of every run runs
 redb's `check_integrity()` before any read. A reopen later in the same run skips it only when the
@@ -143,8 +146,8 @@ sync with `--pair-index /var/packages/synology-drive-sync/var/state/cache/pairs`
 - **A retired index** (the profile was re-created with another source, remote or NAS) is named
   `pair-index-retired` and shown as information on the profile's line, because it explains why the
   first run afterwards is slow.
-- **Removing the profile** deletes its `.redb`, the quarantined copies, its lasting block and its
-  alerts state. A file that cannot be removed is named as a warning.
+- **Removing the profile** deletes its `.redb`, the quarantined copies, a panic record, its lasting
+  block and its alerts state. A file that cannot be removed is named as a warning.
 
 ## Reconciliation
 

@@ -164,25 +164,85 @@ pub fn decode_record(bytes: &[u8]) -> Option<(PairRecord, bool)> {
 pub struct IndexPaths {
     pub directory: PathBuf,
     pub profile: String,
+    /// What the profile's files are named by: the profile name, or for a name too long to be a
+    /// file name, a hashed form of it (see [`file_stem`]).
+    pub stem: String,
     pub database: PathBuf,
     /// Where a panic inside redb on this file is recorded (see the module documentation).
     pub panicked: PathBuf,
 }
 
+/// Characters of a long profile name kept in its file name.
+const STEM_PREFIX_CHARS: usize = 48;
+/// Hex digits of the name's SHA-256 that follow them.
+const STEM_HASH_HEX: usize = 16;
+
+/// The name a profile's index files carry.
+///
+/// Profile names have no length cap, but one over 64 characters cannot be a file name here
+/// (N1). Such a name is filed as `<first 48 characters>-<first 16 hex digits of SHA-256(name)>`:
+/// stable, never equal to a short name's stem (65 characters), and distinct for two names that
+/// share their first 48 characters unless SHA-256 collides in 64 bits, in which case the binding
+/// in `meta` (which holds the full name) retires the file rather than serve it. The package's
+/// shell names it the same way: `printf '%s' "$name" | sha256sum | cut -c1-16`.
+pub fn file_stem(profile: &str) -> Option<String> {
+    if crate::evidence_dir::name_is_safe(profile) {
+        return Some(profile.to_owned());
+    }
+    let prefix = profile.get(..STEM_PREFIX_CHARS)?;
+    // Only a name that is safe but for its length.
+    if !crate::evidence_dir::name_is_safe(prefix)
+        || !profile
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+        || profile.contains("..")
+    {
+        return None;
+    }
+    use sha2::{Digest as _, Sha256};
+    let digest = Sha256::digest(profile.as_bytes());
+    let hex: String = digest
+        .iter()
+        .flat_map(|byte| [byte >> 4, byte & 0x0f])
+        .take(STEM_HASH_HEX)
+        .map(|nibble| char::from_digit(u32::from(nibble), 16).expect("a nibble"))
+        .collect();
+    Some(format!("{prefix}-{hex}"))
+}
+
+/// Whether `stem` is one [`file_stem`] can produce.
+fn stem_is_owned(stem: &str) -> bool {
+    if crate::evidence_dir::name_is_safe(stem) {
+        return true;
+    }
+    let Some((prefix, hex)) = stem.split_at_checked(STEM_PREFIX_CHARS) else {
+        return false;
+    };
+    let Some(hex) = hex.strip_prefix('-') else {
+        return false;
+    };
+    crate::evidence_dir::name_is_safe(prefix)
+        && hex.len() == STEM_HASH_HEX
+        && hex
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
 impl IndexPaths {
     pub fn new(directory: &Path, profile: &str) -> Result<Self, IndexIssue> {
-        if !crate::evidence_dir::name_is_safe(profile) {
+        let Some(stem) = file_stem(profile) else {
             return Err(IndexIssue::warning(
                 "pair-index-unsafe",
                 directory.display().to_string(),
                 format!("profile name {profile:?} cannot name an index file"),
             ));
-        }
+        };
         Ok(Self {
             directory: directory.to_path_buf(),
             profile: profile.to_owned(),
-            database: directory.join(format!("{profile}{SUFFIX_DATABASE}")),
-            panicked: directory.join(format!("{profile}{SUFFIX_PANICKED}")),
+            database: directory.join(format!("{stem}{SUFFIX_DATABASE}")),
+            panicked: directory.join(format!("{stem}{SUFFIX_PANICKED}")),
+            stem,
         })
     }
 
@@ -199,16 +259,16 @@ fn is_index_owned(name: &std::ffi::OsStr) -> bool {
     if name == MARKER {
         return true;
     }
-    if let Some((profile, epoch)) = name.split_once(SUFFIX_CORRUPT) {
-        return crate::evidence_dir::name_is_safe(profile)
+    if let Some((stem, epoch)) = name.split_once(SUFFIX_CORRUPT) {
+        return stem_is_owned(stem)
             && !epoch.is_empty()
             && epoch.bytes().all(|byte| byte.is_ascii_digit());
     }
-    if let Some(profile) = name.strip_suffix(SUFFIX_PANICKED) {
-        return crate::evidence_dir::name_is_safe(profile);
+    if let Some(stem) = name.strip_suffix(SUFFIX_PANICKED) {
+        return stem_is_owned(stem);
     }
     name.strip_suffix(SUFFIX_DATABASE)
-        .is_some_and(crate::evidence_dir::name_is_safe)
+        .is_some_and(stem_is_owned)
 }
 
 thread_local! {
@@ -535,7 +595,7 @@ fn unix_now() -> i64 {
 /// Set a file that failed its check aside as `<profile>.redb.corrupt-<epoch>`, keeping one copy,
 /// so the run rebuilds from its own evidence.
 fn quarantine(paths: &IndexPaths) -> Result<Quarantined, String> {
-    let prefix = format!("{}{SUFFIX_CORRUPT}", paths.profile);
+    let prefix = format!("{}{SUFFIX_CORRUPT}", paths.stem);
     let mut failures = Failures::default();
     match fs::read_dir(&paths.directory) {
         Ok(entries) => {
@@ -577,10 +637,9 @@ fn quarantine(paths: &IndexPaths) -> Result<Quarantined, String> {
         })?;
         None
     } else {
-        let target =
-            paths
-                .directory
-                .join(format!("{}{SUFFIX_CORRUPT}{}", paths.profile, unix_now()));
+        let target = paths
+            .directory
+            .join(format!("{}{SUFFIX_CORRUPT}{}", paths.stem, unix_now()));
         fs::rename(&paths.database, &target)
             .map_err(|error| format!("could not be set aside as {}: {error}", target.display()))?;
         Some(target)
@@ -1361,6 +1420,62 @@ mod tests {
         ] {
             assert!(!is_index_owned(std::ffi::OsStr::new(foreign)), "{foreign}");
         }
+    }
+
+    /// N1: profile names have no length cap, and a name over 64 characters could not name an
+    /// index file, so every run of such a profile was `pair-index-unsafe`. Such a name is filed
+    /// under its first 48 characters and 16 hex digits of its SHA-256: stable, distinct from
+    /// every short name (65 characters), and named the same way by the package's shell.
+    #[test]
+    fn a_long_profile_name_gets_a_stable_hashed_file_name() {
+        let directory = Path::new("/var/state/cache/pairs");
+        let long = "p".repeat(70);
+        let paths = IndexPaths::new(directory, &long).expect("a long name is usable");
+        let stem = format!("{}-d79ad4b575f328af", "p".repeat(48));
+        assert_eq!(paths.database, directory.join(format!("{stem}.redb")));
+        assert_eq!(
+            paths.panicked,
+            directory.join(format!("{stem}.redb.panicked"))
+        );
+        assert_eq!(
+            IndexPaths::new(directory, &long).unwrap().database,
+            paths.database,
+            "stable"
+        );
+        let sibling = format!("{}q", "p".repeat(69));
+        assert_eq!(
+            IndexPaths::new(directory, &sibling).unwrap().database,
+            directory.join(format!("{}-5b37311183a27028.redb", "p".repeat(48))),
+            "a name sharing the first 48 characters gets its own file"
+        );
+        for owned in [
+            format!("{stem}.redb"),
+            format!("{stem}.redb.corrupt-1800000000"),
+            format!("{stem}.redb.panicked"),
+        ] {
+            assert!(is_index_owned(std::ffi::OsStr::new(&owned)), "{owned}");
+        }
+        for foreign in [
+            format!("{}-D79AD4B575F328AF.redb", "p".repeat(48)),
+            format!("{}-d79ad4b575f328afe.redb", "p".repeat(48)),
+            format!("{}xd79ad4b575f328af.redb", "p".repeat(48)),
+            format!(".{}-d79ad4b575f328af.redb", "p".repeat(47)),
+        ] {
+            assert!(!is_index_owned(std::ffi::OsStr::new(&foreign)), "{foreign}");
+        }
+        // Short names keep the file they always had; unsafe characters are still refused.
+        assert_eq!(
+            IndexPaths::new(directory, "photos").unwrap().database,
+            directory.join("photos.redb")
+        );
+        assert_eq!(
+            IndexPaths::new(directory, &"p".repeat(64))
+                .unwrap()
+                .database,
+            directory.join(format!("{}.redb", "p".repeat(64)))
+        );
+        let refused = IndexPaths::new(directory, &format!("{}/x", "p".repeat(70)));
+        assert_eq!(refused.unwrap_err().code, "pair-index-unsafe");
     }
 
     fn scratch(label: &str) -> PathBuf {

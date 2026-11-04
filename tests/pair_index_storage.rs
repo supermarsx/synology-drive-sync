@@ -644,6 +644,51 @@ fn an_undecodable_record_sets_the_file_aside_instead_of_failing_every_run() {
     }
 }
 
+/// N1: a profile name over 64 characters has an index of its own, which the directory claim
+/// accepts on the next run, alongside a short-named profile's.
+#[test]
+fn a_long_profile_name_keeps_an_index_the_directory_accepts() {
+    let dir = Dir::new("long-name");
+    let long = format!("{}-{}", "nightly_mirror".repeat(4), "x".repeat(20));
+    assert!(long.len() > 64);
+    prepare_directory(&dir.0).unwrap();
+    let long_paths = IndexPaths::new(&dir.0, &long).expect("usable");
+    for paths in [
+        long_paths.clone(),
+        IndexPaths::new(&dir.0, "photos").unwrap(),
+    ] {
+        let mut backend = RedbPairIndex::open(paths, 8).backend.expect("usable");
+        backend
+            .commit(IndexCommit {
+                upsert: vec![(
+                    key(1),
+                    StoredPair {
+                        record: record(1, 1),
+                        remote_spelling: None,
+                    },
+                )],
+                meta: Some(meta()),
+                ..IndexCommit::default()
+            })
+            .unwrap();
+    }
+    assert!(long_paths.database.is_file());
+    let name = long_paths
+        .database
+        .file_name()
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
+    assert_eq!(name.len(), 48 + 1 + 16 + ".redb".len(), "{name}");
+    assert!(name.starts_with(&long[..48]), "{name}");
+    // The next run claims the directory with both files in it.
+    assert!(prepare_directory(&dir.0).unwrap().is_empty());
+    let mut backend = RedbPairIndex::open(IndexPaths::new(&dir.0, &long).unwrap(), 8)
+        .backend
+        .expect("usable");
+    assert_eq!(read_all(&mut backend).len(), 1);
+}
+
 /// A copy that cannot be removed: a non-empty directory under a copy's name, which
 /// `remove_file` refuses whatever the permissions.
 fn stuck_copy(dir: &Dir, epoch: u64, old: bool) -> PathBuf {
