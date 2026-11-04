@@ -51,6 +51,10 @@ pub struct VouchedPair {
     /// False when only the local read may be skipped: the remote side has no change signal the
     /// source can trust, so File Station's MD5 still runs for it (perf-design §2.8).
     pub remote_too: bool,
+    /// The NAS clock of the `MD5.start` that proved the vouched digest, when it sent one. It
+    /// becomes the remote entry's `digest_nas_time`, so a later judge of the digest (the
+    /// reconciliation carry) applies the racy rule to the read that actually produced it.
+    pub nas_clock: Option<i64>,
 }
 
 /// What a source vouches for in one pass: pairs whose digests it supplies, and pairs it could
@@ -177,6 +181,7 @@ pub fn apply_vouched(
         if pair.remote_too {
             if let Some(entry) = remote.entries.get_mut(&pair.remote) {
                 entry.content_md5 = Some(digest);
+                entry.digest_nas_time = pair.nas_clock;
             }
             comparison.remove(&pair.remote);
         }
@@ -199,6 +204,7 @@ pub fn undo_vouched(
             && let Some(entry) = remote.entries.get_mut(&pair.remote)
         {
             entry.content_md5 = None;
+            entry.digest_nas_time = None;
             redo.insert(pair.remote.clone());
         }
     }
@@ -310,12 +316,16 @@ pub fn local_facts_match(fresh: &LocalEntry, earlier: &LocalEntry) -> bool {
 
 /// Whether a fresh remote listing of a file has exactly the facts of an earlier one: path, size,
 /// mtime, and the change and creation times as DSM reported them.
+///
+/// A listing without a change time never matches: two absent change times comparing equal show
+/// nothing about a replacement that kept size and mtime (D2).
 pub fn remote_facts_match(fresh: &RemoteEntry, earlier: &RemoteEntry) -> bool {
     fresh.kind == EntryKind::File
         && earlier.kind == EntryKind::File
         && fresh.remote_path == earlier.remote_path
         && fresh.size == earlier.size
         && fresh.mtime_seconds == earlier.mtime_seconds
+        && fresh.ctime_seconds.is_some()
         && fresh.ctime_seconds == earlier.ctime_seconds
         && fresh.crtime_seconds == earlier.crtime_seconds
         && fresh.mount_point_type.is_none()
@@ -397,14 +407,42 @@ impl TouchedPaths {
 ///
 /// The fresh reconciliation walk and listing are kept in full: they are what proves nothing else
 /// moved. A pair is carried when the run did not touch it, both sides' facts (ctimes included)
-/// equal the plan-time facts, and the plan pass proved both sides equal. Everything else is
-/// verified live: touched pairs, pairs whose facts moved, and the canary.
+/// equal the plan-time facts, the plan pass proved both sides equal, and neither side's change
+/// time was within the racy window of the plan's read of it (D2: the index's rule, see
+/// [`crate::pair_index::RacyWindows`]). Everything else is verified live: touched pairs, pairs
+/// whose facts moved, pairs the plan read while they could still change unseen, and the canary.
 pub struct PlanCarry<'plan> {
     pub local: &'plan LocalInventory,
     pub remote: &'plan RemoteInventory,
     pub touched: TouchedPaths,
     pub canary: usize,
     pub seed: u64,
+    /// No later than the plan pass's first local read: the run's start serves.
+    pub read_started: std::time::SystemTime,
+    /// The racy windows ([`crate::pair_index::RacyWindows::for_host`] outside tests).
+    pub racy: crate::pair_index::RacyWindows,
+}
+
+impl PlanCarry<'_> {
+    /// Whether the plan's digests of this pair were taken while a write could still hide from
+    /// its facts: locally a change time within the window of the run's start (no later than the
+    /// read), on the NAS one within the window of the plan's own `MD5.start` clock, or no such
+    /// clock at all.
+    fn racy_at_plan(&self, local: &LocalEntry, remote: &RemoteEntry) -> bool {
+        if self.racy.unbounded {
+            return true;
+        }
+        let read_ns = match self.read_started.duration_since(std::time::UNIX_EPOCH) {
+            Ok(elapsed) => i64::try_from(elapsed.as_nanos()).unwrap_or(i64::MAX),
+            Err(_) => return true,
+        };
+        let local_racy = local.times.ctime_ns > read_ns.saturating_sub(self.racy.local_ns);
+        let remote_racy = match (remote.ctime_seconds, remote.digest_nas_time) {
+            (Some(ctime), Some(clock)) => ctime > clock.saturating_sub(self.racy.remote_seconds),
+            _ => true,
+        };
+        local_racy || remote_racy
+    }
 }
 
 impl EvidenceSource for PlanCarry<'_> {
@@ -441,6 +479,7 @@ impl EvidenceSource for PlanCarry<'_> {
             };
             if !local_facts_match(fresh_local, plan_local)
                 || !remote_facts_match(fresh_remote, plan_remote)
+                || self.racy_at_plan(plan_local, plan_remote)
             {
                 continue;
             }
@@ -457,6 +496,7 @@ impl EvidenceSource for PlanCarry<'_> {
                 remote: remote_relative.clone(),
                 md5: *local_digest.as_bytes(),
                 remote_too: true,
+                nas_clock: plan_remote.digest_nas_time,
             });
         }
         split_canaries(eligible, self.canary, self.seed)
@@ -497,10 +537,22 @@ mod tests {
             mtime_seconds: 1,
             ctime_seconds: Some(ctime),
             crtime_seconds: Some(1),
-            digest_nas_time: None,
+            // The plan's MD5.start clock, long after every fixture change time.
+            digest_nas_time: md5.map(|_| CLOCK),
             mount_point_type: None,
             content_md5: md5.map(ContentMd5::from_bytes),
         }
+    }
+
+    /// The plan pass's clocks: change times in the fixtures are seconds, so far before them.
+    const CLOCK: i64 = 1_000;
+
+    fn plan_read_started() -> std::time::SystemTime {
+        std::time::UNIX_EPOCH + std::time::Duration::from_secs(CLOCK as u64)
+    }
+
+    fn windows() -> crate::pair_index::RacyWindows {
+        crate::pair_index::RacyWindows::fixed(60_000_000_000, 60)
     }
 
     fn inventories(
@@ -572,6 +624,8 @@ mod tests {
             touched,
             canary: 0,
             seed: 0,
+            read_started: plan_read_started(),
+            racy: windows(),
         };
         let comparison: BTreeSet<String> = fresh_remote
             .entries
@@ -600,8 +654,92 @@ mod tests {
             touched: TouchedPaths::default(),
             canary: 0,
             seed: 0,
+            read_started: plan_read_started(),
+            racy: windows(),
         };
         let comparison = BTreeSet::from(["x".to_owned()]);
+        let vouched = carry.vouch(
+            &fresh_local,
+            &fresh_remote,
+            &comparison,
+            &BTreeSet::new(),
+            &BTreeMap::new(),
+        );
+        assert!(vouched.served.is_empty());
+    }
+
+    /// D2: a NAS listing without change times shows nothing about a same-size, same-mtime
+    /// replacement; two absent change times comparing equal establish nothing.
+    #[test]
+    fn a_remote_side_without_a_change_time_is_never_carried() {
+        let (plan_local, mut plan_remote) = inventories(&[("x", 10, 20, Some(A))]);
+        let (fresh_local, mut fresh_remote) = inventories(&[("x", 10, 20, None)]);
+        for inventory in [&mut plan_remote, &mut fresh_remote] {
+            inventory.entries.get_mut("x").unwrap().ctime_seconds = None;
+        }
+        let mut carry = PlanCarry {
+            local: &plan_local,
+            remote: &plan_remote,
+            touched: TouchedPaths::default(),
+            canary: 0,
+            seed: 0,
+            read_started: plan_read_started(),
+            racy: windows(),
+        };
+        let comparison = BTreeSet::from(["x".to_owned()]);
+        let vouched = carry.vouch(
+            &fresh_local,
+            &fresh_remote,
+            &comparison,
+            &BTreeSet::new(),
+            &BTreeMap::new(),
+        );
+        assert!(vouched.served.is_empty() && vouched.canaries.is_empty());
+    }
+
+    /// D2: the plan's digests are carried only when neither side could still change unseen when
+    /// the plan read it: no NAS change time within the window of the plan's `MD5.start` clock,
+    /// a clock to judge by, and no local change time within the window of the plan's read.
+    #[test]
+    fn a_pair_the_plan_read_inside_the_racy_window_is_never_carried() {
+        let recent_ns = (CLOCK - 5) * 1_000_000_000;
+        let (plan_local, mut plan_remote) = inventories(&[
+            ("settled", 10, 20, Some(A)),
+            ("local-racy", recent_ns, 20, Some(A)),
+            ("remote-racy", 10, CLOCK - 5, Some(A)),
+            ("no-clock", 10, 20, Some(A)),
+        ]);
+        plan_remote
+            .entries
+            .get_mut("no-clock")
+            .unwrap()
+            .digest_nas_time = None;
+        let (fresh_local, fresh_remote) = inventories(&[
+            ("settled", 10, 20, None),
+            ("local-racy", recent_ns, 20, None),
+            ("remote-racy", 10, CLOCK - 5, None),
+            ("no-clock", 10, 20, None),
+        ]);
+        let comparison: BTreeSet<String> = fresh_remote.entries.keys().cloned().collect();
+        let mut carry = PlanCarry {
+            local: &plan_local,
+            remote: &plan_remote,
+            touched: TouchedPaths::default(),
+            canary: 0,
+            seed: 0,
+            read_started: plan_read_started(),
+            racy: windows(),
+        };
+        let vouched = carry.vouch(
+            &fresh_local,
+            &fresh_remote,
+            &comparison,
+            &BTreeSet::new(),
+            &BTreeMap::new(),
+        );
+        assert_eq!(names(&vouched.served), vec!["settled"]);
+        // No bound at all: nothing is carried.
+        carry.racy = crate::pair_index::RacyWindows::from_writeback_settings(Ok(3_000), Ok(0));
         let vouched = carry.vouch(
             &fresh_local,
             &fresh_remote,
@@ -625,6 +763,8 @@ mod tests {
             touched: TouchedPaths::default(),
             canary: 0,
             seed: 0,
+            read_started: plan_read_started(),
+            racy: windows(),
         };
         let comparison = BTreeSet::from(["x".to_owned()]);
         assert!(
@@ -651,6 +791,8 @@ mod tests {
             touched: TouchedPaths::default(),
             canary: 0,
             seed: 0,
+            read_started: plan_read_started(),
+            racy: windows(),
         };
         let comparison = BTreeSet::from(["x".to_owned()]);
         let strong = comparison.clone();
@@ -689,6 +831,7 @@ mod tests {
                 remote: format!("f{index:03}"),
                 md5: A,
                 remote_too: true,
+                nas_clock: None,
             })
             .collect();
         let first = split_canaries(pairs.clone(), 25, 0);
@@ -713,18 +856,21 @@ mod tests {
                 remote: "a".to_owned(),
                 md5: A,
                 remote_too: true,
+                nas_clock: None,
             },
             VouchedPair {
                 local: "b".to_owned(),
                 remote: "b".to_owned(),
                 md5: A,
                 remote_too: true,
+                nas_clock: None,
             },
             VouchedPair {
                 local: "gone".to_owned(),
                 remote: "gone".to_owned(),
                 md5: A,
                 remote_too: true,
+                nas_clock: None,
             },
         ];
         let mut report = EvidenceReport::default();
@@ -748,12 +894,14 @@ mod tests {
                 remote: "a".to_owned(),
                 md5: A,
                 remote_too: true,
+                nas_clock: Some(CLOCK - 120),
             },
             VouchedPair {
                 local: "b".to_owned(),
                 remote: "b".to_owned(),
                 md5: B,
                 remote_too: false,
+                nas_clock: None,
             },
         ];
         apply_vouched(&mut local, &mut remote, &mut comparison, &served);
@@ -761,6 +909,8 @@ mod tests {
         let served_digest = local.entries["a"].content_md5.unwrap();
         assert!(!served_digest.has_full_proof(), "the type barrier");
         assert!(remote.entries["b"].content_md5.is_none());
+        // The digest keeps the clock of the read that proved it, for the carry's racy rule.
+        assert_eq!(remote.entries["a"].digest_nas_time, Some(CLOCK - 120));
         let redo = undo_vouched(&mut local, &mut remote, &served);
         assert_eq!(redo, BTreeSet::from(["a".to_owned()]));
         assert!(
@@ -773,7 +923,7 @@ mod tests {
             remote
                 .entries
                 .values()
-                .all(|entry| entry.content_md5.is_none())
+                .all(|entry| entry.content_md5.is_none() && entry.digest_nas_time.is_none())
         );
     }
 }

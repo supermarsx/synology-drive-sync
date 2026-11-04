@@ -3264,6 +3264,8 @@ fn prepare_and_run_sync_reporting(
             touched: touched.clone(),
             canary: settings.behavior.reconcile_canary,
             seed: canary_seed(started_at),
+            read_started: started_at,
+            racy: synology_drive_sync::pair_index::RacyWindows::for_host(),
         });
         let carrying = carry.is_some();
         let (reconciliation, reconciliation_deferred, evidence) = build_reconciliation_plan(

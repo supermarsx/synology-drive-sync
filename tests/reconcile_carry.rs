@@ -40,6 +40,10 @@ fn run(arguments: &[&str]) -> Output {
             command.env_remove(name);
         }
     }
+    // A pair the plan read within the racy window of its last change is not carried (D2). The
+    // fixtures settle for 2.2 s, not the minute the writeback bound asks of a real tree; the
+    // debug-only override shortens the windows to match.
+    command.env("SDSYNC_TEST_PAIR_INDEX_RACY_WINDOW_MS", "1000");
     command.output().expect("run synology-drive-sync")
 }
 
@@ -97,6 +101,8 @@ fn tree(files: usize, missing: usize) -> Tree {
         }
     }
     let password = fixture.write("password", PASSWORD);
+    // Outside the (shortened) racy window before the plan reads them, or nothing is carried.
+    std::thread::sleep(std::time::Duration::from_millis(2_200));
     Tree {
         _fixture: fixture,
         source,

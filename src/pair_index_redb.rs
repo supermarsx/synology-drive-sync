@@ -2,12 +2,22 @@
 //!
 //! redb 4.4 reports a truncated, foreign or locked file as an error at open, so the file is
 //! opened in this process. It still panics when a read meets a corrupted page that has not been
-//! verified (perf-design measured 29 of 80 random corruptions), so every open is an
-//! [`open_verified`]: `check_integrity()` verifies every page checksum (and repairs an
-//! interrupted commit) before any table is read. A file that fails is set aside as
-//! `<profile>.redb.corrupt-<epoch>` and rebuilt from the run's own evidence; one redb had to
-//! repair is cleared in the run's commit. Every key and value is `&[u8]` and checked as UTF-8
-//! here, so no stored byte can reach a decoder that unwraps.
+//! verified (perf-design measured 29 of 80 random corruptions), so the first open of each run is
+//! an [`open_verified`]: `check_integrity()` verifies every page checksum (and repairs an
+//! interrupted commit) before any table is read. A reopen later in the same run skips it only
+//! when the file is exactly as this process left it (see [`Fingerprint`]).
+//!
+//! Damage of any kind retires the file: it is set aside as `<stem>.redb.corrupt-<epoch>` and
+//! rebuilt from the run's own evidence, and nothing read from it is served. That covers a file
+//! that fails the check, one redb had to repair (on the first open or a reopen), and a record,
+//! key or `meta` value that does not decode. Every key and value is `&[u8]` and checked here, so
+//! no stored byte can reach a decoder that unwraps.
+//!
+//! redb also panics inside `create_file`, before `check_integrity` can run, on some corruptions
+//! of its saved allocator state (a single flipped byte, found by a byte-flip sweep). A release
+//! build aborts on a panic, so such a file would crash every run. While a thread is inside redb
+//! for an index file, a panic hook records the panic beside it (`<stem>.redb.panicked`); the next
+//! open finds the record and retires the file instead of opening it, so one crashed run heals.
 //!
 //! The file is held in two short windows: W1 reads `meta` and the pairs the comparison set names,
 //! then closes; W2, at the end of the run, reopens and writes one transaction. Between them the
@@ -17,9 +27,12 @@
 //! Every way the index cannot be used is a named [`IndexIssue`] and a fully live run; none fails
 //! a run or makes it partial.
 
+use std::cell::RefCell;
 use std::fs;
-use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
+use std::io::Write as _;
+use std::os::unix::fs::{FileExt as _, MetadataExt as _, OpenOptionsExt as _};
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use redb::{
@@ -38,6 +51,12 @@ pub const MARKER: &str = ".sdsync-pair-index";
 const MARKER_PREFIX: &str = "sdsync.pair-index.";
 const SUFFIX_DATABASE: &str = ".redb";
 const SUFFIX_CORRUPT: &str = ".redb.corrupt-";
+const SUFFIX_PANICKED: &str = ".redb.panicked";
+/// The bytes of the file a [`Fingerprint`] keeps: redb's header (magic, flags, both commit
+/// slots with their transaction ids and checksums) is the first 320.
+const HEADER_BYTES: u64 = 512;
+/// The most of a panic message a `.panicked` record keeps.
+const PANIC_RECORD_BYTES: usize = 300;
 /// Default redb cache. Mandatory: redb's 1 GiB default reached +642 MB RSS at 1M entries.
 pub const DEFAULT_CACHE_MIB: u64 = 8;
 pub const MAX_CACHE_MIB: u64 = 64;
@@ -46,6 +65,9 @@ pub const LOCK_WAIT: Duration = Duration::from_secs(30);
 const LOCK_RETRY: Duration = Duration::from_millis(250);
 /// Quarantined copies older than this are swept.
 const QUARANTINE_AGE: Duration = Duration::from_secs(7 * 86_400);
+/// Earlier copies of one profile that could not be removed, past which a damaged file is deleted
+/// instead of set aside, so copies cannot pile up without bound.
+const MAX_STUCK_COPIES: usize = 3;
 /// Bytes per stored pair the compaction rule budgets.
 const COMPACT_BYTES_PER_ENTRY: u64 = 300;
 const COMPACT_SLACK_BYTES: u64 = 64 * 1024 * 1024;
@@ -142,22 +164,85 @@ pub fn decode_record(bytes: &[u8]) -> Option<(PairRecord, bool)> {
 pub struct IndexPaths {
     pub directory: PathBuf,
     pub profile: String,
+    /// What the profile's files are named by: the profile name, or for a name too long to be a
+    /// file name, a hashed form of it (see [`file_stem`]).
+    pub stem: String,
     pub database: PathBuf,
+    /// Where a panic inside redb on this file is recorded (see the module documentation).
+    pub panicked: PathBuf,
+}
+
+/// Characters of a long profile name kept in its file name.
+const STEM_PREFIX_CHARS: usize = 48;
+/// Hex digits of the name's SHA-256 that follow them.
+const STEM_HASH_HEX: usize = 16;
+
+/// The name a profile's index files carry.
+///
+/// Profile names have no length cap, but one over 64 characters cannot be a file name here
+/// (N1). Such a name is filed as `<first 48 characters>-<first 16 hex digits of SHA-256(name)>`:
+/// stable, never equal to a short name's stem (65 characters), and distinct for two names that
+/// share their first 48 characters unless SHA-256 collides in 64 bits, in which case the binding
+/// in `meta` (which holds the full name) retires the file rather than serve it. The package's
+/// shell names it the same way: `printf '%s' "$name" | sha256sum | cut -c1-16`.
+pub fn file_stem(profile: &str) -> Option<String> {
+    if crate::evidence_dir::name_is_safe(profile) {
+        return Some(profile.to_owned());
+    }
+    let prefix = profile.get(..STEM_PREFIX_CHARS)?;
+    // Only a name that is safe but for its length.
+    if !crate::evidence_dir::name_is_safe(prefix)
+        || !profile
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+        || profile.contains("..")
+    {
+        return None;
+    }
+    use sha2::{Digest as _, Sha256};
+    let digest = Sha256::digest(profile.as_bytes());
+    let hex: String = digest
+        .iter()
+        .flat_map(|byte| [byte >> 4, byte & 0x0f])
+        .take(STEM_HASH_HEX)
+        .map(|nibble| char::from_digit(u32::from(nibble), 16).expect("a nibble"))
+        .collect();
+    Some(format!("{prefix}-{hex}"))
+}
+
+/// Whether `stem` is one [`file_stem`] can produce.
+fn stem_is_owned(stem: &str) -> bool {
+    if crate::evidence_dir::name_is_safe(stem) {
+        return true;
+    }
+    let Some((prefix, hex)) = stem.split_at_checked(STEM_PREFIX_CHARS) else {
+        return false;
+    };
+    let Some(hex) = hex.strip_prefix('-') else {
+        return false;
+    };
+    crate::evidence_dir::name_is_safe(prefix)
+        && hex.len() == STEM_HASH_HEX
+        && hex
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 impl IndexPaths {
     pub fn new(directory: &Path, profile: &str) -> Result<Self, IndexIssue> {
-        if !crate::evidence_dir::name_is_safe(profile) {
+        let Some(stem) = file_stem(profile) else {
             return Err(IndexIssue::warning(
                 "pair-index-unsafe",
                 directory.display().to_string(),
                 format!("profile name {profile:?} cannot name an index file"),
             ));
-        }
+        };
         Ok(Self {
             directory: directory.to_path_buf(),
             profile: profile.to_owned(),
-            database: directory.join(format!("{profile}{SUFFIX_DATABASE}")),
+            database: directory.join(format!("{stem}{SUFFIX_DATABASE}")),
+            panicked: directory.join(format!("{stem}{SUFFIX_PANICKED}")),
+            stem,
         })
     }
 
@@ -174,17 +259,160 @@ fn is_index_owned(name: &std::ffi::OsStr) -> bool {
     if name == MARKER {
         return true;
     }
-    if let Some((profile, epoch)) = name.split_once(SUFFIX_CORRUPT) {
-        return crate::evidence_dir::name_is_safe(profile)
+    if let Some((stem, epoch)) = name.split_once(SUFFIX_CORRUPT) {
+        return stem_is_owned(stem)
             && !epoch.is_empty()
             && epoch.bytes().all(|byte| byte.is_ascii_digit());
     }
+    if let Some(stem) = name.strip_suffix(SUFFIX_PANICKED) {
+        return stem_is_owned(stem);
+    }
     name.strip_suffix(SUFFIX_DATABASE)
-        .is_some_and(crate::evidence_dir::name_is_safe)
+        .is_some_and(stem_is_owned)
+}
+
+thread_local! {
+    /// The `.panicked` record of the index file this thread is inside redb for, if any.
+    static INSIDE_REDB: RefCell<Option<PathBuf>> = const { RefCell::new(None) };
+}
+
+/// While alive, a panic on this thread is recorded beside the index file it is working on, so
+/// the next open retires a file redb cannot read without crashing (see the module documentation).
+struct InsideRedb {
+    previous: Option<PathBuf>,
+}
+
+impl InsideRedb {
+    fn enter(paths: &IndexPaths) -> Self {
+        install_panic_hook();
+        let previous = INSIDE_REDB.with(|cell| cell.replace(Some(paths.panicked.clone())));
+        Self { previous }
+    }
+}
+
+impl Drop for InsideRedb {
+    fn drop(&mut self) {
+        let previous = self.previous.take();
+        let _ = INSIDE_REDB.try_with(|cell| *cell.borrow_mut() = previous);
+    }
+}
+
+/// Chain a hook in front of whatever hook is installed. It acts only on a thread inside redb for
+/// an index file; every panic still reaches the previous hook (and then aborts, in a release).
+fn install_panic_hook() {
+    static INSTALLED: OnceLock<()> = OnceLock::new();
+    INSTALLED.get_or_init(|| {
+        let previous = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            let record = INSIDE_REDB
+                .try_with(|cell| cell.try_borrow().ok().and_then(|path| path.clone()))
+                .ok()
+                .flatten();
+            if let Some(path) = record {
+                let message: String = info
+                    .to_string()
+                    .chars()
+                    .map(|c| if c.is_control() { ' ' } else { c })
+                    .take(PANIC_RECORD_BYTES)
+                    .collect();
+                if let Err(error) = write_panic_record(&path, &message) {
+                    // The process is going down; standard error is the only place left.
+                    eprintln!(
+                        "warning: pair-index-corrupt: redb panicked on the index and the panic \
+                         could not be recorded at {} ({error}); delete the index file by hand if \
+                         every run stops here",
+                        path.display()
+                    );
+                }
+            }
+            previous(info);
+        }));
+    });
+}
+
+fn write_panic_record(path: &Path, message: &str) -> std::io::Result<()> {
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true).mode(0o600);
+    #[cfg(target_os = "linux")]
+    options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+    let mut file = options.open(path)?;
+    file.write_all(message.as_bytes())?;
+    file.write_all(b"\n")?;
+    file.sync_all()
+}
+
+/// The panic a previous process recorded inside redb on this file, if any.
+fn panic_record(paths: &IndexPaths) -> Option<String> {
+    let metadata = fs::symlink_metadata(&paths.panicked).ok()?;
+    let text = if metadata.is_file() {
+        fs::read(&paths.panicked)
+            .map(|bytes| String::from_utf8_lossy(&bytes).trim().to_owned())
+            .unwrap_or_else(|error| format!("the record could not be read: {error}"))
+    } else {
+        "the record is not a regular file".to_owned()
+    };
+    let text: String = text.chars().take(PANIC_RECORD_BYTES).collect();
+    Some(format!(
+        "a previous run stopped inside redb on this file ({text}), which a damaged page \
+         causes; it is not opened again"
+    ))
+}
+
+/// What this process knows of the file as it last closed it: identity, length, times and
+/// redb's header. Every redb commit rewrites the header's transaction id and slot checksums,
+/// and every writable open and close commits or rewrites it, so another writer cannot leave
+/// all of these as they were.
+///
+/// A reopen within the same run that finds exactly this skips `check_integrity()`: the pages
+/// were verified by this run's first open and written since only by this process through redb.
+/// The first open of each run always verifies (redb can panic on an unverified corrupt page),
+/// and any difference at all verifies again. What this does not see is a change between the
+/// fingerprint read and redb taking its lock (microseconds), or one that restores every byte of
+/// the header and every time to the nanosecond; the next run's first open verifies either way.
+/// It saves a full read of the file per reopen (three or four per run), which on an armv7 NAS
+/// is most of the index's cost.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Fingerprint {
+    device: u64,
+    inode: u64,
+    length: u64,
+    mtime: (i64, i64),
+    ctime: (i64, i64),
+    header: Vec<u8>,
+}
+
+impl Fingerprint {
+    fn of(file: &fs::File) -> Option<Self> {
+        let metadata = file.metadata().ok()?;
+        if !metadata.is_file() {
+            return None;
+        }
+        let mut header = vec![0_u8; usize::try_from(HEADER_BYTES.min(metadata.len())).ok()?];
+        file.read_exact_at(&mut header, 0).ok()?;
+        Some(Self {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+            length: metadata.len(),
+            mtime: (metadata.mtime(), metadata.mtime_nsec()),
+            ctime: (metadata.ctime(), metadata.ctime_nsec()),
+            header,
+        })
+    }
+
+    fn of_path(path: &Path) -> Option<Self> {
+        let mut options = fs::OpenOptions::new();
+        options.read(true);
+        #[cfg(target_os = "linux")]
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK);
+        Self::of(&options.open(path).ok()?)
+    }
 }
 
 /// Make `directory` the index's own: created 0700 when missing, private, and claimed by marker.
-pub fn prepare_directory(directory: &Path) -> Result<(), IndexIssue> {
+///
+/// `Ok` carries what the directory's upkeep could not do (a quarantined copy that could not be
+/// swept), for the run to name; none of it stops the index being used.
+pub fn prepare_directory(directory: &Path) -> Result<Vec<IndexIssue>, IndexIssue> {
     let unusable = |cause: String| {
         IndexIssue::warning(
             "pair-index-directory-unusable",
@@ -219,31 +447,80 @@ pub fn prepare_directory(directory: &Path) -> Result<(), IndexIssue> {
         },
     )
     .map_err(unusable)?;
-    sweep_quarantine(directory);
-    Ok(())
+    Ok(sweep_quarantine(directory).into_iter().collect())
 }
 
-/// Remove quarantined copies past [`QUARANTINE_AGE`]. Best effort: a copy that stays is harmless.
-fn sweep_quarantine(directory: &Path) {
-    let Ok(entries) = fs::read_dir(directory) else {
-        return;
+/// Remove quarantined copies past [`QUARANTINE_AGE`]. A copy that stays costs only space, so a
+/// failure does not stop the run; it is named once (`pair-index-cleanup-failed`, the first path
+/// and cause, and how many more), because copies that can never be removed would pile up.
+fn sweep_quarantine(directory: &Path) -> Option<IndexIssue> {
+    let entries = match fs::read_dir(directory) {
+        Ok(entries) => entries,
+        Err(error) => {
+            return Some(IndexIssue::warning(
+                "pair-index-cleanup-failed",
+                directory.display().to_string(),
+                format!("quarantined copies could not be listed for their weekly sweep: {error}"),
+            ));
+        }
     };
     let now = SystemTime::now();
-    for entry in entries.flatten() {
+    let mut failures = Failures::default();
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) => {
+                failures.add(directory, format!("an entry could not be read: {error}"));
+                continue;
+            }
+        };
         let is_copy = entry
             .file_name()
             .to_str()
             .is_some_and(|name| name.contains(SUFFIX_CORRUPT));
+        if !is_copy {
+            continue;
+        }
+        // Not following a link: a link named like a copy is the link's to lose, not its target's.
         let old = entry
             .metadata()
             .ok()
-            .filter(fs::Metadata::is_file)
             .and_then(|metadata| metadata.modified().ok())
             .and_then(|modified| now.duration_since(modified).ok())
             .is_some_and(|age| age > QUARANTINE_AGE);
-        if is_copy && old {
-            let _ = fs::remove_file(entry.path());
+        if old && let Err(error) = fs::remove_file(entry.path()) {
+            failures.add(&entry.path(), error.to_string());
         }
+    }
+    failures.issue("a quarantined copy older than 7 days could not be removed")
+}
+
+/// Removals that failed, named once: the first path and cause, and how many more.
+#[derive(Default)]
+struct Failures {
+    first: Option<(PathBuf, String)>,
+    count: usize,
+}
+
+impl Failures {
+    fn add(&mut self, path: &Path, cause: String) {
+        self.count += 1;
+        if self.first.is_none() {
+            self.first = Some((path.to_path_buf(), cause));
+        }
+    }
+
+    fn issue(self, what: &str) -> Option<IndexIssue> {
+        let (path, cause) = self.first?;
+        let more = match self.count {
+            1 => String::new(),
+            count => format!(" ({} more failed the same way or another)", count - 1),
+        };
+        Some(IndexIssue::warning(
+            "pair-index-cleanup-failed",
+            path.display().to_string(),
+            format!("{what}: {cause}{more}"),
+        ))
     }
 }
 
@@ -317,25 +594,89 @@ fn unix_now() -> i64 {
 
 /// Set a file that failed its check aside as `<profile>.redb.corrupt-<epoch>`, keeping one copy,
 /// so the run rebuilds from its own evidence.
-fn quarantine(paths: &IndexPaths) -> Result<PathBuf, String> {
-    if let Ok(entries) = fs::read_dir(&paths.directory) {
-        let prefix = format!("{}{SUFFIX_CORRUPT}", paths.profile);
-        for entry in entries.flatten() {
-            if entry
-                .file_name()
-                .to_str()
-                .is_some_and(|name| name.starts_with(&prefix))
-            {
-                let _ = fs::remove_file(entry.path());
+fn quarantine(paths: &IndexPaths) -> Result<Quarantined, String> {
+    let prefix = format!("{}{SUFFIX_CORRUPT}", paths.stem);
+    let mut failures = Failures::default();
+    match fs::read_dir(&paths.directory) {
+        Ok(entries) => {
+            for entry in entries {
+                match entry {
+                    Ok(entry)
+                        if entry
+                            .file_name()
+                            .to_str()
+                            .is_some_and(|name| name.starts_with(&prefix)) =>
+                    {
+                        if let Err(error) = fs::remove_file(entry.path()) {
+                            failures.add(&entry.path(), error.to_string());
+                        }
+                    }
+                    Ok(_) => {}
+                    Err(error) => failures.add(
+                        &paths.directory,
+                        format!("an entry could not be read: {error}"),
+                    ),
+                }
             }
         }
+        Err(error) => failures.add(
+            &paths.directory,
+            format!("earlier copies could not be listed: {error}"),
+        ),
     }
-    let target = paths
-        .directory
-        .join(format!("{}{SUFFIX_CORRUPT}{}", paths.profile, unix_now()));
-    fs::rename(&paths.database, &target)
-        .map_err(|error| format!("could not be set aside as {}: {error}", target.display()))?;
-    Ok(target)
+    let stuck = failures.count;
+    let cleanup = failures.issue("an earlier quarantined copy could not be removed");
+    let kept = if stuck >= MAX_STUCK_COPIES {
+        // Copies that cannot be removed would pile up, one per damaged file: past the bound the
+        // damaged file is deleted instead of kept, and the cleanup failure says why.
+        fs::remove_file(&paths.database).map_err(|error| {
+            format!(
+                "could not be removed ({error}), and is not set aside because {stuck} earlier \
+                 copies could not be removed either"
+            )
+        })?;
+        None
+    } else {
+        let target = paths
+            .directory
+            .join(format!("{}{SUFFIX_CORRUPT}{}", paths.stem, unix_now()));
+        fs::rename(&paths.database, &target)
+            .map_err(|error| format!("could not be set aside as {}: {error}", target.display()))?;
+        Some(target)
+    };
+    // The panic record names the file just set aside, not the one that replaces it.
+    match fs::remove_file(&paths.panicked) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(format!(
+                "was set aside, but its panic record {} could not be removed ({error}), so the \
+                 next run would set the new file aside too",
+                paths.panicked.display()
+            ));
+        }
+    }
+    Ok(Quarantined { kept, cleanup })
+}
+
+/// What setting a damaged file aside did.
+struct Quarantined {
+    /// Where the copy was kept, or `None` when it was deleted (see [`MAX_STUCK_COPIES`]).
+    kept: Option<PathBuf>,
+    /// Earlier copies that could not be removed, named once.
+    cleanup: Option<IndexIssue>,
+}
+
+impl Quarantined {
+    fn describe(&self) -> String {
+        match &self.kept {
+            Some(target) => format!("set aside as {}", target.display()),
+            None => format!(
+                "deleted rather than set aside, because {MAX_STUCK_COPIES} or more earlier \
+                 copies could not be removed"
+            ),
+        }
+    }
 }
 
 /// What opening and checking the file found.
@@ -357,18 +698,66 @@ pub enum CheckVerdict {
 
 /// Open the file (waiting for another holder) and verify it before anything reads it.
 ///
-/// The only way this module obtains a readable handle: redb 4.4 can panic reading a page that
-/// is corrupted and unverified, so no table is opened on a file `check_integrity()` has not
-/// passed in this same open.
+/// redb 4.4 can panic reading a page that is corrupted and unverified, so no table is opened on
+/// a file `check_integrity()` has not passed in this open.
 pub fn open_verified(paths: &IndexPaths, cache_mib: u64) -> (Option<Database>, CheckVerdict) {
-    let mut database = match open_database(paths, cache_mib) {
-        Ok(database) => database,
-        Err(Opening::Issue(issue)) => return (None, CheckVerdict::Unsafe(issue)),
-        Err(Opening::Redb(error)) => return (None, verdict_for(error)),
+    let opened = open_checked(paths, cache_mib, None);
+    (opened.database, opened.verdict)
+}
+
+/// What [`open_checked`] produced.
+struct Checked {
+    database: Option<Database>,
+    verdict: CheckVerdict,
+    /// `check_integrity()` ran (whatever it found).
+    verified: bool,
+}
+
+/// Open the file, verified unless it is exactly `trusted` (see [`Fingerprint`]). A file with a
+/// panic record is not opened at all: it is reported corrupt, to be set aside.
+fn open_checked(paths: &IndexPaths, cache_mib: u64, trusted: Option<&Fingerprint>) -> Checked {
+    let unopened = |verdict| Checked {
+        database: None,
+        verdict,
+        verified: false,
     };
+    if let Some(cause) = panic_record(paths) {
+        if fs::symlink_metadata(&paths.database).is_ok() {
+            return unopened(CheckVerdict::Corrupt(cause));
+        }
+        // The file it names is gone already; the record has nothing left to protect.
+        if let Err(error) = fs::remove_file(&paths.panicked) {
+            return unopened(CheckVerdict::Unsafe(IndexIssue::warning(
+                "pair-index-cleanup-failed",
+                paths.panicked.display().to_string(),
+                format!("a panic record for a file that is gone could not be removed: {error}"),
+            )));
+        }
+    }
+    let _inside = InsideRedb::enter(paths);
+    let (mut database, found) = match open_database(paths, cache_mib) {
+        Ok(opened) => opened,
+        Err(Opening::Issue(issue)) => return unopened(CheckVerdict::Unsafe(issue)),
+        Err(Opening::Redb(error)) => return unopened(verdict_for(error)),
+    };
+    if trusted.is_some() && found.as_ref() == trusted {
+        return Checked {
+            database: Some(database),
+            verdict: CheckVerdict::Passed { repaired: false },
+            verified: false,
+        };
+    }
     match database.check_integrity() {
-        Ok(clean) => (Some(database), CheckVerdict::Passed { repaired: !clean }),
-        Err(error) => (None, verdict_for(error.into())),
+        Ok(clean) => Checked {
+            database: Some(database),
+            verdict: CheckVerdict::Passed { repaired: !clean },
+            verified: true,
+        },
+        Err(error) => Checked {
+            database: None,
+            verdict: verdict_for(error.into()),
+            verified: true,
+        },
     }
 }
 
@@ -398,13 +787,18 @@ enum Opening {
     Redb(redb::Error),
 }
 
-/// Open the database, waiting up to [`LOCK_WAIT`] for another holder.
-fn open_database(paths: &IndexPaths, cache_mib: u64) -> Result<Database, Opening> {
+/// Open the database, waiting up to [`LOCK_WAIT`] for another holder, with the fingerprint the
+/// file had just before redb opened it.
+fn open_database(
+    paths: &IndexPaths,
+    cache_mib: u64,
+) -> Result<(Database, Option<Fingerprint>), Opening> {
     let started = Instant::now();
     loop {
         let file = open_file_safely(paths).map_err(Opening::Issue)?;
+        let found = Fingerprint::of(&file);
         match builder(cache_mib).create_file(file) {
-            Ok(database) => return Ok(database),
+            Ok(database) => return Ok((database, found)),
             Err(redb::DatabaseError::DatabaseAlreadyOpen) if started.elapsed() < LOCK_WAIT => {
                 std::thread::sleep(LOCK_RETRY);
             }
@@ -461,129 +855,121 @@ pub struct RedbPairIndex {
     respell: Option<ReadOnlyTable<&'static [u8], &'static [u8]>>,
     meta: Option<Option<IndexMeta>>,
     notes: Vec<IndexIssue>,
-    /// A reopen found and repaired damage: the commit clears every pair.
-    repaired_since_open: bool,
+    /// The file as this process last closed it, for a reopen to skip verification.
+    trusted: Option<Fingerprint>,
+    /// How many times `check_integrity()` ran on this run's opens.
+    integrity_checks: usize,
+    /// The stored evidence was set aside during the run; the session has not been told yet.
+    discarded: bool,
+    /// Pairs the last commit left, so the count needs no reopen.
+    entries: Option<u64>,
 }
 
 /// What opening the index for a run produced: a backend, or none, and the issues met on the way.
 pub struct Opened {
     pub backend: Option<RedbPairIndex>,
-    /// The file's evidence must not be served and is cleared in the run's commit.
-    pub clear: bool,
     pub issues: Vec<IndexIssue>,
 }
 
-impl RedbPairIndex {
-    /// Open the index, verified. Corrupt and foreign-format files become an empty index (the
-    /// file set aside first); a file redb had to repair is cleared by the run's commit; locked,
-    /// read-only and unsafe files give no backend at all. Every case but a clean pass is named.
-    pub fn open(paths: IndexPaths, cache_mib: u64) -> Opened {
-        let mut issues = Vec::new();
-        let label = paths.label();
-        let refused = |issues: Vec<IndexIssue>| Opened {
-            backend: None,
-            clear: false,
-            issues,
-        };
-        let (mut database, verdict) = open_verified(&paths, cache_mib);
-        let mut clear = false;
-        match verdict {
-            CheckVerdict::Passed { repaired } => {
-                if repaired {
-                    // Repaired damage may have been anything: none of the evidence is trusted.
-                    clear = true;
-                    issues.push(IndexIssue::warning(
-                        "pair-index-corrupt",
-                        label.clone(),
-                        "redb found and repaired damage in the file; its evidence is not served \
-                         and is replaced by this run's",
-                    ));
-                }
-            }
-            CheckVerdict::Corrupt(cause) | CheckVerdict::Unsupported(cause) => {
-                let code = if cause.starts_with("file format") {
-                    "pair-index-format-unsupported"
-                } else {
-                    "pair-index-corrupt"
-                };
-                match quarantine(&paths) {
-                    Ok(target) => issues.push(IndexIssue::warning(
-                        code,
-                        label.clone(),
-                        format!(
-                            "{cause}; set aside as {} and rebuilt from this run's evidence",
-                            target.display()
-                        ),
-                    )),
-                    Err(why) => {
-                        issues.push(IndexIssue::warning(code, label, format!("{cause}; {why}")));
-                        return refused(issues);
-                    }
-                }
-                // A new, empty file in its place.
-                let (fresh, verdict) = open_verified(&paths, cache_mib);
-                match verdict {
-                    CheckVerdict::Passed { .. } => database = fresh,
-                    other => {
-                        issues.push(IndexIssue::warning(
-                            "pair-index-store-failed",
-                            paths.label(),
-                            format!("a new index could not be created: {other:?}"),
-                        ));
-                        return refused(issues);
-                    }
-                }
-            }
-            CheckVerdict::Locked => {
-                issues.push(issue_for(&paths, redb::Error::DatabaseAlreadyOpen, false));
-                return refused(issues);
-            }
-            CheckVerdict::ReadOnly(cause) => {
-                issues.push(IndexIssue::warning("pair-index-readonly", label, cause));
-                return refused(issues);
-            }
-            CheckVerdict::Unsafe(issue) => {
-                issues.push(issue);
-                return refused(issues);
-            }
+/// What a damaged file is reported as.
+#[derive(Clone, Copy)]
+enum Damage {
+    Corrupt,
+    Unsupported,
+}
+
+impl Damage {
+    fn code(self) -> &'static str {
+        match self {
+            Self::Corrupt => "pair-index-corrupt",
+            Self::Unsupported => "pair-index-format-unsupported",
         }
-        let backend = Self {
+    }
+}
+
+impl RedbPairIndex {
+    /// Open the index, verified. A damaged, repaired or foreign-format file is set aside and
+    /// replaced by an empty one; locked, read-only and unsafe files give no backend at all. Every
+    /// case but a clean pass is named.
+    pub fn open(paths: IndexPaths, cache_mib: u64) -> Opened {
+        let mut backend = Self {
             paths,
             cache_mib,
-            database,
+            database: None,
             pairs: None,
             respell: None,
             meta: None,
             notes: Vec::new(),
-            repaired_since_open: false,
+            trusted: None,
+            integrity_checks: 0,
+            discarded: false,
+            entries: None,
         };
-        Opened {
-            backend: Some(backend),
-            clear,
-            issues,
+        let opened = backend.ensure_open();
+        let mut issues = std::mem::take(&mut backend.notes);
+        match opened {
+            Ok(()) => Opened {
+                backend: Some(backend),
+                issues,
+            },
+            Err(issue) => {
+                issues.push(issue);
+                Opened {
+                    backend: None,
+                    issues,
+                }
+            }
         }
     }
 
-    /// Reopen for another window, verified as every open is.
+    /// How many times `check_integrity()` ran on this backend's opens: once per run, unless a
+    /// reopen found the file changed.
+    pub fn integrity_checks(&self) -> usize {
+        self.integrity_checks
+    }
+
+    /// Open the file for a window: the run's first open is verified, a reopen of the file exactly
+    /// as this process left it is not (see [`Fingerprint`]). Damage of any kind retires it.
     fn ensure_open(&mut self) -> Result<(), IndexIssue> {
         if self.database.is_some() {
             return Ok(());
         }
-        let (database, verdict) = open_verified(&self.paths, self.cache_mib);
+        let reopen = self.trusted.is_some();
+        let opened = open_checked(&self.paths, self.cache_mib, self.trusted.as_ref());
+        self.integrity_checks += usize::from(opened.verified);
+        self.settle(opened.database, opened.verdict, reopen)
+    }
+
+    /// Take what an open found: keep a clean database, retire a damaged or repaired file, and
+    /// refuse the rest by name.
+    fn settle(
+        &mut self,
+        database: Option<Database>,
+        verdict: CheckVerdict,
+        reopen: bool,
+    ) -> Result<(), IndexIssue> {
         match verdict {
-            CheckVerdict::Passed { repaired } => {
-                if repaired {
-                    self.repaired_since_open = true;
-                    self.notes.push(IndexIssue::warning(
-                        "pair-index-corrupt",
-                        self.paths.label(),
-                        "redb found and repaired damage in the file while the run worked; its \
-                         evidence was cleared",
-                    ));
-                }
+            CheckVerdict::Passed { repaired: false } => {
                 self.database = database;
                 Ok(())
             }
+            CheckVerdict::Passed { repaired: true } => {
+                drop(database);
+                // Repaired damage may have been anything: none of the evidence is trusted, and
+                // it must not be trusted by a later run either, so the file goes, not just its
+                // pairs.
+                self.retire(
+                    Damage::Corrupt,
+                    if reopen {
+                        "redb found and repaired damage in the file while the run worked"
+                    } else {
+                        "redb found and repaired damage in the file"
+                    }
+                    .to_owned(),
+                )
+            }
+            CheckVerdict::Corrupt(cause) => self.retire(Damage::Corrupt, cause),
+            CheckVerdict::Unsupported(cause) => self.retire(Damage::Unsupported, cause),
             CheckVerdict::Locked => Err(issue_for(
                 &self.paths,
                 redb::Error::DatabaseAlreadyOpen,
@@ -595,9 +981,46 @@ impl RedbPairIndex {
                 cause,
             )),
             CheckVerdict::Unsafe(issue) => Err(issue),
-            CheckVerdict::Corrupt(cause) | CheckVerdict::Unsupported(cause) => Err(
-                IndexIssue::warning("pair-index-corrupt", self.paths.label(), cause),
+        }
+    }
+
+    /// Set the file aside and continue on a new, empty, verified one: nothing read from the old
+    /// one is served (the session is told through [`PairIndex::take_discarded`]), and the run's
+    /// commit rebuilds the index from its own live evidence. Named with what was found.
+    fn retire(&mut self, damage: Damage, cause: String) -> Result<(), IndexIssue> {
+        self.pairs = None;
+        self.respell = None;
+        self.database = None;
+        self.trusted = None;
+        self.entries = None;
+        let label = self.paths.label();
+        let quarantined = quarantine(&self.paths).map_err(|why| {
+            IndexIssue::warning(damage.code(), label.clone(), format!("{cause}; {why}"))
+        })?;
+        self.notes.push(IndexIssue::warning(
+            damage.code(),
+            label.clone(),
+            format!(
+                "{cause}; {}: nothing from it is served, and the index is rebuilt from this \
+                 run's evidence",
+                quarantined.describe()
             ),
+        ));
+        self.notes.extend(quarantined.cleanup);
+        self.discarded = true;
+        self.meta = Some(None);
+        let fresh = open_checked(&self.paths, self.cache_mib, None);
+        self.integrity_checks += usize::from(fresh.verified);
+        match fresh.verdict {
+            CheckVerdict::Passed { .. } => {
+                self.database = fresh.database;
+                Ok(())
+            }
+            other => Err(IndexIssue::warning(
+                "pair-index-store-failed",
+                label,
+                format!("a new index could not be created: {other:?}"),
+            )),
         }
     }
 
@@ -607,6 +1030,7 @@ impl RedbPairIndex {
             return Ok(());
         }
         self.ensure_open()?;
+        let _inside = InsideRedb::enter(&self.paths);
         let database = self.database.as_ref().expect("opened above");
         let read = database
             .begin_read()
@@ -624,33 +1048,29 @@ impl RedbPairIndex {
         Ok(())
     }
 
-    fn read_meta(&mut self) -> Result<Option<IndexMeta>, IndexIssue> {
-        self.ensure_open()?;
+    /// `meta`, or `Err(Ok(cause))` for a value that does not decode (the file is retired).
+    fn read_meta_values(&mut self) -> Result<Option<IndexMeta>, Result<String, IndexIssue>> {
+        self.ensure_open().map_err(Err)?;
+        let _inside = InsideRedb::enter(&self.paths);
         let database = self.database.as_ref().expect("opened above");
         let read = database
             .begin_read()
-            .map_err(|error| issue_for(&self.paths, error.into(), false))?;
+            .map_err(|error| Err(issue_for(&self.paths, error.into(), false)))?;
         let table = match read.open_table(META) {
             Ok(table) => table,
             Err(redb::TableError::TableDoesNotExist(_)) => return Ok(None),
-            Err(error) => return Err(issue_for(&self.paths, error.into(), false)),
+            Err(error) => return Err(Err(issue_for(&self.paths, error.into(), false))),
         };
-        let get = |key: &str| -> Result<Option<String>, IndexIssue> {
+        let get = |key: &str| -> Result<Option<String>, Result<String, IndexIssue>> {
             let Some(value) = table
                 .get(key.as_bytes())
-                .map_err(|error| issue_for(&self.paths, error.into(), false))?
+                .map_err(|error| Err(issue_for(&self.paths, error.into(), false)))?
             else {
                 return Ok(None);
             };
             String::from_utf8(value.value().to_vec())
                 .map(Some)
-                .map_err(|_| {
-                    IndexIssue::warning(
-                        "pair-index-corrupt",
-                        self.paths.label(),
-                        format!("meta {key:?} is not UTF-8"),
-                    )
-                })
+                .map_err(|_| Ok(format!("meta {key:?} is not UTF-8")))
         };
         let Some(schema) = get("schema")? else {
             return Ok(None);
@@ -678,11 +1098,16 @@ impl RedbPairIndex {
         }))
     }
 
-    /// Close the file: the read window is over.
+    /// Close the file: the read window is over. What it looks like now is what a reopen in this
+    /// run may trust.
     fn close(&mut self) {
+        let was_open = self.database.is_some();
         self.pairs = None;
         self.respell = None;
         self.database = None;
+        if was_open {
+            self.trusted = Fingerprint::of_path(&self.paths.database);
+        }
     }
 
     fn file_len(&self) -> u64 {
@@ -690,78 +1115,111 @@ impl RedbPairIndex {
     }
 }
 
+/// How a stored pair read back: one, none, or a value that does not decode.
+enum Decoded {
+    Pair(StoredPair),
+    Absent,
+    Damaged(String),
+}
+
 impl PairIndex for RedbPairIndex {
     fn meta(&mut self) -> Result<Option<IndexMeta>, IndexIssue> {
         if let Some(meta) = &self.meta {
             return Ok(meta.clone());
         }
-        let meta = self.read_meta()?;
+        let meta = match self.read_meta_values() {
+            Ok(meta) => meta,
+            Err(Ok(cause)) => {
+                self.retire(Damage::Corrupt, cause)?;
+                None
+            }
+            Err(Err(issue)) => return Err(issue),
+        };
         self.meta = Some(meta.clone());
         Ok(meta)
     }
 
     fn get(&mut self, local_relative: &str) -> Result<Option<StoredPair>, IndexIssue> {
         self.read_tables()?;
-        let Some(pairs) = &self.pairs else {
-            return Ok(None);
-        };
-        let Some(bytes) = pairs
-            .get(local_relative.as_bytes())
-            .map_err(|error| issue_for(&self.paths, error.into(), false))?
-        else {
-            return Ok(None);
-        };
-        let Some((record, respelled)) = decode_record(bytes.value()) else {
-            return Err(IndexIssue::warning(
-                "pair-index-corrupt",
-                self.paths.label(),
-                format!("the record for {local_relative:?} is not a valid pair record"),
-            ));
-        };
-        let remote_spelling = if respelled {
-            let spelling = match &self.respell {
-                Some(table) => table
-                    .get(local_relative.as_bytes())
-                    .map_err(|error| issue_for(&self.paths, error.into(), false))?
-                    .and_then(|value| String::from_utf8(value.value().to_vec()).ok()),
-                None => None,
+        let decoded = {
+            let _inside = InsideRedb::enter(&self.paths);
+            let Some(pairs) = &self.pairs else {
+                return Ok(None);
             };
-            if spelling.is_none() {
-                return Err(IndexIssue::warning(
-                    "pair-index-corrupt",
-                    self.paths.label(),
-                    format!("the record for {local_relative:?} names a spelling that is missing"),
-                ));
+            match pairs
+                .get(local_relative.as_bytes())
+                .map_err(|error| issue_for(&self.paths, error.into(), false))?
+            {
+                None => Decoded::Absent,
+                Some(bytes) => match decode_record(bytes.value()) {
+                    None => Decoded::Damaged(format!(
+                        "the record for {local_relative:?} is not a valid pair record"
+                    )),
+                    Some((record, false)) => Decoded::Pair(StoredPair {
+                        record,
+                        remote_spelling: None,
+                    }),
+                    Some((record, true)) => {
+                        let spelling = match &self.respell {
+                            Some(table) => table
+                                .get(local_relative.as_bytes())
+                                .map_err(|error| issue_for(&self.paths, error.into(), false))?
+                                .and_then(|value| String::from_utf8(value.value().to_vec()).ok()),
+                            None => None,
+                        };
+                        match spelling {
+                            Some(spelling) => Decoded::Pair(StoredPair {
+                                record,
+                                remote_spelling: Some(spelling),
+                            }),
+                            None => Decoded::Damaged(format!(
+                                "the record for {local_relative:?} names a spelling that is \
+                                 missing"
+                            )),
+                        }
+                    }
+                },
             }
-            spelling
-        } else {
-            None
         };
-        Ok(Some(StoredPair {
-            record,
-            remote_spelling,
-        }))
+        match decoded {
+            Decoded::Pair(pair) => Ok(Some(pair)),
+            Decoded::Absent => Ok(None),
+            Decoded::Damaged(cause) => {
+                // One record that does not decode means the file holds bytes this build never
+                // wrote: none of it is trusted, and it must not stop every later run either.
+                self.retire(Damage::Corrupt, cause)?;
+                Ok(None)
+            }
+        }
     }
 
     fn for_each_key(&mut self, visit: &mut dyn FnMut(&str)) -> Result<(), IndexIssue> {
         self.read_tables()?;
-        let Some(pairs) = &self.pairs else {
-            return Ok(());
-        };
-        let range = pairs
-            .iter()
-            .map_err(|error| issue_for(&self.paths, error.into(), false))?;
-        for entry in range {
-            // Stop at the first error rather than skip what could not be read.
-            let (key, _) = entry.map_err(|error| issue_for(&self.paths, error.into(), false))?;
-            let Ok(key) = std::str::from_utf8(key.value()) else {
-                return Err(IndexIssue::warning(
-                    "pair-index-corrupt",
-                    self.paths.label(),
-                    "a stored path is not UTF-8",
-                ));
+        let damaged = {
+            let _inside = InsideRedb::enter(&self.paths);
+            let Some(pairs) = &self.pairs else {
+                return Ok(());
             };
-            visit(key);
+            let range = pairs
+                .iter()
+                .map_err(|error| issue_for(&self.paths, error.into(), false))?;
+            let mut damaged = false;
+            for entry in range {
+                // Stop at the first error rather than skip what could not be read.
+                let (key, _) =
+                    entry.map_err(|error| issue_for(&self.paths, error.into(), false))?;
+                match std::str::from_utf8(key.value()) {
+                    Ok(key) => visit(key),
+                    Err(_) => {
+                        damaged = true;
+                        break;
+                    }
+                }
+            }
+            damaged
+        };
+        if damaged {
+            self.retire(Damage::Corrupt, "a stored path is not UTF-8".to_owned())?;
         }
         Ok(())
     }
@@ -774,7 +1232,7 @@ impl PairIndex for RedbPairIndex {
         self.pairs = None;
         self.respell = None;
         self.ensure_open()?;
-        let clear_repaired = std::mem::take(&mut self.repaired_since_open);
+        let _inside = InsideRedb::enter(&self.paths);
         let paths = self.paths.clone();
         let failed = |error: redb::Error| issue_for(&paths, error, true);
         let database = self.database.as_ref().expect("opened above");
@@ -787,7 +1245,7 @@ impl PairIndex for RedbPairIndex {
         let applied = (|| -> Result<u64, redb::Error> {
             let mut pairs = write.open_table(PAIRS)?;
             let mut respell = write.open_table(RESPELL)?;
-            if commit.clear || clear_repaired {
+            if commit.clear {
                 pairs.retain(|_, _| false)?;
                 respell.retain(|_, _| false)?;
             }
@@ -837,7 +1295,13 @@ impl PairIndex for RedbPairIndex {
             Ok(entries) => entries,
             Err(error) => {
                 // The previous commit stays: an aborted write transaction changes nothing.
-                let _ = write.abort();
+                if let Err(abort) = write.abort() {
+                    self.notes.push(IndexIssue::warning(
+                        "pair-index-store-failed",
+                        paths.label(),
+                        format!("the failed write could not be abandoned cleanly: {abort}"),
+                    ));
+                }
                 let issue = failed(error);
                 self.close();
                 return Err(issue);
@@ -848,6 +1312,7 @@ impl PairIndex for RedbPairIndex {
             self.close();
             return Err(issue);
         }
+        self.entries = Some(entries);
         if let Some(meta) = commit.meta {
             self.meta = Some(Some(meta));
         }
@@ -879,12 +1344,21 @@ impl PairIndex for RedbPairIndex {
     }
 
     fn stored_pairs(&mut self) -> Option<u64> {
+        if let Some(entries) = self.entries {
+            return Some(entries);
+        }
         self.read_tables().ok()?;
-        self.pairs.as_ref().and_then(|table| table.len().ok())
+        let entries = self.pairs.as_ref().and_then(|table| table.len().ok());
+        self.entries = entries;
+        entries
     }
 
     fn take_notes(&mut self) -> Vec<IndexIssue> {
         std::mem::take(&mut self.notes)
+    }
+
+    fn take_discarded(&mut self) -> bool {
+        std::mem::take(&mut self.discarded)
     }
 }
 
@@ -928,7 +1402,12 @@ mod tests {
 
     #[test]
     fn only_the_indexs_own_names_are_claimed() {
-        for owned in ["photos.redb", "photos.redb.corrupt-1800000000", MARKER] {
+        for owned in [
+            "photos.redb",
+            "photos.redb.corrupt-1800000000",
+            "photos.redb.panicked",
+            MARKER,
+        ] {
             assert!(is_index_owned(std::ffi::OsStr::new(owned)), "{owned}");
         }
         for foreign in [
@@ -937,8 +1416,143 @@ mod tests {
             ".hidden.redb",
             "photos.redb.corrupt-",
             "photos.redb.meta",
+            ".x.redb.panicked",
         ] {
             assert!(!is_index_owned(std::ffi::OsStr::new(foreign)), "{foreign}");
         }
+    }
+
+    /// N1: profile names have no length cap, and a name over 64 characters could not name an
+    /// index file, so every run of such a profile was `pair-index-unsafe`. Such a name is filed
+    /// under its first 48 characters and 16 hex digits of its SHA-256: stable, distinct from
+    /// every short name (65 characters), and named the same way by the package's shell.
+    #[test]
+    fn a_long_profile_name_gets_a_stable_hashed_file_name() {
+        let directory = Path::new("/var/state/cache/pairs");
+        let long = "p".repeat(70);
+        let paths = IndexPaths::new(directory, &long).expect("a long name is usable");
+        let stem = format!("{}-d79ad4b575f328af", "p".repeat(48));
+        assert_eq!(paths.database, directory.join(format!("{stem}.redb")));
+        assert_eq!(
+            paths.panicked,
+            directory.join(format!("{stem}.redb.panicked"))
+        );
+        assert_eq!(
+            IndexPaths::new(directory, &long).unwrap().database,
+            paths.database,
+            "stable"
+        );
+        let sibling = format!("{}q", "p".repeat(69));
+        assert_eq!(
+            IndexPaths::new(directory, &sibling).unwrap().database,
+            directory.join(format!("{}-5b37311183a27028.redb", "p".repeat(48))),
+            "a name sharing the first 48 characters gets its own file"
+        );
+        for owned in [
+            format!("{stem}.redb"),
+            format!("{stem}.redb.corrupt-1800000000"),
+            format!("{stem}.redb.panicked"),
+        ] {
+            assert!(is_index_owned(std::ffi::OsStr::new(&owned)), "{owned}");
+        }
+        for foreign in [
+            format!("{}-D79AD4B575F328AF.redb", "p".repeat(48)),
+            format!("{}-d79ad4b575f328afe.redb", "p".repeat(48)),
+            format!("{}xd79ad4b575f328af.redb", "p".repeat(48)),
+            format!(".{}-d79ad4b575f328af.redb", "p".repeat(47)),
+        ] {
+            assert!(!is_index_owned(std::ffi::OsStr::new(&foreign)), "{foreign}");
+        }
+        // Short names keep the file they always had; unsafe characters are still refused.
+        assert_eq!(
+            IndexPaths::new(directory, "photos").unwrap().database,
+            directory.join("photos.redb")
+        );
+        assert_eq!(
+            IndexPaths::new(directory, &"p".repeat(64))
+                .unwrap()
+                .database,
+            directory.join(format!("{}.redb", "p".repeat(64)))
+        );
+        let refused = IndexPaths::new(directory, &format!("{}/x", "p".repeat(70)));
+        assert_eq!(refused.unwrap_err().code, "pair-index-unsafe");
+    }
+
+    fn scratch(label: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt as _;
+        let directory = std::env::temp_dir().join(format!(
+            "sdsync-redb-unit-{label}-{}-{}",
+            std::process::id(),
+            unix_now()
+        ));
+        fs::create_dir_all(&directory).unwrap();
+        fs::set_permissions(&directory, fs::Permissions::from_mode(0o700)).unwrap();
+        prepare_directory(&directory).unwrap();
+        directory
+    }
+
+    fn one_pair() -> IndexCommit {
+        let record = PairRecord {
+            size: 1,
+            local_mtime_ns: 1,
+            local_ctime_ns: 1,
+            device: 1,
+            inode: 1,
+            remote_mtime: 1,
+            remote_ctime: Some(1),
+            remote_crtime: None,
+            md5: [1; 16],
+            verified_at: 1,
+            verified_at_nas: Some(1),
+            racy: false,
+        };
+        IndexCommit {
+            upsert: vec![(
+                "a".to_owned(),
+                StoredPair {
+                    record,
+                    remote_spelling: None,
+                },
+            )],
+            ..IndexCommit::default()
+        }
+    }
+
+    /// D4: damage redb found and repaired on a reopen used to be noted ("its evidence was
+    /// cleared") while the run went on reading the repaired file, and nothing cleared it if the
+    /// run then abandoned. Now the file is set aside on the spot, the session is told, the note
+    /// says what happened, and what remains is a new, empty, verified file.
+    #[test]
+    fn a_repair_found_on_a_reopen_sets_the_file_aside_and_serves_nothing() {
+        let directory = scratch("repaired");
+        let paths = IndexPaths::new(&directory, "photos").unwrap();
+        let mut backend = RedbPairIndex::open(paths.clone(), 8).backend.unwrap();
+        backend.commit(one_pair()).unwrap();
+        assert!(backend.get("a").unwrap().is_some());
+        backend.finish_reads();
+        // What a reopen reports when redb repaired damage.
+        backend
+            .settle(None, CheckVerdict::Passed { repaired: true }, true)
+            .unwrap();
+        assert!(backend.take_discarded(), "the session is told");
+        assert!(!backend.take_discarded(), "once");
+        assert_eq!(backend.get("a").unwrap(), None, "nothing from it is read");
+        let notes = backend.take_notes();
+        assert_eq!(notes.len(), 1, "{notes:?}");
+        assert_eq!(notes[0].code, "pair-index-corrupt");
+        assert!(
+            notes[0].cause.contains("while the run worked")
+                && notes[0].cause.contains("set aside as")
+                && !notes[0].cause.contains("was cleared"),
+            "{}",
+            notes[0].cause
+        );
+        let copies = fs::read_dir(&directory)
+            .unwrap()
+            .flatten()
+            .filter(|entry| entry.file_name().to_string_lossy().contains(SUFFIX_CORRUPT))
+            .count();
+        assert_eq!(copies, 1);
+        fs::remove_dir_all(&directory).unwrap();
     }
 }

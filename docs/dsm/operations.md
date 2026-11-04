@@ -388,7 +388,8 @@ the lock, so a person typing no longer makes runs refuse.
 ### Verified-pair index status
 
 The daemon runs every sync with the [verified-pair index](../pair-index.md) on:
-`--pair-index var/state/cache/pairs`, one `<profile>.redb` per profile. The profile's `index:` entry in
+`--pair-index var/state/cache/pairs`, one `<profile>.redb` per profile (a name over 64 characters is
+shortened with a hash; see [Where it lives](../pair-index.md#where-it-lives)). The profile's `index:` entry in
 `sdsync-dsm-api --ctl status`, and the `Checksum index:` note at the end of the profile's **Last run:** line in the dashboard, show what its last run
 did with it: `state` (`off`, `cold`, `warm`, `refreshed`, `unusable` or `local-only`), `entries` held,
 `hits` (reused) and `misses` (checked live), the canary checked and any canary mismatches, whether it

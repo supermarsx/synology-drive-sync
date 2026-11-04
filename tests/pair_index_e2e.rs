@@ -21,6 +21,8 @@ use support::file_station_mock::{CapturedRequest, MockFileStation};
 
 const PASSWORD: &[u8] = b"correct horse battery staple\n";
 const ROOT: &str = "/team/indexed";
+/// Read by debug builds only (`pair_index::RacyWindows::for_host`).
+const RACY_WINDOW_OVERRIDE: &str = "SDSYNC_TEST_PAIR_INDEX_RACY_WINDOW_MS";
 
 fn run(arguments: &[&str]) -> Output {
     let environment = TestDir::new("index-environment");
@@ -37,6 +39,10 @@ fn run(arguments: &[&str]) -> Output {
             command.env_remove(name);
         }
     }
+    // The fixtures settle for 2.2 s, not the minute the writeback bound asks of a real tree; the
+    // debug-only override shortens the racy windows to match. `tests/pair_index_mmap.rs` runs the
+    // real window.
+    command.env(RACY_WINDOW_OVERRIDE, "1000");
     command.output().expect("run synology-drive-sync")
 }
 

@@ -1495,6 +1495,8 @@ impl Engine {
                     seed: started_at
                         .duration_since(std::time::UNIX_EPOCH)
                         .map_or(0, |elapsed| elapsed.as_nanos() as u64),
+                    read_started: started_at,
+                    racy: crate::pair_index::RacyWindows::for_host(),
                 };
                 let (rebuilt, reconciliation_deferred, evidence) = reconciliation_plan(
                     &client,
