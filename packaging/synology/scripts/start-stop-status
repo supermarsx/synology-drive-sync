@@ -645,6 +645,36 @@ stop_failed_start_children() {
     done
 }
 
+# 0 when api.sock is a prepared (0000) socket with no server behind it: no
+# api.pid record, and nothing holds daemon.lock, so the API child that bound it
+# died between bind and activation. 1 when that cannot be said -- not a
+# prepared socket, an api.pid exists (its own rules apply), or daemon.lock is
+# held, or cannot be probed (the daemon judges its own socket).
+stale_prepared_api_socket() {
+    api_path_exists "$api_socket" || return 1
+    api_prepared_socket_safe >/dev/null 2>&1 || return 1
+    ! api_path_exists "$api_pid_file" || return 1
+    stale_prepared_lock=0
+    daemon_lock_held_status || stale_prepared_lock=$?
+    [ "$stale_prepared_lock" -eq 1 ]
+}
+
+# Remove such a socket, by the device and inode just captured, and say so.
+# 0 removed, 1 not stale (left alone), 2 stale but not removable (named).
+remove_stale_prepared_api_socket() {
+    stale_prepared_api_socket || return 1
+    stale_prepared_identity=$(api_socket_identity 2>/dev/null || true)
+    [ -n "$stale_prepared_identity" ] || {
+        package_message "stale prepared API socket $api_socket cannot be identified; not removed"
+        return 2
+    }
+    remove_safe_api_socket "$stale_prepared_identity" || {
+        package_message "stale prepared API socket $api_socket could not be removed"
+        return 2
+    }
+    package_message "removed stale API socket $api_socket (prepared, mode 0000; no API server and no daemon holds it)"
+}
+
 status_code() {
     failed_child_topology=0
     failed_start_markers_status || failed_child_topology=$?
@@ -731,10 +761,15 @@ status_code() {
             # Metadata alone cannot prove whether an untracked socket is live.
             # A prepared 0000 listener is recoverable only with its exact dead
             # package-owned PID record. Without that proof it is inconsistent.
-            api_prepared_socket_safe >/dev/null 2>&1 && return 2
-            # Classify only an exact final socket as restartable; the Rust bind
-            # path performs the bounded connect-refused check.
-            api_stale_socket_safe >/dev/null 2>&1 || return 2
+            # Unless no server can own it: no api.pid, no daemon.lock holder.
+            if api_prepared_socket_safe >/dev/null 2>&1; then
+                stale_prepared_api_socket || return 2
+                status_stale_api_socket=$api_socket
+            else
+                # Classify only an exact final socket as restartable; the Rust
+                # bind path performs the bounded connect-refused check.
+                api_stale_socket_safe >/dev/null 2>&1 || return 2
+            fi
             api_stale=true
         fi
     fi
@@ -913,10 +948,16 @@ prepare_api_start() {
             package_message "refusing unsafe untracked API socket: $api_socket"
             return 1
         }
-        api_prepared_socket_safe >/dev/null 2>&1 && {
-            package_message "refusing untracked prepared API socket without an exact dead PID record"
-            return 1
-        }
+        if api_prepared_socket_safe >/dev/null 2>&1; then
+            # No api.pid and no daemon.lock holder: the child that bound it is
+            # gone. Anything else keeps the refusal.
+            prepared_removal=0
+            remove_stale_prepared_api_socket || prepared_removal=$?
+            if [ "$prepared_removal" -eq 1 ]; then
+                package_message "refusing untracked prepared API socket without an exact dead PID record"
+            fi
+            [ "$prepared_removal" -eq 0 ] || return 1
+        fi
     fi
     # A dead PID plus socket is removed atomically by the Rust verifier above.
     # For an untracked final socket, the Rust bind path alone validates exact
@@ -1085,6 +1126,31 @@ note_lasting_blocks_under_shell() {
         || package_message "warning: the lasting_blocks_not_applied event could not be written to the controller log"
 }
 
+# 0 when a daemon of the daemon engine may be running, for the shell engine to
+# step aside from: a holder of daemon.lock, or a live supervisor that is about to
+# respawn one. Sets shell_engine_daemon_note, naming it. 1 otherwise. A lock that
+# cannot be probed is said, once, and does not block.
+daemon_beside_shell_engine() {
+    shell_engine_daemon_note=
+    shell_engine_daemon_lock=0
+    daemon_lock_held_status || shell_engine_daemon_lock=$?
+    case $shell_engine_daemon_lock in
+        0)
+            shell_engine_daemon_pid=$(script_pid "$daemon_pid_file" 2>/dev/null || true)
+            shell_engine_daemon_note="the sync daemon (PID ${shell_engine_daemon_pid:-unknown}) holds $daemon_lock_file"
+            return 0
+            ;;
+        3)
+            shell_engine_daemon_note="the sync daemon supervisor (PID $supervisor_record_pid) named by $supervisor_pid_file is live"
+            return 0
+            ;;
+        2)
+            echo "warning: $daemon_lock_file cannot be probed (flock is unavailable or failed); a running daemon would not be seen" >&2
+            ;;
+    esac
+    return 1
+}
+
 daemon_ctl() {
     "$api_server" --ctl "$@" --home "$package_home" --var "$package_var"
 }
@@ -1098,9 +1164,19 @@ daemon_answers_ping() {
 # daemon.pid names. Sets daemon_live_pid/start/boot. 1 when no daemon process
 # exists (no records, or records naming a process that is gone). 73 when that
 # cannot be proven, with the cause in daemon_identity_cause.
+#
+# daemon.lock decides first. The daemon holds it for its whole life and the
+# kernel drops it on any death, so a lock nobody holds means no daemon
+# process exists, whatever the records say: a crash leaves them behind, and
+# the PID they name may belong to an unrelated process by the time anyone
+# looks. That used to be a permanent 73 (start_mismatch). A held lock, or one
+# that cannot be probed (no flock(1)), keeps the strict identity check below.
 daemon_identity_status() {
     daemon_live_pid= daemon_live_start= daemon_live_boot= daemon_identity_cause=
     daemon_recorded_pid=
+    daemon_identity_lock=0
+    daemon_lock_held_status || daemon_identity_lock=$?
+    [ "$daemon_identity_lock" -ne 1 ] || return 1
     if api_path_exists "$daemon_pid_file"; then
         daemon_recorded_pid=$(script_pid "$daemon_pid_file" 2>/dev/null || true)
         [ -n "$daemon_recorded_pid" ] || {
@@ -1182,6 +1258,37 @@ capture_daemon_supervisor() {
     daemon_supervisor_start=$daemon_parent_start
 }
 
+# The supervisor supervisor.pid names, when it is a live --supervise process of
+# this package. Sets daemon_supervisor_pid/start (empty when there is none, or
+# the record is stale: stop removes it with the other daemon records). 1, with
+# the cause printed, when the record names a live process that cannot be
+# proven a supervisor: nothing is signalled on a guess.
+capture_supervisor_record() {
+    daemon_supervisor_pid= daemon_supervisor_start=
+    daemon_supervisor_record_live || return 0
+    capture_record_pid=$supervisor_record_pid
+    capture_record_start=$supervisor_record_start
+    capture_record_boot=$supervisor_record_boot
+    capture_record_status=0
+    process_identity_is_live "$capture_record_pid" "$capture_record_start" \
+        "$capture_record_boot" || capture_record_status=$?
+    case $capture_record_status in
+        0) ;;
+        1) return 0 ;;
+        *)
+            package_message "refusing to stop: $supervisor_pid_file names PID $capture_record_pid, which cannot be identified (${process_identity_cause:-unknown})"
+            return 1
+            ;;
+    esac
+    tr '\000' '\n' 2>/dev/null < "/proc/$capture_record_pid/cmdline" \
+        | grep -F -x -- '--supervise' >/dev/null 2>&1 || {
+        package_message "refusing to stop: $supervisor_pid_file names live PID $capture_record_pid, which is not a --supervise process"
+        return 1
+    }
+    daemon_supervisor_pid=$capture_record_pid
+    daemon_supervisor_start=$capture_record_start
+}
+
 # 0 while PID $1 still has start time $2, 1 once it is gone or reused.
 daemon_process_still() {
     read_process_stat_fields "$1" || return 1
@@ -1205,7 +1312,10 @@ daemon_wait_gone() {
     poll_reset
     while :; do
         daemon_still=false
-        daemon_process_still "$daemon_live_pid" "$daemon_live_start" && daemon_still=true
+        if [ -n "$daemon_live_pid" ] \
+            && daemon_process_still "$daemon_live_pid" "$daemon_live_start"; then
+            daemon_still=true
+        fi
         if [ -n "$daemon_supervisor_pid" ] \
             && daemon_process_still "$daemon_supervisor_pid" "$daemon_supervisor_start"; then
             daemon_still=true
@@ -1216,6 +1326,47 @@ daemon_wait_gone() {
     done
 }
 
+# Sets daemon_stop_left_s to the whole seconds left of the stop budget
+# (daemon_grace, counted from daemon_stop_began), never below 0. Without a
+# readable clock it is the whole budget, which the caller has announced.
+daemon_stop_left() {
+    daemon_stop_left_s=$daemon_grace
+    [ -n "$daemon_stop_began" ] || return 0
+    daemon_stop_now=$(date +%s 2>/dev/null || true)
+    case $daemon_stop_now in ''|*[!0-9]*) return 0 ;; esac
+    daemon_stop_used=$((daemon_stop_now - daemon_stop_began))
+    [ "$daemon_stop_used" -ge 0 ] || daemon_stop_used=0
+    daemon_stop_left_s=$((daemon_grace - daemon_stop_used))
+    [ "$daemon_stop_left_s" -ge 0 ] || daemon_stop_left_s=0
+}
+
+# A live supervisor with no daemon to ask: it is between its daemon's death and
+# the respawn (or its daemon's records are unusable). TERM stops it and, with
+# it, anything it would respawn; KILL after the grace. Waits for the supervisor
+# only.
+stop_orphan_supervisor() {
+    package_message "the daemon supervisor (PID $daemon_supervisor_pid) is live without a daemon to ask; signalling it"
+    daemon_signal_exact "$daemon_supervisor_pid" TERM "$daemon_supervisor_start" || {
+        package_message "the daemon supervisor (PID $daemon_supervisor_pid) could not be signalled"
+        return 1
+    }
+    daemon_live_pid= daemon_live_start=
+    daemon_stop_left
+    daemon_phase_budget=$daemon_stop_left_s
+    [ "$daemon_phase_budget" -ge 2 ] || daemon_phase_budget=2
+    if ! daemon_wait_gone "$daemon_phase_budget"; then
+        package_message "the daemon supervisor (PID $daemon_supervisor_pid) outlasted its $daemon_grace s stop budget after TERM; killing it"
+        append_controller_log_event error service_stop_forced \
+            "engine=daemon supervisor_pid=$daemon_supervisor_pid grace_s=$daemon_grace" >/dev/null 2>&1 || true
+        daemon_signal_exact "$daemon_supervisor_pid" KILL "$daemon_supervisor_start" || true
+        daemon_wait_gone 10 || {
+            package_message "the daemon supervisor (PID $daemon_supervisor_pid) remained live after KILL"
+            return 1
+        }
+    fi
+    daemon_supervisor_pid= daemon_supervisor_start=
+}
+
 # Stop a daemon of this package: `ctl stop`, which lets a running sync end its
 # cancel grace and removes the daemon's records; then, if it is still there,
 # TERM and after the grace KILL, to the exact process daemon.ready names and to
@@ -1224,11 +1375,42 @@ daemon_wait_gone() {
 # daemon_stop_transitioned when a live daemon was stopped.
 stop_daemon_engine() {
     daemon_stop_transitioned=false
+    daemon_grace=${SDSYNC_DSM_STOP_TIMEOUT:-120}
+    case $daemon_grace in ''|*[!0-9]*) daemon_grace=120 ;; esac
+    [ "$daemon_grace" -ge 1 ] || daemon_grace=1
+    [ "$daemon_grace" -le 120 ] || daemon_grace=120
+    # One budget covers every phase below: ctl stop, the wait after it, TERM
+    # and its wait. Each of them used to get the whole grace, which made the
+    # worst case ctl 125 s + 120 s + 120 s (+ KILL's 10 s) against the 120 s the
+    # shell engine's stop has. KILL's own wait is the margin on top. The TERM
+    # phase keeps a sixth of the budget (at least 2 s) in reserve from the start.
+    daemon_term_share=$((daemon_grace / 6))
+    [ "$daemon_term_share" -ge 2 ] || daemon_term_share=2
+    daemon_ctl_wait=$((daemon_grace - daemon_term_share - 5))
+    [ "$daemon_ctl_wait" -ge 1 ] || daemon_ctl_wait=1
+    daemon_stop_began=$(date +%s 2>/dev/null || true)
+    case $daemon_stop_began in ''|*[!0-9]*)
+        daemon_stop_began=
+        package_message "warning: the clock cannot be read; each stop phase gets its own share of the $daemon_grace s budget"
+        ;;
+    esac
+    # The supervisor is found through its own record first: between a daemon's
+    # death and the respawn there is no daemon.ready to find it by, and a
+    # record removed under a live supervisor is recreated by the next respawn.
+    capture_supervisor_record || return 1
     daemon_identity=0
     daemon_identity_status || daemon_identity=$?
+    if [ "$daemon_identity" -ne 0 ] && [ -n "$daemon_supervisor_pid" ]; then
+        stop_orphan_supervisor || return 1
+        daemon_stop_transitioned=true
+        # With the supervisor gone the lock can be probed; a daemon that
+        # outlived it still holds the lock and is judged strictly.
+        daemon_identity=0
+        daemon_identity_status || daemon_identity=$?
+    fi
     case $daemon_identity in
         0)
-            capture_daemon_supervisor "$daemon_live_pid"
+            [ -n "$daemon_supervisor_pid" ] || capture_daemon_supervisor "$daemon_live_pid"
             daemon_stop_transitioned=true
             ;;
         1) ;;
@@ -1237,14 +1419,10 @@ stop_daemon_engine() {
             return 1
             ;;
     esac
-    daemon_grace=${SDSYNC_DSM_STOP_TIMEOUT:-120}
-    case $daemon_grace in ''|*[!0-9]*) daemon_grace=120 ;; esac
-    [ "$daemon_grace" -ge 1 ] || daemon_grace=1
-    [ "$daemon_grace" -le 120 ] || daemon_grace=120
     daemon_ctl_status=69
     if [ "$daemon_identity" -eq 0 ] || api_path_exists "$daemon_socket"; then
         daemon_ctl_status=0
-        daemon_ctl_reply=$(daemon_ctl stop "wait_s=$daemon_grace" 2>&1) || daemon_ctl_status=$?
+        daemon_ctl_reply=$(daemon_ctl stop "wait_s=$daemon_ctl_wait" 2>&1) || daemon_ctl_status=$?
         if [ "$daemon_ctl_status" -ne 0 ] && [ "$daemon_identity" -eq 0 ]; then
             if [ "$daemon_ctl_status" -eq 69 ]; then
                 package_message "warning: the daemon (PID $daemon_live_pid) did not answer ctl stop; signalling it"
@@ -1253,12 +1431,17 @@ stop_daemon_engine() {
             fi
         fi
     fi
-    # After an accepted ctl stop the daemon gets the whole grace to end on its
-    # own; one that did not answer is signalled at once.
+    # After an accepted ctl stop the daemon gets what is left of the budget,
+    # less the TERM share, to end on its own; one that did not answer is
+    # signalled at once.
     daemon_settled=false
-    if [ "$daemon_identity" -eq 0 ] && [ "$daemon_ctl_status" -eq 0 ] \
-        && daemon_wait_gone "$daemon_grace"; then
-        daemon_settled=true
+    if [ "$daemon_identity" -eq 0 ] && [ "$daemon_ctl_status" -eq 0 ]; then
+        daemon_stop_left
+        daemon_phase_budget=$((daemon_stop_left_s - daemon_term_share))
+        [ "$daemon_phase_budget" -ge 0 ] || daemon_phase_budget=0
+        if daemon_wait_gone "$daemon_phase_budget"; then
+            daemon_settled=true
+        fi
     fi
     if [ "$daemon_identity" -eq 0 ] && [ "$daemon_settled" != true ]; then
         if [ -n "$daemon_supervisor_pid" ]; then
@@ -1271,8 +1454,11 @@ stop_daemon_engine() {
             package_message "the daemon (PID $daemon_live_pid) could not be signalled"
             return 1
         }
-        if ! daemon_wait_gone "$daemon_grace"; then
-            package_message "the daemon (PID $daemon_live_pid) outlasted its $daemon_grace s grace after TERM; killing it"
+        daemon_stop_left
+        daemon_phase_budget=$daemon_stop_left_s
+        [ "$daemon_phase_budget" -ge 2 ] || daemon_phase_budget=2
+        if ! daemon_wait_gone "$daemon_phase_budget"; then
+            package_message "the daemon (PID $daemon_live_pid) outlasted its $daemon_grace s stop budget after TERM; killing it"
             append_controller_log_event error service_stop_forced \
                 "engine=daemon pid=$daemon_live_pid grace_s=$daemon_grace" >/dev/null 2>&1 || true
             [ -z "$daemon_supervisor_pid" ] \
@@ -1292,7 +1478,12 @@ stop_daemon_engine() {
         package_message "refusing to clean daemon records while daemon.lock is held"
         return 1
     fi
-    for daemon_record in "$daemon_socket" "$daemon_ready_file" "$daemon_pid_file"; do
+    if [ "$daemon_held" -eq 3 ]; then
+        package_message "refusing to clean daemon records while the supervisor named by $supervisor_pid_file is live"
+        return 1
+    fi
+    for daemon_record in "$daemon_socket" "$daemon_ready_file" "$daemon_pid_file" \
+        "$supervisor_pid_file"; do
         api_path_exists "$daemon_record" || continue
         if [ -d "$daemon_record" ] && [ ! -L "$daemon_record" ]; then
             package_message "refusing to remove $daemon_record: it is a directory"
@@ -1302,6 +1493,7 @@ stop_daemon_engine() {
             package_message "stale daemon record $daemon_record could not be removed"
             return 1
         }
+        package_message "removed stale daemon record $daemon_record"
     done
 }
 
@@ -1317,7 +1509,8 @@ daemon_status_code() {
     fi
     daemon_status_held=0
     daemon_lock_held_status || daemon_status_held=$?
-    [ "$daemon_status_held" -ne 0 ] || return 2
+    # Held, or a live supervisor that may be respawning the daemon (not probed).
+    case $daemon_status_held in 0|3) return 2 ;; esac
     if daemon_artifacts_present; then
         daemon_status_identity=0
         daemon_identity_status || daemon_status_identity=$?
@@ -1408,6 +1601,14 @@ start_daemon_engine() {
     esac
     stop_daemon_engine || {
         package_message "refusing to start over the records of a daemon that could not be stopped"
+        exit 1
+    }
+    # A prepared socket left by an API child that died before activation would
+    # make the new daemon's API keeper refuse to bind; the lock is free here.
+    daemon_prepared_removal=0
+    remove_stale_prepared_api_socket || daemon_prepared_removal=$?
+    [ "$daemon_prepared_removal" -le 1 ] || {
+        package_message "refusing to start over a stale prepared API socket that could not be removed"
         exit 1
     }
     start_event_pending=true
@@ -1505,6 +1706,10 @@ case ${1:-} in
             package_message "cannot start while package $start_transition_state is in progress"
             exit 1
         }
+        if daemon_beside_shell_engine; then
+            package_message "refusing to start the shell engine: $shell_engine_daemon_note; stop the package first, or remove $service_engine_file to run the daemon engine"
+            exit 1
+        fi
         set +e
         status_code
         current_status=$?
@@ -2101,7 +2306,17 @@ case ${1:-} in
                     package_message "refusing unsafe untracked API socket: $api_socket"
                     exit 1
                 }
-                api_stale_artifacts=true
+                if api_prepared_socket_safe >/dev/null 2>&1; then
+                    stop_prepared_removal=0
+                    remove_stale_prepared_api_socket || stop_prepared_removal=$?
+                    case $stop_prepared_removal in
+                        0) ;;
+                        1) api_stale_artifacts=true ;;
+                        *) exit 1 ;;
+                    esac
+                else
+                    api_stale_artifacts=true
+                fi
             fi
         fi
 
@@ -2328,9 +2543,17 @@ case ${1:-} in
             fi
             [ "$result" -ne 1 ] || [ -z "${daemon_status_stale:-}" ] \
                 || echo "stale daemon record of a daemon that is gone: $daemon_status_stale" >&2
+            [ "$result" -ne 1 ] || [ -z "${status_stale_api_socket:-}" ] \
+                || echo "stale API socket: $status_stale_api_socket (prepared, mode 0000; no API server and no daemon holds it)" >&2
         else
             status_code
             result=$?
+            if daemon_beside_shell_engine; then
+                result=2
+                echo "$shell_engine_daemon_note; the shell engine is selected" >&2
+            fi
+            [ "$result" -ne 1 ] || [ -z "${status_stale_api_socket:-}" ] \
+                || echo "stale API socket: $status_stale_api_socket (prepared, mode 0000; no API server and no daemon holds it)" >&2
         fi
         set -e
         if [ "$result" -eq 2 ] && controller_dead_with_live_api; then

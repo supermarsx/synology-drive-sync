@@ -169,6 +169,12 @@ lifecycle command:
 | `shell` | the controller and runner of earlier releases, kept for one release as a fallback |
 | anything else | the daemon, after a `warn` `service_engine_invalid` event in `controller.log` and a console line naming the path and what the file holds |
 
+The shell engine steps aside from a daemon: while a process holds `daemon.lock`, or a live
+supervisor (`run/supervisor.pid`) is about to respawn one, start refuses ("refusing to start the shell
+engine: the sync daemon (PID n) holds ...") and status reports `2` with the same line on stderr.
+Stop the package first, or remove `var/state/engine` to run the daemon engine. A lock `flock` cannot
+probe is said on stderr and does not block.
+
 Under the shell engine, profiles the daemon held for a lasting condition (`state/lasting/<p>.state`)
 are not held: start says so once (`lasting_blocks_not_applied`, with the count).
 
@@ -198,11 +204,27 @@ not answer within 30 s. The daemon's own stderr is kept in `log/daemon-stderr.lo
 line.
 
 Daemon stop asks the daemon to stop (`ctl stop`, which lets a running sync end within its cancel
-grace). A daemon that does not answer, or outlasts `SDSYNC_DSM_STOP_TIMEOUT` (default 120 s), is
-sent TERM and then KILL, together with its supervisor, but only after its identity is proven from
+grace). The whole stop runs on one budget, `SDSYNC_DSM_STOP_TIMEOUT` (default and maximum 120 s,
+the figure the shell engine's stop has always had; the Package Center's own stop deadline is not
+documented by Synology and was not verified on a unit): `ctl stop` waits at most the budget less a
+sixth of it (at least 2 s) and 5 s, the daemon then gets the rest less that sixth to end, and TERM gets
+whatever remains. KILL's own 10 s wait is the only margin on top, so the worst case is the budget plus
+about 10 s. A daemon that does not
+answer, or outlasts the budget, is sent TERM and then KILL, together with its supervisor, but only
+after its identity is proven from
 `run/daemon.ready` (PID, `/proc` start time, boot id, package uid, `--daemon` argv); an unprovable
 one is refused and named. Stop leaves no `daemon.pid`, `daemon.ready` or `ctl.sock` (`daemon.lock`
-stays; only a live holder of it means a daemon runs). Stop stops whichever engine's processes are
+stays; only a live holder of it means a daemon runs). When nobody holds `daemon.lock`, no daemon
+exists: whatever `daemon.pid`, `daemon.ready` and `ctl.sock` say is stale even if the PID they name
+now belongs to another process, and stop and start remove them and name each path (`removed stale
+daemon record <path>`). A held lock keeps the strict identity check above; without `flock(1)` the
+lock cannot be probed, so that check applies too and a refusal names its cause. The probe itself
+holds the lock for one `flock -n` call, and it is never made while `run/supervisor.pid` (the
+supervisor's own pid, start time and boot id) names a live supervisor: between a daemon's death and
+its respawn nobody holds the lock, and a probe that took it would make the respawning daemon give
+up. Status then reports `2`, the hooks refuse naming `supervisor.pid`, and stop signals that
+supervisor (TERM, then KILL after the grace) even when `daemon.ready` is absent, before it removes
+any record. A `supervisor.pid` naming no live supervisor is a stale record like the others. Stop stops whichever engine's processes are
 present, both after an engine switch made while one was running. Status is `0` when the daemon
 answers `ctl ping` with admission open, `3` with no daemon records, and `1` when records of a daemon
 that is gone remain (named on stderr).

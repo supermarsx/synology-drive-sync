@@ -1393,16 +1393,55 @@ configure_profile() {
     echo "next: set its password, run doctor, review plan, then enable the schedule"
 }
 
+# The pair index is named by a stem (src/pair_index_redb.rs file_stem): the
+# profile name itself up to 64 characters, longer ones their first 48 characters,
+# a dash and the first 16 hex digits of the SHA-256 of the whole name. A profile
+# name is [A-Za-z0-9_-], so characters and bytes agree. Sets pair_index_stem_value,
+# or returns 1 with pair_index_stem_cause; never a glob on the prefix, which
+# could match another long profile's index.
+pair_index_stem() {
+    pair_index_stem_value=
+    pair_index_stem_cause=
+    stem_name=$1
+    if [ "${#stem_name}" -le 64 ]; then
+        pair_index_stem_value=$stem_name
+        return 0
+    fi
+    command -v sha256sum >/dev/null 2>&1 || {
+        pair_index_stem_cause="sha256sum is not available"
+        return 1
+    }
+    stem_hash=$(printf '%s' "$stem_name" | sha256sum 2>/dev/null) || {
+        pair_index_stem_cause="sha256sum failed"
+        return 1
+    }
+    stem_hash=$(printf '%s' "$stem_hash" | cut -c1-16)
+    case $stem_hash in ''|*[!0-9a-f]*)
+        pair_index_stem_cause="sha256sum printed no digest"
+        return 1
+        ;;
+    esac
+    stem_prefix=$(printf '%s' "$stem_name" | cut -c1-48)
+    pair_index_stem_value=$stem_prefix-$stem_hash
+}
+
 # State the profile's own runs left beside its configuration: the alert counter
 # (never removed before, so a profile recreated under the name inherited its
-# failure streak), the verified-pair index and its quarantined copies, and the
-# daemon's lasting condition. The configuration is already gone by now, so one
-# that cannot be removed does not undo the removal: it is named with its path
-# and cause as a warning, which `api` returns as the result's warning.
+# failure streak), the verified-pair index, its quarantined copies and its panic
+# record (by the stem above), and the daemon's lasting condition. The
+# configuration is already gone by now, so one that cannot be removed does not
+# undo the removal: it is named with its path and cause as a warning, which
+# `api` returns as the result's warning.
 remove_profile_leftovers() {
     leftover_profile=$1
-    set -- "$state_root/alerts-$leftover_profile.state" "$state_root/lasting/$leftover_profile.state" \
-        "$cache_root/pairs/$leftover_profile.redb" "$cache_root/pairs/$leftover_profile.redb.corrupt-"*
+    set -- "$state_root/alerts-$leftover_profile.state" "$state_root/lasting/$leftover_profile.state"
+    if pair_index_stem "$leftover_profile"; then
+        set -- "$@" "$cache_root/pairs/$pair_index_stem_value.redb" \
+            "$cache_root/pairs/$pair_index_stem_value.redb.corrupt-"* \
+            "$cache_root/pairs/$pair_index_stem_value.redb.panicked"
+    else
+        echo "warning: the pair index files of profile $leftover_profile in $cache_root/pairs were not removed: $pair_index_stem_cause" >&2
+    fi
     for leftover_path in "$@"; do
         [ -e "$leftover_path" ] || [ -L "$leftover_path" ] || continue
         leftover_parent=${leftover_path%/*}
@@ -3666,6 +3705,7 @@ api_logs() {
         all) set -- "$log_root/api.log" "$log_root/api.log.1" "$log_root/api.log.2" \
             "$log_root/api.log.3" "$log_root/api.log.4" "$log_root/api.log.5" \
             "$doctor_inventory_log" "$doctor_inventory_log.1" "$doctor_inventory_log.2" "$doctor_inventory_log.3" \
+            "$log_root/daemon-stderr.log.1" "$log_root/daemon-stderr.log" \
             "$log_root/controller.log" "$log_root/controller.log.1" "$log_root/controller.log.2" \
             "$log_root/controller.log.3" "$log_root/controller.log.4" "$log_root/controller.log.5" \
             "$log_root/scheduler.log" "$log_root/scheduler.log.1" "$log_root/scheduler.log.2" \
@@ -3675,7 +3715,10 @@ api_logs() {
         api) set -- "$log_root/api.log" "$log_root/api.log.1" "$log_root/api.log.2" \
             "$log_root/api.log.3" "$log_root/api.log.4" "$log_root/api.log.5" ;;
         doctor) set -- "$doctor_inventory_log" "$doctor_inventory_log.1" "$doctor_inventory_log.2" "$doctor_inventory_log.3" ;;
-        controller) set -- "$log_root/controller.log" "$log_root/controller.log.1" \
+        # The daemon's own stderr and its one rotation come first, the oldest
+        # entries, as in the bridge's log_source_files.
+        controller) set -- "$log_root/daemon-stderr.log.1" "$log_root/daemon-stderr.log" \
+            "$log_root/controller.log" "$log_root/controller.log.1" \
             "$log_root/controller.log.2" "$log_root/controller.log.3" \
             "$log_root/controller.log.4" "$log_root/controller.log.5" ;;
         scheduler) set -- "$log_root/scheduler.log" "$log_root/scheduler.log.1" \
@@ -3709,7 +3752,8 @@ api_logs() {
             "$log_root/api.log.1" "$log_root/api.log"; api_json_log_close ,
         printf '{"source":"doctor","lines":'; api_json_log_lines "$doctor_inventory_log.3" "$log_lines" doctor "$security_runtime_operations_level" "$log_byte_limit" \
             "$doctor_inventory_log.2" "$doctor_inventory_log.1" "$doctor_inventory_log"; api_json_log_close ,
-        printf '{"source":"controller","lines":'; api_json_log_lines "$log_root/controller.log.5" "$log_lines" controller "$security_runtime_controller_level" "$log_byte_limit" \
+        printf '{"source":"controller","lines":'; api_json_log_lines "$log_root/daemon-stderr.log.1" "$log_lines" controller "$security_runtime_controller_level" "$log_byte_limit" \
+            "$log_root/daemon-stderr.log" "$log_root/controller.log.5" \
             "$log_root/controller.log.4" "$log_root/controller.log.3" "$log_root/controller.log.2" \
             "$log_root/controller.log.1" "$log_root/controller.log"; api_json_log_close ,
         printf '{"source":"scheduler","lines":'; api_json_log_lines "$log_root/scheduler.log.5" "$log_lines" scheduler "$security_runtime_scheduler_level" "$log_byte_limit" \
@@ -3734,7 +3778,8 @@ api_logs() {
                     "$doctor_inventory_log.2" "$doctor_inventory_log.1" "$doctor_inventory_log"; api_json_log_close
                 ;;
             controller)
-                printf '{"source":"controller","lines":'; api_json_log_lines "$log_root/controller.log.5" "$log_lines" controller "$security_runtime_controller_level" "$log_byte_limit" \
+                printf '{"source":"controller","lines":'; api_json_log_lines "$log_root/daemon-stderr.log.1" "$log_lines" controller "$security_runtime_controller_level" "$log_byte_limit" \
+                    "$log_root/daemon-stderr.log" "$log_root/controller.log.5" \
                     "$log_root/controller.log.4" "$log_root/controller.log.3" "$log_root/controller.log.2" \
                     "$log_root/controller.log.1" "$log_root/controller.log"; api_json_log_close
                 ;;

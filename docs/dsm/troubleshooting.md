@@ -871,6 +871,22 @@ snapshot (under bash, `/bin/sh` on DSM, in a single read), so a loaded NAS can n
 healthy controller look unprovable; if a field is missing the check retries up to three bounded passes
 while the process exists, then fails closed with `status_fields_missing`.
 
+**Stop or Run refuses after a crash, a power loss or a reused PID (daemon engine).** The daemon's
+records (`run/daemon.pid`, `daemon.ready`, `ctl.sock`, `supervisor.pid`) can outlive it, and the PID
+they name can by then belong to an unrelated process. `daemon.lock` decides: the kernel drops it
+when the daemon dies, so with nobody holding it the records are stale whatever they say, and `status`
+reports `1` ("stale daemon record of a daemon that is gone: <path>") while Stop and Run remove them,
+printing `removed stale daemon record <path>` for each. A lock that is held, or one `flock` cannot
+probe, keeps the strict identity check: the refusal is "refusing to stop an unverified daemon" with its
+cause (for example `start_mismatch`), and nothing is signalled or removed on a guess. The same
+reading applies to a prepared `run/api.sock` (mode `0000`) left by an API child that died between bind
+and activation: with no `api.pid` and no holder of `daemon.lock` it is stale, status reports it
+(`stale API socket: <path>`), and Stop and Run remove it (`removed stale API socket <path>`); beside a
+live `api.pid` or a held lock it is left alone. Stop is bounded by one deadline,
+`SDSYNC_DSM_STOP_TIMEOUT` (default and maximum 120 s) plus KILL's 10 s margin. What a daemon says
+on stderr before its own log opens (a panic, a refusal) is in `var/log/daemon-stderr.log` and its one
+rotation `.1`; the Logs source `controller` lists both ahead of `controller.log`, as errors.
+
 **The controller died but the API service is still up.** After a SIGKILL or an out-of-memory kill of the
 controller alone, Package Center may still report the package running. `status` now logs
 `controller_found_dead phase=status` once for that dead controller and service pair, and **Start** (or

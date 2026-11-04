@@ -1832,7 +1832,7 @@ class RuntimeTests(unittest.TestCase):
     except (OSError, json.JSONDecodeError):
         job_payload = {{}}
     mode = job_payload.get("test_fail_job_mode") or ""
-    known_cause = cause in ("classification_failed", "secret_claim_failed", "consumer_failed", "consumer_wrote_no_result")
+    known_cause = cause in ("classification_failed", "secret_claim_failed", "consumer_failed", "consumer_wrote_no_result", "audit_unavailable")
     with Path({str(queue_capture)!r}).open("a", encoding="utf-8") as stream:
         if mode == "refuse":
             stream.write(f"fail-job-refused {{request.stem}}\\n")
@@ -9738,6 +9738,104 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
         stopped = self.shell(self.lifecycle, "stop", timeout=15)
         self.assertEqual(stopped.returncode, 0, stopped.stdout + stopped.stderr)
 
+    def _exec_during_starting_check(self, release: Path, gate: Path, *, in_terminate: bool) -> None:
+        """Hold the window the exec race needs: the watcher child execs AFTER
+        the caller found it not yet a watcher and BEFORE realtime_watcher_starting
+        looks at it. The fixture's realtime_watcher_starting, once `gate` exists,
+        releases the child's exec barrier and waits until its argv is the
+        watcher's, then goes on with its real check. With `in_terminate` only
+        the call made by terminate_realtime_watcher does."""
+        controller = self.real_target / "libexec/sdsync-controller"
+        source = controller.read_text(encoding="utf-8")
+        needle = 'realtime_watcher_starting() {\n    read_process_stat_fields "$1" || return 1\n'
+        self.assertEqual(source.count(needle), 1, "realtime_watcher_starting changed")
+        is_watcher = "tr '\\000' '\\n' < \"/proc/$1/cmdline\" 2>/dev/null | grep -qx -- --watch"
+        condition = f'[ -e {shlex.quote(str(gate))} ]'
+        if in_terminate:
+            condition += ' && [ "${race_in_terminate:-}" = 1 ]'
+        source = source.replace(
+            needle,
+            "realtime_watcher_starting() {\n"
+            f"    if {condition} && ! {is_watcher}; then\n"
+            f"        : > {shlex.quote(str(release))}\n"
+            f"        while ! {is_watcher}; do /bin/sleep 0.02; done\n"
+            "    fi\n"
+            '    read_process_stat_fields "$1" || return 1\n',
+        )
+        if in_terminate:
+            terminate = "    terminate_pid=$(read_pid \"$terminate_pid_path\" 2>/dev/null || true)\n"
+            self.assertEqual(source.count(terminate), 1, "terminate_realtime_watcher changed")
+            source = source.replace(terminate, terminate + "    race_in_terminate=1\n")
+        controller.write_text(source, encoding="utf-8")
+
+    def test_a_watcher_that_execs_between_the_two_checks_is_adopted_not_orphaned(self) -> None:
+        # ensure_realtime_watcher read the pid file's child as "not a watcher
+        # yet" (realtime_watcher_matches), the child exec'd, and the second
+        # check (realtime_watcher_starting, which wants the controller's own
+        # command) found it neither: the pid file was declared to have outlived
+        # its watcher, removed, a failure recorded, and the live watcher left
+        # running with nothing recording or stopping it.
+        self._realtime_watch_profile()
+        release = self.root / "watcher-exec-release"
+        gate = self.root / "watcher-race-gate"
+        self._hold_watcher_before_exec(release)
+        self._exec_during_starting_check(release, gate, in_terminate=False)
+        environment, _clock = self.realtime_watcher_environment(label="exec-race")
+        started = self.shell(self.lifecycle, "start", extra_environment=environment, timeout=15)
+        self.assertEqual(started.returncode, 0, started.stdout + started.stderr)
+        pid_path = self.real_var / "run/watch-watch.pid"
+        state_path = self.real_var / "state/routines/watch.state"
+        first = self._watcher_before_exec()
+        gate.touch()
+        deadline = time.monotonic() + 15
+        while time.monotonic() < deadline and not release.exists():
+            time.sleep(0.03)
+        self.assertTrue(release.exists(), "no turn reached the starting check")
+        # The fake sleep collapses each turn to ~0.03 s: a second is dozens.
+        time.sleep(1.0)
+        events = (self.real_var / "log/controller.log").read_text(encoding="utf-8")
+        self.assertEqual(self.event_details("routine_watch_failed"), [], events)
+        self.assertTrue(pid_path.exists(), "the pid file of a live watcher was removed\n" + events)
+        self.assertEqual(int(pid_path.read_text(encoding="utf-8").strip()), first)
+        argv = Path(f"/proc/{first}/cmdline").read_bytes().split(b"\0")
+        self.assertIn(b"--watch", argv)
+        state_text = state_path.read_text(encoding="utf-8") if state_path.exists() else ""
+        self.assertIn("backend=inotify", state_text)
+        stopped = self.shell(self.lifecycle, "stop", timeout=15)
+        self.assertEqual(stopped.returncode, 0, stopped.stdout + stopped.stderr)
+        self._wait_for(lambda: not Path(f"/proc/{first}").exists()
+                       or "Z" in Path(f"/proc/{first}/stat").read_text().split(")")[-1][:3],
+                       "the adopted watcher outlived the package stop", timeout=10)
+
+    def test_a_watcher_that_execs_during_package_stop_is_stopped_not_orphaned(self) -> None:
+        # The same window in terminate_realtime_watcher: not stoppable yet,
+        # exec'd, not starting any more: the pid file was removed and the
+        # watcher left running past the package's stop.
+        self._realtime_watch_profile()
+        release = self.root / "watcher-exec-release"
+        gate = self.root / "watcher-race-gate"
+        self._hold_watcher_before_exec(release)
+        self._exec_during_starting_check(release, gate, in_terminate=True)
+        environment, _clock = self.realtime_watcher_environment(label="exec-race-stop")
+        started = self.shell(self.lifecycle, "start", extra_environment=environment, timeout=15)
+        self.assertEqual(started.returncode, 0, started.stdout + started.stderr)
+        first = self._watcher_before_exec()
+        gate.touch()
+        try:
+            stopped = self.shell(self.lifecycle, "stop", timeout=30)
+            self.assertEqual(stopped.returncode, 0, stopped.stdout + stopped.stderr)
+            self.assertTrue(release.exists(), "the stop never reached the starting check")
+            self._wait_for(
+                lambda: not Path(f"/proc/{first}").exists()
+                or "Z" in Path(f"/proc/{first}/stat").read_text().split(")")[-1][:3],
+                "a watcher that exec'd during stop was left running", timeout=10,
+            )
+        finally:
+            try:
+                os.kill(first, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+
     def test_realtime_watcher_that_never_starts_is_a_named_failure(self) -> None:
         # Still not exec'd past the start limit: stopped, and a failed start
         # recorded and named -- never reported as watching forever.
@@ -12874,6 +12972,7 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
                 state / f"lasting/{name}.state",
                 state / f"cache/pairs/{name}.redb",
                 state / f"cache/pairs/{name}.redb.corrupt-123",
+                state / f"cache/pairs/{name}.redb.panicked",
             ]
 
         for name, source, default in (
@@ -12912,6 +13011,88 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
                 self.assertFalse(path.exists(), path)
         for path in leftovers("kept"):
             self.assertTrue(path.is_file(), path)
+
+    def _profile_with_a_long_name(self, name: str, source: Path, default: bool) -> None:
+        """A profile named over 64 characters. New names are capped at 64 (valid_new_name),
+        so one that long can only be a fragment an older package wrote: configure a short
+        profile and rename its fragment."""
+        short = "zzlongsource"
+        configured = self.configure(short, source, f"/home/Drive/{short}", default)
+        self.assertEqual(configured.returncode, 0, configured.stdout + configured.stderr)
+        profiles = self.real_home / "config/profiles.d"
+        text = (profiles / f"{short}.toml").read_text(encoding="utf-8").replace(short, name)
+        (profiles / f"{short}.toml").unlink()
+        renamed = profiles / f"{name}.toml"
+        renamed.write_text(text, encoding="utf-8")
+        renamed.chmod(0o600)
+        if os.getuid() == 0:
+            os.chown(renamed, self.drop_uid, self.drop_gid)
+        if default:
+            default_file = self.real_home / "config/default-profile"
+            if default_file.exists():
+                default_file.write_text(f"{name}\n", encoding="utf-8")
+
+    def test_remove_profile_removes_the_hashed_index_files_of_a_long_name(self) -> None:
+        # A name over 64 characters names its pair index by a stem: its first 48
+        # characters, a dash and the first 16 hex digits of the SHA-256 of the
+        # whole name (src/pair_index_redb.rs file_stem). Removal must remove
+        # exactly that stem's files, and never a second long profile's that
+        # shares the 48-character prefix.
+        state = self.real_var / "state"
+        pairs = state / "cache/pairs"
+        pairs.mkdir(parents=True, exist_ok=True, mode=0o700)
+        gone_name = "p" * 70
+        other_name = "p" * 69 + "q"
+        stems = {gone_name: "p" * 48 + "-d79ad4b575f328af", other_name: "p" * 48 + "-5b37311183a27028"}
+
+        def index_files(name: str) -> list[Path]:
+            stem = stems[name]
+            return [
+                pairs / f"{stem}.redb",
+                pairs / f"{stem}.redb.corrupt-123",
+                pairs / f"{stem}.redb.panicked",
+            ]
+
+        for name, source in ((gone_name, self.source_one), (other_name, self.source_two)):
+            self._profile_with_a_long_name(name, source, name == gone_name)
+            for path in index_files(name):
+                path.write_text("state\n", encoding="utf-8")
+                path.chmod(0o600)
+        # The raw-name file is not this profile's index file name and stays.
+        raw = pairs / f"{gone_name}.redb"
+        raw.write_text("not an index file name\n", encoding="utf-8")
+        raw.chmod(0o600)
+        removed = self.shell(self.manager, "remove-profile", gone_name)
+        self.assertEqual(removed.returncode, 0, removed.stdout + removed.stderr)
+        self.assertNotIn("warning:", removed.stderr)
+        for path in index_files(gone_name):
+            self.assertFalse(path.exists(), path)
+        for path in index_files(other_name) + [raw]:
+            self.assertTrue(path.is_file(), path)
+
+    def test_remove_profile_names_an_index_it_cannot_locate_without_sha256sum(self) -> None:
+        # No stem without a digest, and no glob on the 48-character prefix
+        # (it could match another long profile's index): the warning names the
+        # profile, the directory and the cause, and the profile is still removed.
+        pairs = self.real_var / "state/cache/pairs"
+        pairs.mkdir(parents=True, exist_ok=True, mode=0o700)
+        name = "r" * 70
+        self._profile_with_a_long_name(name, self.source_one, True)
+        farm = self.root / "no-sha256sum-bin"
+        farm.mkdir(mode=0o700)
+        for directory in ("/usr/local/sbin", "/usr/local/bin", "/usr/sbin", "/usr/bin", "/sbin", "/bin"):
+            for entry in Path(directory).iterdir():
+                if entry.name != "sha256sum" and not (farm / entry.name).exists():
+                    (farm / entry.name).symlink_to(entry)
+        result = self.shell(
+            self.manager, "remove-profile", name,
+            extra_environment={"PATH": f"{self.fake_system_bin}:{farm}"},
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("warning:", result.stderr)
+        self.assertIn(str(self.fhs / "var/state/cache/pairs"), result.stderr)
+        self.assertIn("sha256sum is not available", result.stderr)
+        self.assertFalse((self.real_home / f"config/profiles.d/{name}.toml").exists())
 
     def test_runner_refuses_while_package_configuration_is_being_changed(self) -> None:
         # The run side of the two-lock exclusion: a save holds management.lock
@@ -13355,6 +13536,366 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
                 self.assertEqual(refused.returncode, 1, f"{hook}: {refused.stdout}{refused.stderr}")
                 self.assertIn(f"not fully stopped: {self.fhs / 'var/run' / record}", refused.stdout, hook)
             (run / record).unlink()
+
+    # -- stale daemon records, supervisor.pid, and the lock probe (fix5) ------
+    #
+    # Fake processes stand in for the daemon, its supervisor and a process
+    # that reused a recorded PID. They are plain python children of the test
+    # whose argv carries the exact flag the lifecycle's identity checks look
+    # for (--daemon / --supervise), so every identity rule the real daemon
+    # meets is met here too, without a real daemon.
+
+    def _spawn_fake(
+        self, flag: str, *, hold_lock: bool = False, ignore_term: bool = False
+    ) -> subprocess.Popen[str]:
+        code = (
+            "import fcntl, os, signal, sys, time\n"
+            "if sys.argv[2] == 'ignore':\n"
+            "    signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+            "if sys.argv[3] != '-':\n"
+            "    fd = os.open(sys.argv[3], os.O_RDWR | os.O_CREAT, 0o600)\n"
+            "    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)\n"
+            "print('up', flush=True)\n"
+            "time.sleep(600)\n"
+        )
+        lock = str(self.real_var / "run/daemon.lock") if hold_lock else "-"
+        process = subprocess.Popen(
+            [sys.executable, "-c", code, flag, "ignore" if ignore_term else "default", lock],
+            stdout=subprocess.PIPE,
+            text=True,
+            preexec_fn=(
+                (lambda: (os.setgroups([]), os.setgid(self.drop_gid), os.setuid(self.drop_uid)))
+                if os.getuid() == 0
+                else None
+            ),
+        )
+        self.addCleanup(self._reap_fake, process)
+        assert process.stdout is not None
+        self.assertEqual(process.stdout.readline().strip(), "up")
+        return process
+
+    @staticmethod
+    def _reap_fake(process: subprocess.Popen[str]) -> None:
+        if process.poll() is None:
+            process.kill()
+        process.wait(timeout=10)
+        if process.stdout is not None:
+            process.stdout.close()
+
+    @staticmethod
+    def _identity_triple(pid: int, *, start_delta: int = 0) -> str:
+        stat_text = Path(f"/proc/{pid}/stat").read_text(encoding="ascii")
+        start = int(stat_text.rsplit(")", 1)[1].split()[19]) + start_delta
+        boot = Path("/proc/sys/kernel/random/boot_id").read_text(encoding="ascii").strip()
+        return f"{pid}\n{start}\n{boot}\n"
+
+    def _write_run_record(self, name: str, text: str) -> Path:
+        record = self.real_var / "run" / name
+        record.write_text(text, encoding="ascii")
+        record.chmod(0o600)
+        if os.getuid() == 0:
+            os.chown(record, self.drop_uid, self.drop_gid)
+        return record
+
+    def _free_daemon_lock(self) -> Path:
+        return self._write_run_record("daemon.lock", "")
+
+    def _seed_reused_pid_daemon_records(self, pid: int, *, legacy_pid_file: bool = False) -> None:
+        """daemon.pid, daemon.ready and ctl.sock as a dead daemon left them,
+        with its PID now held by the live process `pid` (start time differs)."""
+        reused = self._identity_triple(pid, start_delta=-1)
+        self._write_run_record("daemon.ready", reused)
+        self._write_run_record("daemon.pid", f"{pid}\n" if legacy_pid_file else reused)
+        self._bind_dead_socket(self.real_var / "run/ctl.sock", 0o600)
+
+    def _bind_dead_socket(self, path: Path, mode: int) -> None:
+        path.unlink(missing_ok=True)
+        listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
+            listener.bind(str(path))
+        finally:
+            listener.close()
+        path.chmod(mode)
+
+    def test_stale_daemon_records_naming_a_reused_pid_are_removed_while_the_lock_is_free(self) -> None:
+        # daemon.lock is a flock the kernel releases on death. Free, no daemon
+        # exists, whatever PID the records name: the identity check used to
+        # return 73 for a reused PID, and start and stop refused for good.
+        self._daemon_engine(None)
+        run = self.real_var / "run"
+        self._free_daemon_lock()
+        reused = self._spawn_fake("--sleeper")
+        for legacy_pid_file in (False, True):
+            with self.subTest(legacy_pid_file=legacy_pid_file):
+                self._seed_reused_pid_daemon_records(reused.pid, legacy_pid_file=legacy_pid_file)
+                status = self.shell(self.lifecycle, "status")
+                self.assertEqual(status.returncode, 1, status.stdout + status.stderr)
+                self.assertIn("stale daemon record of a daemon that is gone", status.stderr)
+                stopped = self.shell(self.lifecycle, "stop", timeout=60)
+                self.assertEqual(stopped.returncode, 0, stopped.stdout + stopped.stderr)
+                for record in ("daemon.pid", "daemon.ready", "ctl.sock"):
+                    self.assertIn(
+                        f"removed stale daemon record {self.fhs / 'var/run' / record}",
+                        stopped.stdout, stopped.stdout + stopped.stderr,
+                    )
+                    self.assertFalse((run / record).exists(), record)
+                self.assertIsNone(reused.poll(), "stop signalled the process that reused the PID")
+        # Start over the same stale records starts a daemon.
+        self._seed_reused_pid_daemon_records(reused.pid)
+        self._start_daemon()
+        self.assertEqual(self.shell(self.lifecycle, "status").returncode, 0)
+        self.assertIsNone(reused.poll(), "start signalled the process that reused the PID")
+        stopped = self.shell(self.lifecycle, "stop", timeout=60)
+        self.assertEqual(stopped.returncode, 0, stopped.stdout + stopped.stderr)
+
+    def test_a_held_daemon_lock_keeps_the_strict_identity_check_for_reused_pids(self) -> None:
+        self._daemon_engine(None)
+        run = self.real_var / "run"
+        holder = self._spawn_fake("--daemon", hold_lock=True)
+        self._seed_reused_pid_daemon_records(holder.pid)
+        status = self.shell(self.lifecycle, "status")
+        self.assertEqual(status.returncode, 2, status.stdout + status.stderr)
+        stopped = self.shell(self.lifecycle, "stop", timeout=60)
+        self.assertEqual(stopped.returncode, 1, stopped.stdout + stopped.stderr)
+        self.assertIn("refusing to stop an unverified daemon", stopped.stdout)
+        self.assertIn("start_mismatch", stopped.stdout)
+        for record in ("daemon.pid", "daemon.ready", "ctl.sock"):
+            self.assertTrue((run / record).exists(), f"{record} was removed while the lock is held")
+        self.assertIsNone(holder.poll())
+
+    def test_a_missing_flock_keeps_the_strict_identity_check_and_names_the_cause(self) -> None:
+        self._daemon_engine(None)
+        run = self.real_var / "run"
+        self._free_daemon_lock()
+        reused = self._spawn_fake("--sleeper")
+        self._seed_reused_pid_daemon_records(reused.pid)
+        farm = self.root / "no-flock-bin"
+        farm.mkdir(mode=0o700)
+        for directory in ("/usr/local/sbin", "/usr/local/bin", "/usr/sbin", "/usr/bin", "/sbin", "/bin"):
+            for entry in Path(directory).iterdir():
+                if entry.name != "flock" and not (farm / entry.name).exists():
+                    (farm / entry.name).symlink_to(entry)
+        environment = {"PATH": f"{self.fake_system_bin}:{farm}"}
+        status = self.shell(self.lifecycle, "status", extra_environment=environment)
+        self.assertEqual(status.returncode, 2, status.stdout + status.stderr)
+        stopped = self.shell(self.lifecycle, "stop", timeout=60, extra_environment=environment)
+        self.assertEqual(stopped.returncode, 1, stopped.stdout + stopped.stderr)
+        self.assertIn("refusing to stop an unverified daemon", stopped.stdout)
+        self.assertTrue((run / "daemon.ready").exists())
+        self.assertIsNone(reused.poll())
+
+    def _flock_probe_log(self) -> Path:
+        """A flock shim in front of the real one that logs every call."""
+        real = shutil.which("flock", path=os.environ["PATH"])
+        self.assertIsNotNone(real, "flock(1) is required by the daemon-engine tests")
+        log = self.root / "flock-calls.log"
+        shim = self.fake_system_bin / "flock"
+        shim.write_text(
+            f'#!/bin/sh\nprintf \'%s\\n\' "$*" >> {shlex.quote(str(log))}\nexec {shlex.quote(str(real))} "$@"\n',
+            encoding="utf-8",
+        )
+        shim.chmod(0o755)
+        return log
+
+    def test_the_lock_probe_never_runs_while_a_live_supervisor_restarts_the_daemon(self) -> None:
+        # Between a daemon's death and its respawn nobody holds daemon.lock;
+        # a shell probe there can take it from the respawning daemon, which
+        # then exits 75. With supervisor.pid naming a live supervisor the
+        # probe is not made at all.
+        self._daemon_engine(None)
+        run = self.real_var / "run"
+        self._free_daemon_lock()
+        calls = self._flock_probe_log()
+        supervisor = self._spawn_fake("--supervise")
+        self._write_run_record("supervisor.pid", self._identity_triple(supervisor.pid))
+        status = self.shell(self.lifecycle, "status")
+        self.assertEqual(status.returncode, 2, status.stdout + status.stderr)
+        for hook in ("preuninst", "preupgrade"):
+            refused = self.shell(self.lifecycle_dir / hook)
+            self.assertEqual(refused.returncode, 1, f"{hook}: {refused.stdout}{refused.stderr}")
+            self.assertIn(f"{self.fhs / 'var/run/supervisor.pid'}", refused.stdout, hook)
+        self.assertFalse(calls.exists() and calls.read_text(encoding="utf-8").strip(),
+                         "the lock was probed beside a live supervisor: " + (calls.read_text() if calls.exists() else ""))
+        # Stop signals the supervisor found through supervisor.pid even though
+        # there is no daemon.ready, and only then removes the records.
+        stopped = self.shell(self.lifecycle, "stop", timeout=60)
+        self.assertEqual(stopped.returncode, 0, stopped.stdout + stopped.stderr)
+        self._wait_for(lambda: supervisor.poll() is not None, "stop left the supervisor running", timeout=10)
+        self.assertFalse((run / "supervisor.pid").exists())
+        self.assertIn(f"removed stale daemon record {self.fhs / 'var/run/supervisor.pid'}", stopped.stdout)
+
+    def test_a_supervisor_record_naming_no_live_supervisor_is_stale(self) -> None:
+        self._daemon_engine(None)
+        run = self.real_var / "run"
+        self._free_daemon_lock()
+        gone = self._spawn_fake("--supervise")
+        record = self._identity_triple(gone.pid)
+        gone.kill()
+        gone.wait(timeout=10)
+        self._write_run_record("supervisor.pid", record)
+        status = self.shell(self.lifecycle, "status")
+        self.assertEqual(status.returncode, 1, status.stdout + status.stderr)
+        stopped = self.shell(self.lifecycle, "stop", timeout=60)
+        self.assertEqual(stopped.returncode, 0, stopped.stdout + stopped.stderr)
+        self.assertIn(f"removed stale daemon record {self.fhs / 'var/run/supervisor.pid'}", stopped.stdout)
+        self.assertFalse((run / "supervisor.pid").exists())
+
+    def test_daemon_stop_has_one_deadline_across_ctl_stop_term_and_kill(self) -> None:
+        # ctl stop waited the whole grace, the wait after it another, the wait
+        # after TERM a third, then KILL: about 6 minutes at the default 120 s
+        # against the old 120. One deadline now covers all of it; KILL's own
+        # wait is the small margin on top.
+        self._daemon_engine(None)
+        budget = 8
+        bridge = self.real_target / "bin/sdsync-dsm-api"
+        source = bridge.read_text(encoding="utf-8")
+        needle = "if len(sys.argv) >= 2 and sys.argv[1] in ('--launch-daemon'"
+        self.assertEqual(source.count(needle), 1, "the mock's daemon passthrough changed")
+        bridge.write_text(
+            source.replace(
+                needle,
+                "if len(sys.argv) >= 3 and sys.argv[1] == '--ctl' and sys.argv[2] == 'stop':\n"
+                "    _wait = [a[7:] for a in sys.argv if a.startswith('wait_s=')]\n"
+                "    time.sleep(int(_wait[0]))\n"
+                "    raise SystemExit(0)\n" + needle,
+                1,
+            ),
+            encoding="utf-8",
+        )
+        self._free_daemon_lock()
+        daemon = self._spawn_fake("--daemon", hold_lock=True, ignore_term=True)
+        supervisor = self._spawn_fake("--supervise", ignore_term=True)
+        self._write_run_record("daemon.ready", self._identity_triple(daemon.pid))
+        self._write_run_record("daemon.pid", self._identity_triple(daemon.pid))
+        self._write_run_record("supervisor.pid", self._identity_triple(supervisor.pid))
+        self._bind_dead_socket(self.real_var / "run/ctl.sock", 0o600)
+        began = time.monotonic()
+        stopped = self.shell(
+            self.lifecycle, "stop", timeout=120,
+            extra_environment={"SDSYNC_DSM_STOP_TIMEOUT": str(budget)},
+        )
+        elapsed = time.monotonic() - began
+        self.assertEqual(stopped.returncode, 0, stopped.stdout + stopped.stderr)
+        self.assertLessEqual(
+            elapsed, budget + 10 + 4,
+            f"stop took {elapsed:.1f} s against a {budget} s budget plus KILL's 10 s margin\n"
+            + stopped.stdout + stopped.stderr,
+        )
+        self.assertGreaterEqual(elapsed, budget - 2, "the daemon was killed before it had its grace")
+        self.assertIsNotNone(daemon.poll(), "the daemon survived stop")
+        self.assertIsNotNone(supervisor.poll(), "the supervisor survived stop")
+        self.assertEqual(
+            self._daemon_records(), {"daemon.pid": False, "daemon.ready": False, "ctl.sock": False}
+        )
+        self.assertFalse((self.real_var / "run/supervisor.pid").exists())
+        self.assertIn("service_stop_forced", (self.real_var / "log/controller.log").read_text(encoding="utf-8"))
+
+    def test_a_prepared_api_socket_with_no_server_is_stale_when_the_daemon_lock_is_free(self) -> None:
+        # --serve binds api.sock at 0000 and activates it later; a kill in
+        # between leaves a socket nothing can connect to and no api.pid. That
+        # made status 2 and start and stop refuse. With daemon.lock free and
+        # no live API server it is stale: removed, and named.
+        self._daemon_engine(None)
+        run = self.real_var / "run"
+        socket_path = run / "api.sock"
+        self._free_daemon_lock()
+        self._bind_dead_socket(socket_path, 0o000)
+        status = self.shell(self.lifecycle, "status")
+        self.assertEqual(status.returncode, 1, status.stdout + status.stderr)
+        self.assertIn(f"stale API socket: {self.fhs / 'var/run/api.sock'}", status.stderr)
+        self.assertTrue(socket_path.exists(), "status removed a record; it only reports")
+        stopped = self.shell(self.lifecycle, "stop", timeout=60)
+        self.assertEqual(stopped.returncode, 0, stopped.stdout + stopped.stderr)
+        self.assertIn(f"removed stale API socket {self.fhs / 'var/run/api.sock'}", stopped.stdout)
+        self.assertFalse(socket_path.exists())
+        # Start removes it too, and goes on to start the daemon.
+        self._bind_dead_socket(socket_path, 0o000)
+        started = self._start_daemon()
+        self.assertIn(f"removed stale API socket {self.fhs / 'var/run/api.sock'}", started.stdout)
+        self.assertEqual(self.shell(self.lifecycle, "status").returncode, 0)
+        stopped = self.shell(self.lifecycle, "stop", timeout=60)
+        self.assertEqual(stopped.returncode, 0, stopped.stdout + stopped.stderr)
+
+    def test_a_prepared_api_socket_is_stale_under_the_shell_engine_too(self) -> None:
+        run = self.real_var / "run"
+        socket_path = run / "api.sock"
+        self._free_daemon_lock()
+        self._bind_dead_socket(socket_path, 0o000)
+        status = self.shell(self.lifecycle, "status")
+        self.assertEqual(status.returncode, 1, status.stdout + status.stderr)
+        self.assertIn(f"stale API socket: {self.fhs / 'var/run/api.sock'}", status.stderr)
+        stopped = self.shell(self.lifecycle, "stop", timeout=60)
+        self.assertEqual(stopped.returncode, 0, stopped.stdout + stopped.stderr)
+        self.assertIn(f"removed stale API socket {self.fhs / 'var/run/api.sock'}", stopped.stdout)
+        self.assertFalse(socket_path.exists())
+        self._bind_dead_socket(socket_path, 0o000)
+        started = self.shell(self.lifecycle, "start", timeout=60)
+        self.assertEqual(started.returncode, 0, self.lifecycle_failure_diagnostic(started))
+        self.assertIn(f"removed stale API socket {self.fhs / 'var/run/api.sock'}", started.stdout)
+        stopped = self.shell(self.lifecycle, "stop", timeout=60)
+        self.assertEqual(stopped.returncode, 0, stopped.stdout + stopped.stderr)
+
+    def test_a_prepared_api_socket_is_kept_while_a_daemon_or_an_api_server_may_own_it(self) -> None:
+        self._daemon_engine(None)
+        run = self.real_var / "run"
+        socket_path = run / "api.sock"
+        # A live process in api.pid: the socket may be its own.
+        self._free_daemon_lock()
+        server = self._spawn_fake("--serve")
+        self._write_run_record("api.pid", f"{server.pid}\n")
+        self._bind_dead_socket(socket_path, 0o000)
+        status = self.shell(self.lifecycle, "status")
+        self.assertEqual(status.returncode, 2, status.stdout + status.stderr)
+        stopped = self.shell(self.lifecycle, "stop", timeout=60)
+        self.assertEqual(stopped.returncode, 1, stopped.stdout + stopped.stderr)
+        self.assertTrue(socket_path.exists(), "a socket beside a live api.pid was removed")
+        self.assertNotIn("removed stale API socket", stopped.stdout)
+        (run / "api.pid").unlink()
+        # A held daemon.lock: the daemon judges its own socket.
+        holder = self._spawn_fake("--daemon", hold_lock=True)
+        status = self.shell(self.lifecycle, "status")
+        self.assertEqual(status.returncode, 2, status.stdout + status.stderr)
+        stopped = self.shell(self.lifecycle, "stop", timeout=60)
+        self.assertEqual(stopped.returncode, 1, stopped.stdout + stopped.stderr)
+        self.assertTrue(socket_path.exists(), "a socket beside a held daemon.lock was removed")
+        self.assertIsNone(holder.poll())
+
+    def test_shell_engine_start_and_status_see_a_live_daemon(self) -> None:
+        # The shell engine's start and status looked only for its own
+        # controller and API: with the engine file switched to shell while a
+        # daemon ran, start launched a second set of services beside it.
+        run = self.real_var / "run"
+        lock = self.fhs / "var/run/daemon.lock"
+        holder = self._spawn_fake("--daemon", hold_lock=True)
+        self._write_run_record("daemon.pid", self._identity_triple(holder.pid))
+        self._write_run_record("daemon.ready", self._identity_triple(holder.pid))
+        status = self.shell(self.lifecycle, "status")
+        self.assertEqual(status.returncode, 2, status.stdout + status.stderr)
+        self.assertIn(f"the sync daemon (PID {holder.pid}) holds {lock}", status.stderr)
+        started = self.shell(self.lifecycle, "start", timeout=60)
+        self.assertEqual(started.returncode, 1, started.stdout + started.stderr)
+        self.assertIn(f"the sync daemon (PID {holder.pid}) holds {lock}", started.stdout)
+        self.assertIn("refusing to start the shell engine", started.stdout)
+        for record in ("controller.pid", "api.pid", "controller.starting"):
+            self.assertFalse((run / record).exists(), f"start launched services: {record}")
+        self.assertIsNone(holder.poll())
+        # No daemon.pid to name it: the refusal says so rather than guessing.
+        (run / "daemon.pid").unlink()
+        started = self.shell(self.lifecycle, "start", timeout=60)
+        self.assertEqual(started.returncode, 1, started.stdout + started.stderr)
+        self.assertIn(f"the sync daemon (PID unknown) holds {lock}", started.stdout)
+
+    def test_shell_engine_start_and_status_see_a_live_daemon_supervisor(self) -> None:
+        supervisor = self._spawn_fake("--supervise")
+        self._free_daemon_lock()
+        self._write_run_record("supervisor.pid", self._identity_triple(supervisor.pid))
+        status = self.shell(self.lifecycle, "status")
+        self.assertEqual(status.returncode, 2, status.stdout + status.stderr)
+        self.assertIn(f"the sync daemon supervisor (PID {supervisor.pid})", status.stderr)
+        started = self.shell(self.lifecycle, "start", timeout=60)
+        self.assertEqual(started.returncode, 1, started.stdout + started.stderr)
+        self.assertIn(f"the sync daemon supervisor (PID {supervisor.pid})", started.stdout)
+        self.assertFalse((self.real_var / "run/controller.pid").exists())
 
     def test_postupgrade_removes_shell_leftovers_only_under_the_daemon_engine(self) -> None:
         leftovers = [
@@ -20314,12 +20855,18 @@ fi
         api_socket.chmod(0o000)
         if os.getuid() == 0:
             os.chown(api_socket, self.drop_uid, self.drop_gid)
-        self.assertEqual(self.shell(self.lifecycle, "status").returncode, 2)
-        refused_orphan = self.shell(self.lifecycle, "start")
-        self.assertEqual(refused_orphan.returncode, 1, refused_orphan.stderr)
-        self.assertTrue(stat.S_ISSOCK(api_socket.lstat().st_mode))
-        self.assertEqual(api_socket.lstat().st_mode & 0o7777, 0o000)
-        api_socket.unlink()
+        # A prepared socket with no api.pid is recoverable once nothing can own
+        # it: no api.pid, nobody holding daemon.lock. It is then stale -- status
+        # reports it (1), start removes it by name and goes on -- where it used
+        # to be inconsistent for good. A live api.pid or a held lock keeps the
+        # refusal (test_a_prepared_api_socket_is_kept_while_a_daemon_or_an_api_server_may_own_it).
+        self.assertEqual(self.shell(self.lifecycle, "status").returncode, 1)
+        recovered_orphan = self.shell(self.lifecycle, "start", timeout=60)
+        self.assertEqual(recovered_orphan.returncode, 0, recovered_orphan.stdout + recovered_orphan.stderr)
+        self.assertIn(f"removed stale API socket {self.fhs / 'var/run/api.sock'}", recovered_orphan.stdout)
+        stopped_orphan = self.shell(self.lifecycle, "stop", timeout=60)
+        self.assertEqual(stopped_orphan.returncode, 0, stopped_orphan.stdout + stopped_orphan.stderr)
+        self.assertFalse(api_socket.exists())
 
         api_pid_file = self.real_var / "run/api.pid"
         api_pid_file.symlink_to(outside)
@@ -21996,6 +22543,77 @@ fi
         everything, payload = self.api("logs", "--lines", "10")
         self.assertEqual(everything.returncode, 0, everything.stderr)
         self.assertNotIn("run-stderr", {entry["source"] for entry in payload["logs"]})
+
+    def test_controller_logs_list_the_daemon_stderr_files_first(self) -> None:
+        # The daemon's own stderr (a panic, a refusal before its log opens) goes
+        # to var/log/daemon-stderr.log and one rotation. The bridge's Logs read
+        # lists both ahead of controller.log.5..controller.log; the manager must
+        # read the same files in the same order or the dashboard shows a
+        # different Logs tab depending on which rung answered. Raw text, so an
+        # error whatever the threshold.
+        def write_log(name: str, lines: list[str]) -> None:
+            self.write_private_state(self.real_var / "log" / name, "".join(f"{line}\n" for line in lines))
+
+        info_json = '{"epoch":1,"level":"info","category":"controller","event":"quiet_info"}'
+        error_json = '{"epoch":2,"level":"error","category":"controller","event":"loud_error"}'
+        write_log("daemon-stderr.log.1", [f"thread 'main' panicked at {self.real_var}/state/x"])
+        write_log("daemon-stderr.log", ["refused: the package home is not private"])
+        write_log("controller.log.1", [info_json])
+        write_log("controller.log", [error_json])
+        policy, _ = self.api(
+            "security-policy", *self.security_policy_options(controller_log_level="warn")
+        )
+        self.assertEqual(policy.returncode, 0, policy.stderr)
+        expected = [
+            "thread 'main' panicked at [package-var]/state/x",
+            "refused: the package home is not private",
+            error_json,
+        ]
+        for source in ("controller", "all"):
+            result, payload = self.api("logs", "--source", source, "--lines", "50")
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            entries = {entry["source"]: entry["lines"] for entry in payload["logs"]}
+            self.assertEqual(entries["controller"], expected, source)
+        # An unsafe stderr file is refused by name, not skipped.
+        stderr_log = self.real_var / "log/daemon-stderr.log"
+        stderr_log.unlink()
+        stderr_log.symlink_to(self.real_var / "log/controller.log")
+        refused, _ = self.api("logs", "--source", "controller", "--lines", "5")
+        self.assertNotEqual(refused.returncode, 0, refused.stdout)
+        self.assertIn("unsafe", refused.stdout + refused.stderr)
+
+    def test_controller_log_readers_accept_every_event_name_the_daemon_writes(self) -> None:
+        # The daemon writes event names the shell never did. Neither the shell
+        # writer nor the Logs read allowlists names; this pins that, so a reader
+        # that learned an allowlist later cannot silently drop them.
+        names = [
+            "service_superseded", "service_records_removed", "service_records_kept",
+            "daemon_stderr_unavailable", "api_socket_stale_removed", "api_socket_stale_kept",
+            "api_server_unwaitable", "audit_unavailable", "consumer_unkillable",
+            "consumer_stderr", "config_unreadable", "event_log_lock_stale",
+            "event_log_rotation_failed", "ctl_accept_failed",
+        ]
+        helper = self.root / "daemon-events-helper.sh"
+        helper.write_text(
+            "#!/bin/sh\nset -eu\n"
+            f'. "{self.real_target / "libexec/sdsync-common"}"\n'
+            "ensure_layout\n"
+            + "".join(
+                f'append_controller_log_event warn {name} "path=/x cause=test" controller true\n'
+                for name in names
+            ),
+            encoding="utf-8",
+        )
+        helper.chmod(0o755)
+        if os.getuid() == 0:
+            os.chown(helper, self.drop_uid, self.drop_gid)
+        written = self.shell(helper)
+        self.assertEqual(written.returncode, 0, written.stdout + written.stderr)
+        result, payload = self.api("logs", "--source", "controller", "--lines", "100")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        text = "\n".join(payload["logs"][0]["lines"])
+        for name in names:
+            self.assertIn(f'"event":"{name}"', text, name)
 
     def test_free_text_request_id_is_never_read_as_a_request_tag(self) -> None:
         # ADV-B-5, writer half. A run's error line naming a file such as
