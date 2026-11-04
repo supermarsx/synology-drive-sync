@@ -1514,13 +1514,6 @@ mod tests {
     /// it. The successor owes an overflow for the first baseline of a routine that had a poller.
     #[test]
     fn a_successor_poller_owes_an_overflow_for_what_changed_between_pollers() {
-        struct Stuck;
-        impl DirSource for Stuck {
-            fn list(&self, _dir: &Path) -> io::Result<Vec<Listed>> {
-                thread::sleep(Duration::from_millis(400));
-                Ok(Vec::new())
-            }
-        }
         let dir = TempDir::new("gap-between");
         dir.write("f", "f");
         let carry = new_carry();
@@ -1556,8 +1549,10 @@ mod tests {
             handle.join().expect("the poller panicked");
             seen
         };
-        // The first poller never finishes a walk; then a file appears in the gap.
-        let first = run_one(Arc::new(Stuck), Duration::from_millis(700));
+        // The first poller reads the tree (its baseline) and ends; then a file appears in the
+        // gap. No blocked walks: they would hold the process-wide walk cap that other tests
+        // share.
+        let first = run_one(Arc::new(FsSource), Duration::from_millis(400));
         assert!(!first.is_empty(), "the first poller reported nothing");
         dir.write("created-in-the-gap", "g");
         let second = run_one(Arc::new(FsSource), Duration::from_millis(600));
