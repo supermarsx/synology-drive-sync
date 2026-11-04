@@ -1669,7 +1669,25 @@ mod tests {
                  degraded_cause=exit=73 audit outbox: Permission denied\n"
             );
             tree.private("var/state/controller.state", &bytes);
+            // S3-3: the block is the daemon's own claim, served only while the daemon is
+            // live. With no daemon.ready it is a dead service's leftover and is not served.
             let snapshot = tree.snapshot();
+            assert_eq!(snapshot["service"]["state"], "stopped", "{snapshot:#}");
+            assert!(
+                snapshot["controller"].get("degraded").is_none(),
+                "a dead service's block was served: {:#}",
+                snapshot["controller"]
+            );
+            // This test process is the daemon: its identity, as lifecycle publishes it.
+            let me = std::process::id();
+            let start = super::super::super::super::linux_files::process_start(me).unwrap();
+            let boot = fs::read_to_string("/proc/sys/kernel/random/boot_id").unwrap();
+            tree.private(
+                "var/run/daemon.ready",
+                format!("{me}\n{start}\n{}\n", boot.trim()).as_bytes(),
+            );
+            let snapshot = tree.snapshot();
+            assert_eq!(snapshot["service"]["state"], "running", "{snapshot:#}");
             eprintln!("{:#}", snapshot["controller"]);
             assert_eq!(
                 snapshot["controller"]["degraded"],
