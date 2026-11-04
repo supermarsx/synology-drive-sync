@@ -500,11 +500,12 @@ begin_admitted() {
                         valid_name "${1:-}" && direct_audit_profile=$1
                         ;;
                     resync)
-                        # The named profile, else the default the command will
-                        # resolve; all only when neither can be resolved, in which
-                        # case the command refuses and the record ends failed.
+                        # The named profile; the default only when no name was
+                        # given at all. A name that is given and invalid is
+                        # refused by the command, so the record names none
+                        # (all) rather than a default it never acted on.
                         resolved_resync_profile=$(resync_named_profile "$@")
-                        if ! valid_name "$resolved_resync_profile"; then
+                        if [ -z "$resolved_resync_profile" ]; then
                             resolved_resync_profile=$(current_default_for_action 2>/dev/null || true)
                         fi
                         if valid_name "$resolved_resync_profile"; then
@@ -525,16 +526,6 @@ begin_admitted() {
                             all) direct_audit_profile=all ;;
                             *) valid_name "${selected_scope:-}" && direct_audit_profile=$selected_scope ;;
                         esac
-                        ;;
-                    resync)
-                        # It was outside this list, so mark_mutation_commit_started
-                        # found no audit pending and every resync, plan or
-                        # confirmed, ended 64 before the engine ran.
-                        resolved_resync_profile=$(resync_named_profile "$@")
-                        valid_name "$resolved_resync_profile" \
-                            || resolved_resync_profile=$(current_default_for_action 2>/dev/null) \
-                            || resolved_resync_profile=
-                        valid_name "$resolved_resync_profile" && direct_audit_profile=$resolved_resync_profile
                         ;;
                 esac
                 ensure_audit_transaction || {
@@ -677,18 +668,6 @@ read_daemon_run_scope() {
         return 1
     fi
     daemon_run_profiles=$run_scope_list
-}
-
-# The profile a resync names on its command line, or nothing.
-resync_named_profile() {
-    while [ "$#" -gt 0 ]; do
-        case $1 in
-            --scope|--confirm) [ "$#" -lt 2 ] || shift ;;
-            --*) ;;
-            *) printf '%s\n' "$1"; return 0 ;;
-        esac
-        shift
-    done
 }
 
 daemon_run_covers() {

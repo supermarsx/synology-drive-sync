@@ -6025,8 +6025,9 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
             (("ghost",), "ghost", "resync requires one existing profile"),
             (("nopass",), "nopass", "has no password"),
             (("personal", "--confirm", "NOT-A-TICKET"), "personal", "lowercase hexadecimal"),
-            # An invalid name resolves to the default, as the audit target does.
-            (("bad name",), "personal", "invalid profile name"),
+            # An invalid name is not the default: the command refuses the name
+            # it was given, so the record names no profile.
+            (("bad name",), "all", "invalid profile name"),
         ):
             with self.subTest(arguments=arguments):
                 self.reset_audit_log()
@@ -6037,6 +6038,24 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
                 self.assertNotIn("audit execution phase", result.stderr)
                 self.assertEqual(self.capture.read_text(encoding="utf-8"), "")
                 self.assert_one_resync_audit(profile, "failed")
+
+    def test_resync_audit_names_the_profile_given_all_for_an_invalid_one_and_the_default_for_none(self) -> None:
+        # The audit record names what the command acts on. The default stands
+        # in only when no name was given; a name that is given and refused is
+        # not silently recorded as the default profile.
+        self.configure_with_password("personal", self.source_one, True)
+        self.configure_with_password("archive", self.source_two)
+        for arguments, profile, succeeds in (
+            (("archive",), "archive", True),
+            (("bad/name",), "all", False),
+            (("--scope", "Photos"), "personal", True),
+            ((), "personal", True),
+        ):
+            with self.subTest(arguments=arguments):
+                self.reset_audit_log()
+                result = self.shell(self.manager, "resync", *arguments)
+                self.assertEqual(result.returncode == 0, succeeds, result.stdout + result.stderr)
+                self.assert_one_resync_audit(profile, "succeeded" if succeeds else "failed")
 
     def test_resync_with_no_resolvable_profile_is_audited_as_all_and_refused(self) -> None:
         self.reset_audit_log()
