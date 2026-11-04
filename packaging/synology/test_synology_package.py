@@ -9738,6 +9738,104 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
         stopped = self.shell(self.lifecycle, "stop", timeout=15)
         self.assertEqual(stopped.returncode, 0, stopped.stdout + stopped.stderr)
 
+    def _exec_during_starting_check(self, release: Path, gate: Path, *, in_terminate: bool) -> None:
+        """Hold the window the exec race needs: the watcher child execs AFTER
+        the caller found it not yet a watcher and BEFORE realtime_watcher_starting
+        looks at it. The fixture's realtime_watcher_starting, once `gate` exists,
+        releases the child's exec barrier and waits until its argv is the
+        watcher's, then goes on with its real check. With `in_terminate` only
+        the call made by terminate_realtime_watcher does."""
+        controller = self.real_target / "libexec/sdsync-controller"
+        source = controller.read_text(encoding="utf-8")
+        needle = 'realtime_watcher_starting() {\n    read_process_stat_fields "$1" || return 1\n'
+        self.assertEqual(source.count(needle), 1, "realtime_watcher_starting changed")
+        is_watcher = "tr '\\000' '\\n' < \"/proc/$1/cmdline\" 2>/dev/null | grep -qx -- --watch"
+        condition = f'[ -e {shlex.quote(str(gate))} ]'
+        if in_terminate:
+            condition += ' && [ "${race_in_terminate:-}" = 1 ]'
+        source = source.replace(
+            needle,
+            "realtime_watcher_starting() {\n"
+            f"    if {condition} && ! {is_watcher}; then\n"
+            f"        : > {shlex.quote(str(release))}\n"
+            f"        while ! {is_watcher}; do /bin/sleep 0.02; done\n"
+            "    fi\n"
+            '    read_process_stat_fields "$1" || return 1\n',
+        )
+        if in_terminate:
+            terminate = "    terminate_pid=$(read_pid \"$terminate_pid_path\" 2>/dev/null || true)\n"
+            self.assertEqual(source.count(terminate), 1, "terminate_realtime_watcher changed")
+            source = source.replace(terminate, terminate + "    race_in_terminate=1\n")
+        controller.write_text(source, encoding="utf-8")
+
+    def test_a_watcher_that_execs_between_the_two_checks_is_adopted_not_orphaned(self) -> None:
+        # ensure_realtime_watcher read the pid file's child as "not a watcher
+        # yet" (realtime_watcher_matches), the child exec'd, and the second
+        # check (realtime_watcher_starting, which wants the controller's own
+        # command) found it neither: the pid file was declared to have outlived
+        # its watcher, removed, a failure recorded, and the live watcher left
+        # running with nothing recording or stopping it.
+        self._realtime_watch_profile()
+        release = self.root / "watcher-exec-release"
+        gate = self.root / "watcher-race-gate"
+        self._hold_watcher_before_exec(release)
+        self._exec_during_starting_check(release, gate, in_terminate=False)
+        environment, _clock = self.realtime_watcher_environment(label="exec-race")
+        started = self.shell(self.lifecycle, "start", extra_environment=environment, timeout=15)
+        self.assertEqual(started.returncode, 0, started.stdout + started.stderr)
+        pid_path = self.real_var / "run/watch-watch.pid"
+        state_path = self.real_var / "state/routines/watch.state"
+        first = self._watcher_before_exec()
+        gate.touch()
+        deadline = time.monotonic() + 15
+        while time.monotonic() < deadline and not release.exists():
+            time.sleep(0.03)
+        self.assertTrue(release.exists(), "no turn reached the starting check")
+        # The fake sleep collapses each turn to ~0.03 s: a second is dozens.
+        time.sleep(1.0)
+        events = (self.real_var / "log/controller.log").read_text(encoding="utf-8")
+        self.assertEqual(self.event_details("routine_watch_failed"), [], events)
+        self.assertTrue(pid_path.exists(), "the pid file of a live watcher was removed\n" + events)
+        self.assertEqual(int(pid_path.read_text(encoding="utf-8").strip()), first)
+        argv = Path(f"/proc/{first}/cmdline").read_bytes().split(b"\0")
+        self.assertIn(b"--watch", argv)
+        state_text = state_path.read_text(encoding="utf-8") if state_path.exists() else ""
+        self.assertIn("backend=inotify", state_text)
+        stopped = self.shell(self.lifecycle, "stop", timeout=15)
+        self.assertEqual(stopped.returncode, 0, stopped.stdout + stopped.stderr)
+        self._wait_for(lambda: not Path(f"/proc/{first}").exists()
+                       or "Z" in Path(f"/proc/{first}/stat").read_text().split(")")[-1][:3],
+                       "the adopted watcher outlived the package stop", timeout=10)
+
+    def test_a_watcher_that_execs_during_package_stop_is_stopped_not_orphaned(self) -> None:
+        # The same window in terminate_realtime_watcher: not stoppable yet,
+        # exec'd, not starting any more: the pid file was removed and the
+        # watcher left running past the package's stop.
+        self._realtime_watch_profile()
+        release = self.root / "watcher-exec-release"
+        gate = self.root / "watcher-race-gate"
+        self._hold_watcher_before_exec(release)
+        self._exec_during_starting_check(release, gate, in_terminate=True)
+        environment, _clock = self.realtime_watcher_environment(label="exec-race-stop")
+        started = self.shell(self.lifecycle, "start", extra_environment=environment, timeout=15)
+        self.assertEqual(started.returncode, 0, started.stdout + started.stderr)
+        first = self._watcher_before_exec()
+        gate.touch()
+        try:
+            stopped = self.shell(self.lifecycle, "stop", timeout=30)
+            self.assertEqual(stopped.returncode, 0, stopped.stdout + stopped.stderr)
+            self.assertTrue(release.exists(), "the stop never reached the starting check")
+            self._wait_for(
+                lambda: not Path(f"/proc/{first}").exists()
+                or "Z" in Path(f"/proc/{first}/stat").read_text().split(")")[-1][:3],
+                "a watcher that exec'd during stop was left running", timeout=10,
+            )
+        finally:
+            try:
+                os.kill(first, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+
     def test_realtime_watcher_that_never_starts_is_a_named_failure(self) -> None:
         # Still not exec'd past the start limit: stopped, and a failed start
         # recorded and named -- never reported as watching forever.

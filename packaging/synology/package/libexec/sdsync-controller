@@ -972,6 +972,26 @@ realtime_watcher_starting() {
     pid_matches_command "$1" "$controller"
 }
 
+# Whether $1 is a live, non-zombie child of this controller -- a watcher it
+# spawned -- whatever that child is running at this instant: the controller's
+# own command before the exec, nothing readable while the exec is under way, the
+# watcher after. realtime_watcher_matches and realtime_watcher_starting each see
+# one side of the exec; a child that execs between two such checks is neither
+# to the second, and was declared dead and orphaned. A caller that finds a live
+# child of its own must never call it dead on those two checks alone. Sets
+# realtime_watcher_start_state and realtime_watcher_start_age like
+# realtime_watcher_starting.
+realtime_watcher_live_child() {
+    read_process_stat_fields "$1" || return 1
+    [ "$process_stat_ppid" = "$$" ] || return 1
+    case $process_stat_state in Z|X|x) return 1 ;; esac
+    realtime_watcher_start_state=$process_stat_state
+    realtime_watcher_start_ticks=$process_stat_start
+    read_uptime_seconds || return 1
+    realtime_watcher_start_age=$((uptime_seconds - realtime_watcher_start_ticks / 100))
+    [ "$realtime_watcher_start_age" -ge 0 ] || realtime_watcher_start_age=0
+}
+
 terminate_realtime_watcher() {
     terminate_profile=$1
     terminate_pid_path=$runtime_root/watch-$terminate_profile.pid
@@ -980,7 +1000,8 @@ terminate_realtime_watcher() {
     # One still starting is stopped too: left alone, it would exec into a
     # watcher whose pid file is already gone.
     if [ -n "$terminate_pid" ] && { realtime_watcher_is_stoppable "$terminate_pid" \
-        || realtime_watcher_starting "$terminate_pid"; }; then
+        || realtime_watcher_starting "$terminate_pid" \
+        || realtime_watcher_live_child "$terminate_pid"; }; then
         kill -TERM "$terminate_pid" 2>/dev/null || true
         # A watcher left stopped by a controller that died inside the
         # STOP/CONT window never runs its pending TERM handler, and the wait
@@ -1247,6 +1268,51 @@ stop_watch_count_job() {
     watch_count_profile=
 }
 
+# Adopt $watcher_existing, a live watcher the pid file names, or refuse it and
+# say why. 0 when adopted (the realtime_* results are set). 1 when it was
+# refused -- an unrecorded source, another tree, a stopped process -- and has
+# been stopped and its record removed, named.
+adopt_realtime_watcher() {
+    # pid_matches_command deliberately never looks at the watched
+    # directory: it also verifies the API bridge's parent, and teaching it
+    # about watcher arguments would put that logic on the bridge path. The
+    # watched path is recorded beside the pid file instead, so a profile
+    # whose source changed cannot keep reporting inotify on the old tree.
+    watcher_adopt_refusal=
+    if [ ! -f "$watcher_source_path" ] || [ ! -r "$watcher_source_path" ]; then
+        watcher_adopt_refusal=unmatched
+    elif ! IFS= read -r watcher_recorded_source < "$watcher_source_path"; then
+        watcher_adopt_refusal=unmatched
+    elif [ "$watcher_recorded_source" != "$watcher_source" ]; then
+        watcher_adopt_refusal=stale_source
+    elif sed -n 's/^State:[[:space:]]*\([Tt]\).*/\1/p' \
+        "/proc/$watcher_existing/status" 2>/dev/null | grep -Eq '^[Tt]$'; then
+        # A watcher still stopped from an interrupted consume raises no
+        # further events. Adopting it would report a healthy native
+        # backend for a routine nothing is observing.
+        watcher_adopt_refusal=stopped
+    fi
+    if [ -z "$watcher_adopt_refusal" ]; then
+        # A watcher that is live, matched and watching the right tree is the
+        # only evidence that clears the failure history; without this the
+        # count would carry across a recovery and abandon a healthy routine.
+        rm -f "$watcher_failure_path"
+        realtime_backend=inotify
+        realtime_watcher_pid=$watcher_existing
+        realtime_watcher_reason=ok
+        return 0
+    fi
+    controller_log_event warn routine_watch_orphaned \
+        "profile=$watcher_profile pid=$watcher_existing reason=$watcher_adopt_refusal" || true
+    kill -TERM "$watcher_existing" 2>/dev/null || true
+    kill -CONT "$watcher_existing" 2>/dev/null || true
+    realtime_reap_pids="${realtime_reap_pids:-} $watcher_existing"
+    rm -f "$watcher_pid_path" "$watcher_source_path"
+    reap_realtime_watchers
+    [ "$watcher_adopt_refusal" != stopped ] || realtime_watcher_reason=watch_stopped
+    return 1
+}
+
 ensure_realtime_watcher() {
     watcher_profile=$1
     watcher_source=$2
@@ -1270,43 +1336,7 @@ ensure_realtime_watcher() {
     done
     watcher_existing=$(read_pid "$watcher_pid_path" 2>/dev/null || true)
     if [ -n "$watcher_existing" ] && realtime_watcher_matches "$watcher_existing"; then
-        # pid_matches_command deliberately never looks at the watched
-        # directory: it also verifies the API bridge's parent, and teaching it
-        # about watcher arguments would put that logic on the bridge path. The
-        # watched path is recorded beside the pid file instead, so a profile
-        # whose source changed cannot keep reporting inotify on the old tree.
-        watcher_adopt_refusal=
-        if [ ! -f "$watcher_source_path" ] || [ ! -r "$watcher_source_path" ]; then
-            watcher_adopt_refusal=unmatched
-        elif ! IFS= read -r watcher_recorded_source < "$watcher_source_path"; then
-            watcher_adopt_refusal=unmatched
-        elif [ "$watcher_recorded_source" != "$watcher_source" ]; then
-            watcher_adopt_refusal=stale_source
-        elif sed -n 's/^State:[[:space:]]*\([Tt]\).*/\1/p' \
-            "/proc/$watcher_existing/status" 2>/dev/null | grep -Eq '^[Tt]$'; then
-            # A watcher still stopped from an interrupted consume raises no
-            # further events. Adopting it would report a healthy native
-            # backend for a routine nothing is observing.
-            watcher_adopt_refusal=stopped
-        fi
-        if [ -z "$watcher_adopt_refusal" ]; then
-            # A watcher that is live, matched and watching the right tree is the
-            # only evidence that clears the failure history; without this the
-            # count would carry across a recovery and abandon a healthy routine.
-            rm -f "$watcher_failure_path"
-            realtime_backend=inotify
-            realtime_watcher_pid=$watcher_existing
-            realtime_watcher_reason=ok
-            return 0
-        fi
-        controller_log_event warn routine_watch_orphaned \
-            "profile=$watcher_profile pid=$watcher_existing reason=$watcher_adopt_refusal" || true
-        kill -TERM "$watcher_existing" 2>/dev/null || true
-        kill -CONT "$watcher_existing" 2>/dev/null || true
-        realtime_reap_pids="${realtime_reap_pids:-} $watcher_existing"
-        rm -f "$watcher_pid_path" "$watcher_source_path"
-        reap_realtime_watchers
-        [ "$watcher_adopt_refusal" != stopped ] || realtime_watcher_reason=watch_stopped
+        adopt_realtime_watcher && return 0
     fi
     # A watcher still starting (realtime_watcher_starting) is reported as the
     # spawn turn reported it. Stopped before its exec it raises nothing, as a
@@ -1341,6 +1371,27 @@ ensure_realtime_watcher() {
                 watcher_start_detail="start_timeout the watcher had not started ${realtime_watcher_start_age}s after its spawn (limit ${realtime_watcher_start_limit}s)"
                 ;;
         esac
+    fi
+    # A live child of this controller is never declared dead on the two checks
+    # above alone: it may have exec'd between them (matches said not yet,
+    # starting said no longer), or be inside the exec. Look again, and adopt it
+    # if it is the watcher now.
+    if [ -z "$watcher_start_detail" ] && [ -n "$watcher_existing" ] && [ -f "$watcher_pid_path" ] \
+        && realtime_watcher_live_child "$watcher_existing"; then
+        if realtime_watcher_matches "$watcher_existing"; then
+            adopt_realtime_watcher && return 0
+        elif [ "$realtime_watcher_start_age" -lt "$realtime_watcher_start_limit" ]; then
+            realtime_backend=inotify
+            realtime_watcher_pid=$watcher_existing
+            realtime_watcher_reason=ok
+            return 0
+        else
+            kill -TERM "$watcher_existing" 2>/dev/null || true
+            kill -CONT "$watcher_existing" 2>/dev/null || true
+            realtime_reap_pids="${realtime_reap_pids:-} $watcher_existing"
+            reap_realtime_watchers
+            watcher_start_detail="start_timeout the watcher had not started ${realtime_watcher_start_age}s after its spawn (limit ${realtime_watcher_start_limit}s)"
+        fi
     fi
     if [ -f "$watcher_pid_path" ]; then
         # The pid file outlived the watcher it named. inotifywait reports the
