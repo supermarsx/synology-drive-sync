@@ -893,33 +893,52 @@ pub(crate) fn publish_run_lock(run_dir: &Path, profiles: &[String]) -> Result<()
     fs::set_permissions(&lock, fs::Permissions::from_mode(0o700))
         .map_err(|error| fail("chmod", io_cause(&error)))?;
     // S1-c1: the lock directory holds exactly `pid`, at every instant. The
-    // owner file is written and flushed beside the lock, then linked in (the
-    // shell's claim -> ln), so no temporary ever appears inside it, and a crash
-    // leaves a dot-file in run/ (swept above), never an unprovable lock.
+    // owner file is written and flushed beside the lock, then renamed in, so
+    // no temporary ever appears inside it, and a crash leaves a dot-file in
+    // run/ (swept above), never an unprovable lock.
+    //
+    // R1: renamed, not linked then unlinked. Between a link and its unlink the
+    // record had two names, and a crash there left `run.lock/pid` with nlink 2,
+    // which the shell's private-file reader refuses as unprovable. A rename
+    // within one directory tree is atomic: the record has one name, before and
+    // after. (The shell still reads a same-inode staging sibling as a
+    // companion, as a defence for trees an older daemon left.)
     let staged = run_dir.join(format!(
         "{LOCK_PID_STAGING}{pid}.{}",
         TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed)
     ));
     let target = lock.join("pid");
-    let linked = write_private_file(
+    let placed = write_private_file(
         &staged,
         format!("{pid}\n{start}\n{boot}\n").as_bytes(),
         &target,
     )
     .and_then(|()| {
-        fs::hard_link(&staged, &target).map_err(|error| WriteError {
+        fs::rename(&staged, &target).map_err(|error| WriteError {
             path: target.clone(),
-            step: "link",
+            step: "rename",
             cause: io_cause(&error),
         })
     });
-    let unstaged = fs::remove_file(&staged);
-    linked?;
-    unstaged.map_err(|error| WriteError {
-        path: staged.clone(),
-        step: "unstage",
-        cause: io_cause(&error),
-    })
+    let Err(failure) = placed else {
+        return Ok(());
+    };
+    // The staging file may be left behind by a failed write or rename: it is
+    // removed now, and a removal that fails is named beside the first cause
+    // (the next publish sweeps it too).
+    match fs::remove_file(&staged) {
+        Ok(()) => Err(failure),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Err(failure),
+        Err(error) => Err(WriteError {
+            cause: format!(
+                "{}; the staging file {} could not be removed: {}",
+                failure.cause,
+                staged.display(),
+                io_cause(&error)
+            ),
+            ..failure
+        }),
+    }
 }
 
 /// The prefix of `publish_run_lock`'s staging file in `run/`.
@@ -1675,7 +1694,7 @@ mod tests {
         /// `private_event_lock_directory` refuses any other entry (every save
         /// exits 73), and a temporary left there by a crash wedged start and
         /// stop for good. The owner file is written beside the lock and
-        /// linked in.
+        /// renamed in.
         #[test]
         fn run_lock_never_holds_an_entry_but_pid_while_published() {
             use std::sync::Arc;
@@ -1714,6 +1733,45 @@ mod tests {
                 .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
                 .collect();
             assert!(left.is_empty(), "{left:?}");
+        }
+
+        /// R1: `run.lock/pid` never has a second name, at any instant. A
+        /// link-then-unlink publish had one between the two calls, and a crash
+        /// there left the owner record with nlink 2, which the shell's strict
+        /// private-file reader refuses. The record is renamed into place.
+        #[test]
+        fn run_lock_pid_never_has_a_second_link() {
+            use std::os::unix::fs::MetadataExt;
+            use std::sync::Arc;
+            use std::sync::atomic::AtomicBool;
+            let tree = Tree::new("lock-one-link");
+            let run_dir = tree.p("var/run");
+            let done = Arc::new(AtomicBool::new(false));
+            let observer = {
+                let done = Arc::clone(&done);
+                let pid = run_dir.join("run.lock/pid");
+                thread::spawn(move || {
+                    let (mut seen, mut doubled) = (0_u64, 0_u64);
+                    while !done.load(Ordering::SeqCst) {
+                        if let Ok(metadata) = fs::symlink_metadata(&pid) {
+                            seen += 1;
+                            if metadata.nlink() != 1 {
+                                doubled += 1;
+                            }
+                        }
+                    }
+                    (seen, doubled)
+                })
+            };
+            for _ in 0..3000 {
+                publish_run_lock(&run_dir, &["photos".to_owned()]).unwrap();
+                remove_run_lock(&run_dir).unwrap();
+            }
+            done.store(true, Ordering::SeqCst);
+            let (seen, doubled) = observer.join().unwrap();
+            eprintln!("run.lock/pid observed {seen} times, {doubled} with nlink != 1");
+            assert!(seen > 0, "the observer never saw the owner record");
+            assert_eq!(doubled, 0, "run.lock/pid had a second link {doubled} times");
         }
 
         /// A temporary a crash left beside the lock is swept by the next
