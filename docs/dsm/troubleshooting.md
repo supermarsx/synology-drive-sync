@@ -882,7 +882,9 @@ reading applies to a prepared `run/api.sock` (mode `0000`) left by an API child 
 and activation: with no `api.pid` and no holder of `daemon.lock` it is stale, status reports it
 (`stale API socket: <path>`), and Stop and Run remove it (`removed stale API socket <path>`); beside a
 live `api.pid` or a held lock it is left alone. Stop is bounded by one deadline,
-`SDSYNC_DSM_STOP_TIMEOUT` (default and maximum 120 s) plus KILL's 10 s margin.
+`SDSYNC_DSM_STOP_TIMEOUT` (default and maximum 120 s) plus KILL's 10 s margin. What a daemon says
+on stderr before its own log opens (a panic, a refusal) is in `var/log/daemon-stderr.log` and its one
+rotation `.1`; the Logs source `controller` lists both ahead of `controller.log`, as errors.
 
 **The controller died but the API service is still up.** After a SIGKILL or an out-of-memory kill of the
 controller alone, Package Center may still report the package running. `status` now logs

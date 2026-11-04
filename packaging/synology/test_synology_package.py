@@ -22455,6 +22455,77 @@ fi
         self.assertEqual(everything.returncode, 0, everything.stderr)
         self.assertNotIn("run-stderr", {entry["source"] for entry in payload["logs"]})
 
+    def test_controller_logs_list_the_daemon_stderr_files_first(self) -> None:
+        # The daemon's own stderr (a panic, a refusal before its log opens) goes
+        # to var/log/daemon-stderr.log and one rotation. The bridge's Logs read
+        # lists both ahead of controller.log.5..controller.log; the manager must
+        # read the same files in the same order or the dashboard shows a
+        # different Logs tab depending on which rung answered. Raw text, so an
+        # error whatever the threshold.
+        def write_log(name: str, lines: list[str]) -> None:
+            self.write_private_state(self.real_var / "log" / name, "".join(f"{line}\n" for line in lines))
+
+        info_json = '{"epoch":1,"level":"info","category":"controller","event":"quiet_info"}'
+        error_json = '{"epoch":2,"level":"error","category":"controller","event":"loud_error"}'
+        write_log("daemon-stderr.log.1", [f"thread 'main' panicked at {self.real_var}/state/x"])
+        write_log("daemon-stderr.log", ["refused: the package home is not private"])
+        write_log("controller.log.1", [info_json])
+        write_log("controller.log", [error_json])
+        policy, _ = self.api(
+            "security-policy", *self.security_policy_options(controller_log_level="warn")
+        )
+        self.assertEqual(policy.returncode, 0, policy.stderr)
+        expected = [
+            "thread 'main' panicked at [package-var]/state/x",
+            "refused: the package home is not private",
+            error_json,
+        ]
+        for source in ("controller", "all"):
+            result, payload = self.api("logs", "--source", source, "--lines", "50")
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            entries = {entry["source"]: entry["lines"] for entry in payload["logs"]}
+            self.assertEqual(entries["controller"], expected, source)
+        # An unsafe stderr file is refused by name, not skipped.
+        stderr_log = self.real_var / "log/daemon-stderr.log"
+        stderr_log.unlink()
+        stderr_log.symlink_to(self.real_var / "log/controller.log")
+        refused, _ = self.api("logs", "--source", "controller", "--lines", "5")
+        self.assertNotEqual(refused.returncode, 0, refused.stdout)
+        self.assertIn("unsafe", refused.stdout + refused.stderr)
+
+    def test_controller_log_readers_accept_every_event_name_the_daemon_writes(self) -> None:
+        # The daemon writes event names the shell never did. Neither the shell
+        # writer nor the Logs read allowlists names; this pins that, so a reader
+        # that learned an allowlist later cannot silently drop them.
+        names = [
+            "service_superseded", "service_records_removed", "service_records_kept",
+            "daemon_stderr_unavailable", "api_socket_stale_removed", "api_socket_stale_kept",
+            "api_server_unwaitable", "audit_unavailable", "consumer_unkillable",
+            "consumer_stderr", "config_unreadable", "event_log_lock_stale",
+            "event_log_rotation_failed", "ctl_accept_failed",
+        ]
+        helper = self.root / "daemon-events-helper.sh"
+        helper.write_text(
+            "#!/bin/sh\nset -eu\n"
+            f'. "{self.real_target / "libexec/sdsync-common"}"\n'
+            "ensure_layout\n"
+            + "".join(
+                f'append_controller_log_event warn {name} "path=/x cause=test" controller true\n'
+                for name in names
+            ),
+            encoding="utf-8",
+        )
+        helper.chmod(0o755)
+        if os.getuid() == 0:
+            os.chown(helper, self.drop_uid, self.drop_gid)
+        written = self.shell(helper)
+        self.assertEqual(written.returncode, 0, written.stdout + written.stderr)
+        result, payload = self.api("logs", "--source", "controller", "--lines", "100")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        text = "\n".join(payload["logs"][0]["lines"])
+        for name in names:
+            self.assertIn(f'"event":"{name}"', text, name)
+
     def test_free_text_request_id_is_never_read_as_a_request_tag(self) -> None:
         # ADV-B-5, writer half. A run's error line naming a file such as
         # `meeting request_id=5.txt` reached an Activity message, and a
