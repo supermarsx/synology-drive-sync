@@ -8117,7 +8117,66 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
             self.assertIn("fingerprint=none", watch_state.read_text(encoding="utf-8"))
         stopped = self.shell(self.lifecycle, "stop", timeout=15)
         self.assertEqual(stopped.returncode, 0, stopped.stdout + stopped.stderr)
-        self.assertFalse(list((self.real_var / "run").glob("fingerprint.*")))
+        leftovers = sorted(path.name for path in (self.real_var / "run").glob("fingerprint.*"))
+        self.assertEqual(
+            leftovers, [],
+            "a stop left poll scratch directories behind\n" + stopped.stdout + stopped.stderr
+            + "\nprocesses:\n" + subprocess.run(
+                ["ps", "-eo", "pid,ppid,stat,etime,args"], capture_output=True, text=True, check=False
+            ).stdout
+            + "\nrun/: " + " ".join(sorted(path.name for path in (self.real_var / "run").iterdir()))
+            + "\n" + bounded_file_tail(self.real_var / "log/controller.log"),
+        )
+
+    def test_a_stop_during_the_polls_scratch_setup_leaves_no_scratch_directory(self) -> None:
+        # The poll walk makes run/fingerprint.<controller pid>.<n> and only then
+        # installs the trap that removes it. A TERM in that gap -- chmod and the
+        # reads between mkdir and the trap are forks, and on a loaded unit the
+        # gap is long -- killed the walk by the default action and left the
+        # directory (fingerprint.* survived a stop in the loaded gate; the
+        # leftover was only pruned by the next start). The shim below holds the
+        # walk inside the gap and then stops the package.
+        self.assertEqual(
+            self.configure("watch", self.source_two, "/home/Drive/Watch", True).returncode, 0
+        )
+        (self.source_two / "first.txt").write_text("one\n", encoding="utf-8")
+        realtime, _ = self.api(
+            "routine", "--profile", "watch", "--enabled", "true", "--action", "sync",
+            "--mode", "realtime", "--interval", "60", "--weekdays", "1,2,3,4,5,6,7",
+            "--time-window-start", "00:00", "--time-window-end", "23:59",
+            "--debounce-seconds", "1", "--retry-count", "1", "--retry-backoff-seconds", "10",
+            "--poll-seconds", "5", "--allow-delete", "false", "--max-total-delete", "100",
+        )
+        self.assertEqual(realtime.returncode, 0, realtime.stderr)
+        held = self.root / "scratch-gap-held"
+        shim_bin = self.root / "scratch-gap-bin"
+        shim_bin.mkdir(mode=0o700)
+        shim = shim_bin / "chmod"
+        shim.write_text(
+            "#!/bin/sh\n"
+            'case "${2:-}" in\n'
+            f"  */fingerprint.*) : > {shlex.quote(str(held))}; /bin/sleep 3 ;;\n"
+            "esac\n"
+            'exec /bin/chmod "$@"\n',
+            encoding="utf-8",
+        )
+        shim.chmod(0o755)
+        if os.getuid() == 0:
+            os.chown(shim_bin, self.drop_uid, self.drop_gid)
+            os.chown(shim, self.drop_uid, self.drop_gid)
+        environment = self.fast_clock_environment(step=31)
+        environment["PATH"] = f"{shim_bin}:{environment['PATH']}"
+        started = self.shell(self.lifecycle, "start", extra_environment=environment, timeout=30)
+        self.assertEqual(started.returncode, 0, started.stdout + started.stderr)
+        self._wait_for(held.exists, "no poll walk reached its scratch directory", timeout=30)
+        stopped = self.shell(self.lifecycle, "stop", timeout=60)
+        self.assertEqual(stopped.returncode, 0, stopped.stdout + stopped.stderr)
+        leftovers = sorted(path.name for path in (self.real_var / "run").glob("fingerprint.*"))
+        self.assertEqual(
+            leftovers, [],
+            "a stop left poll scratch directories behind\n" + stopped.stdout + stopped.stderr
+            + bounded_file_tail(self.real_var / "log/controller.log"),
+        )
 
     def test_realtime_poll_reports_unreadable_subtree_without_dispatch(self) -> None:
         # Row 1. chmod 000 on a subdirectory makes find's walk fail with a

@@ -1739,27 +1739,23 @@ fingerprint_reading() {
     # BusyBox ash has no pipefail. Keep each stage in a private file and check
     # its status before the next stage so a failed find/stat/sort/cksum cannot
     # be mistaken for a valid fingerprint of partial input.
+    #
+    # The cleanup and interrupt traps are in place before the directory is made.
+    # They used to follow it, and the chmod and reads between were forks: a TERM
+    # in that gap (a stop while the unit is loaded) ended the walk by the default
+    # action and left run/fingerprint.<pid>.<n> behind until the next start
+    # pruned it. Until the directory is owned, a signal is only noted (a
+    # deferred TERM is acted on the moment the traps are final), so there is no
+    # instant at which the walk can die holding a directory nobody will remove.
     fingerprint_attempt=0
     fingerprint_temp_dir=
-    while [ "$fingerprint_attempt" -lt 32 ]; do
-        fingerprint_candidate=$runtime_root/fingerprint.$$.$fingerprint_attempt
-        if mkdir "$fingerprint_candidate" 2>/dev/null; then
-            fingerprint_temp_dir=$fingerprint_candidate
-            break
-        fi
-        fingerprint_attempt=$((fingerprint_attempt + 1))
-    done
-    [ -n "$fingerprint_temp_dir" ] || { echo "no poll scratch directory could be created in $runtime_root" >&2; return 73; }
-    chmod 700 "$fingerprint_temp_dir" || { echo "the poll scratch directory $fingerprint_temp_dir could not be made private" >&2; return 73; }
-    fingerprint_metadata=$fingerprint_temp_dir/metadata
-    fingerprint_stderr=$fingerprint_temp_dir/stderr
-    fingerprint_sorted=$fingerprint_temp_dir/sorted
-    fingerprint_checksum=$fingerprint_temp_dir/checksum
+    fingerprint_metadata= fingerprint_stderr= fingerprint_sorted= fingerprint_checksum=
     fingerprint_find_pid=
     fingerprint_find_start=
     fingerprint_self_pid=
-    IFS=' ' read -r fingerprint_self_pid _fingerprint_self_rest < /proc/self/stat || fingerprint_self_pid=
+    fingerprint_signal_seen=false
     fingerprint_cleanup() {
+        [ -n "$fingerprint_temp_dir" ] || return 0
         rm -f "$fingerprint_metadata" "$fingerprint_stderr" \
             "$fingerprint_sorted" "$fingerprint_checksum" 2>/dev/null || true
         rmdir "$fingerprint_temp_dir" 2>/dev/null || true
@@ -1772,7 +1768,24 @@ fingerprint_reading() {
         exit 143
     }
     trap fingerprint_cleanup 0
+    trap 'fingerprint_signal_seen=true' HUP INT TERM
+    while [ "$fingerprint_attempt" -lt 32 ]; do
+        fingerprint_candidate=$runtime_root/fingerprint.$$.$fingerprint_attempt
+        if mkdir "$fingerprint_candidate" 2>/dev/null; then
+            fingerprint_temp_dir=$fingerprint_candidate
+            fingerprint_metadata=$fingerprint_temp_dir/metadata
+            fingerprint_stderr=$fingerprint_temp_dir/stderr
+            fingerprint_sorted=$fingerprint_temp_dir/sorted
+            fingerprint_checksum=$fingerprint_temp_dir/checksum
+            break
+        fi
+        fingerprint_attempt=$((fingerprint_attempt + 1))
+    done
+    [ -n "$fingerprint_temp_dir" ] || { echo "no poll scratch directory could be created in $runtime_root" >&2; return 73; }
+    chmod 700 "$fingerprint_temp_dir" || { echo "the poll scratch directory $fingerprint_temp_dir could not be made private" >&2; return 73; }
+    IFS=' ' read -r fingerprint_self_pid _fingerprint_self_rest < /proc/self/stat || fingerprint_self_pid=
     trap fingerprint_interrupted HUP INT TERM
+    [ "$fingerprint_signal_seen" = false ] || exit 143
 
     # One stat for the whole batch instead of one per file. Files are read as
     # name, size and mtime; directories as their name alone (v3). A files-only
