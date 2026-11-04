@@ -86,6 +86,42 @@ lists its own commits.
 - **Log rotation by the daemon takes the shell's `event-log.lock`.** A rotation that cannot be made
   keeps the line and writes `var/state/log-rotation.failed`.
 
+### Verified-pair index: correctness fixes
+
+- **A write through a shared memory mapping is no longer missed.** Linux moves a file's times only
+  when a mapped write first dirties a page, so for up to about 35 s after a change (the kernel's
+  writeback interval) the content can change again with every fact unchanged. The index took such a
+  file as settled after 2 s and could skip its upload indefinitely. The racy window is now
+  `dirty_expire_centisecs` + `dirty_writeback_centisecs` from `/proc/sys/vm` + 25 s, at least 2 s:
+  60 s with the defaults, and 60 s on macOS and the NAS side. An unreadable setting is
+  `pair-index-writeback-unknown` (60 s); periodic writeback switched off is
+  `pair-index-writeback-unbounded`, and nothing local is served. **The first run after upgrading
+  verifies every pair live**: indexes written before are retired by name (`pair-index-retired`,
+  semantics epoch 1, the two-second window). A file changed within a minute of a run is read live
+  once more on the next run.
+- **A NAS clock that disagrees with this host's is not trusted.** The `Date` header of `MD5.start`
+  more than 20 s outside this host's clock during the pass (a proxy, a NAS with the wrong time) makes
+  the pair racy and is named once per run, `pair-index-nas-clock-skewed`.
+- **Reconciliation carries fewer digests on trust.** A pair is carried from the plan pass only when
+  the NAS listing has a change time for it and neither side changed within the racy window of the
+  read that produced its digest.
+- **A damaged index heals itself.** A file redb repaired, one that fails a check on any open, and
+  one with a record that does not decode are set aside and rebuilt on the spot, and nothing read from
+  them is served (`pair-index-corrupt`); before, a repair found mid-run kept serving, and one
+  undecodable record disabled the index until the file was deleted by hand. redb 4.4 can also crash
+  while opening a file with a damaged allocator page: the crash is recorded beside the file
+  (`<profile>.redb.panicked`) and the next run sets the file aside, so one crashed run heals it.
+- **The index file is verified once per run**, not on every reopen: a reopen within the run trusts a
+  file that is exactly as the run left it (identity, length, times and redb's header). On an armv7 NAS
+  this removes three or four full reads of the file per run.
+- **Quarantined copies that cannot be removed are named** (`pair-index-cleanup-failed`), and past
+  three such copies a damaged file is deleted instead of kept.
+- **A profile name over 64 characters gets an index** (`<first 48 characters>-<16 hex of its
+  SHA-256>.redb`) instead of `pair-index-unsafe` on every run.
+- New `pair_index.issues` codes: `pair-index-writeback-unknown`, `pair-index-writeback-unbounded`,
+  `pair-index-nas-clock-skewed`, `pair-index-cleanup-failed`. See
+  [Verified-pair index](pair-index.md#when-it-cannot-be-used).
+
 ## Read this before upgrading
 
 - **Rust 1.90 or newer is needed to build from source** (was 1.88). The verified-pair index uses redb
