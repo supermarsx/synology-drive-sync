@@ -409,7 +409,8 @@ impl TouchedPaths {
 /// moved. A pair is carried when the run did not touch it, both sides' facts (ctimes included)
 /// equal the plan-time facts, the plan pass proved both sides equal, and neither side's change
 /// time was within the racy window of the plan's read of it (D2: the index's rule, see
-/// [`crate::pair_index::RacyWindows`]). Everything else is verified live: touched pairs, pairs
+/// [`crate::pair_index::RacyWindows`]), the NAS side judged by a clock this host's clock bounds
+/// (D3: the index's skew bound on the `MD5.start` clock). Everything else is verified live: touched pairs, pairs
 /// whose facts moved, pairs the plan read while they could still change unseen, and the canary.
 pub struct PlanCarry<'plan> {
     pub local: &'plan LocalInventory,
@@ -438,10 +439,36 @@ impl PlanCarry<'_> {
         };
         let local_racy = local.times.ctime_ns > read_ns.saturating_sub(self.racy.local_ns);
         let remote_racy = match (remote.ctime_seconds, remote.digest_nas_time) {
-            (Some(ctime), Some(clock)) => ctime > clock.saturating_sub(self.racy.remote_seconds),
+            (Some(ctime), Some(clock)) => {
+                !self.nas_clock_is_bounded(clock, read_ns)
+                    || ctime > clock.saturating_sub(self.racy.remote_seconds)
+            }
             _ => true,
         };
         local_racy || remote_racy
+    }
+
+    /// Whether this host's clock bounds the NAS clock the plan's `MD5.start` reported (the D3
+    /// guard of [`crate::pair_index::PairIndex`]'s harvest, applied to the carry). The `Date`
+    /// header can be a proxy's or a NAS with the wrong time, and a clock hours ahead made every
+    /// change time look settled. Every `MD5.start` of the plan pass ran after `read_started` and
+    /// before now (the carry is judged after the plan pass), so a clock more than
+    /// [`crate::pair_index::NAS_CLOCK_TOLERANCE_SECONDS`] outside that interval is not one the
+    /// window can be judged by, and the pair is verified live. The upper bound is looser than
+    /// the index's, which knows when its pass ended; a skewed clock is therefore caught when it is
+    /// wrong by more than the time since the plan pass began, plus the tolerance. The demotion is
+    /// visible as a lower `served` count in the result's `reconciliation` object.
+    fn nas_clock_is_bounded(&self, clock: i64, read_ns: i64) -> bool {
+        let tolerance = crate::pair_index::NAS_CLOCK_TOLERANCE_SECONDS;
+        let earliest = (read_ns / 1_000_000_000).saturating_sub(tolerance);
+        // A host clock before 1970 bounds nothing: the pair is verified live.
+        let Ok(since_epoch) = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+        else {
+            return false;
+        };
+        let now = i64::try_from(since_epoch.as_secs()).unwrap_or(i64::MAX);
+        let latest = now.saturating_add(tolerance);
+        earliest <= clock && clock <= latest
     }
 }
 
@@ -748,6 +775,68 @@ mod tests {
             &BTreeMap::new(),
         );
         assert!(vouched.served.is_empty());
+    }
+
+    /// N-I4 (the D3 guard, for the carry): a NAS clock the host's clock does not bound cannot show
+    /// whether a NAS change time was settled when the plan read it, so the pair is verified live.
+    /// The `Date` header can be a proxy's or a NAS with the wrong time; a clock hours ahead made
+    /// every change time look settled.
+    #[test]
+    fn a_pair_whose_plan_clock_the_host_does_not_bound_is_never_carried() {
+        use crate::pair_index::NAS_CLOCK_TOLERANCE_SECONDS as TOLERANCE;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        // Read a moment ago, by this host's clock; every change time long settled.
+        let read_started = std::time::UNIX_EPOCH + std::time::Duration::from_secs((now - 5) as u64);
+        let (plan_local, mut plan_remote) = inventories(&[
+            ("in-bounds", 10, 20, Some(A)),
+            ("behind", 10, 20, Some(A)),
+            ("barely-behind", 10, 20, Some(A)),
+            ("ahead", 10, 20, Some(A)),
+            ("barely-ahead", 10, 20, Some(A)),
+        ]);
+        for (name, clock) in [
+            ("in-bounds", now),
+            ("behind", now - 3_600),
+            ("barely-behind", now - 5 - TOLERANCE),
+            ("ahead", now + 3_600),
+            ("barely-ahead", now + TOLERANCE),
+        ] {
+            plan_remote.entries.get_mut(name).unwrap().digest_nas_time = Some(clock);
+        }
+        let (fresh_local, fresh_remote) = inventories(&[
+            ("in-bounds", 10, 20, None),
+            ("behind", 10, 20, None),
+            ("barely-behind", 10, 20, None),
+            ("ahead", 10, 20, None),
+            ("barely-ahead", 10, 20, None),
+        ]);
+        let comparison: BTreeSet<String> = fresh_remote.entries.keys().cloned().collect();
+        let mut carry = PlanCarry {
+            local: &plan_local,
+            remote: &plan_remote,
+            touched: TouchedPaths::default(),
+            canary: 0,
+            seed: 0,
+            read_started,
+            racy: windows(),
+        };
+        let vouched = carry.vouch(
+            &fresh_local,
+            &fresh_remote,
+            &comparison,
+            &BTreeSet::new(),
+            &BTreeMap::new(),
+        );
+        let mut carried = names(&vouched.served);
+        carried.sort_unstable();
+        assert_eq!(
+            carried,
+            vec!["barely-ahead", "barely-behind", "in-bounds"],
+            "a clock more than {TOLERANCE} s outside the pass is not one to judge by"
+        );
     }
 
     #[test]

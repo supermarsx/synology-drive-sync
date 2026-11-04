@@ -351,7 +351,8 @@ pub struct RemoteEntry {
     /// that digest was computed live by this process and the NAS sent a parseable `Date`.
     ///
     /// The NAS starts reading after it accepts the task, so every write stamped with a change
-    /// time at least two seconds before this is in the digest (the racy rule, perf-design §2.4).
+    /// time at least the NAS racy window (60 s, `NAS_WINDOW_SECONDS`) before this is in the digest
+    /// (the racy rule, perf-design §2.4). The window was two seconds under evidence epoch 1.
     pub digest_nas_time: Option<i64>,
     /// File Station mount-point type (for example CIFS/NFS/ISO), when present.
     /// Mounted directories are inventory boundaries and are never traversed or deleted.
@@ -1830,7 +1831,9 @@ impl ApiClient {
     /// `MD5.start` answer, when there was a parseable one.
     ///
     /// DSM reads the file only after it has accepted the task, so a write whose change time is
-    /// at least two seconds before that clock is in the digest. That is the remote half of the
+    /// at least the NAS racy window (60 s, `NAS_WINDOW_SECONDS`) before that clock is in the
+    /// digest, provided the clock is one this host's clock bounds (20 s,
+    /// `NAS_CLOCK_TOLERANCE_SECONDS`). That is the remote half of the
     /// verified-pair racy rule (perf-design §2.4 condition 5).
     pub fn remote_content_md5_dated(
         &self,

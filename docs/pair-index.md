@@ -198,7 +198,9 @@ Independently of the index, post-run reconciliation re-lists both sides in full 
 only the pairs the run touched, plus a canary of 25 untouched pairs. Every other pair whose facts
 did not move keeps the digests the plan pass proved, provided the NAS listing carries a change
 time for it and neither side's change time was within the racy window of the read that produced
-the digest (the run's start locally, the `MD5.start` clock on the NAS); otherwise it is verified
-live. The result's `reconciliation` object says how
+the digest (the run's start locally, the `MD5.start` clock on the NAS), and the `MD5.start` clock
+was within 20 s of this host's clock over the run (a clock further out cannot judge the window, as
+for the index above); otherwise it is verified live. That demotion is not a separate warning: it
+shows as a lower carried count in the `reconciliation` object. The result's `reconciliation` object says how
 many pairs were carried and verified live. `--reconcile full` (hidden, command line only) restores
 the exhaustive pass.
