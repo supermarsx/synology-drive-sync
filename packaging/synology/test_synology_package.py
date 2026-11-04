@@ -8196,6 +8196,112 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
             + bounded_file_tail(self.real_var / "log/controller.log"),
         )
 
+    def test_a_poll_killed_outright_leaves_no_scratch_directory_for_the_next_poll(self) -> None:
+        # S3-22. A poll subshell killed by SIGKILL (the OOM killer) cannot run
+        # its cleanup trap, and its run/fingerprint.<controller pid>.<n> stayed
+        # for the controller's whole life; 32 of them and every later poll
+        # failed with 73. The directory now carries its owner's PID and start
+        # tick, and the next poll removes one whose owner is gone, naming it.
+        self.assertEqual(
+            self.configure("watch", self.source_two, "/home/Drive/Watch", True).returncode, 0
+        )
+        (self.source_two / "first.txt").write_text("one\n", encoding="utf-8")
+        realtime, _ = self.api(
+            "routine", "--profile", "watch", "--enabled", "true", "--action", "sync",
+            "--mode", "realtime", "--interval", "60", "--weekdays", "1,2,3,4,5,6,7",
+            "--time-window-start", "00:00", "--time-window-end", "23:59",
+            "--debounce-seconds", "1", "--retry-count", "1", "--retry-backoff-seconds", "10",
+            "--poll-seconds", "5", "--allow-delete", "false", "--max-total-delete", "100",
+        )
+        self.assertEqual(realtime.returncode, 0, realtime.stderr)
+        held = self.root / "killed-poll-held"
+        shim_bin = self.root / "killed-poll-bin"
+        shim_bin.mkdir(mode=0o700)
+        shim = shim_bin / "chmod"
+        shim.write_text(
+            "#!/bin/sh\n"
+            'case "${2:-}" in\n'
+            "  */fingerprint.*)\n"
+            f"    printf '%s %s %s\\n' \"$PPID\" \"$$\" \"$2\" >> {shlex.quote(str(held))}\n"
+            f"    if [ \"$(wc -l < {shlex.quote(str(held))})\" -le 1 ]; then /bin/sleep 120; fi ;;\n"
+            "esac\n"
+            'exec /bin/chmod "$@"\n',
+            encoding="utf-8",
+        )
+        shim.chmod(0o755)
+        if os.getuid() == 0:
+            os.chown(shim_bin, self.drop_uid, self.drop_gid)
+            os.chown(shim, self.drop_uid, self.drop_gid)
+        environment = self.fast_clock_environment(step=31)
+        environment["PATH"] = f"{shim_bin}:{environment['PATH']}"
+        started = self.shell(self.lifecycle, "start", extra_environment=environment, timeout=30)
+        self.assertEqual(started.returncode, 0, started.stdout + started.stderr)
+        self._wait_for(held.exists, "no poll walk reached its scratch directory", timeout=30)
+        poll, shim_pid, leaked = held.read_text(encoding="utf-8").split()[:3]
+        self.addCleanup(lambda: subprocess.run(["kill", "-KILL", shim_pid], check=False, capture_output=True))
+        self.assertTrue(Path(leaked).is_dir(), leaked)
+        os.kill(int(poll), signal.SIGKILL)
+        self._wait_for(
+            lambda: len(held.read_text(encoding="utf-8").splitlines()) >= 2,
+            "no later poll made a scratch directory\n" + bounded_file_tail(self.real_var / "log/controller.log"),
+            timeout=60,
+        )
+        self.assertFalse(
+            Path(leaked).exists(),
+            f"the dead poll's scratch directory {leaked} was left behind\n"
+            + bounded_file_tail(self.real_var / "log/controller.log"),
+        )
+        removed = self.event_details("poll_scratch_leftover_removed")
+        self.assertTrue(any(f"path={leaked}" in detail and f"owner_pid={poll}" in detail for detail in removed), removed)
+        stopped = self.shell(self.lifecycle, "stop", timeout=60)
+        self.assertEqual(stopped.returncode, 0, stopped.stdout + stopped.stderr)
+        self.assertEqual(sorted((self.real_var / "run").glob("fingerprint.*")), [])
+
+    def test_killing_the_controller_stops_its_inotifywait_fallback_watcher(self) -> None:
+        # S3-22. The package's own watcher is killed with its parent by the
+        # kernel; an inotifywait fallback was not, and outlived a controller
+        # that was killed outright. A guard per fallback watcher stops it.
+        self._without_the_package_watcher()
+        self._realtime_watch_profile()
+        environment, _clock = self.realtime_watcher_environment(label="orphan")
+        started = self.shell(self.lifecycle, "start", extra_environment=environment, timeout=15)
+        self.assertEqual(started.returncode, 0, started.stdout + started.stderr)
+        pid_path = self.real_var / "run/watch-watch.pid"
+        state_path = self.real_var / "state/routines/watch.state"
+        deadline = time.monotonic() + 15
+        while time.monotonic() < deadline:
+            state_text = state_path.read_text(encoding="utf-8") if state_path.exists() else ""
+            if pid_path.is_file() and "backend=inotify" in state_text:
+                break
+            time.sleep(0.03)
+        else:
+            self.fail("the inotifywait fallback was never adopted")
+        watcher = int(pid_path.read_text(encoding="utf-8").strip())
+        controller = int((self.real_var / "run/controller.pid").read_text(encoding="utf-8").split()[0])
+        os.kill(controller, signal.SIGKILL)
+
+        def watcher_gone() -> bool:
+            try:
+                state = Path(f"/proc/{watcher}/stat").read_text(encoding="ascii").rsplit(") ", 1)[1].split()[0]
+            except OSError:
+                return True
+            return state in ("Z", "X")
+
+        self._wait_for(
+            watcher_gone,
+            f"the inotifywait watcher (PID {watcher}) outlived the controller\n"
+            + bounded_file_tail(self.real_var / "log/controller.log"),
+            timeout=20,
+        )
+        self._wait_for(
+            lambda: any(f"pid={watcher} " in detail for detail in self.event_details("routine_watch_orphan_stopped")),
+            "the guard did not log that it stopped the orphaned watcher\n"
+            + bounded_file_tail(self.real_var / "log/controller.log"),
+            timeout=10,
+        )
+        stopped = self.shell(self.lifecycle, "stop", timeout=60)
+        self.assertEqual(stopped.returncode, 0, stopped.stdout + stopped.stderr)
+
     def test_realtime_poll_reports_unreadable_subtree_without_dispatch(self) -> None:
         # Row 1. chmod 000 on a subdirectory makes find's walk fail with a
         # non-empty stderr line on both the first attempt and the tolerated
@@ -23802,6 +23908,10 @@ fi
             "api_server_identity_unavailable", "daemon_lock_probe", "routine_watch_pid_mismatch",
             "ctl_peer_gone", "ctl_peer_unchecked", "ctl_reply_dropped", "ctl_socket_option_failed",
             "routine_backend", "service_stop_forced",
+            # fix7: the poll's dead-owner cleanup and the fallback watcher's guard.
+            "poll_scratch_leftover_removed", "poll_scratch_leftover_unremovable",
+            "routine_watch_orphan_stopped", "routine_watch_orphan_unstoppable",
+            "routine_watch_guard_unavailable",
         ]
         helper = self.root / "daemon-events-helper.sh"
         helper.write_text(
