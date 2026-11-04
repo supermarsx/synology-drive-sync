@@ -1358,7 +1358,23 @@ mod tests {
         let gone = dir.path().join("src.gone");
         fs::rename(&root, &gone).unwrap();
         fs::remove_dir_all(&gone).unwrap();
-        let failure = harness.next();
+        // A reading that was walking `src` when it was renamed away reports what it saw: a named
+        // skip (a `WatchLimit` account that now lists the skipped entry) or a change. Those are
+        // correct, belong to the tree being taken apart, and come before the failure this test
+        // waits for; under load a walk is often in the middle of it.
+        let failure = loop {
+            let event = harness.next();
+            let mid_walk = match &event {
+                ChangeEvent::Changed { .. } => true,
+                ChangeEvent::Backend { reason, detail, .. } => {
+                    *reason == BackendReason::WatchLimit && detail.contains("skipped")
+                }
+                _ => false,
+            };
+            if !mid_walk {
+                break event;
+            }
+        };
         let ChangeEvent::Backend { reason, detail, .. } = failure else {
             panic!("expected the failure, got {failure:?}");
         };
