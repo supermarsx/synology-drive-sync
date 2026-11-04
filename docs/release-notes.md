@@ -194,6 +194,21 @@ lists its own commits.
 - **The shell snapshot carries `controller.degraded`** (`reason`, `since_epoch`, `cause`) from the
   daemon's three optional `controller.state` lines, and refuses a malformed set as `corrupt_state`.
 
+### Follow-ups from the integration
+
+- **An unreadable request queue is named, not read as empty.** A control directory the daemon cannot
+  read is logged once per episode with its path and cause (`control_dir_unreadable`, then
+  `control_dir_recovered`), raised as `controller.degraded` (`control_dir_unreadable`) and shown in
+  amber.
+- **`pair-index-plan-clock-unbounded`** (information) names how many pairs the run's carry did not
+  serve because the NAS clock of the plan pass was more than 20 s from this host's; they were checked
+  live. The count is also in the result's `reconciliation.plan_clock_unbounded`.
+- **A supervisor waits out a `supervisor.lock` held for a moment** (2 s, like `daemon.lock`) instead of
+  leaving with exit 0 and no daemon; if the lock is still held it says so on stderr and as
+  `service_superseded`.
+- **`--launch-daemon` returns when `daemon.ready` is published**, not on the socket's first ping.
+- A control-socket connect failure names the socket path once.
+
 ### Verified-pair index: correctness fixes
 
 - **A write through a shared memory mapping is no longer missed.** Linux moves a file's times only
