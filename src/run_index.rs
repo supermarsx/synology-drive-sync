@@ -31,6 +31,8 @@ pub(crate) enum IndexStart {
     Ready {
         paths: synology_drive_sync::pair_index_redb::IndexPaths,
         cache_mib: u64,
+        /// What the directory's upkeep could not do, named in the run's report.
+        notes: Vec<IndexIssue>,
     },
 }
 
@@ -70,14 +72,16 @@ pub(crate) fn begin(profile: &str, settings: &config::ResolvedSync) -> IndexStar
     #[cfg(unix)]
     {
         use synology_drive_sync::pair_index_redb::{IndexPaths, prepare_directory};
-        let paths =
-            match prepare_directory(directory).and_then(|()| IndexPaths::new(directory, profile)) {
-                Ok(paths) => paths,
-                Err(issue) => return IndexStart::Report(IndexReport::unusable(issue)),
-            };
+        let prepared = prepare_directory(directory)
+            .and_then(|notes| IndexPaths::new(directory, profile).map(|paths| (paths, notes)));
+        let (paths, notes) = match prepared {
+            Ok(prepared) => prepared,
+            Err(issue) => return IndexStart::Report(IndexReport::unusable(issue)),
+        };
         IndexStart::Ready {
             paths,
             cache_mib: settings.behavior.pair_index_cache_mib,
+            notes,
         }
     }
 }
@@ -99,10 +103,15 @@ pub(crate) fn open(
         IndexStart::Off => Ok(None),
         IndexStart::Report(report) => Err(Box::new(report)),
         #[cfg(unix)]
-        IndexStart::Ready { paths, cache_mib } => {
+        IndexStart::Ready {
+            paths,
+            cache_mib,
+            notes,
+        } => {
             use synology_drive_sync::pair_index_redb::RedbPairIndex;
             let label = paths.label();
-            let opened = RedbPairIndex::open(paths, cache_mib);
+            let mut opened = RedbPairIndex::open(paths, cache_mib);
+            opened.issues.splice(0..0, notes);
             let Some(backend) = opened.backend else {
                 let mut report = IndexReport {
                     state: IndexState::Unusable,

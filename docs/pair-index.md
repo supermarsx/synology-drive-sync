@@ -90,7 +90,7 @@ and a fully live run. None fails a run or makes it partial.
 | --- | --- |
 | `pair-index-locked` | Another process held the file for more than 30 s. |
 | `pair-index-readonly` | The file or its volume does not let this account write. |
-| `pair-index-corrupt` | The file failed its integrity check (on the run's first open, or on a reopen that found it changed), redb repaired damage in it, a stored record, path or `meta` value does not decode, or a previous run stopped inside redb on it (`<profile>.redb.panicked`). The file is set aside as `<profile>.redb.corrupt-<epoch>` (one copy, swept after 7 days), nothing from it is served, and the index is rebuilt from this run. |
+| `pair-index-corrupt` | The file failed its integrity check (on the run's first open, or on a reopen that found it changed), redb repaired damage in it, a stored record, path or `meta` value does not decode, or a previous run stopped inside redb on it (`<profile>.redb.panicked`). The file is set aside as `<profile>.redb.corrupt-<epoch>` (one copy, swept after 7 days; earlier copies that cannot be removed are named `pair-index-cleanup-failed`, and with three of them the damaged file is deleted instead of kept), nothing from it is served, and the index is rebuilt from this run. |
 | `pair-index-format-unsupported` | The file is in a format this build's redb does not read; set aside and rebuilt. |
 | `pair-index-store-failed` | The end-of-run write failed (a full volume); the previous evidence stays valid. |
 | `pair-index-unsafe` | The file is a link, not a regular file, owned by someone else, or shared with group or other. |

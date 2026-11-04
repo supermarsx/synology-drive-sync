@@ -644,6 +644,103 @@ fn an_undecodable_record_sets_the_file_aside_instead_of_failing_every_run() {
     }
 }
 
+/// A copy that cannot be removed: a non-empty directory under a copy's name, which
+/// `remove_file` refuses whatever the permissions.
+fn stuck_copy(dir: &Dir, epoch: u64, old: bool) -> PathBuf {
+    let path = dir.0.join(format!("photos.redb.corrupt-{epoch}"));
+    fs::create_dir_all(path.join("inside")).unwrap();
+    if old {
+        fs::File::open(&path)
+            .unwrap()
+            .set_modified(std::time::SystemTime::now() - Duration::from_secs(30 * 86_400))
+            .unwrap();
+    }
+    path
+}
+
+/// S3-7: the weekly sweep of quarantined copies ignored a copy it could not remove. It is named
+/// once, with the first path and cause and how many more, and the index is still used.
+#[test]
+fn a_quarantined_copy_the_sweep_cannot_remove_is_named_once() {
+    let dir = Dir::new("sweep");
+    prepare_directory(&dir.0).unwrap();
+    let first = stuck_copy(&dir, 1, true);
+    let second = stuck_copy(&dir, 2, true);
+    let recent = stuck_copy(&dir, 3, false);
+    let notes = prepare_directory(&dir.0).expect("the directory is still usable");
+    assert_eq!(notes.len(), 1, "{notes:?}");
+    assert_eq!(notes[0].code, "pair-index-cleanup-failed");
+    assert!(
+        [first.display().to_string(), second.display().to_string()].contains(&notes[0].path),
+        "{notes:?}"
+    );
+    assert!(
+        notes[0].cause.contains("older than 7 days") && notes[0].cause.contains("1 more"),
+        "{}",
+        notes[0].cause
+    );
+    assert!(recent.exists(), "a recent copy is not swept");
+}
+
+/// S3-7: copies a damaged file's quarantine could not remove are named, and past three a damaged
+/// file is deleted instead of set aside, so copies cannot pile up.
+#[test]
+fn copies_that_cannot_be_removed_are_named_and_bounded() {
+    for stuck in [1_u64, 3] {
+        let dir = Dir::new("bounded");
+        write(&dir, 100, 1);
+        for epoch in 0..stuck {
+            stuck_copy(&dir, epoch + 1, false);
+        }
+        fs::OpenOptions::new()
+            .write(true)
+            .open(database(&dir))
+            .unwrap()
+            .set_len(4096)
+            .unwrap();
+        let opened = RedbPairIndex::open(paths(&dir), 8);
+        let codes: Vec<&str> = opened.issues.iter().map(|issue| issue.code).collect();
+        assert_eq!(
+            codes,
+            vec!["pair-index-corrupt", "pair-index-cleanup-failed"],
+            "{stuck}: {:?}",
+            opened.issues
+        );
+        assert!(
+            opened.issues[1]
+                .path
+                .contains(&dir.0.join("photos.redb.corrupt-").display().to_string()),
+            "{:?}",
+            opened.issues[1]
+        );
+        let copies = fs::read_dir(&dir.0)
+            .unwrap()
+            .flatten()
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .contains(".redb.corrupt-")
+            })
+            .count();
+        if stuck < 3 {
+            assert!(opened.issues[0].cause.contains("set aside as"));
+            assert_eq!(copies as u64, stuck + 1, "the damaged file is kept");
+        } else {
+            assert!(
+                opened.issues[0]
+                    .cause
+                    .contains("deleted rather than set aside"),
+                "{}",
+                opened.issues[0].cause
+            );
+            assert_eq!(copies as u64, stuck, "no copy is added past the bound");
+        }
+        let mut backend = opened.backend.expect("a new, empty index");
+        assert!(read_all(&mut backend).is_empty());
+    }
+}
+
 /// The panic record, read: a file a previous run's redb panicked on is set aside before redb
 /// opens it again, and the record goes with it.
 #[test]

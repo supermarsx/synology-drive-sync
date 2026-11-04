@@ -65,6 +65,9 @@ pub const LOCK_WAIT: Duration = Duration::from_secs(30);
 const LOCK_RETRY: Duration = Duration::from_millis(250);
 /// Quarantined copies older than this are swept.
 const QUARANTINE_AGE: Duration = Duration::from_secs(7 * 86_400);
+/// Earlier copies of one profile that could not be removed, past which a damaged file is deleted
+/// instead of set aside, so copies cannot pile up without bound.
+const MAX_STUCK_COPIES: usize = 3;
 /// Bytes per stored pair the compaction rule budgets.
 const COMPACT_BYTES_PER_ENTRY: u64 = 300;
 const COMPACT_SLACK_BYTES: u64 = 64 * 1024 * 1024;
@@ -346,7 +349,10 @@ impl Fingerprint {
 }
 
 /// Make `directory` the index's own: created 0700 when missing, private, and claimed by marker.
-pub fn prepare_directory(directory: &Path) -> Result<(), IndexIssue> {
+///
+/// `Ok` carries what the directory's upkeep could not do (a quarantined copy that could not be
+/// swept), for the run to name; none of it stops the index being used.
+pub fn prepare_directory(directory: &Path) -> Result<Vec<IndexIssue>, IndexIssue> {
     let unusable = |cause: String| {
         IndexIssue::warning(
             "pair-index-directory-unusable",
@@ -381,31 +387,80 @@ pub fn prepare_directory(directory: &Path) -> Result<(), IndexIssue> {
         },
     )
     .map_err(unusable)?;
-    sweep_quarantine(directory);
-    Ok(())
+    Ok(sweep_quarantine(directory).into_iter().collect())
 }
 
-/// Remove quarantined copies past [`QUARANTINE_AGE`]. Best effort: a copy that stays is harmless.
-fn sweep_quarantine(directory: &Path) {
-    let Ok(entries) = fs::read_dir(directory) else {
-        return;
+/// Remove quarantined copies past [`QUARANTINE_AGE`]. A copy that stays costs only space, so a
+/// failure does not stop the run; it is named once (`pair-index-cleanup-failed`, the first path
+/// and cause, and how many more), because copies that can never be removed would pile up.
+fn sweep_quarantine(directory: &Path) -> Option<IndexIssue> {
+    let entries = match fs::read_dir(directory) {
+        Ok(entries) => entries,
+        Err(error) => {
+            return Some(IndexIssue::warning(
+                "pair-index-cleanup-failed",
+                directory.display().to_string(),
+                format!("quarantined copies could not be listed for their weekly sweep: {error}"),
+            ));
+        }
     };
     let now = SystemTime::now();
-    for entry in entries.flatten() {
+    let mut failures = Failures::default();
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) => {
+                failures.add(directory, format!("an entry could not be read: {error}"));
+                continue;
+            }
+        };
         let is_copy = entry
             .file_name()
             .to_str()
             .is_some_and(|name| name.contains(SUFFIX_CORRUPT));
+        if !is_copy {
+            continue;
+        }
+        // Not following a link: a link named like a copy is the link's to lose, not its target's.
         let old = entry
             .metadata()
             .ok()
-            .filter(fs::Metadata::is_file)
             .and_then(|metadata| metadata.modified().ok())
             .and_then(|modified| now.duration_since(modified).ok())
             .is_some_and(|age| age > QUARANTINE_AGE);
-        if is_copy && old {
-            let _ = fs::remove_file(entry.path());
+        if old && let Err(error) = fs::remove_file(entry.path()) {
+            failures.add(&entry.path(), error.to_string());
         }
+    }
+    failures.issue("a quarantined copy older than 7 days could not be removed")
+}
+
+/// Removals that failed, named once: the first path and cause, and how many more.
+#[derive(Default)]
+struct Failures {
+    first: Option<(PathBuf, String)>,
+    count: usize,
+}
+
+impl Failures {
+    fn add(&mut self, path: &Path, cause: String) {
+        self.count += 1;
+        if self.first.is_none() {
+            self.first = Some((path.to_path_buf(), cause));
+        }
+    }
+
+    fn issue(self, what: &str) -> Option<IndexIssue> {
+        let (path, cause) = self.first?;
+        let more = match self.count {
+            1 => String::new(),
+            count => format!(" ({} more failed the same way or another)", count - 1),
+        };
+        Some(IndexIssue::warning(
+            "pair-index-cleanup-failed",
+            path.display().to_string(),
+            format!("{what}: {cause}{more}"),
+        ))
     }
 }
 
@@ -479,38 +534,90 @@ fn unix_now() -> i64 {
 
 /// Set a file that failed its check aside as `<profile>.redb.corrupt-<epoch>`, keeping one copy,
 /// so the run rebuilds from its own evidence.
-fn quarantine(paths: &IndexPaths) -> Result<PathBuf, String> {
-    if let Ok(entries) = fs::read_dir(&paths.directory) {
-        let prefix = format!("{}{SUFFIX_CORRUPT}", paths.profile);
-        for entry in entries.flatten() {
-            if entry
-                .file_name()
-                .to_str()
-                .is_some_and(|name| name.starts_with(&prefix))
-            {
-                let _ = fs::remove_file(entry.path());
+fn quarantine(paths: &IndexPaths) -> Result<Quarantined, String> {
+    let prefix = format!("{}{SUFFIX_CORRUPT}", paths.profile);
+    let mut failures = Failures::default();
+    match fs::read_dir(&paths.directory) {
+        Ok(entries) => {
+            for entry in entries {
+                match entry {
+                    Ok(entry)
+                        if entry
+                            .file_name()
+                            .to_str()
+                            .is_some_and(|name| name.starts_with(&prefix)) =>
+                    {
+                        if let Err(error) = fs::remove_file(entry.path()) {
+                            failures.add(&entry.path(), error.to_string());
+                        }
+                    }
+                    Ok(_) => {}
+                    Err(error) => failures.add(
+                        &paths.directory,
+                        format!("an entry could not be read: {error}"),
+                    ),
+                }
             }
         }
+        Err(error) => failures.add(
+            &paths.directory,
+            format!("earlier copies could not be listed: {error}"),
+        ),
     }
-    let target = paths
-        .directory
-        .join(format!("{}{SUFFIX_CORRUPT}{}", paths.profile, unix_now()));
-    fs::rename(&paths.database, &target)
-        .map_err(|error| format!("could not be set aside as {}: {error}", target.display()))?;
+    let stuck = failures.count;
+    let cleanup = failures.issue("an earlier quarantined copy could not be removed");
+    let kept = if stuck >= MAX_STUCK_COPIES {
+        // Copies that cannot be removed would pile up, one per damaged file: past the bound the
+        // damaged file is deleted instead of kept, and the cleanup failure says why.
+        fs::remove_file(&paths.database).map_err(|error| {
+            format!(
+                "could not be removed ({error}), and is not set aside because {stuck} earlier \
+                 copies could not be removed either"
+            )
+        })?;
+        None
+    } else {
+        let target =
+            paths
+                .directory
+                .join(format!("{}{SUFFIX_CORRUPT}{}", paths.profile, unix_now()));
+        fs::rename(&paths.database, &target)
+            .map_err(|error| format!("could not be set aside as {}: {error}", target.display()))?;
+        Some(target)
+    };
     // The panic record names the file just set aside, not the one that replaces it.
     match fs::remove_file(&paths.panicked) {
         Ok(()) => {}
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => {
             return Err(format!(
-                "was set aside as {}, but its panic record {} could not be removed ({error}), \
-                 so the next run would set the new file aside too",
-                target.display(),
+                "was set aside, but its panic record {} could not be removed ({error}), so the \
+                 next run would set the new file aside too",
                 paths.panicked.display()
             ));
         }
     }
-    Ok(target)
+    Ok(Quarantined { kept, cleanup })
+}
+
+/// What setting a damaged file aside did.
+struct Quarantined {
+    /// Where the copy was kept, or `None` when it was deleted (see [`MAX_STUCK_COPIES`]).
+    kept: Option<PathBuf>,
+    /// Earlier copies that could not be removed, named once.
+    cleanup: Option<IndexIssue>,
+}
+
+impl Quarantined {
+    fn describe(&self) -> String {
+        match &self.kept {
+            Some(target) => format!("set aside as {}", target.display()),
+            None => format!(
+                "deleted rather than set aside, because {MAX_STUCK_COPIES} or more earlier \
+                 copies could not be removed"
+            ),
+        }
+    }
 }
 
 /// What opening and checking the file found.
@@ -828,18 +935,19 @@ impl RedbPairIndex {
         self.trusted = None;
         self.entries = None;
         let label = self.paths.label();
-        let target = quarantine(&self.paths).map_err(|why| {
+        let quarantined = quarantine(&self.paths).map_err(|why| {
             IndexIssue::warning(damage.code(), label.clone(), format!("{cause}; {why}"))
         })?;
         self.notes.push(IndexIssue::warning(
             damage.code(),
             label.clone(),
             format!(
-                "{cause}; set aside as {}: nothing from it is served, and the index is rebuilt \
-                 from this run's evidence",
-                target.display()
+                "{cause}; {}: nothing from it is served, and the index is rebuilt from this \
+                 run's evidence",
+                quarantined.describe()
             ),
         ));
+        self.notes.extend(quarantined.cleanup);
         self.discarded = true;
         self.meta = Some(None);
         let fresh = open_checked(&self.paths, self.cache_mib, None);
