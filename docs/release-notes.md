@@ -116,11 +116,17 @@ lists its own commits.
 - **A realtime source too large to walk within 2 minutes is still synced.**
   - The walk and arm deadlines grow, named (`walk_deadline_exceeded`), up to 30 minutes.
   - Meanwhile the routine stays amber (`watch_setup_failed`) and the whole tree is synced at most
-    once per poll interval, at most hourly.
-  - A disarmed routine's walk ends at once, and all walks share one cap of 16.
+    every 15 minutes (every poll interval if that is longer, at most hourly), not once a minute.
+    The grown deadline and that cadence survive the native-watch retries.
+  - Every backend report is logged (`routine_backend`), so `walk_deadline_exceeded` and skipped
+    entries reach `controller.log`.
+  - A disarmed routine's walks end at once, and all walks share one cap of 16; a walk the cap
+    refuses is named as the cap (`walk_cap`) and retried within 15 s.
 - **The control socket keeps room for `ping` and `status`.**
   - One deadline covers a whole request.
-  - Long verbs (`wait`, `mutate`, `stop`) are limited to 16 of 32 connections.
+  - `ping`, `status` and `stop` have reserved slots; `wait` and `mutate` are limited to 16 of 32.
+  - A connection counts only once its verb is read, and a waiter whose client hung up frees its
+    slot (`ctl_peer_gone`).
   - A client's connect is bounded.
   - Accept failures are named and backed off.
 - **Runs:**

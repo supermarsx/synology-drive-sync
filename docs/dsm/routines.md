@@ -130,9 +130,15 @@ watcher gives up and names that directory (`watch_setup_failed`, `deadline=120s`
 engine a tree that is simply too large to walk in time is not left unobserved. The arm deadline and
 the polling walk's deadline double on each attempt, up to 30 minutes, and the backend detail names
 the growth (`walk_deadline_exceeded … next_walk_deadline_seconds=N`). While no walk finishes, the
-routine stays amber (`watch_setup_failed`) and the whole tree is synced at most once per poll
-interval, and at most hourly. Disarming a routine ends its walk at once, and the process keeps at
-most 16 walks blocked in the filesystem. If the kernel drops
+routine stays amber (`watch_setup_failed`) and the whole tree is synced at most every 15 minutes
+(every poll interval if that is longer, and at most hourly); a tree that cannot be walked is
+expensive to sync, so it is not synced once a minute, and what the poller has learned (the grown
+deadline, when the tree was last synced whole) survives the daemon's native-watch retries. Every
+backend report is logged as a `routine_backend` line, so the growth is in `controller.log`.
+Disarming a routine ends its walk at once (the floor's walks too), and the process runs at most 16
+directory walks at a time. A walk refused by that cap is named as the cap (`walk_cap`: other
+routines are arming, or walks abandoned on a stalled disk have not returned) and is tried again
+within 15 seconds, not after the 10-minute polling backoff. If the kernel drops
 events (`IN_Q_OVERFLOW`), the watcher re-walks the tree to restore its watches and reports that the whole
 tree must be treated as changed, so a run is triggered. The watcher keeps about 6 MiB of
 memory at 20,000 directories and about 16 MiB at 100,000. A directory created while watching is added to
