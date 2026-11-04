@@ -1723,6 +1723,39 @@ fn the_audit_health_is_published_in_controller_state() {
     );
 }
 
+/// N-D5 (status half, asked by fix6-watch): the change source's account of
+/// a degraded backend reaches `ctl status` as `backend_detail`, the latest
+/// one, even when backend and reason did not change.
+#[test]
+fn status_carries_the_backends_detail() {
+    let h = realtime_harness("backend-detail");
+    h.wait_for("arm", Duration::from_secs(5), |h| {
+        armed_generation(h, "docs").is_some()
+    });
+    let detail = |h: &Harness| {
+        h.ask(Request::Status)["routines"]
+            .as_array()
+            .and_then(|list| list.iter().find(|r| r["profile"] == "docs").cloned())
+            .map(|r| r["backend_detail"].clone())
+            .unwrap_or(Value::Null)
+    };
+    for account in [
+        "walk_deadline_exceeded seconds=120 path=/volume1/docs",
+        "walk_deadline_exceeded seconds=240 path=/volume1/docs",
+    ] {
+        h.tx.send(Msg::Change(ChangeEvent::Backend {
+            routine: "docs".into(),
+            backend: Backend::Polling,
+            reason: BackendReason::WatchSetupFailed,
+            detail: account.into(),
+        }))
+        .unwrap();
+        h.wait_for("the detail in status", Duration::from_secs(5), |h| {
+            detail(h) == Value::from(account)
+        });
+    }
+}
+
 /// The paths `ctl status` lists as `config_unreadable`.
 fn unreadable_paths(h: &Harness) -> Vec<String> {
     h.ask(Request::Status)["config_unreadable"]

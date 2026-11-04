@@ -284,6 +284,9 @@ struct Entry {
     dirty: DirtySet,
     source: SourceStatus,
     backend: Option<(Backend, BackendReason)>,
+    /// The change source's last account of the backend (N-D5): its cause,
+    /// one line, at most 240 bytes. Cleared when the routine is re-armed.
+    backend_detail: Option<String>,
     /// What the change source is watching for this routine, if anything.
     armed: Option<ArmSpec>,
     /// When the safety-net whole-tree run is next due (design §2.3: inotify
@@ -1138,6 +1141,7 @@ impl Control {
                 dirty: DirtySet::default(),
                 source: SourceStatus::Ok,
                 backend: None,
+                backend_detail: None,
                 armed: None,
                 full_due: None,
             });
@@ -1198,12 +1202,14 @@ impl Control {
                             changes.arm(wanted.clone());
                         }
                         entry.armed = Some(wanted);
+                        entry.backend_detail = None;
                     }
                     (None, Some(_)) => {
                         if let Some(changes) = self.changes.as_mut() {
                             changes.disarm(&name);
                         }
                         entry.armed = None;
+                        entry.backend_detail = None;
                         entry.dirty = DirtySet::default();
                     }
                     (None, None) => {}
@@ -2773,6 +2779,16 @@ impl Control {
 
     fn change(&mut self, event: ChangeEvent) {
         let now = Instant::now();
+        // N-D5: the backend's cause is carried into `ctl status`
+        // (`backend_detail`), whatever the log below makes of the report.
+        if let ChangeEvent::Backend {
+            routine, detail, ..
+        } = &event
+            && let Some(entry) = self.routines.get_mut(routine)
+        {
+            let detail = sanitize_detail(detail.trim(), 240);
+            entry.backend_detail = (!detail.is_empty()).then_some(detail);
+        }
         match event {
             ChangeEvent::Changed { routine, dir } => {
                 if let Some(entry) = self.routines.get_mut(&routine) {
@@ -3144,6 +3160,7 @@ impl Control {
                     "state": state.map(|s| s.state.as_str()),
                     "backend": state.map(|s| s.backend.as_str()),
                     "backend_reason": state.map(|s| s.backend_reason.as_str()),
+                    "backend_detail": e.backend_detail,
                     "next_run_epoch": state.map(|s| s.next_run),
                     "pending_change": !e.dirty.is_empty(),
                     "mode": e.routine.as_ref().ok().and_then(|r| r.as_ref()).map(|r| r.mode.as_str()),
