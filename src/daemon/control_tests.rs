@@ -1358,6 +1358,56 @@ fn runs_wait_for_service_admission() {
     h.wait_for("the run", Duration::from_secs(5), |h| h.launched() >= 1);
 }
 
+/// `wait` answers with the run's own exit and outcome, or names a timeout.
+#[test]
+fn wait_answers_with_the_runs_own_ending() {
+    let h = Harness::new("wait", |home, _| profile(home, "alpha"));
+    *h.plan.lock().unwrap() = Plan {
+        finish_after: Some(Duration::from_millis(300)),
+        exit: 3,
+        stop_takes: Duration::ZERO,
+    };
+    let queued = h.ask(run("alpha"));
+    let id = queued["id"].as_u64().unwrap();
+    let done = ask(
+        &h.tx,
+        Request::Wait {
+            id,
+            within: Duration::from_secs(5),
+        },
+        Duration::from_secs(10),
+    );
+    assert_eq!(done["finished"], true, "{done}");
+    assert_eq!(done["exit"], 3);
+    assert_eq!(done["outcome"], "partial");
+    // Asked again after the end: the same answer.
+    let again = h.ask(Request::Wait {
+        id,
+        within: Duration::from_secs(1),
+    });
+    assert_eq!(again["exit"], 3);
+    // A run still going when the deadline passes: named, exit 75.
+    *h.plan.lock().unwrap() = Plan {
+        finish_after: Some(Duration::from_secs(5)),
+        exit: 0,
+        stop_takes: Duration::ZERO,
+    };
+    let long = h.ask(run("alpha"))["id"].as_u64().unwrap();
+    let timed_out = h.ask(Request::Wait {
+        id: long,
+        within: Duration::from_millis(300),
+    });
+    assert_eq!(timed_out["code"], "wait_timeout", "{timed_out}");
+    assert_eq!(timed_out["exit"], 75);
+    assert_eq!(
+        h.ask(Request::Wait {
+            id: 999,
+            within: Duration::from_secs(1)
+        })["code"],
+        "run_unknown"
+    );
+}
+
 /// Every plan and sync gets the verified-pair index directory.
 #[test]
 fn runs_are_given_the_pair_index_directory() {

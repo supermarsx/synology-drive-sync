@@ -127,6 +127,13 @@ pub(crate) enum Request {
         profile: String,
     },
     Mutate(Mutation),
+    /// Answer when run `id` has finished (its exit, outcome and reason), or
+    /// `wait_timeout` after `within`: what `sdsync-dsm run --wait` needs to
+    /// keep the CLI's exit status the sync's own.
+    Wait {
+        id: u64,
+        within: Duration,
+    },
 }
 
 pub(crate) enum Msg {
@@ -341,6 +348,10 @@ pub(crate) struct Control {
     events: VecDeque<Value>,
     in_flight: BTreeMap<u64, InFlightMutation>,
     blocked: BTreeMap<String, Blocked>,
+    /// The last finished runs, for `wait`.
+    finished_runs: VecDeque<(u64, Value)>,
+    /// `wait` requests not yet answered: run id, deadline, reply.
+    waiters: Vec<(u64, Instant, Sender<Value>)>,
     suppressed_logged: std::collections::HashMap<String, Instant>,
     lasting_reported: HashSet<String>,
     last_controller_write: Option<Instant>,
@@ -406,6 +417,8 @@ impl Control {
             events: VecDeque::new(),
             in_flight: BTreeMap::new(),
             blocked: BTreeMap::new(),
+            finished_runs: VecDeque::new(),
+            waiters: Vec::new(),
             suppressed_logged: std::collections::HashMap::new(),
             lasting_reported: HashSet::new(),
             last_controller_write: None,
@@ -553,6 +566,9 @@ impl Control {
     fn next_wake(&self) -> Duration {
         let mut wake = self.settings.wake_cap;
         let instant_now = Instant::now();
+        for (_, deadline, _) in &self.waiters {
+            wake = wake.min(deadline.saturating_duration_since(instant_now));
+        }
         if let Some(deadline) = self.shutdown_deadline {
             wake = wake.min(deadline.saturating_duration_since(instant_now));
         }
@@ -934,7 +950,25 @@ impl Control {
 
     // ------------------------------------------------------------ the turn
 
+    /// Answer the `wait`s whose deadline passed: the run goes on, named.
+    fn expire_waiters(&mut self) {
+        let now = Instant::now();
+        let (expired, kept): (Vec<_>, Vec<_>) = std::mem::take(&mut self.waiters)
+            .into_iter()
+            .partition(|(_, deadline, _)| now >= *deadline);
+        self.waiters = kept;
+        for (id, _, reply) in expired {
+            let mut answer = refusal(
+                "wait_timeout",
+                &format!("run {id} has not finished; it goes on (follow it with status)"),
+            );
+            answer["exit"] = json!(75);
+            let _ = reply.send(answer);
+        }
+    }
+
     fn turn(&mut self) {
+        self.expire_waiters();
         // Configuration is cheap to read and the shell re-read it every turn;
         // a save whose HUP never arrived still takes effect.
         self.reload("turn");
@@ -1913,6 +1947,28 @@ impl Control {
         let Some(mut active) = self.active.take() else {
             return;
         };
+        // `wait` answers: the run's own exit, outcome and reason.
+        {
+            let verdict = classify(&report);
+            let done = json!({
+                "ok": true, "id": active.request.id, "scope": active.request.scope,
+                "finished": true, "exit": report.exit, "outcome": verdict.outcome.as_str(),
+                "reason": verdict.reason, "detail": verdict.detail,
+            });
+            if self.finished_runs.len() == 64 {
+                self.finished_runs.pop_front();
+            }
+            self.finished_runs
+                .push_back((active.request.id, done.clone()));
+            let id = active.request.id;
+            let (ready, kept): (Vec<_>, Vec<_>) = std::mem::take(&mut self.waiters)
+                .into_iter()
+                .partition(|(run, _, _)| *run == id);
+            self.waiters = kept;
+            for (_, _, reply) in ready {
+                let _ = reply.send(done.clone());
+            }
+        }
         if let Some(cause) = &report.audit_error {
             // The outbox still holds the run's record; the next reconciliation
             // completes it. Named, never silent.
@@ -2472,6 +2528,20 @@ impl Control {
                 let _ = reply.send(self.cancel(id));
             }
             Request::Mutate(mutation) => self.mutate(mutation, reply),
+            Request::Wait { id, within } => {
+                if let Some((_, done)) = self.finished_runs.iter().find(|(run, _)| *run == id) {
+                    let _ = reply.send(done.clone());
+                } else if self.active.as_ref().is_some_and(|a| a.request.id == id)
+                    || self.queue.iter().any(|r| r.id == id)
+                {
+                    self.waiters.push((id, Instant::now() + within, reply));
+                } else {
+                    let _ = reply.send(refusal(
+                        "run_unknown",
+                        "no queued, running or recently finished run has that id",
+                    ));
+                }
+            }
         }
     }
 

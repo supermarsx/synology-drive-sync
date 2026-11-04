@@ -61,6 +61,17 @@ pub(crate) fn parse_request(
         "cancel" => Request::Cancel {
             id: value["id"].as_u64(),
         },
+        "wait" => {
+            let id = value["id"].as_u64().ok_or("wait needs the run id")?;
+            let wait = value["wait_s"].as_u64().unwrap_or(3600).clamp(1, 86_400);
+            return Ok((
+                Request::Wait {
+                    id,
+                    within: Duration::from_secs(wait),
+                },
+                Duration::from_secs(wait + 5),
+            ));
+        }
         "run" | "plan" => {
             let scope = text("scope").unwrap_or_else(|| "all".into());
             if scope != "all" && !valid_name(&scope) {
@@ -266,6 +277,9 @@ pub(crate) fn request_from_args(verb: &str, pairs: &[String]) -> Result<(Value, 
     let deadline = match verb {
         "stop" => Duration::from_secs(request["wait_s"].as_u64().unwrap_or(30).clamp(1, 120) + 5),
         "mutate" => Duration::from_secs(130),
+        "wait" => {
+            Duration::from_secs(request["wait_s"].as_u64().unwrap_or(3600).clamp(1, 86_400) + 10)
+        }
         _ => Duration::from_secs(10),
     };
     Ok((request, deadline))
