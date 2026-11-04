@@ -198,6 +198,7 @@ pub const ISSUE_CODES: &[&str] = &[
     "pair-index-remote-ctime-unavailable",
     "pair-index-writeback-unknown",
     "pair-index-writeback-unbounded",
+    "pair-index-nas-clock-skewed",
 ];
 
 impl IndexIssue {
@@ -422,6 +423,8 @@ pub struct IndexSession {
     /// Keys looked up whose facts no longer matched.
     invalidated: BTreeSet<String>,
     canary_at: i64,
+    /// `pair-index-nas-clock-skewed` was named this run: once is enough.
+    clock_skew_named: bool,
     pub report: IndexReport,
 }
 
@@ -510,6 +513,7 @@ impl IndexSession {
             upserts: BTreeMap::new(),
             invalidated: BTreeSet::new(),
             canary_at,
+            clock_skew_named: false,
             report,
         }
     }
@@ -635,6 +639,15 @@ impl IndexSession {
     /// within the local racy window of it (from the whole second, as `verified_at` stores it, so
     /// the serve-time check agrees), or a remote one within the NAS window of the `MD5.start`
     /// clock (or no NAS clock at all), makes the record racy.
+    ///
+    /// The NAS clock is the `Date` header of `MD5.start`, which a proxy or a NAS with the wrong
+    /// time can set to anything (D3). Every `MD5.start` of the pass ran between `read_started`
+    /// and `observed_at` (when the pass finished) by this host's clock, so a NAS clock outside
+    /// that interval by more than [`NAS_CLOCK_TOLERANCE_SECONDS`] is not one the window can be
+    /// judged by: the record is stored racy, and the condition is named once per run
+    /// (`pair-index-nas-clock-skewed`). A long pass widens the interval, so this bounds a clock
+    /// that is wrong by more than the pass took; a short pass, the realtime case, bounds it
+    /// tightly.
     pub fn harvest(
         &mut self,
         local: &LocalInventory,
@@ -642,11 +655,16 @@ impl IndexSession {
         live: &BTreeSet<String>,
         spellings: &BTreeMap<String, String>,
         read_started: SystemTime,
+        observed_at: SystemTime,
     ) {
         if self.broken {
             return;
         }
         let started = unix_seconds(read_started);
+        let earliest = started.saturating_sub(NAS_CLOCK_TOLERANCE_SECONDS);
+        let latest = unix_seconds(observed_at)
+            .max(started)
+            .saturating_add(NAS_CLOCK_TOLERANCE_SECONDS);
         for remote_relative in live {
             let local_relative = spellings
                 .get(remote_relative)
@@ -684,8 +702,14 @@ impl IndexSession {
                 verified_at_nas: remote_entry.digest_nas_time,
                 racy: false,
             };
+            let skewed = remote_entry
+                .digest_nas_time
+                .filter(|clock| *clock < earliest || *clock > latest);
+            if let Some(clock) = skewed {
+                self.name_clock_skew(remote_relative, clock, earliest, latest);
+            }
             let record = PairRecord {
-                racy: self.racy_by_window(&record),
+                racy: skewed.is_some() || self.racy_by_window(&record),
                 ..record
             };
             self.upserts.insert(
@@ -782,6 +806,37 @@ impl IndexSession {
         self.report.remote_signal = Some(self.signal);
         self.report.issues.extend(self.backend.take_notes());
         self.report
+    }
+
+    /// Name, once per run, a NAS clock the remote racy window cannot be judged by.
+    fn name_clock_skew(&mut self, relative: &str, clock: i64, earliest: i64, latest: i64) {
+        if std::mem::replace(&mut self.clock_skew_named, true) {
+            return;
+        }
+        let off = if clock < earliest {
+            format!(
+                "{} s behind",
+                earliest + NAS_CLOCK_TOLERANCE_SECONDS - clock
+            )
+        } else {
+            format!(
+                "{} s ahead of",
+                clock - (latest - NAS_CLOCK_TOLERANCE_SECONDS)
+            )
+        };
+        self.report.issues.push(IndexIssue::warning(
+            "pair-index-nas-clock-skewed",
+            relative,
+            format!(
+                "the NAS clock from the Date header of its MD5.start ({clock}) is {off} this \
+                 host's clock while the pass read ({}..{}, {NAS_CLOCK_TOLERANCE_SECONDS} s \
+                 allowed), so it cannot show whether a NAS change time is settled; pairs proven \
+                 by it are stored racy and verified live next run. Check the time settings of \
+                 the NAS, and of any proxy in front of it",
+                earliest + NAS_CLOCK_TOLERANCE_SECONDS,
+                latest - NAS_CLOCK_TOLERANCE_SECONDS
+            ),
+        ));
     }
 
     /// Whether `record`'s change times fall within this run's racy windows of the clocks that
@@ -928,7 +983,14 @@ impl EvidenceSource for IndexSession {
         spellings: &BTreeMap<String, String>,
         read_started: SystemTime,
     ) {
-        self.harvest(local, remote, live, spellings, read_started);
+        self.harvest(
+            local,
+            remote,
+            live,
+            spellings,
+            read_started,
+            SystemTime::now(),
+        );
     }
 
     fn conclude(&mut self, evidence: &EvidenceReport) {

@@ -68,6 +68,9 @@ restore) that keeps size and mtime.
   (`dirty_writeback_centisecs` = 0) nothing bounds it, so no local evidence is served
   (`pair-index-writeback-unbounded`). On macOS, which has no such setting to read, it is 60 s.
   The NAS side uses 60 s too: DSM runs the kernel defaults, which cannot be read from the client.
+  Its clock is the `Date` header of the `MD5.start` that read the copy; one more than 20 s outside
+  this host's clock during the pass (a proxy's clock, or a NAS with the wrong time) cannot judge
+  the window, so the pair is stored racy and the run names `pair-index-nas-clock-skewed` once.
   The windows are applied again when a record is about to be served, so evidence settled under a
   shorter window is not served on its word. A file changed within the window of a run is read
   live once more on the next run, after which it is served as before.
@@ -95,6 +98,7 @@ and a fully live run. None fails a run or makes it partial.
 | `pair-index-unbound` | File Station did not name the host serving the run, which the index binds to. |
 | `pair-index-writeback-unknown` | `/proc/sys/vm/dirty_expire_centisecs` or `dirty_writeback_centisecs` could not be read (path and cause named); the local racy window is 60 s. |
 | `pair-index-writeback-unbounded` | Periodic writeback is switched off (`dirty_writeback_centisecs` = 0), so no window bounds a mapped write: nothing local is served and every pair is verified live. |
+| `pair-index-nas-clock-skewed` | The NAS clock (`Date` of an `MD5.start`) stood more than 20 s outside this host's clock while the pass read; evidence it proved is stored racy and verified live next run. Fix the NAS's (or a proxy's) time. |
 | `pair-index-retired` (info) | The index was bound to another profile, source, remote root or NAS, or an older comparison semantics; it was cleared. Semantics epoch 1 (the two-second racy window) is retired by name. |
 | `pair-index-not-applicable` (info) | The run does not compare content, so it neither reads nor writes the index. |
 | `pair-index-unsupported-platform` (info) | Windows: a directory walk exposes no status-change time or file identity, so the index is never used there. |

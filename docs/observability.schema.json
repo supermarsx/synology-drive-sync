@@ -62,7 +62,8 @@
                   "pair-index-link-guard-unchecked",
                   "pair-index-remote-ctime-unavailable",
                   "pair-index-writeback-unknown",
-                  "pair-index-writeback-unbounded"
+                  "pair-index-writeback-unbounded",
+                  "pair-index-nas-clock-skewed"
                 ]
               },
               "severity": { "enum": ["info", "warning"] },

@@ -139,7 +139,14 @@ fn proven(pairs: &[(&str, Facts)]) -> MemoryPairIndex {
         options(0),
         at(OLD),
     );
-    session.harvest(&local, &remote, &keys(&remote), &BTreeMap::new(), at(OLD));
+    session.harvest(
+        &local,
+        &remote,
+        &keys(&remote),
+        &BTreeMap::new(),
+        at(OLD),
+        at(OLD),
+    );
     let index = MemoryPairIndex {
         pairs: std::mem::take(&mut session.upserts).into_iter().collect(),
         meta: Some(IndexMeta {
@@ -257,6 +264,7 @@ fn a_write_within_the_racy_window_is_stored_but_never_served() {
         &keys(&remote),
         &BTreeMap::new(),
         at(read_started),
+        at(read_started),
     );
     let racy: Vec<&str> = writer
         .upserts
@@ -283,6 +291,58 @@ fn a_write_within_the_racy_window_is_stored_but_never_served() {
     assert_eq!(session.report.racy, 2);
 }
 
+/// D3: the NAS clock is the `Date` header of `MD5.start`, which a proxy, or a NAS whose time is
+/// wrong, can set to anything. One that stands more than the tolerance from this host's clock
+/// during the reads cannot rule the remote window out: the record is stored racy, and the
+/// condition is named once per run, however many pairs it touched.
+#[test]
+fn a_nas_clock_that_disagrees_with_the_local_clock_makes_the_record_racy() {
+    let now = SystemTime::now();
+    let now_seconds = unix_seconds(now);
+    let mut settled = facts();
+    settled.ctime_ns = (now_seconds - 3_600) * 1_000_000_000;
+    // By an hour-slow NAS clock, the remote change time looks long settled.
+    let behind = now_seconds - 3_600;
+    settled.remote_ctime = Some(behind - 120);
+    let (local, mut remote) = tree(&[
+        ("behind-1.jpg", settled, Some(MD5_A)),
+        ("behind-2.jpg", settled, Some(MD5_A)),
+        ("ahead.jpg", settled, Some(MD5_A)),
+        ("close.jpg", settled, Some(MD5_A)),
+    ]);
+    for (name, clock) in [
+        ("behind-1.jpg", behind),
+        ("behind-2.jpg", behind),
+        ("ahead.jpg", now_seconds + 3_600),
+        ("close.jpg", now_seconds - NAS_CLOCK_TOLERANCE_SECONDS + 5),
+    ] {
+        remote.entries.get_mut(name).unwrap().digest_nas_time = Some(clock);
+    }
+    let mut writer = IndexSession::open(
+        Box::new(MemoryPairIndex::default()),
+        binding(),
+        options(0),
+        now,
+    );
+    writer.observe_live(&local, &remote, &keys(&remote), &BTreeMap::new(), now);
+    let racy: Vec<&str> = writer
+        .upserts
+        .iter()
+        .filter(|(_, pair)| pair.record.racy)
+        .map(|(key, _)| key.as_str())
+        .collect();
+    assert_eq!(racy, vec!["ahead.jpg", "behind-1.jpg", "behind-2.jpg"]);
+    let named: Vec<&IndexIssue> = writer
+        .report
+        .issues
+        .iter()
+        .filter(|issue| issue.code == "pair-index-nas-clock-skewed")
+        .collect();
+    assert_eq!(named.len(), 1, "{:?}", writer.report.issues);
+    assert_eq!(named[0].severity, Severity::Warning);
+    assert!(named[0].cause.contains("Date"), "{}", named[0].cause);
+}
+
 /// No NAS clock from `MD5.start` means the remote side's racy window cannot be ruled out.
 #[test]
 fn evidence_without_a_nas_clock_is_racy() {
@@ -294,7 +354,14 @@ fn evidence_without_a_nas_clock_is_racy() {
         options(0),
         at(OLD),
     );
-    writer.harvest(&local, &remote, &keys(&remote), &BTreeMap::new(), at(OLD));
+    writer.harvest(
+        &local,
+        &remote,
+        &keys(&remote),
+        &BTreeMap::new(),
+        at(OLD),
+        at(OLD),
+    );
     assert!(writer.upserts["a.jpg"].record.racy);
 }
 
@@ -325,6 +392,7 @@ fn a_change_the_facts_cannot_show_inside_the_writeback_window_is_never_served() 
         &remote,
         &keys(&remote),
         &BTreeMap::new(),
+        at(read_started),
         at(read_started),
     );
     assert!(writer.upserts["mapped.db"].record.racy);
@@ -442,7 +510,14 @@ fn the_windows_own_conditions_are_named_and_no_bound_serves_nothing() {
         "pair-index-writeback-unbounded"
     );
     let (local, remote) = tree(&[("a.jpg", facts(), Some(MD5_A))]);
-    session.harvest(&local, &remote, &keys(&remote), &BTreeMap::new(), at(NOW));
+    session.harvest(
+        &local,
+        &remote,
+        &keys(&remote),
+        &BTreeMap::new(),
+        at(OLD),
+        at(OLD),
+    );
     assert!(session.upserts["a.jpg"].record.racy);
 }
 
@@ -457,7 +532,14 @@ fn a_differing_pair_is_never_stored() {
         options(0),
         at(OLD),
     );
-    writer.harvest(&local, &remote, &keys(&remote), &BTreeMap::new(), at(OLD));
+    writer.harvest(
+        &local,
+        &remote,
+        &keys(&remote),
+        &BTreeMap::new(),
+        at(OLD),
+        at(OLD),
+    );
     assert!(writer.upserts.is_empty());
 }
 
@@ -660,7 +742,14 @@ fn a_discarded_index_is_rebuilt_from_this_runs_live_evidence() {
     );
     let (local, remote) = tree(&[("a.jpg", facts(), Some(MD5_A))]);
     session.discard();
-    session.harvest(&local, &remote, &keys(&remote), &BTreeMap::new(), at(NOW));
+    session.harvest(
+        &local,
+        &remote,
+        &keys(&remote),
+        &BTreeMap::new(),
+        at(OLD),
+        at(OLD),
+    );
     let report = session.commit(Some(&local), None, true);
     // What the index holds after the commit, for the status `index:` line.
     assert_eq!(report.entries, Some(1));
@@ -682,7 +771,14 @@ fn an_abandoned_run_leaves_the_index_exactly_as_it_was() {
         at(NOW),
     );
     let (local, remote) = tree(&[("a.jpg", facts(), Some(MD5_B))]);
-    session.harvest(&local, &remote, &keys(&remote), &BTreeMap::new(), at(NOW));
+    session.harvest(
+        &local,
+        &remote,
+        &keys(&remote),
+        &BTreeMap::new(),
+        at(OLD),
+        at(OLD),
+    );
     let report = session.abandon();
     assert_eq!(
         report.entries,
@@ -760,7 +856,14 @@ fn a_failed_store_is_named_and_keeps_the_previous_evidence() {
         at(NOW),
     );
     let (local, remote) = tree(&[("b.jpg", facts(), Some(MD5_A))]);
-    session.harvest(&local, &remote, &keys(&remote), &BTreeMap::new(), at(NOW));
+    session.harvest(
+        &local,
+        &remote,
+        &keys(&remote),
+        &BTreeMap::new(),
+        at(OLD),
+        at(OLD),
+    );
     let report = session.commit(Some(&local), None, true);
     assert_eq!(report.issues[0].code, "pair-index-store-failed");
     assert_eq!(report.stored, 0);
@@ -799,7 +902,14 @@ fn an_unreadable_index_serves_nothing_and_writes_nothing() {
         &BTreeMap::new(),
     );
     assert!(vouched.served.is_empty());
-    session.harvest(&local, &remote, &keys(&remote), &BTreeMap::new(), at(NOW));
+    session.harvest(
+        &local,
+        &remote,
+        &keys(&remote),
+        &BTreeMap::new(),
+        at(OLD),
+        at(OLD),
+    );
     let report = session.commit(Some(&local), None, true);
     assert_eq!(report.state, IndexState::Unusable);
     assert_eq!(report.issues[0].code, "pair-index-corrupt");
