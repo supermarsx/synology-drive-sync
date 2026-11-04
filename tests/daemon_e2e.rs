@@ -831,6 +831,33 @@ fn a_supervisor_lock_held_for_a_moment_does_not_make_the_supervisor_leave() {
     let _ = holder.wait();
 }
 
+/// A program a forked child still holds open for writing is "Text file busy" until the child execs;
+/// the fixture's run of the manager waits that out instead of failing the test (seen as
+/// `run the manager: Text file busy` on slow, instrumented runners).
+#[test]
+fn a_script_that_is_briefly_busy_for_writing_is_run_once_it_is_free() {
+    let dir = std::env::temp_dir().join(format!("sdsyncd-etxtbsy-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).unwrap();
+    let program = script(&dir.join("prog"), "echo ran");
+    let writer = fs::OpenOptions::new().write(true).open(&program).unwrap();
+    // Busy: exec fails now, as it would with a forked child's copy of the descriptor.
+    let plain = Command::new(&program).output();
+    assert_eq!(
+        plain.as_ref().err().and_then(|error| error.raw_os_error()),
+        Some(26),
+        "{plain:?}"
+    );
+    let releaser = thread::spawn(move || {
+        thread::sleep(Duration::from_millis(300));
+        drop(writer);
+    });
+    let output = dsm_package::output_retrying(&mut Command::new(&program)).unwrap();
+    releaser.join().unwrap();
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "ran\n");
+    let _ = fs::remove_dir_all(&dir);
+}
+
 /// F4: the shell's `flock -n daemon.lock true` probe holds the lock for a
 /// moment; a daemon starting then waits it out instead of exiting 75.
 #[test]

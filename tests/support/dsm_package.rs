@@ -80,6 +80,29 @@ fn copy_tree(from: &Path, to: &Path) -> io::Result<()> {
     Ok(())
 }
 
+/// `ETXTBSY` on Linux.
+const TEXT_FILE_BUSY: i32 = 26;
+
+/// [`Command::output`], retried while the program is "Text file busy".
+///
+/// A script this process wrote a moment ago cannot be executed while any process holds a
+/// descriptor open for writing on it, and a process forked by another test thread between our
+/// `open` and `close` holds one until it execs (close-on-exec runs then). The fork's child
+/// is short-lived, so the busy state ends within milliseconds; under coverage instrumentation
+/// the gap is long enough to be met. Anything but that error is returned at once.
+pub fn output_retrying(command: &mut Command) -> io::Result<Output> {
+    let mut attempts = 0;
+    loop {
+        match command.output() {
+            Err(error) if error.raw_os_error() == Some(TEXT_FILE_BUSY) && attempts < 250 => {
+                attempts += 1;
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            other => return other,
+        }
+    }
+}
+
 fn patch_once(path: &Path, from: &str, to: &str) {
     let text = fs::read_to_string(path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
     assert_eq!(
@@ -234,9 +257,8 @@ impl DsmPackage {
                 command.arg(value);
             }
         }
-        let output: Output = command
-            .output()
-            .unwrap_or_else(|e| panic!("run the manager: {e}"));
+        let output: Output =
+            output_retrying(&mut command).unwrap_or_else(|e| panic!("run the manager: {e}"));
         assert!(
             output.status.success(),
             "the manager refused configure-profile {name}: {}\nstdout: {}\nstderr: {}",
