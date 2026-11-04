@@ -18,6 +18,8 @@
 //! build aborts on a panic, so such a file would crash every run. While a thread is inside redb
 //! for an index file, a panic hook records the panic beside it (`<stem>.redb.panicked`); the next
 //! open finds the record and retires the file instead of opening it, so one crashed run heals.
+//! Only a panic raised in redb's own sources (by the `Location` it reports) is recorded: one
+//! from this crate while the thread is in redb's scope says nothing about the file.
 //!
 //! The file is held in two short windows: W1 reads `meta` and the pairs the comparison set names,
 //! then closes; W2, at the end of the run, reopens and writes one transaction. Between them the
@@ -308,7 +310,12 @@ fn install_panic_hook() {
                 .try_with(|cell| cell.try_borrow().ok().and_then(|path| path.clone()))
                 .ok()
                 .flatten();
-            if let Some(path) = record {
+            // Only a panic raised in redb's own sources says anything about the file: one from
+            // this crate (an `expect`, a visitor) while the thread is in redb's scope does not.
+            let in_redb = info
+                .location()
+                .is_some_and(|location| location_is_redb(location.file()));
+            if let Some(path) = record.filter(|_| in_redb) {
                 let message: String = info
                     .to_string()
                     .chars()
@@ -330,6 +337,21 @@ fn install_panic_hook() {
     });
 }
 
+/// Whether a panic location (`Location::file`) is inside redb's own sources: a path component
+/// that is `redb` or `redb-<version>` (the registry or a vendored copy) followed by `src`. A
+/// location in this crate, in the standard library, or in any other dependency is not. Both path
+/// separators are split on, because a build made on Windows records its own.
+fn location_is_redb(file: &str) -> bool {
+    let parts: Vec<&str> = file.split(['/', '\\']).collect();
+    parts.windows(2).any(|pair| {
+        let crate_dir = pair[0] == "redb"
+            || pair[0]
+                .strip_prefix("redb-")
+                .is_some_and(|version| version.starts_with(|c: char| c.is_ascii_digit()));
+        crate_dir && pair[1] == "src"
+    })
+}
+
 fn write_panic_record(path: &Path, message: &str) -> std::io::Result<()> {
     let mut options = fs::OpenOptions::new();
     options.write(true).create(true).truncate(true).mode(0o600);
@@ -342,8 +364,25 @@ fn write_panic_record(path: &Path, message: &str) -> std::io::Result<()> {
 }
 
 /// The panic a previous process recorded inside redb on this file, if any.
-fn panic_record(paths: &IndexPaths) -> Option<String> {
-    let metadata = fs::symlink_metadata(&paths.panicked).ok()?;
+///
+/// `Ok(None)` only when there is no record. A record that cannot be examined is an issue naming
+/// its path and cause: whether the file is safe to open is then unknown, so it is not opened.
+fn panic_record(paths: &IndexPaths) -> Result<Option<String>, IndexIssue> {
+    let metadata = match fs::symlink_metadata(&paths.panicked) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(IndexIssue::warning(
+                "pair-index-unsafe",
+                paths.panicked.display().to_string(),
+                format!(
+                    "its panic record could not be examined ({error}), so it is not known \
+                     whether a previous run stopped inside redb on {}; the index is not opened",
+                    paths.database.display()
+                ),
+            ));
+        }
+    };
     let text = if metadata.is_file() {
         fs::read(&paths.panicked)
             .map(|bytes| String::from_utf8_lossy(&bytes).trim().to_owned())
@@ -352,10 +391,10 @@ fn panic_record(paths: &IndexPaths) -> Option<String> {
         "the record is not a regular file".to_owned()
     };
     let text: String = text.chars().take(PANIC_RECORD_BYTES).collect();
-    Some(format!(
+    Ok(Some(format!(
         "a previous run stopped inside redb on this file ({text}), which a damaged page \
          causes; it is not opened again"
-    ))
+    )))
 }
 
 /// What this process knows of the file as it last closed it: identity, length, times and
@@ -454,6 +493,15 @@ pub fn prepare_directory(directory: &Path) -> Result<Vec<IndexIssue>, IndexIssue
 /// failure does not stop the run; it is named once (`pair-index-cleanup-failed`, the first path
 /// and cause, and how many more), because copies that can never be removed would pile up.
 fn sweep_quarantine(directory: &Path) -> Option<IndexIssue> {
+    sweep_quarantine_with(directory, |entry| entry.metadata()?.modified())
+}
+
+/// [`sweep_quarantine`], with the way an entry's modification time is read given, so a failure to
+/// read it can be provoked.
+fn sweep_quarantine_with(
+    directory: &Path,
+    modified: impl Fn(&fs::DirEntry) -> std::io::Result<SystemTime>,
+) -> Option<IndexIssue> {
     let entries = match fs::read_dir(directory) {
         Ok(entries) => entries,
         Err(error) => {
@@ -482,12 +530,21 @@ fn sweep_quarantine(directory: &Path) -> Option<IndexIssue> {
             continue;
         }
         // Not following a link: a link named like a copy is the link's to lose, not its target's.
-        let old = entry
-            .metadata()
-            .ok()
-            .and_then(|metadata| metadata.modified().ok())
-            .and_then(|modified| now.duration_since(modified).ok())
-            .is_some_and(|age| age > QUARANTINE_AGE);
+        let modified = match modified(&entry) {
+            Ok(modified) => modified,
+            Err(error) => {
+                // Left alone, and named: a copy whose age is unknowable is one that piles up.
+                failures.add(
+                    &entry.path(),
+                    format!("its age could not be read for the weekly sweep: {error}"),
+                );
+                continue;
+            }
+        };
+        // A modification time in the future (a clock set back) is not yet 7 days old.
+        let old = now
+            .duration_since(modified)
+            .is_ok_and(|age| age > QUARANTINE_AGE);
         if old && let Err(error) = fs::remove_file(entry.path()) {
             failures.add(&entry.path(), error.to_string());
         }
@@ -721,9 +778,24 @@ fn open_checked(paths: &IndexPaths, cache_mib: u64, trusted: Option<&Fingerprint
         verdict,
         verified: false,
     };
-    if let Some(cause) = panic_record(paths) {
-        if fs::symlink_metadata(&paths.database).is_ok() {
-            return unopened(CheckVerdict::Corrupt(cause));
+    let recorded = match panic_record(paths) {
+        Ok(recorded) => recorded,
+        Err(issue) => return unopened(CheckVerdict::Unsafe(issue)),
+    };
+    if let Some(cause) = recorded {
+        match fs::symlink_metadata(&paths.database) {
+            Ok(_) => return unopened(CheckVerdict::Corrupt(cause)),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return unopened(CheckVerdict::Unsafe(IndexIssue::warning(
+                    "pair-index-unsafe",
+                    paths.label(),
+                    format!(
+                        "could not be examined while its panic record stands ({error}), so it \
+                         is not opened"
+                    ),
+                )));
+            }
         }
         // The file it names is gone already; the record has nothing left to protect.
         if let Err(error) = fs::remove_file(&paths.panicked) {
@@ -887,6 +959,22 @@ impl Damage {
     }
 }
 
+/// The database `ensure_open` just opened. Its absence cannot happen, and is named rather than
+/// panicked on: a panic here, in the scope of redb's, must never be taken for damage in the
+/// file.
+fn opened_database<'a>(
+    database: &'a Option<Database>,
+    paths: &IndexPaths,
+) -> Result<&'a Database, IndexIssue> {
+    database.as_ref().ok_or_else(|| {
+        IndexIssue::warning(
+            "pair-index-store-failed",
+            paths.label(),
+            "the index reported itself open but holds no database (an internal error)".to_owned(),
+        )
+    })
+}
+
 impl RedbPairIndex {
     /// Open the index, verified. A damaged, repaired or foreign-format file is set aside and
     /// replaced by an empty one; locked, read-only and unsafe files give no backend at all. Every
@@ -1031,7 +1119,7 @@ impl RedbPairIndex {
         }
         self.ensure_open()?;
         let _inside = InsideRedb::enter(&self.paths);
-        let database = self.database.as_ref().expect("opened above");
+        let database = opened_database(&self.database, &self.paths)?;
         let read = database
             .begin_read()
             .map_err(|error| issue_for(&self.paths, error.into(), false))?;
@@ -1052,7 +1140,7 @@ impl RedbPairIndex {
     fn read_meta_values(&mut self) -> Result<Option<IndexMeta>, Result<String, IndexIssue>> {
         self.ensure_open().map_err(Err)?;
         let _inside = InsideRedb::enter(&self.paths);
-        let database = self.database.as_ref().expect("opened above");
+        let database = opened_database(&self.database, &self.paths).map_err(Err)?;
         let read = database
             .begin_read()
             .map_err(|error| Err(issue_for(&self.paths, error.into(), false)))?;
@@ -1235,7 +1323,7 @@ impl PairIndex for RedbPairIndex {
         let _inside = InsideRedb::enter(&self.paths);
         let paths = self.paths.clone();
         let failed = |error: redb::Error| issue_for(&paths, error, true);
-        let database = self.database.as_ref().expect("opened above");
+        let database = opened_database(&self.database, &self.paths)?;
         let mut write = database
             .begin_write()
             .map_err(|error| failed(error.into()))?;
@@ -1476,6 +1564,91 @@ mod tests {
         );
         let refused = IndexPaths::new(directory, &format!("{}/x", "p".repeat(70)));
         assert_eq!(refused.unwrap_err().code, "pair-index-unsafe");
+    }
+
+    /// N-I3: the hook marks an index only for a panic raised inside redb's own code. A panic from
+    /// this crate's code while the thread is in redb's scope (an `expect`, a visitor) says
+    /// nothing about the file, and must not retire a healthy index.
+    #[test]
+    fn a_panic_from_our_own_code_does_not_mark_the_index() {
+        let directory = scratch("hook-ours");
+        let paths = IndexPaths::new(&directory, "photos").unwrap();
+        {
+            let _inside = InsideRedb::enter(&paths);
+            let ours = std::panic::catch_unwind(|| {
+                let none: Option<u8> = None;
+                none.expect("opened above")
+            });
+            assert!(ours.is_err());
+            let ours = std::panic::catch_unwind(|| panic!("a visitor of ours"));
+            assert!(ours.is_err());
+        }
+        assert!(
+            !paths.panicked.exists(),
+            "a panic from our own code must not leave a panic record"
+        );
+        fs::remove_dir_all(&directory).unwrap();
+    }
+
+    #[test]
+    fn only_a_location_in_redbs_sources_counts_as_redb() {
+        for redb in [
+            "/usr/local/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/redb-4.4.0/src/tree_store/page_store/header.rs",
+            "/home/u/.cargo/registry/src/x/redb-4.4.0/src/db.rs",
+            "vendor/redb/src/db.rs",
+            "C:\\Users\\u\\redb-4.4.0\\src\\db.rs",
+        ] {
+            assert!(location_is_redb(redb), "{redb}");
+        }
+        for ours in [
+            "src/pair_index_redb.rs",
+            "tests/pair_index_storage.rs",
+            "/rustc/abc123/library/core/src/option.rs",
+            "/home/u/.cargo/registry/src/x/redbx-1.0.0/src/db.rs",
+            "/home/u/redb/project/src/main.rs",
+            "",
+        ] {
+            assert!(!location_is_redb(ours), "{ours}");
+        }
+    }
+
+    /// N-I3: a record that cannot be examined is neither "no record" nor silently ignored.
+    #[test]
+    fn a_panic_record_that_cannot_be_examined_is_named_with_its_path_and_cause() {
+        let directory = scratch("record-unreadable");
+        let paths = IndexPaths::new(&directory, "photos").unwrap();
+        assert_eq!(panic_record(&paths).unwrap(), None, "no record, no finding");
+        // A parent that is a file makes the lookup fail with ENOTDIR, not NotFound.
+        fs::write(directory.join("a-file"), b"x").unwrap();
+        let blocked = IndexPaths {
+            panicked: directory.join("a-file").join("photos.redb.panicked"),
+            ..paths.clone()
+        };
+        let issue = panic_record(&blocked).expect_err("an unexaminable record is named");
+        assert_eq!(issue.code, "pair-index-unsafe");
+        assert!(issue.path.contains("photos.redb.panicked"), "{issue:?}");
+        assert!(issue.cause.contains("could not be examined"), "{issue:?}");
+        fs::remove_dir_all(&directory).unwrap();
+    }
+
+    /// N-I3: a quarantined copy whose age cannot be read is named, not skipped without a word.
+    #[test]
+    fn a_quarantined_copy_whose_age_cannot_be_read_is_named() {
+        let directory = scratch("sweep-age");
+        let copy = directory.join("photos.redb.corrupt-1700000000");
+        fs::write(&copy, b"old").unwrap();
+        let issue = sweep_quarantine_with(&directory, |_| {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "denied by the test",
+            ))
+        })
+        .expect("the failure is surfaced");
+        assert_eq!(issue.code, "pair-index-cleanup-failed");
+        assert!(issue.path.contains("photos.redb.corrupt-"), "{issue:?}");
+        assert!(issue.cause.contains("denied by the test"), "{issue:?}");
+        assert!(copy.exists(), "an unexaminable copy is left alone");
+        fs::remove_dir_all(&directory).unwrap();
     }
 
     fn scratch(label: &str) -> PathBuf {

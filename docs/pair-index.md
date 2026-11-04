@@ -124,7 +124,11 @@ interrupted write leaves the last complete commit.
 redb 4.4 can panic while it opens a file with a damaged allocator-state page, before any check
 can run; a release build stops there. A panic inside redb on an index file is recorded beside it
 as `<profile>.redb.panicked`, and the next run sets the file aside instead of opening it, so one
-crashed run heals the index.
+crashed run heals the index. Only a panic raised in redb's own sources is recorded (the hook reads
+the panic's reported source location); a panic from this program's own code never retires a healthy
+index. A panic record that cannot be examined, or a quarantined copy whose age cannot be read for the
+weekly sweep, is named as a warning with its path and cause (`pair-index-unsafe`, which leaves the
+index unused for the run, and `pair-index-cleanup-failed`).
 
 Size is about 340 bytes per pair at 100,000 pairs and 270 at a million; redb's page cache is held at
 8 MiB, so memory does not grow with the share. When the file grows past twice its contents plus
