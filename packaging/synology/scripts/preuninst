@@ -36,10 +36,13 @@ case $daemon_held_status in
         exit 1
         ;;
     2)
-        if command -v flock >/dev/null 2>&1; then
-            package_message "the sync daemon lock cannot be checked: $daemon_lock_file"
+        # Neither flock(1) nor the bridge's probe exists: the records below are
+        # the only witness, and say so. Any other failure to probe refuses.
+        if [ "${daemon_lock_probe_unavailable:-false}" != true ]; then
+            package_message "the sync daemon lock cannot be checked: $daemon_lock_file (${daemon_lock_probe_cause:-unknown cause})"
             exit 1
         fi
+        echo "warning: ${daemon_lock_probe_cause:-$daemon_lock_file cannot be probed}; the daemon records decide" >&2
         ;;
 esac
 controller_start_file=$runtime_root/controller.starting

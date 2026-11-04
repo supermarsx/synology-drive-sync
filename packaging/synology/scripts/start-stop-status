@@ -1519,6 +1519,7 @@ stop_daemon_engine() {
 # 0 running (ping answers, admission open), 3 stopped (no daemon records, no
 # daemon), 1 stale records of a daemon that is gone, 2 anything else.
 daemon_status_code() {
+    daemon_status_cause=
     if daemon_answers_ping; then
         daemon_status_transition=$(package_transition_status 2>/dev/null) || return 2
         [ "$daemon_status_transition" = open ] || return 2
@@ -1529,14 +1530,30 @@ daemon_status_code() {
     daemon_status_held=0
     daemon_lock_held_status || daemon_status_held=$?
     # Held, or a live supervisor that may be respawning the daemon (not probed).
-    case $daemon_status_held in 0|3) return 2 ;; esac
+    case $daemon_status_held in
+        0)
+            daemon_status_cause="the sync daemon holds $daemon_lock_file but does not answer"
+            return 2
+            ;;
+        3)
+            daemon_status_cause="the sync daemon supervisor named by $supervisor_pid_file is live; the daemon is not answering"
+            return 2
+            ;;
+    esac
+    daemon_status_probe_cause=
+    [ "$daemon_status_held" -ne 2 ] \
+        || daemon_status_probe_cause="$daemon_lock_file cannot be probed (${daemon_lock_probe_cause:-unknown cause}); "
     if daemon_artifacts_present; then
         daemon_status_identity=0
         daemon_identity_status || daemon_status_identity=$?
-        [ "$daemon_status_identity" -eq 1 ] || return 2
+        if [ "$daemon_status_identity" -ne 1 ]; then
+            daemon_status_cause="${daemon_status_probe_cause}the daemon's records cannot be settled: ${daemon_identity_cause:-a daemon process is live}"
+            return 2
+        fi
         daemon_status_stale=$daemon_present_artifact
         return 1
     fi
+    [ "$daemon_status_held" -ne 2 ] || echo "warning: ${daemon_status_probe_cause}no daemon record exists, so none is assumed" >&2
     return 3
 }
 
@@ -2560,6 +2577,8 @@ case ${1:-} in
                 status_code
                 result=$?
             fi
+            [ "$result" -ne 2 ] || [ -z "${daemon_status_cause:-}" ] \
+                || echo "$daemon_status_cause" >&2
             [ "$result" -ne 1 ] || [ -z "${daemon_status_stale:-}" ] \
                 || echo "stale daemon record of a daemon that is gone: $daemon_status_stale" >&2
             [ "$result" -ne 1 ] || [ -z "${status_stale_api_socket:-}" ] \

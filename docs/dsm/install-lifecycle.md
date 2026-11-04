@@ -172,8 +172,10 @@ lifecycle command:
 The shell engine steps aside from a daemon: while a process holds `daemon.lock`, or a live
 supervisor (`run/supervisor.pid`) is about to respawn one, start refuses ("refusing to start the shell
 engine: the sync daemon (PID n) holds ...") and status reports `2` with the same line on stderr.
-Stop the package first, or remove `var/state/engine` to run the daemon engine. A lock `flock` cannot
-probe is said on stderr and does not block.
+Stop the package first, or remove `var/state/engine` to run the daemon engine. A lock that cannot be
+probed (see below) is decided by the identity check on the daemon's records, the one stop uses: a
+live daemon, or one the check cannot rule out, blocks, and the refusal says the lock could not be
+probed and why; only "no record names a live daemon" goes on, with a warning on stderr.
 
 Under the shell engine, profiles the daemon held for a lasting condition (`state/lasting/<p>.state`)
 are not held: start says so once (`lasting_blocks_not_applied`, with the count).
@@ -217,9 +219,17 @@ one is refused and named. Stop leaves no `daemon.pid`, `daemon.ready` or `ctl.so
 stays; only a live holder of it means a daemon runs). When nobody holds `daemon.lock`, no daemon
 exists: whatever `daemon.pid`, `daemon.ready` and `ctl.sock` say is stale even if the PID they name
 now belongs to another process, and stop and start remove them and name each path (`removed stale
-daemon record <path>`). A held lock keeps the strict identity check above; without `flock(1)` the
-lock cannot be probed, so that check applies too and a refusal names its cause. The probe itself
-holds the lock for one `flock -n` call, and it is never made while `run/supervisor.pid` (the
+daemon record <path>`). A held lock keeps the strict identity check above. The lock is probed with
+`flock -n`, or, on a unit without `flock(1)`, with the bridge's own `sdsync-dsm-api --daemon-lock-probe
+<path>` (the same non-blocking `flock`, read-only, released at once; exit `0` free, `3` held, `1` cannot
+probe, with a `daemon-lock-probe: <path>: <cause>` line on stderr). The probe in use is named once
+per change in `controller.log` (`info` `daemon_lock_probe`, `tool=flock` or `tool=daemon-lock-probe
+flock=absent`; the last tool is kept in `run/daemon-lock-probe.tool`) and, for the bridge's, in a
+`note:` line on stderr. Only when neither can run (no `flock(1)` and no executable bridge, or the
+probe fails) is the lock "cannot be told": the strict identity check applies, status reports `2` and
+names why on stderr, and the pre-upgrade and pre-uninstall hooks refuse unless the cause is that no
+tool exists at all (then the records they also check decide, with a warning). The probe itself
+holds the lock for one call, and it is never made while `run/supervisor.pid` (the
 supervisor's own pid, start time and boot id) names a live supervisor: between a daemon's death and
 its respawn nobody holds the lock, and a probe that took it would make the respawning daemon give
 up. Status then reports `2`, the hooks refuse naming `supervisor.pid`, and stop signals that

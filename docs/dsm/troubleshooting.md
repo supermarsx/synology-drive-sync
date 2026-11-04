@@ -876,8 +876,9 @@ records (`run/daemon.pid`, `daemon.ready`, `ctl.sock`, `supervisor.pid`) can out
 they name can by then belong to an unrelated process. `daemon.lock` decides: the kernel drops it
 when the daemon dies, so with nobody holding it the records are stale whatever they say, and `status`
 reports `1` ("stale daemon record of a daemon that is gone: <path>") while Stop and Run remove them,
-printing `removed stale daemon record <path>` for each. A lock that is held, or one `flock` cannot
-probe, keeps the strict identity check: the refusal is "refusing to stop an unverified daemon" with its
+printing `removed stale daemon record <path>` for each. A lock that is held, or one that cannot be
+probed (no `flock(1)` and the bridge's `--daemon-lock-probe` fails; `status` names why on stderr),
+keeps the strict identity check: the refusal is "refusing to stop an unverified daemon" with its
 cause (for example `start_mismatch`), and nothing is signalled or removed on a guess. The same
 reading applies to a prepared `run/api.sock` (mode `0000`) left by an API child that died between bind
 and activation: with no `api.pid` and no holder of `daemon.lock` it is stale, status reports it

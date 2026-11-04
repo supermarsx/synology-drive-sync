@@ -1780,6 +1780,62 @@ class RuntimeTests(unittest.TestCase):
         if os.getuid() == 0:
             os.chown(engine, self.drop_uid, self.drop_gid)
 
+    #: Whether the built bridge answers `--daemon-lock-probe <path>` (keyed by
+    #: its path): exit 1 and one `daemon-lock-probe: ...` stderr line for a
+    #: file that does not exist, which no other flag produces.
+    _bridge_probes_locks: dict[str, bool] = {}
+
+    @classmethod
+    def bridge_has_lock_probe(cls, binary: Path) -> bool:
+        key = str(binary)
+        if key not in cls._bridge_probes_locks:
+            probe = subprocess.run(
+                [key, "--daemon-lock-probe", "/nonexistent/sdsync-probe-check"],
+                capture_output=True, text=True, timeout=30, check=False,
+            )
+            cls._bridge_probes_locks[key] = (
+                probe.returncode == 1 and probe.stderr.startswith("daemon-lock-probe:")
+                and probe.stdout == ""
+            )
+        return cls._bridge_probes_locks[key]
+
+    def _lock_probe_source(self, daemon_binary: Path | None) -> str:
+        """The mock's `--daemon-lock-probe <path>`: the contract of the bridge's
+        probe (exit 0 free, 3 held, 1 cannot probe with one
+        `daemon-lock-probe: <path>: <cause>` line on stderr, nothing on
+        stdout; O_RDONLY|O_CLOEXEC|O_NOFOLLOW, flock LOCK_EX|LOCK_NB, released
+        at once). The built bridge answers it when it can; until it can, this
+        stand-in follows the same contract. SDSYNC_TEST_LOCK_PROBE_FAIL makes it
+        a probe that cannot probe, for the unit whose every tool is broken."""
+        real = ""
+        if daemon_binary is not None and self.bridge_has_lock_probe(daemon_binary):
+            real = f"    os.execv({str(daemon_binary)!r}, [{str(daemon_binary)!r}, *sys.argv[1:]])\n"
+        return (
+            "if len(sys.argv) >= 2 and sys.argv[1] == '--daemon-lock-probe':\n"
+            "    _probe_path = sys.argv[2] if len(sys.argv) > 2 else ''\n"
+            "    if os.environ.get('SDSYNC_TEST_LOCK_PROBE_FAIL'):\n"
+            "        sys.stderr.write(f'daemon-lock-probe: {_probe_path}: test hook: the probe is disabled\\n')\n"
+            "        raise SystemExit(1)\n"
+            + real
+            + "    try:\n"
+            "        _probe_fd = os.open(_probe_path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)\n"
+            "        try:\n"
+            "            if not stat.S_ISREG(os.fstat(_probe_fd).st_mode):\n"
+            "                raise OSError('not a regular file')\n"
+            "            try:\n"
+            "                fcntl.flock(_probe_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)\n"
+            "            except BlockingIOError:\n"
+            "                raise SystemExit(3)\n"
+            "            fcntl.flock(_probe_fd, fcntl.LOCK_UN)\n"
+            "        finally:\n"
+            "            os.close(_probe_fd)\n"
+            "    except OSError as _probe_error:\n"
+            "        sys.stderr.write(f'daemon-lock-probe: {_probe_path}: {_probe_error}\\n')\n"
+            "        raise SystemExit(1)\n"
+            "    raise SystemExit(0)\n"
+            "\n"
+        )
+
     def write_api_mock(
         self,
         *,
@@ -1993,6 +2049,7 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
             "    fake_exit = fake_ctl / f'{fake_verb}.exit'\n"
             "    raise SystemExit(int(fake_exit.read_text(encoding='utf-8')) if fake_exit.exists() else 0)\n"
             "\n"
+            + self._lock_probe_source(daemon_binary)
             + daemon_passthrough
             + "def run_mock_watch():\n"
             "    # The package's own realtime watcher. With SDSYNC_TEST_NATIVE_WATCH\n"
@@ -13951,6 +14008,102 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
         self.assertIn(f"{lock} cannot be probed", started.stdout + started.stderr)
         stopped = self.shell(self.lifecycle, "stop", timeout=60, extra_environment=environment)
         self.assertEqual(stopped.returncode, 0, stopped.stdout + stopped.stderr)
+
+    def test_a_missing_flock_probes_the_lock_with_the_bridge_and_names_the_probe_once(self) -> None:
+        # N-S5. A unit without flock(1) used to read daemon.lock as "cannot be
+        # told" for good: stale records were never recovered (start and stop
+        # refused with start_mismatch) and a live holder was a guess. The
+        # bridge's `--daemon-lock-probe` is the same flock(LOCK_EX|LOCK_NB);
+        # the lifecycle uses it when flock is absent, and the controller log
+        # names the probe in use once, not once per command.
+        self._daemon_engine(None)
+        run = self.real_var / "run"
+        no_flock = self._no_flock_environment()
+        self._free_daemon_lock()
+        reused = self._spawn_fake("--sleeper")
+        self._seed_reused_pid_daemon_records(reused.pid)
+        for attempt in range(2):
+            status = self.shell(self.lifecycle, "status", extra_environment=no_flock)
+            self.assertEqual(status.returncode, 1, status.stdout + status.stderr)
+            self.assertIn("note: flock(1) is not installed", status.stderr)
+        for hook in ("preuninst", "preupgrade"):
+            held_by_records = self.shell(self.lifecycle_dir / hook, extra_environment=no_flock)
+            self.assertEqual(held_by_records.returncode, 1, f"{hook}: {held_by_records.stdout}")
+            self.assertIn("not fully stopped", held_by_records.stdout, hook)
+        stopped = self.shell(self.lifecycle, "stop", timeout=60, extra_environment=no_flock)
+        self.assertEqual(stopped.returncode, 0, stopped.stdout + stopped.stderr)
+        for record in ("daemon.pid", "daemon.ready", "ctl.sock"):
+            self.assertFalse((run / record).exists(), f"{record} survived stop: {stopped.stdout}")
+        self.assertIsNone(reused.poll(), "stop signalled the process that reused the PID")
+        # A live holder is seen as one, through the same probe.
+        holder = self._spawn_fake("--daemon", hold_lock=True)
+        self._write_run_record("daemon.pid", self._identity_triple(holder.pid))
+        self._write_run_record("daemon.ready", self._identity_triple(holder.pid))
+        status = self.shell(self.lifecycle, "status", extra_environment=no_flock)
+        self.assertEqual(status.returncode, 2, status.stdout + status.stderr)
+        self.assertIn("holds", status.stderr)
+        for hook in ("preuninst", "preupgrade"):
+            refused = self.shell(self.lifecycle_dir / hook, extra_environment=no_flock)
+            self.assertEqual(refused.returncode, 1, f"{hook}: {refused.stdout}{refused.stderr}")
+            self.assertIn(f"the sync daemon is still running (it holds {self.fhs / 'var/run/daemon.lock'})",
+                          refused.stdout, hook)
+        stopped = self.shell(self.lifecycle, "stop", timeout=60, extra_environment=no_flock)
+        self.assertEqual(stopped.returncode, 0, stopped.stdout + stopped.stderr)
+        self._wait_for(lambda: holder.poll() is not None, "stop left the lock holder running", timeout=10)
+        # The probe in use is in the log once per change of probe: the bridge's
+        # (two statuses, a hook, a stop and a second round did not repeat it),
+        # then flock(1) when it is back.
+        probes = self.event_details("daemon_lock_probe")
+        self.assertEqual(len(probes), 1, probes)
+        self.assertIn("tool=daemon-lock-probe", probes[0])
+        self.assertIn("flock=absent", probes[0])
+        self.assertEqual((run / "daemon-lock-probe.tool").read_text(encoding="utf-8"), "daemon-lock-probe\n")
+        for _ in range(2):
+            self.assertEqual(self.shell(self.lifecycle, "status").returncode, 3)
+        probes = self.event_details("daemon_lock_probe")
+        self.assertEqual(len(probes), 2, probes)
+        self.assertIn("tool=flock", probes[1])
+        self.assertNotIn("flock=absent", probes[1])
+
+    def test_a_lock_that_no_tool_can_probe_is_named_and_the_records_decide(self) -> None:
+        # No flock(1) and a bridge whose probe fails: status says why, the
+        # hooks still stop at what the records show, and nothing is guessed.
+        self._daemon_engine(None)
+        environment = self._no_flock_environment(**self.NO_LOCK_PROBE)
+        holder = self._spawn_fake("--daemon", hold_lock=True)
+        self._write_run_record("daemon.pid", self._identity_triple(holder.pid))
+        self._write_run_record("daemon.ready", self._identity_triple(holder.pid))
+        status = self.shell(self.lifecycle, "status", extra_environment=environment)
+        self.assertEqual(status.returncode, 2, status.stdout + status.stderr)
+        self.assertIn(f"{self.fhs / 'var/run/daemon.lock'} cannot be probed", status.stderr)
+        self.assertIn("--daemon-lock-probe exited 1", status.stderr)
+        self.assertIn("test hook: the probe is disabled", status.stderr)
+        refused = self.shell(self.lifecycle_dir / "preuninst", extra_environment=environment)
+        self.assertEqual(refused.returncode, 1, refused.stdout + refused.stderr)
+        self.assertIn("the sync daemon lock cannot be checked", refused.stdout)
+        self.assertIn("--daemon-lock-probe exited 1", refused.stdout)
+        # With no tool at all (the bridge itself is not executable) the hook
+        # says so and the records it also checks are what refuse.
+        bridge = self.real_target / "bin/sdsync-dsm-api"
+        bridge.chmod(0o644)
+        try:
+            refused = self.shell(self.lifecycle_dir / "preuninst", extra_environment=environment)
+        finally:
+            bridge.chmod(0o755)
+        self.assertEqual(refused.returncode, 1, refused.stdout + refused.stderr)
+        self.assertIn("is not an executable file to probe with", refused.stderr)
+        self.assertIn("the daemon records decide", refused.stderr)
+        self.assertIn("not fully stopped", refused.stdout)
+        # An unreadable lock is not the same as no tool: it refuses, naming why.
+        lock = self.real_var / "run/daemon.lock"
+        lock.chmod(0o000)
+        try:
+            refused = self.shell(self.lifecycle_dir / "preuninst")
+            self.assertEqual(refused.returncode, 1, refused.stdout + refused.stderr)
+            self.assertIn("the sync daemon lock cannot be checked", refused.stdout)
+            self.assertIn("is not readable by this user", refused.stdout)
+        finally:
+            lock.chmod(0o600)
 
     def test_postupgrade_removes_shell_leftovers_only_under_the_daemon_engine(self) -> None:
         leftovers = [
