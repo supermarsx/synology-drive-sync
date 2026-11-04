@@ -23,8 +23,8 @@ Usage:
   sdsync-dsm configure-routine --profile NAME [options] | remove-routine NAME
   sdsync-dsm doctor [NAME|--all] [--write-test]
   sdsync-dsm resync [NAME] [--scope PATH] [--confirm TICKET]
-  sdsync-dsm plan [NAME|--all] [--allow-delete] [--max-total-delete N]
-  sdsync-dsm run [NAME|--all] [--allow-delete] [--max-total-delete N]
+  sdsync-dsm plan [NAME|--all] [--allow-delete] [--max-total-delete N] [--no-wait|--wait-seconds S]
+  sdsync-dsm run [NAME|--all] [--allow-delete] [--max-total-delete N] [--no-wait|--wait-seconds S]
   sdsync-dsm enable [--interval SECONDS] [--allow-delete] [--max-total-delete N]
   sdsync-dsm disable | status | logs [LINES] | paths
   sdsync-dsm api snapshot | logs --lines N | activity --lines N
@@ -71,6 +71,13 @@ configure-alerts options:
   --system-log-level info|warn|err       (lowest severity delivered; default warn)
   --system-log-message-id 0xHHHHHHHH     (identifier from DSM's own system-log
                                           catalogue, verified on your DSM build)
+
+plan and run: under the daemon engine (the default) the sync daemon runs
+them. The command waits for the run and exits with its exit status (0, 3
+partial, 1 ...); --wait-seconds S bounds the wait (1..86400, default 86400),
+after which the run goes on and the command exits 75; --no-wait returns once
+the run is queued. Under the shell engine the runner runs in the foreground
+and the two options are ignored.
 
 REMOTE is your chosen File Station logical path, for example
 /home/Drive/Backups or /TeamShare/Backups. It is never a /volumeN path.
@@ -1428,6 +1435,46 @@ manager_service_engine() {
     esac
 }
 
+# A script that ran `sdsync-dsm run` read the sync's own exit status. The run
+# the daemon queued is waited for, and its own exit becomes this command's.
+# A wait that ends first is not an outcome: the run goes on, and that is 75.
+wait_for_daemon_run() {
+    waited_id=$1
+    wait_status=0
+    wait_reply=$("$api_bridge" --ctl wait "id=$waited_id" "wait_s=$run_wait_seconds" \
+        --home "$package_home" --var "$package_var" 2>&1) || wait_status=$?
+    wait_field() {
+        printf '%s\n' "$wait_reply" | sed -n "s/.*\"$1\":\"\\([^\"]*\\)\".*/\\1/p" | sed -n '1p'
+    }
+    wait_exit=$(printf '%s\n' "$wait_reply" | sed -n 's/.*"exit":\(-\{0,1\}[0-9][0-9]*\).*/\1/p' | sed -n '1p')
+    case $wait_reply in
+        *'"finished":true'*)
+            wait_outcome=$(wait_field outcome)
+            wait_reason=$(wait_field reason)
+            wait_detail=$(wait_field detail)
+            case $wait_exit in
+                ''|-*) wait_code=1 ;;
+                *) if [ "$wait_exit" -le 255 ] 2>/dev/null; then wait_code=$wait_exit; else wait_code=1; fi ;;
+            esac
+            echo "run $waited_id finished: ${wait_outcome:-unknown}${wait_reason:+ ($wait_reason)}, exit ${wait_exit:-unknown}${wait_detail:+: $(one_safe_line "$wait_detail")}"
+            exit "$wait_code"
+            ;;
+    esac
+    wait_code_name=$(wait_field code)
+    case $wait_status:$wait_code_name in
+        *:wait_timeout|75:*)
+            echo "run $waited_id has not finished within $run_wait_seconds s; it goes on: follow it with \`sdsync-dsm status\`" >&2
+            exit 75
+            ;;
+        69:*)
+            echo "lost contact with the sync service while waiting for run $waited_id; the run may go on: follow it with \`sdsync-dsm status\`" >&2
+            exit 75
+            ;;
+    esac
+    echo "the outcome of run $waited_id cannot be told: ${wait_code_name:-unanswered}$( [ -z "$wait_reply" ] || printf ' (%s)' "$(one_safe_line "$wait_reply")")" >&2
+    exit 73
+}
+
 # Under the daemon engine a plan or run is the daemon's to execute: one run
 # slot, its watchdog, one owner of run.lock. The shell runner would run the
 # core beside it, so it is never the fallback: a daemon that does not answer
@@ -1453,7 +1500,8 @@ forward_run_to_daemon() {
     if [ "$forward_status" -eq 0 ] && [ -n "$forward_id" ]; then
         echo "queued as run $forward_id: $command_name of $selected_scope; its outcome is recorded in run.state and Activity"
         end_mutation succeeded
-        exit 0
+        [ "${run_wait:-false}" = true ] || exit 0
+        wait_for_daemon_run "$forward_id"
     fi
     forward_code=$(printf '%s\n' "$forward_reply" | sed -n 's/.*"code":"\([a-z_]*\)".*/\1/p' | sed -n '1p')
     case $forward_status:$forward_code in
@@ -4969,6 +5017,10 @@ api_action() {
         [ "$action_level_seen" = false ] || api_error invalid_request "level is only valid for doctor" 64
         [ "$action_write_seen" = false ] || api_error invalid_request "write-test is only valid for doctor" 64
         if [ "$action_scope" = all ]; then set -- "$manager" "$action_kind" --all; else set -- "$manager" "$action_kind" "$action_scope"; fi
+        # The dashboard queues and follows the run through the snapshot; it
+        # never holds its job open for the run's duration.
+        manager_service_engine 2>/dev/null
+        [ "$manager_engine" = shell ] || set -- "$@" --no-wait
         [ "$action_delete" = false ] || set -- "$@" --allow-delete
         if [ "$action_max_seen" = true ]; then
             [ "$action_scope" = all ] || api_error invalid_request "max-total-delete requires scope all" 64
@@ -5370,6 +5422,31 @@ case $command_name in
         ;;
     plan|run)
         require_package_identity || exit 77
+        # The daemon engine's wait options, taken out before the shared
+        # selection parser sees them.
+        run_wait=true
+        run_wait_seconds=86400
+        run_wait_given=false
+        run_wait_value_next=false
+        for run_argument in "$@"; do
+            shift
+            if [ "$run_wait_value_next" = true ]; then
+                run_wait_seconds=$run_argument
+                run_wait_value_next=false
+                continue
+            fi
+            case $run_argument in
+                --no-wait) run_wait=false; run_wait_given=true; continue ;;
+                --wait-seconds) run_wait_value_next=true; run_wait_given=true; continue ;;
+            esac
+            set -- "$@" "$run_argument"
+        done
+        [ "$run_wait_value_next" = false ] || die "--wait-seconds requires a value"
+        case $run_wait_seconds in
+            ''|*[!0-9]*) die "--wait-seconds must be from 1 through 86400" ;;
+        esac
+        decimal_at_most "$run_wait_seconds" 86400 && [ "$run_wait_seconds" -ge 1 ] \
+            || die "--wait-seconds must be from 1 through 86400"
         selection "$command_name" "$@"
         if [ "$command_name" = plan ]; then run_mode=plan; else run_mode=sync; fi
         if [ "$selected_scope" = all ]; then
@@ -5379,6 +5456,8 @@ case $command_name in
         fi
         manager_service_engine
         [ "$manager_engine" = shell ] || forward_run_to_daemon "$@"
+        [ "$run_wait_given" = false ] \
+            || echo "note: --no-wait and --wait-seconds are ignored under the shell engine; the runner runs in the foreground" >&2
         exec "$runner" "$run_mode" "$selected_scope" "$allow_selected_delete" foreground "$runner_max_total"
         ;;
     enable)

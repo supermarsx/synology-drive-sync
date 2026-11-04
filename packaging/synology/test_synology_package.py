@@ -13225,10 +13225,12 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
         )
         audit_log = self.real_var / "log/audit.log"
         before = len(audit_log.read_text(encoding="utf-8").splitlines())
-        ran = self.shell(self.manager, "run", "personal")
+        ran = self.shell(self.manager, "run", "personal", "--no-wait")
         self.assertEqual(ran.returncode, 0, ran.stdout + ran.stderr)
         self.assertIn("queued as run 7", ran.stdout)
-        planned = self.shell(self.manager, "plan", "--all", "--allow-delete", "--max-total-delete", "40")
+        planned = self.shell(
+            self.manager, "plan", "--no-wait", "--all", "--allow-delete", "--max-total-delete", "40"
+        )
         self.assertEqual(planned.returncode, 0, planned.stdout + planned.stderr)
         calls = self._ctl_calls(fake)
         runs = [call for call in calls if call.startswith("run ")]
@@ -13257,6 +13259,8 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
         self.assertIs(payload["ok"], True, payload)
         self.assertEqual(payload["message"], "run queued", payload)
         self.assertIn("queued as run 7", payload["output"])
+        # Neither the --no-wait commands nor the dashboard path waited.
+        self.assertEqual([call for call in self._ctl_calls(fake) if call.startswith("wait ")], [])
 
         # A refusal keeps its code and its busy shape.
         self._fake_ctl(run=(1, '{"ok":false,"code":"stopping","detail":"the service is stopping and takes no new work"}'))
@@ -13271,6 +13275,63 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
         missing = self.shell(self.manager, "run", "personal")
         self.assertEqual(missing.returncode, 66, missing.stdout + missing.stderr)
         self.assertIn("scope_not_found", missing.stderr)
+
+    def test_cli_plan_and_run_wait_for_the_daemon_run_and_keep_its_exit_status(self) -> None:
+        # A script that ran `sdsync-dsm run` read the sync's own exit status;
+        # under the daemon engine the command waits for the run it queued.
+        self.assertEqual(
+            self.configure("personal", self.source_one, "/home/Drive/Test", True).returncode, 0
+        )
+        self.set_engine(None)
+        fake = self._fake_ctl(
+            ping=(0, '{"ok":true}'),
+            run=(0, '{"ok":true,"id":9,"position":1}'),
+            wait=(0, '{"ok":true,"id":9,"scope":"personal","finished":true,"exit":3,'
+                     '"outcome":"partial","reason":"core_partial","detail":"2 paths deferred"}'),
+        )
+        partial = self.shell(self.manager, "run", "personal")
+        self.assertEqual(partial.returncode, 3, partial.stdout + partial.stderr)
+        self.assertIn("queued as run 9", partial.stdout)
+        self.assertIn("run 9 finished: partial (core_partial), exit 3", partial.stdout)
+        self.assertIn("2 paths deferred", partial.stdout + partial.stderr)
+        waits = [call for call in self._ctl_calls(fake) if call.startswith("wait ")]
+        self.assertEqual(len(waits), 1, self._ctl_calls(fake))
+        self.assertIn("wait id=9 wait_s=86400", waits[0])
+
+        self._fake_ctl(wait=(0, '{"ok":true,"id":9,"scope":"personal","finished":true,"exit":0,'
+                                '"outcome":"succeeded","reason":null,"detail":null}'))
+        clean = self.shell(self.manager, "plan", "personal", "--wait-seconds", "120")
+        self.assertEqual(clean.returncode, 0, clean.stdout + clean.stderr)
+        self.assertIn("run 9 finished: succeeded, exit 0", clean.stdout)
+        self.assertIn("wait id=9 wait_s=120", self._ctl_calls(fake)[-1])
+
+        for bad in ("0", "86401", "soon"):
+            refused = self.shell(self.manager, "run", "personal", "--wait-seconds", bad)
+            self.assertEqual(refused.returncode, 64, refused.stdout + refused.stderr)
+            self.assertIn("--wait-seconds", refused.stderr)
+
+    def test_cli_wait_timeout_says_the_run_goes_on_and_exits_75(self) -> None:
+        self.assertEqual(
+            self.configure("personal", self.source_one, "/home/Drive/Test", True).returncode, 0
+        )
+        self.set_engine(None)
+        self._fake_ctl(
+            ping=(0, '{"ok":true}'),
+            run=(0, '{"ok":true,"id":4,"position":1}'),
+            wait=(75, '{"ok":false,"code":"wait_timeout","detail":"run 4 has not finished; it goes on (follow it with status)","exit":75}'),
+        )
+        timed_out = self.shell(self.manager, "run", "personal", "--wait-seconds", "5")
+        self.assertEqual(timed_out.returncode, 75, timed_out.stdout + timed_out.stderr)
+        self.assertIn("run 4 has not finished within 5 s; it goes on", timed_out.stderr)
+        self.assertIn("sdsync-dsm status", timed_out.stderr)
+        self._fake_ctl(wait=(1, '{"ok":false,"code":"run_unknown","detail":"no queued, running or recently finished run has that id"}'))
+        unknown = self.shell(self.manager, "run", "personal")
+        self.assertEqual(unknown.returncode, 73, unknown.stdout + unknown.stderr)
+        self.assertIn("run_unknown", unknown.stderr)
+        self._fake_ctl(wait=(69, '{"ok":false,"code":"daemon_unreachable","detail":"connection refused"}'))
+        lost = self.shell(self.manager, "run", "personal")
+        self.assertEqual(lost.returncode, 75, lost.stdout + lost.stderr)
+        self.assertIn("lost contact with the sync service while waiting for run 4", lost.stderr)
 
     def test_plan_and_run_refuse_when_the_daemon_engine_does_not_answer(self) -> None:
         self.assertEqual(
@@ -13298,6 +13359,14 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
         planned = self.shell(self.manager, "plan", "personal")
         # The shell runner answers, as it always did (here: no service, no admission).
         self.assertNotIn("queued as run", planned.stdout)
+        self.assertNotIn("ignored", planned.stderr)
+        # The runner always runs in the foreground; the daemon's wait options
+        # are accepted, and said to be ignored, so a script works on both engines.
+        unwaited = self.shell(self.manager, "plan", "personal", "--no-wait", "--wait-seconds", "60")
+        self.assertEqual(unwaited.returncode, planned.returncode, unwaited.stdout + unwaited.stderr)
+        self.assertIn(
+            "--no-wait and --wait-seconds are ignored under the shell engine", unwaited.stderr
+        )
         self.assertEqual(self._ctl_calls(fake), [])
 
     def test_a_run_records_completion_only_for_the_profiles_it_covered(self) -> None:

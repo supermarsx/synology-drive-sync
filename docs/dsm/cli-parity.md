@@ -44,8 +44,8 @@ administrator's ACL instead of the package user's real source access.
 | Remove routine | `remove-routine NAME` |
 | DSM notification policy | `configure-alerts ...` |
 | Doctor | `doctor [NAME|--all] [--level LEVEL] [--write-test]` |
-| Plan | `plan [NAME|--all] [--allow-delete] [--max-total-delete N]` |
-| Run | `run [NAME|--all] [--allow-delete] [--max-total-delete N]` |
+| Plan | `plan [NAME|--all] [--allow-delete] [--max-total-delete N] [--no-wait|--wait-seconds S]` |
+| Run | `run [NAME|--all] [--allow-delete] [--max-total-delete N] [--no-wait|--wait-seconds S]` |
 | Service/run snapshot | `status` |
 | Bounded logs | `logs [LINES]` |
 | Package paths | `paths` |
@@ -60,13 +60,23 @@ for source behavior, independent target execution, and bounded section evidence.
 
 Under the daemon engine (no `var/state/engine`, or `daemon`), `plan` and `run`, and the dashboard's
 Plan and Run, do not start a runner: the manager audits the request and hands it to the sync daemon
-(`ctl run`), which runs it in its one run slot under its watchdog. The command returns once the run is
-queued (`queued as run N: …`, exit `0`; through `api action` the message is `plan queued` or
-`run queued`), and the outcome is recorded in `run.state` and Activity like any other run. A daemon
-that does not answer is a refusal, `the sync service is not running`, exit `75`; there is no fallback
-to the runner. A refusal by the daemon names its code: `stopping`, `busy` or `profile_running` exit
-`75`, `scope_not_found` exit `66`, anything else exit `1`. Doctor and a confirmed resync still run in
-the manager. Under the shell engine nothing changed.
+(`ctl run`), which runs it in its one run slot under its watchdog.
+
+- **On the command line, `plan` and `run` wait for that run** and exit with the run's own exit status,
+  as the runner did: `0`, `3` for partial, `1` for a failure, and so on. They print
+  `queued as run N: …` and then `run N finished: <outcome> (<reason>), exit E: <detail>`.
+  `--wait-seconds S` (1 to 86400, default 86400) bounds the wait. If the run has not finished by then,
+  it goes on: the command says so, names `sdsync-dsm status` to follow it, and exits `75`. If the
+  daemon stops answering during the wait, the command also exits `75` and says the run may go on.
+- **`--no-wait`** returns as soon as the run is queued (`queued as run N: …`, exit `0`).
+- **The dashboard never waits.** Its Plan and Run (`api action`) return `plan queued` or `run queued`,
+  and the outcome arrives through `run.state` and Activity like any other run's.
+
+A daemon that does not answer is a refusal, `the sync service is not running`, exit `75`; there is no
+fallback to the runner. A refusal by the daemon names its code: `stopping`, `busy` or
+`profile_running` exit `75`, `scope_not_found` exit `66`, anything else exit `1`. Doctor and a
+confirmed resync still run in the manager. Under the shell engine nothing changed: the runner runs in
+the foreground, and `--no-wait` and `--wait-seconds` are accepted and named as ignored.
 
 `configure-profile` is a complete replacement of the named profile's non-secret settings. It covers
 the dashboard's target, sync, safety, network, TLS, local-output, and remote-observability fields,

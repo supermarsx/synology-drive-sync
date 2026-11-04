@@ -46,6 +46,13 @@ lists its own commits.
   gates and the secret checks apply, with the same reasons (`policy_*`, `password_missing`,
   `secret_unsafe`, `audit_unavailable`). A daemon pointed at a tree that is not a package runs
   unaudited and says so (`service_audit`).
+- **`sdsync-dsm plan` and `run` hand the run to the daemon and wait for it.** Under the daemon engine
+  the command queues the run, waits for it, and exits with the sync's own exit status (`0`, `3`
+  partial, `1`, ...), so scripts read the same status as before. `--wait-seconds S` (default 86400)
+  bounds the wait; when it runs out the run goes on and the command exits `75`, naming
+  `sdsync-dsm status`. `--no-wait` returns once the run is queued. The dashboard's Plan and Run never
+  wait. A daemon that does not answer is refused (`the sync service is not running`, exit `75`), never
+  run by the old runner. See [CLI parity](dsm/cli-parity.md).
 - **Failure alerts** go through the package's alert policy, counter, notifier and Log Center as
   before, and an escalation follows the policy's cooldown. A delivery that fails is logged as
   `alert_unavailable` with its channel and cause.
