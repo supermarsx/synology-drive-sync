@@ -272,7 +272,8 @@ impl Worker {
         // CLOSE_WRITE marks the end of a write; MODIFY would be one event per
         // buffer of every copy.
         events.modify = false;
-        let mut tree = match TreeWatch::arm(
+        // H9: a disarm ends the arming walk (and every later one) at once.
+        let mut tree = match TreeWatch::arm_until(
             &self.spec.source,
             WatchOptions {
                 filter,
@@ -280,6 +281,7 @@ impl Worker {
                 limit: LimitPolicy::System,
                 setup_deadline,
             },
+            Arc::clone(&self.stop),
         ) {
             Ok(tree) => tree,
             Err(error) => return Attempt::Failed(error),
@@ -410,7 +412,26 @@ impl Worker {
             self.spec.source.clone(),
             filter,
             self.settings.walk_deadline,
+            Some(&self.stop),
         );
+        if self.stopped() {
+            return false;
+        }
+        // S3-7: what the walk could not read is named, not passed over.
+        if let Ok(facts) = &facts
+            && facts.skipped > 0
+            && !self.emit(ChangeEvent::Notice {
+                routine: self.spec.routine.clone(),
+                warn: true,
+                detail: format!(
+                    "catch_up_skipped entries={} first={}",
+                    facts.skipped,
+                    facts.skip_sample.join(",")
+                ),
+            })
+        {
+            return false;
+        }
         if let Ok(facts) = &facts
             && !facts.mounts.is_empty()
             && !self.emit(ChangeEvent::Notice {
@@ -606,15 +627,31 @@ struct Floor {
 impl Floor {
     fn start(worker: &Worker) -> Self {
         let every = worker.floor();
-        let filter = worker.filter().ok().map(Arc::new);
-        let baseline = filter.as_ref().and_then(|filter| {
-            super::poll::read_with_deadline(
+        // S3-7: a floor that cannot build its filter or its first reading is
+        // named (once per episode, as compare() does), never silently blind.
+        let (filter, failure) = match worker.filter() {
+            Ok(filter) => (Some(Arc::new(filter)), None),
+            Err(error) => (None, Some(format!("filter: {error}"))),
+        };
+        let (baseline, failure) = match &filter {
+            Some(filter) => match super::poll::read_with_deadline(
                 worker.spec.source.clone(),
                 Arc::clone(filter),
                 worker.settings.walk_deadline,
-            )
-            .ok()
-        });
+            ) {
+                Ok(reading) => (Some(reading), failure),
+                Err(error) => (None, Some(error.to_string())),
+            },
+            None => (None, failure),
+        };
+        if let Some(cause) = &failure {
+            // A gone control thread is seen by the next emit.
+            let _ = worker.emit(ChangeEvent::Notice {
+                routine: worker.spec.routine.clone(),
+                warn: true,
+                detail: format!("poll_floor_failed cause={cause}"),
+            });
+        }
         Self {
             filter,
             every,
@@ -622,7 +659,7 @@ impl Floor {
             baseline,
             reported: std::collections::BTreeSet::new(),
             overflowed: false,
-            failing: false,
+            failing: failure.is_some(),
         }
     }
 
@@ -728,30 +765,56 @@ struct TreeFacts {
     /// Directories on another filesystem than the root (USB, bind, CIFS/NFS
     /// mounts): inotify sees only this kernel's own writes there.
     mounts: Vec<String>,
+    /// Entries the walk could not read (S3-7), and the first few of them.
+    skipped: usize,
+    skip_sample: Vec<String>,
 }
 
+/// The arm-time walk, on a thread of its own under the process's walk cap,
+/// bounded by `deadline` and ended by `stop` (H9): an abandoned walk is told
+/// to cancel and does so at its next directory.
 fn newest_change(
     root: PathBuf,
     filter: Arc<Filter>,
     deadline: Duration,
+    stop: Option<&AtomicBool>,
 ) -> Result<TreeFacts, String> {
+    let slot = synology_drive_sync::watch::walk_slot().map_err(|live| {
+        format!("walker_unavailable: {live} earlier directory walks are still blocked")
+    })?;
     let current = Arc::new(std::sync::Mutex::new(String::new()));
+    let cancel = Arc::new(AtomicBool::new(false));
     let (tx, rx) = mpsc::channel();
     let walker_current = Arc::clone(&current);
+    let walker_cancel = Arc::clone(&cancel);
     thread::Builder::new()
         .name("sdsyncd-catch-up".into())
         .spawn(move || {
-            let _ = tx.send(walk_newest(&root, &filter, &walker_current));
+            let _slot = slot;
+            let _ = tx.send(walk_newest(&root, &filter, &walker_current, &walker_cancel));
         })
         .map_err(|error| format!("walker_unavailable: {error}"))?;
-    match rx.recv_timeout(deadline) {
-        Ok(result) => result,
-        Err(_) => {
+    let give_up_at = std::time::Instant::now() + deadline;
+    loop {
+        if stop.is_some_and(|stop| stop.load(Ordering::SeqCst)) {
+            cancel.store(true, Ordering::SeqCst);
+            return Err("walk_stopped: the routine was disarmed".to_owned());
+        }
+        let left = give_up_at.saturating_duration_since(std::time::Instant::now());
+        if left.is_zero() {
+            cancel.store(true, Ordering::SeqCst);
             let at = current.lock().map(|path| path.clone()).unwrap_or_default();
-            Err(format!(
+            return Err(format!(
                 "walk_deadline deadline={}s path={at}",
                 deadline.as_secs()
-            ))
+            ));
+        }
+        match rx.recv_timeout(left.min(Duration::from_millis(100))) {
+            Ok(result) => return result,
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                return Err("walker_unavailable: the walk ended without a result".to_owned());
+            }
         }
     }
 }
@@ -760,9 +823,18 @@ fn walk_newest(
     root: &Path,
     filter: &Filter,
     current: &std::sync::Mutex<String>,
+    cancel: &AtomicBool,
 ) -> Result<TreeFacts, String> {
     let mut newest: Option<i64> = None;
     let mut mounts = Vec::new();
+    let mut skipped = 0_usize;
+    let mut skip_sample = Vec::new();
+    let mut skip = |what: String| {
+        skipped += 1;
+        if skip_sample.len() < 3 {
+            skip_sample.push(what);
+        }
+    };
     #[cfg(unix)]
     let root_device = {
         use std::os::unix::fs::MetadataExt;
@@ -770,6 +842,9 @@ fn walk_newest(
     };
     let mut pending = vec![String::new()];
     while let Some(relative) = pending.pop() {
+        if cancel.load(Ordering::SeqCst) {
+            return Err("walk_cancelled".to_owned());
+        }
         let dir = if relative.is_empty() {
             root.to_owned()
         } else {
@@ -785,7 +860,10 @@ fn walk_newest(
             Err(error) if relative.is_empty() => {
                 return Err(format!("root_unreadable path={}: {error}", dir.display()));
             }
-            Err(_) => continue,
+            Err(error) => {
+                skip(format!("{relative} ({:?})", error.kind()));
+                continue;
+            }
         };
         note_time(&mut newest, std::fs::symlink_metadata(&dir).ok().as_ref());
         for entry in entries.flatten() {
@@ -795,8 +873,14 @@ fn walk_newest(
             } else {
                 format!("{relative}/{name}")
             };
-            let Ok(metadata) = entry.metadata() else {
-                continue;
+            let metadata = match entry.metadata() {
+                Ok(metadata) => metadata,
+                // Gone since it was listed: nothing to compare.
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => {
+                    skip(format!("{child} ({:?})", error.kind()));
+                    continue;
+                }
             };
             let is_dir = metadata.is_dir();
             if filter.excludes(&child, is_dir) {
@@ -816,7 +900,12 @@ fn walk_newest(
         }
     }
     mounts.sort();
-    Ok(TreeFacts { newest, mounts })
+    Ok(TreeFacts {
+        newest,
+        mounts,
+        skipped,
+        skip_sample,
+    })
 }
 
 fn note_time(newest: &mut Option<i64>, metadata: Option<&std::fs::Metadata>) {
@@ -1024,6 +1113,7 @@ mod tests {
             root.join("source"),
             Arc::clone(&filter),
             Duration::from_secs(10),
+            None,
         )
         .unwrap()
         .newest
@@ -1033,13 +1123,65 @@ mod tests {
         let excluded = temp_tree("catchup-excluded");
         std::fs::create_dir_all(excluded.join("source/@eaDir")).unwrap();
         let only_dsm = Arc::new(Filter::build(&excluded.join("source"), Vec::new()).unwrap());
-        assert!(newest_change(excluded.join("source"), only_dsm, Duration::from_secs(10)).is_ok());
+        assert!(
+            newest_change(
+                excluded.join("source"),
+                only_dsm,
+                Duration::from_secs(10),
+                None
+            )
+            .is_ok()
+        );
         // A missing root is named.
         let missing =
-            newest_change(root.join("nope"), filter, Duration::from_secs(10)).unwrap_err();
+            newest_change(root.join("nope"), filter, Duration::from_secs(10), None).unwrap_err();
         assert!(missing.starts_with("root_unreadable"), "{missing}");
         let _ = std::fs::remove_dir_all(&root);
         let _ = std::fs::remove_dir_all(&excluded);
+    }
+
+    /// S3-7: the catch-up walk names what it could not read instead of
+    /// passing over it; H9: a stop ends the walk at once.
+    #[cfg(unix)]
+    #[test]
+    fn the_catch_up_walk_names_its_skips_and_honours_a_stop() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = temp_tree("catchup-skips");
+        std::fs::create_dir_all(root.join("source/locked/inner")).unwrap();
+        std::fs::set_permissions(
+            root.join("source/locked"),
+            std::fs::Permissions::from_mode(0o000),
+        )
+        .unwrap();
+        let filter = Arc::new(Filter::build(&root.join("source"), Vec::new()).unwrap());
+        if std::fs::read_dir(root.join("source/locked")).is_err() {
+            let facts = newest_change(
+                root.join("source"),
+                Arc::clone(&filter),
+                Duration::from_secs(10),
+                None,
+            )
+            .unwrap();
+            assert_eq!(facts.skipped, 1, "{facts:?}");
+            assert!(facts.skip_sample[0].starts_with("locked"), "{facts:?}");
+        }
+        std::fs::set_permissions(
+            root.join("source/locked"),
+            std::fs::Permissions::from_mode(0o700),
+        )
+        .unwrap();
+        let stop = AtomicBool::new(true);
+        let stopped = newest_change(
+            root.join("source"),
+            filter,
+            Duration::from_secs(10),
+            Some(&stop),
+        );
+        // Stopped before or after a (fast) walk finished: never a hang.
+        if let Err(cause) = stopped {
+            assert!(cause.starts_with("walk_stopped"), "{cause}");
+        }
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// The floor names and syncs what inotify did not report, and only that.
@@ -1106,7 +1248,8 @@ mod tests {
     #[test]
     fn nested_mounts_are_found_by_device() {
         let filter = Arc::new(Filter::build(Path::new("/dev"), Vec::new()).unwrap());
-        let facts = newest_change(PathBuf::from("/dev"), filter, Duration::from_secs(10)).unwrap();
+        let facts =
+            newest_change(PathBuf::from("/dev"), filter, Duration::from_secs(10), None).unwrap();
         assert!(
             facts
                 .mounts

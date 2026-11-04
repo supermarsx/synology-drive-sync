@@ -34,7 +34,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::thread::{self, JoinHandle};
@@ -51,11 +51,6 @@ const SKIP_SAMPLE: usize = 3;
 const SLICE: Duration = Duration::from_millis(250);
 /// How often a waiting poller looks at `stop` while a walk runs.
 const WALK_SLICE: Duration = Duration::from_millis(50);
-/// The most abandoned (still blocked) walkers the process tolerates before it
-/// refuses to start another, so a dying disk cannot pile up threads.
-const MAX_LIVE_WALKERS: usize = 16;
-
-static LIVE_WALKERS: AtomicUsize = AtomicUsize::new(0);
 
 /// One reading of a source tree.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -369,14 +364,6 @@ enum Waited {
     Stopped,
 }
 
-struct LiveGuard;
-
-impl Drop for LiveGuard {
-    fn drop(&mut self) {
-        LIVE_WALKERS.fetch_sub(1, Ordering::SeqCst);
-    }
-}
-
 /// Run one walk on a helper thread and wait for it at most `deadline`, looking
 /// at `stop` (when given) while it waits.
 fn wait_walk(
@@ -386,32 +373,33 @@ fn wait_walk(
     deadline: Duration,
     stop: Option<&AtomicBool>,
 ) -> Waited {
-    let live = LIVE_WALKERS.load(Ordering::SeqCst);
-    if live >= MAX_LIVE_WALKERS {
-        return Waited::Done(Err(PollError::Unreadable {
-            path: root,
-            detail: format!(
-                "{live} earlier directory walks are still blocked in the filesystem; not starting another"
-            ),
-        }));
-    }
+    // The cap is the process's, shared with the native watch's walks (H9).
+    let slot = match synology_drive_sync::watch::walk_slot() {
+        Ok(slot) => slot,
+        Err(live) => {
+            return Waited::Done(Err(PollError::Unreadable {
+                path: root,
+                detail: format!(
+                    "{live} earlier directory walks are still blocked in the filesystem; not starting another"
+                ),
+            }));
+        }
+    };
     let current = Arc::new(Mutex::new(String::new()));
     let cancel = Arc::new(AtomicBool::new(false));
     let (sender, receiver) = mpsc::channel();
-    LIVE_WALKERS.fetch_add(1, Ordering::SeqCst);
     let spawned = thread::Builder::new()
         .name("sdsyncd-poll-walk".to_owned())
         .spawn({
             let (current, cancel, root) = (Arc::clone(&current), Arc::clone(&cancel), root.clone());
             move || {
-                let _live = LiveGuard;
+                let _slot = slot;
                 let result = walk(source.as_ref(), &root, &filter, &current, &cancel);
                 // The receiver is gone once the deadline passed; nothing to report then.
                 let _ = sender.send(result);
             }
         });
     if let Err(error) = spawned {
-        LIVE_WALKERS.fetch_sub(1, Ordering::SeqCst);
         return Waited::Done(Err(PollError::Unreadable {
             path: root,
             detail: format!("cannot start the directory walk thread: {error}"),
@@ -777,7 +765,7 @@ pub(crate) fn spawn_poller_from(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::AtomicU32;
+    use std::sync::atomic::{AtomicU32, AtomicUsize};
     use std::sync::mpsc::Receiver;
 
     struct TempDir(PathBuf);
