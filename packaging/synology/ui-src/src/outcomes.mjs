@@ -175,7 +175,12 @@ const INDEX_ISSUE_COPY =Object.freeze({
   "pair-index-directory-unusable": "the folder that holds the checksum index could not be used, so every file was checked live",
   "pair-index-unbound": "the checksum index belongs to a different source or destination, so it was not used and every file was checked live",
   "pair-index-format-unsupported": "the checksum index was written in a format or version this package does not read, so it was not used and every file was checked live",
-  "pair-index-canary-mismatch": "a stored checksum disagreed with a live one, so the index was not trusted and every file was checked live"
+  "pair-index-canary-mismatch": "a stored checksum disagreed with a live one, so the index was not trusted and every file was checked live",
+  "pair-index-writeback-unknown": "this NAS's writeback setting could not be read, so files changed in the last minute are treated as unsettled and checked live",
+  "pair-index-writeback-unbounded": "periodic writeback is switched off on this NAS (vm.dirty_writeback_centisecs is 0), so the checksum index cannot tell when a changed file has settled and every file was checked live",
+  "pair-index-nas-clock-skewed": "the destination's clock (or a proxy's in front of it) is more than 20 seconds from this NAS's, so the files it reported were checked live again; check the time settings",
+  "pair-index-cleanup-failed": "a set-aside copy of the checksum index could not be removed and is using disk space; the path is in the detail",
+  "pair-index-remote-ctime-static": "the destination did not show this run's write in a file's change time, so the destination's checksums are always computed live and only the local read is skipped"
 });
 
 const SAFE_TOKEN = /^[A-Za-z0-9_:.-]{1,64}$/;

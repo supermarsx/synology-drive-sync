@@ -1793,6 +1793,43 @@ mod tests {
                 index["issue_detail"],
                 "/var/state/cache/pairs/photos.redb: integrity check failed"
             );
+            // RI-2: the warning codes fix5-index added travel the whole way,
+            // from the core's result record (an info code beside them) to
+            // the bridge's outcomes, so a future allowlist cannot drop them.
+            for code in [
+                "pair-index-writeback-unknown",
+                "pair-index-writeback-unbounded",
+                "pair-index-nas-clock-skewed",
+                "pair-index-cleanup-failed",
+            ] {
+                let facts = IndexFacts::from_value(&json!({
+                    "state": "warm",
+                    "entries": 10,
+                    "served": 4,
+                    "verified_live": 6,
+                    "canary_checked": 1,
+                    "issues": [
+                        {"code": "pair-index-retired", "severity": "info", "path": "", "cause": ""},
+                        {"code": code, "severity": "warning", "path": "/volume1/photos/a.jpg", "cause": "named"}
+                    ]
+                }))
+                .expect("the record reads");
+                assert_eq!(
+                    facts.issue.as_deref(),
+                    Some(code),
+                    "{code}: the warning ranks first"
+                );
+                profile.facts.index = Some(facts);
+                tree.private(
+                    "var/state/profiles/photos.state",
+                    &render_profile_state(&profile, "sync", None).unwrap(),
+                );
+                let outcomes = tree.outcomes();
+                assert_eq!(outcomes["errors"], json!([]), "{code}: {outcomes}");
+                let index = &outcomes["profiles"][0]["index"];
+                assert_eq!(index["issue"], code, "{outcomes}");
+                assert_eq!(index["issue_detail"], "/volume1/photos/a.jpg: named");
+            }
             profile.facts.index = None;
             tree.private(
                 "var/state/profiles/photos.state",
