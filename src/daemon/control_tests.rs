@@ -702,6 +702,18 @@ fn an_invalid_routine_is_reported_once_per_field() {
         profile(home, "alpha");
         routine(home, "alpha", "enabled=true\nmode=hourly\n");
     });
+    // Wait for the first report (a loaded runner can take longer than any
+    // fixed sleep to reach the first turn), then give later turns the chance
+    // to repeat it.
+    let reported = |h: &Harness| {
+        h.logs()
+            .iter()
+            .any(|l| l.starts_with("routine_invalid profile=alpha field=mode"))
+    };
+    h.wait_for("the first report", Duration::from_secs(10), reported);
+    // More turns (a reload would rightly report it again, so only wakes).
+    let _ = h.ask(Request::Wake);
+    let _ = h.ask(Request::Wake);
     thread::sleep(Duration::from_millis(400));
     let skips = h
         .logs()
