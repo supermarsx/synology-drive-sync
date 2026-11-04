@@ -1832,7 +1832,7 @@ class RuntimeTests(unittest.TestCase):
     except (OSError, json.JSONDecodeError):
         job_payload = {{}}
     mode = job_payload.get("test_fail_job_mode") or ""
-    known_cause = cause in ("classification_failed", "secret_claim_failed", "consumer_failed", "consumer_wrote_no_result")
+    known_cause = cause in ("classification_failed", "secret_claim_failed", "consumer_failed", "consumer_wrote_no_result", "audit_unavailable")
     with Path({str(queue_capture)!r}).open("a", encoding="utf-8") as stream:
         if mode == "refuse":
             stream.write(f"fail-job-refused {{request.stem}}\\n")
