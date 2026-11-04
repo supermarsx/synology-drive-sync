@@ -169,6 +169,12 @@ lifecycle command:
 | `shell` | the controller and runner of earlier releases, kept for one release as a fallback |
 | anything else | the daemon, after a `warn` `service_engine_invalid` event in `controller.log` and a console line naming the path and what the file holds |
 
+The shell engine steps aside from a daemon: while a process holds `daemon.lock`, or a live
+supervisor (`run/supervisor.pid`) is about to respawn one, start refuses ("refusing to start the shell
+engine: the sync daemon (PID n) holds ...") and status reports `2` with the same line on stderr.
+Stop the package first, or remove `var/state/engine` to run the daemon engine. A lock `flock` cannot
+probe is said on stderr and does not block.
+
 Under the shell engine, profiles the daemon held for a lasting condition (`state/lasting/<p>.state`)
 are not held: start says so once (`lasting_blocks_not_applied`, with the count).
 

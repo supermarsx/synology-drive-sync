@@ -1126,6 +1126,31 @@ note_lasting_blocks_under_shell() {
         || package_message "warning: the lasting_blocks_not_applied event could not be written to the controller log"
 }
 
+# 0 when a daemon of the daemon engine may be running, for the shell engine to
+# step aside from: a holder of daemon.lock, or a live supervisor that is about to
+# respawn one. Sets shell_engine_daemon_note, naming it. 1 otherwise. A lock that
+# cannot be probed is said, once, and does not block.
+daemon_beside_shell_engine() {
+    shell_engine_daemon_note=
+    shell_engine_daemon_lock=0
+    daemon_lock_held_status || shell_engine_daemon_lock=$?
+    case $shell_engine_daemon_lock in
+        0)
+            shell_engine_daemon_pid=$(script_pid "$daemon_pid_file" 2>/dev/null || true)
+            shell_engine_daemon_note="the sync daemon (PID ${shell_engine_daemon_pid:-unknown}) holds $daemon_lock_file"
+            return 0
+            ;;
+        3)
+            shell_engine_daemon_note="the sync daemon supervisor (PID $supervisor_record_pid) named by $supervisor_pid_file is live"
+            return 0
+            ;;
+        2)
+            echo "warning: $daemon_lock_file cannot be probed (flock is unavailable or failed); a running daemon would not be seen" >&2
+            ;;
+    esac
+    return 1
+}
+
 daemon_ctl() {
     "$api_server" --ctl "$@" --home "$package_home" --var "$package_var"
 }
@@ -1681,6 +1706,10 @@ case ${1:-} in
             package_message "cannot start while package $start_transition_state is in progress"
             exit 1
         }
+        if daemon_beside_shell_engine; then
+            package_message "refusing to start the shell engine: $shell_engine_daemon_note; stop the package first, or remove $service_engine_file to run the daemon engine"
+            exit 1
+        fi
         set +e
         status_code
         current_status=$?
@@ -2519,6 +2548,10 @@ case ${1:-} in
         else
             status_code
             result=$?
+            if daemon_beside_shell_engine; then
+                result=2
+                echo "$shell_engine_daemon_note; the shell engine is selected" >&2
+            fi
             [ "$result" -ne 1 ] || [ -z "${status_stale_api_socket:-}" ] \
                 || echo "stale API socket: $status_stale_api_socket (prepared, mode 0000; no API server and no daemon holds it)" >&2
         fi

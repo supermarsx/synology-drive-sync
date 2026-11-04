@@ -13679,6 +13679,43 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
         self.assertTrue(socket_path.exists(), "a socket beside a held daemon.lock was removed")
         self.assertIsNone(holder.poll())
 
+    def test_shell_engine_start_and_status_see_a_live_daemon(self) -> None:
+        # The shell engine's start and status looked only for its own
+        # controller and API: with the engine file switched to shell while a
+        # daemon ran, start launched a second set of services beside it.
+        run = self.real_var / "run"
+        lock = self.fhs / "var/run/daemon.lock"
+        holder = self._spawn_fake("--daemon", hold_lock=True)
+        self._write_run_record("daemon.pid", self._identity_triple(holder.pid))
+        self._write_run_record("daemon.ready", self._identity_triple(holder.pid))
+        status = self.shell(self.lifecycle, "status")
+        self.assertEqual(status.returncode, 2, status.stdout + status.stderr)
+        self.assertIn(f"the sync daemon (PID {holder.pid}) holds {lock}", status.stderr)
+        started = self.shell(self.lifecycle, "start", timeout=60)
+        self.assertEqual(started.returncode, 1, started.stdout + started.stderr)
+        self.assertIn(f"the sync daemon (PID {holder.pid}) holds {lock}", started.stdout)
+        self.assertIn("refusing to start the shell engine", started.stdout)
+        for record in ("controller.pid", "api.pid", "controller.starting"):
+            self.assertFalse((run / record).exists(), f"start launched services: {record}")
+        self.assertIsNone(holder.poll())
+        # No daemon.pid to name it: the refusal says so rather than guessing.
+        (run / "daemon.pid").unlink()
+        started = self.shell(self.lifecycle, "start", timeout=60)
+        self.assertEqual(started.returncode, 1, started.stdout + started.stderr)
+        self.assertIn(f"the sync daemon (PID unknown) holds {lock}", started.stdout)
+
+    def test_shell_engine_start_and_status_see_a_live_daemon_supervisor(self) -> None:
+        supervisor = self._spawn_fake("--supervise")
+        self._free_daemon_lock()
+        self._write_run_record("supervisor.pid", self._identity_triple(supervisor.pid))
+        status = self.shell(self.lifecycle, "status")
+        self.assertEqual(status.returncode, 2, status.stdout + status.stderr)
+        self.assertIn(f"the sync daemon supervisor (PID {supervisor.pid})", status.stderr)
+        started = self.shell(self.lifecycle, "start", timeout=60)
+        self.assertEqual(started.returncode, 1, started.stdout + started.stderr)
+        self.assertIn(f"the sync daemon supervisor (PID {supervisor.pid})", started.stdout)
+        self.assertFalse((self.real_var / "run/controller.pid").exists())
+
     def test_postupgrade_removes_shell_leftovers_only_under_the_daemon_engine(self) -> None:
         leftovers = [
             self.real_var / "state/controller-reload.pending",
