@@ -235,8 +235,11 @@ fn mapped_write_attempt(attempt: usize) -> Attempt {
     fixture
         .server
         .add_file(&format!("{ROOT}/db.bin"), &first, 1_700_000_000);
-    // Past the old two-second window, well inside the writeback window.
-    std::thread::sleep(Duration::from_millis(2_500));
+    // Past the old two-second window by more than the whole-second flooring of `verified_at`
+    // (a pair proven at t.9 s is stamped t, so 2.5 s can still read as under 2 s old), and well
+    // inside the writeback window. With the window forced to 2 s this is what makes the case
+    // fail every time, not most times.
+    std::thread::sleep(Duration::from_millis(3_500));
 
     let proving = fixture.sync();
     assert_eq!(Fixture::uploaded(&proving), 0, "{proving}");
@@ -310,7 +313,7 @@ fn a_file_written_again_within_the_window_is_never_served() {
         1_700_000_000,
     );
     let mtime = fs::metadata(&path).unwrap().modified().unwrap();
-    std::thread::sleep(Duration::from_millis(2_500));
+    std::thread::sleep(Duration::from_millis(3_500));
 
     let proving = fixture.sync();
     assert_eq!(Fixture::uploaded(&proving), 0, "{proving}");
