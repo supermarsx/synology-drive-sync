@@ -405,6 +405,13 @@ fn wait_walk(
     }
     let give_up_at = Instant::now() + deadline;
     loop {
+        // A disarm ends the wait before any result is looked at: a walk that happened to finish
+        // just before the flag was read must not be reported as one the routine still wants (it
+        // made `the_floors_walk_honours_a_disarm` fail about 3 runs in 100 under load).
+        if stop.is_some_and(|stop| stop.load(Ordering::SeqCst)) {
+            cancel.store(true, Ordering::Relaxed);
+            return Waited::Stopped;
+        }
         let remaining = give_up_at.saturating_duration_since(Instant::now());
         let slice = if stop.is_some() {
             remaining.min(WALK_SLICE)
