@@ -59,11 +59,17 @@ impl Package {
         ] {
             private_dir(&root.join(dir));
         }
+        // As the package writes them: the daemon holds every run to the
+        // runner's pre-core checks (the url, the policy, the password file).
         fs::write(
             root.join("home/config/profiles.d/alpha.toml"),
-            "source = \"/volume1/alpha\"\nmax-delete = 100\n",
+            "source = \"/volume1/alpha\"\nurl = \"http://127.0.0.1:9\"\ndelete = false\n\
+             max-delete = 100\n",
         )
         .unwrap();
+        let password = root.join("home/secrets/alpha.password");
+        fs::write(&password, b"secret\n").unwrap();
+        fs::set_permissions(&password, fs::Permissions::from_mode(0o600)).unwrap();
         Self { root, daemon: None }
     }
 

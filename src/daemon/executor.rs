@@ -69,6 +69,21 @@ pub(crate) struct RunSpec {
     /// The run's mandatory audit (I-7), opened by the supervisor before the
     /// core starts and completed after it ends; `None` runs unaudited (tests).
     pub(crate) audit: Option<AuditStep>,
+    /// The runner's pre-core checks (daemon/preflight.rs), run by the
+    /// supervisor first; a refusal never starts the core.
+    pub(crate) preflight: Option<PreflightStep>,
+}
+
+/// A run's pre-core check: `Err((reason, detail))` refuses it.
+#[derive(Clone)]
+pub(crate) struct PreflightStep(
+    pub(crate) std::sync::Arc<dyn Fn() -> Result<(), (&'static str, String)> + Send + Sync>,
+);
+
+impl std::fmt::Debug for PreflightStep {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("PreflightStep")
+    }
 }
 
 /// What a run's audit records.
@@ -688,26 +703,32 @@ mod process {
     }
 
     fn supervise(spec: RunSpec, requests: mpsc::Receiver<StopCause>, sink: &dyn Fn(ExecEvent)) {
+        let refused = |reason: &'static str, cause: String| {
+            sink(ExecEvent::Finished(Box::new(RunReport {
+                exit: -1,
+                ending: Ending::Refused { reason, cause },
+                stderr_tail: Vec::new(),
+                records: Vec::new(),
+                record_error: None,
+                oom_proven: None,
+                memory_note: None,
+                audit_error: None,
+                last_phase: None,
+            })));
+        };
+        if let Some(PreflightStep(check)) = &spec.preflight
+            && let Err((reason, cause)) = check()
+        {
+            refused(reason, cause);
+            return;
+        }
         // I-7: the audit is opened before the core starts; a run whose audit
         // cannot be opened does not start.
         let transaction = match &spec.audit {
             Some(step) => match step.open() {
                 Ok(transaction) => Some(transaction),
                 Err(cause) => {
-                    sink(ExecEvent::Finished(Box::new(RunReport {
-                        exit: -1,
-                        ending: Ending::Refused {
-                            reason: "audit_unavailable",
-                            cause,
-                        },
-                        stderr_tail: Vec::new(),
-                        records: Vec::new(),
-                        record_error: None,
-                        oom_proven: None,
-                        memory_note: None,
-                        audit_error: None,
-                        last_phase: None,
-                    })));
+                    refused("audit_unavailable", cause);
                     return;
                 }
             },
@@ -972,6 +993,7 @@ mod process {
                 progress_record: None,
                 timings,
                 audit: None,
+                preflight: None,
             }
         }
 

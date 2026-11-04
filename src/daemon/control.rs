@@ -1185,6 +1185,30 @@ impl Control {
             .insert(profile.to_owned(), Blocked::Lasting(lasting));
     }
 
+    /// The runner's pre-core checks for this run (Linux: the package's own
+    /// policy and secrets; elsewhere none, as there is no package).
+    fn preflight(
+        &self,
+        request: &RunRequest,
+        profiles: &[String],
+    ) -> Option<super::executor::PreflightStep> {
+        #[cfg(target_os = "linux")]
+        {
+            let home = self.paths.config_dir.parent()?.to_path_buf();
+            let profiles = profiles.to_vec();
+            let allow_delete = request.allow_delete;
+            let uid = super::sys::geteuid();
+            Some(super::executor::PreflightStep(Arc::new(move || {
+                super::preflight::check(&home, &profiles, allow_delete, uid)
+            })))
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = (request, profiles);
+            None
+        }
+    }
+
     /// Lift the blocks a requested run of `scope` covers.
     fn clear_blocks(&mut self, scope: &str, cause: &str) {
         let names: Vec<String> = self
@@ -1610,6 +1634,7 @@ impl Control {
             result_record: Some(result_record),
             progress_record: None,
             timings: self.settings.timings,
+            preflight: self.preflight(&request, &profiles),
             audit: Some(super::executor::AuditStep {
                 audit: Arc::clone(&self.audit),
                 operation: match request.action {
