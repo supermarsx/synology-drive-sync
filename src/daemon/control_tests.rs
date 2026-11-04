@@ -388,8 +388,84 @@ fn profile_with(home: &Path, name: &str, settings: &[(&str, &str)]) {
     .unwrap();
 }
 
+/// The shipped manager's `routines.d/<name>.conf`, as `configure-routine --profile
+/// <name>` renders it: every key it writes, in its order, with its defaults. The e2e
+/// test `the_unit_harness_routine_template_is_what_the_real_manager_renders`
+/// (tests/routine_template_drift.rs) re-renders it with the real shell manager, in
+/// every mode, and fails when the two drift apart.
+const MANAGER_ROUTINE: &str = include_str!("testdata/manager-routine.conf");
+
+/// Write `routines.d/<name>.conf` as the manager would: its whole key set, with
+/// `conf` (`key=value` lines) replacing the manager's value for each key it names.
+/// A key the manager does not write is a test bug and panics, so a setting can
+/// never be silently dropped, and a conf of three or four keys that no manager
+/// ever produced cannot hide what the daemon does with a real one.
 fn routine(home: &Path, name: &str, conf: &str) {
-    fs::write(home.join(format!("config/routines.d/{name}.conf")), conf).unwrap();
+    let mut wanted: Vec<(&str, &str)> = conf
+        .lines()
+        .filter(|line| !line.is_empty())
+        .map(|line| {
+            line.split_once('=')
+                .unwrap_or_else(|| panic!("`{line}` is not a key=value line"))
+        })
+        .collect();
+    let mut text = String::new();
+    for line in MANAGER_ROUTINE.lines() {
+        let key = line.split_once('=').map_or(line, |(key, _)| key);
+        match wanted.iter().position(|(wanted, _)| *wanted == key) {
+            Some(at) => {
+                let (key, value) = wanted.remove(at);
+                text.push_str(&format!("{key}={value}\n"));
+            }
+            None => {
+                text.push_str(line);
+                text.push('\n');
+            }
+        }
+    }
+    assert!(
+        wanted.is_empty(),
+        "the manager's routine has no such key (or it is given twice): {wanted:?}\n{MANAGER_ROUTINE}"
+    );
+    fs::write(home.join(format!("config/routines.d/{name}.conf")), text).unwrap();
+}
+
+/// The harness writes the manager's whole routine, overrides applied in place, and
+/// refuses a key the manager does not write.
+#[test]
+fn the_harness_writes_routines_with_the_managers_key_set() {
+    let root = std::env::temp_dir().join(format!(
+        "sdsyncd-routine-keys-{}-{}",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::SeqCst)
+    ));
+    let home = root.join("home");
+    fs::create_dir_all(home.join("config/routines.d")).unwrap();
+    routine(
+        &home,
+        "alpha",
+        "enabled=false\nmode=realtime\ndebounce_seconds=1\n",
+    );
+    let written = fs::read_to_string(home.join("config/routines.d/alpha.conf")).unwrap();
+    let keys = |text: &str| -> Vec<String> {
+        text.lines()
+            .map(|l| l.split_once('=').map_or(l, |(k, _)| k).to_owned())
+            .collect()
+    };
+    assert_eq!(keys(&written), keys(MANAGER_ROUTINE), "{written}");
+    assert!(
+        written.contains("enabled=false\n")
+            && written.contains("mode=realtime\n")
+            && written.contains("debounce_seconds=1\n")
+            && written.contains("retry_count=5\n"),
+        "overrides in place, the manager's defaults elsewhere:\n{written}"
+    );
+    let refused = std::panic::catch_unwind(|| routine(&home, "beta", "enabled=true\nbogus=1\n"));
+    fs::remove_dir_all(&root).unwrap();
+    assert!(
+        refused.is_err(),
+        "a key the manager does not write was accepted"
+    );
 }
 
 /// Replace `path` whole, as the shipped manager does (a private temporary beside
