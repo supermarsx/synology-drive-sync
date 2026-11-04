@@ -134,6 +134,27 @@ lists its own commits.
   - Readiness no longer connects (that connect was logged as a failed request).
   - An API child that cannot be waited for is KILLed and reaped before a restart.
 
+### Lifecycle script fixes from the second review
+
+- **The shell engine no longer starts beside a daemon it cannot see.** When `daemon.lock` cannot be
+  probed, start and status ask the identity check on the daemon's records, as stop does: a live
+  daemon, or one the check cannot rule out, blocks, and the refusal says why.
+- **A unit without `flock(1)` still sees the daemon.** The lock is probed with
+  `sdsync-dsm-api --daemon-lock-probe <path>`, and the probe in use is named once per change in
+  `controller.log` (`daemon_lock_probe`). Status names why a lock could not be probed.
+- **A malformed or unreadable `supervisor.pid` no longer reads as "no supervisor".**
+  `supervisor.lock`, which the supervisor holds for its life, is the second witness; start, the
+  hooks and stop refuse naming it, and a stale record's removal names why it could not be trusted.
+- **The controller signals only its own watcher.** A pid file naming another child of the controller
+  (a wrapped PID) is left alone and named (`routine_watch_pid_mismatch`, or `pid_reused` in the
+  failure detail).
+- **A stop without a readable clock has one deadline.** Each phase is charged what it can take
+  against `SDSYNC_DSM_STOP_TIMEOUT`, so the worst case is the same as with a clock.
+- **Recovering a dead `run.lock` owner removes the daemon's staged owner file** (`run/.run.lock.pid.<pid>.<n>`)
+  and names it.
+- **The shell snapshot carries `controller.degraded`** (`reason`, `since_epoch`, `cause`) from the
+  daemon's three optional `controller.state` lines, and refuses a malformed set as `corrupt_state`.
+
 ### Verified-pair index: correctness fixes
 
 - **A write through a shared memory mapping is no longer missed.** Linux moves a file's times only
