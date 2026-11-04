@@ -575,19 +575,25 @@ knowing when reading it:
 | `routine_watch_notice` | A named skip or note while watching (`profile=` and the detail): a vanished entry, an unreadable subdirectory (first three paths, with cause), a walk that hit its deadline, `watch_missed_change dirs=N first=… floor_seconds=…` (`warn`: the stat-only floor found a directory that changed without an inotify event, and synced it), `poll_floor_failed cause=…` (a floor reading failed, once), or `nested_mounts=N first=… watched_by=poll_floor every_seconds=…` (`info` at arm: other devices below the source) |
 | `routine_suppressed` | `warn`. A trigger was held by a lasting block (`profile=`, `run=`, `reason=`, `clears_on=run_now_or_settings_change`); at most once an hour per profile |
 | `control_consumer_failed` / `control_consumer_outcome_unknown` | A dashboard job's worker died or passed its lane deadline: the operation was answered `consumer_failed` / left outcome-unknown because it may have committed (see [Named terminal failures](troubleshooting.md#named-terminal-failures)) |
-| `control_request_rejected` / `control_file_expired` | A queue request file was refused (not a private regular file, or over 64 KiB) / an old request or response was removed |
+| `control_request_rejected` / `control_file_expired` | A queue request file was refused (not a private regular file, or over 64 KiB) / an old request or response was removed (only once it is gone) |
+| `control_file_unremovable` | `error`. The queue could not remove one of a job's files (`id=`, `kind=processing\|secret\|request\|response\|progress`, `path=`, `cause=`). A `secret` may hold a credential: remove it by hand. A secret that is a symbolic link is left in place and named |
 | `api_server_exited` / `api_server_restarted` | `error` / `warn`. The daemon's API service child exited (`status=`, `served_seconds=`, `cause=`: its last stderr line) / was started again (`attempt=`, `after_seconds=`) |
 | `api_socket_stale_removed` / `api_socket_stale_kept` | `warn` / `error`. Before starting its API service, the daemon removed an `api.sock` left by a server that is gone: one killed between bind and activation (`mode=0000`), or one nobody accepts on. Or it kept the socket and named why (another live server, or not a socket of this package) |
-| `api_server_unwaitable` | `error`. The API service child could not be waited for, so it was KILLed and reaped (`pid=`, `killed=`, `reaped=`) before a restart |
+| `api_server_unwaitable` | `error`. The API service child could not be waited for (`pid=`, `cause=`, `killed=`, `reaped=`, `gone=`). It is KILLed only while its pid still names it (after `ECHILD` it was reaped elsewhere and is not signalled: `killed=skipped`) |
+| `api_server_respawn_held` / `api_server_respawn_released` | `error` / `info`. The previous API service child could not be proven gone, so no new one is started beside it; checked again every 30 s / it is gone and the restart goes ahead |
+| `api_server_identity_unavailable` | `warn`. The API service child's start tick could not be read at spawn (`pid=`); it is told apart from a reused pid only while unreaped |
 | `service_start_failed` | `error`, with Activity `service.start_failed`. Either the daemon did not start (`step=` `daemon.pid`, `daemon.ready`, `ctl_socket`, `api_server`, `queue`, … `path=`, `cause=`), and its records were removed; or the supervisor gave up (`exit=`, `last_stderr=`, `restarts_exhausted=`) |
 | `service_restarted` | `warn`. The supervisor restarted a crashed daemon (`exit=`, `last_stderr=`; `cause=daemon_lock_held` for a daemon that found `daemon.lock` held and no daemon answering) |
 | `service_superseded` | `info`. A supervisor left because another daemon (or supervisor) already serves |
 | `service_records_removed` / `service_records_kept` | `warn` / `error`. A supervisor that gave up removed the dead daemon's `daemon.pid`, `daemon.ready` and `ctl.sock` (`paths=`), or could not (`cause=`) |
 | `daemon_stderr_unavailable` | `error`. The supervisor could not open `log/daemon-stderr.log` (`cause=`); the daemon's stderr is discarded |
-| `config_unreadable` / `config_recovered` | `error` / `info`. A configuration or state file could not be read (`path=`, `cause=`): permissions, an I/O error, or over 1 MiB. It is never read as absent; the last configuration read stays in force, and a routine with none is skipped as `field=unreadable`. Listed in `ctl status` (`config_unreadable`). Once per episode |
-| `audit_reconcile_failed` / `audit_reconcile_recovered` / `audit_unavailable` | `error` / `info` / `error`. The dashboard queue could not reconcile the audit outbox (once per episode, with `retry_seconds=`) / it could again / a waiting job was answered `audit_unavailable` after the bound (`id=`, `op=`) |
+| `config_unreadable` / `config_recovered` | `error` / `info`. A configuration or state file could not be read (`path=`, `cause=`): permissions, an I/O error, or over 1 MiB. It is never read as absent; `kept=` says what stands instead (the last configuration read; a routine's state holds the routine; a dependency's profile state is a dependency not met; a profile state is not rewritten; `run.state` is rewritten without the aggregate it carried), and a routine with no configuration is skipped as `field=unreadable`. Listed in `ctl status` (`config_unreadable`). Once per episode |
+| `config_forgotten` | `info`. A routine was removed, so its unreadable configuration or state is no longer read and leaves `config_unreadable` (`path=`) |
+| `profile_state_unreadable` | `error`, scheduler. A run ended but the profile's state record could not be read (`id=`, `profile=`, `path=`, `cause=`), so it was not rewritten: the failure streak and last success it carries stay as they are. The run says `degraded=profile_state` |
+| `audit_reconcile_failed` / `audit_reconcile_recovered` / `audit_unavailable` | `error` / `info` / `error`. The dashboard queue could not reconcile the audit outbox (once per episode, with `retry_seconds=`) / it could again / a waiting job was answered `audit_unavailable` after the 30 s bound (`id=`, `op=`). A job is refused only on an attempt made after it arrived: within 2 s of the last attempt it waits for a fresh one, so a recovered audit is not refused for the rest of the backoff. An open episode is retried on its backoff even with no job waiting |
+| `service_degraded` / `service_degraded_cleared` | `warn` / `info`. The service is degraded (`reason=audit_unavailable`, `since=`, `cause=`): `controller.state` carries `degraded=`, `degraded_since=` and `degraded_cause=`, and the dashboard shows it in amber / it recovered and the keys are gone |
 | `consumer_unkillable` / `consumer_unwaitable` / `consumer_stderr` | `error` / `error` / `warn` or `error`. A dashboard job's worker outlived KILL and its slot was freed / could not be waited for / wrote this line on stderr (`id=`, `op=`, `exit=`, `path=`, `line=`) |
-| `event_log_lock_stale` / `event_log_rotation_failed` / `event_log_rotation_recovered` | `warn` / `error` / `info`. A rotation cleared a dead or torn `event-log.lock` owner / could not be made (`path=`, `cause=`, `retry_seconds=`) / succeeded again |
+| `event_log_lock_stale` / `event_log_rotation_deferred` / `event_log_rotation_failed` / `event_log_rotation_recovered` | `warn` / `info` / `error` / `info`. A rotation cleared a dead or torn `event-log.lock` owner / found it held by a live writer (or a torn record not yet provably stale) and is tried again in 5 s (`path=`, `cause=`, `retry_seconds=`) / could not be made, or the lock stayed held for a minute (`path=`, `cause=`, `retry_seconds=`) / the log is under its limit again |
 | `ctl_accept_failed` / `ctl_accept_recovered` | `error` / `info`. The control socket could not accept a connection or start a thread for it (`path=`, `cause=`); the listener pauses 200 ms instead of spinning. Once per episode |
 
 Re-levelled from `warn` to `error` because each records a failed write or delivery:
@@ -603,9 +609,13 @@ size limit, and the failure is recorded once per episode on standard error and i
 successful rotation of that log removes. Lines are single `O_APPEND` writes, which never interleave.
 The daemon rotates under the same `event-log.lock` as the shell writers, taken by the shell's own
 claim-and-link protocol. An empty lock directory is free. An owner that is gone, or a torn record
-from before this boot, is cleared and named (`event_log_lock_stale`). A live owner is never waited
-for: the rotation is skipped, the line is kept, the failure is named once
-(`event_log_rotation_failed`), and that log is not tried again for a minute. The marker is on-disk
+from before this boot, is cleared and named (`event_log_lock_stale`); the record cleared is checked to be
+the one judged, and one a live writer linked in meanwhile is put back. A live owner is never waited
+for: the rotation is skipped and the line is kept. That is contention, named once at `info`
+(`event_log_rotation_deferred`) and tried again in 5 s; only a lock held for a minute, or one that
+cannot be taken at all, is the failure (`event_log_rotation_failed`, the marker), and that log is then
+not tried again for a minute. The episode ends when the log is found under its limit again (rotated
+here or by a shell writer), so a later failure is named again. The marker is on-disk
 evidence only; the dashboard does not display it. An unsafe rotation set is still refused with exit `73` and nothing is written to it.
 
 ### Dashboard requests the service could not serve

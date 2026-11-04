@@ -100,8 +100,9 @@ lists its own commits.
     logs).
   - A daemon waits out the lifecycle's own `daemon.lock` probe instead of exiting.
 - **No log line waits on `event-log.lock`.** An empty lock directory is free; a dead or torn owner
-  is cleared; a live one skips the rotation for a minute. Each case is named
-  (`event_log_rotation_failed`, `event_log_lock_stale`).
+  is cleared; a live one skips the rotation, which is tried again in 5 s and is a failure only after
+  a minute. Each case is named (`event_log_rotation_deferred`, `event_log_rotation_failed`,
+  `event_log_lock_stale`).
 - **The dashboard queue never waits forever.**
   - A failing audit reconcile is named once and backed off. Waiting jobs are answered
     `audit_unavailable` after 30 s, a new named failure with its own dashboard guidance.
@@ -133,6 +134,34 @@ lists its own commits.
     (`api_socket_stale_removed`).
   - Readiness no longer connects (that connect was logged as a failed request).
   - An API child that cannot be waited for is KILLed and reaped before a restart.
+
+### Daemon fixes from the fix5 review
+
+- **`run.lock/pid` is renamed into place**, so a crash can no longer leave it with a second link.
+- **The audit log's state is on the Overview.** While the dashboard queue cannot reconcile the audit
+  log for more than 30 s, `controller.state` carries `degraded=audit_unavailable`, `degraded_since=`
+  and `degraded_cause=`, the snapshot's `controller.degraded`, and an amber item says queued operations
+  are refused until it recovers (`service_degraded` / `service_degraded_cleared`). A recovered audit
+  log is no longer refused for the rest of its backoff: a job is refused only on an attempt made after
+  it arrived, and an open episode is retried even with nothing waiting.
+- **A profile state that cannot be read is not rewritten.** Its failure streak and last success stay
+  as they are (`profile_state_unreadable`, `degraded=profile_state`). `config_unreadable` says what
+  stands instead (`kept=`), a dependency's unreadable state is named, a removed routine's unreadable
+  records are forgotten (`config_forgotten`), and `ctl status` names an unreadable `profiles.d`
+  (`index_unavailable`).
+- **A scheduled all-profiles run publishes its progress record**, so the watchdog no longer takes a
+  long network phase of a batch for a stall.
+- **A file the dashboard queue cannot remove is named** (`control_file_unremovable`), a secret
+  sidecar included; `control_file_expired` is logged only for a file that is gone.
+- **Log rotation:** an episode ends when the log is found rotated, so a later failure is named again;
+  a torn owner record is reported as torn; a record cleared as stale is checked to be the one judged.
+- **Bounded waits:** a configuration save whose manager outlives KILL, or whose grandchild holds its
+  stderr, no longer holds the save's reply. A full control-socket backlog is named, not reported as
+  "Transport endpoint is not connected".
+- **The API service child** is signalled only while its pid still names it, and is not respawned beside
+  one that could not be proven gone (`api_server_respawn_held`).
+- **`sdsync-dsm-api --daemon-lock-probe <path>`** answers what `flock -n` does on `daemon.lock` (0 free,
+  3 held, 1 cannot probe, named on stderr) for a NAS whose BusyBox has no `flock`.
 
 ### Verified-pair index: correctness fixes
 
