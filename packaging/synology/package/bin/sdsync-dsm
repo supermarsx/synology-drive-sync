@@ -234,6 +234,20 @@ doctor_audit_scope() {
     printf '%s\n' "$doctor_scope"
 }
 
+# The profile name a resync command line names: its first positional argument,
+# skipping --scope and --confirm and their values. Prints nothing when it names
+# none. Whether the name is valid is the caller's to decide.
+resync_named_profile() {
+    while [ "$#" -gt 0 ]; do
+        case $1 in
+            --scope|--confirm) [ "$#" -ge 2 ] || return 0; shift ;;
+            --*) ;;
+            *) printf '%s\n' "$1"; return 0 ;;
+        esac
+        shift
+    done
+}
+
 configure_profile_audit_target() {
     audit_target=
     audit_singletons=,
@@ -440,7 +454,7 @@ begin_mutation() {
             configure-profile|remove-profile|set-default|configure-routine|remove-routine|\
             set-password|set-totp|set-remote-log-token|remove-password|remove-totp|\
             remove-remote-log-token|enable|disable|set-schedule|configure-alerts|\
-            configure-performance|configure-security-policy|doctor)
+            configure-performance|configure-security-policy|doctor|resync)
                 case $command_name in
                     configure-routine) direct_audit_operation=routine ;;
                     set-schedule|enable|disable) direct_audit_operation=schedule ;;
@@ -462,6 +476,18 @@ begin_mutation() {
                     remove-profile|remove-routine|set-default|set-password|set-totp|set-remote-log-token|\
                     remove-password|remove-totp|remove-remote-log-token)
                         valid_name "${1:-}" && direct_audit_profile=$1
+                        ;;
+                    resync)
+                        # The named profile, else the default the command will
+                        # resolve; all only when neither can be resolved, in which
+                        # case the command refuses and the record ends failed.
+                        resolved_resync_profile=$(resync_named_profile "$@")
+                        if ! valid_name "$resolved_resync_profile"; then
+                            resolved_resync_profile=$(current_default_for_action 2>/dev/null || true)
+                        fi
+                        if valid_name "$resolved_resync_profile"; then
+                            direct_audit_profile=$resolved_resync_profile
+                        fi
                         ;;
                     doctor)
                         resolved_doctor_audit_scope=$(doctor_audit_scope "$@" 2>/dev/null || true)

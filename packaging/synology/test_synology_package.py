@@ -398,6 +398,64 @@ class BuilderTests(unittest.TestCase):
             with self.assertRaises(SystemExit):
                 select_shard(tests, bad)
 
+    def test_every_mutating_dispatch_arm_is_in_the_audited_command_list(self) -> None:
+        # begin_mutation hands the arm a mandatory audit record only for the
+        # commands named in the audited list, and mark_mutation_commit_started
+        # refuses (exit 73) for any other. `resync` called begin_mutation, was
+        # missing from the list, and so died before the engine ran on every
+        # invocation. The two must name exactly the same commands.
+        source = (HERE / "package/bin/sdsync-dsm").read_text(encoding="utf-8")
+        lines = source.splitlines()
+
+        start = next(index for index, line in enumerate(lines) if line == "case $command_name in")
+        end = next(index for index in range(start, len(lines)) if lines[index] == "esac")
+        arm_header = re.compile(r"^    ([A-Za-z0-9|*-]+)\)(.*)$")
+        arms: dict[str, list[str]] = {}
+        current: list[str] | None = None
+        for line in lines[start + 1 : end]:
+            header = arm_header.match(line)
+            if header:
+                current = []
+                for name in header.group(1).split("|"):
+                    arms[name] = current
+                current.append(header.group(2))
+            elif current is not None:
+                current.append(line)
+        dispatched_with_begin = {
+            name for name, body in arms.items() if any("begin_mutation" in part for part in body)
+        }
+
+        marker = "    mutation_commit_started=false\n    case ${command_name:-} in\n"
+        self.assertEqual(source.count(marker), 1)
+        pattern_block = source.split(marker, 1)[1].split(")\n", 1)[0]
+        audited = {
+            name.strip()
+            for name in pattern_block.replace("\\\n", "").split("|")
+            if name.strip()
+        }
+
+        # Guard against the parser quietly matching nothing.
+        for canary in ("configure-profile", "doctor", "configure-security-policy"):
+            self.assertIn(canary, audited)
+            self.assertIn(canary, dispatched_with_begin)
+        self.assertGreaterEqual(len(dispatched_with_begin), 15)
+
+        self.assertEqual(
+            sorted(dispatched_with_begin - audited),
+            [],
+            "dispatch arms call begin_mutation but are not in the audited command list",
+        )
+        self.assertEqual(
+            sorted(audited - set(arms)),
+            [],
+            "the audited command list names commands that are not dispatch arms",
+        )
+        self.assertEqual(
+            sorted(audited - dispatched_with_begin),
+            [],
+            "the audited command list names commands that never call begin_mutation",
+        )
+
     def test_validator_binary_override_is_authoritative_over_newer_fallbacks(self) -> None:
         override = self.root / "explicit-validator"
         fallback = self.root / "newer-fallback"
@@ -5808,6 +5866,172 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
             )
             terminal_profiles.append(str(transaction_records[0]["profile"]))
         self.assertCountEqual(terminal_profiles, ["archive", "personal", "all"])
+
+    def reset_audit_log(self) -> Path:
+        audit_log = self.real_var / "log/audit.log"
+        audit_log.write_text("", encoding="utf-8")
+        audit_log.chmod(0o600)
+        if os.getuid() == 0:
+            os.chown(audit_log, self.drop_uid, self.drop_gid)
+        return audit_log
+
+    def audit_transactions(self, operation: str) -> list[list[dict[str, object]]]:
+        """The audit records of one operation, grouped by transaction in log order."""
+        audit_log = self.real_var / "log/audit.log"
+        records = [
+            json.loads(line)
+            for line in audit_log.read_text(encoding="utf-8").splitlines()
+            if line
+        ]
+        grouped: dict[str, list[dict[str, object]]] = {}
+        for record in records:
+            if record["operation"] == operation:
+                grouped.setdefault(str(record["transaction"]), []).append(record)
+        return list(grouped.values())
+
+    def assert_one_resync_audit(self, profile: str, terminal: str) -> None:
+        transactions = self.audit_transactions("resync")
+        self.assertEqual(len(transactions), 1, transactions)
+        records = transactions[0]
+        self.assertEqual([str(record["state"]) for record in records], ["requested", terminal], records)
+        self.assertEqual({str(record["profile"]) for record in records}, {profile}, records)
+        # The execution phase is recorded in the outbox, not the log, and a
+        # transaction that reached its terminal state leaves nothing behind.
+        outbox = self.real_var / "state/audit-outbox"
+        self.assertEqual(sorted(outbox.glob("*")) if outbox.is_dir() else [], [])
+
+    def test_resync_plan_is_audited_and_runs_the_engine(self) -> None:
+        # A shipped regression: begin_mutation ran for resync, but the audited
+        # command list did not name it, so mark_mutation_commit_started refused
+        # with "mandatory audit execution phase could not be recorded" before
+        # the engine ran. Every resync, plan and confirmed alike, died there.
+        self.configure_with_password("personal", self.source_one, True)
+        self.configure_with_password("archive", self.source_two)
+        for arguments, profile in (
+            (("personal",), "personal"),
+            (("archive",), "archive"),
+            ((), "personal"),
+        ):
+            with self.subTest(arguments=arguments):
+                self.reset_audit_log()
+                self.capture.write_text("", encoding="utf-8")
+                result = self.shell(self.manager, "resync", *arguments)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertNotIn("audit execution phase", result.stderr)
+                calls = self.capture.read_text(encoding="utf-8").splitlines()
+                self.assertEqual(len(calls), 1, calls)
+                self.assertIn(f"--output json resync --profile {profile}", calls[0])
+                self.assertNotIn("--confirm", calls[0])
+                self.assertNotIn("--scope", calls[0])
+                self.assert_one_resync_audit(profile, "succeeded")
+
+    def test_confirmed_resync_passes_its_ticket_and_scope_and_is_audited(self) -> None:
+        self.configure_with_password("personal", self.source_one, True)
+        self.reset_audit_log()
+        self.capture.write_text("", encoding="utf-8")
+        ticket = "0123456789abcdef"
+        result = self.shell(
+            self.manager, "resync", "personal", "--scope", "Photos/2024", "--confirm", ticket
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        calls = self.capture.read_text(encoding="utf-8").splitlines()
+        self.assertEqual(len(calls), 1, calls)
+        self.assertIn(
+            f"--output json resync --profile personal --scope Photos/2024 --confirm {ticket}",
+            calls[0],
+        )
+        self.assert_one_resync_audit("personal", "succeeded")
+
+    def test_failed_resync_is_audited_as_failed_and_keeps_the_engine_status(self) -> None:
+        self.configure_with_password("personal", self.source_one, True)
+        core = self.real_target / "bin/synology-drive-sync"
+        core.write_text(
+            "#!/bin/sh\n"
+            'printf \'%s\\n\' "$*" >> "$SDSYNC_TEST_CAPTURE"\n'
+            "echo 'engine refused the resync' >&2\n"
+            "exit 7\n",
+            encoding="utf-8",
+        )
+        core.chmod(0o755)
+        for arguments in (("personal",), ("personal", "--confirm", "fedcba9876543210")):
+            with self.subTest(arguments=arguments):
+                self.reset_audit_log()
+                self.capture.write_text("", encoding="utf-8")
+                result = self.shell(self.manager, "resync", *arguments)
+                self.assertEqual(result.returncode, 7, result.stdout + result.stderr)
+                self.assertIn("engine refused the resync", result.stderr)
+                self.assertIn("resync --profile personal", self.capture.read_text(encoding="utf-8"))
+                self.assert_one_resync_audit("personal", "failed")
+
+    def test_refused_resync_is_audited_as_failed_and_never_reaches_the_engine(self) -> None:
+        self.configure_with_password("personal", self.source_one, True)
+        configured = self.configure("nopass", self.source_two, "/home/Drive/NoPass")
+        self.assertEqual(configured.returncode, 0, configured.stderr)
+        for arguments, profile, cause in (
+            (("ghost",), "ghost", "resync requires one existing profile"),
+            (("nopass",), "nopass", "has no password"),
+            (("personal", "--confirm", "NOT-A-TICKET"), "personal", "lowercase hexadecimal"),
+            # An invalid name resolves to the default, as the audit target does.
+            (("bad name",), "personal", "invalid profile name"),
+        ):
+            with self.subTest(arguments=arguments):
+                self.reset_audit_log()
+                self.capture.write_text("", encoding="utf-8")
+                result = self.shell(self.manager, "resync", *arguments)
+                self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertIn(cause, result.stderr)
+                self.assertNotIn("audit execution phase", result.stderr)
+                self.assertEqual(self.capture.read_text(encoding="utf-8"), "")
+                self.assert_one_resync_audit(profile, "failed")
+
+    def test_resync_with_no_resolvable_profile_is_audited_as_all_and_refused(self) -> None:
+        self.reset_audit_log()
+        self.capture.write_text("", encoding="utf-8")
+        result = self.shell(self.manager, "resync")
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("no usable default profile", result.stderr)
+        self.assertEqual(self.capture.read_text(encoding="utf-8"), "")
+        self.assert_one_resync_audit("all", "failed")
+
+    def test_api_resync_routes_through_the_audited_manager(self) -> None:
+        self.configure_with_password("personal", self.source_one, True)
+        self.reset_audit_log()
+        self.capture.write_text("", encoding="utf-8")
+        planned, payload = self.api("resync", "--profile", "personal")
+        self.assertEqual(planned.returncode, 0, planned.stdout + planned.stderr)
+        self.assertEqual(payload["ok"], True, payload)
+        self.assertEqual(payload["status"], "succeeded", payload)
+        self.assert_one_resync_audit("personal", "succeeded")
+
+        self.reset_audit_log()
+        self.capture.write_text("", encoding="utf-8")
+        ticket = "00ff00ff00ff00ff"
+        confirmed, payload = self.api(
+            "resync", "--profile", "personal", "--scope", "Docs", "--confirm", ticket
+        )
+        self.assertEqual(confirmed.returncode, 0, confirmed.stdout + confirmed.stderr)
+        self.assertEqual(payload["ok"], True, payload)
+        calls = self.capture.read_text(encoding="utf-8").splitlines()
+        self.assertEqual(len(calls), 1, calls)
+        self.assertIn(
+            f"--output json resync --profile personal --scope Docs --confirm {ticket}",
+            calls[0],
+        )
+        self.assert_one_resync_audit("personal", "succeeded")
+
+        core = self.real_target / "bin/synology-drive-sync"
+        core.write_text(
+            "#!/bin/sh\n"
+            "echo 'engine refused the resync' >&2\n"
+            "exit 7\n",
+            encoding="utf-8",
+        )
+        core.chmod(0o755)
+        self.reset_audit_log()
+        failed, payload = self.api("resync", "--profile", "personal", "--confirm", ticket)
+        self.assertNotEqual(failed.returncode, 0, failed.stdout + failed.stderr)
+        self.assertEqual(payload["ok"], False, payload)
+        self.assert_one_resync_audit("personal", "failed")
 
     def test_direct_doctor_levels_select_expected_source_and_target_core_checks(self) -> None:
         self.assertEqual(
