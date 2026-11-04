@@ -230,6 +230,14 @@ and exit `137`, with an `info` Activity `run.cancelled` row (state `cancelled`),
 `runner_died`. A cancellation the runner itself observes, before the core starts or before it
 completes, writes the same `run.cancelled` row; cancellations no longer appear as `run.failed`.
 
+The shell engine's stop has one budget, `SDSYNC_DSM_STOP_TIMEOUT` (default and maximum 120 seconds),
+for the controller's whole shutdown, not only the runner's grace. If it ends with services still
+live, the stop does not exit `1` with them running: it says `graceful stop timed out after N seconds;
+killing what is left`, logs `service_stop_forced` (`error`, `engine=shell`), kills the runner (found
+by its verified identity) with its direct children and the API service, gives the controller 5 more
+seconds to record the run and exit, and kills it too, naming each KILL. A service that is still live
+10 seconds after KILL fails the stop. A run ended this way is not a clean cancellation.
+
 A run read as stale is never reported as running anywhere in the snapshot: the legacy `run.state`,
 `outcomes.run.state` and every covered routine's state read `failed` (`outcomes.run.outcome` stays
 `stale`, reason `runner_died`). A profile that run covered, whose own record predates the run, reads

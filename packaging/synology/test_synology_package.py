@@ -25687,6 +25687,50 @@ fi
         self.assertNotIn("exit=137", " ".join(str(r.get("detail")) for r in self.ctl_runs("slow")), self.ctl_dump())
         self.ctl_assert_stop_was_a_cancellation(env)
 
+    def test_a_package_stop_that_outlasts_its_budget_kills_what_is_left_and_says_so(self) -> None:
+        # The shell engine's stop waited for the controller up to
+        # SDSYNC_DSM_STOP_TIMEOUT and then printed "graceful stop timed out
+        # ...; process was not force-killed" and exited 1 with the controller,
+        # its runner and the sync core all still alive: the Package Center saw a
+        # failed stop and a service still working. The deadline now ends in KILL
+        # for what is still there, found by exact identity, the runner's core
+        # with it, and the stop says what it forced (and logs service_stop_forced).
+        self.ctl_profile("slow", self.source_one)
+        self.ctl_routine("slow", "interval", interval="60")
+        env, clock = self.ctl_world("c5f", 810000)
+        env["SDSYNC_DSM_RUNNER_STOP_GRACE"] = "100"  # the controller would wait far past the stop budget
+        pid_file, _ = self.ctl_slow_cancel_core("c5f", ignore_term=True)
+        self.capture.write_text("", encoding="utf-8")
+        self.ctl_start(env)
+        write_clock(clock, "810061\n")
+        self.ctl_wait(pid_file.exists, "the core to start")
+        core_pid = int(pid_file.read_text(encoding="utf-8").strip())
+        controller_pid = int((self.real_var / "run/controller.pid").read_text(encoding="utf-8").split()[0])
+        runner_pid = int((self.real_var / "run/run.lock/pid").read_text(encoding="utf-8").split()[0])
+        began = time.monotonic()
+        stopped = self.shell(
+            self.lifecycle, "stop", timeout=120, extra_environment={"SDSYNC_DSM_STOP_TIMEOUT": "4"},
+        )
+        elapsed = time.monotonic() - began
+        report = stopped.stdout + stopped.stderr + self.ctl_dump()
+        self.assertEqual(stopped.returncode, 0, report)
+        self.assertIn("graceful stop timed out after 4 seconds", stopped.stdout, report)
+        self.assertIn("killing", stopped.stdout, report)
+        self.assertIn(f"killed runner PID {runner_pid}", stopped.stdout, report)
+        self.assertLess(elapsed, 4 + 10 + 20, f"stop took {elapsed:.1f} s\n" + report)
+        for label, pid in (("controller", controller_pid), ("runner", runner_pid), ("core", core_pid)):
+            self.assertTrue(
+                not Path(f"/proc/{pid}").exists()
+                or "Z" in Path(f"/proc/{pid}/stat").read_text().split(")")[-1][:3],
+                f"the {label} (PID {pid}) survived a stop that reported success\n" + report,
+            )
+        forced = self.ctl_events("service_stop_forced")
+        self.assertTrue(forced, report)
+        self.assertIn("engine=shell", str(forced[-1].get("detail")), report)
+        self.assertEqual(self.shell(self.lifecycle, "status").returncode, 3, report)
+        self.assertFalse((self.real_var / "run/controller.pid").exists(), report)
+        self.assertFalse((self.real_var / "run/run.lock").exists(), report)
+
     def test_a_runner_killed_by_a_package_stop_is_recorded_as_cancelled(self) -> None:
         self.ctl_profile("slow", self.source_one)
         self.ctl_routine("slow", "interval", interval="60")
@@ -25697,8 +25741,18 @@ fi
         self.ctl_start(env)
         write_clock(clock, "800061\n")
         self.ctl_wait(pid_file.exists, "the core to start")
-        stopped = self.shell(self.lifecycle, "stop", timeout=150)
+        # The controller's own shutdown (wake-up, the 2 s grace, its KILL, the
+        # cancellation record, its exit) took 6.5 s of the suite's 10 s stop
+        # budget on an idle host; a loaded one ran out (integrator gate at
+        # 7722b3c: "graceful stop timed out after 10 seconds"). The budget is
+        # for the controller's whole shutdown, not for the 2 s grace, so this test
+        # gives it the 30 s the cooperative-cancel test above does, and asserts
+        # the stop was not one the lifecycle had to force.
+        stopped = self.shell(
+            self.lifecycle, "stop", timeout=150, extra_environment={"SDSYNC_DSM_STOP_TIMEOUT": "30"},
+        )
         self.assertEqual(stopped.returncode, 0, stopped.stdout + stopped.stderr)
+        self.assertNotIn("killing", stopped.stdout, stopped.stdout + stopped.stderr)
         self.assertTrue(self.ctl_events("runner_stop_forced", "profile=slow"), self.ctl_dump())
         self.ctl_assert_stop_was_a_cancellation(env)
 

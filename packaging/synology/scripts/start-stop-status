@@ -297,6 +297,78 @@ hard_stop_exact_launched_child() {
     return 75
 }
 
+# The shell engine's stop signals TERM and waits; the controller escalates to
+# KILL itself (the runner's grace, then KILL). When the stop budget ends first --
+# a controller wedged, a grace longer than the budget, a unit too loaded to finish
+# in time -- the stop used to print "process was not force-killed" and exit 1 with
+# the services still running. It now forces what is left, in two steps so that a
+# controller that only waited on its runner can record that run itself:
+#   1. the runner (if its identity is the verified one) and its direct children,
+#      and the API service;
+#   2. the controller.
+# Every target is killed only after its identity is checked again; each KILL is
+# named. 0 when nothing unsafe was met, 1 when an identity could not be proven
+# (then nothing more is signalled).
+force_stop_runner_and_api() {
+    force_names=
+    if [ "${run_active:-false}" = true ] && verified_service_pid_matches runner "$run_pid"; then
+        force_children=
+        for force_entry in /proc/[0-9]*; do
+            force_child=${force_entry#/proc/}
+            read_process_stat_fields "$force_child" || continue
+            [ "$process_stat_ppid" = "$run_pid" ] || continue
+            read_process_status_ids "$force_child" || continue
+            [ "$process_status_uid" = "$path_owner" ] || continue
+            force_children="$force_children $force_child"
+        done
+        kill -KILL "$run_pid" 2>/dev/null || true
+        force_names="runner PID $run_pid"
+        for force_child in $force_children; do
+            kill -KILL "$force_child" 2>/dev/null || true
+            force_names="$force_names, its child PID $force_child"
+        done
+    fi
+    if [ "${api_active:-false}" = true ]; then
+        force_api_status=0
+        exact_controller_process_status "$saved_api_pid" "$saved_api_start" "$saved_api_boot" \
+            || force_api_status=$?
+        case $force_api_status in
+            0)
+                api_pid_matches "$saved_api_pid" || {
+                    package_message "refusing to kill API PID $saved_api_pid: its executable identity changed"
+                    return 1
+                }
+                kill -KILL "$saved_api_pid" 2>/dev/null || true
+                force_names="${force_names:+$force_names, }API service PID $saved_api_pid"
+                ;;
+            1) ;;
+            *)
+                package_message "refusing to kill API PID $saved_api_pid: its identity cannot be proven"
+                return 1
+                ;;
+        esac
+    fi
+    [ -z "$force_names" ] || package_message "killed $force_names"
+    return 0
+}
+
+force_stop_controller() {
+    [ "${controller_active:-false}" = true ] || return 0
+    force_controller_status=0
+    exact_controller_process_status "$saved_pid" "$saved_controller_start" "$saved_controller_boot" \
+        || force_controller_status=$?
+    case $force_controller_status in
+        0) ;;
+        1) return 0 ;;
+        *)
+            package_message "refusing to kill controller PID $saved_pid: its identity cannot be proven"
+            return 1
+            ;;
+    esac
+    kill -KILL "$saved_pid" 2>/dev/null || true
+    package_message "killed controller PID $saved_pid"
+}
+
 signal_exact_controller_identity() {
     exact_signal_pid=$1
     exact_signal_start=$2
@@ -2408,6 +2480,8 @@ case ${1:-} in
         # seconds; only the sampling is finer.
         load_poll_resolution
         poll_reset
+        stop_force_stage=0
+        stop_wait_limit=$timeout
         while :; do
             controller_still_active=false
             run_still_active=false
@@ -2448,9 +2522,31 @@ case ${1:-} in
             fi
             [ "$controller_still_active" = true ] || [ "$run_still_active" = true ] || \
                 [ "$api_still_active" = true ] || break
-            if poll_expired "$timeout"; then
-                package_message "graceful stop timed out after $timeout seconds; process was not force-killed"
-                exit 1
+            if poll_expired "$stop_wait_limit"; then
+                # Past the budget: force what is left (see force_stop_runner_and_api).
+                case $stop_force_stage in
+                    0)
+                        package_message "graceful stop timed out after $timeout seconds; killing what is left"
+                        append_controller_log_event error service_stop_forced \
+                            "engine=shell stage=runner_and_api controller_pid=${saved_pid:-none} runner_pid=${run_pid:-none} grace_s=$timeout" >/dev/null 2>&1 \
+                            || package_message "warning: the service_stop_forced event could not be written to the controller log"
+                        force_stop_runner_and_api || exit 1
+                        stop_force_stage=1
+                        stop_wait_limit=5
+                        ;;
+                    1)
+                        package_message "the controller (PID ${saved_pid:-none}) did not exit within 5 seconds of its runner's KILL; killing it"
+                        force_stop_controller || exit 1
+                        stop_force_stage=2
+                        stop_wait_limit=10
+                        ;;
+                    *)
+                        package_message "services remained live 10 seconds after KILL; the stop failed"
+                        exit 1
+                        ;;
+                esac
+                poll_reset
+                continue
             fi
             poll_wait
         done
