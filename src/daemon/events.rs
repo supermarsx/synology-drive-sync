@@ -8,9 +8,13 @@
 //! The shell `sdsync-dsm` still appends to `activity.log` and `controller.log`.
 //! Lines are `O_APPEND` single writes, which never interleave; a rotation is
 //! made under the shell's `event-log.lock`, taken by the shell's own claim and
-//! link protocol and never waited for: a held lock skips the rotation (the line
-//! is kept past the limit, the shell's marker names it) and the next attempt
-//! for that file is a minute away, so no log line ever waits on it (H1).
+//! link protocol and never waited for: a held lock skips the rotation and the
+//! line is kept past the limit, so no log line ever waits on it (H1). A live
+//! writer holding it is contention, named once at info and tried again in
+//! seconds; only contention that lasts a minute, or a lock that cannot be
+//! taken at all, is the Error and the shell's marker (N-D7). An episode ends
+//! when the file is found under its limit again, so a later failure is named
+//! again (N-D2).
 
 #![forbid(unsafe_code)]
 
@@ -163,9 +167,26 @@ static ROTATION: Mutex<()> = Mutex::new(());
 /// line ever waits for a lock (H1).
 const ROTATION_BACKOFF: std::time::Duration = std::time::Duration::from_secs(60);
 
-/// Per log file: when its rotation may next be tried, and whether its failure
-/// episode was already reported.
-static ROTATION_TROUBLE: Mutex<BTreeMap<PathBuf, Instant>> = Mutex::new(BTreeMap::new());
+/// While a live writer holds the lock, the rotation is tried again this soon:
+/// contention is a deferral, not a failure (N-D7).
+const CONTENTION_RETRY: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// One log file's rotation episode: open from the first deferral or failure
+/// until the file is found under its limit again (rotated here or by the
+/// shell, N-D2).
+struct Trouble {
+    /// When the rotation may next be tried.
+    retry_at: Instant,
+    /// Since when a live writer has held the lock, across retries.
+    contended_since: Option<Instant>,
+    /// The deferral was named (info, once per episode).
+    deferred_noted: bool,
+    /// The failure was named (error and marker, once per episode).
+    reported: bool,
+}
+
+/// Per log file, its open rotation episode.
+static ROTATION_TROUBLE: Mutex<BTreeMap<PathBuf, Trouble>> = Mutex::new(BTreeMap::new());
 
 /// controller.log lines about the logs themselves (a rotation that failed, a
 /// stale lock that was cleared), written ahead of the next controller.log line
@@ -214,12 +235,17 @@ impl FileSink {
     /// keeps the line (appended past the limit, as the shell does), leaves the
     /// shell's marker naming the file and the cause once per episode, and is
     /// not tried again for [`ROTATION_BACKOFF`].
+    ///
+    /// A live writer holding the lock (a shell writer mid-rotation) is
+    /// contention, not a failure (N-D7): the deferral is named once at info
+    /// and retried after [`CONTENTION_RETRY`]; only contention that outlasts
+    /// [`ROTATION_BACKOFF`] becomes the Error and the marker.
     fn rotate_locked(&self, path: &Path, limit: u64, keep: usize) {
         let now = Instant::now();
         let backing_off = ROTATION_TROUBLE
             .lock()
             .ok()
-            .and_then(|trouble| trouble.get(path).copied())
+            .and_then(|trouble| trouble.get(path).map(|t| t.retry_at))
             .is_some_and(|retry_at| now < retry_at);
         if backing_off {
             return;
@@ -228,6 +254,7 @@ impl FileSink {
         // Another sink may have rotated it while this one waited (H1/S3-7: a
         // second rotation would push a fresh generation out).
         if !fs::symlink_metadata(path).is_ok_and(|m| m.len() >= limit) {
+            self.end_episode(path);
             return;
         }
         let outcome = event_lock::take(&self.event_lock).and_then(|taken| {
@@ -238,45 +265,122 @@ impl FileSink {
                     format!("path={} cause={stale}", self.event_lock.display()),
                 );
             }
+            // N-D7: checked again under the lock. A shell writer that held it
+            // may have rotated the file meanwhile, and a second rotation
+            // would push a fresh generation out.
+            if !fs::symlink_metadata(path).is_ok_and(|m| m.len() >= limit) {
+                return Ok(());
+            }
             // The guard lives until the rotation is done, then releases.
-            rotate(path, keep).map_err(|error| format!("rotate: {error}"))
+            rotate(path, keep)
+                .map_err(|error| event_lock::TakeError::Failed(format!("rotate: {error}")))
         });
         match outcome {
-            Ok(()) => {
-                let reported = ROTATION_TROUBLE
-                    .lock()
-                    .ok()
-                    .and_then(|mut trouble| trouble.remove(path))
-                    .is_some();
-                self.retire_marker(path);
-                if reported {
-                    self.note(
-                        Level::Info,
-                        "event_log_rotation_recovered",
-                        format!("path={}", path.display()),
-                    );
-                }
+            Ok(()) => self.end_episode(path),
+            Err(event_lock::TakeError::Held(cause)) => self.contended(path, now, &cause),
+            Err(event_lock::TakeError::Failed(cause)) => self.failed(path, now, &cause),
+        }
+    }
+
+    /// The file is under its limit (rotated, here or by the shell): its
+    /// episode is over, so a later failure is a new one and is named again
+    /// (N-D2: an episode left open hid every later failure).
+    fn end_episode(&self, path: &Path) {
+        let ended = match ROTATION_TROUBLE.lock() {
+            Ok(mut trouble) => trouble.remove(path),
+            Err(_) => {
+                eprintln!(
+                    "sdsyncd: the log rotation state is poisoned; {} keeps its episode",
+                    path.display()
+                );
+                None
             }
-            Err(cause) => {
-                let first = ROTATION_TROUBLE
-                    .lock()
-                    .ok()
-                    .map(|mut trouble| trouble.insert(path.to_owned(), now + ROTATION_BACKOFF))
-                    .is_none_or(|previous| previous.is_none());
-                if first {
-                    self.record_marker(path, &cause);
-                    self.note(
-                        Level::Error,
-                        "event_log_rotation_failed",
-                        format!(
-                            "path={} cause={} retry_seconds={} new lines are kept past the size limit",
-                            path.display(),
-                            one_line(&cause),
-                            ROTATION_BACKOFF.as_secs()
-                        ),
-                    );
-                }
+        };
+        let Some(ended) = ended else {
+            return;
+        };
+        if ended.reported {
+            self.retire_marker(path);
+            self.note(
+                Level::Info,
+                "event_log_rotation_recovered",
+                format!("path={}", path.display()),
+            );
+        }
+    }
+
+    /// A live (or not yet provably stale) writer holds the lock.
+    fn contended(&self, path: &Path, now: Instant, cause: &str) {
+        let (since, noted, reported) = {
+            let Ok(mut trouble) = ROTATION_TROUBLE.lock() else {
+                // Without the episode state this is a failure, named.
+                self.failed(path, now, cause);
+                return;
+            };
+            let entry = trouble.entry(path.to_owned()).or_insert(Trouble {
+                retry_at: now,
+                contended_since: None,
+                deferred_noted: false,
+                reported: false,
+            });
+            let since = *entry.contended_since.get_or_insert(now);
+            entry.retry_at = now + CONTENTION_RETRY;
+            let noted = std::mem::replace(&mut entry.deferred_noted, true);
+            (since, noted, entry.reported)
+        };
+        let held_for = now.duration_since(since);
+        if held_for >= ROTATION_BACKOFF {
+            if !reported {
+                self.failed(
+                    path,
+                    now,
+                    &format!("{cause}, for {} s", held_for.as_secs()),
+                );
             }
+            return;
+        }
+        if !noted {
+            self.note(
+                Level::Info,
+                "event_log_rotation_deferred",
+                format!(
+                    "path={} cause={} retry_seconds={} the line is kept past the size limit meanwhile",
+                    path.display(),
+                    one_line(cause),
+                    CONTENTION_RETRY.as_secs()
+                ),
+            );
+        }
+    }
+
+    /// The rotation cannot be made: once per episode, the marker and an Error.
+    fn failed(&self, path: &Path, now: Instant, cause: &str) {
+        let first = match ROTATION_TROUBLE.lock() {
+            Ok(mut trouble) => {
+                let entry = trouble.entry(path.to_owned()).or_insert(Trouble {
+                    retry_at: now,
+                    contended_since: None,
+                    deferred_noted: false,
+                    reported: false,
+                });
+                entry.retry_at = now + ROTATION_BACKOFF;
+                !std::mem::replace(&mut entry.reported, true)
+            }
+            // Poisoned: named every time rather than never.
+            Err(_) => true,
+        };
+        if first {
+            self.record_marker(path, cause);
+            self.note(
+                Level::Error,
+                "event_log_rotation_failed",
+                format!(
+                    "path={} cause={} retry_seconds={} new lines are kept past the size limit",
+                    path.display(),
+                    one_line(cause),
+                    ROTATION_BACKOFF.as_secs()
+                ),
+            );
         }
     }
 
@@ -334,16 +438,26 @@ impl FileSink {
         let named = |step: &str, error: io::Error| {
             format!("path={} step={step} cause={error}", path.display())
         };
-        if let Ok(metadata) = fs::symlink_metadata(path) {
-            if metadata.file_type().is_symlink() || !metadata.file_type().is_file() {
-                return Err(format!(
-                    "path={} step=refuse cause=not a regular file",
-                    path.display()
-                ));
+        match fs::symlink_metadata(path) {
+            Ok(metadata) => {
+                if metadata.file_type().is_symlink() || !metadata.file_type().is_file() {
+                    return Err(format!(
+                        "path={} step=refuse cause=not a regular file",
+                        path.display()
+                    ));
+                }
+                if metadata.len() >= limit {
+                    self.rotate_locked(path, limit, keep);
+                } else {
+                    // Rotated by another writer (the shell) while an episode
+                    // was open: it is over (N-D2).
+                    self.end_episode(path);
+                }
             }
-            if metadata.len() >= limit {
-                self.rotate_locked(path, limit, keep);
-            }
+            // Rotated away and not yet recreated: the episode is over too.
+            Err(error) if error.kind() == io::ErrorKind::NotFound => self.end_episode(path),
+            // Any other error is met, and named, by the open below.
+            Err(_) => {}
         }
         let mut options = OpenOptions::new();
         options.append(true).create(true);
@@ -435,58 +549,121 @@ mod event_lock {
         Some((now - seconds) as i64)
     }
 
-    /// Whether the owner record at `owner` provably names no live writer:
-    /// `Some(cause)` when stale, `None` when it is (or may be) held.
-    fn stale(lock: &Path, owner: &Path) -> Result<Option<String>, String> {
+    /// Why the lock was not taken.
+    pub(super) enum TakeError {
+        /// A live writer holds it, or a torn record has not yet settled:
+        /// contention, tried again soon (N-D7).
+        Held(String),
+        /// It cannot be taken or used: a failure, named once per episode.
+        Failed(String),
+    }
+
+    /// What the owner record at `owner` says about the lock.
+    enum Owner {
+        /// The record went away meanwhile: the lock may be free now.
+        Vanished,
+        /// A live writer (or one not provably dead): the cause names it.
+        Held(String),
+        /// Provably stale, with the cause and the record judged, by device and
+        /// inode, so the recovery removes that record and no other.
+        Stale(String, (u64, u64)),
+    }
+
+    /// Judge the owner record at `owner`.
+    fn judge(lock: &Path, owner: &Path) -> Result<Owner, TakeError> {
         let metadata = match fs::symlink_metadata(owner) {
             Ok(metadata) => metadata,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Err(error) => return Err(format!("{}: {error}", owner.display())),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(Owner::Vanished);
+            }
+            Err(error) => return Err(TakeError::Failed(format!("{}: {error}", owner.display()))),
         };
         if !metadata.file_type().is_file() {
-            return Err(format!("{}: not a regular file", owner.display()));
+            return Err(TakeError::Failed(format!(
+                "{}: not a regular file",
+                owner.display()
+            )));
         }
-        let text = fs::read_to_string(owner).unwrap_or_default();
+        let recorded = (metadata.dev(), metadata.ino());
+        // An unreadable record is not an empty (torn) one: it could name a
+        // live writer, so it is never cleared as stale.
+        let text = match fs::read_to_string(owner) {
+            Ok(text) => text,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(Owner::Vanished);
+            }
+            Err(error) => return Err(TakeError::Failed(format!("{}: {error}", owner.display()))),
+        };
         let lines: Vec<&str> = text.lines().collect();
         let well_formed = lines.len() == 3
             && lines[0].parse::<u32>().is_ok_and(|pid| pid > 1)
             && lines[1].parse::<u64>().is_ok_and(|start| start > 0)
             && !lines[2].is_empty();
         if well_formed {
-            return Ok(super::super::state::private_lock_owner(lock)
-                .is_none()
-                .then(|| format!("its owner PID {} is gone", lines[0])));
+            return Ok(
+                if super::super::state::private_lock_owner(lock).is_some() {
+                    Owner::Held(format!(
+                        "{} is held by a live writer (PID {})",
+                        lock.display(),
+                        lines[0]
+                    ))
+                } else {
+                    Owner::Stale(format!("its owner PID {} is gone", lines[0]), recorded)
+                },
+            );
         }
         // Torn: written before this boot, or unchanged across a settle.
         if boot_epoch().is_some_and(|boot| metadata.mtime() < boot) {
-            return Ok(Some("a torn owner record from before this boot".into()));
+            return Ok(Owner::Stale(
+                "a torn owner record from before this boot".into(),
+                recorded,
+            ));
         }
+        let torn = || {
+            Owner::Held(format!(
+                "{} holds a torn owner record ({} bytes), not yet provably stale",
+                lock.display(),
+                metadata.len()
+            ))
+        };
         let identity = (
             metadata.dev(),
             metadata.ino(),
             metadata.len(),
             metadata.mtime(),
         );
-        let mut seen = TORN_SEEN.lock().map_err(|_| "poisoned".to_owned())?;
+        let mut seen = TORN_SEEN.lock().map_err(|_| {
+            TakeError::Failed("the torn-record state is poisoned".to_owned())
+        })?;
         match *seen {
             Some((earlier, at)) if earlier == identity && at.elapsed() >= TORN_SETTLED => {
                 *seen = None;
-                Ok(Some(format!(
-                    "a torn owner record unchanged for {} s",
-                    TORN_SETTLED.as_secs()
-                )))
+                Ok(Owner::Stale(
+                    format!(
+                        "a torn owner record unchanged for {} s",
+                        TORN_SETTLED.as_secs()
+                    ),
+                    recorded,
+                ))
             }
-            Some((earlier, _)) if earlier == identity => Ok(None),
+            Some((earlier, _)) if earlier == identity => Ok(torn()),
             _ => {
                 *seen = Some((identity, Instant::now()));
-                Ok(None)
+                Ok(torn())
             }
         }
     }
 
-    /// Take the lock without waiting: `Err(cause)` when a live (or not
-    /// provably dead) writer holds it, or it cannot be taken.
-    pub(super) fn take(lock: &Path) -> Result<Taken, String> {
+    /// Any other error on the way is a failure.
+    impl From<String> for TakeError {
+        fn from(cause: String) -> Self {
+            Self::Failed(cause)
+        }
+    }
+
+    /// Take the lock without waiting: `Held` when a live (or not provably
+    /// dead) writer holds it, `Failed` when it cannot be taken.
+    pub(super) fn take(lock: &Path) -> Result<Taken, TakeError> {
         let pid = std::process::id();
         let start = super::super::super::linux_files::process_start(pid)
             .map_err(|_| "this process's start tick cannot be read".to_owned())?;
@@ -505,24 +682,24 @@ mod event_lock {
             match fs::DirBuilder::new().mode(0o700).create(lock) {
                 Ok(()) => {}
                 Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
-                Err(error) => return Err(format!("{}: {error}", lock.display())),
+                Err(error) => return Err(format!("{}: {error}", lock.display()).into()),
             }
             let metadata = fs::symlink_metadata(lock)
                 .map_err(|error| format!("{}: {error}", lock.display()))?;
             if !metadata.file_type().is_dir() {
-                return Err(format!("{}: not a directory", lock.display()));
+                return Err(format!("{}: not a directory", lock.display()).into());
             }
             // Only `pid` may be inside; anything else makes it unprovable.
-            for entry in fs::read_dir(lock)
-                .map_err(|error| format!("{}: {error}", lock.display()))?
-                .flatten()
+            for entry in fs::read_dir(lock).map_err(|error| format!("{}: {error}", lock.display()))?
             {
+                let entry = entry.map_err(|error| format!("{}: {error}", lock.display()))?;
                 if entry.file_name() != "pid" {
                     return Err(format!(
                         "{} holds {:?}, not only pid",
                         lock.display(),
                         entry.file_name()
-                    ));
+                    )
+                    .into());
                 }
             }
             write_claim(&claim, &record)?;
@@ -544,41 +721,72 @@ mod event_lock {
                     });
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
-                Err(error) => return Err(format!("{}: {error}", owner.display())),
+                Err(error) => return Err(format!("{}: {error}", owner.display()).into()),
             }
-            match stale(lock, &owner)? {
-                Some(cause) => {
-                    // Recovered the shell's way: renamed to a name of our own,
-                    // so one contender takes any one record.
+            match judge(lock, &owner)? {
+                Owner::Vanished => {}
+                Owner::Held(cause) => return Err(TakeError::Held(cause)),
+                Owner::Stale(cause, judged) => {
                     let recovery = PathBuf::from(format!(
                         "{}.recover.{pid}.{start}.{}",
                         lock.display(),
                         boot.trim()
                     ));
-                    if fs::rename(&owner, &recovery).is_ok() {
-                        if let Err(error) = fs::remove_file(&recovery) {
-                            return Err(format!("{}: {error}", recovery.display()));
-                        }
+                    if recover(&owner, &recovery, judged)? {
                         cleared.push(cause);
                     }
                 }
-                None => {
-                    return Err(format!(
-                        "{} is held by a live writer ({})",
-                        lock.display(),
-                        fs::read_to_string(&owner)
-                            .unwrap_or_default()
-                            .lines()
-                            .next()
-                            .map_or_else(|| "unknown".to_owned(), |pid| format!("PID {pid}"))
-                    ));
-                }
             }
         }
-        Err(format!(
+        Err(TakeError::Held(format!(
             "{} could not be taken: its owner record kept changing",
             lock.display()
-        ))
+        )))
+    }
+
+    /// Clear the stale record judged at `owner` the shell's way: renamed to a
+    /// name of our own, so one contender takes any one record (N-D7). The
+    /// renamed record is checked to be the one judged: another contender may
+    /// have cleared it and a live writer linked its own in between. That one
+    /// is put back; if it cannot be (a third writer took the lock), the
+    /// displaced record is kept at `recovery` and the failure names it.
+    /// `Ok(true)` when the judged record was removed, `Ok(false)` when there
+    /// was nothing (left) to clear.
+    fn recover(owner: &Path, recovery: &Path, judged: (u64, u64)) -> Result<bool, TakeError> {
+        match fs::rename(owner, recovery) {
+            Ok(()) => {}
+            // Another contender cleared it first.
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => {
+                return Err(TakeError::Failed(format!(
+                    "{} could not be cleared: {error}",
+                    owner.display()
+                )));
+            }
+        }
+        let renamed = fs::symlink_metadata(recovery)
+            .map(|metadata| (metadata.dev(), metadata.ino()))
+            .map_err(|error| format!("{}: {error}", recovery.display()))?;
+        if renamed == judged {
+            fs::remove_file(recovery).map_err(|error| format!("{}: {error}", recovery.display()))?;
+            return Ok(true);
+        }
+        // Not the record judged: restored, and the lock is held by it.
+        match fs::hard_link(recovery, owner) {
+            Ok(()) => {
+                fs::remove_file(recovery)
+                    .map_err(|error| format!("{}: {error}", recovery.display()))?;
+                Err(TakeError::Held(format!(
+                    "{} was replaced by a new owner record while it was being cleared; it was put back",
+                    owner.display()
+                )))
+            }
+            Err(error) => Err(TakeError::Failed(format!(
+                "{} was replaced by a new owner record while it was being cleared and could not be put back ({error}); it is kept at {}",
+                owner.display(),
+                recovery.display()
+            ))),
+        }
     }
 
     fn write_claim(claim: &Path, record: &str) -> Result<(), String> {
@@ -610,7 +818,13 @@ mod event_lock {
         pub(super) cleared: Vec<String>,
     }
 
-    pub(super) fn take(_: &Path) -> Result<Taken, String> {
+    #[allow(dead_code)]
+    pub(super) enum TakeError {
+        Held(String),
+        Failed(String),
+    }
+
+    pub(super) fn take(_: &Path) -> Result<Taken, TakeError> {
         Ok(Taken {
             cleared: Vec::new(),
         })
@@ -776,8 +990,9 @@ mod tests {
     }
 
     /// H1: a live owner is never waited for: the rotation is skipped at once,
-    /// named once (marker and controller.log), and not tried again within the
-    /// backoff, while every line is still appended.
+    /// the deferral named once (N-D7: contention is not a failure), and not
+    /// tried again within the retry, while every line is still appended.
+    /// Contention that outlasts the backoff becomes the failure and its marker.
     #[cfg(target_os = "linux")]
     #[test]
     fn a_live_owner_skips_the_rotation_without_waiting() {
@@ -815,18 +1030,40 @@ mod tests {
         assert!(!root.join("log/activity.log.1").exists());
         let activity = fs::read_to_string(root.join("log/activity.log")).unwrap();
         assert!(activity.ends_with("line 4\n"), "every line is kept");
-        let marker = fs::read_to_string(root.join("state/log-rotation.failed")).unwrap();
-        assert!(
-            marker.contains(&format!("path={}", root.join("log/activity.log").display())),
-            "{marker}"
-        );
+        assert!(!root.join("state/log-rotation.failed").exists());
         let controller = fs::read_to_string(root.join("log/controller.log")).unwrap();
+        assert_eq!(
+            controller.matches("event_log_rotation_deferred").count(),
+            1,
+            "{controller}"
+        );
+        assert!(controller.contains("held by a live writer"), "{controller}");
+        // Still held a minute later: now a failure, named once, with its marker.
+        let path = root.join("log/activity.log");
+        {
+            let mut trouble = ROTATION_TROUBLE.lock().unwrap();
+            let trouble = trouble.get_mut(&path).expect("the deferral opened an episode");
+            let past = Instant::now()
+                .checked_sub(ROTATION_BACKOFF + std::time::Duration::from_secs(1))
+                .expect("the monotonic clock is past one minute");
+            trouble.contended_since = Some(past);
+            trouble.retry_at = past;
+        }
+        sink.activity(6, &started(6)).unwrap();
+        sink.activity(7, &started(7)).unwrap();
+        probe_line(&sink);
+        let controller = fs::read_to_string(root.join("log/controller.log")).unwrap();
+        eprintln!("{controller}");
         assert_eq!(
             controller.matches("event_log_rotation_failed").count(),
             1,
             "{controller}"
         );
-        assert!(controller.contains("held by a live writer"), "{controller}");
+        let marker = fs::read_to_string(root.join("state/log-rotation.failed")).unwrap();
+        assert!(
+            marker.contains(&format!("path={}", path.display())),
+            "{marker}"
+        );
         let _ = holder.kill();
         let _ = holder.wait();
         let _ = fs::remove_dir_all(&root);
@@ -882,6 +1119,140 @@ mod tests {
             "{controller}"
         );
         assert_eq!(controller.matches("event_log_lock_stale").count(), 2);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    fn probe_line(sink: &FileSink) {
+        sink.log(
+            1,
+            &LogEvent {
+                level: Level::Info,
+                category: "controller",
+                event: "probe",
+                detail: String::new(),
+            },
+        )
+        .unwrap();
+    }
+
+    /// N-D2: a rotation episode ends when the file is found under its limit
+    /// again (the shell rotated it), so a later failure is a new episode and
+    /// is named again. The episode used to stay open for good: the second
+    /// failure went unreported.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_later_rotation_failure_is_named_again() {
+        let root = var_tree("second-episode");
+        let lock = root.join("run/event-log.lock");
+        // A lock directory holding something besides `pid` cannot be taken:
+        // a failure, named at once.
+        let wedge = |on: bool| {
+            if on {
+                fs::create_dir_all(lock.join("stray")).unwrap();
+            } else {
+                fs::remove_dir_all(&lock).unwrap();
+            }
+        };
+        wedge(true);
+        activity_over_limit(&root);
+        let sink = FileSink::new(&root.join("log"));
+        sink.activity(1, &started(1)).unwrap();
+        probe_line(&sink);
+        // The shell rotates: the lock is free, the log is small, the marker
+        // is retired.
+        wedge(false);
+        fs::rename(
+            root.join("log/activity.log"),
+            root.join("log/activity.log.1"),
+        )
+        .unwrap();
+        fs::remove_file(root.join("state/log-rotation.failed")).unwrap();
+        sink.activity(2, &started(2)).unwrap();
+        // Later: over the limit and wedged again.
+        wedge(true);
+        activity_over_limit(&root);
+        sink.activity(3, &started(3)).unwrap();
+        probe_line(&sink);
+        let controller = fs::read_to_string(root.join("log/controller.log")).unwrap();
+        eprintln!("{controller}");
+        assert_eq!(
+            controller.matches("event_log_rotation_failed").count(),
+            2,
+            "both episodes are named: {controller}"
+        );
+        assert!(
+            fs::read_to_string(root.join("state/log-rotation.failed"))
+                .is_ok_and(|m| m.contains("activity.log")),
+            "the marker names the second episode"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// N-D7: a torn owner record that has not yet settled is reported as
+    /// torn, not as "held by a live writer" naming whatever its first line
+    /// says.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_torn_owner_is_reported_as_torn() {
+        let root = var_tree("torn-named");
+        let lock = root.join("run/event-log.lock");
+        fs::create_dir_all(&lock).unwrap();
+        fs::write(lock.join("pid"), b"12").unwrap();
+        activity_over_limit(&root);
+        let sink = FileSink::new(&root.join("log"));
+        sink.activity(1, &started(1)).unwrap();
+        probe_line(&sink);
+        let controller = fs::read_to_string(root.join("log/controller.log")).unwrap();
+        eprintln!("{controller}");
+        assert!(
+            !controller.contains("held by a live writer"),
+            "a torn record names no writer: {controller}"
+        );
+        assert!(controller.contains("torn"), "{controller}");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// N-D7: a live shell writer holding the lock is contention, not a
+    /// failure: no Error and no amber marker for the next minute. The line is
+    /// kept, the deferral is named at info, and it is tried again soon.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn live_contention_is_not_an_error() {
+        let root = var_tree("contention");
+        let lock = root.join("run/event-log.lock");
+        fs::create_dir_all(&lock).unwrap();
+        let mut holder = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let start = super::super::super::linux_files::process_start(holder.id()).unwrap();
+        let boot = fs::read_to_string("/proc/sys/kernel/random/boot_id").unwrap();
+        fs::write(
+            lock.join("pid"),
+            format!("{}\n{start}\n{}\n", holder.id(), boot.trim()),
+        )
+        .unwrap();
+        activity_over_limit(&root);
+        let sink = FileSink::new(&root.join("log"));
+        sink.activity(1, &started(1)).unwrap();
+        probe_line(&sink);
+        let controller = fs::read_to_string(root.join("log/controller.log")).unwrap();
+        eprintln!("{controller}");
+        assert!(
+            !root.join("state/log-rotation.failed").exists(),
+            "no amber marker for a writer that is merely busy"
+        );
+        assert!(
+            !controller.contains("\"level\":\"error\""),
+            "no Error for contention: {controller}"
+        );
+        assert!(
+            controller.contains("event_log_rotation_deferred")
+                && controller.contains(&format!("PID {}", holder.id())),
+            "the deferral is named with its holder: {controller}"
+        );
+        let _ = holder.kill();
+        let _ = holder.wait();
         let _ = fs::remove_dir_all(&root);
     }
 
