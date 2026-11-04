@@ -855,3 +855,73 @@ fn a_panic_inside_redb_is_recorded_and_the_next_open_heals() {
     let mut backend = opened.backend.expect("healed");
     assert!(read_all(&mut backend).is_empty());
 }
+
+/// The compaction budget is `2 * COMPACT_BYTES_PER_ENTRY` bytes per pair. Measured here so the
+/// number cannot drift below what redb and the record layout really cost: a compacted file built
+/// in key order, as every commit writes its pairs, costs at most `COMPACT_BYTES_PER_ENTRY` per
+/// pair with paths of 76 and 150 bytes, and one built in an arbitrary order (redb splits its
+/// pages half full) still fits the doubled budget with 76-byte paths, so compacting it cannot
+/// leave the file over budget for good. (The file on disk before compaction is larger, because
+/// redb grows it in doubling steps; the budget is what bounds that.)
+#[test]
+fn a_compacted_pair_costs_no_more_than_the_compaction_budget_assumes() {
+    use synology_drive_sync::pair_index_redb::COMPACT_BYTES_PER_ENTRY;
+    const ENTRIES: u64 = 30_000;
+    for (key_bytes, in_key_order, ceiling) in [
+        (76_usize, true, COMPACT_BYTES_PER_ENTRY),
+        (150, true, COMPACT_BYTES_PER_ENTRY),
+        (76, false, 2 * COMPACT_BYTES_PER_ENTRY),
+    ] {
+        let dir = Dir::new("dense");
+        let location = paths(&dir);
+        {
+            let mut backend = RedbPairIndex::open(location.clone(), 8)
+                .backend
+                .expect("a usable index");
+            let mut upsert: Vec<(String, StoredPair)> = (0..ENTRIES)
+                .map(|index| {
+                    let mut name = format!("Photos/2019/trip-{:03}/IMG_{index:07}", index % 97);
+                    while name.len() + 4 < key_bytes {
+                        name.push('x');
+                    }
+                    name.push_str(".jpg");
+                    (
+                        name,
+                        StoredPair {
+                            record: record(index, 1),
+                            remote_spelling: None,
+                        },
+                    )
+                })
+                .collect();
+            if in_key_order {
+                upsert.sort_by(|a, b| a.0.cmp(&b.0));
+            }
+            backend
+                .commit(IndexCommit {
+                    clear: false,
+                    remove: Vec::new(),
+                    upsert,
+                    meta: Some(meta()),
+                })
+                .unwrap();
+        }
+        let mut database = redb::Database::open(&location.database).expect("the file opens");
+        database.compact().expect("compacts");
+        drop(database);
+        let per_entry = fs::metadata(&location.database).unwrap().len() / ENTRIES;
+        eprintln!(
+            "{key_bytes}-byte paths, key order {in_key_order}: {per_entry} bytes per compacted pair"
+        );
+        assert!(
+            per_entry <= ceiling,
+            "a compacted pair with {key_bytes}-byte paths (key order {in_key_order}) costs \
+             {per_entry} bytes, over the {ceiling} the compaction budget allows: correct \
+             COMPACT_BYTES_PER_ENTRY, pair_index_redb.rs's note on it and docs/pair-index.md"
+        );
+        assert!(
+            per_entry >= key_bytes as u64 + 104,
+            "{per_entry} bytes is less than the key and record alone: the measurement is wrong"
+        );
+    }
+}

@@ -70,8 +70,20 @@ const QUARANTINE_AGE: Duration = Duration::from_secs(7 * 86_400);
 /// Earlier copies of one profile that could not be removed, past which a damaged file is deleted
 /// instead of set aside, so copies cannot pile up without bound.
 const MAX_STUCK_COPIES: usize = 3;
-/// Bytes per stored pair the compaction rule budgets.
-const COMPACT_BYTES_PER_ENTRY: u64 = 300;
+/// The most a compacted (dense) file costs per stored pair, which the compaction rule budgets
+/// twice over: a commit compacts when the file exceeds `2 * this * entries + slack`.
+///
+/// Measured on redb 4.4 with sorted keys (as every commit writes them), after `compact()`: the
+/// 104-byte record plus the key plus about 25 bytes of tree, so 155 bytes per pair at 36-byte
+/// paths, 200 at 76, 247 at 116 and 281 at 150, the same at 100,000 and at a million pairs. 300
+/// covers paths up to about 160 bytes. A tree built in arbitrary key order has pages half full
+/// and costs up to twice that (375 at 76-byte paths), which the doubled budget still holds
+/// (`tests/pair_index_storage.rs` pins both). It is NOT the size of the file
+/// on disk: redb grows the file in doubling steps and a rewrite is copy-on-write, so an
+/// uncompacted file stands at 1.1x to 4x the dense size (168 to 800 bytes per pair measured, 538
+/// right after a rewrite at a million pairs); the budget is what bounds that, and the slack keeps
+/// small indexes from compacting at all.
+pub const COMPACT_BYTES_PER_ENTRY: u64 = 300;
 const COMPACT_SLACK_BYTES: u64 = 64 * 1024 * 1024;
 
 const META: TableDefinition<&[u8], &[u8]> = TableDefinition::new("meta");
