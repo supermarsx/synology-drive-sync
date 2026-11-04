@@ -1588,7 +1588,7 @@ mod tests {
         {
             let _inside = InsideRedb::enter(&paths);
             let ours = std::panic::catch_unwind(|| {
-                let none: Option<u8> = None;
+                let none: Option<u8> = std::hint::black_box(None);
                 none.expect("opened above")
             });
             assert!(ours.is_err());
