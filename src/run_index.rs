@@ -131,6 +131,7 @@ pub(crate) fn open(
                     max_age_seconds: i64::from(settings.behavior.pair_index_max_age_days) * 86_400,
                     canary: settings.behavior.pair_index_canary,
                     refresh: settings.behavior.pair_index_refresh,
+                    racy: synology_drive_sync::pair_index::RacyWindows::for_host(),
                 },
                 std::time::SystemTime::now(),
             );

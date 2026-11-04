@@ -25,7 +25,7 @@
         },
         "served": { "description": "Pairs whose digests came from the index.", "$ref": "#/$defs/nonNegativeInteger" },
         "verified_live": { "description": "Comparison pairs whose remote digest was computed live.", "$ref": "#/$defs/nonNegativeInteger" },
-        "racy": { "description": "Stored pairs whose facts matched but which were observed within two seconds of a write, so verified live.", "$ref": "#/$defs/nonNegativeInteger" },
+        "racy": { "description": "Stored pairs whose facts matched but which were observed within the racy window of a write (the kernel's writeback bound, 60 s with Linux defaults), so verified live.", "$ref": "#/$defs/nonNegativeInteger" },
         "expired": { "description": "Stored pairs past the rolling max age, verified live.", "$ref": "#/$defs/nonNegativeInteger" },
         "canary_checked": { "$ref": "#/$defs/nonNegativeInteger" },
         "canary_inconclusive": { "$ref": "#/$defs/nonNegativeInteger" },
@@ -60,7 +60,9 @@
                   "pair-index-not-applicable",
                   "pair-index-unsupported-platform",
                   "pair-index-link-guard-unchecked",
-                  "pair-index-remote-ctime-unavailable"
+                  "pair-index-remote-ctime-unavailable",
+                  "pair-index-writeback-unknown",
+                  "pair-index-writeback-unbounded"
                 ]
               },
               "severity": { "enum": ["info", "warning"] },

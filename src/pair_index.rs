@@ -13,8 +13,10 @@
 //! - **Served** only when the index is bound to this profile, source, remote root and server; the
 //!   pair is in this run's comparison set under exactly the stored spelling; size, mtime, ctime,
 //!   device and inode are unchanged locally and size, mtime, ctime and crtime remotely (or the
-//!   remote side is live, in local-only mode); the record is not racy and not expired; it is not
-//!   drawn as a canary; and the run's link guard ran everywhere.
+//!   remote side is live, in local-only mode); the record is not racy (see [`RacyWindows`]: a
+//!   change time within the kernel's writeback bound of the read, so a write through a shared
+//!   mapping cannot hide) and not expired; it is not drawn as a canary; and the run's link guard
+//!   ran everywhere.
 //! - **Stored** only from pairs whose two digests this run computed live and which agreed. Served
 //!   pairs keep their original verification time, so `max_age` expires them.
 //! - **Never** the cause of an upload, a deletion or a server copy: a served digest is MD5-only
@@ -35,17 +37,40 @@ use crate::local::{EntryKind, LocalEntry, LocalInventory};
 /// The `meta.schema` every index carries.
 pub const SCHEMA: &str = "sdsync.pair-index.v1";
 
+mod racy;
+pub use racy::{
+    FALLBACK_WINDOW_NS, NAS_CLOCK_TOLERANCE_SECONDS, NAS_WINDOW_SECONDS, RACY_FLOOR_NS,
+    RacyWindows, WRITEBACK_MARGIN_NS,
+};
+
 /// Bumped whenever what makes two files "the same" changes (`compare_files`,
-/// `comparison_candidates`, the record's fields). An index written under another epoch is retired.
-pub const SEMANTICS_EPOCH: u32 = 1;
+/// `comparison_candidates`, the record's fields), or when the rule that decided a stored record
+/// was settled weakens what it proves. An index written under another epoch is retired:
+///
+/// - 1: the original rules, with a two-second racy window.
+/// - 2: the racy window is the kernel's writeback bound (D1), so evidence epoch 1 stored as
+///   settled may hold a write through a shared mapping that its facts never showed.
+pub const SEMANTICS_EPOCH: u32 = 2;
+
+/// Why an index written under `stored` is retired by this build, for the issue's cause.
+fn epoch_retired_because(stored: u32) -> &'static str {
+    match stored {
+        1 => {
+            "its evidence was stored under the two-second racy window, which a write through a \
+             shared memory mapping can outlast without moving the file's times"
+        }
+        _ if stored > SEMANTICS_EPOCH => "it was written by a newer build",
+        _ => "its comparison rules are not this build's",
+    }
+}
 
 /// Default age after which evidence is re-verified, in seconds (30 days).
 pub const DEFAULT_MAX_AGE_SECONDS: i64 = 30 * 86_400;
 
-/// A record whose change time is within this many seconds of the clock that observed it may have
-/// been written during the observation, so it is stored racy and never served.
-pub const RACY_WINDOW_NS: i64 = 2_000_000_000;
-const RACY_WINDOW_SECONDS: i64 = 2;
+/// How far before the NAS clock taken ahead of execution an uploaded file's change time may fall
+/// and still show the upload (the self-test of perf-design §2.8): the `Date` header's and the
+/// listing's whole-second rounding.
+const SELF_TEST_TOLERANCE_SECONDS: i64 = 2;
 
 /// What an index is bound to. A mismatch in any field retires it.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -171,6 +196,8 @@ pub const ISSUE_CODES: &[&str] = &[
     "pair-index-unsupported-platform",
     "pair-index-link-guard-unchecked",
     "pair-index-remote-ctime-unavailable",
+    "pair-index-writeback-unknown",
+    "pair-index-writeback-unbounded",
 ];
 
 impl IndexIssue {
@@ -354,12 +381,14 @@ impl IndexReport {
 }
 
 /// How a run uses the index.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub struct IndexOptions {
     pub max_age_seconds: i64,
     pub canary: usize,
     /// `--pair-index-refresh`: serve nothing, rewrite everything.
     pub refresh: bool,
+    /// The racy windows: [`RacyWindows::for_host`] outside tests.
+    pub racy: RacyWindows,
 }
 
 impl Default for IndexOptions {
@@ -368,6 +397,7 @@ impl Default for IndexOptions {
             max_age_seconds: DEFAULT_MAX_AGE_SECONDS,
             canary: crate::digest_evidence::DEFAULT_CANARY,
             refresh: false,
+            racy: RacyWindows::for_host(),
         }
     }
 }
@@ -423,8 +453,9 @@ impl IndexSession {
                     Some(format!("schema {:?} is not {SCHEMA:?}", meta.schema))
                 } else if meta.semantics_epoch != SEMANTICS_EPOCH {
                     Some(format!(
-                        "semantics epoch {} is not {SEMANTICS_EPOCH}",
-                        meta.semantics_epoch
+                        "semantics epoch {} is not {SEMANTICS_EPOCH}: {}; retired",
+                        meta.semantics_epoch,
+                        epoch_retired_because(meta.semantics_epoch)
                     ))
                 } else {
                     binding_mismatch(&meta.binding, &binding)
@@ -454,6 +485,14 @@ impl IndexSession {
             clear = true;
             serving = false;
             report.state = IndexState::Refreshed;
+        }
+        // How the local racy window was found, when it is not the kernel's own bound: once per
+        // run. With no bound at all, nothing local can be served.
+        if let Some(issue) = options.racy.issue.clone() {
+            report.issues.push(issue);
+        }
+        if options.racy.unbounded {
+            serving = false;
         }
         // The read window closes until the comparison set is known: the file is not held while
         // the run lists the NAS.
@@ -530,7 +569,7 @@ impl IndexSession {
                 continue;
             };
             let too_early =
-                nas_clock_before.is_some_and(|clock| ctime < clock - RACY_WINDOW_SECONDS);
+                nas_clock_before.is_some_and(|clock| ctime < clock - SELF_TEST_TOLERANCE_SECONDS);
             let unmoved = before
                 .entries
                 .get(relative)
@@ -593,8 +632,9 @@ impl IndexSession {
     /// were both computed live this pass and agree.
     ///
     /// `read_started` is the local clock when the pass's local reads began: a local change time
-    /// within the racy window of it, or a remote one within the window of the `MD5.start` clock
-    /// (or no NAS clock at all), makes the record racy.
+    /// within the local racy window of it (from the whole second, as `verified_at` stores it, so
+    /// the serve-time check agrees), or a remote one within the NAS window of the `MD5.start`
+    /// clock (or no NAS clock at all), makes the record racy.
     pub fn harvest(
         &mut self,
         local: &LocalInventory,
@@ -606,8 +646,7 @@ impl IndexSession {
         if self.broken {
             return;
         }
-        let started_ns = unix_nanos(read_started);
-        let started = started_ns.div_euclid(1_000_000_000);
+        let started = unix_seconds(read_started);
         for remote_relative in live {
             let local_relative = spellings
                 .get(remote_relative)
@@ -631,12 +670,6 @@ impl IndexSession {
             {
                 continue;
             }
-            let local_racy = local_entry.times.ctime_ns > started_ns - RACY_WINDOW_NS;
-            let remote_racy = match (remote_entry.ctime_seconds, remote_entry.digest_nas_time) {
-                (Some(ctime), Some(clock)) => ctime > clock - RACY_WINDOW_SECONDS,
-                (Some(_), None) => true,
-                (None, _) => false,
-            };
             let record = PairRecord {
                 size: local_entry.size,
                 local_mtime_ns: local_entry.times.mtime_ns,
@@ -649,7 +682,11 @@ impl IndexSession {
                 md5: *local_digest.as_bytes(),
                 verified_at: started,
                 verified_at_nas: remote_entry.digest_nas_time,
-                racy: local_racy || remote_racy,
+                racy: false,
+            };
+            let record = PairRecord {
+                racy: self.racy_by_window(&record),
+                ..record
             };
             self.upserts.insert(
                 local_relative.to_owned(),
@@ -747,6 +784,22 @@ impl IndexSession {
         self.report
     }
 
+    /// Whether `record`'s change times fall within this run's racy windows of the clocks that
+    /// observed it: locally `verified_at` (the read's start, whole seconds), on the NAS the
+    /// `MD5.start` clock. No NAS clock rules nothing out; no bound at all makes everything racy.
+    fn racy_by_window(&self, record: &PairRecord) -> bool {
+        let windows = &self.options.racy;
+        let read_ns = record.verified_at.saturating_mul(1_000_000_000);
+        let local =
+            windows.unbounded || record.local_ctime_ns > read_ns.saturating_sub(windows.local_ns);
+        let remote = match (record.remote_ctime, record.verified_at_nas) {
+            (Some(ctime), Some(clock)) => ctime > clock.saturating_sub(windows.remote_seconds),
+            (Some(_), None) => true,
+            (None, _) => false,
+        };
+        local || remote
+    }
+
     /// Facts check for one stored pair against this run's fresh entries.
     fn facts_match(
         &self,
@@ -837,7 +890,9 @@ impl EvidenceSource for IndexSession {
                 self.invalidated.insert(local_relative.to_owned());
                 continue;
             }
-            if stored.record.racy {
+            // Racy as stored, or by this run's windows: a record settled under a shorter window
+            // (a kernel retuned since) is not served on its word.
+            if stored.record.racy || self.racy_by_window(&stored.record) {
                 self.report.racy += 1;
                 continue;
             }

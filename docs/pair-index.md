@@ -57,8 +57,20 @@ restore) that keeps size and mtime.
   disagreement is named (`pair-index-canary-mismatch`, with the path and digest prefixes).
 - **Rolling expiry.** Evidence older than `--pair-index-max-age` days (default 30) is re-verified,
   spread across the second half of that window rather than all at once.
-- **Racy evidence is never served.** A pair observed within two seconds of a write, on either side,
-  is stored but verified live next time.
+- **Racy evidence is never served.** A pair observed within the racy window of its last change, on
+  either side, is stored but verified live next time. The window is what keeps a write through a
+  shared memory mapping (a database, a VM image) safe: Linux moves a file's mtime and ctime only
+  when such a write first dirties a clean page, not on later writes into the page before
+  writeback cleans it, so for a while the content can change with every fact unchanged. Locally
+  the window is `dirty_expire_centisecs` plus `dirty_writeback_centisecs` from `/proc/sys/vm`
+  plus 25 s, never under 2 s: 60 s with the kernel defaults (30 s + 5 s). If those cannot be read
+  it is 60 s, named `pair-index-writeback-unknown`; with periodic writeback switched off
+  (`dirty_writeback_centisecs` = 0) nothing bounds it, so no local evidence is served
+  (`pair-index-writeback-unbounded`). On macOS, which has no such setting to read, it is 60 s.
+  The NAS side uses 60 s too: DSM runs the kernel defaults, which cannot be read from the client.
+  The windows are applied again when a record is about to be served, so evidence settled under a
+  shorter window is not served on its word. A file changed within the window of a run is read
+  live once more on the next run, after which it is served as before.
 - **Local-only mode.** If the NAS listing carries no change time, or one of the run's own uploads is
   listed with a change time that does not show the write, File Station's MD5 always runs and only the
   local read is skipped (`pair-index-remote-ctime-unavailable`, `pair-index-remote-ctime-static`).
@@ -81,7 +93,9 @@ and a fully live run. None fails a run or makes it partial.
 | `pair-index-unsafe` | The file is a link, not a regular file, owned by someone else, or shared with group or other. |
 | `pair-index-directory-unusable` | The directory is not private, or holds files the index did not write. |
 | `pair-index-unbound` | File Station did not name the host serving the run, which the index binds to. |
-| `pair-index-retired` (info) | The index was bound to another profile, source, remote root or NAS, or an older comparison semantics; it was cleared. |
+| `pair-index-writeback-unknown` | `/proc/sys/vm/dirty_expire_centisecs` or `dirty_writeback_centisecs` could not be read (path and cause named); the local racy window is 60 s. |
+| `pair-index-writeback-unbounded` | Periodic writeback is switched off (`dirty_writeback_centisecs` = 0), so no window bounds a mapped write: nothing local is served and every pair is verified live. |
+| `pair-index-retired` (info) | The index was bound to another profile, source, remote root or NAS, or an older comparison semantics; it was cleared. Semantics epoch 1 (the two-second racy window) is retired by name. |
 | `pair-index-not-applicable` (info) | The run does not compare content, so it neither reads nor writes the index. |
 | `pair-index-unsupported-platform` (info) | Windows: a directory walk exposes no status-change time or file identity, so the index is never used there. |
 
