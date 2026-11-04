@@ -146,8 +146,11 @@ sync with `--pair-index /var/packages/synology-drive-sync/var/state/cache/pairs`
 - **A retired index** (the profile was re-created with another source, remote or NAS) is named
   `pair-index-retired` and shown as information on the profile's line, because it explains why the
   first run afterwards is slow.
-- **Removing the profile** deletes its `.redb`, the quarantined copies, a panic record, its lasting
-  block and its alerts state. A file that cannot be removed is named as a warning.
+- **Removing the profile** deletes its `.redb`, the quarantined copies (`.redb.corrupt-<epoch>`), a
+  panic record (`.redb.panicked`), its lasting block and its alerts state. For a name over 64
+  characters these are the files of the hashed stem (`<first 48>-<16 hex of the SHA-256>`, see
+  [Where it lives](#where-it-lives)), matched by that exact stem. A file that cannot be removed, or
+  a stem that cannot be computed, is named as a warning.
 
 ## Reconciliation
 

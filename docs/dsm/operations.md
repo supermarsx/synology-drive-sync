@@ -402,8 +402,12 @@ was `refreshed`, and the most serious issue the run named with its path and caus
   slow first run.
 - A read of an index that a run of the same profile is using reports `index: "busy"`, not an
   error.
-- `remove-profile` removes the profile's `.redb`, its quarantined copies, its lasting block and its
-  alerts state. A file it could not remove is named in the result as a warning.
+- `remove-profile` removes the profile's index file, its quarantined copies (`.redb.corrupt-<epoch>`),
+  its panic record (`.redb.panicked`), its lasting block and its alerts state. For a name over 64
+  characters the files are the hashed ones, `<first 48>-<16 hex of the SHA-256>.redb` and its
+  siblings, found by that exact stem and never by a prefix glob, so another long profile's index is
+  left alone. A file it could not remove, or a stem it could not compute (no `sha256sum`), is named
+  in the result as a warning.
 
 ### Lasting block after an out-of-memory kill
 
