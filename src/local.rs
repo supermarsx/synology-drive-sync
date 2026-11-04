@@ -3130,8 +3130,10 @@ mod tests {
         fs::write(root.join("private/secret.txt"), b"secret").unwrap();
         fs::write(root.join("keep.txt"), b"payload").unwrap();
         fs::set_permissions(root.join("private"), fs::Permissions::from_mode(0o000)).unwrap();
-        if fs::read_dir(root.join("private")).is_ok() {
-            eprintln!("skipping: this account can list a mode-000 folder (root)");
+        if crate::testkit::permissions_do_not_bind(
+            "an_unlistable_folder_is_withheld_as_permission_denied",
+            &root.join("private"),
+        ) {
             fs::set_permissions(root.join("private"), fs::Permissions::from_mode(0o755)).unwrap();
             fs::remove_dir_all(root).unwrap();
             return;
@@ -3393,19 +3395,19 @@ mod tests {
             .clone();
 
         fs::set_permissions(&target, fs::Permissions::from_mode(0o000)).unwrap();
+        if crate::testkit::permissions_do_not_bind(
+            "hashing_reports_the_open_failure_when_read_permission_is_denied",
+            &target,
+        ) {
+            fs::set_permissions(&target, fs::Permissions::from_mode(0o644)).unwrap();
+            fs::remove_dir_all(root).unwrap();
+            return;
+        }
         let result = hash_file_snapshot(&entry, &CancellationToken::default());
         // Restore permissions unconditionally: cleanup needs it, and a root-owned CI runner
         // that ignores mode bits must not leave an unreadable fixture behind either way.
         fs::set_permissions(&target, fs::Permissions::from_mode(0o644)).unwrap();
 
-        if result.is_ok() {
-            eprintln!(
-                "skipping hashing_reports_the_open_failure_when_read_permission_is_denied: \
-                 running with privileges that bypass file permissions"
-            );
-            fs::remove_dir_all(root).unwrap();
-            return;
-        }
         assert!(matches!(
             result,
             Err(Error::FileIo { path, .. }) if path == entry.full_path
