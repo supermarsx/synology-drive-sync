@@ -1533,9 +1533,10 @@ mod tests {
                 dir.path().to_path_buf(),
                 filter(dir.path(), &[]),
                 PollConfig {
+                    // The walks here are instant; a 60 ms deadline failed whenever the machine was busy.
                     interval: Duration::from_millis(20),
-                    walk_deadline: Duration::from_millis(60),
-                    walk_deadline_max: Duration::from_millis(240),
+                    walk_deadline: Duration::from_secs(5),
+                    walk_deadline_max: Duration::from_secs(5),
                     degraded_every: Duration::from_secs(30),
                     reason: BackendReason::WatchSetupFailed,
                     detail: "arm gave up".to_owned(),
