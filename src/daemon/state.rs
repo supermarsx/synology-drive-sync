@@ -794,8 +794,17 @@ pub(crate) fn render_schedule_state(next_run: u64) -> Vec<u8> {
 /// dead runner (`runner_died`), and the shell manager reads a live one as "a
 /// run is in flight". The daemon holds `daemon.lock`, so a lock left by an
 /// earlier daemon that died is stale by construction and is replaced.
+///
+/// `run.scope` is published first, beside it (the lock directory may hold only
+/// `pid`): the same pid, start tick and boot id, then `profiles=a,b`. The shell
+/// manager trusts it only while the lock is live and names the same owner, and
+/// then refuses only what would touch a running profile (`profile_running`)
+/// instead of every save during a sync.
+///
+/// A lock whose owner is another live process (a shell runner, or anything
+/// else that took it) is never taken over: that is a named refusal.
 #[cfg(target_os = "linux")]
-pub(crate) fn publish_run_lock(run_dir: &Path) -> Result<(), WriteError> {
+pub(crate) fn publish_run_lock(run_dir: &Path, profiles: &[String]) -> Result<(), WriteError> {
     use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
     let lock = run_dir.join("run.lock");
     let fail = |step: &'static str, cause: String| WriteError {
@@ -813,11 +822,43 @@ pub(crate) fn publish_run_lock(run_dir: &Path) -> Result<(), WriteError> {
     let boot = fs::read_to_string("/proc/sys/kernel/random/boot_id")
         .map_err(|error| fail("identity", io_cause(&error)))?;
     let boot = boot.trim();
-    remove_run_lock(run_dir)?;
-    fs::DirBuilder::new()
-        .mode(0o700)
-        .create(&lock)
-        .map_err(|error| fail("create", io_cause(&error)))?;
+    if let Some(owner) = private_lock_owner(&lock).filter(|owner| *owner != pid) {
+        return Err(fail(
+            "busy",
+            format!("run.lock is held by live process {owner}, not this daemon"),
+        ));
+    }
+    atomic_write(
+        &run_dir.join("run.scope"),
+        format!("{pid}\n{start}\n{boot}\nprofiles={}\n", profiles.join(",")).as_bytes(),
+    )?;
+    // Taken with mkdir, which fails if the lock exists: only a lock whose
+    // owner is not live (checked above, and again just before) is removed, so
+    // a run that took the lock in between is never taken over.
+    let create = || fs::DirBuilder::new().mode(0o700).create(&lock);
+    match create() {
+        Ok(()) => {}
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+            if let Some(owner) = private_lock_owner(&lock).filter(|owner| *owner != pid) {
+                return Err(fail(
+                    "busy",
+                    format!("run.lock is held by live process {owner}, not this daemon"),
+                ));
+            }
+            remove_lock_directory(run_dir)?;
+            create().map_err(|error| {
+                if error.kind() == io::ErrorKind::AlreadyExists {
+                    fail(
+                        "busy",
+                        "run.lock was taken while it was being replaced".into(),
+                    )
+                } else {
+                    fail("create", io_cause(&error))
+                }
+            })?;
+        }
+        Err(error) => return Err(fail("create", io_cause(&error))),
+    }
     fs::set_permissions(&lock, fs::Permissions::from_mode(0o700))
         .map_err(|error| fail("chmod", io_cause(&error)))?;
     atomic_write(
@@ -829,9 +870,47 @@ pub(crate) fn publish_run_lock(run_dir: &Path) -> Result<(), WriteError> {
     Ok(())
 }
 
-/// Remove `run.lock` (after the final `run.state` is written).
+/// Remove `run.lock` (after the final `run.state` is written), then `run.scope`.
 #[cfg(target_os = "linux")]
 pub(crate) fn remove_run_lock(run_dir: &Path) -> Result<(), WriteError> {
+    remove_lock_directory(run_dir)?;
+    let scope = run_dir.join("run.scope");
+    match fs::remove_file(&scope) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(WriteError {
+            path: scope,
+            step: "remove",
+            cause: io_cause(&error),
+        }),
+    }
+}
+
+/// The live owner of a private lock directory (`run.lock`, `management.lock`):
+/// its `pid` file's three lines (pid, start tick, boot id) naming a process
+/// that still runs with that start tick in this boot. A one-line legacy
+/// record, an unreadable or malformed one, or a dead owner is `None`, as the
+/// shell's `private_process_lock_is_live` reads them.
+#[cfg(target_os = "linux")]
+pub(crate) fn private_lock_owner(lock: &Path) -> Option<u32> {
+    let text = fs::read_to_string(lock.join("pid")).ok()?;
+    let mut lines = text.lines();
+    let pid: u32 = lines.next()?.parse().ok()?;
+    let start: u64 = lines.next()?.parse().ok()?;
+    let boot = lines.next()?;
+    if lines.next().is_some() || pid <= 1 {
+        return None;
+    }
+    let current = fs::read_to_string("/proc/sys/kernel/random/boot_id").ok()?;
+    if current.trim() != boot {
+        return None;
+    }
+    let actual = super::super::linux_files::process_start(pid).ok()?;
+    (actual == start).then_some(pid)
+}
+
+#[cfg(target_os = "linux")]
+fn remove_lock_directory(run_dir: &Path) -> Result<(), WriteError> {
     let lock = run_dir.join("run.lock");
     match fs::symlink_metadata(&lock) {
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
@@ -1368,13 +1447,28 @@ mod tests {
             let run_dir = tree.p("var/run");
             // Without the lock the bridge calls it a dead runner.
             assert_eq!(tree.outcomes()["run"]["outcome"], "stale");
-            publish_run_lock(&run_dir).unwrap();
+            publish_run_lock(&run_dir, &["photos".to_owned(), "docs".to_owned()]).unwrap();
+            let scope = fs::read_to_string(run_dir.join("run.scope")).unwrap();
+            let lock = fs::read_to_string(run_dir.join("run.lock/pid")).unwrap();
+            assert_eq!(
+                scope,
+                format!("{lock}profiles=photos,docs\n"),
+                "run.scope names the lock's own owner, then the profiles"
+            );
+            assert_eq!(
+                fs::metadata(run_dir.join("run.scope"))
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600
+            );
             let outcomes = tree.outcomes();
             assert_eq!(outcomes["run"]["outcome"], "running", "{outcomes}");
             assert_eq!(outcomes["run"]["stale"]["lock"], "live");
             assert_eq!(outcomes["errors"], json!([]));
             // Publishing again (a stale lock from an earlier daemon) replaces it.
-            publish_run_lock(&run_dir).unwrap();
+            publish_run_lock(&run_dir, &["photos".to_owned()]).unwrap();
             let names: Vec<_> = fs::read_dir(run_dir.join("run.lock"))
                 .unwrap()
                 .map(|e| e.unwrap().file_name())
@@ -1382,6 +1476,37 @@ mod tests {
             assert_eq!(names, ["pid"]);
             remove_run_lock(&run_dir).unwrap();
             assert!(!run_dir.join("run.lock").exists());
+            assert!(!run_dir.join("run.scope").exists());
+        }
+
+        /// A lock held by another live process is never taken over.
+        #[test]
+        fn a_lock_held_by_another_live_process_is_refused_by_name() {
+            let tree = Tree::new("foreign-lock");
+            let run_dir = tree.p("var/run");
+            let mut sleeper = std::process::Command::new("sleep")
+                .arg("30")
+                .spawn()
+                .unwrap();
+            let pid = sleeper.id();
+            let start = super::super::super::super::linux_files::process_start(pid).unwrap();
+            let boot = fs::read_to_string("/proc/sys/kernel/random/boot_id").unwrap();
+            fs::create_dir_all(run_dir.join("run.lock")).unwrap();
+            fs::write(
+                run_dir.join("run.lock/pid"),
+                format!("{pid}\n{start}\n{}\n", boot.trim()),
+            )
+            .unwrap();
+            let error = publish_run_lock(&run_dir, &["photos".to_owned()]).unwrap_err();
+            assert_eq!(error.step, "busy");
+            assert!(error.cause.contains(&pid.to_string()), "{error}");
+            assert_eq!(private_lock_owner(&run_dir.join("run.lock")), Some(pid));
+            let _ = sleeper.kill();
+            let _ = sleeper.wait();
+            // Its owner gone, the lock is stale and replaced.
+            assert_eq!(private_lock_owner(&run_dir.join("run.lock")), None);
+            publish_run_lock(&run_dir, &["photos".to_owned()]).unwrap();
+            remove_run_lock(&run_dir).unwrap();
         }
 
         /// The index line reads back through the bridge as `index`, a corrupt

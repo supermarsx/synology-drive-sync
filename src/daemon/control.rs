@@ -1522,6 +1522,22 @@ impl Control {
         } else {
             vec![request.scope.clone()]
         };
+        // A configuration change in flight (management.lock) is never run
+        // beside: its commit is several renames, and a run starting between
+        // them would read a torn set. Checked again once run.lock is published,
+        // as the shell runner does on both sides of taking its lock.
+        #[cfg(target_os = "linux")]
+        if self.settings.publish_run_lock
+            && let Some(owner) =
+                super::state::private_lock_owner(&self.paths.run_dir.join("management.lock"))
+        {
+            self.defer_busy(
+                request,
+                now,
+                &format!("package configuration is being changed by process {owner}"),
+            );
+            return;
+        }
         let operation = request.action.as_str();
         let run_state_path = self.paths.state_dir.join("run.state");
         let previous = read_small(&run_state_path);
@@ -1538,8 +1554,14 @@ impl Control {
         #[cfg(target_os = "linux")]
         if failure.is_none()
             && self.settings.publish_run_lock
-            && let Err(error) = super::state::publish_run_lock(&self.paths.run_dir)
+            && let Err(error) = super::state::publish_run_lock(&self.paths.run_dir, &profiles)
         {
+            if error.step == "busy" {
+                // Another live process holds run.lock: never taken over.
+                let _ = self.write_state(&run_state_path, previous.clone().unwrap_or_default());
+                self.defer_busy(request, now, &error.cause);
+                return;
+            }
             self.log(
                 Level::Error,
                 "controller",
@@ -1547,6 +1569,21 @@ impl Control {
                 error.to_string(),
             );
             failure = Some(error.to_string());
+        }
+        #[cfg(target_os = "linux")]
+        if failure.is_none()
+            && self.settings.publish_run_lock
+            && let Some(owner) =
+                super::state::private_lock_owner(&self.paths.run_dir.join("management.lock"))
+        {
+            let _ = super::state::remove_run_lock(&self.paths.run_dir);
+            let _ = self.write_state(&run_state_path, previous.clone().unwrap_or_default());
+            self.defer_busy(
+                request,
+                now,
+                &format!("package configuration began changing (process {owner})"),
+            );
+            return;
         }
         if let Some(cause) = failure {
             self.refuse_start(request, now, &cause);
@@ -1639,6 +1676,54 @@ impl Control {
 
     /// The run's record could not be written before the core started: nothing
     /// ran, which is said, and the run is tried again after the floor.
+    /// A run that cannot start now because something else holds the package
+    /// (a configuration change, a foreign run.lock): deferred as `busy`, named,
+    /// and tried again after the retry floor, as the shell runner's exit 75.
+    /// A requested run is not repeated: the operator is told to run it again.
+    fn defer_busy(&mut self, request: RunRequest, now: u64, cause: &str) {
+        self.log(
+            Level::Warn,
+            "scheduler",
+            "run_deferred",
+            format!(
+                "id={} scope={} reason=lock_busy cause={cause}",
+                request.id, request.scope
+            ),
+        );
+        self.activity(
+            "run.deferred",
+            &request.scope,
+            "deferred",
+            "sync",
+            Level::Warn,
+            format!(
+                "Package action deferred: {}; retry later",
+                sanitize_detail(cause, 120)
+            ),
+        );
+        match request.origin {
+            Origin::Routine { name, dirty, .. } => {
+                if let Some(entry) = self.routines.get_mut(&name) {
+                    if let Some(dirty) = dirty {
+                        entry.dirty.merge(dirty);
+                    }
+                    if let Ok(state) = entry.state.as_mut() {
+                        state.state = RoutineRunState::Deferred;
+                        state.defer_reason = routines::DeferReason::Busy;
+                        state.last_reason = "lock_busy".into();
+                        state.next_run = now + routines::RETRY_FLOOR_SECONDS;
+                    }
+                }
+                self.save_routine(&name);
+            }
+            Origin::Aggregate => {
+                self.schedule_deadline = now + routines::RETRY_FLOOR_SECONDS;
+                self.save_schedule();
+            }
+            Origin::Requested => {}
+        }
+    }
+
     fn refuse_start(&mut self, request: RunRequest, now: u64, cause: &str) {
         self.log(
             Level::Error,

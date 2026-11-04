@@ -1136,6 +1136,64 @@ fn status_names_each_profiles_index() {
     assert_eq!(index["delta"], Value::Null);
 }
 
+/// I-7's twin on the run side: a configuration change in flight
+/// (management.lock held by a live process) is never run beside. The run is
+/// deferred as busy and named; once the change is done, a run publishes
+/// run.scope with run.lock and removes both after.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_run_never_starts_while_management_lock_is_live() {
+    let h = Harness::tuned(
+        "management",
+        |home, _| {
+            profile(home, "alpha");
+            profile(home, "beta");
+        },
+        |settings| settings.publish_run_lock = true,
+    );
+    let run_dir = h.var.join("run");
+    let mut holder = std::process::Command::new("sleep")
+        .arg("30")
+        .spawn()
+        .unwrap();
+    let pid = holder.id();
+    let start = super::super::super::linux_files::process_start(pid).unwrap();
+    let boot = fs::read_to_string("/proc/sys/kernel/random/boot_id").unwrap();
+    fs::create_dir_all(run_dir.join("management.lock")).unwrap();
+    fs::write(
+        run_dir.join("management.lock/pid"),
+        format!("{pid}\n{start}\n{}\n", boot.trim()),
+    )
+    .unwrap();
+    assert_eq!(h.ask(run("all"))["ok"], true);
+    h.wait_for("the deferral", Duration::from_secs(5), |h| {
+        h.logs()
+            .iter()
+            .any(|l| l.starts_with("run_deferred ") && l.contains(&format!("process {pid}")))
+    });
+    assert_eq!(h.launched(), 0, "a run started mid-commit");
+    assert!(!run_dir.join("run.lock").exists() && !run_dir.join("run.scope").exists());
+    let _ = holder.kill();
+    let _ = holder.wait();
+    fs::remove_dir_all(run_dir.join("management.lock")).unwrap();
+    *h.plan.lock().unwrap() = Plan {
+        finish_after: Some(Duration::from_millis(400)),
+        exit: 0,
+        stop_takes: Duration::ZERO,
+    };
+    assert_eq!(h.ask(run("all"))["ok"], true);
+    h.wait_for("the run", Duration::from_secs(5), |h| h.launched() == 1);
+    let scope = fs::read_to_string(run_dir.join("run.scope")).unwrap();
+    let lock = fs::read_to_string(run_dir.join("run.lock/pid")).unwrap();
+    assert_eq!(
+        scope,
+        format!("{lock}profiles=alpha,beta\n"),
+        "all is expanded"
+    );
+    h.wait_for("idle", Duration::from_secs(5), Harness::idle);
+    assert!(!run_dir.join("run.lock").exists() && !run_dir.join("run.scope").exists());
+}
+
 /// Every plan and sync gets the verified-pair index directory.
 #[test]
 fn runs_are_given_the_pair_index_directory() {
