@@ -21,7 +21,7 @@ where those actors can touch the same target.
 | Active weekdays | Non-empty unique subset of Monday `1` through Sunday `7`; daily mode only |
 | Window starts / ends | 24-hour `HH:MM`; daily mode only |
 | Realtime debounce | `1..3600` seconds; defaults to `45`; realtime mode only |
-| Fallback poll | `5..3600` seconds; realtime mode only |
+| Fallback poll | `5..3600` seconds; realtime mode only. Under the daemon it is how often the polling fallback reads the tree while the native watch is unavailable (60 seconds if unset) |
 | Retry attempts | `0..5` after a failed whole routine action; defaults to `5` |
 | Retry backoff | `10..300` seconds before the first retry |
 | Exponential backoff | On by default for compatibility; when off, every retry uses the fixed base delay |
@@ -84,7 +84,33 @@ is available.
 ## Realtime mode and fallback
 
 Realtime mode is still a sequence of finite sync actions, not a permanently connected sync engine.
-DSM ships no `inotifywait`, so the package brings its own recursive watcher: the controller runs
+
+**Under the daemon (the default engine)** the daemon watches each realtime source itself with inotify,
+in process (`src/daemon/watch_source.rs`), one watcher thread per routine, using the same watcher
+library, skip list and exclude matcher as `sdsync-dsm-api --watch` below, so the watch budget and the
+setup deadline are the same. Polling is the fallback: it replaces the native watch when the
+watch cannot run, for the named reason `watch_limit`, `watch_unavailable` or `watch_setup_failed`,
+and the daemon tries the native watch again after 10 minutes, doubling up to every 6 hours. The
+fallback reports a change from a single differing reading, because the debounce below is what waits
+for a copy to settle. A vanished entry or an unreadable subdirectory is a named skip, not a stall,
+and every walk has a deadline. Editing a realtime profile's source or excludes replaces the watch
+(`routine_rearmed`). When the daemon starts, and when the native watch is armed again, it syncs the
+whole tree once if the source changed after the last success. The controller log carries
+`routine_backend` (every change of backend, with the cause), `routine_watch_notice` (named skips)
+and `routine_rearmed`. A healthy native watch has a safety-net floor: a stat-only reading of the tree every
+min(the routine's poll interval, 1 hour), and never more often than once a minute. A directory that changed without an
+inotify event is synced and named (`watch_missed_change dirs=N first=… floor_seconds=…`, `warn`, under
+`routine_watch_notice`); a floor reading that fails is named once (`poll_floor_failed cause=…`). When
+the watch is armed, nested mounts (a different device below the source: USB, bind, CIFS or NFS) are
+listed as an `info` note (`nested_mounts=N first=… watched_by=poll_floor every_seconds=…`), because
+inotify does not see changes made through them. Separately, an armed realtime routine syncs its whole
+tree once every 24 hours (`routine_full_reconcile`, `info`). A profile held by a [lasting
+block](operations.md#lasting-block-after-an-out-of-memory-kill) is not run by its routine, and each
+held trigger is logged at most once an hour (`routine_suppressed`). See
+[Realtime reports polling](troubleshooting.md#realtime-reports-polling).
+
+**Under the shell engine** DSM ships no
+`inotifywait`, so the package brings its own recursive watcher: the controller runs
 `sdsync-dsm-api --watch`, which watches every directory of the source except the DSM-managed ones
 (`@eaDir`, `#recycle`, `#snapshot`, `@tmp`, ...) and whatever the profile's excludes and the source's
 `.sdsyncignore` exclude, using the same matcher as the sync. It reports file writes when they are
@@ -118,7 +144,7 @@ default that ceiling is 180 seconds. The ceiling is not configurable; the operat
 debounce, and it is derived from that one field rather than adding a second number nothing else
 explains.
 
-**Fallback poll is a floor, not a fallback.** It runs on every install and alongside every healthy
+**Fallback poll is a floor, not a fallback (shell engine).** It runs on every install and alongside every healthy
 native watcher, checking a periodic source fingerprint (file path, size and mtime, plus the names of directories) whenever no
 native event is pending for that turn. A native event inside its debounce only suppresses the poll
 for that one turn; it does not turn polling off. Reducing **Fallback poll** therefore increases
@@ -131,7 +157,7 @@ routine whose walk finished and the routine whose poll is due next, so a source 
 to walk no longer delays the rest of the controller. Everything else (native events, windows, the queue
 and the schedule) keeps the five-second turn.
 
-The poll requires one unchanged reading before it dispatches: a fingerprint that differs from the
+Under the shell engine the poll requires one unchanged reading before it dispatches: a fingerprint that differs from the
 last one is held rather than acted on immediately, and is only promoted once the next poll sees that
 same reading again. This adds at most one poll interval of latency, and is the price of not
 dispatching against a copy still in progress. `@eaDir`, `#recycle`, `#snapshot`, and `@tmp` are
@@ -196,7 +222,8 @@ Routine files created before the exponential toggle are interpreted as enabled, 
 former doubling behavior. A legacy base above five minutes is read and executed as 300 seconds; the
 next save writes the supported bounded value.
 
-When a routine exhausts its retry attempts, Activity records `routine.retries_exhausted` (error)
+When a routine exhausts its retry attempts (the daemon's escalation follows the same alert
+policy and cooldown), Activity records `routine.retries_exhausted` (error)
 with the attempt count and the last reason, a sync routine raises a DSM system-log `sync_failed` and,
 when failure alerts are enabled, a desktop one, and a realtime routine then cools down for 900
 seconds before it may try again. The desktop and system-log escalation honours the alert cooldown

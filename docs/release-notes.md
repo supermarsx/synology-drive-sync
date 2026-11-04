@@ -6,6 +6,79 @@ changes below are in the first release built after the audit fix round documente
 [observability reference](observability.md). Older notes are not kept here: each release's GitHub page
 lists its own commits.
 
+## Unreleased: the daemon is the DSM service engine
+
+- **The Rust daemon replaces the shell controller and runner.** `sdsync-dsm-api --daemon`
+  (launched by `--launch-daemon --serve-api`) keeps the schedule, the realtime watchers, the dashboard
+  queue and the dashboard's API service in one process. The shell engine stays for this release as a
+  fallback: write `shell` to `var/state/engine`, then stop the package and run it again. Any other
+  content is named (`service_engine`, and an amber item on the Overview) and the daemon runs. The About
+  page and the dashboard's outcomes show the engine. Lasting blocks (below) are not applied by the shell
+  engine. See [Service engine](dsm/operations.md#service-engine).
+- **Realtime routines use the native inotify watcher inside the daemon.** Polling is the
+  fallback, named `watch_limit`, `watch_unavailable` or `watch_setup_failed`, and the daemon tries
+  the native watch again after 10 minutes, doubling up to every 6 hours. Beside a healthy watch a
+  stat-only floor reading (every min(the routine's poll interval, 1 hour), at most once a minute)
+  syncs and names any directory that changed without an event (`watch_missed_change`, `warn`; a failed
+  reading is `poll_floor_failed`), nested mounts are listed at arm time (`nested_mounts`, `info`), and
+  every armed routine syncs its whole tree once every 24 hours (`routine_full_reconcile`). The polling fallback reports
+  from one differing reading instead of two identical ones. A vanished entry or an unreadable
+  subdirectory is a named skip and every walk has a deadline. Editing a realtime profile's source or
+  excludes re-arms its watch. A start-up catch-up syncs the whole tree when it changed after the last
+  success. New `controller.log` events: `routine_rearmed`, `routine_watch_notice`, `routine_backend`.
+  See [Routines](dsm/routines.md#realtime-mode-and-fallback).
+- **Saves and dashboard jobs no longer wait for a sync.** The dashboard queue runs in lanes beside any
+  sync: one serialized job (saves), two concurrent (status walks, Doctor, actions) and two connection
+  probes, with deadlines of 10 minutes, 6 hours and 3 minutes. A job past its deadline is answered
+  `consumer_failed`, or, for a save, left outcome-unknown, as a dead worker is. New events:
+  `control_consumer_failed`, `control_consumer_outcome_unknown`, `control_request_rejected`,
+  `control_file_expired`.
+- **A save during a sync commits and says it takes effect on the next run** (`applies_next_run`). Only
+  a change that would touch a running profile is refused, with exit `75` and a message starting
+  `profile_running:`: remove, set-default, remove-routine, a change of URL, username, source, remote,
+  compare mode, deletion settings or excludes, removing its secrets, and a confirmed resync. Doctor no
+  longer holds the management lock (a Doctor `--write-test` against a running profile is still
+  refused), a plan-only resync takes no lock, and an interactive `set-password` reads the secret
+  before it takes the lock. A daemon run publishes `var/run/run.scope` naming its profiles, and never
+  starts while `management.lock` is live (`run_deferred`, `reason=lock_busy`). The shell engine keeps
+  the whole-package refusal. See [Saves beside a daemon run](dsm/operations.md#saves-beside-a-daemon-run).
+- **A daemon run is gated and audited like a shell run.** The mandatory audit, the security-policy
+  gates and the secret checks apply, with the same reasons (`policy_*`, `password_missing`,
+  `secret_unsafe`, `audit_unavailable`). A daemon pointed at a tree that is not a package runs
+  unaudited and says so (`service_audit`).
+- **Failure alerts** go through the package's alert policy, counter, notifier and Log Center as
+  before, and an escalation follows the policy's cooldown. A delivery that fails is logged as
+  `alert_unavailable` with its channel and cause.
+- **The verified-pair index is on by default for daemon runs** (`--pair-index var/state/cache/pairs`,
+  one `<profile>.redb`). `index:` appears in `ctl status` and in the dashboard: state, entries, hits,
+  misses, canary, refreshed and the worst issue with its path and cause. A damaged index is named
+  (`pair-index-corrupt`), set aside and rebuilt; one retired by re-creating the profile with another
+  source, remote or NAS is named as information. `remove-profile` deletes the `.redb`, its quarantined
+  copies, the lasting block and the alerts state. The result's `pair_index` has a new `entries` field.
+  See [Verified-pair index](pair-index.md#on-a-dsm-package).
+- **An out-of-memory kill is a lasting block.** An exit `137` is `core_oom_killed` (the cgroup's
+  counter moved) or `core_killed`, never `core_failed`, and the detail names the memory a run could
+  use. After `core_oom_killed` the daemon holds the profile (`var/state/lasting/<profile>.state`): no
+  retries and no automatic runs, and each held trigger is logged at most once an hour
+  (`routine_suppressed`). **Run now**, or a change to the profile's settings or the performance level,
+  lifts the hold; a save that changes nothing does not. It survives restarts, an unreadable record is
+  named and still holds, and the dashboard shows an amber **not synced until you fix this**. See
+  [Lasting block](dsm/operations.md#lasting-block-after-an-out-of-memory-kill).
+- **An HTTP request that timed out is `timeout`, not `network`**, and its message leads with the
+  innermost cause. See [Observability](observability.md).
+- **The API service is a supervised child of the daemon.** The package is not ready until `api.sock`
+  answers; a crash is named (`api_server_exited`) and restarted with a backoff (`api_server_restarted`).
+- **New dashboard labels** for the reasons `run_stalled`, `launch_failed`, `state_unwritable`,
+  `consumer_timeout` and `lasting_state_unreadable`. The daemon ends a run with no progress for 45
+  minutes as `run_stalled`.
+- **`service_layout`** logs the home and var roots as named and as resolved. DSM's aliases are followed
+  one level only; the target must be a directory owned by the package user and not writable by group or
+  others, and a refusal names both paths.
+- **A password, TOTP seed or remote-log token saved while that profile syncs** says it takes effect on
+  the next run (`applies_next_run`).
+- **Log rotation by the daemon takes the shell's `event-log.lock`.** A rotation that cannot be made
+  keeps the line and writes `var/state/log-rotation.failed`.
+
 ## Read this before upgrading
 
 - **Rust 1.90 or newer is needed to build from source** (was 1.88). The verified-pair index uses redb
@@ -26,7 +99,8 @@ lists its own commits.
   with reason `tree-too-large-for-memory`, naming the entry counts, the estimate and the fix (split
   the profile). On a DSM package a core killed with exit `137` is now recorded as `core_oom_killed`
   (the cgroup's OOM counter moved) or `core_killed`, instead of `core_failed`.
-- **`--pair-index DIR` is new** (opt-in, Unix only). See [Verified-pair index](pair-index.md).
+- **`--pair-index DIR` is new** (opt-in on the command line, Unix only; on by default for DSM daemon
+  runs). See [Verified-pair index](pair-index.md).
 
 - **Excluded files that already leaked to the NAS stay there; delete them by hand.** Exclude matching
   now covers cases an earlier release missed (a composed `é` rule against a decomposed `é` folder, a
@@ -59,7 +133,8 @@ lists its own commits.
   numbers) and polled; only root can raise that limit, which is optional (see
   [Raising the inotify watch limit](dsm/troubleshooting.md#raising-the-inotify-watch-limit)). The
   watch budget is 80% of that limit minus what the package user already holds. An `inotifywait` is now
-  only a fallback, used if the package binary fails its executable checks. The setup walk has a
+  only a fallback, used if the package binary fails its executable checks. (Under the daemon engine
+  the watcher runs inside the daemon and `inotifywait` is not used.) The setup walk has a
   120-second deadline that names the directory it was stuck on, and a kernel event overflow triggers a
   full re-walk. A realtime routine that is not watched natively is now an amber item on the Overview.
   The watcher uses about 6 MiB at 20,000 directories and about 16 MiB at 100,000.

@@ -89,8 +89,8 @@ account already has access to.
 - **One Synology pushing to another.** The DSM 7 package runs on the NAS that holds the
   authoritative folder and sends it over HTTPS to a File Station path on a second Synology.
   Interval and daily routines cover a schedule; a realtime routine watches with the package's own
-  `inotify` watcher (DSM ships no `inotifywait`), polls the source on a floor either way, and
-  launches a finite run after a debounce.
+  `inotify` watcher (DSM ships no `inotifywait`), falls back to polling only when that watcher
+  cannot run (and says why), and launches a finite run after a debounce.
 - **Getting a folder into Synology Drive without speaking Drive's protocol.** Point the destination
   at a path under the remote account's My Drive or an enabled Team Folder and Drive indexes what
   File Station wrote, so the result reaches Drive clients without this tool implementing anything

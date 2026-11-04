@@ -58,6 +58,16 @@ Plan/Run, and `--max-total-delete` applies to an all-profile deletion action. In
 trailing options are rejected rather than ignored. See [Health and Doctor](operations.md#health-and-doctor)
 for source behavior, independent target execution, and bounded section evidence.
 
+Under the daemon engine (no `var/state/engine`, or `daemon`), `plan` and `run`, and the dashboard's
+Plan and Run, do not start a runner: the manager audits the request and hands it to the sync daemon
+(`ctl run`), which runs it in its one run slot under its watchdog. The command returns once the run is
+queued (`queued as run N: …`, exit `0`; through `api action` the message is `plan queued` or
+`run queued`), and the outcome is recorded in `run.state` and Activity like any other run. A daemon
+that does not answer is a refusal, `the sync service is not running`, exit `75`; there is no fallback
+to the runner. A refusal by the daemon names its code: `stopping`, `busy` or `profile_running` exit
+`75`, `scope_not_found` exit `66`, anything else exit `1`. Doctor and a confirmed resync still run in
+the manager. Under the shell engine nothing changed.
+
 `configure-profile` is a complete replacement of the named profile's non-secret settings. It covers
 the dashboard's target, sync, safety, network, TLS, local-output, and remote-observability fields,
 including `--log-format`, `--progress`, and `--output`. DSM keeps the local log path, OS-vault policy,
@@ -135,7 +145,11 @@ A mutation result (`sdsync.dsm-result.v1` with `"ok": true`) may carry `"warning
 sixteen `{"code", "message"}` entries meaning *the change is saved, but something it depends on did not
 complete*. `controller_reload_failed` says the running controller was not told to reload, so the
 previous schedule, routines or policy stay in effect until the package service restarts or a later save
-reloads it. A manager that prints the older single pair `warning_code` and `warning` is accepted and
+reloads it. `applies_next_run` is the one entry that is not a shortfall: the change was committed while a
+sync was running and takes effect on the next run (the notice is headed *Saved, takes effect on the next
+run* when it is the only entry). The fixed `set-secret` result (`has_password`, `has_totp`,
+`has_remote_log_token`) carries the same `warnings` list when a credential is stored for a profile a
+daemon run is syncing, or the save printed a warning. A manager that prints the older single pair `warning_code` and `warning` is accepted and
 normalised into `warnings`, so the dashboard only ever sees the list. The bridge records each entry as
 one `mutation_warning` record in `api.log` and shows the dashboard a red *Saved, but it is not fully in
 effect* notice with the message; a warning line that sanitises to nothing is shown as "The change was saved,

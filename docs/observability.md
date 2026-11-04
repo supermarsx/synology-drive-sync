@@ -189,14 +189,27 @@ evidence_canary_mismatch  pair_index_unusable       pair_index_store_failed   tr
 (`operations`) and verified live (`files`); `reconcile.carry_canary_mismatch` names a canary that
 disagreed. `pair_index.*` reports the [verified-pair index](pair-index.md): `served` with the pairs
 served and verified live, the others with the path and one of the reasons above.
-`memory.tree_too_large` carries the entry count and the estimate in bytes; `memory.budget_unchecked`
-says the host exposed no limits to check against.
+The result's `pair_index` object (and the plan's) carries the pairs the index holds after the run in
+`entries`, or `null` when it was never opened; the DSM package shows it as the `index:` line of
+a profile. `memory.tree_too_large` carries the entry count and the estimate in bytes;
+`memory.budget_unchecked` says the host exposed no limits to check against.
+
+A failed HTTP request is classified by its cause: one that timed out at the transport is `timeout`,
+any other is `network`. Its message leads with the innermost cause, then the chain, for example
+`HTTP request failed during <op>: operation timed out (error sending request for url (…): …)`, so the
+cause survives the 160-byte cut that Activity and `run.state` apply. The SDK and FFI error code for
+the same failure is still `network`.
 
 `remote_refused_share_wide` is the refusal breaker and `remote_real_path_unusable` is the link-shape
 breaker (see [Partial runs, deferrals and skips](#partial-runs-deferrals-and-skips)). A scope that is,
 or lies beneath, a NAS link fails with `remote_path_refused`.
 
-The DSM package surfaces these on the dashboard as the reason a run failed or is partial.
+The DSM package surfaces these on the dashboard as the reason a run failed or is partial. It adds
+reasons of its own to `run.state` for what happens around the core, which are not core reasons and not
+in this list: `core_oom_killed` and `core_killed` for an exit `137` (the first when the cgroup's
+out-of-memory counter moved), and, under the daemon engine, `run_stalled`, `launch_failed`,
+`state_unwritable`, `consumer_timeout` and `lasting_state_unreadable`
+(see [Troubleshooting](dsm/troubleshooting.md#a-run-failed-died-or-was-refused)).
 
 ## Request-level diagnostics
 

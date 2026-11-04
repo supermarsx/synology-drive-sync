@@ -51,6 +51,12 @@ The deterministic suite has these complementary layers:
   measured test weights, because DSM's `/bin/sh` is believed to be bash and dash and BusyBox read a
   builtin `read` differently), and also runs the lifecycle under BusyBox in an Alpine container. Every
   shell-sensitive probe also loops over each shell present on the host.
+- **Daemon tests** (`src/daemon/` unit tests and `tests/daemon_e2e.rs`) run the real
+  `sdsync-dsm-api --daemon` against a private package tree with a fake or real core, and assert that
+  `ctl status` answers within a second, a mutation completes within two and stop finishes within its
+  budget while a job or a run hangs. The verified-pair index has its own files:
+  `tests/pair_index_storage.rs` (damaged, locked and read-only files on a real file system),
+  `tests/pair_index_e2e.rs` and `tests/scale_requests.rs` (request counts).
 - **Native watcher tests** (`tests/watch_inotify.rs`, `tests/watch_cli.rs`, and the unit tests in
   `src/watch/`) drive the real inotify watcher on Linux: which directories are watched (DSM-managed
   names and the profile's excludes are not), the marker lines, new directories, overflow, the watch

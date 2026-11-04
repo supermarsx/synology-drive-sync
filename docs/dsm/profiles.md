@@ -231,7 +231,10 @@ generation-fenced so they cannot overwrite it. Recovery reads are allowed withou
 open draft. An ordinary Close performs one fresh status read even when periodic refresh is set to
 **Manual only**; unresolved recovery deliberately prevents Close from destroying its draft.
 Removing a profile also removes its package-owned password, TOTP,
-remote-log-token, routine, and cached state, then rebuilds the generated configuration. It does not
+remote-log-token, routine, and cached state (including its alerts state, its lasting block and its
+[verified-pair index](../pair-index.md) with any quarantined copies), then rebuilds the generated
+configuration. A file that cannot be removed is named in the result as a warning. While a daemon sync of
+the profile is running the removal is refused (exit `75`, `profile_running:`). It does not
 touch local or remote data. Removing the final profile disables the legacy global schedule.
 
 ## CLI example

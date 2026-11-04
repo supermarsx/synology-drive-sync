@@ -160,7 +160,7 @@ if progress resumes. When the heartbeat has been stale for 30 minutes the contro
 `controller_blocked_by_stalled_run` (`error`, once per run; the scope, the last progress time, the number
 of queued jobs and what is waiting: `routines`, `polls`, `schedule`) and raises the failure alert (DSM
 log and desktop) for it. Nothing here stops the core, and the controller's own loop does not become
-responsive: while a run holds it, polls and serialized dashboard jobs still wait. The dashboard lists a long-running or stalled run in
+responsive: under the shell engine, while a run holds it, polls and serialized dashboard jobs still wait (the daemon's queue does not, see [What may run beside what](#what-may-run-beside-what)). The dashboard lists a long-running or stalled run in
 the attention list and shows a routine waiting behind it as “Waiting (busy)” or, once the run is
 long-running, “Waiting (run may be stuck)”, never as healthy.
 
@@ -248,10 +248,75 @@ sync log. A condition that clears by itself is `partial` instead
 dashboard says so. An alert that could not be processed is itself recorded: the dashboard shows
 “Failure alerts unavailable” and Activity gets `notification.unavailable`.
 
+## Service engine
+
+The package service runs on one of two engines. The default is the **daemon**: `sdsync-dsm-api
+--daemon`, started by `--launch-daemon --serve-api`. One process keeps the schedule, the realtime
+watchers, the dashboard queue and the dashboard's API service (a supervised child). The shell
+controller and runner stay for one release as a fallback. `var/state/engine` selects between them:
+
+| Content of `var/state/engine` | Engine |
+| --- | --- |
+| absent, or `daemon` | daemon |
+| `shell` | shell controller and runner |
+| anything else, or unreadable | the daemon runs, and the content is named: `service_engine` in `controller.log` (`file=invalid`, with the path and cause) and an amber item on the Overview |
+
+The change takes effect when the package is stopped and run again in Package Center. The About page
+and `outcomes.engine` show which engine is active. The daemon logs `service_engine` once at start.
+
+What differs under the daemon, and what the pages below describe for it:
+
+- Lasting blocks, such as the one after an out-of-memory kill, are applied by the daemon only; the
+  shell engine retries as before.
+- The API service is not ready until `api.sock` answers. A crash of it is named
+  (`api_server_exited`) and it is restarted with a backoff that starts at one second and doubles to
+  thirty (`api_server_restarted`).
+- A run never starts while `management.lock` is live, so a save or a Doctor write test is never
+  read half-written: the run is deferred as `run_deferred` with `reason=lock_busy` and retried.
+- Every run publishes `var/run/run.scope` (see [Saves beside a daemon run](#saves-beside-a-daemon-run)).
+- Realtime routines use the daemon's in-process inotify watcher, not `sdsync-dsm-api --watch` (see
+  [Realtime mode](routines.md#realtime-mode-and-fallback)).
+
+### Gates before a daemon run
+
+A daemon run applies the same checks as the shell runner before it starts the core, and refuses with
+the same reasons: `policy_*` (the security policy), `password_missing`, `secret_unsafe` and
+`audit_unavailable`. The audit trail is mandatory for a run: the daemon writes the audit record
+before the core starts and settles it when the core ends. A daemon pointed at a tree that is not a
+package tree has no audit helper; it runs unaudited and says so (`service_audit` in
+`controller.log`, once at start).
+
+### Failure alerts under the daemon
+
+A failed run raises its alert through the package's [alert policy](#dsm-desktop-alert-policy): the
+same per-scope counter, threshold and cooldown, the same desktop notifier and the same DSM system log
+entry. An escalation after exhausted retries follows the policy's cooldown. A delivery that fails is
+logged as `alert_unavailable` with the channel and the cause, and the run keeps its own result.
+
 ## What may run beside what
 
-Every dashboard request that does real work becomes a queued job, and the controller classifies each
-one before dispatching it. The class decides what else may run at the same time:
+Every dashboard request that does real work becomes a queued job, and the service classifies each
+one before dispatching it. The class decides what else may run at the same time.
+
+**Daemon.** The queue runs in lanes beside any sync, including a sync of the profile the job names:
+
+| Lane | Jobs | At once | Deadline |
+| --- | --- | ---: | --- |
+| Serialized | profile save, secrets, routines, alert and security policy, interface event | 1 | 10 minutes |
+| Concurrent | Check status, Doctor, resync plan and the other actions | 2 | 6 hours |
+| Connection | authentication test, remote browsing | 2 | 3 minutes |
+
+Order is kept within a lane and never across lanes. A save is therefore never queued behind a sync or
+a status walk. A job that passes its deadline has its process group stopped and is answered exactly
+as a dead worker is: `consumer_failed`, or, for a save, which may have committed part of its change,
+no result at all and an outcome-unknown verdict (see
+[Named terminal failures](troubleshooting.md#named-terminal-failures)). The dashboard labels the
+reason `consumer_timeout`. The daemon logs `control_consumer_failed` and
+`control_consumer_outcome_unknown` for the two cases, `control_request_rejected` for a request file
+it refused to read (not a private regular file, or over 64 KiB) and
+`control_file_expired` for an old request or response it removed.
+
+**Shell engine.** The controller has one work slot:
 
 | Class | Jobs | May run beside |
 | --- | --- | --- |
@@ -262,7 +327,7 @@ one before dispatching it. The class decides what else may run at the same time:
 Two jobs of the same class never overlap. A serialized job commits configuration, credential, policy
 or scheduler state, so two of them cannot interleave and neither may run beside a scheduled sync.
 
-The row that matters in practice is the second one. **Check status** walks the whole local tree and
+**Check status** walks the whole local tree and
 enumerates the whole remote one, which on a small NAS takes minutes; it used to hold the only work
 slot for that entire time, so a profile save started while it ran waited it out. The dashboard bounds
 its own wait for a queued result at thirty seconds, so such a save was reported as an outcome the
@@ -308,7 +373,42 @@ the whole-package refusal above applies, preceded — when the file exists — b
 **Doctor** and a **resync plan** (no `--confirm`) only read, and take no management lock, so a save
 does not wait for them and they do not make a run refuse. Beside a shell-engine run they are still
 refused as before. A **Doctor write test** writes into the destination and keeps the management lock
-for its whole duration.
+for its whole duration. An interactive `set-password` or `set-totp` reads the secret before it takes
+the lock, so a person typing no longer makes runs refuse.
+
+### Verified-pair index status
+
+The daemon runs every sync with the [verified-pair index](../pair-index.md) on:
+`--pair-index var/state/cache/pairs`, one `<profile>.redb` per profile. The profile's `index:` entry in
+`sdsync-dsm-api --ctl status`, and the `Checksum index:` note at the end of the profile's **Last run:** line in the dashboard, show what its last run
+did with it: `state` (`off`, `cold`, `warm`, `refreshed`, `unusable` or `local-only`), `entries` held,
+`hits` (reused) and `misses` (checked live), the canary checked and any canary mismatches, whether it
+was `refreshed`, and the most serious issue the run named with its path and cause on one line.
+
+- A damaged index is named `pair-index-corrupt`, set aside as `<profile>.redb.corrupt-<epoch>` and
+  rebuilt from the run. It is an amber item.
+- An index kept for a profile that was re-created with another source, remote or NAS is retired and
+  rebuilt: `pair-index-retired`, shown as information on the line, not as a problem. It explains the
+  slow first run.
+- A read of an index that a run of the same profile is using reports `index: "busy"`, not an
+  error.
+- `remove-profile` removes the profile's `.redb`, its quarantined copies, its lasting block and its
+  alerts state. A file it could not remove is named in the result as a warning.
+
+### Lasting block after an out-of-memory kill
+
+A run whose core was killed with exit `137` is recorded as `core_oom_killed` when this cgroup's
+out-of-memory counter moved, and as `core_killed` when it did not, never as `core_failed`. The detail
+names the memory a run could use. Under the daemon, `core_oom_killed` also holds the profile as a
+lasting block in `var/state/lasting/<profile>.state`: nothing retries it and no scheduled or
+realtime trigger starts it, because running it again would kill it again. Each held trigger is
+logged at most once an hour (`routine_suppressed`). The Overview shows an amber **not synced until
+you fix this** item for the profile.
+
+The block is lifted by **Run now**, or by a change to the profile's settings or to the performance
+level. The comparison is by content, so a save that changes nothing does not lift it. It survives a
+restart of the package. A record that cannot be read is named (`lasting_state_unreadable`) and still
+holds the profile; **Run now** clears it. The shell engine does not apply lasting blocks.
 
 ## Structured Activity
 
@@ -443,7 +543,7 @@ knowing when reading it:
 | `controller_exited` | The controller's last line: `status=` and `shutdown=`, `info` after a requested stop and `error` otherwise |
 | `run_state_unverifiable` | The controller could not decide whether a run was alive (`phase=liveness` or `acquire`) |
 | `controller_found_dead` | `warn`, category controller. The controller is gone while its API service is still running: `phase=status` (written once per dead controller and API instance, which is the record a SIGKILL never wrote) or `phase=start` (written whenever Start repairs it); `pid=` the controller's recorded pid or `none`, `api_pid=` the service. Start then stops the service and starts both again, and writes an Activity `service.restarted` (`warn`) saying so |
-| `core_killed` | `error`, scheduler. The sync core was killed (`exit=137`) without reporting an error and the run was not a cancellation. `scope=`, `oom_kill=<before>-><after>`, `proven=true\|false`: `proven=true` when this cgroup's out-of-memory kill counter moved across the run. The profile and run detail then say "killed by the out-of-memory killer" (or, unproven, "killed (SIGKILL, exit 137) without reporting an error; out of memory? check the DSM system log"); the reason is `core_oom_killed` when proven and `core_killed` otherwise, never `core_failed`. The package does not read `dmesg`, which is privileged |
+| `core_killed` | `error`, scheduler. The sync core was killed (`exit=137`) without reporting an error and the run was not a cancellation. `scope=`, `oom_kill=<before>-><after>`, `proven=true\|false`: `proven=true` when this cgroup's out-of-memory kill counter moved across the run. The profile and run detail then say "killed by the out-of-memory killer" (or, unproven, "killed (SIGKILL, exit 137) without reporting an error; out of memory? check the DSM system log"); the reason is `core_oom_killed` when proven and `core_killed` otherwise, never `core_failed`. The detail also names the memory a run could use. Under the daemon `core_oom_killed` holds the profile ([lasting block](#lasting-block-after-an-out-of-memory-kill)). The package does not read `dmesg`, which is privileged |
 | `realtime_watcher_command` | Which watcher realtime routines use, once per controller start: `path=` and `kind=native` (the package's `sdsync-dsm-api --watch`) or `kind=inotifywait` (`info`); `warn` with `path=none kind=none` when neither passed the executable checks and every realtime routine is polled (`backend_reason=watch_unavailable`) |
 | `routine_watch_failed` / `routine_watch_limit` | `warn`. A native watcher exited (`profile=`, `consecutive=`, `detail=` its first stderr line: the reason, then the cause, then the path) / a source does not fit the per-user inotify watch budget (`dirs=`, `budget=`, `limit=` from the controller's own count, or `source=watcher detail=watch_limit dirs=… budget=… limit=… held=…` from the watcher's) |
 | `routine_watch_limit_unchecked` | `warn`. The inotify watch limit could not be checked for a routine (`profile=`, `cause=absent\|not_a_file\|unreadable\|malformed\|count_failed\|cache_unsafe\|cache_unwritable`, sometimes `path=`); logged once per controller lifetime, and the watcher is started anyway |
@@ -451,6 +551,18 @@ knowing when reading it:
 | `routine_window_dst_gap` | `warn`, scheduler. A daily window fell wholly inside a spring-forward gap and opened after it (`profile=`, `window_day=`, `start=`, `end=`) |
 | `routine_clock_unavailable` / `routine_clock_recovered` | The controller could not read the clock (`cause=`; `warn`, once per episode, and nothing is dispatched meanwhile) / it could again (`info`) |
 | `routine_fingerprint_format_changed` | `info`. A realtime routine's stored fingerprint was written by an earlier release (`from=`), so one comparison sync runs and the `to=v3` reading becomes the baseline. Replaces `routine_fingerprint_rebased` |
+| `service_engine` | The engine in force, once per daemon start: `engine=daemon file=absent\|daemon\|shell\|invalid\|unreadable` (`warn` when the file is `shell`, invalid or unreadable, with the path and cause) |
+| `service_audit` | `runs=audited` (`info`), or `runs=unaudited` (`warn`) when the daemon's tree is not the package's `var` |
+| `run_deferred` | `warn`. A run was not started because `management.lock` was live (`reason=lock_busy`, `scope=`, `cause=`); it is retried and no retry is consumed |
+| `routine_backend` | The change source of a realtime routine changed (`profile=`, `backend=inotify\|polling`, `reason=ok\|watch_limit\|watch_unavailable\|watch_setup_failed`, then the detail). `warn` when the reason is not `ok` |
+| `service_layout` | `info`, once per daemon start: `home=` and `var=` as named and `resolved=` as followed. DSM's aliases are followed one level only; the target must be a directory owned by the package user and not writable by group or others, and a refusal names both paths |
+| `routine_full_reconcile` | `info`. An armed realtime routine syncs its whole tree once every 24 hours (`profile=`, `every_seconds=`) |
+| `routine_rearmed` | `info`. A realtime routine's source or exclude list was edited, so its watch was replaced (`profile=`, `source=`) |
+| `routine_watch_notice` | A named skip or note while watching (`profile=` and the detail): a vanished entry, an unreadable subdirectory (first three paths, with cause), a walk that hit its deadline, `watch_missed_change dirs=N first=… floor_seconds=…` (`warn`: the stat-only floor found a directory that changed without an inotify event, and synced it), `poll_floor_failed cause=…` (a floor reading failed, once), or `nested_mounts=N first=… watched_by=poll_floor every_seconds=…` (`info` at arm: other devices below the source) |
+| `routine_suppressed` | `warn`. A trigger was held by a lasting block (`profile=`, `run=`, `reason=`, `clears_on=run_now_or_settings_change`); at most once an hour per profile |
+| `control_consumer_failed` / `control_consumer_outcome_unknown` | A dashboard job's worker died or passed its lane deadline: the operation was answered `consumer_failed` / left outcome-unknown because it may have committed (see [Named terminal failures](troubleshooting.md#named-terminal-failures)) |
+| `control_request_rejected` / `control_file_expired` | A queue request file was refused (not a private regular file, or over 64 KiB) / an old request or response was removed |
+| `api_server_exited` / `api_server_restarted` | `error` / `warn`. The daemon's API service child exited (`status=`, `served_seconds=`, `cause=`: its last stderr line) / was started again (`attempt=`, `after_seconds=`) |
 
 Re-levelled from `warn` to `error` because each records a failed write or delivery:
 `activity_append_failed`, `alert_unavailable`, `observability_write_failed` (which now carries the
@@ -462,8 +574,9 @@ refused).
 A log rotation that fails never drops the line: it is appended to the still-valid active file past the
 size limit, and the failure is recorded once per episode on standard error and in
 `var/state/log-rotation.failed` (package-owned `0600`: `epoch=`, `path=`, `cause=`), which the next
-successful rotation of that log removes. The marker is on-disk evidence only; the dashboard does not
-display it. An unsafe rotation set is still refused with exit `73` and nothing is written to it.
+successful rotation of that log removes. The daemon takes the same `event-log.lock` as the shell
+writers for every append and rotation, so the two cannot interleave. The marker is on-disk evidence
+only; the dashboard does not display it. An unsafe rotation set is still refused with exit `73` and nothing is written to it.
 
 ### Dashboard requests the service could not serve
 

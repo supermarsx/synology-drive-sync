@@ -512,7 +512,7 @@ which calls for the opposite action.
 | --- | --- | --- |
 | `classification_failed` | The controller could not determine what kind of operation the request was, so it never started it. | Nothing ran and nothing changed. Read the classification exit code from `controller.log`, then submit again. |
 | `secret_claim_failed` | The stored credential the request needed could not be claimed by the controller, so the operation was never started. | Nothing ran and nothing changed. Check the profile's stored credential under Security and `controller.log`, then submit again. |
-| `consumer_failed` | The worker running the operation exited before finishing. The exit code is reported with the failure. | On a memory-constrained unit this is most often the kernel OOM killer — check `dmesg` as well as Logs. Retry with a narrower scope. |
+| `consumer_failed` | The worker running the operation exited before finishing, or (daemon) passed its lane deadline of 3 minutes, 10 minutes or 6 hours and was stopped. The exit code is reported with the failure. | On a memory-constrained unit this is most often the kernel OOM killer — check `dmesg` as well as Logs. Retry with a narrower scope. |
 | `consumer_wrote_no_result` | The worker exited cleanly but wrote no result, so how far it got cannot be established from the queue. | Treat the operation as **unconfirmed**, not as failed. This is the one named code that still raises a reconciliation barrier and retains its request authentication, because naming the stage that dropped a job is not the same as knowing what it left behind. Inspect Activity and current state before submitting again. |
 
 Each code is published by the bridge itself, from the same result vocabulary as a failure inside the
@@ -578,6 +578,14 @@ Check the package identity can read and traverse the local source. Then review:
 The browser can allow a syntactically numeric value that the strict bridge still rejects. Effective
 connect timeout is at most 600 seconds and notification cooldown is at least 60 seconds.
 
+A save made while the daemon is syncing normally succeeds and reads **Saved, takes effect on the next
+run** (`applies_next_run`); the run in flight keeps the settings it started with. It is refused,
+with exit `75` and a message beginning `profile_running:`, only if it would change what that run is
+using: removing or setting as default the profile, removing its routine or secrets, changing its
+URL, username, source, remote, compare mode, deletion settings or excludes, or a confirmed resync.
+Save again when the run has finished. See
+[Saves beside a daemon run](operations.md#saves-beside-a-daemon-run).
+
 ## Password or TOTP authentication fails
 
 Confirm the target account can use File Station and can see the selected first path component. Test
@@ -610,20 +618,43 @@ and inspect for leftovers after a failure.
 
 ## Realtime reports polling
 
-`inotify` is the expected backend: the package's own watcher (`sdsync-dsm-api --watch`) needs no
-inotify-tools. `polling` with `backend_reason=watch_limit`, `watch_setup_failed` or
+`inotify` is the expected backend. Under the daemon (the default engine, see
+[Service engine](operations.md#service-engine)) the daemon itself watches the source with inotify,
+in process; under the shell engine the package's own watcher (`sdsync-dsm-api --watch`) does. Neither
+needs inotify-tools. `polling` with `backend_reason=watch_limit`, `watch_setup_failed` or
 `watch_unavailable` means the native watcher is not in use for that routine; the Overview lists
-each such routine as an amber item. Polling is not merely a fallback: it runs alongside a healthy native watcher too, checking
-path/size/mtime fingerprints at the configured interval whenever no native event is pending for that
-turn, and it now requires one unchanged reading before it dispatches. Confirm source ACLs and
-controller logs. Reducing the interval increases source traversal work. Do not claim native realtime
-operation unless the snapshot reports `inotify`.
+each such routine as an amber item. Do not claim native realtime operation unless the snapshot
+reports `inotify`.
 
-An unreadable subtree fails only itself, not the whole poll. `backend_reason=poll_unreadable` in the
-routine's state means part of the source could not be read on the last poll; the readable part stays
-observed, and the controller log names the failure `routine_poll_unavailable`. Fix permissions on the
-unreadable path — `@eaDir`, `#recycle`, `#snapshot`, and `@tmp` are already pruned from the walk and
-cannot be the cause.
+**Under the daemon, polling is the fallback.** It replaces the native watch only for the reason
+named, and `routine_backend` in `controller.log` carries that reason with the watcher's own cause
+(a path and what failed). While it polls, the daemon tries the native watch again after 10 minutes,
+then 20, doubling up to every 6 hours, and on every save of the routine; when it succeeds the
+routine reports `inotify` again and the whole tree is treated as changed once. The polling walk
+reports a change from a single differing reading; the debounce is what waits for a copy to settle.
+An entry that vanishes during a walk, or a subdirectory that cannot be read, is a named skip
+(`routine_watch_notice`: the count and the first three paths with their cause, once per path) and the
+walk goes on; every walk has a deadline, and one that overruns is `watch_setup_failed` naming the
+directory it was in. Editing a realtime profile's source or excludes replaces the watch
+(`routine_rearmed`). When the daemon starts, or a native watch is armed again, it runs one sync of
+the whole tree if the source changed after the last success. Beside a healthy watch a stat-only floor
+reading (every min(the poll interval, 1 hour), at most once a minute) catches what inotify missed:
+`routine_watch_notice` with `watch_missed_change dirs=N first=… floor_seconds=…` (`warn`) names the
+directories it had to sync, which usually means a nested mount (the arm-time note `nested_mounts=N
+first=… watched_by=poll_floor` lists them) or a writer inotify cannot see. `poll_floor_failed cause=…`
+means a floor reading itself failed. An armed routine also syncs its whole tree once every 24 hours
+(`routine_full_reconcile`).
+
+**Under the shell engine, polling is not merely a fallback:** it runs alongside a healthy native
+watcher too, checking path/size/mtime fingerprints at the configured interval whenever no native
+event is pending for that turn, and it requires one unchanged reading before it dispatches. Confirm
+source ACLs and controller logs. Reducing the interval increases source traversal work.
+
+An unreadable subtree fails only itself, not the whole poll. Under the shell engine
+`backend_reason=poll_unreadable` in the routine's state means part of the source could not be read on
+the last poll; the readable part stays observed, and the controller log names the failure
+`routine_poll_unavailable`. Fix permissions on the unreadable path — `@eaDir`, `#recycle`,
+`#snapshot`, and `@tmp` are already pruned from the walk and cannot be the cause.
 
 ## Realtime routine never runs
 
@@ -645,6 +676,13 @@ before this field existed, and that reads as `ok`.
 
 `backend` itself is only as current as the last poll that actually completed; a stalled or failing
 poll leaves it holding whatever it last reported rather than updating to reflect the present.
+
+The daemon uses only `ok`, `source_missing`, `watch_unavailable`, `watch_setup_failed` and
+`watch_limit`, and reads them differently from the table: `watch_unavailable` means the native
+watch could not be created at all (not that a helper binary failed its checks), `watch_setup_failed`
+and `watch_limit` are retried on the 10 minute to 6 hour backoff above instead of being abandoned
+after five failures, and `source_missing` is looked for again every 30 seconds. The cause is in
+`routine_backend`, not in `routine_watch_failed`.
 
 ### Probe what inotify sees on a share
 
@@ -705,10 +743,15 @@ shows the core's last error line and the path it failed on when the runner recor
 | `no_password:<profile>` | That profile's password file is missing | Enter the password on Profiles. |
 | `supervisor_refused` | The package supervisor refused before the core ran (exit `78`) | Read the stderr line in `api.log`/`controller.log`; reinstall if the binary identity mismatch persists. |
 | `runner_died` | The runner was killed or lost before it finished (out of memory, power loss) | Review Logs, then run again. Nothing is rolled back. |
-| `core_failed` / a core reason (`authentication`, `network`, `timeout`, `share_not_writable`, ...) | The core ran and failed; the reason is the class of the core's error | Follow the dashboard's next step; the one-line `detail` is the core's last error line (a profile's own record keeps up to 240 bytes of it; `run.state` and Activity keep 160). A refused `config validate` reads "configuration did not validate: <the core's line>". |
-| `core_oom_killed` | The core was killed with exit `137` and this cgroup's out-of-memory counter moved: the source holds more entries than the NAS has memory for. The detail reads "killed by the out-of-memory killer" | Split the profile (a scope, or subfolder profiles). The core normally refuses such a tree itself first, as `tree-too-large-for-memory` below; this is the backstop when its estimate was wrong. `core_killed` in `controller.log` records it. |
+| `core_failed` / a core reason (`authentication`, `network`, `timeout`, `share_not_writable`, ...) | The core ran and failed; the reason is the class of the core's error. An HTTP request that timed out is `timeout`, not `network`, and its detail leads with the innermost cause: `HTTP request failed during <op>: operation timed out (error sending request for url (…): …)`. An exit `137` is never `core_failed`: see the next two rows | Follow the dashboard's next step; the one-line `detail` is the core's last error line (a profile's own record keeps up to 240 bytes of it; `run.state` and Activity keep 160). A refused `config validate` reads "configuration did not validate: <the core's line>". |
+| `core_oom_killed` | The core was killed with exit `137` and this cgroup's out-of-memory counter moved: the source holds more entries than the NAS has memory for. The detail reads "killed by the out-of-memory killer" and names the memory a run could use. Under the daemon the profile is then held, with no retries and no automatic runs, and the Overview shows **not synced until you fix this** | Split the profile (a scope, or subfolder profiles), then click **Run now**, or change the profile's settings or the performance level: either lifts the hold, and a save that changes nothing does not. `lasting_state_unreadable` below is the same hold with an unreadable record. The core normally refuses such a tree itself first, as `tree-too-large-for-memory` below; this is the backstop when its estimate was wrong. `core_killed` in `controller.log` records it. |
 | `core_killed` | The core was killed with exit `137` without reporting an error, and nothing proves the out-of-memory killer sent it. The detail reads "the sync core was killed (SIGKILL, exit 137) without reporting an error; out of memory?" | Check the DSM system log for the OOM killer; split the profile if the source is very large. `core_killed` in `controller.log` records it. |
 | `tree-too-large-for-memory` (a deferred path `.`) | The core estimated that the tree needs more memory than this run may use (the cgroup limit's headroom and `MemAvailable`, with 20% kept back) and refused before listing the NAS. The run is complete with a warning, exit `0`; nothing was synced. The detail names the entry counts, the estimate in MiB and the memory available | Split the profile with a scope or into subfolder profiles. The `memory.tree_too_large` event in the sync log carries the same numbers. |
+| `run_stalled` | Daemon only. The core made no progress (its read and write counters and progress record) for 45 minutes and was stopped; a warning of the same name is logged at 15 minutes. The failure consumes a retry | Check that the source and the NAS are reachable (a hung SMB or NFS mount), then run again. |
+| `launch_failed` | Daemon only. The core could not be started (the cause is in `controller.log`) | Review Logs; repair the package if it repeats. |
+| `state_unwritable` | A package state file could not be written. When a run was being started, it was not started because its record could not be written | Check free space on the package volume and file ownership. |
+| `consumer_timeout` | Daemon only. A dashboard request did not finish within its lane deadline, so its outcome is unknown | Try again; see [Named terminal failures](#named-terminal-failures). |
+| `lasting_state_unreadable` | Daemon only. The record that holds a profile after a lasting failure (`var/state/lasting/<profile>.state`) could not be read, so automatic runs stay held | **Run now** clears it; repair the package if it repeats. |
 | `profiles_skipped` | An aggregate ran without the profiles that failed preflight | Fix those profiles; each has its own failed record. |
 | `batch_target_failed:<profile>` / `not_reached` | An aggregate stopped at, or never reached, this profile | Fix the named profile, then run again. |
 | `deferred_paths` | The core exited `3`: finished, with some paths deferred to the next run. Recorded as `succeeded` with outcome `partial`, an Activity warning counting the waiting paths, no alert and no failure count | Nothing; the next run picks them up. Read `entry.deferred` in the sync log if it repeats. |
@@ -729,14 +772,17 @@ permissions that only a person can fix (a name the NAS refuses, an unreadable fo
 rename File Station would not make) are in that group and stay amber on every run until fixed; if a
 refusal covers most of the share the run instead **fails**, naming the cause.
 
-**A run that never finishes.** The attention list flags a run going for more than six hours
+**A run that never finishes (shell engine).** The attention list flags a run going for more than six hours
 (`long_running`) and one whose heartbeat is more than 30 minutes old (`stalled`: its read and write
 counters stopped growing by 16 KiB a minute; where the kernel hides them, `stalled` is `null` with the
 warning `stall_unobservable` and a hang cannot be detected). Neither stops the run, and nothing in the package stops the core on its
 own. There is no dashboard *Cancel run*: a package stop is the way to end a hung run (Package Center
 stop or `synopkg stop`; DSM offers Stop and Run, not Restart). The controller stops within 60 seconds, the run is recorded as `cancelled`
 (not `runner_died`), with an Activity `run.cancelled` row, and a core that ignores the termination request is killed after the grace. Meanwhile every routine waits behind the run as “Waiting (busy)”. Check the NAS side first: a hung SMB or NFS
-source mount, or a File Station request with no deadline.
+source mount, or a File Station request with no deadline. The daemon engine does stop a hung run:
+after 45 minutes without progress it ends the run as `run_stalled`; a package stop cancels with a
+20-second grace before the core is killed. It has no total-duration cap, because a first upload can
+take days.
 
 **A save that is not applied.** A green save followed by the red notice *Saved, but it is not fully in
 effect* (and an Overview item *Saved, not yet applied; stop and run the package service*) means the change
@@ -750,7 +796,8 @@ are applied* means the marker file itself failed its safety check.
 Check active weekday/time window, NAS clock/time zone, dependency latest-success states, and deletion
 approval. A deferral is written once when the routine enters it (Activity and `controller.log`), not
 on every controller turn, and a busy run lock (exit `75`) defers the routine for 30 seconds without
-consuming a retry. If a profile's deletion cap is greater than its routine approval ceiling, the controller
+consuming a retry. The daemon also defers a run while a save or a Doctor write test holds the
+management lock (`run_deferred`, `reason=lock_busy`). If a profile's deletion cap is greater than its routine approval ceiling, the controller
 defers instead of weakening the bound. Cyclic, missing, duplicate, or self dependencies are rejected
 at configuration time.
 
@@ -799,6 +846,10 @@ expected is more likely a classification gap than a delivery failure; check the 
 ## Exit `75`, active lock, or package will not stop
 
 Status and logs should identify the active operation/PID. Wait for a legitimate operation to finish.
+Under the daemon engine a save made during a sync is not a cause of `75`: it commits, unless it
+would change a running profile, and then it says `profile_running:` and names the profile and the
+operation; retry when the run has ended. A run that is deferred because a save was in progress logs
+`run_deferred` with `reason=lock_busy` and is retried on its own.
 Stop uses cooperative termination and can wait for the core to unwind; it deliberately refuses an
 untrusted PID and does not force-kill after timeout. When the run lock is held by the controller
 itself (it takes the lock to reconcile a dead run), stop verifies and stops it as the controller

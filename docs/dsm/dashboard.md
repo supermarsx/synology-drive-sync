@@ -252,6 +252,21 @@ tree-comparison table notes “Last run failed: …” beside a profile whose la
 is taken when someone asks, not a verdict on the last run), and while the bridge is unreachable the
 page is dimmed rather than left looking current.
 
+Three more items come from the daemon engine (see [Service engine](operations.md#service-engine)):
+
+- **`<profile>`: not synced until you fix this** (amber) is a profile held after a lasting failure.
+  For an out-of-memory kill it names the kill and the memory a run could use, and says that
+  **Run now**, or a change to the profile's settings or the performance level, lets it run again; if
+  the record that holds the profile cannot be read, it says automatic runs stay held and **Run now**
+  clears it. See [Lasting block](operations.md#lasting-block-after-an-out-of-memory-kill).
+- **`<profile>`: checksum index needs attention** (amber) is a verified-pair index problem named with
+  its cause and path: damaged (set aside and rebuilt), locked, on a read-only location, unsafe,
+  failed to save, bound to another source or destination, or a canary mismatch. An index retired
+  because the profile was re-created is information on the profile's index line, not an item.
+- **The service engine setting is not understood; the daemon runs** (amber) means
+  `var/state/engine` holds something other than `daemon` or `shell`. The About page shows the engine
+  in use: `daemon`, or `shell (fallback)`.
+
 **Plan all profiles** and **Run all profiles** enqueue an action with scope `all`. The dashboard does
 not enable deletion from these quick actions. Use the reviewed deletion flow documented under
 [Deletion approval](routines.md#deletion-approval-is-layered).
@@ -268,8 +283,16 @@ and three secret-state editors. See:
 - [Profiles and destinations](profiles.md) for every displayed field and constraint;
 - [Secrets and protected values](secrets.md) for keep, replace, clear, non-disclosure, and ordering.
 
+Each profile's **Last run:** line also ends with what the run did with the checksum index, for
+example `Checksum index: warm, 1,000 pairs; 975 reused, 25 checked live (25 canary)`: the state (`off`, `cold`, `warm`, `refreshed`,
+`unusable` or `local-only`), the pairs held, how many were reused and how many were checked live, and
+the canary. See [Verified-pair index](../pair-index.md).
+
 The underlying save is queued, but the page polls its sanitized result and reports success only after
-the controller completes it. A save that completed but carries warnings (for example, the running
+the controller completes it. A save made while a sync is running is committed too, and reads **Saved,
+takes effect on the next run** (`applies_next_run`): the run in flight keeps the settings it started
+with. Only a change that would touch a running profile is refused (exit `75`, `profile_running:`); see
+[Saves beside a daemon run](operations.md#saves-beside-a-daemon-run). A save that completed but carries warnings (for example, the running
 controller could not be told to reload, so the previous schedule or policy is still in effect) is shown
 as saved with a persistent red *Saved, but it is not fully in effect* notice that names each warning
 and can be dismissed; it is never reported as plain success. Configuration is applied first, followed by
@@ -454,7 +477,11 @@ flow, focus behavior, contrast, zoom, and the exact DSM window sizes during
 
 Every changing request receives a client request ID and is published into a private package queue.
 The API service first returns HTTP `202` with state `queued`. The controller later claims and validates
-the job, runs the package manager under a clean package identity, and writes a private response.
+the job, runs the package manager under a clean package identity, and writes a private response. The
+daemon engine does this in lanes beside any running sync, each with a deadline of 3 minutes, 10
+minutes or 6 hours; a job past its deadline is answered `consumer_failed`, or, for a save that may
+have committed, left outcome-unknown (see
+[What may run beside what](operations.md#what-may-run-beside-what)).
 Configuration/secret/routine/policy calls and Doctor poll that response before reporting a terminal
 result. Plan and Run remain asynchronous. Therefore:
 

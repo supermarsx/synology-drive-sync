@@ -304,7 +304,9 @@ Queue behavior:
   authentication** or **Browse target** probes beside it, one at a time, but only when the next
   probe is the current FIFO head;
 - it never scans past an earlier action or configuration mutation to reach a connection probe, and
-  it does not open the connection lane while a serialized mutation is active;
+  it does not open the connection lane while a serialized mutation is active (this is the shell
+  engine's rule; the daemon engine runs the lanes beside each other and beside a sync, see
+  [What may run beside what](operations.md#what-may-run-beside-what), and applies a deadline to each);
 - jobs older than the accepted window, malformed jobs, unexpected secret files, unsafe paths, and
   output containing sensitive material fail closed; and
 - the result endpoint returns only pending or a sanitized terminal manager result.

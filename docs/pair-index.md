@@ -7,6 +7,8 @@ a start plus at least one status poll, so a share of 100,000 unchanged files cos
 requests and two whole-share reads before anything is known to be unchanged.
 
 `--pair-index DIR` keeps what earlier runs proved, so a run where nothing changed costs the listing.
+On the command line it is opt-in. On a DSM package it is on by default: the daemon engine passes
+`--pair-index var/state/cache/pairs` to every run (see [On a DSM package](#on-a-dsm-package)).
 
 ```bash
 synology-drive-sync sync --profile photos --pair-index /var/packages/synology-drive-sync/var/state/cache/pairs
@@ -96,6 +98,25 @@ transaction), so a dashboard read is never queued behind a sync. Every open runs
 Size is about 340 bytes per pair at 100,000 pairs and 270 at a million; redb's page cache is held at
 8 MiB, so memory does not grow with the share. When the file grows past twice its contents plus
 64 MiB, it is compacted (`pair-index-compacted`).
+
+## On a DSM package
+
+The daemon engine (the default; see [Service engine](dsm/operations.md#service-engine)) runs every
+sync with `--pair-index /var/packages/synology-drive-sync/var/state/cache/pairs`, one
+`<profile>.redb` per profile. The shell engine does not pass it.
+
+- **Status.** The profile's `index:` entry in `sdsync-dsm-api --ctl status`, and the dashboard's
+  `Checksum index:` note on the profile's **Last run:** line, show the state, `entries`, `hits`,
+  `misses`, the canary checked and mismatched, whether it was refreshed, and the worst issue of the
+  run with its path and cause. `entries` is the result's `pair_index.entries`. A read of the index
+  while a run of that profile uses it says `busy` instead of opening it.
+- **A damaged file** is named `pair-index-corrupt` (an amber item on the dashboard), set aside as
+  `<profile>.redb.corrupt-<epoch>` and rebuilt from the run.
+- **A retired index** (the profile was re-created with another source, remote or NAS) is named
+  `pair-index-retired` and shown as information on the profile's line, because it explains why the
+  first run afterwards is slow.
+- **Removing the profile** deletes its `.redb`, the quarantined copies, its lasting block and its
+  alerts state. A file that cannot be removed is named as a warning.
 
 ## Reconciliation
 
