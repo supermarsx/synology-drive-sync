@@ -1154,7 +1154,10 @@ mod tests {
         )
         .unwrap();
         let filter = Arc::new(Filter::build(&root.join("source"), Vec::new()).unwrap());
-        if std::fs::read_dir(root.join("source/locked")).is_err() {
+        if !super::super::testkit::permissions_do_not_bind(
+            "the_catch_up_walk_names_its_skips_and_honours_a_stop",
+            &root.join("source/locked"),
+        ) {
             let facts = newest_change(
                 root.join("source"),
                 Arc::clone(&filter),

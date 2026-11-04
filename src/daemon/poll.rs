@@ -942,8 +942,10 @@ mod tests {
         dir.write("locked/secret.txt", "s");
         let filter = filter(dir.path(), &[]);
         fs::set_permissions(dir.path().join("locked"), fs::Permissions::from_mode(0o000)).unwrap();
-        if fs::read_dir(dir.path().join("locked")).is_ok() {
-            eprintln!("skipped: running as a user that ignores directory modes (root)");
+        if super::super::testkit::permissions_do_not_bind(
+            "an_unreadable_subdirectory_is_a_named_skip_and_the_rest_is_read",
+            &dir.path().join("locked"),
+        ) {
             return;
         }
         let before = read(dir.path(), &filter);
@@ -1275,8 +1277,10 @@ mod tests {
         dir.write("open/f", "f");
         dir.write("locked/s", "s");
         fs::set_permissions(dir.path().join("locked"), fs::Permissions::from_mode(0o000)).unwrap();
-        if fs::read_dir(dir.path().join("locked")).is_ok() {
-            eprintln!("skipped: running as a user that ignores directory modes (root)");
+        if super::super::testkit::permissions_do_not_bind(
+            "skipped_entries_are_named_in_the_backend_detail",
+            &dir.path().join("locked"),
+        ) {
             return;
         }
         let harness = start(dir.path(), &[], None);

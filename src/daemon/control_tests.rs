@@ -1574,8 +1574,10 @@ fn unreadable_configuration_is_named_and_never_read_as_absent() {
     h.wait_for("arm", Duration::from_secs(5), armed);
     let conf = h.root.join("home/config/routines.d/docs.conf");
     fs::set_permissions(&conf, fs::Permissions::from_mode(0o000)).unwrap();
-    if fs::read(&conf).is_ok() {
-        // Running as root: permissions do not bind; nothing to prove here.
+    if super::super::testkit::permissions_do_not_bind(
+        "unreadable_configuration_is_named_and_never_read_as_absent",
+        &conf,
+    ) {
         return;
     }
     let named = |h: &Harness, needle: &str| {
@@ -1652,7 +1654,10 @@ fn an_unreadable_routine_state_is_held_not_reset() {
         fs::write(&state, format!("next_run_epoch={}\n", T0 - 5)).unwrap();
         fs::set_permissions(&state, fs::Permissions::from_mode(0o000)).unwrap();
     });
-    if fs::read(h.var.join("state/routines/alpha.state")).is_ok() {
+    if super::super::testkit::permissions_do_not_bind(
+        "an_unreadable_routine_state_is_held_not_reset",
+        &h.var.join("state/routines/alpha.state"),
+    ) {
         return;
     }
     h.wait_for("the state named", Duration::from_secs(5), |h| {

@@ -31,6 +31,8 @@ pub(crate) mod routines;
 pub(crate) mod state;
 #[cfg(target_os = "linux")]
 pub(crate) mod sys;
+#[cfg(all(test, unix))]
+pub(crate) mod testkit;
 pub(crate) mod watch_source;
 pub(crate) mod window;
 
