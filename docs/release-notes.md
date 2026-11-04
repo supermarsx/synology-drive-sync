@@ -132,6 +132,13 @@ lists its own commits.
 
 ## DSM package
 
+- **`sdsync-dsm resync` runs again.** The previous release shipped it unable to start: every resync,
+  a plan or a `--confirm`, from the command line or from the dashboard, stopped with `mandatory audit
+  execution phase could not be recorded` (exit `64`) before the engine ran, and nothing was uploaded.
+  A resync now writes the mandatory audit record like every other mutating command: operation
+  `resync`, the profile it addressed (`all` only when neither a name nor a default could be resolved,
+  which the command then refuses), and a terminal state of `succeeded` or `failed`. A test now fails the build
+  if a command calls `begin_mutation` without being on the audited list, or the reverse.
 - **Dashboard.** A top-bar chip counts the current problems on every page; failure toasts stay until
   dismissed; a stopped, untrusted or silent controller is an attention item (and a wedged controller no
   longer reads "All profiles healthy" in the widget); before the first read the cards say "Not read";
