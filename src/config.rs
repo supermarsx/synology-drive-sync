@@ -19,7 +19,7 @@ use thiserror::Error;
 use crate::cli::{
     AuthenticationArgs, CompareArg, ConnectionArgs, CredentialProfileArgs, DoctorArgs, DoctorLevel,
     LogFormat, LogLevel, NetworkArgs, OutputArgs, OutputFormat, ProgressMode, REMOTE_LOG_TOKEN_ENV,
-    RemoteLogMode, SafetyArgs, SyncArgs, SyncBehaviorArgs,
+    ReconcileArg, RemoteLogMode, SafetyArgs, SyncArgs, SyncBehaviorArgs,
 };
 
 const MAX_CONFIG_BYTES: usize = 1024 * 1024;
@@ -356,6 +356,19 @@ pub struct ResolvedSyncBehavior {
     /// a persisted unconditional re-upload would overwrite the whole destination on every
     /// scheduled run, with nothing in the configuration reading as destructive.
     pub force_resync: bool,
+    /// How post-run reconciliation proves content. Command line only: an operator escape hatch
+    /// and a test hook, never a profile key.
+    pub reconcile: ReconcileArg,
+    /// Untouched pairs reconciliation re-verifies live as a canary.
+    pub reconcile_canary: usize,
+    /// `--memory-budget`, in MiB. Command line only.
+    pub memory_budget_mib: Option<u64>,
+    /// `--pair-index`: where verified-pair evidence is kept. Command line only.
+    pub pair_index: Option<PathBuf>,
+    pub pair_index_refresh: bool,
+    pub pair_index_max_age_days: u32,
+    pub pair_index_canary: usize,
+    pub pair_index_cache_mib: u64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -799,6 +812,18 @@ fn resolve_behavior(
         // Never resolved from arguments or a profile. `resync` sets it on the settings it has
         // already planned and had confirmed; nothing else can reach it.
         force_resync: false,
+        reconcile: arguments.reconcile.unwrap_or_default(),
+        reconcile_canary: arguments
+            .reconcile_canary
+            .unwrap_or(synology_drive_sync::digest_evidence::DEFAULT_CANARY),
+        memory_budget_mib: arguments.memory_budget,
+        pair_index: arguments.pair_index.clone(),
+        pair_index_refresh: arguments.pair_index_refresh,
+        pair_index_max_age_days: arguments.pair_index_max_age.unwrap_or(30),
+        pair_index_canary: arguments
+            .pair_index_canary
+            .unwrap_or(synology_drive_sync::digest_evidence::DEFAULT_CANARY),
+        pair_index_cache_mib: arguments.pair_index_cache_mib.unwrap_or(8),
     })
 }
 
@@ -2248,6 +2273,14 @@ mod scope_and_force_tests {
             jobs: None,
             excludes: Vec::new(),
             scope: None,
+            reconcile: None,
+            reconcile_canary: None,
+            memory_budget: None,
+            pair_index: None,
+            pair_index_refresh: false,
+            pair_index_max_age: None,
+            pair_index_canary: None,
+            pair_index_cache_mib: None,
         }
     }
 

@@ -81,7 +81,7 @@
 
           <div v-if="mutationWarning" class="sdsync-banner sdsync-mutation-warning" role="alert">
             <div>
-              <strong>Saved, but it is not fully in effect</strong>
+              <strong>{{ mutationWarningTitle }}</strong>
               <span v-for="(warning, index) in mutationWarning" :key="index">{{ warning.text }}</span>
               <v-button type="border" display="icon-text" tooltip="Hide this notice. It returns if the next save has the same problem." @click="mutationWarning = null"><template #icon><action-icon name="close" /></template>Dismiss</v-button>
             </div>
@@ -556,6 +556,7 @@
                   <div><dt>Repository</dt><dd><a :href="aboutMetadata.repository" target="_blank" rel="noopener noreferrer">GitHub</a></dd></div>
                   <div><dt>License</dt><dd><a :href="aboutMetadata.licenseUrl" target="_blank" rel="noopener noreferrer">{{ aboutMetadata.license }}</a></dd></div>
                   <div><dt>Installed package version</dt><dd><code>{{ installedPackageVersion }}</code></dd></div>
+                  <div v-if="serviceEngineLabel"><dt>Service engine</dt><dd><code>{{ serviceEngineLabel }}</code></dd></div>
                   <div><dt>Core source version</dt><dd><code>{{ aboutMetadata.coreVersion }}</code></dd></div>
                   <div><dt>DSM UI build version</dt><dd><code>{{ aboutMetadata.uiVersion }}</code></dd></div>
                   <div><dt>API schema</dt><dd><code>{{ aboutMetadata.apiSchema }}</code></dd></div>
@@ -664,6 +665,7 @@ import {
   CONTROLLER_TICK_STALE_SECONDS,
   attentionItems as outcomeAttentionItems,
   cacheHealthNote,
+  engineLabel,
   failureKey as outcomeFailureKey,
   historyNote,
   normalizeOutcomes,
@@ -731,7 +733,7 @@ function profileOutcomeFor(name, outcomes, stale, nowSeconds, entries) {
   // A retained reading is dimmed (unknown); a token this window cannot read is a
   // warning, never the neutral colour of "nobody has looked".
   const shownLevel = stale ? (row.level !== "fail" ? "unknown" : row.level) : (row.level === "unknown" ? "warn" : row.level);
-  return { level: shownLevel, text: ["Last run: " + row.label, row.detail, row.age, stale ? "stale reading" : ""].filter(Boolean).join(" · ") };
+  return { level: shownLevel, text: ["Last run: " + row.label, row.detail, row.age, row.indexNote, stale ? "stale reading" : ""].filter(Boolean).join(" · ") };
 }
 // The package clock when the newest snapshot was generated. The snapshot object is frozen,
 // so the value that moves on every poll lives in snapshotGeneratedAt; a window that has not
@@ -1210,6 +1212,11 @@ const QUEUED_FAILURE_COPY = Object.freeze({
     title: "Queued operation reported nothing",
     cause: "The worker exited cleanly but wrote no result, so how far it got cannot be established from the queue.",
     next: "Treat this operation as unconfirmed. Review Activity and the current state before submitting it again."
+  }),
+  audit_unavailable: Object.freeze({
+    title: "Queued operation was refused: the audit log is unavailable",
+    cause: "The package could not reconcile its audit log, so it did not start this operation rather than run it unrecorded.",
+    next: "Nothing ran and nothing was changed. Review Logs for audit_reconcile_failed and its cause, then submit the request again once it has recovered."
   })
 });
 
@@ -1700,7 +1707,8 @@ const ABOUT_RUST_DEPENDENCIES = Object.freeze([
   { name: "apple-native-keyring-store", pin: "1.0.2", scope: "macOS", url: "https://crates.io/crates/apple-native-keyring-store" },
   { name: "libc", pin: "0.2.191", scope: "Linux", url: "https://crates.io/crates/libc" },
   { name: "nix", pin: "0.31.3", scope: "Linux", url: "https://crates.io/crates/nix" },
-  { name: "zbus-secret-service-keyring-store", pin: "1.0.1", scope: "Linux", url: "https://crates.io/crates/zbus-secret-service-keyring-store" }
+  { name: "zbus-secret-service-keyring-store", pin: "1.0.1", scope: "Linux", url: "https://crates.io/crates/zbus-secret-service-keyring-store" },
+  { name: "redb", pin: "4.4.0", scope: "Linux and macOS", url: "https://crates.io/crates/redb" }
 ]);
 const ABOUT_UI_DEPENDENCIES = Object.freeze([
   { name: "@babel/core", pin: "8.0.1", scope: "devDependency", url: "https://www.npmjs.com/package/@babel/core" },
@@ -1918,7 +1926,7 @@ const REALTIME_REASON_GUIDANCE = Object.freeze({
   source_missing: "The configured source path does not exist. Restore it, or point this routine's profile at a path that exists.",
   source_symlink: "The configured source path is a symlink. Point the profile at the real directory it targets.",
   watch_unavailable: "No native watcher is available: the package's own watcher failed its executable checks and no inotify-tools inotifywait was found. Polling continues to observe the source meanwhile; reinstall the package to restore native detection, and see realtime_watcher_command in the controller log.",
-  watch_setup_failed: "The native watcher failed to start, or stopped. The controller retries with a growing delay and stops after five failures; routine_watch_failed in the controller log names the cause. Fix it, then save this routine to try again.",
+  watch_setup_failed: "The native watcher failed to start, or stopped. The controller retries with a growing delay and stops after five failures; routine_watch_failed in the controller log names the cause. Fix it, then save this routine to try again. Under the daemon engine, a source too large to walk in time is given longer on each try, up to 30 minutes (the routine_backend lines for this profile in the controller log name it: walk_deadline_exceeded, or next_setup_deadline_seconds while arming) and, until a walk finishes, is synced whole at most every 15 minutes (or every poll interval if that is longer, up to an hour).",
   watch_limit: "The source has more directories than the inotify watch budget allows. Raise fs.inotify.max_user_watches (a root sysctl), or narrow the source. routine_watch_limit in the controller log gives the numbers. Until then the source is polled, which keeps its disks from hibernating.",
   watch_stopped: "A stopped native watcher was found and was replaced automatically. Inspect what is pausing it if this keeps happening.",
   poll_unreadable: "Part of the source could not be read during the last poll. Fix permissions on the unreadable subtree; the readable part is still observed.",
@@ -4453,6 +4461,16 @@ export default {
     // The package's own verdict on runs, or null for a package that reports
     // none. Null is never read as success: attentionItems says so.
     outcomes() { return normalizeOutcomes(this.snapshot && this.snapshot.outcomes); },
+    // "daemon" or "shell (fallback)" for the About page; "" for a package that reports no engine.
+    // A save committed beside a running sync is complete, only not yet in effect: it is headed
+    // by that, and the generic heading is kept for a save whose side effect really failed.
+    mutationWarningTitle() {
+      const list = Array.isArray(this.mutationWarning) ? this.mutationWarning : [];
+      return list.length && list.every((warning) => warning.code === "applies_next_run")
+        ? "Saved, takes effect on the next run"
+        : "Saved, but it is not fully in effect";
+    },
+    serviceEngineLabel() { return this.outcomes ? engineLabel(this.outcomes.engine) : ""; },
     // True once a poll has failed while an earlier snapshot is still on screen.
     // Every value derived from it is then history, not evidence.
     retainedStale() { return Boolean(this.snapshot) && !this.connected; },
@@ -4499,12 +4517,32 @@ export default {
       // A defect in this window while applying a good snapshot is shown for as long
       // as it lasts, not only in a six-second toast.
       if (this.applyError) items.push({ id: "ui-apply-error", level: "warn", title: "This window failed to apply part of the package status", detail: `${this.applyError}. The package itself answered.` });
+      if (this.controllerDegradedItem) items.push(this.controllerDegradedItem);
       items.push(...this.realtimeAttentionItems);
       return this.retainedStale
         ? [{ id: "stale-poll", level: "unknown", title: "Showing a stale reading", detail: `${this.freshness} Rows below are history, not current status.` }].concat(items)
         : items;
     },
     serviceAttentionItem() { return this.snapshot ? serviceAttentionItem(this.snapshot, this.serviceState, packageGeneratedEpoch(this)) : null; },
+    // H2: the service publishes `controller.degraded` while its audit log cannot be
+    // reconciled past the bound, when every queued dashboard operation is refused
+    // `audit_unavailable`. One amber item for as long as it lasts, gone on recovery.
+    controllerDegradedItem() {
+      const controller = this.snapshot && this.snapshot.controller;
+      const degraded = controller && typeof controller === "object" && !Array.isArray(controller) ? controller.degraded : null;
+      if (!degraded || typeof degraded !== "object" || Array.isArray(degraded)) return null;
+      const reason = boundedText(degraded.reason, "unknown");
+      const since = numberOr(degraded.since_epoch, 0);
+      const when = since > 0 ? `Since ${formatDate(since)}${this.nasTimeSuffix(since)}: ` : "";
+      const cause = boundedText(degraded.cause, "no cause was recorded");
+      if (reason === "audit_unavailable") {
+        return { id: "controller-audit-unavailable", level: "warn", title: "Dashboard operations are refused: the audit log cannot be reconciled", detail: `${when}${cause}. Saves, tests and other queued operations are answered "audit log unavailable" without running until it recovers. Review Logs for audit_reconcile_failed.` };
+      }
+      if (reason === "control_dir_unreadable") {
+        return { id: "controller-control-dir-unreadable", level: "warn", title: "The service cannot read the dashboard's request queue", detail: `${when}${cause}. Requests the dashboard submitted are not seen until it can. Review Logs for control_dir_unreadable.` };
+      }
+      return { id: `controller-degraded-${reason}`, level: "warn", title: `The sync service reports a degradation (${reason})`, detail: `${when}${cause}.` };
+    },
     // One amber item per enabled realtime routine whose native watcher is not in use,
     // named by its reason and carrying the same guidance as the routine editor.
     realtimeAttentionItems() {
@@ -6080,7 +6118,7 @@ export default {
     noteMutationWarning(warnings) {
       const list = Array.isArray(warnings) && warnings.length ? warnings : null;
       this.mutationWarning = list;
-      if (list) this.toast("Saved, but not fully in effect", list.map((warning) => warning.text).join(" "), true);
+      if (list) this.toast(list.every((warning) => warning.code === "applies_next_run") ? this.mutationWarningTitle : "Saved, but not fully in effect", list.map((warning) => warning.text).join(" "), true);
     },
     shownName(value) { return visibleText(typeof value === "string" ? value : String(value === undefined || value === null ? "" : value)); },
     scheduleSnapshot() {

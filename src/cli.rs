@@ -553,6 +553,59 @@ pub struct SyncBehaviorArgs {
         long_help = "Restrict the run to one SOURCE-relative path, naming either a folder (its whole subtree) or a single file. The path is relative to SOURCE: it is not absolute and not a pattern. Entries outside the scope are neither compared nor modified.\n\nMirror deletion is restricted to the scope as well: with --delete, only remote-only entries inside the scope are considered, never the rest of the destination. The deletion guards still apply and are evaluated against the scoped counts, so scope-mirroring a folder whose local contents were all removed still requires --allow-empty-source.\n\nBecause only the scope is scanned, the check for paths that differ only by letter case covers the scope alone. A scoped run cannot create a collision outside it, but a clean scoped result is not a whole-tree result.\n\nThis never implies --compare force. Scoping selects what is examined; it does not change how it is compared."
     )]
     pub scope: Option<String>,
+
+    /// How post-run reconciliation proves content (operator escape hatch, not a profile key).
+    ///
+    /// `carry` (the default) re-lists both sides in full, verifies live every path the run
+    /// touched plus a canary sample, and carries the plan pass's digests for untouched pairs whose
+    /// facts did not move. `full` re-verifies every pair live, as before.
+    #[arg(long, value_enum, hide = true, help_heading = "Sync")]
+    pub reconcile: Option<ReconcileArg>,
+
+    /// Untouched pairs reconciliation re-verifies live as a canary (default 25).
+    #[arg(long, value_name = "N", hide = true, help_heading = "Sync")]
+    pub reconcile_canary: Option<usize>,
+
+    /// Memory this run may use, in MiB, instead of what the kernel reports (CLI only).
+    ///
+    /// Linux reads the cgroup limit and `MemAvailable`; elsewhere the check is skipped unless this
+    /// is given. A tree whose estimated need exceeds the budget is refused by name
+    /// (`tree_too_large_for_memory`) before it is listed.
+    #[arg(long, value_name = "MIB", hide = true, help_heading = "Sync")]
+    pub memory_budget: Option<u64>,
+
+    /// Keep verified-pair evidence in DIRECTORY so unchanged files are not re-read every run.
+    #[arg(
+        long,
+        value_name = "DIRECTORY",
+        help_heading = "Sync",
+        long_help = "Keep a verified-pair index in DIRECTORY (one file per profile, `<profile>.redb`; a profile name over 64 characters is filed under its first 48 characters, a hyphen and 16 hex digits of the name's SHA-256). After a content comparison proves a pair equal with two live MD5s, the facts both sides had are stored with the digest: local size, modification and status-change time, device and inode; NAS size, modification, change and creation time. A later run whose fresh facts still match exactly on both sides takes the stored digest instead of reading the file and asking the NAS to read its copy, so a run where nothing changed costs the listing, not a read of the whole share on both sides.\n\nA stored digest only ever suppresses an upload. It is MD5-only, so no deletion guard and no server-side copy can use it, and it is never stored for a pair that differed. Every run re-verifies a canary sample live (--pair-index-canary); a disagreement discards the whole index, re-verifies everything live in the same run and is reported as pair-index-canary-mismatch. Evidence older than --pair-index-max-age is re-verified, spread across the second half of that window. Content comparison only, and Unix only: Windows exposes no status-change time to a directory walk.\n\nThe directory must be private (no group or other write access) and is claimed with a .sdsync-pair-index marker; a directory holding anything else is refused. Every way the index cannot be used (locked, corrupt, unsafe, a full disk) is a named warning and a fully live run, never a failed one. Off unless given."
+    )]
+    pub pair_index: Option<PathBuf>,
+
+    /// Ignore the stored evidence for this run and rebuild it from live digests.
+    #[arg(long, requires = "pair_index", help_heading = "Sync")]
+    pub pair_index_refresh: bool,
+
+    /// Re-verify stored evidence older than DAYS (default 30), spread across the second half.
+    #[arg(long, value_name = "DAYS", requires = "pair_index", value_parser = clap::value_parser!(u32).range(1..=3650), help_heading = "Sync")]
+    pub pair_index_max_age: Option<u32>,
+
+    /// Stored pairs re-verified live every run as a canary (default 25).
+    #[arg(long, value_name = "N", requires = "pair_index", help_heading = "Sync")]
+    pub pair_index_canary: Option<usize>,
+
+    /// The index's page cache, in MiB (default 8, at most 64).
+    #[arg(long, value_name = "MIB", requires = "pair_index", value_parser = clap::value_parser!(u64).range(1..=64), hide = true, help_heading = "Sync")]
+    pub pair_index_cache_mib: Option<u64>,
+}
+
+/// How post-run reconciliation proves content. See [`SyncBehaviorArgs::reconcile`].
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, ValueEnum)]
+pub enum ReconcileArg {
+    #[default]
+    Carry,
+    Full,
 }
 
 #[derive(Debug, Args)]

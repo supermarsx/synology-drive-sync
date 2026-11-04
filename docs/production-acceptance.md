@@ -581,14 +581,17 @@ UP() { # UP /share/folder local-file [extra curl -F options]
     - The probe prints the directory count against `max_user_watches`, `held_by_this_user` and the
       budget (80% of the limit), then each change it sees, and exits 0 when changes arrived, 1 when it
       was armed but nothing arrived, and prints a `refused:` line when it could not arm. A route that
-      produces no line is a route the realtime routine cannot see, which polling will still catch;
-      record which. Do this on every volume type in use (btrfs, ext4, an encrypted share, a USB share).
+      produces no line is a route the realtime routine cannot see. Polling still catches it: the shell engine's
+      polling floor, or the daemon's stat-only floor reading, which syncs the directory and logs
+      `watch_missed_change` (`routine_watch_notice`); record which routes need it. Do this on every volume type in use (btrfs, ext4, an encrypted share, a USB share).
     - Record `max_user_watches`, the directory count of the largest source and whether `watch_limit`
       appears. A limit below the budget needed is a root-only change (see
       [Raising the inotify watch limit](dsm/troubleshooting.md#raising-the-inotify-watch-limit));
       record the DSM build's default.
     - Also record the watcher's resident memory while the routine runs (`VmRSS` in `/proc/<pid>/status`
-      of the `--watch` process): about 6 MiB is expected at 20,000 directories and about 16 MiB at 100,000.
+      of the `--watch` process under the shell engine; under the daemon the watcher runs inside the
+      `sdsync-dsm-api --daemon` process, so compare that process before and after arming): about 6 MiB is
+      expected at 20,000 directories and about 16 MiB at 100,000.
 
 ## Acceptance record
 

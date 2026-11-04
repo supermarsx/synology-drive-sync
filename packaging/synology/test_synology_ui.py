@@ -463,6 +463,7 @@ class DsmUiContractTests(unittest.TestCase):
             'cfg(target_os = "windows")': "Windows",
             'cfg(target_os = "macos")': "macOS",
             'cfg(target_os = "linux")': "Linux",
+            "cfg(unix)": "Linux and macOS",
         }
         self.assertEqual(set(cargo["target"]), set(target_scopes))
         for target, target_values in cargo["target"].items():

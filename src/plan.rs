@@ -342,9 +342,33 @@ pub struct SyncPlan {
     /// ([`crate::api::ScopedRemoteInventory::link_guard_unchecked`]). Zero means the link guard ran
     /// everywhere it was needed; more is a lasting, named warning.
     pub link_guard_unchecked: usize,
+    /// What the verified-pair index did for this plan's digest pass, when one was asked for.
+    /// Not the planner's to know: the caller sets it (`--pair-index`).
+    pub pair_index: Option<crate::pair_index::IndexReport>,
 }
 
 impl SyncPlan {
+    /// A plan that does nothing, for a run refused before anything was compared.
+    pub fn nothing(source_root: PathBuf, scope: Scope, rules: IgnoreRules) -> Self {
+        Self {
+            source_root,
+            scope,
+            rules,
+            pre_deletes: Vec::new(),
+            creates: Vec::new(),
+            copies: Vec::new(),
+            uploads: Vec::new(),
+            post_deletes: Vec::new(),
+            renames: Vec::new(),
+            unchanged_files: 0,
+            protected_entries: 0,
+            upload_bytes: 0,
+            skipped: Vec::new(),
+            link_guard_unchecked: 0,
+            pair_index: None,
+        }
+    }
+
     pub fn delete_count(&self) -> usize {
         self.pre_deletes.len() + self.post_deletes.len()
     }
@@ -513,6 +537,21 @@ fn comparison_candidates(
     rules: &IgnoreRules,
     resolution: &Resolution,
 ) -> BTreeSet<String> {
+    comparison_candidates_spelled(local, remote, rules, resolution, None)
+}
+
+/// [`comparison_candidates`], recording into `spellings` the local relative of every selected
+/// pair whose local spelling differs from its remote one (a case or normalisation re-pair).
+///
+/// Only the differing ones are recorded: in the steady state there are none, and a map naming
+/// every pair would hold the whole tree's paths a third time.
+fn comparison_candidates_spelled(
+    local: &LocalInventory,
+    remote: &RemoteInventory,
+    rules: &IgnoreRules,
+    resolution: &Resolution,
+    mut spellings: Option<&mut BTreeMap<String, String>>,
+) -> BTreeSet<String> {
     let mut selected = BTreeSet::new();
     for local_entry in local.entries.values() {
         // Two empty files are identical by definition, so `compare_files` never asks for their
@@ -532,9 +571,46 @@ fn comparison_candidates(
             && !is_excluded_from_comparison(remote_entry, rules, &resolution.pairs)
         {
             selected.insert(remote_entry.relative.clone());
+            if let Some(spellings) = spellings.as_deref_mut()
+                && remote_entry.relative != local_entry.relative
+            {
+                spellings.insert(remote_entry.relative.clone(), local_entry.relative.clone());
+            }
         }
     }
     selected
+}
+
+/// The digest selections of [`select_plan_digests`], plus the local spelling of each comparison
+/// pair whose local relative differs from its remote one (keyed by the remote relative).
+///
+/// For a caller that must know exactly which local file each comparison digest is paired with:
+/// evidence carried or stored for a pair is only valid for the pairing it was taken under
+/// (perf-design §2.9, P2).
+pub fn select_plan_digests_paired(
+    local: &LocalInventory,
+    remote: &RemoteInventory,
+    rules: &IgnoreRules,
+    server_copy: bool,
+    delete: bool,
+    incomplete: &[String],
+) -> (BTreeSet<String>, BTreeSet<String>, BTreeMap<String, String>) {
+    let resolution = resolve(local, remote, rules, delete, Vec::new());
+    let mut spellings = BTreeMap::new();
+    let comparison =
+        comparison_candidates_spelled(local, remote, rules, &resolution, Some(&mut spellings));
+    let strong = strong_candidates(
+        local,
+        remote,
+        rules,
+        &StrongSelection {
+            server_copy,
+            delete,
+            incomplete,
+        },
+        &resolution,
+    );
+    (comparison, strong, spellings)
 }
 
 /// Select the remote files whose digest guards a mutation and must therefore be strong.
@@ -751,6 +827,7 @@ pub fn build_plan(
         upload_bytes: 0,
         skipped,
         link_guard_unchecked: 0,
+        pair_index: None,
     };
     let pairs = &resolution.pairs;
     let shield = &resolution.shield;
@@ -2849,6 +2926,7 @@ mod tests {
                             size: *size,
                             mtime_ms: *mtime_ms,
                             identity: Default::default(),
+                            times: Default::default(),
                             content_md5: None,
                         },
                     )
@@ -2872,6 +2950,9 @@ mod tests {
                             kind: *kind,
                             size: *size,
                             mtime_seconds: *mtime_seconds,
+                            ctime_seconds: None,
+                            crtime_seconds: None,
+                            digest_nas_time: None,
                             mount_point_type: None,
                             content_md5: None,
                         },
@@ -5090,6 +5171,7 @@ mod status_tests {
                             size: *size,
                             mtime_ms: *mtime_ms,
                             identity: Default::default(),
+                            times: Default::default(),
                             content_md5: None,
                         },
                     )
@@ -5113,6 +5195,9 @@ mod status_tests {
                             kind: *kind,
                             size: *size,
                             mtime_seconds: *mtime_seconds,
+                            ctime_seconds: None,
+                            crtime_seconds: None,
+                            digest_nas_time: None,
                             mount_point_type: None,
                             content_md5: None,
                         },
@@ -5350,6 +5435,7 @@ mod status_tests {
             size: 10,
             mtime_ms: 5_000,
             identity: Default::default(),
+            times: Default::default(),
             content_md5: None,
         };
         let identical_remote = RemoteEntry {
@@ -5358,6 +5444,9 @@ mod status_tests {
             kind: EntryKind::File,
             size: 10,
             mtime_seconds: 5,
+            ctime_seconds: None,
+            crtime_seconds: None,
+            digest_nas_time: None,
             mount_point_type: None,
             content_md5: None,
         };
@@ -6099,6 +6188,7 @@ mod scoped_deletion_tests {
                             size: *size,
                             mtime_ms: *mtime_ms,
                             identity: Default::default(),
+                            times: Default::default(),
                             content_md5: None,
                         },
                     )
@@ -6122,6 +6212,9 @@ mod scoped_deletion_tests {
                             kind: *kind,
                             size: *size,
                             mtime_seconds: *mtime_seconds,
+                            ctime_seconds: None,
+                            crtime_seconds: None,
+                            digest_nas_time: None,
                             mount_point_type: None,
                             content_md5: None,
                         },
@@ -6276,6 +6369,7 @@ mod resync_ticket_tests {
                 size,
                 mtime_ms: 1_000,
                 identity: Default::default(),
+                times: Default::default(),
                 content_md5: None,
             },
             remote_path: format!("/share/root/{relative}"),
@@ -6303,6 +6397,7 @@ mod resync_ticket_tests {
             upload_bytes,
             skipped: Vec::new(),
             link_guard_unchecked: 0,
+            pair_index: None,
         }
     }
 

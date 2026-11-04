@@ -23,8 +23,8 @@ Usage:
   sdsync-dsm configure-routine --profile NAME [options] | remove-routine NAME
   sdsync-dsm doctor [NAME|--all] [--write-test]
   sdsync-dsm resync [NAME] [--scope PATH] [--confirm TICKET]
-  sdsync-dsm plan [NAME|--all] [--allow-delete] [--max-total-delete N]
-  sdsync-dsm run [NAME|--all] [--allow-delete] [--max-total-delete N]
+  sdsync-dsm plan [NAME|--all] [--allow-delete] [--max-total-delete N] [--no-wait|--wait-seconds S]
+  sdsync-dsm run [NAME|--all] [--allow-delete] [--max-total-delete N] [--no-wait|--wait-seconds S]
   sdsync-dsm enable [--interval SECONDS] [--allow-delete] [--max-total-delete N]
   sdsync-dsm disable | status | logs [LINES] | paths
   sdsync-dsm api snapshot | logs --lines N | activity --lines N
@@ -72,6 +72,13 @@ configure-alerts options:
   --system-log-message-id 0xHHHHHHHH     (identifier from DSM's own system-log
                                           catalogue, verified on your DSM build)
 
+plan and run: under the daemon engine (the default) the sync daemon runs
+them. The command waits for the run and exits with its exit status (0, 3
+partial, 1 ...); --wait-seconds S bounds the wait (1..86400, default 86400),
+after which the run goes on and the command exits 75; --no-wait returns once
+the run is queued. Under the shell engine the runner runs in the foreground
+and the two options are ignored.
+
 REMOTE is your chosen File Station logical path, for example
 /home/Drive/Backups or /TeamShare/Backups. It is never a /volumeN path.
 
@@ -99,6 +106,10 @@ valid_new_name() {
 }
 
 manager_lock_acquired=false
+run_scope_file=$runtime_root/run.scope
+daemon_run_note=
+daemon_run_guard_profile=
+secret_preread=false
 policy_execution_lock_acquired=false
 mutation_commit_started=false
 tty_active=false
@@ -374,6 +385,31 @@ complete_security_policy_arguments() {
 }
 
 begin_mutation() {
+    begin_identity "$@"
+    acquire_private_process_lock "$management_lock" || {
+        manager_lock_status=$?
+        if [ "$manager_lock_status" -eq 75 ]; then
+            echo "another package-management operation is active" >&2
+        else
+            echo "cannot acquire the private package-manager lock" >&2
+        fi
+        exit "$manager_lock_status"
+    }
+    manager_lock_acquired=true
+    begin_admitted "$@"
+}
+
+# What a read-only command (Doctor without a write test, a resync that only
+# plans) needs from begin_mutation without management.lock: holding it made
+# every save and every run refuse for as long as Doctor took. Identity,
+# admission, the security policy and the mandatory audit are unchanged, and so
+# is the refusal beside a shell-runner run.
+begin_operation() {
+    begin_identity "$@"
+    begin_admitted "$@"
+}
+
+begin_identity() {
     require_package_identity || {
         echo "retry with: sudo -u synology-drive-sync -- $manager ..." >&2
         exit 77
@@ -394,16 +430,9 @@ begin_mutation() {
             }
             ;;
     esac
-    acquire_private_process_lock "$management_lock" || {
-        manager_lock_status=$?
-        if [ "$manager_lock_status" -eq 75 ]; then
-            echo "another package-management operation is active" >&2
-        else
-            echo "cannot acquire the private package-manager lock" >&2
-        fi
-        exit "$manager_lock_status"
-    }
-    manager_lock_acquired=true
+}
+
+begin_admitted() {
     trap cleanup_manager_lock 0
     trap manager_signal HUP INT TERM
     direct_transition_state=$(package_transition_status) || {
@@ -454,7 +483,7 @@ begin_mutation() {
             configure-profile|remove-profile|set-default|configure-routine|remove-routine|\
             set-password|set-totp|set-remote-log-token|remove-password|remove-totp|\
             remove-remote-log-token|enable|disable|set-schedule|configure-alerts|\
-            configure-performance|configure-security-policy|doctor|resync)
+            configure-performance|configure-security-policy|doctor|resync|plan|run)
                 case $command_name in
                     configure-routine) direct_audit_operation=routine ;;
                     set-schedule|enable|disable) direct_audit_operation=schedule ;;
@@ -478,11 +507,12 @@ begin_mutation() {
                         valid_name "${1:-}" && direct_audit_profile=$1
                         ;;
                     resync)
-                        # The named profile, else the default the command will
-                        # resolve; all only when neither can be resolved, in which
-                        # case the command refuses and the record ends failed.
+                        # The named profile; the default only when no name was
+                        # given at all. A name that is given and invalid is
+                        # refused by the command, so the record names none
+                        # (all) rather than a default it never acted on.
                         resolved_resync_profile=$(resync_named_profile "$@")
-                        if ! valid_name "$resolved_resync_profile"; then
+                        if [ -z "$resolved_resync_profile" ]; then
                             resolved_resync_profile=$(current_default_for_action 2>/dev/null || true)
                         fi
                         if valid_name "$resolved_resync_profile"; then
@@ -494,6 +524,14 @@ begin_mutation() {
                         case $resolved_doctor_audit_scope in
                             all) direct_audit_profile=all ;;
                             *) valid_name "$resolved_doctor_audit_scope" && direct_audit_profile=$resolved_doctor_audit_scope ;;
+                        esac
+                        ;;
+                    plan|run)
+                        # Only under the daemon engine (forward_run_to_daemon);
+                        # the shell runner audits its own runs.
+                        case ${selected_scope:-} in
+                            all) direct_audit_profile=all ;;
+                            *) valid_name "${selected_scope:-}" && direct_audit_profile=$selected_scope ;;
                         esac
                         ;;
                 esac
@@ -522,17 +560,222 @@ begin_mutation() {
         73) echo "security policy is not a private complete document" >&2; exit 73 ;;
         *) echo "operation is disabled by the current security policy" >&2; exit 77 ;;
     esac
+    case ${command_name:-} in plan|run) return 0 ;; esac
     opposing_run_status=0
     private_process_lock_is_live "$run_lock" || opposing_run_status=$?
     if [ "$opposing_run_status" -eq 0 ]; then
             active_run=$lock_owner_pid
-            echo "cannot change profiles, credentials, or schedule while PID $active_run is planning/syncing" >&2
-            exit 75
+            if ! read_daemon_run_scope "$lock_owner_pid" "$lock_owner_start" "$lock_owner_boot"; then
+                echo "cannot change profiles, credentials, or schedule while PID $active_run is planning/syncing" >&2
+                exit 75
+            fi
+            daemon_run_admission "$@"
+            return 0
     fi
     [ "$opposing_run_status" -eq 1 ] || {
         echo "cannot validate the private run lock" >&2
         exit 73
     }
+}
+
+# A daemon run names the profiles it covers in run.scope, beside run.lock (the
+# lock directory admits no entry but `pid`): the pid, start time and boot id of
+# the run.lock owner, then `profiles=a,b`. It is trusted only while it names
+# the live run.lock owner exactly. Anything else is the shell runner's run, or a
+# scope that cannot be proven, and keeps the whole-package refusal; a file that
+# is there but unusable says why, so the refusal is never unexplained.
+# Sets daemon_run_profiles on success.
+read_daemon_run_scope() {
+    daemon_run_profiles=
+    run_scope_expected="$1:$2:$3"
+    [ -e "$run_scope_file" ] || [ -L "$run_scope_file" ] || return 1
+    run_scope_cause=
+    run_scope_line_count=0
+    run_scope_pid= run_scope_start= run_scope_boot= run_scope_list=
+    if [ -L "$run_scope_file" ]; then
+        run_scope_cause="it is a symlink"
+    elif [ ! -f "$run_scope_file" ]; then
+        run_scope_cause="it is not a regular file"
+    else
+        run_scope_metadata=$(stat -c '%u:%a:%h:%s' "$run_scope_file" 2>/dev/null) || run_scope_metadata=
+        run_scope_uid=${run_scope_metadata%%:*}
+        run_scope_rest=${run_scope_metadata#*:}
+        run_scope_mode=${run_scope_rest%%:*}
+        run_scope_rest=${run_scope_rest#*:}
+        run_scope_links=${run_scope_rest%%:*}
+        run_scope_size=${run_scope_rest#*:}
+        case $run_scope_uid:$run_scope_mode:$run_scope_links:$run_scope_size in
+            *[!0-9:]*|:*|*::*|*:) run_scope_cause="its metadata cannot be read" ;;
+        esac
+        if [ -n "$run_scope_cause" ]; then
+            :
+        elif [ -z "$path_owner" ] || [ "$run_scope_uid" != "$path_owner" ]; then
+            run_scope_cause="it is owned by uid $run_scope_uid, not the package uid ${path_owner:-unknown}"
+        elif [ "$run_scope_mode" != 600 ]; then
+            run_scope_cause="mode $run_scope_mode, not 600"
+        elif [ "$run_scope_links" != 1 ]; then
+            run_scope_cause="it has $run_scope_links hard links"
+        elif [ "$run_scope_size" -gt 4096 ]; then
+            run_scope_cause="it is $run_scope_size bytes, over 4096"
+        elif [ ! -r "$run_scope_file" ]; then
+            run_scope_cause="it cannot be read"
+        else
+            run_scope_line=
+            while IFS= read -r run_scope_line || [ -n "$run_scope_line" ]; do
+                run_scope_line_count=$((run_scope_line_count + 1))
+                case $run_scope_line_count in
+                    1) run_scope_pid=$run_scope_line ;;
+                    2) run_scope_start=$run_scope_line ;;
+                    3) run_scope_boot=$run_scope_line ;;
+                    4) run_scope_list=$run_scope_line ;;
+                    *) break ;;
+                esac
+                run_scope_line=
+            done < "$run_scope_file" || run_scope_cause="it cannot be read"
+        fi
+    fi
+    if [ -z "$run_scope_cause" ]; then
+        if [ "$run_scope_line_count" -ne 4 ]; then
+            run_scope_cause="it has $run_scope_line_count lines, not 4"
+        elif ! is_pid "$run_scope_pid"; then
+            run_scope_cause="line 1 is not a PID"
+        else
+            case $run_scope_start in
+                ''|*[!0-9]*|0) run_scope_cause="line 2 is not a process start time" ;;
+            esac
+        fi
+    fi
+    if [ -z "$run_scope_cause" ] && ! valid_boot_identity "$run_scope_boot"; then
+        run_scope_cause="line 3 is not a boot id"
+    fi
+    if [ -z "$run_scope_cause" ]; then
+        case $run_scope_list in
+            profiles=?*) run_scope_list=${run_scope_list#profiles=} ;;
+            *) run_scope_cause="line 4 is not profiles=NAME[,NAME...]" ;;
+        esac
+    fi
+    if [ -z "$run_scope_cause" ]; then
+        run_scope_remaining=$run_scope_list
+        while :; do
+            run_scope_profile=${run_scope_remaining%%,*}
+            valid_name "$run_scope_profile" || {
+                run_scope_cause="line 4 names an invalid profile"
+                break
+            }
+            [ "$run_scope_remaining" != "$run_scope_profile" ] || break
+            run_scope_remaining=${run_scope_remaining#*,}
+        done
+    fi
+    if [ -z "$run_scope_cause" ] \
+        && [ "$run_scope_pid:$run_scope_start:$run_scope_boot" != "$run_scope_expected" ]; then
+        run_scope_cause="it does not name the run.lock owner (it names PID $run_scope_pid start $run_scope_start boot $run_scope_boot; the owner is PID $1 start $2 boot $3)"
+    fi
+    if [ -n "$run_scope_cause" ]; then
+        echo "run.scope ignored: $run_scope_cause ($run_scope_file)" >&2
+        return 1
+    fi
+    daemon_run_profiles=$run_scope_list
+}
+
+daemon_run_covers() {
+    case ,$daemon_run_profiles, in *,"$1",*) return 0 ;; esac
+    return 1
+}
+
+# Exit 75 like every busy refusal, with a prefix the dashboard and the daemon
+# can tell from the whole-package one.
+refuse_profile_running() {
+    echo "profile_running: profile $1 is syncing now; $2 is refused while it runs$3; retry after the run" >&2
+    exit 75
+}
+
+# A daemon run of daemon_run_profiles is live and named. Refuse only what would
+# change or remove what that run is using; everything else commits, and its
+# output says that it applies to the next run (end_mutation prints the note).
+daemon_run_admission() {
+    daemon_run_note=
+    daemon_run_guard_profile=
+    daemon_run_first=${daemon_run_profiles%%,*}
+    case ${command_name:-} in
+        remove-profile|set-default|remove-routine|remove-password|remove-totp|remove-remote-log-token)
+            # A removed fragment, default or routine would be read by the
+            # run's own post-run writers; a removed credential by the core's
+            # next re-authentication mid-run.
+            if valid_name "${1:-}" && daemon_run_covers "$1"; then
+                refuse_profile_running "$1" "$command_name" ""
+            fi
+            case $command_name in set-default|remove-routine) daemon_run_note=global ;; esac
+            ;;
+        configure-profile)
+            # Compared with the stored fragment in configure_profile, once the
+            # requested values are canonical.
+            if daemon_run_covers "$resolved_direct_audit_profile"; then
+                daemon_run_guard_profile=$resolved_direct_audit_profile
+                daemon_run_note=$resolved_direct_audit_profile
+            fi
+            ;;
+        set-password|set-totp|set-remote-log-token)
+            if valid_name "${1:-}" && daemon_run_covers "$1"; then daemon_run_note=$1; fi
+            ;;
+        configure-routine)
+            if daemon_run_covers "$resolved_direct_audit_profile"; then
+                daemon_run_note=$resolved_direct_audit_profile
+            else
+                daemon_run_note=global
+            fi
+            ;;
+        enable|disable|set-schedule|configure-alerts|configure-performance|configure-security-policy)
+            daemon_run_note=global
+            ;;
+        resync)
+            # A plan changes nothing. A confirmed resync re-uploads, and must
+            # not run beside a sync of any profile.
+            case " $* " in *" --confirm "*) ;; *) return 0 ;; esac
+            daemon_run_resync_profile=${resolved_resync_profile:-}
+            valid_name "$daemon_run_resync_profile" || daemon_run_resync_profile=default
+            if daemon_run_covers "$daemon_run_resync_profile"; then
+                refuse_profile_running "$daemon_run_resync_profile" resync ""
+            fi
+            refuse_profile_running "$daemon_run_first" "resync of profile $daemon_run_resync_profile" \
+                " (a confirmed resync re-uploads and never runs beside a sync)"
+            ;;
+        doctor)
+            # A Doctor that only reads refuses nothing. A write test writes
+            # into the destination the run is syncing.
+            case " $* " in *" --write-test "*) ;; *) return 0 ;; esac
+            case ${resolved_doctor_audit_scope:-} in
+                all) refuse_profile_running "$daemon_run_first" "doctor --write-test" " (all profiles were selected)" ;;
+                *)
+                    if daemon_run_covers "${resolved_doctor_audit_scope:-}"; then
+                        refuse_profile_running "$resolved_doctor_audit_scope" "doctor --write-test" ""
+                    fi
+                    ;;
+            esac
+            ;;
+    esac
+}
+
+# The fields that decide what a profile syncs and where to, and what it may
+# delete there. The running core holds them in memory: a save mid-run would not
+# reach it, and the run's recorded outcome would be filed against the new
+# settings. Printed as a comma list of the keys that differ.
+daemon_run_identity_changes() {
+    identity_new=$1
+    identity_current=$2
+    identity_changed=
+    for identity_key in source remote url username compare excludes delete allow-empty-source max-delete; do
+        identity_new_line=$(LC_ALL=C sed -n "/^$identity_key = /{p;q;}" "$identity_new" 2>/dev/null) \
+            || identity_new_line=
+        identity_current_line=
+        if [ -f "$identity_current" ] && [ ! -L "$identity_current" ]; then
+            identity_current_line=$(LC_ALL=C sed -n "/^$identity_key = /{p;q;}" "$identity_current" 2>/dev/null) \
+                || identity_current_line=
+        fi
+        if [ -z "$identity_current_line" ] || [ "$identity_new_line" != "$identity_current_line" ]; then
+            identity_changed=${identity_changed:+$identity_changed, }$identity_key
+        fi
+    done
+    printf '%s\n' "$identity_changed"
 }
 
 end_mutation() {
@@ -545,6 +788,16 @@ end_mutation() {
     fi
     cleanup_manager_lock
     trap - 0 HUP INT TERM
+    # Committed beside a daemon run: say that the run in flight keeps what it
+    # started with. Last on stderr, which is the line the daemon reports, and
+    # `api` turns it into the result's warning.
+    if [ "$direct_audit_result" = succeeded ]; then
+        case ${daemon_run_note:-} in
+            '') ;;
+            global) echo "note: a sync is running; this change takes effect on the next run" >&2 ;;
+            *) echo "note: profile $daemon_run_note is syncing now; this change takes effect on its next run" >&2 ;;
+        esac
+    fi
     # The change is committed and audited as such; what failed is applying it
     # to the running controller, and that has its own status so no caller can
     # read the save as in effect. `api` maps it to a result warning.
@@ -1119,6 +1372,11 @@ configure_profile() {
         printf 'log-file = "%s"\nprogress = "%s"\noutput = "%s"\n' "$log_file" "$progress" "$output"
     } > "$fragment_temp"
     finish_private_file "$fragment_temp"
+    if [ "$daemon_run_guard_profile" = "$profile_name" ]; then
+        identity_changes=$(daemon_run_identity_changes "$fragment_temp" "$profiles_dir/$profile_name.toml")
+        [ -z "$identity_changes" ] || refuse_profile_running "$profile_name" configure-profile \
+            " (it would change $identity_changes; its other settings can be saved now)"
+    fi
     if [ "$make_default" = true ]; then
         selected_default=$profile_name
     else
@@ -1135,16 +1393,172 @@ configure_profile() {
     echo "next: set its password, run doctor, review plan, then enable the schedule"
 }
 
-read_secret() {
-    secret_label=$1
-    source_path=${2:-}
-    if [ -n "$source_path" ]; then
-        if [ ! -f "$source_path" ] || [ -L "$source_path" ] || [ ! -r "$source_path" ]; then
-            die "$secret_label source is not a readable non-symlink file"
+# The pair index is named by a stem (src/pair_index_redb.rs file_stem): the
+# profile name itself up to 64 characters, longer ones their first 48 characters,
+# a dash and the first 16 hex digits of the SHA-256 of the whole name. A profile
+# name is [A-Za-z0-9_-], so characters and bytes agree. Sets pair_index_stem_value,
+# or returns 1 with pair_index_stem_cause; never a glob on the prefix, which
+# could match another long profile's index.
+pair_index_stem() {
+    pair_index_stem_value=
+    pair_index_stem_cause=
+    stem_name=$1
+    if [ "${#stem_name}" -le 64 ]; then
+        pair_index_stem_value=$stem_name
+        return 0
+    fi
+    command -v sha256sum >/dev/null 2>&1 || {
+        pair_index_stem_cause="sha256sum is not available"
+        return 1
+    }
+    stem_hash=$(printf '%s' "$stem_name" | sha256sum 2>/dev/null) || {
+        pair_index_stem_cause="sha256sum failed"
+        return 1
+    }
+    stem_hash=$(printf '%s' "$stem_hash" | cut -c1-16)
+    case $stem_hash in ''|*[!0-9a-f]*)
+        pair_index_stem_cause="sha256sum printed no digest"
+        return 1
+        ;;
+    esac
+    stem_prefix=$(printf '%s' "$stem_name" | cut -c1-48)
+    pair_index_stem_value=$stem_prefix-$stem_hash
+}
+
+# State the profile's own runs left beside its configuration: the alert counter
+# (never removed before, so a profile recreated under the name inherited its
+# failure streak), the verified-pair index, its quarantined copies and its panic
+# record (by the stem above), and the daemon's lasting condition. The
+# configuration is already gone by now, so one that cannot be removed does not
+# undo the removal: it is named with its path and cause as a warning, which
+# `api` returns as the result's warning.
+remove_profile_leftovers() {
+    leftover_profile=$1
+    set -- "$state_root/alerts-$leftover_profile.state" "$state_root/lasting/$leftover_profile.state"
+    if pair_index_stem "$leftover_profile"; then
+        set -- "$@" "$cache_root/pairs/$pair_index_stem_value.redb" \
+            "$cache_root/pairs/$pair_index_stem_value.redb.corrupt-"* \
+            "$cache_root/pairs/$pair_index_stem_value.redb.panicked"
+    else
+        echo "warning: the pair index files of profile $leftover_profile in $cache_root/pairs were not removed: $pair_index_stem_cause" >&2
+    fi
+    for leftover_path in "$@"; do
+        [ -e "$leftover_path" ] || [ -L "$leftover_path" ] || continue
+        leftover_parent=${leftover_path%/*}
+        if [ -L "$leftover_parent" ]; then
+            echo "warning: $leftover_path was not removed: $leftover_parent is a symlink" >&2
+            continue
         fi
-        IFS= read -r secret_value < "$source_path" || true
-    elif [ -t 0 ]; then
-        printf '%s: ' "$secret_label" >&2
+        leftover_error=$(rm -f -- "$leftover_path" 2>&1) && continue
+        echo "warning: $leftover_path was not removed: $(one_safe_line "${leftover_error:-rm failed}")" >&2
+    done
+}
+
+# The engine the lifecycle runs, by its grammar (scripts/common
+# resolve_service_engine): absent or `daemon` is the daemon, `shell` the shell
+# engine, anything else the daemon, named on stderr.
+manager_service_engine() {
+    manager_engine=daemon
+    manager_engine_file=$state_root/engine
+    [ -e "$manager_engine_file" ] || [ -L "$manager_engine_file" ] || return 0
+    manager_engine_size=
+    manager_engine_text=
+    if [ -f "$manager_engine_file" ] && [ ! -L "$manager_engine_file" ]; then
+        manager_engine_size=$(wc -c 2>/dev/null < "$manager_engine_file" | tr -d ' ')
+        manager_engine_text=$(head -c 64 "$manager_engine_file" 2>/dev/null) || manager_engine_text=
+    fi
+    case $manager_engine_text:$manager_engine_size in
+        daemon:6|daemon:7) ;;
+        shell:5|shell:6) manager_engine=shell ;;
+        *) echo "warning: $manager_engine_file is not daemon or shell; the daemon engine runs" >&2 ;;
+    esac
+}
+
+# A script that ran `sdsync-dsm run` read the sync's own exit status. The run
+# the daemon queued is waited for, and its own exit becomes this command's.
+# A wait that ends first is not an outcome: the run goes on, and that is 75.
+wait_for_daemon_run() {
+    waited_id=$1
+    wait_status=0
+    wait_reply=$("$api_bridge" --ctl wait "id=$waited_id" "wait_s=$run_wait_seconds" \
+        --home "$package_home" --var "$package_var" 2>&1) || wait_status=$?
+    wait_field() {
+        printf '%s\n' "$wait_reply" | sed -n "s/.*\"$1\":\"\\([^\"]*\\)\".*/\\1/p" | sed -n '1p'
+    }
+    wait_exit=$(printf '%s\n' "$wait_reply" | sed -n 's/.*"exit":\(-\{0,1\}[0-9][0-9]*\).*/\1/p' | sed -n '1p')
+    case $wait_reply in
+        *'"finished":true'*)
+            wait_outcome=$(wait_field outcome)
+            wait_reason=$(wait_field reason)
+            wait_detail=$(wait_field detail)
+            case $wait_exit in
+                ''|-*) wait_code=1 ;;
+                *) if [ "$wait_exit" -le 255 ] 2>/dev/null; then wait_code=$wait_exit; else wait_code=1; fi ;;
+            esac
+            echo "run $waited_id finished: ${wait_outcome:-unknown}${wait_reason:+ ($wait_reason)}, exit ${wait_exit:-unknown}${wait_detail:+: $(one_safe_line "$wait_detail")}"
+            exit "$wait_code"
+            ;;
+    esac
+    wait_code_name=$(wait_field code)
+    case $wait_status:$wait_code_name in
+        *:wait_timeout|75:*)
+            echo "run $waited_id has not finished within $run_wait_seconds s; it goes on: follow it with \`sdsync-dsm status\`" >&2
+            exit 75
+            ;;
+        69:*)
+            echo "lost contact with the sync service while waiting for run $waited_id; the run may go on: follow it with \`sdsync-dsm status\`" >&2
+            exit 75
+            ;;
+    esac
+    echo "the outcome of run $waited_id cannot be told: ${wait_code_name:-unanswered}$( [ -z "$wait_reply" ] || printf ' (%s)' "$(one_safe_line "$wait_reply")")" >&2
+    exit 73
+}
+
+# Under the daemon engine a plan or run is the daemon's to execute: one run
+# slot, its watchdog, one owner of run.lock. The shell runner would run the
+# core beside it, so it is never the fallback: a daemon that does not answer
+# is a refusal that says so. The request is audited here (the runner audited
+# its own); the run's outcome arrives through run.state and Activity.
+forward_run_to_daemon() {
+    begin_operation "$@"
+    [ "$security_runtime_allow_operational_actions" = true ] \
+        || policy_denied "security policy blocks interactive doctor, plan, and run actions"
+    if ! "$api_bridge" --ctl ping --home "$package_home" --var "$package_var" >/dev/null 2>&1; then
+        echo "the sync service is not running: the daemon engine runs plans and runs, and it does not answer; start the package" >&2
+        exit 75
+    fi
+    set -- "$api_bridge" --ctl run "scope=$selected_scope" "action=$run_mode" \
+        "allow_delete=$allow_selected_delete"
+    [ "$selected_scope" != all ] || set -- "$@" "max_total_delete=$selected_max_total"
+    set -- "$@" --home "$package_home" --var "$package_var"
+    mark_mutation_commit_started || die "mandatory audit execution phase could not be recorded"
+    forward_status=0
+    forward_reply=$("$@" 2>&1) || forward_status=$?
+    forward_reply_line=$(one_safe_line "$forward_reply")
+    forward_id=$(printf '%s\n' "$forward_reply" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p' | sed -n '1p')
+    if [ "$forward_status" -eq 0 ] && [ -n "$forward_id" ]; then
+        echo "queued as run $forward_id: $command_name of $selected_scope; its outcome is recorded in run.state and Activity"
+        end_mutation succeeded
+        [ "${run_wait:-false}" = true ] || exit 0
+        wait_for_daemon_run "$forward_id"
+    fi
+    forward_code=$(printf '%s\n' "$forward_reply" | sed -n 's/.*"code":"\([a-z_]*\)".*/\1/p' | sed -n '1p')
+    case $forward_status:$forward_code in
+        69:*) forward_exit=75; forward_cause="the sync service is not running (it stopped answering)" ;;
+        75:*|*:stopping|*:busy|*:profile_running) forward_exit=75; forward_cause=${forward_code:-busy} ;;
+        *:scope_not_found) forward_exit=66; forward_cause=$forward_code ;;
+        0:*) forward_exit=73; forward_cause="the sync service accepted the request without naming its run" ;;
+        *) forward_exit=1; forward_cause=${forward_code:-refused} ;;
+    esac
+    echo "the sync service did not queue the $command_name of $selected_scope: $forward_cause${forward_reply_line:+ ($forward_reply_line)}" >&2
+    end_mutation failed
+    exit "$forward_exit"
+}
+
+read_secret_input() {
+    secret_extra_line=false
+    if [ -t 0 ]; then
+        printf '%s: ' "$1" >&2
         saved_tty=$(stty -g)
         stty -echo
         tty_active=true
@@ -1155,9 +1569,50 @@ read_secret() {
         if [ "${SDSYNC_DSM_EXACT_SECRET_INPUT:-false}" = true ]; then
             unexpected_secret_line=
             if IFS= read -r unexpected_secret_line || [ -n "$unexpected_secret_line" ]; then
-                unset unexpected_secret_line secret_value
-                die "$secret_label input must contain exactly one line"
+                unset unexpected_secret_line
+                secret_extra_line=true
             fi
+        fi
+    fi
+}
+
+# A person typing a secret at the prompt used to hold management.lock for as
+# long as the prompt waited, and every run refused 75 meanwhile. When the
+# command line is one an existing profile's set-* would accept, the value is
+# read first, with the same tty handling and signal cleanup; anything else is
+# left to fail exactly where it did, under the lock.
+preread_secret() {
+    secret_preread=false
+    [ "$#" -eq 1 ] && valid_name "$1" || return 0
+    require_package_identity >/dev/null 2>&1 || return 0
+    profile_exists "$1" || return 0
+    case $command_name in
+        set-password) preread_label='DSM password' ;;
+        set-totp) preread_label='DSM Base32 TOTP seed or otpauth URI' ;;
+        *) preread_label='remote log bearer token' ;;
+    esac
+    trap cleanup_manager_lock 0
+    trap manager_signal HUP INT TERM
+    read_secret_input "$preread_label"
+    secret_preread=true
+}
+
+read_secret() {
+    secret_label=$1
+    source_path=${2:-}
+    if [ -n "$source_path" ]; then
+        if [ ! -f "$source_path" ] || [ -L "$source_path" ] || [ ! -r "$source_path" ]; then
+            die "$secret_label source is not a readable non-symlink file"
+        fi
+        IFS= read -r secret_value < "$source_path" || true
+    else
+        # Read before the management lock (preread_secret) when it could be;
+        # every check on the value still happens here, under the lock.
+        [ "$secret_preread" = true ] || read_secret_input "$secret_label"
+        secret_preread=false
+        if [ "$secret_extra_line" = true ]; then
+            unset secret_value
+            die "$secret_label input must contain exactly one line"
         fi
     fi
     [ -n "${secret_value:-}" ] || die "$secret_label cannot be empty"
@@ -2478,6 +2933,10 @@ api_capture_or_error() {
     api_capture "$api_exact_secret" "$@"
     api_warning_code=
     api_warning=
+    api_note=
+    if [ "$api_exit" -eq 0 ] || [ "$api_exit" -eq 76 ]; then
+        api_next_run_note
+    fi
     if [ "$api_exit" -eq 76 ] && [ "$api_exact_secret" = false ]; then
         # Saved and audited, but the running controller was not reloaded
         # (record_controller_reload_failure). The dashboard contract for that is
@@ -3246,6 +3705,7 @@ api_logs() {
         all) set -- "$log_root/api.log" "$log_root/api.log.1" "$log_root/api.log.2" \
             "$log_root/api.log.3" "$log_root/api.log.4" "$log_root/api.log.5" \
             "$doctor_inventory_log" "$doctor_inventory_log.1" "$doctor_inventory_log.2" "$doctor_inventory_log.3" \
+            "$log_root/daemon-stderr.log.1" "$log_root/daemon-stderr.log" \
             "$log_root/controller.log" "$log_root/controller.log.1" "$log_root/controller.log.2" \
             "$log_root/controller.log.3" "$log_root/controller.log.4" "$log_root/controller.log.5" \
             "$log_root/scheduler.log" "$log_root/scheduler.log.1" "$log_root/scheduler.log.2" \
@@ -3255,7 +3715,10 @@ api_logs() {
         api) set -- "$log_root/api.log" "$log_root/api.log.1" "$log_root/api.log.2" \
             "$log_root/api.log.3" "$log_root/api.log.4" "$log_root/api.log.5" ;;
         doctor) set -- "$doctor_inventory_log" "$doctor_inventory_log.1" "$doctor_inventory_log.2" "$doctor_inventory_log.3" ;;
-        controller) set -- "$log_root/controller.log" "$log_root/controller.log.1" \
+        # The daemon's own stderr and its one rotation come first, the oldest
+        # entries, as in the bridge's log_source_files.
+        controller) set -- "$log_root/daemon-stderr.log.1" "$log_root/daemon-stderr.log" \
+            "$log_root/controller.log" "$log_root/controller.log.1" \
             "$log_root/controller.log.2" "$log_root/controller.log.3" \
             "$log_root/controller.log.4" "$log_root/controller.log.5" ;;
         scheduler) set -- "$log_root/scheduler.log" "$log_root/scheduler.log.1" \
@@ -3289,7 +3752,8 @@ api_logs() {
             "$log_root/api.log.1" "$log_root/api.log"; api_json_log_close ,
         printf '{"source":"doctor","lines":'; api_json_log_lines "$doctor_inventory_log.3" "$log_lines" doctor "$security_runtime_operations_level" "$log_byte_limit" \
             "$doctor_inventory_log.2" "$doctor_inventory_log.1" "$doctor_inventory_log"; api_json_log_close ,
-        printf '{"source":"controller","lines":'; api_json_log_lines "$log_root/controller.log.5" "$log_lines" controller "$security_runtime_controller_level" "$log_byte_limit" \
+        printf '{"source":"controller","lines":'; api_json_log_lines "$log_root/daemon-stderr.log.1" "$log_lines" controller "$security_runtime_controller_level" "$log_byte_limit" \
+            "$log_root/daemon-stderr.log" "$log_root/controller.log.5" \
             "$log_root/controller.log.4" "$log_root/controller.log.3" "$log_root/controller.log.2" \
             "$log_root/controller.log.1" "$log_root/controller.log"; api_json_log_close ,
         printf '{"source":"scheduler","lines":'; api_json_log_lines "$log_root/scheduler.log.5" "$log_lines" scheduler "$security_runtime_scheduler_level" "$log_byte_limit" \
@@ -3314,7 +3778,8 @@ api_logs() {
                     "$doctor_inventory_log.2" "$doctor_inventory_log.1" "$doctor_inventory_log"; api_json_log_close
                 ;;
             controller)
-                printf '{"source":"controller","lines":'; api_json_log_lines "$log_root/controller.log.5" "$log_lines" controller "$security_runtime_controller_level" "$log_byte_limit" \
+                printf '{"source":"controller","lines":'; api_json_log_lines "$log_root/daemon-stderr.log.1" "$log_lines" controller "$security_runtime_controller_level" "$log_byte_limit" \
+                    "$log_root/daemon-stderr.log" "$log_root/controller.log.5" \
                     "$log_root/controller.log.4" "$log_root/controller.log.3" "$log_root/controller.log.2" \
                     "$log_root/controller.log.1" "$log_root/controller.log"; api_json_log_close
                 ;;
@@ -3976,6 +4441,22 @@ api_snapshot() {
     api_load_kv "$controller_state" updated_epoch 0; controller_updated=$kv_value
     case $controller_status in running|stopped) ;; *) api_error corrupt_state "invalid controller state" 73 ;; esac
     case $controller_pid:$controller_next:$controller_active:$controller_updated in *[!0-9:]*) api_error corrupt_state "invalid controller numeric state" 73 ;; esac
+    # The daemon's amber state (fix6 H2): all three lines or none, only while
+    # the service runs degraded. A partial or malformed set is refused, not
+    # served as a snapshot without the amber.
+    api_load_kv_optional "$controller_state" degraded ""; controller_degraded=$kv_value
+    api_load_kv_optional "$controller_state" degraded_since ""; controller_degraded_since=$kv_value
+    api_load_kv_optional "$controller_state" degraded_cause ""; controller_degraded_cause=$kv_value
+    controller_degraded_json=
+    if [ -n "$controller_degraded$controller_degraded_since$controller_degraded_cause" ]; then
+        case $controller_degraded in ''|*[!a-z_]*) api_error corrupt_state "invalid controller degraded reason" 73 ;; esac
+        case $controller_degraded_since in ''|*[!0-9]*) api_error corrupt_state "invalid controller degraded_since" 73 ;; esac
+        [ -n "$controller_degraded_cause" ] || api_error corrupt_state "controller degraded_cause is missing or empty" 73
+        controller_degraded_cause_bytes=$(printf '%s' "$controller_degraded_cause" | wc -c | tr -d ' ')
+        [ "$controller_degraded_cause_bytes" -le 512 ] || api_error corrupt_state "controller degraded_cause exceeds its safe bound" 73
+        controller_degraded_json=$(printf ',"degraded":{"reason":%s,"since_epoch":%s,"cause":%s}' \
+            "$(json_quote "$controller_degraded")" "$controller_degraded_since" "$(json_quote "$controller_degraded_cause")")
+    fi
     api_load_kv "$run_state" state never; run_status=$kv_value
     api_load_kv "$run_state" started_epoch 0; run_started=$kv_value
     api_load_kv "$run_state" finished_epoch 0; run_finished=$kv_value
@@ -4071,8 +4552,9 @@ api_snapshot() {
     {
     printf '"schedule":{"enabled":%s,"interval_seconds":%s,"allow_delete":%s,"max_total_delete":%s},' \
         "$schedule_enabled" "$schedule_interval" "$schedule_delete" "$schedule_max"
-    printf '"controller":{"state":%s,"pid":%s,"next_run_epoch":%s,"active_pid":%s,"updated_epoch":%s},' \
-        "$(json_quote "$controller_status")" "$controller_pid" "$controller_next" "$controller_active" "$controller_updated"
+    printf '"controller":{"state":%s,"pid":%s,"next_run_epoch":%s,"active_pid":%s,"updated_epoch":%s%s},' \
+        "$(json_quote "$controller_status")" "$controller_pid" "$controller_next" "$controller_active" "$controller_updated" \
+        "$controller_degraded_json"
     printf '"run":{"state":%s,"started_epoch":%s,"finished_epoch":%s,"exit_code":' \
         "$(json_quote "$run_status")" "$run_started" "$run_finished"
     if [ "$run_exit" = -1 ]; then printf 'null'; else printf '%s' "$run_exit"; fi
@@ -4367,6 +4849,17 @@ api_resync() {
 
 api_mutation_result() {
     mutation_message=$1
+    if [ -n "${api_note:-}" ] && [ -n "${api_warning_code:-}" ]; then
+        [ -n "${api_warning:-}" ] || api_warning="The change was saved, but its warning could not be shown; see the package logs"
+        printf '{"schema":"sdsync.dsm-result.v1","ok":true,"message":%s,"warnings":[{"code":%s,"message":%s},{"code":"applies_next_run","message":%s}]}\n' \
+            "$(json_quote "$mutation_message")" "$(json_quote "$api_warning_code")" \
+            "$(json_quote "$api_warning")" "$(json_quote "$api_note")"
+        return 0
+    fi
+    if [ -n "${api_note:-}" ]; then
+        api_warning_code=applies_next_run
+        api_warning=$api_note
+    fi
     if [ -n "${api_warning_code:-}" ]; then
         # The bridge refuses an empty warning, which would turn a committed save
         # into a failed job (RB-5): a warning line that sanitised to nothing
@@ -4392,6 +4885,16 @@ api_post_commit_warning() {
         *) api_warning_code=operation_warning ;;
     esac
     api_warning=$(one_safe_line "${api_warning_line#warning: }")
+}
+
+# A save committed beside a daemon run ends with a `note:` line (end_mutation):
+# the run in flight keeps the settings it started with. A success that dropped
+# it would read as already in effect, so it rides as the `applies_next_run`
+# warning, beside any other warning the save printed.
+api_next_run_note() {
+    api_note_line=$(printf '%s\n' "$api_output" | LC_ALL=C awk '/^note: / { line = $0 } END { print line }')
+    [ -n "$api_note_line" ] || return 0
+    api_note=$(one_safe_line "${api_note_line#note: }")
 }
 
 # The warning for a save the running controller did not pick up. The cause is
@@ -4443,8 +4946,21 @@ api_set_secret() {
     api_secret_boolean "$secret_root/$secret_profile.password"; result_password=$secret_boolean
     api_secret_boolean "$secret_root/$secret_profile.totp"; result_totp=$secret_boolean
     api_secret_boolean "$secret_root/$secret_profile.remote-log-token"; result_remote_token=$secret_boolean
-    printf '{"schema":"sdsync.dsm-result.v1","ok":true,"message":"secret state updated","has_password":%s,"has_totp":%s,"has_remote_log_token":%s}\n' \
-        "$result_password" "$result_totp" "$result_remote_token"
+    # The fixed secret document used to drop what the save said beside it: a
+    # credential stored during a sync read as already in use, and a warning
+    # (a pending terminal audit, a controller not reloaded) vanished. Both ride
+    # as `warnings`, the list form only.
+    secret_warnings=
+    if [ -n "${api_warning_code:-}" ]; then
+        [ -n "${api_warning:-}" ] || api_warning="The change was saved, but its warning could not be shown; see the package logs"
+        secret_warnings="{\"code\":$(json_quote "$api_warning_code"),\"message\":$(json_quote "$api_warning")}"
+    fi
+    if [ -n "${api_note:-}" ]; then
+        secret_warnings="${secret_warnings:+$secret_warnings,}{\"code\":\"applies_next_run\",\"message\":$(json_quote "$api_note")}"
+    fi
+    printf '{"schema":"sdsync.dsm-result.v1","ok":true,"message":"secret state updated","has_password":%s,"has_totp":%s,"has_remote_log_token":%s%s}\n' \
+        "$result_password" "$result_totp" "$result_remote_token" \
+        "${secret_warnings:+,\"warnings\":[$secret_warnings]}"
 }
 
 api_client_event() {
@@ -4563,6 +5079,10 @@ api_action() {
         [ "$action_level_seen" = false ] || api_error invalid_request "level is only valid for doctor" 64
         [ "$action_write_seen" = false ] || api_error invalid_request "write-test is only valid for doctor" 64
         if [ "$action_scope" = all ]; then set -- "$manager" "$action_kind" --all; else set -- "$manager" "$action_kind" "$action_scope"; fi
+        # The dashboard queues and follows the run through the snapshot; it
+        # never holds its job open for the run's duration.
+        manager_service_engine 2>/dev/null
+        [ "$manager_engine" = shell ] || set -- "$@" --no-wait
         [ "$action_delete" = false ] || set -- "$@" --allow-delete
         if [ "$action_max_seen" = true ]; then
             [ "$action_scope" = all ] || api_error invalid_request "max-total-delete requires scope all" 64
@@ -4572,8 +5092,13 @@ api_action() {
     api_capture false "$@"
     if [ "$api_exit" -eq 0 ]; then
         [ -n "$api_output" ] || api_output="$action_kind completed"
+        # Under the daemon engine the manager hands a plan or run to the
+        # daemon and returns once it is queued; the outcome arrives through
+        # run.state and Activity like any other run.
+        action_message="$action_kind completed"
+        case $api_output in "queued as run "*) action_message="$action_kind queued" ;; esac
         printf '{"schema":"sdsync.dsm-result.v1","ok":true,"message":%s,"status":"succeeded","exit_code":0,"scope":%s,"output":%s}\n' \
-            "$(json_quote "$action_kind completed")" "$(json_quote "$action_scope")" "$(json_quote "$api_output")"
+            "$(json_quote "$action_message")" "$(json_quote "$action_scope")" "$(json_quote "$api_output")"
     else
         api_map_exit_code "$api_exit"
         [ -n "$api_output" ] || api_output="$action_kind failed"
@@ -4769,12 +5294,13 @@ case $command_name in
             "$secret_root/$remove_name.remote-log-token" "$routines_dir/$remove_name.conf" \
             "$routine_state_dir/$remove_name.state" "$profile_state_dir/$remove_name.state" "$health_dir/$remove_name.state"
         if [ -n "$remaining" ]; then mv -f "$candidate" "$config_file"; finish_private_file "$config_file"; write_default "$selected_default"; else rm -f "$config_file" "$default_profile_file"; fi
+        remove_profile_leftovers "$remove_name"
         echo "removed profile '$remove_name' and its package-owned credentials"
         end_mutation
         ;;
-    set-password) begin_mutation "$@"; set_secret password "$@"; end_mutation ;;
-    set-totp) begin_mutation "$@"; set_secret totp "$@"; end_mutation ;;
-    set-remote-log-token) begin_mutation "$@"; set_secret remote-log-token "$@"; end_mutation ;;
+    set-password) preread_secret "$@"; begin_mutation "$@"; set_secret password "$@"; end_mutation ;;
+    set-totp) preread_secret "$@"; begin_mutation "$@"; set_secret totp "$@"; end_mutation ;;
+    set-remote-log-token) preread_secret "$@"; begin_mutation "$@"; set_secret remote-log-token "$@"; end_mutation ;;
     remove-password|remove-totp|remove-remote-log-token)
         begin_mutation "$@"
         [ "$#" -eq 1 ] || die "$command_name requires an existing profile"
@@ -4783,7 +5309,12 @@ case $command_name in
         end_mutation
         ;;
     doctor)
-        begin_mutation "$@"
+        # Doctor reads; only its write test writes, into the destination, so
+        # only that holds the management lock (a run never starts beside it).
+        case " $* " in
+            *" --write-test "*) begin_mutation "$@" ;;
+            *) begin_operation "$@" ;;
+        esac
         selection doctor "$@"
         load_security_policy_runtime || die "security policy is not a private complete document"
         if [ "$write_test" = true ] && [ "$security_runtime_allow_doctor_write_test" != true ]; then
@@ -4882,7 +5413,11 @@ case $command_name in
         exit "$doctor_exit"
         ;;
     resync)
-        begin_mutation "$@"
+        # Without a ticket the engine only plans and prints one: no lock.
+        case " $* " in
+            *" --confirm "*) begin_mutation "$@" ;;
+            *) begin_operation "$@" ;;
+        esac
         resync_scope_name= resync_scope_seen=false resync_path= resync_ticket=
         while [ "$#" -gt 0 ]; do
             case $1 in
@@ -4949,6 +5484,31 @@ case $command_name in
         ;;
     plan|run)
         require_package_identity || exit 77
+        # The daemon engine's wait options, taken out before the shared
+        # selection parser sees them.
+        run_wait=true
+        run_wait_seconds=86400
+        run_wait_given=false
+        run_wait_value_next=false
+        for run_argument in "$@"; do
+            shift
+            if [ "$run_wait_value_next" = true ]; then
+                run_wait_seconds=$run_argument
+                run_wait_value_next=false
+                continue
+            fi
+            case $run_argument in
+                --no-wait) run_wait=false; run_wait_given=true; continue ;;
+                --wait-seconds) run_wait_value_next=true; run_wait_given=true; continue ;;
+            esac
+            set -- "$@" "$run_argument"
+        done
+        [ "$run_wait_value_next" = false ] || die "--wait-seconds requires a value"
+        case $run_wait_seconds in
+            ''|*[!0-9]*) die "--wait-seconds must be from 1 through 86400" ;;
+        esac
+        decimal_at_most "$run_wait_seconds" 86400 && [ "$run_wait_seconds" -ge 1 ] \
+            || die "--wait-seconds must be from 1 through 86400"
         selection "$command_name" "$@"
         if [ "$command_name" = plan ]; then run_mode=plan; else run_mode=sync; fi
         if [ "$selected_scope" = all ]; then
@@ -4956,6 +5516,10 @@ case $command_name in
         else
             runner_max_total=-
         fi
+        manager_service_engine
+        [ "$manager_engine" = shell ] || forward_run_to_daemon "$@"
+        [ "$run_wait_given" = false ] \
+            || echo "note: --no-wait and --wait-seconds are ignored under the shell engine; the runner runs in the foreground" >&2
         exec "$runner" "$run_mode" "$selected_scope" "$allow_selected_delete" foreground "$runner_max_total"
         ;;
     enable)

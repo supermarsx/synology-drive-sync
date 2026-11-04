@@ -1335,10 +1335,16 @@ read_private_lock_owner() {
             lock_owner_identity=$(stat -c '%d:%i' "$lock_owner_path" 2>/dev/null || true)
             [ -n "$lock_owner_identity" ] || return 1
             lock_owner_topology_valid=false
+            # The daemon publishes run.lock/pid by linking a staging file named
+            # beside the lock (.run.lock.pid.<pid>.<n>, src/daemon/state.rs) and
+            # unlinking it; for that instant it is a companion like a claim.
+            lock_owner_staging_dir=${event_log_lock%/*}
+            lock_owner_staging_name=${event_log_lock##*/}
             for lock_owner_companion in \
                 "$event_log_lock.claim.$lock_owner_pid.$lock_owner_start.$lock_owner_boot" \
                 "$event_log_lock.pending.$lock_owner_pid.$lock_owner_start.$lock_owner_boot" \
-                "$event_log_lock/pid"; do
+                "$event_log_lock/pid" \
+                "$lock_owner_staging_dir/.$lock_owner_staging_name.pid.$lock_owner_pid."*; do
                 [ "$lock_owner_companion" != "$lock_owner_path" ] || continue
                 companion_identity=$(stat -c '%d:%i' "$lock_owner_companion" 2>/dev/null || true)
                 if [ -n "$companion_identity" ] && [ "$companion_identity" = "$lock_owner_identity" ]; then
@@ -1357,6 +1363,30 @@ read_private_lock_owner() {
             ;;
         *) return 1 ;;
     esac
+}
+
+# The daemon publishes run.lock/pid by linking a staging file named beside the
+# lock (.run.lock.pid.<pid>.<n>, src/daemon/state.rs) and unlinking it. Killed
+# between the two it leaves the owner file with two names. Once the dead
+# owner's record ($1: its device:inode, $2: its pid) has been recovered, the
+# staging names that are that same inode go too, each said on stderr; a file of
+# another inode is not this lock's. A name that cannot be removed is said and
+# left (it is harmless: the record it names is dead), never silently.
+remove_staged_lock_owner_siblings() {
+    staged_owner_identity=$1
+    staged_owner_pid=$2
+    staged_owner_dir=${event_log_lock%/*}
+    staged_owner_base=${event_log_lock##*/}
+    for staged_owner_path in "$staged_owner_dir/.$staged_owner_base.pid.$staged_owner_pid."*; do
+        [ -f "$staged_owner_path" ] && [ ! -L "$staged_owner_path" ] || continue
+        [ "$(stat -c '%d:%i' "$staged_owner_path" 2>/dev/null || true)" = "$staged_owner_identity" ] || continue
+        if rm -f "$staged_owner_path"; then
+            echo "removed the staged lock owner record a crashed owner left beside $event_log_lock: $staged_owner_path" >&2
+        else
+            echo "the staged lock owner record $staged_owner_path (the stale owner of $event_log_lock) could not be removed" >&2
+        fi
+    done
+    return 0
 }
 
 loaded_lock_owner_is_live() {
@@ -1954,6 +1984,7 @@ acquire_event_log_lock() {
             continue
         fi
         rm -f "$event_recovery_path" || { rm -f "$event_claim_path"; return 73; }
+        remove_staged_lock_owner_siblings "$recovered_identity" "$recovered_pid"
         event_stale_identity=
         event_stale_observations=0
     done

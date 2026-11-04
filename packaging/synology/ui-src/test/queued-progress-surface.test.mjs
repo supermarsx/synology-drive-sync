@@ -448,7 +448,8 @@ test("each named queued failure renders its cause and its next step", () => {
     classification_failed: [/could not determine what kind of operation/, /submit the request again/],
     secret_claim_failed: [/could not be claimed/, /never started/, /submit the request again/],
     consumer_failed: [/exited before it finished/, /out-of-memory killer/],
-    consumer_wrote_no_result: [/wrote no result/, /unconfirmed/]
+    consumer_wrote_no_result: [/wrote no result/, /unconfirmed/],
+    audit_unavailable: [/audit log/, /Nothing ran/, /submit the request again/]
   };
   for (const [code, patterns] of Object.entries(expectations)) {
     const context = reportContext();
@@ -514,4 +515,25 @@ test("the live progress regions are polite and separate from the assertive barri
       `a per-tick progress note must never interrupt as an alert: ${region}`
     );
   }
+});
+
+test("a control directory the service cannot read is its own amber item, not the generic degradation", () => {
+  const context = {
+    snapshot: {
+      controller: {
+        degraded: {
+          reason: "control_dir_unreadable",
+          since_epoch: 1757548700,
+          cause: "/var/packages/synology-drive-sync/var/control/requests cannot be read (Permission denied (os error 13))"
+        }
+      }
+    },
+    nasTimeSuffix: () => ""
+  };
+  const item = computed.controllerDegradedItem.call(context);
+  assert.equal(item.level, "warn");
+  assert.match(item.title, /request queue/);
+  assert.match(item.detail, /control\/requests cannot be read/);
+  assert.match(item.detail, /control_dir_unreadable/);
+  assert.doesNotMatch(item.title, /reports a degradation/);
 });

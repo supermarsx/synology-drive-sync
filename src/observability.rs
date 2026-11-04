@@ -157,6 +157,27 @@ pub enum EventCode {
     EntryDeferred,
     /// The `--result-record` file a supervisor reads could not be written.
     ResultRecordFailed,
+    /// How post-run reconciliation proved content: `operations` pairs carried from the plan
+    /// pass, `files` pairs verified live (SC-3).
+    ReconcileEvidence,
+    /// A reconciliation canary read live disagreed with the digest the plan pass proved while
+    /// every fact matched; every carried pair was re-verified live. Names the path.
+    ReconcileCarryCanaryMismatch,
+    /// The verified-pair index vouched for comparison pairs: `operations` served, `files`
+    /// verified live.
+    PairIndexServed,
+    /// A verified-pair index canary disagreed; the index was discarded and the run verified live.
+    PairIndexCanaryMismatch,
+    /// The verified-pair index could not be used (locked, corrupt, newer format, unsafe, bound to
+    /// another profile); the run verified everything live.
+    PairIndexUnusable,
+    /// The verified-pair index could not be written; the previous one stays valid evidence.
+    PairIndexStoreFailed,
+    /// The tree needs more memory than the run may use; refused before the listing (SC-2).
+    TreeTooLargeForMemory,
+    /// The memory budget could not be checked on this host (not Linux, `/proc` unreadable); the
+    /// run went ahead unchecked.
+    MemoryBudgetUnchecked,
 }
 
 impl EventCode {
@@ -165,7 +186,7 @@ impl EventCode {
     /// Exhaustive by construction: a new variant that is not listed here fails
     /// `every_event_code_has_a_stable_machine_and_human_name`, so no code can ship without a
     /// stable machine name and human message.
-    pub const ALL: [Self; 32] = [
+    pub const ALL: [Self; 40] = [
         Self::RunBuild,
         Self::RunStarted,
         Self::RunCompleted,
@@ -198,6 +219,14 @@ impl EventCode {
         Self::EntrySkipped,
         Self::EntryDeferred,
         Self::ResultRecordFailed,
+        Self::ReconcileEvidence,
+        Self::ReconcileCarryCanaryMismatch,
+        Self::PairIndexServed,
+        Self::PairIndexCanaryMismatch,
+        Self::PairIndexUnusable,
+        Self::PairIndexStoreFailed,
+        Self::TreeTooLargeForMemory,
+        Self::MemoryBudgetUnchecked,
     ];
 
     /// The stable machine name, as `docs/observability.schema.json` publishes it.
@@ -235,6 +264,14 @@ impl EventCode {
             Self::EntrySkipped => "entry.skipped",
             Self::EntryDeferred => "entry.deferred",
             Self::ResultRecordFailed => "result_record.failed",
+            Self::ReconcileEvidence => "reconcile.evidence",
+            Self::ReconcileCarryCanaryMismatch => "reconcile.carry_canary_mismatch",
+            Self::PairIndexServed => "pair_index.served",
+            Self::PairIndexCanaryMismatch => "pair_index.canary_mismatch",
+            Self::PairIndexUnusable => "pair_index.unusable",
+            Self::PairIndexStoreFailed => "pair_index.store_failed",
+            Self::TreeTooLargeForMemory => "memory.tree_too_large",
+            Self::MemoryBudgetUnchecked => "memory.budget_unchecked",
         }
     }
 
@@ -274,6 +311,24 @@ impl EventCode {
             Self::EntrySkipped => "entry skipped",
             Self::EntryDeferred => "entry deferred",
             Self::ResultRecordFailed => "result record could not be written",
+            Self::ReconcileEvidence => "reconciliation evidence",
+            Self::ReconcileCarryCanaryMismatch => {
+                "a reconciliation canary disagreed with the plan pass; every pair was re-verified live"
+            }
+            Self::PairIndexServed => "verified-pair index served",
+            Self::PairIndexCanaryMismatch => {
+                "a verified-pair index canary disagreed; the index was discarded and the run verified live"
+            }
+            Self::PairIndexUnusable => {
+                "the verified-pair index could not be used; the run verified everything live"
+            }
+            Self::PairIndexStoreFailed => "the verified-pair index could not be written",
+            Self::TreeTooLargeForMemory => {
+                "the tree needs more memory than this run may use; split the profile"
+            }
+            Self::MemoryBudgetUnchecked => {
+                "the memory budget could not be checked on this host; the run went ahead unchecked"
+            }
         }
     }
 }
@@ -325,11 +380,19 @@ pub enum EventReason {
     ServerCopyFallback,
     Excluded,
     UploadFailed,
+    /// Stored or carried evidence disagreed with a live digest while every fact matched.
+    EvidenceCanaryMismatch,
+    /// The verified-pair index could not be opened, read or trusted.
+    PairIndexUnusable,
+    /// The verified-pair index could not be written.
+    PairIndexStoreFailed,
+    /// The tree needs more memory than the run may use (SC-2).
+    TreeTooLargeForMemory,
 }
 
 impl EventReason {
     /// Every reason, so the published vocabulary can be checked against this enum.
-    pub const ALL: [Self; 36] = [
+    pub const ALL: [Self; 40] = [
         Self::Authentication,
         Self::Network,
         Self::HttpStatus,
@@ -366,6 +429,10 @@ impl EventReason {
         Self::ServerCopyFallback,
         Self::Excluded,
         Self::UploadFailed,
+        Self::EvidenceCanaryMismatch,
+        Self::PairIndexUnusable,
+        Self::PairIndexStoreFailed,
+        Self::TreeTooLargeForMemory,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -406,6 +473,10 @@ impl EventReason {
             Self::ServerCopyFallback => "server_copy_fallback",
             Self::Excluded => "excluded",
             Self::UploadFailed => "upload_failed",
+            Self::EvidenceCanaryMismatch => "evidence_canary_mismatch",
+            Self::PairIndexUnusable => "pair_index_unusable",
+            Self::PairIndexStoreFailed => "pair_index_store_failed",
+            Self::TreeTooLargeForMemory => "tree_too_large_for_memory",
         }
     }
 
@@ -426,6 +497,8 @@ impl EventReason {
             Error::InvalidSource(_) => Self::SourceInvalid,
             Error::UnsupportedLocalEntry { .. } => Self::LocalEntryUnsupported,
             Error::FileIo { .. } => Self::LocalIo,
+            // A request that timed out is named as one, not as a generic network fault.
+            Error::Http { source, .. } if source.is_timeout() => Self::Timeout,
             Error::Http { .. } | Error::HttpBody { .. } => Self::Network,
             Error::HttpStatus { .. } => Self::HttpStatus,
             Error::InvalidResponse { .. } => Self::RemoteResponseInvalid,

@@ -26,10 +26,53 @@ pub use tree::{TreeWatch, WatchOptions, held_watches_of_current_user};
 
 use std::fmt;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use crate::local::{DEFAULT_IGNORE_FILE, IgnoreRules};
 use crate::path::is_dsm_managed;
+
+/// The most directory walks that may be live at once in this process: the native watch's walks
+/// and every other walk that shares the cap ([`walk_slot`]). A walk on a disk that stopped
+/// answering cannot be interrupted, only abandoned, and an abandoned walk holds its thread until
+/// its call returns; past this many, a new walk is refused by name rather than piling up threads.
+pub const MAX_LIVE_WALKS: usize = 16;
+
+static LIVE_WALKS: AtomicUsize = AtomicUsize::new(0);
+
+/// One live walk's place under [`MAX_LIVE_WALKS`]; released when dropped (when the walk's thread
+/// ends, however long after it was abandoned).
+#[derive(Debug)]
+pub struct WalkSlot(());
+
+impl Drop for WalkSlot {
+    fn drop(&mut self) {
+        LIVE_WALKS.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// Why a walk was refused a place: the cap is the process's, not a verdict on the filesystem.
+///
+/// The old wording said the earlier walks were "still blocked in the filesystem", which was false
+/// whenever more than [`MAX_LIVE_WALKS`] routines armed at once: those walks are healthy and
+/// short-lived, and a retry a few seconds later succeeds.
+pub fn walk_cap_refusal(live: usize) -> String {
+    format!(
+        "the process-wide cap of {MAX_LIVE_WALKS} concurrent directory walks is reached \
+         ({live} live: other routines are arming or walking, or walks abandoned on a stalled \
+         disk have not returned); this walk was not started"
+    )
+}
+
+/// A place for one more directory walk, or `Err(live)` when [`MAX_LIVE_WALKS`] are live.
+pub fn walk_slot() -> Result<WalkSlot, usize> {
+    let live = LIVE_WALKS.fetch_add(1, Ordering::SeqCst);
+    if live >= MAX_LIVE_WALKS {
+        LIVE_WALKS.fetch_sub(1, Ordering::SeqCst);
+        return Err(live);
+    }
+    Ok(WalkSlot(()))
+}
 
 /// How long arming a tree, or any later walk of part of it, may take before the watcher gives up
 /// and names the directory it was stuck on. Long enough for a hibernating disk to spin up.
@@ -88,6 +131,9 @@ pub enum WatchError {
     Deadline { path: PathBuf, deadline: Duration },
     /// A directory could not be watched or listed.
     Setup { path: PathBuf, detail: String },
+    /// The process-wide cap on concurrent walks ([`MAX_LIVE_WALKS`]) was reached, so no walk
+    /// was started. Transient by nature: the caller retries soon, not after a long backoff.
+    WalkCap { path: PathBuf, live: usize },
     /// The event marker could not be written.
     Output(String),
 }
@@ -116,6 +162,7 @@ impl WatchError {
             | Self::Rules(_)
             | Self::Deadline { .. }
             | Self::Setup { .. }
+            | Self::WalkCap { .. }
             | Self::Output(_) => "watch_setup_failed",
         }
     }
@@ -128,6 +175,7 @@ impl WatchError {
             Self::SourceMissing { .. } | Self::SourceGone { .. } => 66,
             Self::Unavailable(_) => 69,
             Self::Setup { .. } => 71,
+            Self::WalkCap { .. } => 75,
             Self::Deadline { .. } => 72,
             Self::Limit(_) => 73,
             Self::Output(_) => 74,
@@ -189,6 +237,12 @@ impl fmt::Display for WatchError {
             Self::Setup { path, detail } => {
                 write!(formatter, "{reason}: {detail}; path={}", path.display())
             }
+            Self::WalkCap { path, live } => write!(
+                formatter,
+                "{reason} walk_cap: {}; path={}",
+                walk_cap_refusal(*live),
+                path.display()
+            ),
             Self::Output(detail) => write!(formatter, "{reason} output: {detail}"),
         }
     }
@@ -549,6 +603,10 @@ mod tests {
             WatchError::Setup {
                 path: "/s".into(),
                 detail: "x".into(),
+            },
+            WatchError::WalkCap {
+                path: "/s".into(),
+                live: 16,
             },
             WatchError::Output("x".into()),
         ];

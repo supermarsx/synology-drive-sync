@@ -837,6 +837,9 @@ pub enum DeferredReason {
     UnsupportedEntry,
     /// The NAS refuses this account the deletion (no permission); lasting until that changes.
     DeleteNotPermitted,
+    /// The tree needs more memory than the run may use; nothing was synced. Lasting until the
+    /// tree is split. The SDK does not run this check itself; the variant mirrors the engine's.
+    TreeTooLargeForMemory,
 }
 
 impl DeferredReason {
@@ -867,6 +870,7 @@ impl DeferredReason {
             Self::RemoteSkipped => sync::DeferReason::RemoteSkipped,
             Self::UnsupportedEntry => sync::DeferReason::UnsupportedEntry,
             Self::DeleteNotPermitted => sync::DeferReason::DeleteNotPermitted,
+            Self::TreeTooLargeForMemory => sync::DeferReason::TreeTooLargeForMemory,
         }
     }
 }
@@ -891,6 +895,7 @@ impl From<sync::DeferReason> for DeferredReason {
             sync::DeferReason::RemoteSkipped => Self::RemoteSkipped,
             sync::DeferReason::UnsupportedEntry => Self::UnsupportedEntry,
             sync::DeferReason::DeleteNotPermitted => Self::DeleteNotPermitted,
+            sync::DeferReason::TreeTooLargeForMemory => Self::TreeTooLargeForMemory,
         }
     }
 }
@@ -1065,9 +1070,59 @@ pub struct SyncOutcome {
     incomplete_listings: Vec<String>,
     /// See [`PlanSummary::link_guard_unchecked`].
     link_guard_unchecked: usize,
+    /// How reconciliation proved content, when the run reconciled. See [`ReconciliationSummary`].
+    reconciliation: Option<ReconciliationSummary>,
+}
+
+/// How a run's post-execution reconciliation proved content (SC-3).
+///
+/// Reconciliation re-lists both sides in full and verifies live every pair the run touched, plus
+/// a canary sample of the rest. Untouched pairs whose facts did not move keep the digests the
+/// plan pass proved. A canary that disagrees makes the same pass re-verify every carried pair
+/// live, and is named here; the run's verdict then rests on live evidence only.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
+pub struct ReconciliationSummary {
+    /// Pairs whose plan-pass digests were carried.
+    pub carried: usize,
+    /// Pairs whose remote digest was computed live.
+    pub verified_live: usize,
+    /// Canary pairs verified live with a conclusive answer.
+    pub canary_checked: usize,
+    /// Canary pairs that could not be verified live (deferred, vanished, unreadable).
+    pub canary_inconclusive: usize,
+    /// Local relative of the first canary that disagreed, when one did
+    /// (`reconcile-carry-canary-mismatch`).
+    pub canary_mismatch: Option<String>,
+    /// True when a canary disagreement made reconciliation re-verify every carried pair live.
+    pub fell_back_to_full: bool,
+    /// Pairs not carried because the NAS clock of the plan pass was not one this host's clock
+    /// bounds (`pair-index-plan-clock-unbounded`); they were verified live.
+    pub plan_clock_unbounded: usize,
+}
+
+impl ReconciliationSummary {
+    fn from_report(report: &crate::digest_evidence::EvidenceReport) -> Self {
+        Self {
+            carried: report.served,
+            verified_live: report.verified_live,
+            canary_checked: report.canary_checked,
+            canary_inconclusive: report.canary_inconclusive,
+            canary_mismatch: report
+                .canary_mismatch
+                .as_ref()
+                .map(|mismatch| mismatch.path.clone()),
+            fell_back_to_full: report.fell_back,
+            plan_clock_unbounded: report.plan_clock_unbounded,
+        }
+    }
 }
 
 impl SyncOutcome {
+    /// How reconciliation proved content; `None` when the run did not reconcile.
+    pub fn reconciliation(&self) -> Option<&ReconciliationSummary> {
+        self.reconciliation.as_ref()
+    }
+
     pub fn plan(&self) -> &PlanSummary {
         &self.plan
     }
@@ -1363,6 +1418,7 @@ impl Engine {
                     recovered: client.transport_counters(),
                     incomplete_listings: incomplete_directories.clone(),
                     link_guard_unchecked,
+                    reconciliation: None,
                 });
             }
             check_cancellation(cancellation)?;
@@ -1431,16 +1487,39 @@ impl Engine {
                     phase: Phase::Reconciliation,
                 },
             )?;
+            let mut reconciliation = None;
             if !plan.is_empty() {
-                let (reconciliation, reconciliation_deferred) =
-                    reconciliation_plan(&client, request, &root, &rules, &options, cancellation)?;
+                // The command line's SC-3 carry: untouched pairs whose facts held keep the plan
+                // pass's digests; touched pairs and a canary sample are verified live.
+                let carry = crate::digest_evidence::PlanCarry {
+                    local: &local,
+                    remote: &remote,
+                    touched: crate::digest_evidence::TouchedPaths::from_run(&plan, &deferred),
+                    canary: crate::digest_evidence::DEFAULT_CANARY,
+                    seed: started_at
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map_or(0, |elapsed| elapsed.as_nanos() as u64),
+                    read_started: started_at,
+                    racy: crate::pair_index::RacyWindows::for_host(),
+                    clock_unbounded: Default::default(),
+                };
+                let (rebuilt, reconciliation_deferred, evidence) = reconciliation_plan(
+                    &client,
+                    request,
+                    &root,
+                    &rules,
+                    &options,
+                    carry,
+                    cancellation,
+                )?;
+                reconciliation = Some(ReconciliationSummary::from_report(&evidence));
                 merge_deferred(&mut deferred, reconciliation_deferred);
                 // The command line's rules exactly, so an embedding application cannot fail a run
                 // the CLI reports as a success, or the reverse.
                 sync::ensure_reconciled(
                     &plan.source_root,
                     &plan,
-                    &reconciliation,
+                    &rebuilt,
                     started_at,
                     &sync::DeferralIndex::from_records(&deferred),
                 )
@@ -1463,6 +1542,7 @@ impl Engine {
                 recovered: client.transport_counters(),
                 incomplete_listings: incomplete_directories,
                 link_guard_unchecked,
+                reconciliation,
             })
         }));
         let operation = match operation {
@@ -1617,8 +1697,13 @@ fn reconciliation_plan(
     root: &RemoteRoot,
     rules: &IgnoreRules,
     run_options: &PlanOptions,
+    mut carry: crate::digest_evidence::PlanCarry<'_>,
     cancellation: &CancellationToken,
-) -> SdkResult<(SyncPlan, Vec<sync::DeferredPath>)> {
+) -> SdkResult<(
+    SyncPlan,
+    Vec<sync::DeferredPath>,
+    crate::digest_evidence::EvidenceReport,
+)> {
     check_cancellation(cancellation)?;
     let mut local =
         local::scan(&request.source, rules, cancellation).map_err(SdkError::from_core)?;
@@ -1632,15 +1717,18 @@ fn reconciliation_plan(
     check_cancellation(cancellation)?;
     // No promotion: a reconciliation plan is inspected for emptiness, never executed, so nothing
     // consumes an upload's digest here.
-    let mut deferred = sync::populate_plan_digests_with_listings(
+    let (mut deferred, evidence) = sync::populate_plan_digests_evidenced(
         client,
         &mut local,
         &mut remote,
         rules,
-        run_options.compare,
-        run_options.server_copy,
-        run_options.delete,
-        &scanned.incomplete_directories,
+        sync::DigestSelection {
+            compare: run_options.compare,
+            server_copy: run_options.server_copy,
+            delete: run_options.delete,
+            incomplete: &scanned.incomplete_directories,
+        },
+        Some(&mut carry),
         cancellation,
     )
     .map_err(SdkError::from_core)?;
@@ -1672,7 +1760,7 @@ fn reconciliation_plan(
     );
     let named_in_plan = sync::deferrals_in_plan_skips(&plan, &deferred);
     deferred.extend(named_in_plan);
-    Ok((plan, deferred))
+    Ok((plan, deferred, evidence))
 }
 
 fn summarize_plan(plan: &SyncPlan) -> PlanSummary {

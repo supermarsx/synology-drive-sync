@@ -339,6 +339,21 @@ pub struct RemoteEntry {
     pub kind: EntryKind,
     pub size: u64,
     pub mtime_seconds: i64,
+    /// The `time.ctime` File Station reported with the listing, when it reported one.
+    ///
+    /// Recorded so stored evidence about this file can tell a replacement that kept size and
+    /// mtime (a Drive client, `rsync -t`, a restore) from the file it verified: such a writer
+    /// cannot keep the change time (perf-design §2.9, R1). Not used by any comparison.
+    pub ctime_seconds: Option<i64>,
+    /// The `time.crtime` (creation time) File Station reported, when it reported one.
+    pub crtime_seconds: Option<i64>,
+    /// The NAS clock, from the HTTP `Date` of the `MD5.start` that produced `content_md5`, when
+    /// that digest was computed live by this process and the NAS sent a parseable `Date`.
+    ///
+    /// The NAS starts reading after it accepts the task, so every write stamped with a change
+    /// time at least the NAS racy window (60 s, `NAS_WINDOW_SECONDS`) before this is in the digest
+    /// (the racy rule, perf-design §2.4). The window was two seconds under evidence epoch 1.
+    pub digest_nas_time: Option<i64>,
     /// File Station mount-point type (for example CIFS/NFS/ISO), when present.
     /// Mounted directories are inventory boundaries and are never traversed or deleted.
     pub mount_point_type: Option<String>,
@@ -1213,6 +1228,9 @@ struct ResponseFacts {
     response_bytes: u64,
     /// Why the body would not deserialize, in schema terms. Set only on a decode failure.
     decode: Option<DecodeFault>,
+    /// The responder's clock from the HTTP `Date` header, in Unix seconds, when it sent a
+    /// parseable IMF-fixdate. Read for the verified-pair racy rule only.
+    server_date: Option<i64>,
 }
 
 impl ApiClient {
@@ -1662,10 +1680,11 @@ impl ApiClient {
             let digests = self.remote_content_md5_batch(&batch, failure, cancellation)?;
             for ((relative, _), digest) in batch.iter().zip(digests) {
                 match digest {
-                    Ok(digest) => {
+                    Ok((digest, started_at_nas)) => {
                         breaker.succeeded();
                         if let Some(entry) = inventory.entries.get_mut(*relative) {
                             entry.content_md5 = Some(digest);
+                            entry.digest_nas_time = started_at_nas;
                         }
                     }
                     Err(error) => {
@@ -1698,10 +1717,10 @@ impl ApiClient {
         batch: &[(&str, String)],
         failure: DigestFailure,
         cancellation: &CancellationToken,
-    ) -> Result<Vec<Result<ContentMd5>>> {
+    ) -> Result<Vec<Result<DatedDigest>>> {
         let batch_cancellation = cancellation.child();
         let cursor = AtomicUsize::new(0);
-        let collected: Mutex<Vec<Option<Result<ContentMd5>>>> =
+        let collected: Mutex<Vec<Option<Result<DatedDigest>>>> =
             Mutex::new((0..batch.len()).map(|_| None).collect());
         let first_error: Mutex<Option<Error>> = Mutex::new(None);
 
@@ -1714,7 +1733,7 @@ impl ApiClient {
                 let Some((_, remote_path)) = batch.get(index) else {
                     return;
                 };
-                let result = self.remote_content_md5(remote_path, &batch_cancellation);
+                let result = self.remote_content_md5_dated(remote_path, &batch_cancellation);
                 let fatal = match &result {
                     Ok(_) => false,
                     // A peer abandoned the batch; this is not the file's answer.
@@ -1804,24 +1823,41 @@ impl ApiClient {
         remote_path: &str,
         cancellation: &CancellationToken,
     ) -> Result<ContentMd5> {
+        self.remote_content_md5_dated(remote_path, cancellation)
+            .map(|(digest, _)| digest)
+    }
+
+    /// [`Self::remote_content_md5`], also returning the NAS clock from the HTTP `Date` of the
+    /// `MD5.start` answer, when there was a parseable one.
+    ///
+    /// DSM reads the file only after it has accepted the task, so a write whose change time is
+    /// at least the NAS racy window (60 s, `NAS_WINDOW_SECONDS`) before that clock is in the
+    /// digest, provided the clock is one this host's clock bounds (20 s,
+    /// `NAS_CLOCK_TOLERANCE_SECONDS`). That is the remote half of the
+    /// verified-pair racy rule (perf-design §2.4 condition 5).
+    pub fn remote_content_md5_dated(
+        &self,
+        remote_path: &str,
+        cancellation: &CancellationToken,
+    ) -> Result<(ContentMd5, Option<i64>)> {
         self.require_content_api()?;
         cancellation.check()?;
         let _slot = self.md5_tasks.acquire(cancellation)?;
         let deadline = Instant::now()
             .checked_add(self.operation_timeout)
             .ok_or_else(|| Error::Message("operation timeout is too large".to_owned()))?;
-        let task: TaskStartData = self
-            .call_bounded_with_retry(
+        let (task, started_at_nas): (Option<TaskStartData>, Option<i64>) = self
+            .call_bounded_with_retry_dated(
                 "SYNO.FileStation.MD5",
                 2,
                 "start",
                 vec![pair("file_path", json_string(remote_path)?)],
                 self.control_timeout,
-            )?
-            .ok_or_else(|| Error::InvalidResponse {
-                operation: "SYNO.FileStation.MD5.start".to_owned(),
-                message: "successful response contained no task ID".to_owned(),
-            })?;
+            )?;
+        let task = task.ok_or_else(|| Error::InvalidResponse {
+            operation: "SYNO.FileStation.MD5.start".to_owned(),
+            message: "successful response contained no task ID".to_owned(),
+        })?;
         validate_task_id(&task.taskid, "SYNO.FileStation.MD5.start")?;
 
         let mut poll_interval = REMOTE_MD5_FIRST_POLL_INTERVAL;
@@ -1864,7 +1900,7 @@ impl ApiClient {
                     operation: "SYNO.FileStation.MD5.status".to_owned(),
                     message: "finished task contained no MD5 digest".to_owned(),
                 })?;
-                return ContentMd5::parse_hex(&digest);
+                return Ok((ContentMd5::parse_hex(&digest)?, started_at_nas));
             }
             // Ramped rather than flat, because this is now on the hot path: one MD5 task per
             // file in the comparison set, issued serially. A flat 100 ms floor would add that
@@ -3526,6 +3562,7 @@ impl ApiClient {
                 };
                 let (size, mtime_seconds) =
                     file_metadata("SYNO.FileStation.Getinfo.getinfo", kind, &additional)?;
+                let (ctime_seconds, crtime_seconds) = remote_change_times(&additional);
                 // A folder between the root and the scope, or the scope itself, that is a link: a
                 // scoped run, or a dashboard Resync of a file beneath it, would write and delete
                 // wherever it points, though an unscoped run refuses to follow it. The scope is
@@ -3553,6 +3590,9 @@ impl ApiClient {
                         kind,
                         size,
                         mtime_seconds,
+                        ctime_seconds,
+                        crtime_seconds,
+                        digest_nas_time: None,
                         mount_point_type: None,
                         content_md5: None,
                     },
@@ -3689,6 +3729,7 @@ impl ApiClient {
                 let additional = item.additional.unwrap_or_default();
                 let (size, mtime_seconds) =
                     file_metadata("SYNO.FileStation.List.list", kind, &additional)?;
+                let (ctime_seconds, crtime_seconds) = remote_change_times(&additional);
                 let real_path = reported_real_path(&additional);
                 // A link inside the destination (ADV-R-5): DSM's real path for the entry is not
                 // its listed path. Descending would walk, and `--delete` would delete, whatever
@@ -3735,6 +3776,9 @@ impl ApiClient {
                     kind,
                     size,
                     mtime_seconds,
+                    ctime_seconds,
+                    crtime_seconds,
+                    digest_nas_time: None,
                     mount_point_type: mount_point_type.clone(),
                     content_md5: None,
                 };
@@ -5251,11 +5295,25 @@ impl ApiClient {
         parameters: Vec<(String, String)>,
         timeout: Duration,
     ) -> Result<Option<T>> {
+        self.call_bounded_with_retry_dated(api, version, method, parameters, timeout)
+            .map(|(value, _)| value)
+    }
+
+    /// [`Self::call_bounded_with_retry`], also returning the NAS clock from the HTTP `Date` of
+    /// the answer, when it carried a parseable one.
+    fn call_bounded_with_retry_dated<T: DeserializeOwned>(
+        &self,
+        api: &'static str,
+        version: u32,
+        method: &'static str,
+        parameters: Vec<(String, String)>,
+        timeout: Duration,
+    ) -> Result<(Option<T>, Option<i64>)> {
         self.validate_api(api, version)?;
         let url = self.api_url(api)?;
         self.with_session_recovery(|| {
             let fields = self.authenticated_fields(api, version, method, parameters.clone())?;
-            self.send_form_with_retry_bounded(
+            self.send_form_with_retry_bounded_dated(
                 url.clone(),
                 fields,
                 api,
@@ -5319,11 +5377,37 @@ impl ApiClient {
         allow_retry: bool,
         timeout: Duration,
     ) -> Result<Option<T>> {
+        self.send_form_with_retry_bounded_dated(
+            url,
+            fields,
+            api,
+            version,
+            method,
+            allow_retry,
+            timeout,
+        )
+        .map(|(value, _)| value)
+    }
+
+    /// [`Self::send_form_with_retry_bounded`], also returning the NAS clock from the HTTP `Date`
+    /// of the attempt that succeeded, when the response carried a parseable one.
+    #[allow(clippy::too_many_arguments)]
+    fn send_form_with_retry_bounded_dated<T: DeserializeOwned>(
+        &self,
+        url: Url,
+        fields: Vec<(String, String)>,
+        api: &'static str,
+        version: u32,
+        method: &'static str,
+        allow_retry: bool,
+        timeout: Duration,
+    ) -> Result<(Option<T>, Option<i64>)> {
         // These owned copies can include SID/SynoToken values. Erase them after the final
         // attempt; each per-attempt clone is erased by `send_form_once` as well.
         let fields = Zeroizing::new(fields);
         let attempts = if allow_retry { self.retries } else { 0 };
         for attempt in 0..=attempts {
+            let mut facts = ResponseFacts::default();
             let result = self.send_attempt(
                 url.clone(),
                 fields.to_vec(),
@@ -5335,10 +5419,10 @@ impl ApiClient {
                     attempt: attempt + 1,
                     max_attempts: attempts + 1,
                 },
-                &mut ResponseFacts::default(),
+                &mut facts,
             );
             match result {
-                Ok(value) => return Ok(value),
+                Ok(value) => return Ok((value, facts.server_date)),
                 // The pause is this loop's cancellation point, and the only one it may have.
                 // `sleep_cancellable` checks the token before every slice and once more on the
                 // way out, so a cancelled run never reaches the next attempt. The check
@@ -6141,6 +6225,24 @@ fn permission_disables_listing(additional: Option<&RemoteAdditionalWire>) -> boo
 struct RemoteTimeWire {
     #[serde(default)]
     mtime: Option<i64>,
+    /// Status-change and creation times. Kept for stored-evidence keys only (see
+    /// [`RemoteEntry::ctime_seconds`]); a DSM that omits them costs that evidence its remote
+    /// half, never a run.
+    #[serde(default)]
+    ctime: Option<i64>,
+    #[serde(default)]
+    crtime: Option<i64>,
+}
+
+/// A remote MD5 and the NAS clock of the `MD5.start` that produced it, when DSM sent one.
+type DatedDigest = (ContentMd5, Option<i64>);
+
+/// The change and creation times of a listed entry, when DSM reported them.
+fn remote_change_times(additional: &RemoteAdditionalWire) -> (Option<i64>, Option<i64>) {
+    additional
+        .time
+        .as_ref()
+        .map_or((None, None), |time| (time.ctime, time.crtime))
 }
 
 #[derive(Debug, Deserialize)]
@@ -7121,8 +7223,63 @@ fn decode_response_observed<T: DeserializeOwned>(
 /// Read here rather than in `decode_response_body`, which receives only the status and the body
 /// bytes: by then the headers are gone. Whether DSM rotates the session on a *successful* response
 /// is the fact that distinguishes a stale client-held identifier from a rejected one.
+/// Parse an HTTP `Date` in the IMF-fixdate form RFC 9110 requires senders to use
+/// (`Sun, 06 Nov 1994 08:49:37 GMT`), to Unix seconds.
+///
+/// The obsolete RFC 850 and asctime forms are not accepted: a responder sending them gets no NAS
+/// clock, which makes the evidence it verified racy (never served) rather than wrongly dated.
+pub(crate) fn parse_http_date(value: &str) -> Option<i64> {
+    let value = value.trim();
+    let (_, rest) = value.split_once(", ")?;
+    let mut parts = rest.split(' ');
+    let day: i64 = parts.next().filter(|day| day.len() == 2)?.parse().ok()?;
+    let month = match parts.next()? {
+        "Jan" => 1,
+        "Feb" => 2,
+        "Mar" => 3,
+        "Apr" => 4,
+        "May" => 5,
+        "Jun" => 6,
+        "Jul" => 7,
+        "Aug" => 8,
+        "Sep" => 9,
+        "Oct" => 10,
+        "Nov" => 11,
+        "Dec" => 12,
+        _ => return None,
+    };
+    let year: i64 = parts.next().filter(|year| year.len() == 4)?.parse().ok()?;
+    let clock = parts.next()?;
+    if parts.next()? != "GMT" || parts.next().is_some() {
+        return None;
+    }
+    let mut fields = clock.split(':');
+    let mut field = |limit: i64| -> Option<i64> {
+        let text = fields.next().filter(|text| text.len() == 2)?;
+        let number: i64 = text.parse().ok()?;
+        (0..=limit).contains(&number).then_some(number)
+    };
+    let (hour, minute, second) = (field(23)?, field(59)?, field(60)?);
+    if fields.next().is_some() || !(1..=31).contains(&day) {
+        return None;
+    }
+    // Days from the civil date (Howard Hinnant's algorithm), proleptic Gregorian.
+    let shifted = if month <= 2 { year - 1 } else { year };
+    let era = shifted.div_euclid(400);
+    let year_of_era = shifted - era * 400;
+    let month_index = (month + 9) % 12;
+    let day_of_year = (153 * month_index + 2) / 5 + day - 1;
+    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
+    let days = era * 146_097 + day_of_era - 719_468;
+    Some(days * 86_400 + hour * 3_600 + minute * 60 + second)
+}
+
 fn record_response_headers(status: StatusCode, headers: &HeaderMap, facts: &mut ResponseFacts) {
     facts.http_status = Some(status.as_u16());
+    facts.server_date = headers
+        .get(reqwest::header::DATE)
+        .and_then(|value| value.to_str().ok())
+        .and_then(parse_http_date);
     (facts.set_cookie_count, facts.set_cookie_names) = set_cookie_names(headers);
     facts.cookies = cookie_facts(headers);
     facts.intermediary = intermediary_facts(headers);
@@ -8312,6 +8469,7 @@ impl ProbeLocalFile {
                     size: metadata.len(),
                     mtime_ms,
                     identity: crate::local::file_identity(&metadata),
+                    times: crate::local::change_times(&metadata),
                     content_md5: Some(content_md5),
                 },
             });
@@ -8557,6 +8715,11 @@ fn verify_open_file_snapshot(local: &LocalEntry, file: &File) -> Result<()> {
         .ok()
         .and_then(|duration| i64::try_from(duration.as_millis()).ok());
     if !metadata.is_file() || metadata.len() != local.size || millis != Some(local.mtime_ms) {
+        return Err(Error::SourceChanged(local.full_path.clone()));
+    }
+    // The status-change time too, where the scan recorded one: an in-place rewrite that restored
+    // size and mtime is still a different source than the one the plan read.
+    if local.times.is_known() && crate::local::change_times(&metadata) != local.times {
         return Err(Error::SourceChanged(local.full_path.clone()));
     }
     Ok(())
@@ -10627,6 +10790,9 @@ mod tests {
                             kind: EntryKind::File,
                             size: 1,
                             mtime_seconds: 1,
+                            ctime_seconds: None,
+                            crtime_seconds: None,
+                            digest_nas_time: None,
                             mount_point_type: None,
                             content_md5: None,
                         },
@@ -10710,6 +10876,9 @@ mod tests {
                     kind: EntryKind::Directory,
                     size: 0,
                     mtime_seconds: 0,
+                    ctime_seconds: None,
+                    crtime_seconds: None,
+                    digest_nas_time: None,
                     mount_point_type: None,
                     content_md5: None,
                 },
@@ -11245,10 +11414,53 @@ mod tests {
     }
 
     #[test]
+    fn an_http_date_is_read_as_the_nas_clock_and_anything_else_is_no_clock() {
+        assert_eq!(
+            parse_http_date("Sun, 06 Nov 1994 08:49:37 GMT"),
+            Some(784_111_777)
+        );
+        assert_eq!(parse_http_date("Thu, 01 Jan 1970 00:00:00 GMT"), Some(0));
+        assert_eq!(
+            parse_http_date("Tue, 29 Feb 2028 23:59:59 GMT"),
+            Some(1_835_481_599)
+        );
+        // The obsolete forms, a local zone, and malformed fields are no clock at all, which makes
+        // evidence racy (never served) rather than wrongly dated.
+        for rejected in [
+            "Sunday, 06-Nov-94 08:49:37 GMT",
+            "Sun Nov  6 08:49:37 1994",
+            "Sun, 06 Nov 1994 08:49:37 +0000",
+            "Sun, 6 Nov 1994 08:49:37 GMT",
+            "Sun, 06 Nov 1994 24:00:00 GMT",
+            "Sun, 06 Foo 1994 08:49:37 GMT",
+            "",
+        ] {
+            assert_eq!(parse_http_date(rejected), None, "{rejected:?}");
+        }
+    }
+
+    #[test]
+    fn a_listing_keeps_the_change_and_creation_times_dsm_reports() {
+        let additional: RemoteAdditionalWire = serde_json::from_value(serde_json::json!({
+            "size": 3,
+            "time": {"mtime": 10, "ctime": 11, "crtime": 9, "atime": 12}
+        }))
+        .unwrap();
+        assert_eq!(remote_change_times(&additional), (Some(11), Some(9)));
+        let without: RemoteAdditionalWire =
+            serde_json::from_value(serde_json::json!({"size": 3, "time": {"mtime": 10}})).unwrap();
+        assert_eq!(remote_change_times(&without), (None, None));
+    }
+
+    #[test]
     fn file_metadata_fails_closed_for_files_and_defaults_only_for_directories() {
         let complete = RemoteAdditionalWire {
             size: Some(9),
-            time: Some(RemoteTimeWire { mtime: Some(13) }),
+            time: Some(RemoteTimeWire {
+                mtime: Some(13),
+                ctime: None,
+                crtime: None,
+            }),
             mount_point_type: None,
             real_path: None,
             perm: None,
@@ -12933,6 +13145,7 @@ mod tests {
             size: metadata.len(),
             mtime_ms,
             identity: Default::default(),
+            times: Default::default(),
             content_md5: Some(ContentMd5::from_content(payload)),
         };
         client
@@ -13082,6 +13295,7 @@ mod tests {
             )
             .unwrap(),
             identity: Default::default(),
+            times: Default::default(),
             content_md5: Some(ContentMd5::from_content(b"abc")),
         };
         client.upload(&local, "/share/root/abc.bin").unwrap();
@@ -13691,6 +13905,7 @@ mod tests {
             size: 3,
             mtime_ms: 0,
             identity: Default::default(),
+            times: Default::default(),
             content_md5: None,
         };
         let error = client
@@ -13722,6 +13937,7 @@ mod tests {
             size: metadata.len() + 1,
             mtime_ms,
             identity: Default::default(),
+            times: Default::default(),
             content_md5: None,
         };
         assert!(matches!(
@@ -13737,6 +13953,7 @@ mod tests {
             size: metadata.len(),
             mtime_ms,
             identity: Default::default(),
+            times: Default::default(),
             content_md5: Some(ContentMd5::from_bytes([0_u8; 16])),
         };
         assert!(matches!(
@@ -13751,6 +13968,7 @@ mod tests {
             size: metadata.len(),
             mtime_ms,
             identity: Default::default(),
+            times: Default::default(),
             content_md5: Some(ContentMd5::from_content(b"payload")),
         };
         client
@@ -14339,6 +14557,7 @@ mod tests {
             )
             .unwrap(),
             identity: Default::default(),
+            times: Default::default(),
             content_md5: Some(ContentMd5::from_content(contents)),
         };
         (path, entry)
@@ -17698,6 +17917,7 @@ FplE
             )
             .unwrap(),
             identity: Default::default(),
+            times: Default::default(),
             content_md5: None,
         };
         (path, entry)

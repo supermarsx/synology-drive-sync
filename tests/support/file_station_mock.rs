@@ -33,6 +33,35 @@ impl CapturedRequest {
 struct FileNode {
     contents: Vec<u8>,
     mtime_seconds: i64,
+    /// `time.ctime`: moves on every write, as `st_ctime` does, whatever mtime the writer kept.
+    ctime_seconds: i64,
+    /// `time.crtime`: set when the file is created.
+    crtime_seconds: i64,
+}
+
+/// The mock's clock, in Unix seconds, as its `Date` header and change times read it.
+fn mock_now_seconds() -> i64 {
+    i64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock after epoch")
+            .as_secs(),
+    )
+    .expect("seconds fit i64")
+}
+
+impl FileNode {
+    /// A file a client wrote now: its change and creation times are now, its mtime is the
+    /// writer's.
+    fn written(contents: Vec<u8>, mtime_seconds: i64) -> Self {
+        let now = mock_now_seconds();
+        Self {
+            contents,
+            mtime_seconds,
+            ctime_seconds: now,
+            crtime_seconds: now,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -123,6 +152,9 @@ struct ServerState {
     /// Actions to run once, when the first request for an operation arrives and before it is
     /// answered: the way a test changes the local tree at a known point in a run.
     request_hooks: Vec<RequestHook>,
+    /// NAS-side content edits to make when the first request for an operation arrives:
+    /// `(operation, path, contents, keep_ctime)`. `keep_ctime` is a change no listing fact shows.
+    remote_edits_on: Vec<(String, String, Vec<u8>, bool)>,
     /// Folders whose `List.list` DSM refuses with a code, the way an ACL that denies this account
     /// a sub-folder looks: the folder is still listed in its parent, and listing it is refused.
     refused_listings: BTreeMap<String, i64>,
@@ -289,6 +321,7 @@ impl MockFileStation {
             real_path_withheld: BTreeSet::new(),
             misreport_real_paths: false,
             request_hooks: Vec::new(),
+            remote_edits_on: Vec::new(),
             refused_listings: BTreeMap::new(),
             vanish_after_listing: None,
             expire_every: None,
@@ -377,8 +410,79 @@ impl MockFileStation {
             FileNode {
                 contents: contents.to_vec(),
                 mtime_seconds,
+                // A fixture is old: its change and creation times are its mtime.
+                ctime_seconds: mtime_seconds,
+                crtime_seconds: mtime_seconds,
             },
         );
+    }
+
+    /// Delete a file from the NAS, as another client would.
+    #[allow(dead_code)]
+    pub fn remove_file(&self, path: &str) {
+        self.state
+            .lock()
+            .expect("mock state lock")
+            .files
+            .remove(path)
+            .expect("removed file exists");
+    }
+
+    /// When the first `operation` request arrives, replace `path`'s content as a second writer
+    /// would: keeping size and mtime, and moving ctime unless `keep_ctime` (a change no fact
+    /// shows, which only a live digest can catch).
+    #[allow(dead_code)]
+    pub fn edit_file_on_next(
+        &self,
+        operation: &str,
+        path: &str,
+        contents: &[u8],
+        keep_ctime: bool,
+    ) {
+        self.state
+            .lock()
+            .expect("mock state lock")
+            .remote_edits_on
+            .push((
+                operation.to_owned(),
+                path.to_owned(),
+                contents.to_vec(),
+                keep_ctime,
+            ));
+    }
+
+    /// Replace a file's content keeping its size-independent mtime, as a second writer that
+    /// preserves times would (`rsync -t`, a Drive client): only `ctime` moves, to now.
+    #[allow(dead_code)]
+    pub fn rewrite_file_keeping_mtime(&self, path: &str, contents: &[u8]) {
+        let mut state = self.state.lock().expect("mock state lock");
+        let file = state.files.get_mut(path).expect("rewritten file exists");
+        file.contents = contents.to_vec();
+        file.ctime_seconds = mock_now_seconds();
+    }
+
+    /// Set a file's change and creation times, for a test that needs evidence older than the
+    /// racy window without waiting for it.
+    #[allow(dead_code)]
+    pub fn set_file_times(&self, path: &str, ctime_seconds: i64, crtime_seconds: i64) {
+        let mut state = self.state.lock().expect("mock state lock");
+        let file = state.files.get_mut(path).expect("file exists");
+        file.ctime_seconds = ctime_seconds;
+        file.crtime_seconds = crtime_seconds;
+    }
+
+    /// Replace a file's content keeping every listing fact, change times included: a change the
+    /// facts cannot show, which only a live digest (the canary) can catch.
+    #[allow(dead_code)]
+    pub fn corrupt_file_keeping_every_fact(&self, path: &str, contents: &[u8]) {
+        let mut state = self.state.lock().expect("mock state lock");
+        let file = state.files.get_mut(path).expect("corrupted file exists");
+        assert_eq!(
+            file.contents.len(),
+            contents.len(),
+            "facts include the size"
+        );
+        file.contents = contents.to_vec();
     }
 
     pub fn reflect_login_failure(&self, marker: &str) {
@@ -993,6 +1097,18 @@ fn handle_connection(
         {
             (state.request_hooks.remove(index).action)();
         }
+        if let Some(index) = state
+            .remote_edits_on
+            .iter()
+            .position(|(trigger, ..)| *trigger == operation)
+        {
+            let (_, path, contents, keep_ctime) = state.remote_edits_on.remove(index);
+            let file = state.files.get_mut(&path).expect("edited file exists");
+            file.contents = contents;
+            if !keep_ctime {
+                file.ctime_seconds = mock_now_seconds();
+            }
+        }
         let captured_path = captured.request_path.clone();
         state.requests.push(captured);
         let routed = route_request(
@@ -1191,13 +1307,9 @@ fn route_request(
             {
                 let fault = state.getinfo_faults.remove(index);
                 if let Some((contents, mtime_seconds)) = fault.change_to {
-                    state.files.insert(
-                        fault.path,
-                        FileNode {
-                            contents,
-                            mtime_seconds,
-                        },
-                    );
+                    state
+                        .files
+                        .insert(fault.path, FileNode::written(contents, mtime_seconds));
                 }
                 return MockResponse::HttpStatus {
                     status: fault.status,
@@ -1262,10 +1374,7 @@ fn route_request(
             {
                 state.files.insert(
                     mutation.path,
-                    FileNode {
-                        contents: mutation.contents,
-                        mtime_seconds: mutation.mtime_seconds,
-                    },
+                    FileNode::written(mutation.contents, mutation.mtime_seconds),
                 );
             }
             response
@@ -1358,22 +1467,14 @@ fn route_request(
                 torn.resize(new.len(), 0);
                 let written = written.min(new.len());
                 torn[..written].copy_from_slice(&new[..written]);
-                state.files.insert(
-                    path,
-                    FileNode {
-                        contents: torn,
-                        mtime_seconds,
-                    },
-                );
+                state
+                    .files
+                    .insert(path, FileNode::written(torn, mtime_seconds));
                 return MockResponse::Drop;
             }
-            state.files.insert(
-                path,
-                FileNode {
-                    contents: upload.contents,
-                    mtime_seconds,
-                },
-            );
+            state
+                .files
+                .insert(path, FileNode::written(upload.contents, mtime_seconds));
             if let Some(response) =
                 take_injected_fault(state, request_path, api, method, FaultPhase::AfterCommit)
             {
@@ -1467,7 +1568,7 @@ fn route_request(
                 state.failing_copy_tasks.insert(task.clone());
                 return success(json!({"taskid": task}));
             }
-            let mut copy = source_file;
+            let mut copy = FileNode::written(source_file.contents, source_file.mtime_seconds);
             if let Some(mtime_seconds) = state.copy_stamps_mtime {
                 copy.mtime_seconds = mtime_seconds;
             }
@@ -1518,7 +1619,9 @@ fn route_request(
             if state.files.contains_key(&renamed) || state.directories.contains(&renamed) {
                 return api_error(414);
             }
-            if let Some(file) = state.files.remove(&path) {
+            if let Some(mut file) = state.files.remove(&path) {
+                // A rename changes the inode's status: ctime moves, as on ext4 and btrfs.
+                file.ctime_seconds = mock_now_seconds();
                 state.files.insert(renamed.clone(), file);
             } else if state.directories.contains(&path) {
                 let prefix = format!("{path}/");
@@ -1840,7 +1943,11 @@ fn node_value(state: &ServerState, path: &str) -> Option<Value> {
             "isdir": false,
             "additional": {
                 "size": file.contents.len(),
-                "time": {"mtime": file.mtime_seconds},
+                "time": {
+                    "mtime": file.mtime_seconds,
+                    "ctime": file.ctime_seconds,
+                    "crtime": file.crtime_seconds
+                },
                 "mount_point_type": ""
             }
         })
@@ -1848,17 +1955,24 @@ fn node_value(state: &ServerState, path: &str) -> Option<Value> {
 }
 
 fn direct_children(state: &ServerState, folder: &str) -> Vec<Value> {
+    use std::ops::Bound;
     let prefix = format!("{}/", folder.trim_end_matches('/'));
+    // Ranged from the prefix rather than filtered over every entry: a whole-store scan per page
+    // made the mock O(entries) per listing, and a scale test measured the mock instead of the
+    // client (scale-harness lesson).
     let mut children = state
         .directories
-        .iter()
-        .filter(|path| path.starts_with(&prefix) && !path[prefix.len()..].contains('/'))
+        .range::<str, _>((Bound::Included(prefix.as_str()), Bound::Unbounded))
+        .take_while(|path| path.starts_with(&prefix))
+        .filter(|path| !path[prefix.len()..].contains('/'))
         .filter_map(|path| node_value(state, path))
         .chain(
             state
                 .files
-                .keys()
-                .filter(|path| path.starts_with(&prefix) && !path[prefix.len()..].contains('/'))
+                .range::<str, _>((Bound::Included(prefix.as_str()), Bound::Unbounded))
+                .map(|(path, _)| path)
+                .take_while(|path| path.starts_with(&prefix))
+                .filter(|path| !path[prefix.len()..].contains('/'))
                 .filter_map(|path| node_value(state, path)),
         )
         .collect::<Vec<_>>();
@@ -2085,14 +2199,51 @@ fn write_response(stream: &mut TcpStream, response: MockResponse, keep_open: boo
     } else {
         "Connection: close\r\n"
     };
-    write!(
-        stream,
-        "HTTP/1.1 {status} {reason}\r\nContent-Type: {content_type}\r\n{cookie_header}Content-Length: {}\r\n{connection_header}\r\n",
+    // One write per response, with Nagle off: a header and a body in two writes stall on
+    // delayed ACK, which skewed every timing taken against this mock (scale-harness lesson).
+    let mut out = format!(
+        "HTTP/1.1 {status} {reason}\r\nDate: {}\r\nContent-Type: {content_type}\r\n{cookie_header}Content-Length: {}\r\n{connection_header}\r\n",
+        http_date(mock_now_seconds()),
         body.len()
     )
-    .expect("write mock response");
-    stream.write_all(&body).expect("write mock response body");
+    .into_bytes();
+    out.extend_from_slice(&body);
+    let _ = stream.set_nodelay(true);
+    stream.write_all(&out).expect("write mock response");
     stream.flush().expect("flush mock response");
+}
+
+/// IMF-fixdate for `seconds`, as an HTTP server's `Date` header carries it.
+fn http_date(seconds: i64) -> String {
+    const DAYS: [&str; 7] = ["Thu", "Fri", "Sat", "Sun", "Mon", "Tue", "Wed"];
+    const MONTHS: [&str; 12] = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ];
+    let days = seconds.div_euclid(86_400);
+    let clock = seconds.rem_euclid(86_400);
+    // Civil date from days (Howard Hinnant's algorithm).
+    let shifted = days + 719_468;
+    let era = shifted.div_euclid(146_097);
+    let day_of_era = shifted - era * 146_097;
+    let year_of_era =
+        (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let month_index = (5 * day_of_year + 2) / 153;
+    let day = day_of_year - (153 * month_index + 2) / 5 + 1;
+    let month = if month_index < 10 {
+        month_index + 3
+    } else {
+        month_index - 9
+    };
+    let year = year_of_era + era * 400 + i64::from(month <= 2);
+    format!(
+        "{}, {day:02} {} {year:04} {:02}:{:02}:{:02} GMT",
+        DAYS[usize::try_from(days.rem_euclid(7)).expect("weekday index")],
+        MONTHS[usize::try_from(month - 1).expect("month index")],
+        clock / 3_600,
+        clock % 3_600 / 60,
+        clock % 60
+    )
 }
 
 fn http_reason(status: u16) -> &'static str {

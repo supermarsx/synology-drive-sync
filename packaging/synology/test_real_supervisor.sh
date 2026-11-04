@@ -84,6 +84,8 @@ dump_diagnostics() {
             "$physical_var/run/controller.pid" \
             "$physical_var/run/controller.starting" \
             "$physical_var/run/controller.ready" \
+            "$physical_var/run/daemon.ready" \
+            "$physical_var/log/daemon-stderr.log" \
             "$fallback_cgi_summary" \
             "$cgi_summary"
         do
@@ -240,6 +242,14 @@ chmod 0755 "$physical_store"
 chmod 0700 "$physical_home" "$physical_var"
 chown -R "$package_uid:$package_gid" "$physical_store" "$physical_home" "$physical_var" \
     "$package_base/scripts"
+# This fixture proves the shell engine's supervised API child, CGI relay and
+# controller queue consumer. The daemon engine (the default without this file)
+# serves its API through --serve-api; its lifecycle is covered by the package
+# suite until the real-supervisor fixture gains a daemon pass.
+install -d -m 0700 -o "$package_uid" -g "$package_gid" "$physical_var/state"
+printf 'shell\n' > "$physical_var/state/engine"
+chown "$package_uid:$package_gid" "$physical_var/state/engine"
+chmod 0600 "$physical_var/state/engine"
 # DSM's installed @appstore payload is not a mutable runtime directory. Model
 # that boundary explicitly so startup cannot regress to binding inside ui/.
 chmod 0555 "$physical_store/ui"
@@ -754,5 +764,69 @@ printf '%s\n' "$stopped_cgi_response" | grep -Fq '"status":503' \
     exit 1
 }
 
+# The daemon engine, the default without an engine file: the same lifecycle
+# script launches the Rust daemon with --serve-api on the real /var/packages
+# paths, and the CGI reaches the API server the daemon supervises.
+rm -f "$physical_var/state/engine"
+run_lifecycle start
+run_lifecycle status
+for daemon_record in "$physical_var/run/daemon.pid" "$physical_var/run/daemon.ready"; do
+    [ -f "$daemon_record" ] && [ ! -L "$daemon_record" ] \
+        && [ "$(stat -c '%u:%a:%h' "$daemon_record")" = "$package_uid:600:1" ] || {
+        echo "the started daemon did not publish $daemon_record as a package-owned 0600 file" >&2
+        exit 1
+    }
+done
+for daemon_socket in "$physical_var/run/ctl.sock" "$api_socket"; do
+    [ -S "$daemon_socket" ] && [ ! -L "$daemon_socket" ] \
+        && [ "$(stat -c '%u' "$daemon_socket")" = "$package_uid" ] || {
+        echo "the started daemon did not serve $daemon_socket" >&2
+        exit 1
+    }
+done
+[ ! -e "$physical_var/run/controller.pid" ] || {
+    echo "the daemon engine started the shell controller" >&2
+    exit 1
+}
+set +e
+daemon_cgi_response=$(run_package_cgi)
+daemon_cgi_status=$?
+set -e
+daemon_cgi_response=$(printf '%s' "$daemon_cgi_response" | tr -d '\r')
+require_cgi_json_response "daemon-served CSRF" "$daemon_cgi_status" "200 OK" \
+    sdsync.dsm-csrf.v1 "$daemon_cgi_response"
+set +e
+daemon_snapshot_response=$(run_package_cgi_get action=snapshot)
+daemon_snapshot_status=$?
+set -e
+daemon_snapshot_response=$(printf '%s' "$daemon_snapshot_response" | tr -d '\r')
+require_cgi_json_response "daemon-served snapshot" "$daemon_snapshot_status" "200 OK" \
+    sdsync.dsm-api.v1 "$daemon_snapshot_response"
+
+run_lifecycle stop
+set +e
+run_lifecycle status
+daemon_stopped_status=$?
+set -e
+[ "$daemon_stopped_status" -eq 3 ] || {
+    echo "stopped daemon lifecycle returned $daemon_stopped_status instead of 3" >&2
+    exit 1
+}
+for daemon_record in "$physical_var/run/daemon.pid" "$physical_var/run/daemon.ready" \
+    "$physical_var/run/ctl.sock"
+do
+    if [ -e "$daemon_record" ] || [ -L "$daemon_record" ]; then
+        echo "the stopped daemon left $daemon_record behind" >&2
+        exit 1
+    fi
+done
+set +e
+daemon_stopped_cgi=$(run_package_cgi)
+set -e
+printf '%s\n' "$daemon_stopped_cgi" | tr -d '\r' | grep -Fq '"code":"service_unavailable"' || {
+    echo "the CGI of a stopped daemon is not the service-unavailable schema" >&2
+    exit 1
+}
+
 trap - EXIT
-echo "real Rust supervisor, package-UID CGI, and DSM shell lifecycle passed under BusyBox"
+echo "real Rust supervisor, package-UID CGI, and DSM shell and daemon lifecycles passed under BusyBox"
