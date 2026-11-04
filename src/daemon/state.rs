@@ -1755,7 +1755,9 @@ mod tests {
                     while !done.load(Ordering::SeqCst) {
                         if let Ok(metadata) = fs::symlink_metadata(&pid) {
                             seen += 1;
-                            if metadata.nlink() != 1 {
+                            // nlink 0 is a record caught mid-removal by
+                            // remove_run_lock; a second name is nlink 2.
+                            if metadata.nlink() > 1 {
                                 doubled += 1;
                             }
                         }
@@ -1769,7 +1771,7 @@ mod tests {
             }
             done.store(true, Ordering::SeqCst);
             let (seen, doubled) = observer.join().unwrap();
-            eprintln!("run.lock/pid observed {seen} times, {doubled} with nlink != 1");
+            eprintln!("run.lock/pid observed {seen} times, {doubled} with nlink above 1");
             assert!(seen > 0, "the observer never saw the owner record");
             assert_eq!(doubled, 0, "run.lock/pid had a second link {doubled} times");
         }
