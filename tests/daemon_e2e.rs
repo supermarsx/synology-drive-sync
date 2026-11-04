@@ -19,6 +19,10 @@ use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 
+#[path = "support/dsm_package.rs"]
+mod dsm_package;
+use dsm_package::DsmPackage;
+
 const DAEMON: &str = env!("CARGO_BIN_EXE_sdsync-dsm-api");
 const CORE: &str = env!("CARGO_BIN_EXE_synology-drive-sync");
 
@@ -26,6 +30,7 @@ static NEXT: AtomicU64 = AtomicU64::new(0);
 
 struct Package {
     root: PathBuf,
+    dsm: DsmPackage,
     daemon: Option<Child>,
 }
 
@@ -47,36 +52,25 @@ impl Package {
             std::process::id(),
             NEXT.fetch_add(1, Ordering::SeqCst)
         ));
-        let _ = fs::remove_dir_all(&root);
-        // Shaped like DSM: home and var are the framework's symlinks to
-        // @apphome and @appdata, which is what the scripts pass the daemon.
-        for dir in [
-            "",
-            "@apphome",
-            "@apphome/config",
-            "@apphome/config/profiles.d",
-            "@apphome/config/routines.d",
-            "@apphome/secrets",
-            "@appdata",
-        ] {
-            private_dir(&root.join(dir));
+        let dsm = DsmPackage::build(&root, Path::new(CORE));
+        dsm.configure_profile("alpha", &[]);
+        Self {
+            root,
+            dsm,
+            daemon: None,
         }
-        std::os::unix::fs::symlink(root.join("@apphome"), root.join("home")).unwrap();
-        std::os::unix::fs::symlink(root.join("@appdata"), root.join("var")).unwrap();
-        // As the package writes them: the daemon holds every run to the
-        // runner's pre-core checks (the url, the policy, the password file).
-        fs::write(
-            root.join("home/config/profiles.d/alpha.toml"),
-            "[profiles.alpha]\nsource = \"/volume1/alpha\"\nremote = \"/home/Drive/alpha\"\n\
-             url = \"http://127.0.0.1:9\"\nusername = \"operator\"\nexcludes = []\n\
-             delete = false\nallow-empty-source = false\nmax-delete = 100\n\
-             allow-http = true\ndanger-accept-invalid-certs = false\n",
-        )
-        .unwrap();
-        let password = root.join("home/secrets/alpha.password");
-        fs::write(&password, b"secret\n").unwrap();
-        fs::set_permissions(&password, fs::Permissions::from_mode(0o600)).unwrap();
-        Self { root, daemon: None }
+    }
+
+    /// Save profile `name` through the real manager (`overrides` replace or add
+    /// `configure-profile` options, e.g. `("--timeout", "2")`), returning the
+    /// fragment it wrote. Call before [`Package::start`].
+    fn configure(&self, name: &str, overrides: &[(&str, &str)]) -> PathBuf {
+        self.dsm.configure_profile(name, overrides)
+    }
+
+    /// The directory profile `name` syncs from (under the DSM volume root).
+    fn source_dir(&self, name: &str) -> PathBuf {
+        self.dsm.source_dir(name)
     }
 
     fn p(&self, rel: &str) -> PathBuf {
@@ -322,23 +316,17 @@ fn a_black_hole_server_ends_in_a_named_timeout() {
             held.push(stream);
         }
     });
-    let source = package.p("source");
-    fs::create_dir_all(&source).unwrap();
+    let source = package.source_dir("alpha");
     fs::write(source.join("file.txt"), b"data").unwrap();
-    let password = package.p("home/secrets/alpha.password");
-    fs::write(&password, b"secret\n").unwrap();
-    fs::set_permissions(&password, fs::Permissions::from_mode(0o600)).unwrap();
-    fs::write(
-        package.p("home/config/config.toml"),
-        format!(
-            "default-profile = \"alpha\"\n\n[profiles.alpha]\nsource = \"{}\"\nremote = \"/home/Drive/alpha\"\n\
-             url = \"http://127.0.0.1:{port}\"\nusername = \"operator\"\npassword-file = \"{}\"\n\
-             no-vault = true\nallow-http = true\ntimeout = 2\nconnect-timeout = 2\nretries = 0\n",
-            source.display(),
-            password.display()
-        ),
-    )
-    .unwrap();
+    package.configure(
+        "alpha",
+        &[
+            ("--url", &format!("http://127.0.0.1:{port}")),
+            ("--timeout", "2"),
+            ("--connect-timeout", "2"),
+            ("--retries", "0"),
+        ],
+    );
     package.start(Path::new(CORE), &[]);
     package.ask(json!({"verb": "run", "scope": "alpha"}));
     package.wait_until("the core", Duration::from_secs(10), |s| !idle(s));
@@ -820,4 +808,50 @@ fn a_launch_that_times_out_stops_its_supervisor_and_names_the_cause() {
         thread::sleep(Duration::from_millis(50));
     }
     assert!(!package.p("var/run/supervisor.pid").exists());
+}
+
+/// The unit harness (`src/daemon/control_tests.rs`) runs on every CI platform, so
+/// it cannot run the shell manager. It renders its profile fragments from a
+/// template (`src/daemon/testdata/manager-profile.toml`); this test is what keeps
+/// that template honest: it is the real manager's output with the package root,
+/// the source directory and the profile name replaced by `@ROOT@`, `@SOURCE@`
+/// and `@NAME@`, for two profile names. Set `SDSYNC_REGEN_MANAGER_TEMPLATE=1` to
+/// rewrite the template after a deliberate manager change.
+#[test]
+fn the_unit_harness_template_is_what_the_real_manager_renders() {
+    const TEMPLATE: &str = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/src/daemon/testdata/manager-profile.toml"
+    );
+    let package = Package::new("template");
+    let render = |name: &str| {
+        let fragment = package.configure(name, &[]);
+        let text = fs::read_to_string(&fragment)
+            .unwrap_or_else(|e| panic!("read {}: {e}", fragment.display()));
+        (text, package.source_dir(name))
+    };
+    let (alpha, alpha_source) = render("alpha");
+    let normalized = alpha
+        .replace(alpha_source.to_str().unwrap(), "@SOURCE@")
+        .replace(package.root.to_str().unwrap(), "@ROOT@")
+        .replace("alpha", "@NAME@");
+    if std::env::var_os("SDSYNC_REGEN_MANAGER_TEMPLATE").is_some() {
+        fs::write(TEMPLATE, &normalized).unwrap_or_else(|e| panic!("write {TEMPLATE}: {e}"));
+    }
+    let template = fs::read_to_string(TEMPLATE).unwrap_or_else(|e| panic!("read {TEMPLATE}: {e}"));
+    assert_eq!(
+        normalized, template,
+        "the manager renders a profile differently from the unit-harness template; \
+         re-run with SDSYNC_REGEN_MANAGER_TEMPLATE=1 and review the diff"
+    );
+    assert!(template.starts_with("[profiles.@NAME@]\n"), "{template}");
+    let (other, other_source) = render("bravo-2");
+    let expected = template
+        .replace("@SOURCE@", other_source.to_str().unwrap())
+        .replace("@ROOT@", package.root.to_str().unwrap())
+        .replace("@NAME@", "bravo-2");
+    assert_eq!(
+        other, expected,
+        "the template does not generalise over the name"
+    );
 }

@@ -177,6 +177,15 @@ impl Harness {
         let _ = fs::remove_dir_all(&root);
         let home = root.join("home");
         let var = root.join("var");
+        // Shaped like DSM: `home` and `var` are the framework's symlinks to
+        // `@apphome` and `@appdata`, which is what the scripts pass the daemon.
+        #[cfg(unix)]
+        {
+            for (alias, real) in [("home", "@apphome"), ("var", "@appdata")] {
+                fs::create_dir_all(root.join(real)).unwrap();
+                std::os::unix::fs::symlink(root.join(real), root.join(alias)).unwrap();
+            }
+        }
         for dir in [
             "home/config/profiles.d",
             "home/config/routines.d",
@@ -312,10 +321,69 @@ impl Drop for Harness {
     }
 }
 
+/// The shipped manager's `[profiles.<name>]` table, as `configure-profile`
+/// renders it, with `@ROOT@`, `@SOURCE@` and `@NAME@` left to fill. The e2e test
+/// `the_unit_harness_template_is_what_the_real_manager_renders` re-renders it
+/// with the real shell manager and fails when the two drift apart, so the
+/// fragments below are the manager's, not this file's idea of them.
+const MANAGER_PROFILE: &str = include_str!("testdata/manager-profile.toml");
+
+/// Where a DSM volume source for `name` sits in this harness (the manager admits
+/// sources only under a volume; the fake launcher never touches the directory).
+fn volume_source(root: &Path, name: &str) -> PathBuf {
+    root.join("sysroot/volume1").join(name)
+}
+
+/// A path as TOML text and as the daemon reads it back: forward slashes on every
+/// platform (a backslash-u in a TOML basic string is not a path).
+fn slashed(path: &Path) -> String {
+    path.display().to_string().replace('\\', "/")
+}
+
+/// The package root a `home` or `var` path hangs off.
+fn package_root(dir: &Path) -> &Path {
+    dir.parent()
+        .expect("home and var sit under the package root")
+}
+
+/// The manager's fragment for `name`, with `settings` (`key`, TOML value text)
+/// replacing the manager's value for that key. A key the manager does not
+/// render is a test bug and panics, so a setting can never be silently dropped.
+fn fragment(root: &Path, name: &str, settings: &[(&str, &str)]) -> String {
+    let source = volume_source(root, name);
+    let mut text = MANAGER_PROFILE
+        .replace("@SOURCE@", &slashed(&source))
+        .replace("@ROOT@", &slashed(root))
+        .replace("@NAME@", name);
+    for (key, value) in settings {
+        let prefix = format!("{key} = ");
+        let mut found = false;
+        text = text
+            .lines()
+            .map(|line| {
+                if line.starts_with(&prefix) {
+                    found = true;
+                    format!("{prefix}{value}")
+                } else {
+                    line.to_string()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n";
+        assert!(found, "the manager's fragment has no `{key}` line:\n{text}");
+    }
+    text
+}
+
 fn profile(home: &Path, name: &str) {
+    profile_with(home, name, &[]);
+}
+
+fn profile_with(home: &Path, name: &str, settings: &[(&str, &str)]) {
     fs::write(
         home.join(format!("config/profiles.d/{name}.toml")),
-        format!("source = \"/volume1/{name}\"\nmax-delete = 100\n"),
+        fragment(package_root(home), name, settings),
     )
     .unwrap();
 }
@@ -576,13 +644,14 @@ fn change(h: &Harness, dir: &str) {
 #[test]
 fn a_realtime_change_dispatches_a_scoped_run_after_its_debounce() {
     let h = realtime_harness("scope");
+    let source = volume_source(&h.root, "docs");
     h.wait_for("arm", Duration::from_secs(5), |h| {
         h.changes
             .calls
             .lock()
             .unwrap()
             .iter()
-            .any(|c| c.starts_with("arm docs /volume1/docs gen="))
+            .any(|c| c.starts_with(&format!("arm docs {} gen=", slashed(&source))))
     });
     let _ = h.tx.send(Msg::Change(ChangeEvent::Backend {
         routine: "docs".into(),
@@ -834,15 +903,19 @@ fn the_performance_level_sets_the_core_nice_value() {
 
 // ------------------------------------------------------------ lasting blocks
 
-const ALPHA_FRAGMENT: &str = "source = \"/volume1/alpha\"\nmax-delete = 100\n";
+/// `alpha`'s fragment as the manager renders it (`max-delete` 100 unless given).
+fn alpha_fragment(root: &Path, settings: &[(&str, &str)]) -> String {
+    fragment(root, "alpha", settings)
+}
 
 /// A block record for `alpha` tied to its current settings.
 fn plant_block(var: &Path) {
+    let alpha = alpha_fragment(package_root(var), &[]);
     let lasting = super::super::lasting::Lasting {
         reason: "core_oom_killed".into(),
         detail: "the sync core was killed by the out-of-memory killer (exit 137)".into(),
         since: T0 - 100,
-        fingerprint: super::super::lasting::fingerprint(Some(ALPHA_FRAGMENT.as_bytes()), None),
+        fingerprint: super::super::lasting::fingerprint(Some(alpha.as_bytes()), None),
     };
     fs::create_dir_all(var.join("state/lasting")).unwrap();
     fs::write(var.join("state/lasting/alpha.state"), lasting.render()).unwrap();
@@ -908,14 +981,14 @@ fn a_no_op_save_keeps_the_block_and_a_real_change_lifts_it() {
     h.wait_for("the hold", Duration::from_secs(5), |h| {
         suppressed_logs(h) == 1
     });
-    fs::write(&fragment, ALPHA_FRAGMENT).unwrap();
+    fs::write(&fragment, alpha_fragment(&h.root, &[])).unwrap();
     let _ = h.ask(Request::Reload);
     assert_eq!(
         h.ask(Request::Status)["lasting"]["alpha"]["reason"],
         "core_oom_killed"
     );
     assert!(h.var.join("state/lasting/alpha.state").exists());
-    fs::write(&fragment, "source = \"/volume1/alpha\"\nmax-delete = 50\n").unwrap();
+    fs::write(&fragment, alpha_fragment(&h.root, &[("max-delete", "50")])).unwrap();
     let _ = h.ask(Request::Reload);
     h.wait_for("the run", Duration::from_secs(5), |h| h.launched() == 1);
     assert!(!h.var.join("state/lasting/alpha.state").exists());
@@ -1081,9 +1154,14 @@ fn an_edited_realtime_source_is_rearmed_and_old_events_are_dropped() {
         armed_generation(h, "docs").is_some()
     });
     let first = armed_generation(&h, "docs").unwrap();
+    let moved = h.root.join("sysroot/volume2/docs");
     fs::write(
         h.root.join("home/config/profiles.d/docs.toml"),
-        "source = \"/volume2/docs\"\nmax-delete = 100\n",
+        fragment(
+            &h.root,
+            "docs",
+            &[("source", &format!("\"{}\"", slashed(&moved)))],
+        ),
     )
     .unwrap();
     let _ = h.ask(Request::Reload);
@@ -1093,7 +1171,7 @@ fn an_edited_realtime_source_is_rearmed_and_old_events_are_dropped() {
             .lock()
             .unwrap()
             .iter()
-            .any(|c| c.starts_with("arm docs /volume2/docs gen="))
+            .any(|c| c.starts_with(&format!("arm docs {} gen=", slashed(&moved))))
     });
     let second = armed_generation(&h, "docs").unwrap();
     assert!(second > first, "{first} -> {second}");
@@ -1102,7 +1180,7 @@ fn an_edited_realtime_source_is_rearmed_and_old_events_are_dropped() {
         let disarm = calls.iter().position(|c| c == "disarm docs");
         let rearm = calls
             .iter()
-            .position(|c| c.starts_with("arm docs /volume2/docs"));
+            .position(|c| c.starts_with(&format!("arm docs {}", slashed(&moved))));
         assert!(disarm.is_some() && disarm < rearm, "{calls:?}");
     }
     assert!(
