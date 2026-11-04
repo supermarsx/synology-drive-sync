@@ -560,11 +560,53 @@ pub(crate) fn run_daemon(options: &Options) -> ExitCode {
     } else {
         None
     };
+    // The dashboard's queue, beside any sync (lanes, deadlines): the shell
+    // controller's consumer without its single slot. With the dashboard only.
+    let queue = if api.is_some() {
+        let queue_sink = FileSink::new(&log_root);
+        let log: super::queue::QueueLog = Arc::new(move |level, event, detail| {
+            let _ = queue_sink.log(
+                epoch().unwrap_or(0),
+                &LogEvent {
+                    level,
+                    category: "controller",
+                    event,
+                    detail,
+                },
+            );
+        });
+        match std::env::current_exe().and_then(|exe| {
+            super::queue::QueueConsumer::start(
+                exe,
+                options.var.clone(),
+                api_env.clone(),
+                super::queue::QueueSettings::default(),
+                log,
+            )
+        }) {
+            Ok(queue) => Some(queue),
+            Err(error) => {
+                say(&format!("the dashboard queue did not start: {error}"));
+                let _ = control::ask(&tx, control::Request::Stop, Duration::from_secs(60));
+                let _ = control.join();
+                if let Some(api) = api {
+                    api.stop(Duration::from_secs(5));
+                }
+                remove_if_ours(&pid_file);
+                return ExitCode::from(1);
+            }
+        }
+    } else {
+        None
+    };
     let socket = options.socket();
     if let Err(error) = ctl::listen(&socket, uid, tx.clone(), mutation_deadline) {
         say(&format!("cannot serve {}: {error}", socket.display()));
         let _ = control::ask(&tx, control::Request::Stop, Duration::from_secs(60));
         let _ = control.join();
+        if let Some(queue) = queue {
+            queue.stop(Duration::from_secs(15));
+        }
         if let Some(api) = api {
             api.stop(Duration::from_secs(5));
         }
@@ -582,6 +624,9 @@ pub(crate) fn run_daemon(options: &Options) -> ExitCode {
     }
     drop(tx);
     let _ = control.join();
+    if let Some(queue) = queue {
+        queue.stop(Duration::from_secs(15));
+    }
     if let Some(api) = api {
         api.stop(Duration::from_secs(5));
     }

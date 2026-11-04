@@ -22,6 +22,8 @@ pub(crate) mod lasting;
 #[cfg(target_os = "linux")]
 pub(crate) mod lifecycle;
 pub(crate) mod poll;
+#[cfg(target_os = "linux")]
+pub(crate) mod queue;
 pub(crate) mod routines;
 pub(crate) mod state;
 #[cfg(target_os = "linux")]
