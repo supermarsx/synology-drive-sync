@@ -392,6 +392,22 @@ fn routine(home: &Path, name: &str, conf: &str) {
     fs::write(home.join(format!("config/routines.d/{name}.conf")), conf).unwrap();
 }
 
+/// Replace `path` whole, as the shipped manager does (a private temporary beside
+/// it, then a rename). A running daemon reads these documents on its own
+/// schedule: a plain `fs::write` truncates first, so a read in between sees a
+/// torn document (the cause of a flake in the re-arm test).
+fn write_atomic(path: &Path, contents: impl AsRef<[u8]>) {
+    let name = path
+        .file_name()
+        .unwrap_or_else(|| panic!("{} has no file name", path.display()))
+        .to_string_lossy();
+    let temporary = path.with_file_name(format!(".{name}.tmp{}", std::process::id()));
+    fs::write(&temporary, contents)
+        .unwrap_or_else(|e| panic!("write {}: {e}", temporary.display()));
+    fs::rename(&temporary, path)
+        .unwrap_or_else(|e| panic!("rename {} over {}: {e}", temporary.display(), path.display()));
+}
+
 fn run(scope: &str) -> Request {
     Request::Run {
         scope: scope.into(),
@@ -1997,6 +2013,112 @@ fn a_removed_routines_unreadable_record_is_forgotten() {
         logs.iter().any(|l| l.starts_with("config_forgotten")
             && l.contains("routines/alpha.state")
             && l.contains("routine was removed")),
+        "{logs:#?}"
+    );
+}
+
+/// S3-1: an unreadable dependency state stayed in `config_unreadable` after the
+/// routine that depended on it stopped doing so (its `depends_on` edited away),
+/// until the daemon restarted, and its `kept=` text kept claiming a dependency
+/// that no longer exists. The profile is still there: only the dependency read
+/// is gone, so the entry goes with it, named.
+#[cfg(unix)]
+#[test]
+fn a_dependency_state_nobody_depends_on_any_more_is_forgotten() {
+    use std::os::unix::fs::PermissionsExt;
+    let h = Harness::new("dependency-dropped", |home, var| {
+        profile(home, "beta");
+        due_alpha(home, var);
+        routine(
+            home,
+            "alpha",
+            "enabled=true\nmode=interval\ninterval_seconds=60\ndepends_on=beta\n",
+        );
+        let state = var.join("state/profiles/beta.state");
+        fs::write(&state, "state=succeeded\n").unwrap();
+        fs::set_permissions(&state, fs::Permissions::from_mode(0o000)).unwrap();
+    });
+    let state = h.var.join("state/profiles/beta.state");
+    if super::super::testkit::permissions_do_not_bind(
+        "a_dependency_state_nobody_depends_on_any_more_is_forgotten",
+        &state,
+    ) {
+        return;
+    }
+    h.wait_for("the dependency named", Duration::from_secs(5), |h| {
+        unreadable_paths(h)
+            .iter()
+            .any(|p| p.contains("profiles/beta.state"))
+    });
+    // The operator drops the dependency (the manager's configure-routine
+    // replaces the file whole).
+    write_atomic(
+        &h.root.join("home/config/routines.d/alpha.conf"),
+        b"enabled=true\nmode=interval\ninterval_seconds=60\ndepends_on=\n",
+    );
+    let _ = h.ask(Request::Reload);
+    h.wait_for("the entry forgotten", Duration::from_secs(5), |h| {
+        !unreadable_paths(h)
+            .iter()
+            .any(|p| p.contains("profiles/beta.state"))
+    });
+    let logs = h.logs();
+    eprintln!("{logs:#?}\n{:#}", h.ask(Request::Status));
+    let forgotten = logs
+        .iter()
+        .find(|l| l.starts_with("config_forgotten") && l.contains("profiles/beta.state"))
+        .unwrap_or_else(|| panic!("the forgetting is named with its path: {logs:#?}"));
+    assert!(forgotten.contains("depends"), "{forgotten}");
+}
+
+/// S3-1: a removed profile's own state record, unreadable when a run tried to
+/// update it, stayed listed too.
+#[cfg(unix)]
+#[test]
+fn a_removed_profiles_unreadable_state_is_forgotten() {
+    use std::os::unix::fs::PermissionsExt;
+    let h = Harness::new("removed-profile-state", |home, var| {
+        profile(home, "alpha");
+        profile(home, "beta");
+        let state = var.join("state/profiles/beta.state");
+        fs::write(&state, "state=succeeded\n").unwrap();
+        fs::set_permissions(&state, fs::Permissions::from_mode(0o000)).unwrap();
+    });
+    let state = h.var.join("state/profiles/beta.state");
+    if super::super::testkit::permissions_do_not_bind(
+        "a_removed_profiles_unreadable_state_is_forgotten",
+        &state,
+    ) {
+        return;
+    }
+    assert_eq!(h.ask(run("beta"))["ok"], true);
+    h.wait_for("the state named", Duration::from_secs(5), |h| {
+        unreadable_paths(h)
+            .iter()
+            .any(|p| p.contains("profiles/beta.state"))
+    });
+    // A profile that still exists keeps its entry: the record is still read.
+    let _ = h.ask(Request::Reload);
+    assert!(
+        unreadable_paths(&h)
+            .iter()
+            .any(|p| p.contains("profiles/beta.state")),
+        "{:?}",
+        unreadable_paths(&h)
+    );
+    fs::remove_file(h.root.join("home/config/profiles.d/beta.toml")).unwrap();
+    let _ = h.ask(Request::Reload);
+    h.wait_for("the entry forgotten", Duration::from_secs(5), |h| {
+        !unreadable_paths(h)
+            .iter()
+            .any(|p| p.contains("profiles/beta.state"))
+    });
+    let logs = h.logs();
+    eprintln!("{logs:#?}");
+    assert!(
+        logs.iter().any(|l| l.starts_with("config_forgotten")
+            && l.contains("profiles/beta.state")
+            && l.contains("profile was removed")),
         "{logs:#?}"
     );
 }

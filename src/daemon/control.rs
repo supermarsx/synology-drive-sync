@@ -321,6 +321,18 @@ const KEPT_CONFIGURATION: &str = "the last configuration read";
 const KEPT_PROFILE_STATE: &str = "the record on disk, not rewritten";
 /// `kept=` for `run.state` read only to carry its aggregate forward.
 const KEPT_RUN_STATE: &str = "run.state is rewritten without the aggregate it carried";
+/// `kept=` for a dependency's profile state that cannot be read while a routine
+/// is evaluated (N-D8). It is also how a dependency-only entry is told from a
+/// profile's own record, so the entry can be forgotten when no routine depends
+/// on that profile any more (S3-1).
+const KEPT_DEPENDENCY: &str = "the dependency is not met until it can be read";
+
+/// One document that cannot be read now: why, and what the reader kept
+/// instead (the `kept=` of its `config_unreadable` line).
+struct Unreadable {
+    cause: String,
+    kept: String,
+}
 
 struct InFlightMutation {
     mutation: Mutation,
@@ -370,7 +382,7 @@ pub(crate) struct Control {
     lasting_reported: HashSet<String>,
     /// Configuration and state documents that could not be read, with the
     /// cause: each named once per episode, and its recovery named (S2-2).
-    unreadable: BTreeMap<PathBuf, String>,
+    unreadable: BTreeMap<PathBuf, Unreadable>,
     /// The service's degradation, published in controller.state (H2).
     audit_degraded: Option<ControllerDegraded>,
     last_controller_write: Option<Instant>,
@@ -592,11 +604,11 @@ impl Control {
     }
 
     fn unreadable_now_keeping(&mut self, path: &Path, cause: &str, kept: &str) {
-        if self
-            .unreadable
-            .insert(path.to_path_buf(), cause.to_owned())
-            .is_none()
-        {
+        let now = Unreadable {
+            cause: cause.to_owned(),
+            kept: kept.to_owned(),
+        };
+        if self.unreadable.insert(path.to_path_buf(), now).is_none() {
             self.log(
                 Level::Error,
                 "controller",
@@ -606,23 +618,89 @@ impl Control {
         }
     }
 
-    /// Forget the unreadable documents a removed routine leaves behind
-    /// (N-D8): nothing reads them again, so they were listed for good.
-    fn forget_unreadable(&mut self, routine: &str) {
-        let paths = [
-            self.paths.routines_dir.join(format!("{routine}.conf")),
-            self.routine_state_path(routine),
-        ];
-        for path in paths {
+    /// Forget the unreadable documents nothing reads any more (N-D8, S3-1):
+    /// otherwise they stay listed in `config_unreadable` until the daemon
+    /// restarts. Each is judged by what reads it:
+    ///
+    /// - a routine's `.conf` and routine state: the routine;
+    /// - a profile's fragment: the profile, or a routine of that name;
+    /// - a profile's state: the profile, or a routine that depends on it. One
+    ///   named only by a dependency read (`kept=` [`KEPT_DEPENDENCY`]) goes as
+    ///   soon as no routine depends on the profile, though the profile stays.
+    ///
+    /// A profile directory that cannot be listed settles nothing about
+    /// profiles, so their entries stay (the listing failure is `ctl status`'s
+    /// `index_unavailable`). The forgetting is named with the path and why.
+    fn forget_unreadable(&mut self) {
+        if self.unreadable.is_empty() {
+            return;
+        }
+        let profiles: Option<HashSet<String>> = profile_names_in(&self.paths.profiles_dir)
+            .ok()
+            .map(|names| names.into_iter().collect());
+        let depended: HashSet<String> = self
+            .routines
+            .values()
+            .filter_map(|entry| entry.routine.as_ref().ok()?.as_ref())
+            .flat_map(|routine| routine.depends_on.split(','))
+            .filter(|name| !name.is_empty())
+            .map(str::to_owned)
+            .collect();
+        let named = |path: &Path, suffix: &str| -> Option<String> {
+            path.file_name()?
+                .to_str()?
+                .strip_suffix(suffix)
+                .map(str::to_owned)
+        };
+        let mut gone: Vec<(PathBuf, &'static str)> = Vec::new();
+        for (path, entry) in &self.unreadable {
+            let Some(parent) = path.parent() else {
+                continue;
+            };
+            let removed_routine = |name: &str| !self.routines.contains_key(name);
+            let removed_profile = |name: &str| {
+                profiles
+                    .as_ref()
+                    .is_some_and(|profiles| !profiles.contains(name))
+            };
+            let why = if parent == self.paths.routines_dir {
+                named(path, ".conf")
+                    .filter(|name| removed_routine(name))
+                    .map(|_| "the routine was removed, so it is no longer read")
+            } else if parent == self.paths.routine_state_dir {
+                named(path, ".state")
+                    .filter(|name| removed_routine(name))
+                    .map(|_| "the routine was removed, so it is no longer read")
+            } else if parent == self.paths.profiles_dir {
+                named(path, ".toml")
+                    .filter(|name| removed_routine(name) && removed_profile(name))
+                    .map(|_| "the profile was removed, so it is no longer read")
+            } else if parent == self.paths.profile_state_dir {
+                named(path, ".state").and_then(|name| {
+                    if depended.contains(&name) {
+                        None
+                    } else if removed_profile(&name) {
+                        Some("the profile was removed, so it is no longer read")
+                    } else if entry.kept == KEPT_DEPENDENCY {
+                        Some("no routine depends on the profile any more, so it is no longer read")
+                    } else {
+                        None
+                    }
+                })
+            } else {
+                None
+            };
+            if let Some(why) = why {
+                gone.push((path.clone(), why));
+            }
+        }
+        for (path, why) in gone {
             if self.unreadable.remove(&path).is_some() {
                 self.log(
                     Level::Info,
                     "controller",
                     "config_forgotten",
-                    format!(
-                        "path={} cause=the routine was removed, so it is no longer read",
-                        path.display()
-                    ),
+                    format!("path={} cause={why}", path.display()),
                 );
             }
         }
@@ -1091,7 +1169,6 @@ impl Control {
             {
                 changes.disarm(&name);
             }
-            self.forget_unreadable(&name);
         }
         for name in names {
             let existing = self.routines.remove(&name);
@@ -1217,6 +1294,7 @@ impl Control {
             }
             self.routines.insert(name, entry);
         }
+        self.forget_unreadable();
         if why != "turn" {
             // A reload starts the once-per-field reporting again, so a fix that
             // does not take is reported again.
@@ -1762,7 +1840,7 @@ impl Control {
                     Err(cause) => self.unreadable_now_keeping(
                         &path,
                         &cause,
-                        "the dependency is not met until it can be read",
+                        KEPT_DEPENDENCY,
                     ),
                 }
             }
@@ -3237,7 +3315,7 @@ impl Control {
             "config_unreadable": self
                 .unreadable
                 .iter()
-                .map(|(path, cause)| json!({"path": path.display().to_string(), "cause": cause}))
+                .map(|(path, entry)| json!({"path": path.display().to_string(), "cause": entry.cause}))
                 .collect::<Vec<Value>>(),
             "lasting": self
                 .blocked
