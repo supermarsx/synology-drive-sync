@@ -1032,9 +1032,8 @@ struct TreeFacts {
     skip_sample: Vec<String>,
 }
 
-/// The arm-time walk, on a thread of its own under the process's walk cap,
-/// bounded by `deadline` and ended by `stop` (H9): an abandoned walk is told
-/// to cancel and does so at its next directory.
+/// [`newest_change_in`] under the process's real walk cap.
+#[cfg(test)]
 fn newest_change(
     root: PathBuf,
     filter: Arc<Filter>,
@@ -1063,6 +1062,10 @@ impl std::fmt::Display for CatchUpError {
     }
 }
 
+/// The arm-time walk, on a thread of its own under the process's walk cap
+/// (its place taken from `take_slot`), bounded by `deadline` and ended by
+/// `stop` (H9): an abandoned walk is told to cancel and does so at its next
+/// directory.
 fn newest_change_in(
     root: PathBuf,
     filter: Arc<Filter>,
