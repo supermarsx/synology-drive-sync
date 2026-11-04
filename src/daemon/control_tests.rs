@@ -1751,7 +1751,7 @@ fn status_carries_the_backends_detail() {
         }))
         .unwrap();
         h.wait_for("the detail in status", Duration::from_secs(5), |h| {
-            detail(h) == Value::from(account)
+            detail(h) == account
         });
     }
 }
