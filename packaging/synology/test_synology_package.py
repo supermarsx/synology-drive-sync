@@ -4197,8 +4197,24 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
         plain, plain_payload = self.api("snapshot")
         self.assertEqual(plain.returncode, 0, plain.stdout + plain.stderr)
         self.assertNotIn("degraded", plain_payload["controller"], plain.stdout)
+        # S3-3. The block is served only while the service is running: with
+        # no daemon it is absent (not null) -- and a malformed set is refused
+        # all the same.
+        write("degraded=audit_unavailable\ndegraded_since=90\ndegraded_cause=audit outbox: No space left on device\n")
+        stopped, stopped_payload = self.api("snapshot")
+        self.assertEqual(stopped.returncode, 0, stopped.stdout + stopped.stderr)
+        self.assertEqual(stopped_payload["service"]["state"], "stopped", stopped.stdout)
+        self.assertNotIn("degraded", stopped_payload["controller"], stopped.stdout)
+        write("degraded=audit_unavailable\n")
+        refused_stopped, refused_stopped_payload = self.api("snapshot")
+        self.assertEqual(refused_stopped.returncode, 73, refused_stopped.stdout + refused_stopped.stderr)
+        self.assertEqual(refused_stopped_payload["code"], "corrupt_state", refused_stopped.stdout)
+        # A running service: daemon.ready names a live process of the package user.
+        daemon = self._spawn_fake("--daemon")
+        self._write_run_record("daemon.ready", self._identity_triple(daemon.pid))
         write("degraded=audit_unavailable\ndegraded_since=90\ndegraded_cause=audit outbox: No space left on device\n")
         amber, amber_payload = self.api("snapshot")
+        self.assertEqual(amber_payload["service"], {"state": "running", "pid": daemon.pid}, amber.stdout)
         self.assertEqual(amber.returncode, 0, amber.stdout + amber.stderr)
         self.assertEqual(
             amber_payload["controller"],
@@ -4249,6 +4265,18 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
                 refused, refused_payload = self.api("snapshot")
                 self.assertEqual(refused.returncode, 73, refused.stdout + refused.stderr)
                 self.assertEqual(refused_payload["code"], "corrupt_state", refused.stdout)
+        # kill -9: the record stays, the process is gone, and the amber goes with it.
+        write("degraded=audit_unavailable\ndegraded_since=90\ndegraded_cause=audit outbox: No space left on device\n")
+        served, _ = self.api("snapshot")
+        self.assertEqual(served.returncode, 0, served.stdout + served.stderr)
+        self.assertIn('"degraded":{', served.stdout)
+        daemon.kill()
+        daemon.wait(timeout=10)
+        killed, killed_payload = self.api("snapshot")
+        self.assertEqual(killed.returncode, 0, killed.stdout + killed.stderr)
+        self.assertEqual(killed_payload["service"]["state"], "stopped", killed.stdout)
+        self.assertEqual(killed_payload["controller"]["state"], "running", killed.stdout)
+        self.assertNotIn("degraded", killed_payload["controller"], killed.stdout)
 
     def test_api_logs_selected_source_and_aggregate_output_are_capture_bounded(self) -> None:
         payload = "x" * 7000
