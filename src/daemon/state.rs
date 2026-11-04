@@ -1994,7 +1994,10 @@ mod tests {
                 facts.issue.as_deref(),
                 Some("pair-index-plan-clock-unbounded")
             );
-            assert_eq!(facts.issue_detail.as_deref(), Some(": 3 pairs were not carried"));
+            assert_eq!(
+                facts.issue_detail.as_deref(),
+                Some(": 3 pairs were not carried")
+            );
             profile.facts.index = None;
             tree.private(
                 "var/state/profiles/photos.state",

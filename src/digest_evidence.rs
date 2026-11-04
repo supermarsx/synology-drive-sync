@@ -125,7 +125,9 @@ impl EvidenceSource for ReconcileEvidence<'_, '_> {
     }
 
     fn plan_clock_unbounded(&self) -> usize {
-        self.carry.as_ref().map_or(0, PlanCarry::plan_clock_unbounded)
+        self.carry
+            .as_ref()
+            .map_or(0, PlanCarry::plan_clock_unbounded)
     }
 
     fn observe_live(
