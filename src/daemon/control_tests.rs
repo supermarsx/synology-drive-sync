@@ -1881,6 +1881,56 @@ fn the_audit_health_is_published_in_controller_state() {
     );
 }
 
+/// S3-2: a degradation that lasts but whose cause moves (the reconcile failed
+/// with exit 73, now 69) is republished with the new cause and the same start;
+/// controller.state must not keep the cause of the first failure.
+#[test]
+fn a_degradation_whose_cause_changes_is_republished() {
+    let h = Harness::new("audit-cause", |home, _| profile(home, "alpha"));
+    h.wait_for("the first controller.state", Duration::from_secs(5), |h| {
+        h.state("controller.state").starts_with("state=running\n")
+    });
+    let degraded = |cause: &str| super::super::state::ControllerDegraded {
+        reason: "audit_unavailable",
+        since: T0 - 40,
+        cause: cause.into(),
+    };
+    h.tx.send(Msg::AuditHealth(Some(degraded(
+        "the audit log could not be reconciled (exit=73)",
+    ))))
+    .unwrap();
+    h.wait_for("exit=73 written", Duration::from_secs(5), |h| {
+        h.state("controller.state").contains("(exit=73)\n")
+    });
+    h.tx.send(Msg::AuditHealth(Some(degraded(
+        "the audit log could not be reconciled (exit=69)",
+    ))))
+    .unwrap();
+    h.wait_for("exit=69 written", Duration::from_secs(5), |h| {
+        h.state("controller.state").contains("(exit=69)\n")
+    });
+    let state = h.state("controller.state");
+    let logs = h.logs();
+    eprintln!("{state}\n{logs:#?}");
+    assert!(!state.contains("exit=73"), "the old cause stayed: {state}");
+    assert!(
+        state.contains(&format!("degraded_since={}\n", T0 - 40)),
+        "one episode keeps its start: {state}"
+    );
+    // Each cause is named in the log with the episode's start.
+    for exit in ["exit=73", "exit=69"] {
+        assert_eq!(
+            logs.iter()
+                .filter(|l| l.starts_with("service_degraded reason=audit_unavailable")
+                    && l.contains(&format!("since={}", T0 - 40))
+                    && l.contains(exit))
+                .count(),
+            1,
+            "{exit}: {logs:#?}"
+        );
+    }
+}
+
 /// N-D5 (status half, asked by fix6-watch): the change source's account of
 /// a degraded backend reaches `ctl status` as `backend_detail`, the latest
 /// one, even when backend and reason did not change.

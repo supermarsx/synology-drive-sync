@@ -537,16 +537,39 @@ impl Consumer {
                 Some(entries)
             }
             Err(error) => {
-                let first = !self.unreadable.borrow().contains_key(&path);
-                if first {
-                    self.log(
-                        Level::Error,
-                        "control_dir_unreadable",
-                        format!("path={} cause={error}", path.display()),
-                    );
-                    self.unreadable
-                        .borrow_mut()
-                        .insert(path, (epoch_now(), error.to_string()));
+                let cause = error.to_string();
+                // The episode keeps its start; a cause that moves while the
+                // directory stays unreadable (denied, then not a directory) is
+                // named again and published, so neither the log nor
+                // controller.state keeps the first failure's words.
+                let was = self
+                    .unreadable
+                    .borrow()
+                    .get(&path)
+                    .map(|(since, cause)| (*since, cause.clone()));
+                match was {
+                    Some((_, ref earlier)) if *earlier == cause => {}
+                    Some((since, earlier)) => {
+                        self.log(
+                            Level::Error,
+                            "control_dir_unreadable",
+                            format!(
+                                "path={} cause={cause} was={earlier}",
+                                path.display()
+                            ),
+                        );
+                        self.unreadable.borrow_mut().insert(path, (since, cause));
+                    }
+                    None => {
+                        self.log(
+                            Level::Error,
+                            "control_dir_unreadable",
+                            format!("path={} cause={cause}", path.display()),
+                        );
+                        self.unreadable
+                            .borrow_mut()
+                            .insert(path, (epoch_now(), cause));
+                    }
                 }
                 None
             }
@@ -1271,7 +1294,13 @@ mod tests {
 log="$(dirname "$0")/calls"
 echo "$*" >> "$log"
 case $1 in
-  --audit-transaction) [ -e "$(dirname "$0")/audit-fails" ] && exit 73; exit 0 ;;
+  --audit-transaction)
+    # `audit-fails` makes the reconcile fail: with the exit it holds, or 73 when empty.
+    if [ -e "$(dirname "$0")/audit-fails" ]; then
+      code=$(cat "$(dirname "$0")/audit-fails")
+      exit "${code:-73}"
+    fi
+    exit 0 ;;
   --classify-queued-job)
     read class sleep answer < "$(dirname "$0")/var/control/requests/$2.json"
     echo "$class op-$class"; exit 0 ;;
@@ -1673,6 +1702,45 @@ exit 64
         assert_eq!(published[1], None);
     }
 
+    /// S3-2: the degradation's cause follows the reconcile while the episode
+    /// lasts. It was published when the degradation began and read exit=73
+    /// for as long as it stood, though the reconcile had moved to exit=69.
+    #[test]
+    fn the_published_cause_follows_the_reconcile_while_it_fails() {
+        let settings = QueueSettings {
+            audit_unavailable_after: Duration::from_millis(500),
+            reconcile_backoff_max: Duration::from_millis(200),
+            ..fast()
+        };
+        let f = Fixture::new("audit-cause-moves", settings);
+        fs::write(f.dir.join("audit-fails"), b"73").unwrap();
+        f.enqueue(A, "concurrent 0 answer\n");
+        f.wait("the degradation published", Duration::from_secs(10), |f| {
+            !f.health.lock().unwrap().is_empty()
+        });
+        let first = f.health.lock().unwrap()[0]
+            .clone()
+            .expect("the first change is a degradation");
+        assert!(first.cause.contains("exit=73"), "{first:?}");
+        // The failure changes its mind; nothing else changes.
+        fs::write(f.dir.join("audit-fails"), b"69").unwrap();
+        f.wait("the new cause published", Duration::from_secs(20), |f| {
+            f.health
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|h| h.as_ref().is_some_and(|d| d.cause.contains("exit=69")))
+        });
+        let published = f.health.lock().unwrap().clone();
+        eprintln!("{published:#?}");
+        let latest = published
+            .last()
+            .and_then(Option::as_ref)
+            .expect("still degraded");
+        assert!(latest.cause.contains("exit=69"), "{latest:?}");
+        assert_eq!(latest.since, first.since, "one episode, one start");
+    }
+
     /// A control directory the daemon cannot read used to read as empty: no job
     /// was ever seen and nothing said so. It is named once per episode, with its
     /// path and cause, published to controller.state as a degradation, and its
@@ -1732,6 +1800,56 @@ exit 64
                 .any(|e| e.starts_with("control_dir_recovered") && e.contains(&path)),
             "{:?}",
             f.events.lock().unwrap()
+        );
+    }
+
+    /// S3-2: an unreadable control directory whose cause changes while it stays
+    /// unreadable (permission denied, then the directory replaced by a plain
+    /// file) is published with the new cause and the episode's own start. The
+    /// cause of the first failure used to stand in controller.state, and in the
+    /// log, until the directory was readable again.
+    #[test]
+    fn an_unreadable_control_directorys_cause_follows_the_failure() {
+        let requests = |dir: &Path| dir.join("var/control/requests");
+        let f = Fixture::prepared("unreadable-dir-cause", fast(), |dir| {
+            fs::set_permissions(requests(dir), fs::Permissions::from_mode(0o000)).unwrap();
+        });
+        if super::super::testkit::permissions_do_not_bind(
+            "an_unreadable_control_directorys_cause_follows_the_failure",
+            &requests(&f.dir),
+        ) {
+            return;
+        }
+        f.wait("the first cause published", Duration::from_secs(10), |f| {
+            !f.health.lock().unwrap().is_empty()
+        });
+        let first = f.health.lock().unwrap()[0]
+            .clone()
+            .expect("the first change is a degradation");
+        assert!(first.cause.contains("ermission denied"), "{first:?}");
+        // Still unreadable, for another reason.
+        fs::remove_dir(requests(&f.dir)).unwrap();
+        fs::write(requests(&f.dir), b"not a directory").unwrap();
+        f.wait("the new cause published", Duration::from_secs(10), |f| {
+            f.health.lock().unwrap().iter().any(|h| {
+                h.as_ref()
+                    .is_some_and(|d| !d.cause.contains("ermission denied"))
+            })
+        });
+        let published = f.health.lock().unwrap().clone();
+        let events = f.events.lock().unwrap().clone();
+        eprintln!("{published:#?}\n{events:#?}");
+        let latest = published
+            .last()
+            .and_then(Option::as_ref)
+            .expect("still degraded");
+        assert_eq!(latest.reason, "control_dir_unreadable");
+        assert_eq!(latest.since, first.since, "one episode keeps its start");
+        assert!(
+            events.iter().any(|e| e.starts_with("control_dir_unreadable")
+                && e.contains("was=Permission denied")
+                && !e.contains("cause=Permission denied")),
+            "the changed cause is named, with what it was: {events:#?}"
         );
     }
 
