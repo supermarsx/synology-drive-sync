@@ -1480,6 +1480,76 @@ stop_orphan_supervisor() {
     daemon_supervisor_pid= daemon_supervisor_start=
 }
 
+# A supervisor that supervisor.pid does not identify (the record is malformed,
+# unreadable or missing) holds supervisor.lock, and no daemon is live: it is
+# between its daemon's death and the respawn. Nothing can be signalled on the
+# lock alone, but the daemon it respawns proves its parent. So the stop waits,
+# within its budget, for daemon.ready to name that daemon (daemon_identity
+# becomes 0) or for the supervisor to end (the records are then stale). A stop
+# in that window used to refuse and succeed only on a second try.
+wait_for_unidentified_supervisor_respawn() {
+    daemon_supervisor_witness || return 0
+    [ "$supervisor_witness_held" = true ] || return 0
+    daemon_stop_left
+    daemon_respawn_wait=$((daemon_stop_left_s / 2))
+    [ "$daemon_respawn_wait" -le 20 ] || daemon_respawn_wait=20
+    [ "$daemon_respawn_wait" -ge 2 ] || daemon_respawn_wait=2
+    package_message "$supervisor_witness_cause; waiting up to $daemon_respawn_wait s for it to respawn the daemon that proves it"
+    load_poll_resolution
+    poll_reset
+    while :; do
+        daemon_identity=0
+        daemon_identity_status || daemon_identity=$?
+        [ "$daemon_identity" -eq 1 ] || break
+        daemon_supervisor_witness && [ "$supervisor_witness_held" = true ] || break
+        if poll_expired "$daemon_respawn_wait"; then
+            package_message "no daemon was respawned within $daemon_respawn_wait s"
+            break
+        fi
+        poll_wait
+    done
+    daemon_stop_charge_wait
+    return 0
+}
+
+# supervisor.lock is a directory, a symlink, a fifo or unreadable, and
+# daemon_supervisor_scan found no --supervise process of this package, so
+# nothing holds it. A supervisor started over it would refuse with "cannot take
+# the supervisor lock", so make it usable again where that is safe (a link, a
+# fifo, an empty directory, a file this user may chmod) and say what was done;
+# otherwise print the exact command. The stop itself has succeeded either way.
+repair_unusable_supervisor_lock() {
+    repair_lock=$supervisor_lock_file
+    package_message "$supervisor_witness_note"
+    if [ -L "$repair_lock" ]; then
+        repair_target=$(readlink "$repair_lock" 2>/dev/null || true)
+        if rm -f -- "$repair_lock" && [ ! -e "$repair_lock" ] && [ ! -L "$repair_lock" ]; then
+            package_message "removed unusable $repair_lock (a symbolic link to ${repair_target:-a target that could not be read})"
+        else
+            package_message "warning: $repair_lock is a symbolic link and could not be removed; the next start will fail until, as the package user, you run: rm -f -- '$repair_lock'"
+        fi
+    elif [ -d "$repair_lock" ]; then
+        if rmdir -- "$repair_lock" 2>/dev/null; then
+            package_message "removed unusable $repair_lock (an empty directory)"
+        else
+            package_message "warning: $repair_lock is a directory with contents and was not removed; the next start will fail until, as the package user, you run: rm -r -- '$repair_lock'"
+        fi
+    elif [ -f "$repair_lock" ]; then
+        if chmod 600 "$repair_lock"; then
+            package_message "made $repair_lock readable again (mode 0600)"
+        else
+            package_message "warning: $repair_lock is not readable and its mode could not be changed; the next start will fail until, as root, you run: chmod 600 '$repair_lock'"
+        fi
+    else
+        if rm -f -- "$repair_lock" && [ ! -e "$repair_lock" ]; then
+            package_message "removed unusable $repair_lock (not a regular file)"
+        else
+            package_message "warning: $repair_lock is not a regular file and could not be removed; the next start will fail until, as the package user, you run: rm -f -- '$repair_lock'"
+        fi
+    fi
+    return 0
+}
+
 # Stop a daemon of this package: `ctl stop`, which lets a running sync end its
 # cancel grace and removes the daemon's records; then, if it is still there,
 # TERM and after the grace KILL, to the exact process daemon.ready names and to
@@ -1488,6 +1558,7 @@ stop_orphan_supervisor() {
 # daemon_stop_transitioned when a live daemon was stopped.
 stop_daemon_engine() {
     daemon_stop_transitioned=false
+    supervisor_witness_unusable_lock=false
     daemon_grace=${SDSYNC_DSM_STOP_TIMEOUT:-120}
     case $daemon_grace in ''|*[!0-9]*) daemon_grace=120 ;; esac
     [ "$daemon_grace" -ge 1 ] || daemon_grace=1
@@ -1499,8 +1570,6 @@ stop_daemon_engine() {
     # phase keeps a sixth of the budget (at least 2 s) in reserve from the start.
     daemon_term_share=$((daemon_grace / 6))
     [ "$daemon_term_share" -ge 2 ] || daemon_term_share=2
-    daemon_ctl_wait=$((daemon_grace - daemon_term_share - 5))
-    [ "$daemon_ctl_wait" -ge 1 ] || daemon_ctl_wait=1
     daemon_stop_charged=0
     daemon_stop_began=$(date +%s 2>/dev/null || true)
     case $daemon_stop_began in ''|*[!0-9]*)
@@ -1522,6 +1591,9 @@ stop_daemon_engine() {
         daemon_identity=0
         daemon_identity_status || daemon_identity=$?
     fi
+    if [ "$daemon_identity" -eq 1 ] && [ -z "$daemon_supervisor_pid" ]; then
+        wait_for_unidentified_supervisor_respawn
+    fi
     case $daemon_identity in
         0)
             [ -n "$daemon_supervisor_pid" ] || capture_daemon_supervisor "$daemon_live_pid"
@@ -1535,6 +1607,11 @@ stop_daemon_engine() {
     esac
     daemon_ctl_status=69
     if [ "$daemon_identity" -eq 0 ] || api_path_exists "$daemon_socket"; then
+        # What is left of the budget now, not what was left when the stop began:
+        # the orphan-supervisor phase and the respawn wait have spent some.
+        daemon_stop_left
+        daemon_ctl_wait=$((daemon_stop_left_s - daemon_term_share - 5))
+        [ "$daemon_ctl_wait" -ge 1 ] || daemon_ctl_wait=1
         daemon_ctl_status=0
         daemon_ctl_reply=$(daemon_ctl stop "wait_s=$daemon_ctl_wait" 2>&1) || daemon_ctl_status=$?
         # With no clock the whole wait is charged, whether or not it was taken.
@@ -1615,10 +1692,17 @@ stop_daemon_engine() {
         }
         daemon_record_why=
         if [ "$daemon_record" = "$supervisor_pid_file" ] && [ -n "${supervisor_record_problem:-}" ]; then
-            daemon_record_why=" (it $supervisor_record_problem, and $supervisor_lock_file is free)"
+            if [ "${supervisor_witness_unusable_lock:-false}" = true ]; then
+                daemon_record_why=" (it $supervisor_record_problem, $supervisor_lock_file cannot be used, and no process runs --supervise for this package)"
+            else
+                daemon_record_why=" (it $supervisor_record_problem, and $supervisor_lock_file is free)"
+            fi
         fi
         package_message "removed stale daemon record $daemon_record$daemon_record_why"
     done
+    if [ "${supervisor_witness_unusable_lock:-false}" = true ]; then
+        repair_unusable_supervisor_lock
+    fi
 }
 
 # 0 running (ping answers, admission open), 3 stopped (no daemon records, no
@@ -2721,6 +2805,8 @@ case ${1:-} in
                 || echo "$daemon_status_cause" >&2
             [ "$result" -ne 1 ] || [ -z "${daemon_status_stale:-}" ] \
                 || echo "stale daemon record of a daemon that is gone: $daemon_status_stale" >&2
+            [ "$result" -ne 1 ] || [ -z "${supervisor_witness_note:-}" ] \
+                || echo "$supervisor_witness_note; stop removes the record and repairs the lock" >&2
             [ "$result" -ne 1 ] || [ -z "${status_stale_api_socket:-}" ] \
                 || echo "stale API socket: $status_stale_api_socket (prepared, mode 0000; no API server and no daemon holds it)" >&2
         else

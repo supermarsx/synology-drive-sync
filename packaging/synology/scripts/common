@@ -1023,14 +1023,75 @@ daemon_supervisor_record_live() {
 supervisor_lock_file=$runtime_root/supervisor.lock
 
 # The supervisor holds supervisor.lock for its whole life (one per package).
-# 0 held, 1 free or absent, 2 cannot be told (daemon_lock_probe_cause).
+# 0 held, 1 free or absent, 2 cannot be told (daemon_lock_probe_cause;
+# supervisor_lock_unusable is true when the cause is the file itself -- not a
+# regular file, or not readable -- as opposed to a probe tool that failed).
 daemon_supervisor_lock_status() {
+    supervisor_lock_unusable=false
     [ -e "$supervisor_lock_file" ] || [ -L "$supervisor_lock_file" ] || return 1
     [ -f "$supervisor_lock_file" ] && [ ! -L "$supervisor_lock_file" ] || {
         daemon_lock_probe_cause="$supervisor_lock_file is not a regular file"
+        supervisor_lock_unusable=true
         return 2
     }
-    lock_file_probe "$supervisor_lock_file"
+    supervisor_lock_probe_status=0
+    lock_file_probe "$supervisor_lock_file" || supervisor_lock_probe_status=$?
+    supervisor_lock_unusable=$lock_probe_file_unusable
+    return "$supervisor_lock_probe_status"
+}
+
+# Whether any process runs `--supervise` for this package's var directory: the
+# one witness that needs neither supervisor.pid nor supervisor.lock. A
+# supervisor is launched as `<bridge> --supervise --home H --var $package_var
+# ...`, so a live one has --supervise and $package_var as whole argv elements.
+#   0  one does: supervisor_scan_pids lists them;
+#   1  none does, and every /proc entry could be read;
+#   2  that cannot be told: supervisor_scan_unreadable says why (an entry whose
+#      cmdline cannot be read, or no grep(1) to look with).
+# Used only when the lock cannot be, to tell "nothing holds an unusable lock"
+# from "something may".
+daemon_supervisor_scan() {
+    supervisor_scan_pids= supervisor_scan_unreadable=
+    command -v grep >/dev/null 2>&1 || {
+        supervisor_scan_unreadable="grep(1) is not installed"
+        return 2
+    }
+    # One grep over every cmdline narrows it to the few that carry the flag at
+    # all; an entry that cannot be read is reported below, not here.
+    supervisor_scan_candidates=$(grep -l -F -- '--supervise' /proc/[0-9]*/cmdline 2>/dev/null || :)
+    supervisor_scan_newline='
+'
+    for supervisor_scan_file in $supervisor_scan_candidates; do
+        supervisor_scan_pid=${supervisor_scan_file#/proc/}
+        supervisor_scan_pid=${supervisor_scan_pid%/cmdline}
+        supervisor_scan_text=$(tr '\000' '\n' 2>/dev/null < "$supervisor_scan_file") || {
+            [ ! -e "/proc/$supervisor_scan_pid" ] \
+                || supervisor_scan_unreadable="$supervisor_scan_unreadable PID $supervisor_scan_pid (cmdline unreadable)"
+            continue
+        }
+        supervisor_scan_text=$supervisor_scan_newline$supervisor_scan_text$supervisor_scan_newline
+        case $supervisor_scan_text in
+            *"${supervisor_scan_newline}--supervise${supervisor_scan_newline}"*)
+                case $supervisor_scan_text in
+                    *"${supervisor_scan_newline}${package_var}${supervisor_scan_newline}"*)
+                        supervisor_scan_pids="$supervisor_scan_pids $supervisor_scan_pid"
+                        ;;
+                esac
+                ;;
+        esac
+    done
+    # An entry that exists but cannot be read cannot be ruled out either.
+    for supervisor_scan_entry in /proc/[0-9]*; do
+        [ -e "$supervisor_scan_entry" ] || continue
+        [ -r "$supervisor_scan_entry/cmdline" ] && continue
+        [ -e "$supervisor_scan_entry" ] || continue
+        supervisor_scan_unreadable="$supervisor_scan_unreadable PID ${supervisor_scan_entry#/proc/} (cmdline unreadable)"
+    done
+    supervisor_scan_pids=${supervisor_scan_pids# }
+    supervisor_scan_unreadable=${supervisor_scan_unreadable# }
+    [ -z "$supervisor_scan_pids" ] || return 0
+    [ -z "$supervisor_scan_unreadable" ] || return 2
+    return 1
 }
 
 # Whether a supervisor may be running: 0 when supervisor.pid proves one live,
@@ -1042,20 +1103,52 @@ daemon_supervisor_lock_status() {
 # 1 when nothing says a supervisor runs. A supervisor that only the lock
 # shows cannot be identified, so nothing is signalled on it (see
 # capture_supervisor_record); what it blocks is a probe, a start and a cleanup.
+#
+# One case is settled by looking at the processes instead: the record is
+# unusable AND the lock file itself is (a directory, a symlink, a fifo, mode
+# 000), which used to be "cannot be ruled out" for good. daemon_supervisor_scan
+# looks for a --supervise process of this package. None: nothing can hold the
+# lock, so this is 1 with supervisor_witness_unusable_lock=true (the stop
+# repairs the lock) and supervisor_witness_note says why. One: it is named (0,
+# a supervisor the record does not identify). Not tellable: the old answer
+# stands. supervisor_witness_held is true when the lock is held.
 daemon_supervisor_witness() {
     supervisor_witness_cause=
+    supervisor_witness_note=
+    supervisor_witness_held=false
+    supervisor_witness_unusable_lock=false
     daemon_supervisor_record_live && return 0
     supervisor_witness_record=${supervisor_record_problem:-names no live supervisor}
     supervisor_witness_lock=0
     daemon_supervisor_lock_status || supervisor_witness_lock=$?
     case $supervisor_witness_lock in
         0)
+            supervisor_witness_held=true
             supervisor_witness_cause="$supervisor_pid_file $supervisor_witness_record, but $supervisor_lock_file is held: a supervisor runs that the record does not identify"
             return 0
             ;;
         2)
             [ -n "$supervisor_record_problem" ] || return 1
+            supervisor_witness_scan=2
+            if [ "$supervisor_lock_unusable" = true ]; then
+                supervisor_witness_scan=0
+                daemon_supervisor_scan || supervisor_witness_scan=$?
+            fi
+            case $supervisor_witness_scan in
+                1)
+                    supervisor_witness_unusable_lock=true
+                    supervisor_witness_note="$supervisor_pid_file $supervisor_witness_record and $supervisor_lock_file cannot be used (${daemon_lock_probe_cause:-unknown cause}), but no process runs --supervise for $package_var, so nothing holds it"
+                    return 1
+                    ;;
+                0)
+                    supervisor_witness_cause="$supervisor_pid_file $supervisor_witness_record and $supervisor_lock_file cannot be probed (${daemon_lock_probe_cause:-unknown cause}), and a --supervise process of this package runs (PID $supervisor_scan_pids) that the record does not identify"
+                    return 0
+                    ;;
+            esac
             supervisor_witness_cause="$supervisor_pid_file $supervisor_witness_record and $supervisor_lock_file cannot be probed (${daemon_lock_probe_cause:-unknown cause}): a supervisor cannot be ruled out"
+            if [ "$supervisor_lock_unusable" = true ] && [ -n "${supervisor_scan_unreadable:-}" ]; then
+                supervisor_witness_cause="$supervisor_witness_cause; the processes could not all be inspected: $supervisor_scan_unreadable"
+            fi
             return 0
             ;;
     esac
@@ -1100,12 +1193,15 @@ lock_probe_timed_out() {
     return 1
 }
 
+lock_probe_file_unusable=false
 lock_file_probe() {
     lock_probe_path=$1
     daemon_lock_probe_cause=
     daemon_lock_probe_unavailable=false
+    lock_probe_file_unusable=false
     [ -r "$lock_probe_path" ] || {
         lock_probe_tool=none
+        lock_probe_file_unusable=true
         daemon_lock_probe_cause="$lock_probe_path is not readable by this user"
         return 2
     }
