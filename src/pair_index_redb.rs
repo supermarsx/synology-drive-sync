@@ -322,12 +322,20 @@ fn install_panic_hook() {
                 .try_with(|cell| cell.try_borrow().ok().and_then(|path| path.clone()))
                 .ok()
                 .flatten();
-            // Only a panic raised in redb's own sources says anything about the file: one from
-            // this crate (an `expect`, a visitor) while the thread is in redb's scope does not.
-            let in_redb = info
-                .location()
-                .is_some_and(|location| location_is_redb(location.file()));
-            if let Some(path) = record.filter(|_| in_redb) {
+            // Only a panic raised in redb's own sources, or in the standard library called
+            // from them (an impossible allocation off a damaged length: "capacity overflow"),
+            // says anything about the file: one from this crate (an `expect`, a visitor) while
+            // the thread is in redb's scope does not.
+            let file = info.location().map(|location| location.file());
+            let attributed =
+                file.is_some_and(|file| location_is_redb(file) || location_is_std(file));
+            if record.is_some() && !attributed {
+                eprintln!(
+                    "pair-index: panic at {} not attributed to redb",
+                    file.unwrap_or("<unknown location>")
+                );
+            }
+            if let Some(path) = record.filter(|_| attributed) {
                 let message: String = info
                     .to_string()
                     .chars()
@@ -362,6 +370,18 @@ fn location_is_redb(file: &str) -> bool {
                 .is_some_and(|version| version.starts_with(|c: char| c.is_ascii_digit()));
         crate_dir && pair[1] == "src"
     })
+}
+
+/// Whether a panic location is in the standard library: `/rustc/<hash>/library/...` (a release
+/// toolchain, paths remapped) or a path through `/library/core/`, `/library/alloc/` or
+/// `/library/std/` (a toolchain with `rust-src`). redb reaches these with a length it read from
+/// a damaged file, so inside redb's scope they are redb's.
+fn location_is_std(file: &str) -> bool {
+    let file = file.replace('\\', "/");
+    file.starts_with("/rustc/")
+        || ["/library/core/", "/library/alloc/", "/library/std/"]
+            .iter()
+            .any(|part| file.contains(part))
 }
 
 fn write_panic_record(path: &Path, message: &str) -> std::io::Result<()> {
@@ -1600,6 +1620,55 @@ mod tests {
             "a panic from our own code must not leave a panic record"
         );
         fs::remove_dir_all(&directory).unwrap();
+    }
+
+    /// A damaged length field makes redb ask the allocator for an impossible size, and the
+    /// panic ("capacity overflow") can be raised in the standard library, called from redb. It is
+    /// redb's panic all the same: with panic=abort and no record the next run would open the
+    /// same file and abort again, for ever.
+    #[test]
+    fn a_standard_library_panic_inside_redbs_scope_marks_the_index() {
+        let directory = scratch("hook-std");
+        let paths = IndexPaths::new(&directory, "photos").unwrap();
+        {
+            let _inside = InsideRedb::enter(&paths);
+            // `step_by(0)` asserts inside core, in a function that is not `#[track_caller]`:
+            // the panic's location is core's own file, as the allocator's is for a capacity
+            // overflow reached through `reserve`.
+            let in_core = std::panic::catch_unwind(|| {
+                let step = std::hint::black_box(0);
+                (0..3).step_by(step).count()
+            });
+            assert!(in_core.is_err());
+        }
+        let recorded = fs::read_to_string(&paths.panicked).unwrap_or_else(|error| {
+            panic!("no panic record at {}: {error}", paths.panicked.display())
+        });
+        assert!(recorded.contains("step != 0"), "{recorded}");
+        fs::remove_dir_all(&directory).unwrap();
+    }
+
+    #[test]
+    fn standard_library_locations_are_recognised() {
+        for std_file in [
+            "/rustc/1159e78c4747b02ef996e55082b704c09b970588/library/alloc/src/raw_vec.rs",
+            "/rustc/abc123/library/core/src/option.rs",
+            "/home/u/.rustup/toolchains/stable/lib/rustlib/src/rust/library/alloc/src/vec/mod.rs",
+            "/x/library/core/src/slice/index.rs",
+            "/x/library/std/src/io/mod.rs",
+            "C:\\Users\\u\\.rustup\\library\\alloc\\src\\raw_vec.rs",
+        ] {
+            assert!(location_is_std(std_file), "{std_file}");
+        }
+        for ours in [
+            "src/pair_index_redb.rs",
+            "tests/pair_index_storage.rs",
+            "/home/u/.cargo/registry/src/x/serde-1.0.0/src/lib.rs",
+            "/home/u/library-of-things/src/main.rs",
+            "",
+        ] {
+            assert!(!location_is_std(ours), "{ours}");
+        }
     }
 
     #[test]
