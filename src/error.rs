@@ -324,25 +324,33 @@ impl Error {
     }
 }
 
-/// An error with every distinct cause in its source chain, `outer: inner: innermost`.
+/// An error with every distinct cause in its source chain, the innermost first:
+/// `innermost (outer: inner)`.
 ///
 /// `reqwest` puts what distinguishes one transport failure from another
 /// (`operation timed out`, `Connection refused`, a TLS verification message) in
 /// the source chain, which its `Display` drops; a hung server then read as an
-/// unexplained "error sending request". The chain names no credential: it is
-/// the transport's own text.
+/// unexplained "error sending request". The innermost cause leads because the
+/// records that carry this line keep only its head (`run.state` and Activity
+/// keep 160 bytes), and the outer layer starts with a URL of any length. The
+/// chain names no credential: it is the transport's own text, and every WebAPI
+/// call carries its fields in a POST body, never in the URL.
 pub fn cause_chain(error: &dyn std::error::Error) -> String {
-    let mut text = error.to_string();
+    let mut layers = vec![error.to_string()];
     let mut source = error.source();
     while let Some(cause) = source {
         let cause_text = cause.to_string();
-        if !cause_text.is_empty() && !text.contains(&cause_text) {
-            text.push_str(": ");
-            text.push_str(&cause_text);
+        if !cause_text.is_empty() && !layers.iter().any(|layer| layer.contains(&cause_text)) {
+            layers.push(cause_text);
         }
         source = cause.source();
     }
-    text
+    match layers.split_last() {
+        Some((innermost, outer)) if !outer.is_empty() => {
+            format!("{innermost} ({})", outer.join(": "))
+        }
+        _ => layers.concat(),
+    }
 }
 
 fn join_refusal_codes(codes: &[(String, usize)]) -> String {
@@ -575,8 +583,24 @@ mod tests {
         );
         assert_eq!(
             super::cause_chain(&error),
-            "error sending request for url (http://127.0.0.1:9/webapi/entry.cgi): client error (Connect): operation timed out"
+            "operation timed out (error sending request for url (http://127.0.0.1:9/webapi/entry.cgi): client error (Connect))"
         );
+        // What a 160-byte record keeps still names the cause, however long the URL.
+        let long = Layer(
+            Box::leak(
+                format!(
+                    "error sending request for url (https://nas.example:5001/{}/webapi/entry.cgi)",
+                    "x".repeat(200)
+                )
+                .into_boxed_str(),
+            ),
+            Some(Box::new(Layer("operation timed out", None))),
+        );
+        let line = format!(
+            "HTTP request failed during File Station list: {}",
+            super::cause_chain(&long)
+        );
+        assert!(line[..160].contains("operation timed out"), "{line}");
         let repeated = Layer("timed out", Some(Box::new(Layer("timed out", None))));
         assert_eq!(super::cause_chain(&repeated), "timed out");
     }
