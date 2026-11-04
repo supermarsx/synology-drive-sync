@@ -209,6 +209,27 @@ lists its own commits.
 - **`--launch-daemon` returns when `daemon.ready` is published**, not on the socket's first ping.
 - A control-socket connect failure names the socket path once.
 
+### Shell lifecycle follow-ups (fix7)
+
+- **A hung lock probe is cut off.** `flock -n` and the bridge's `--daemon-lock-probe` run under `timeout 5`
+  when `timeout(1)` works; on expiry the lock is "cannot be told" with the cause `timed out after 5 s`.
+- **Two bad supervisor witnesses no longer refuse for good.** A malformed `supervisor.pid` beside an
+  unusable `supervisor.lock` (a directory, symlink, fifo, mode `000`) is settled by looking for a
+  `--supervise` process of the package: none, and stop removes the record and repairs the lock (or prints
+  the exact command); one, and it is named. A stop in the respawn window with a malformed
+  `supervisor.pid` waits for the respawn and succeeds in one call. The `ctl stop` wait is computed from the
+  budget that is left.
+- **The forced stop of the shell engine checks and names.** Each target's start tick is read again
+  immediately before its KILL, the runner is verified by its start tick, `kill`'s status is checked ("killed"
+  lists only what was killed), every skip is named, and a controller that already exited is not reported as
+  one that did not.
+- **The shell snapshot refuses what the in-process one refuses** (`degraded_since` with leading zeros, a
+  `degraded_cause` that is not UTF-8) and serves `controller.degraded` only while the service runs; it also
+  reads `daemon.ready` for `service.state`, as the in-process rung does.
+- **A poll killed outright no longer leaks for the controller's life** (its scratch directory is named for it
+  and removed by the next poll), and **an `inotifywait` fallback watcher is stopped when the controller is
+  killed**.
+
 ### Verified-pair index: correctness fixes
 
 - **A write through a shared memory mapping is no longer missed.** Linux moves a file's times only
