@@ -9893,6 +9893,68 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
             except ProcessLookupError:
                 pass
 
+    def test_a_pid_file_naming_a_live_child_that_is_not_the_watcher_is_never_signalled(self) -> None:
+        # N-S3. realtime_watcher_live_child accepted any live child of the
+        # controller, so after a PID wrap a pid file naming a runner (or
+        # anything else the controller forked) had that process TERMed by
+        # terminate_realtime_watcher and adopted as the watcher. A child is
+        # taken for a watcher still in its exec only while its argv is the
+        # watcher's, the controller's own (not exec'd yet) or unreadable (the
+        # exec is under way); anything else is named and left alone.
+        controller_source = (self.real_target / "libexec/sdsync-controller").read_text(encoding="utf-8")
+        functions = "".join(
+            self.f3_function(controller_source, name) + "\n"
+            for name in ("read_uptime_seconds", "realtime_watcher_is_stoppable", "realtime_watcher_matches",
+                         "realtime_watcher_starting", "realtime_watcher_live_child", "terminate_realtime_watcher")
+        )
+        farm = self.root / "watcher-argv-bin"
+        farm.mkdir()
+        (farm / "inotifywait").symlink_to("/bin/sleep")
+        runtime = self.root / "watcher-pid-runtime"
+        runtime.mkdir()
+        probe = self.f3_script(
+            "s3-live-child.sh",
+            '. "$SYNOPKG_PKGDEST/libexec/sdsync-common"\n'
+            f"runtime_root={shlex.quote(str(runtime))}\n"
+            "path_owner=$(id -u)\n"
+            "inotify_command=\n"
+            "controller_log_event() { printf 'event %s %s %s\\n' \"$1\" \"$2\" \"$3\"; }\n"
+            + functions
+            + f"{shlex.quote(str(farm / 'inotifywait'))} 300 & watcher=$!\n"
+            "/bin/sleep 300 & foreign=$!\n"
+            "/bin/sleep 0.3\n"
+            "rc=0; realtime_watcher_live_child \"$watcher\" || rc=$?; echo \"watcher live_child=$rc\"\n"
+            "rc=0; realtime_watcher_live_child \"$foreign\" || rc=$?\n"
+            "echo \"foreign live_child=$rc cmd=${realtime_watcher_foreign:-}\"\n"
+            "printf '%s\\n' \"$foreign\" > \"$runtime_root/watch-alpha.pid\"\n"
+            "terminate_realtime_watcher alpha\n"
+            "/bin/sleep 0.3\n"
+            "if kill -0 \"$foreign\" 2>/dev/null; then echo 'foreign: alive'; else echo 'foreign: SIGNALLED'; fi\n"
+            "echo \"foreign pid file: $([ -e \"$runtime_root/watch-alpha.pid\" ] && echo kept || echo removed)\"\n"
+            "printf '%s\\n' \"$watcher\" > \"$runtime_root/watch-beta.pid\"\n"
+            "terminate_realtime_watcher beta\n"
+            "/bin/sleep 0.3\n"
+            "if kill -0 \"$watcher\" 2>/dev/null && [ \"$(sed 's/^.*) //' /proc/$watcher/stat | cut -c1)\" != Z ]; then echo 'watcher: alive'; else echo 'watcher: stopped'; fi\n"
+            "kill \"$foreign\" \"$watcher\" 2>/dev/null\n"
+            "wait\n",
+        )
+        for shell in self.f3_shells():
+            with self.subTest(shell=shell):
+                for stale in runtime.iterdir():
+                    stale.unlink()
+                result = self.f3_run(shell, probe, timeout=60)
+                report = result.stdout + result.stderr
+                self.assertIn("watcher live_child=0", result.stdout, report)
+                self.assertIn("foreign live_child=1 cmd=sleep", result.stdout, report)
+                self.assertIn("foreign: alive", result.stdout, "a process that is not the watcher was signalled\n" + report)
+                self.assertRegex(
+                    result.stdout,
+                    r"event warn routine_watch_pid_mismatch profile=alpha pid=\d+ reason=not_the_watcher cmd=sleep",
+                    report,
+                )
+                self.assertIn("foreign pid file: removed", result.stdout, report)
+                self.assertIn("watcher: stopped", result.stdout, report)
+
     def test_realtime_watcher_that_never_starts_is_a_named_failure(self) -> None:
         # Still not exec'd past the start limit: stopped, and a failed start
         # recorded and named -- never reported as watching forever.
