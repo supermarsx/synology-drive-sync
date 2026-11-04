@@ -19866,9 +19866,9 @@ fi
         lifecycle_source = self.lifecycle.read_text(encoding="utf-8")
         self.assertEqual(
             lifecycle_source.count(
-                '                    exact_controller_process_status "$saved_pid" '
+                '                exact_controller_process_status "$saved_pid" '
                 '"$saved_controller_start" \\\n'
-                '                        "$saved_controller_boot" || '
+                '                    "$saved_controller_boot" || '
                 "controller_wait_status=$?"
             ),
             1,
