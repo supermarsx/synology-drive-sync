@@ -948,12 +948,39 @@ realtime_watcher_matches() {
     [ "$watcher_mode_argument" = --watch ]
 }
 
+# How long a spawned watcher may take to exec before it is a failed start.
+realtime_watcher_start_limit=30
+
+# Whether $1 is a watcher this controller spawned that has not exec'd yet: its
+# own child, still running the controller's own command. The pid file is
+# written right after the fork, so a turn can find it before the exec -- on a
+# loaded unit, long before. Judged by realtime_watcher_matches alone it read as
+# a pid file that outlived its watcher: a failure recorded, the pid file
+# removed, a 300-second cooldown, and the child then exec'd into a watcher
+# nothing recorded, adopted or would ever stop. Sets
+# realtime_watcher_start_state (its stat state) and realtime_watcher_start_age
+# (whole seconds since the fork, in USER_HZ ticks, 100 on every platform DSM
+# runs on).
+realtime_watcher_starting() {
+    read_process_stat_fields "$1" || return 1
+    [ "$process_stat_ppid" = "$$" ] || return 1
+    realtime_watcher_start_state=$process_stat_state
+    realtime_watcher_start_ticks=$process_stat_start
+    read_uptime_seconds || return 1
+    realtime_watcher_start_age=$((uptime_seconds - realtime_watcher_start_ticks / 100))
+    [ "$realtime_watcher_start_age" -ge 0 ] || realtime_watcher_start_age=0
+    pid_matches_command "$1" "$controller"
+}
+
 terminate_realtime_watcher() {
     terminate_profile=$1
     terminate_pid_path=$runtime_root/watch-$terminate_profile.pid
     [ -f "$terminate_pid_path" ] && [ ! -L "$terminate_pid_path" ] || return 0
     terminate_pid=$(read_pid "$terminate_pid_path" 2>/dev/null || true)
-    if [ -n "$terminate_pid" ] && realtime_watcher_is_stoppable "$terminate_pid"; then
+    # One still starting is stopped too: left alone, it would exec into a
+    # watcher whose pid file is already gone.
+    if [ -n "$terminate_pid" ] && { realtime_watcher_is_stoppable "$terminate_pid" \
+        || realtime_watcher_starting "$terminate_pid"; }; then
         kill -TERM "$terminate_pid" 2>/dev/null || true
         # A watcher left stopped by a controller that died inside the
         # STOP/CONT window never runs its pending TERM handler, and the wait
@@ -1281,13 +1308,48 @@ ensure_realtime_watcher() {
         reap_realtime_watchers
         [ "$watcher_adopt_refusal" != stopped ] || realtime_watcher_reason=watch_stopped
     fi
+    # A watcher still starting (realtime_watcher_starting) is reported as the
+    # spawn turn reported it. Stopped before its exec it raises nothing, as a
+    # stopped watcher would not, and is replaced the same way. Still not
+    # started past the limit, it is stopped and recorded below as a failed
+    # start, named.
+    watcher_start_detail=
+    if [ -n "$watcher_existing" ] && [ -f "$watcher_pid_path" ] \
+        && realtime_watcher_starting "$watcher_existing"; then
+        case $realtime_watcher_start_state in
+            T|t)
+                controller_log_event warn routine_watch_orphaned \
+                    "profile=$watcher_profile pid=$watcher_existing reason=stopped" || true
+                kill -TERM "$watcher_existing" 2>/dev/null || true
+                kill -CONT "$watcher_existing" 2>/dev/null || true
+                realtime_reap_pids="${realtime_reap_pids:-} $watcher_existing"
+                rm -f "$watcher_pid_path" "$watcher_source_path"
+                reap_realtime_watchers
+                realtime_watcher_reason=watch_stopped
+                ;;
+            *)
+                if [ "$realtime_watcher_start_age" -lt "$realtime_watcher_start_limit" ]; then
+                    realtime_backend=inotify
+                    realtime_watcher_pid=$watcher_existing
+                    realtime_watcher_reason=ok
+                    return 0
+                fi
+                kill -TERM "$watcher_existing" 2>/dev/null || true
+                kill -CONT "$watcher_existing" 2>/dev/null || true
+                realtime_reap_pids="${realtime_reap_pids:-} $watcher_existing"
+                reap_realtime_watchers
+                watcher_start_detail="start_timeout the watcher had not started ${realtime_watcher_start_age}s after its spawn (limit ${realtime_watcher_start_limit}s)"
+                ;;
+        esac
+    fi
     if [ -f "$watcher_pid_path" ]; then
         # The pid file outlived the watcher it named. inotifywait reports the
         # reason on stderr and exits 1 even under -q, so the private stderr
         # file is the only place the operator's real message survives; ENOSPC
         # from the watch limit reads as "No space left on device".
-        watcher_dead_detail=
-        if [ -f "$watcher_stderr_path" ] && [ ! -L "$watcher_stderr_path" ] && [ -s "$watcher_stderr_path" ]; then
+        watcher_dead_detail=$watcher_start_detail
+        if [ -z "$watcher_dead_detail" ] && [ -f "$watcher_stderr_path" ] && [ ! -L "$watcher_stderr_path" ] \
+            && [ -s "$watcher_stderr_path" ]; then
             watcher_dead_detail=$(LC_ALL=C awk \
                 'NR == 1 { gsub(/[^ -~]/, "?"); print substr($0, 1, 120); exit }' \
                 "$watcher_stderr_path" 2>/dev/null || true)

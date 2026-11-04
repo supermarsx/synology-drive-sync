@@ -143,7 +143,10 @@ lists its own commits.
   only a fallback, used if the package binary fails its executable checks. (Under the daemon engine
   the watcher runs inside the daemon and `inotifywait` is not used.) The setup walk has a
   120-second deadline that names the directory it was stuck on, and a kernel event overflow triggers a
-  full re-walk. A realtime routine that is not watched natively is now an amber item on the Overview.
+  full re-walk. Under the shell engine, a watcher the controller has just spawned is no longer
+  mistaken for a dead one before it has started: it is not counted as a failure, a package stop stops
+  it, and one that has not started 30 seconds after its spawn is stopped and named
+  (`routine_watch_failed`, `start_timeout`). A realtime routine that is not watched natively is now an amber item on the Overview.
   The watcher uses about 6 MiB at 20,000 directories and about 16 MiB at 100,000.
   `sdsync-dsm-api --watch-probe <folder>`, run as the package user, shows what inotify sees on a share;
   see [Troubleshooting](dsm/troubleshooting.md#probe-what-inotify-sees-on-a-share) and probe 20 in the

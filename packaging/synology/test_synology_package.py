@@ -7834,7 +7834,8 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
 
         self.capture.write_text("", encoding="utf-8")
         started = self.shell(self.lifecycle, "start", extra_environment=environment, timeout=15)
-        self.assertEqual(started.returncode, 0, started.stderr)
+        # A refused start is named on stdout (package_message).
+        self.assertEqual(started.returncode, 0, started.stdout + started.stderr)
         state_path = self.real_var / "state/routines/watch.state"
         event_path = self.real_var / "run/watch-watch.events"
         initialization_deadline = time.monotonic() + 15
@@ -8392,7 +8393,8 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
         environment.update(self.native_watch_environment())
         self.capture.write_text("", encoding="utf-8")
         started = self.shell(self.lifecycle, "start", extra_environment=environment, timeout=15)
-        self.assertEqual(started.returncode, 0, started.stderr)
+        # A refused start is named on stdout (package_message).
+        self.assertEqual(started.returncode, 0, started.stdout + started.stderr)
         state_path = self.real_var / "state/routines/watch.state"
         event_path = self.real_var / "run/watch-watch.events"
         initialization_deadline = time.monotonic() + 15
@@ -8497,7 +8499,8 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
         environment.update(self.native_watch_environment())
         self.capture.write_text("", encoding="utf-8")
         started = self.shell(self.lifecycle, "start", extra_environment=environment, timeout=15)
-        self.assertEqual(started.returncode, 0, started.stderr)
+        # A refused start is named on stdout (package_message).
+        self.assertEqual(started.returncode, 0, started.stdout + started.stderr)
         state_path = self.real_var / "state/routines/watch.state"
         event_path = self.real_var / "run/watch-watch.events"
         initialization_deadline = time.monotonic() + 15
@@ -9166,7 +9169,8 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
         environment.update(self.native_watch_environment())
         self.capture.write_text("", encoding="utf-8")
         started = self.shell(self.lifecycle, "start", extra_environment=environment, timeout=15)
-        self.assertEqual(started.returncode, 0, started.stderr)
+        # A refused start is named on stdout (package_message).
+        self.assertEqual(started.returncode, 0, started.stdout + started.stderr)
         state_path = self.real_var / "state/routines/watch.state"
         event_path = self.real_var / "run/watch-watch.events"
         initialization_deadline = time.monotonic() + 15
@@ -9608,14 +9612,28 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
         started = self.shell(self.lifecycle, "start", extra_environment=environment, timeout=15)
         self.assertEqual(started.returncode, 0, started.stderr)
         pid_path = self.real_var / "run/watch-watch.pid"
+        # The controller writes the pid file right after its fork, before the
+        # child has exec'd the watcher. Stopping the pid inside that window
+        # stops the controller's own subshell, which never matches a watcher:
+        # the next turn reads the pid file as one that outlived its watcher
+        # (routine_watch_failed, a 300 s cooldown on a clock that never moves)
+        # and nothing is ever orphaned or respawned. A loaded runner widens the
+        # window enough to hit it. Stop the watcher only once it is one.
         deadline = time.monotonic() + 15
+        original_pid = None
         while time.monotonic() < deadline:
-            if pid_path.is_file():
+            try:
+                candidate = int(pid_path.read_text(encoding="utf-8").strip())
+                argv = Path(f"/proc/{candidate}/cmdline").read_bytes().split(b"\0")
+            except (OSError, ValueError):
+                time.sleep(0.03)
+                continue
+            if b"--watch" in argv:
+                original_pid = candidate
                 break
             time.sleep(0.03)
-        else:
+        if original_pid is None:
             self.fail("watcher did not spawn")
-        original_pid = int(pid_path.read_text(encoding="utf-8").strip())
         os.kill(original_pid, signal.SIGSTOP)
         try:
             # No explicit reload here, deliberately: ensure_realtime_watcher
@@ -9653,6 +9671,137 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
                 pass
         stopped = self.shell(self.lifecycle, "stop", timeout=15)
         self.assertEqual(stopped.returncode, 0, stopped.stdout + stopped.stderr)
+
+    def test_realtime_watcher_still_starting_is_not_a_dead_one(self) -> None:
+        # The pid file is written right after the fork, before the exec. A turn
+        # that found it there read the controller's own subshell as a pid file
+        # that outlived its watcher: routine_watch_failed, the pid file
+        # removed, a 300 s cooldown, and the child then exec'd into a watcher
+        # nothing recorded or would ever stop. Held there by a barrier, turn
+        # after turn: still starting; stopped there, orphaned and replaced;
+        # released, the replacement is the routine's watcher.
+        self._realtime_watch_profile()
+        release = self.root / "watcher-exec-release"
+        self._hold_watcher_before_exec(release)
+        environment, _clock = self.realtime_watcher_environment(label="starting")
+        started = self.shell(self.lifecycle, "start", extra_environment=environment, timeout=15)
+        self.assertEqual(started.returncode, 0, started.stdout + started.stderr)
+        pid_path = self.real_var / "run/watch-watch.pid"
+        state_path = self.real_var / "state/routines/watch.state"
+        first = self._watcher_before_exec()
+        # The fake sleep collapses each turn to ~0.03 s: a second is dozens.
+        time.sleep(1.0)
+        self.assertEqual(self.event_details("routine_watch_failed"), [])
+        self.assertEqual(int(pid_path.read_text(encoding="utf-8").strip()), first)
+        self.assertFalse((self.real_var / "run/watch-watch.failed").exists())
+        os.kill(first, 0)
+
+        os.kill(first, signal.SIGSTOP)
+        replacement = None
+        deadline = time.monotonic() + 15
+        while time.monotonic() < deadline:
+            orphaned = [
+                detail for detail in self.event_details("routine_watch_orphaned")
+                if f"pid={first} " in detail and detail.endswith("reason=stopped")
+            ]
+            try:
+                candidate = int(pid_path.read_text(encoding="utf-8").strip())
+            except (OSError, ValueError):
+                candidate = None
+            if orphaned and candidate not in (None, first):
+                replacement = candidate
+                break
+            time.sleep(0.03)
+        self.assertIsNotNone(replacement, "the watcher stopped before its exec was not replaced")
+        gone_deadline = time.monotonic() + 15
+        while time.monotonic() < gone_deadline:
+            try:
+                os.kill(first, 0)
+            except ProcessLookupError:
+                break
+            time.sleep(0.03)
+        else:
+            self.fail("the watcher stopped before its exec was left running")
+
+        release.touch()
+        deadline = time.monotonic() + 15
+        while time.monotonic() < deadline:
+            argv = Path(f"/proc/{replacement}/cmdline").read_bytes().split(b"\0")
+            state_text = state_path.read_text(encoding="utf-8") if state_path.exists() else ""
+            if b"--watch" in argv and "backend=inotify" in state_text:
+                break
+            time.sleep(0.03)
+        else:
+            self.fail("the released watcher was never the routine's watcher")
+        self.assertEqual(int(pid_path.read_text(encoding="utf-8").strip()), replacement)
+        self.assertEqual(self.event_details("routine_watch_failed"), [])
+        stopped = self.shell(self.lifecycle, "stop", timeout=15)
+        self.assertEqual(stopped.returncode, 0, stopped.stdout + stopped.stderr)
+
+    def test_realtime_watcher_that_never_starts_is_a_named_failure(self) -> None:
+        # Still not exec'd past the start limit: stopped, and a failed start
+        # recorded and named -- never reported as watching forever.
+        self._realtime_watch_profile()
+        release = self.root / "watcher-exec-release"
+        self._hold_watcher_before_exec(release, start_limit=1)
+        environment, _clock = self.realtime_watcher_environment(label="never-starts")
+        started = self.shell(self.lifecycle, "start", extra_environment=environment, timeout=15)
+        self.assertEqual(started.returncode, 0, started.stdout + started.stderr)
+        first = self._watcher_before_exec()
+        deadline = time.monotonic() + 15
+        failed: list[str] = []
+        while time.monotonic() < deadline:
+            failed = [d for d in self.event_details("routine_watch_failed") if "start_timeout" in d]
+            if failed:
+                break
+            time.sleep(0.03)
+        self.assertTrue(failed, "a watcher that never started was not named a failed start")
+        self.assertIn("limit 1s", failed[0])
+        gone_deadline = time.monotonic() + 15
+        while time.monotonic() < gone_deadline:
+            try:
+                os.kill(first, 0)
+            except ProcessLookupError:
+                break
+            time.sleep(0.03)
+        else:
+            self.fail("the watcher that never started was left running")
+        self.assertFalse((self.real_var / "run/watch-watch.pid").exists())
+        failure = (self.real_var / "run/watch-watch.failed").read_text(encoding="utf-8")
+        self.assertTrue(failure.rstrip().endswith(" watch_setup_failed"), failure)
+        stopped = self.shell(self.lifecycle, "stop", timeout=15)
+        self.assertEqual(stopped.returncode, 0, stopped.stdout + stopped.stderr)
+
+    def test_realtime_watcher_still_starting_is_stopped_with_the_package(self) -> None:
+        # The stop path judged watchers by realtime_watcher_is_stoppable alone,
+        # which a child not yet exec'd never passes: its pid file was removed,
+        # the child left alone, and it then exec'd into a watcher nothing would
+        # ever stop.
+        self._realtime_watch_profile()
+        release = self.root / "watcher-exec-release"
+        self._hold_watcher_before_exec(release)
+        environment, _clock = self.realtime_watcher_environment(label="starting-stop")
+        started = self.shell(self.lifecycle, "start", extra_environment=environment, timeout=15)
+        self.assertEqual(started.returncode, 0, started.stdout + started.stderr)
+        first = self._watcher_before_exec()
+        try:
+            stopped = self.shell(self.lifecycle, "stop", timeout=15)
+            self.assertEqual(stopped.returncode, 0, stopped.stdout + stopped.stderr)
+            gone_deadline = time.monotonic() + 15
+            while time.monotonic() < gone_deadline:
+                try:
+                    os.kill(first, 0)
+                except ProcessLookupError:
+                    break
+                time.sleep(0.03)
+            else:
+                self.fail("a watcher still starting outlived the package stop")
+        finally:
+            release.touch()
+            try:
+                os.kill(first, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
 
     def test_realtime_watcher_terminated_when_inotifywait_uninstalled_mid_life(self) -> None:
         # Row 18. Adopt, remove the fake inotifywait from PATH, then stop:
@@ -9915,6 +10064,44 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
             source.replace(needle, 'for inotify_probe in "$inotify_path_candidate"', 1),
             encoding="utf-8",
         )
+
+    def _hold_watcher_before_exec(self, release: Path, *, start_limit: int | None = None) -> None:
+        """Hold every package watcher the controller spawns between its fork
+        and its exec until `release` exists: the window a loaded unit opens on
+        its own. `start_limit` shortens the controller's start limit."""
+        controller = self.real_target / "libexec/sdsync-controller"
+        source = controller.read_text(encoding="utf-8")
+        needle = (
+            '    if [ "${inotify_native:-false}" = true ]; then\n'
+            '        "$inotify_command" --watch --profile-fragment'
+        )
+        self.assertEqual(source.count(needle), 1, "the package watcher's spawn changed")
+        source = source.replace(
+            needle,
+            '    if [ "${inotify_native:-false}" = true ]; then\n'
+            f"        while [ ! -e {shlex.quote(str(release))} ]; do /bin/sleep 0.05; done && "
+            'exec "$inotify_command" --watch --profile-fragment',
+        )
+        if start_limit is not None:
+            limit = "realtime_watcher_start_limit=30\n"
+            self.assertEqual(source.count(limit), 1, "the watcher start limit changed")
+            source = source.replace(limit, f"realtime_watcher_start_limit={start_limit}\n")
+        controller.write_text(source, encoding="utf-8")
+
+    def _watcher_before_exec(self) -> int:
+        """The watcher's pid once its pid file exists, still before its exec."""
+        pid_path = self.real_var / "run/watch-watch.pid"
+        deadline = time.monotonic() + 15
+        while time.monotonic() < deadline:
+            try:
+                pid = int(pid_path.read_text(encoding="utf-8").strip())
+                argv = Path(f"/proc/{pid}/cmdline").read_bytes().split(b"\0")
+            except (OSError, ValueError):
+                time.sleep(0.03)
+                continue
+            self.assertNotIn(b"--watch", argv, "the watcher exec'd through the barrier")
+            return pid
+        self.fail("watcher did not spawn")
 
     def _fast_sleep_environment(self, label: str) -> dict[str, str]:
         """Only the controller's multi-second sleeps are shortened; the clock is real."""
@@ -10294,7 +10481,8 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
         environment, clock = self.realtime_watcher_environment(label="events-size")
         self.capture.write_text("", encoding="utf-8")
         started = self.shell(self.lifecycle, "start", extra_environment=environment, timeout=15)
-        self.assertEqual(started.returncode, 0, started.stderr)
+        # A refused start is named on stdout (package_message).
+        self.assertEqual(started.returncode, 0, started.stdout + started.stderr)
         state_path = self.real_var / "state/routines/watch.state"
         event_path = self.real_var / "run/watch-watch.events"
         initialization_deadline = time.monotonic() + 15
