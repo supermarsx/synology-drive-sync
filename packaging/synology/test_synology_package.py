@@ -14252,6 +14252,43 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
         self.assertFalse(calls.exists() and calls.read_text(encoding="utf-8").strip(),
                          "supervisor.lock was probed beside a record that proves the supervisor")
 
+    # -- scenarios against the REAL daemon (fix5 review N-S7) ------------------
+    #
+    # The bridge mock passes --launch-daemon, --supervise, --daemon and --ctl
+    # through to the built bridge, so these start the real daemon under the real
+    # supervisor in the DSM-shaped fixture: /var/packages/<pkg>/{home,var,target}
+    # are symlinks to @apphome/@appdata/@appstore, the profile is rendered by
+    # the real manager, and the processes carry the aliased --home/--var.
+
+    def _daemon_ready_pid(self) -> int:
+        return int((self.real_var / "run/daemon.ready").read_text(encoding="ascii").split()[0])
+
+    def _supervisor_pid(self) -> int:
+        return int((self.real_var / "run/supervisor.pid").read_text(encoding="ascii").split()[0])
+
+    def _daemon_pids_here(self) -> list[int]:
+        """Live --daemon processes of THIS fixture (their argv carries its var path)."""
+        var = str(self.fhs / "var")
+        found: list[int] = []
+        for entry in Path("/proc").iterdir():
+            if not entry.name.isdigit():
+                continue
+            try:
+                argv = (entry / "cmdline").read_bytes().split(b"\0")
+                state = (entry / "stat").read_text(encoding="ascii").rsplit(")", 1)[1].split()[0]
+            except (OSError, IndexError):
+                continue
+            if b"--daemon" in argv and var.encode() in argv and state not in ("Z", "X"):
+                found.append(int(entry.name))
+        return sorted(found)
+
+    def _kill_real_daemons(self) -> None:
+        for pid in self._daemon_pids_here():
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+
     def _crashed_run_lock(self, *, other_inode_sibling: bool = False) -> tuple[Path, Path, int]:
         """run.lock/pid published for a dead owner, as the daemon's link(2) /
         unlink(2) pair leaves it when the daemon dies between the two calls:
@@ -14330,6 +14367,174 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
         self.assertTrue(sibling.exists())
         self.assertTrue((lock / "pid").exists())
         self.assertEqual((lock / "pid").stat().st_nlink, 2)
+
+    def test_real_daemon_killed_with_sigkill_is_respawned_and_never_read_as_stopped(self) -> None:
+        # The supervisor restarts a daemon that dies by a signal, one second
+        # later. In that second nobody holds daemon.lock and daemon.ready names
+        # a dead PID: status must not call the package stopped (3) or stale (1),
+        # and the lock must not be probed (a probe that took it would make the
+        # respawning daemon exit 75). Afterwards exactly one daemon runs.
+        self._daemon_engine(None)
+        self._start_daemon()
+        self.addCleanup(self._kill_real_daemons)
+        calls = self._flock_probe_log()
+        old_daemon = self._daemon_ready_pid()
+        supervisor = self._supervisor_pid()
+        os.kill(old_daemon, signal.SIGKILL)
+        codes: list[int] = []
+        deadline = time.monotonic() + 40
+        respawned = False
+        while time.monotonic() < deadline:
+            status = self.shell(self.lifecycle, "status")
+            codes.append(status.returncode)
+            try:
+                respawned = self._daemon_ready_pid() != old_daemon and status.returncode == 0
+            except (OSError, ValueError):
+                respawned = False
+            if respawned:
+                break
+            time.sleep(0.05)
+        self.assertTrue(respawned, f"the daemon was not respawned; status codes {codes}")
+        self.assertTrue(set(codes) <= {0, 2}, f"status read a respawning package as stopped or stale: {codes}")
+        self.assertIn(2, codes, f"the respawn window was never seen: {codes}")
+        probes = calls.read_text(encoding="utf-8") if calls.exists() else ""
+        self.assertEqual(probes.strip(), "", "daemon.lock was probed beside a live supervisor:\n" + probes)
+        self.assertEqual(self._daemon_pids_here(), [self._daemon_ready_pid()])
+        self.assertEqual(self._supervisor_pid(), supervisor)
+        self.assertEqual(self._daemon_ctl("ping").returncode, 0)
+        # A stop afterwards leaves nothing: no daemon, no supervisor, no record.
+        stopped = self.shell(self.lifecycle, "stop", timeout=60)
+        self.assertEqual(stopped.returncode, 0, stopped.stdout + stopped.stderr)
+        self.assertEqual(self._daemon_pids_here(), [])
+        self._wait_for(lambda: not Path(f"/proc/{supervisor}").exists()
+                       or "Z" in Path(f"/proc/{supervisor}/stat").read_text().split(")")[-1][:3],
+                       "stop left the supervisor running", timeout=10)
+        self.assertEqual(
+            self._daemon_records(), {"daemon.pid": False, "daemon.ready": False, "ctl.sock": False}
+        )
+        self.assertEqual(self.shell(self.lifecycle, "status").returncode, 3)
+
+    def test_real_daemon_start_in_the_respawn_window_starts_no_second_daemon(self) -> None:
+        self._daemon_engine(None)
+        self._start_daemon()
+        self.addCleanup(self._kill_real_daemons)
+        old_daemon = self._daemon_ready_pid()
+        os.kill(old_daemon, signal.SIGKILL)
+        began = time.monotonic()
+        started = self.shell(self.lifecycle, "start", extra_environment=self.DAEMON_START, timeout=90)
+        report = started.stdout + started.stderr + bounded_file_tail(self.real_var / "log/daemon-stderr.log")
+        self.assertEqual(started.returncode, 0, report)
+        self._wait_for(
+            lambda: self._daemon_pids_here() == [self._daemon_ready_pid()]
+            and self._daemon_ready_pid() != old_daemon,
+            "no single respawned daemon after start in the window\n" + report,
+        )
+        self.assertEqual(len(self._daemon_pids_here()), 1, report)
+        self.assertEqual(self.shell(self.lifecycle, "status").returncode, 0, report)
+        self.assertLess(time.monotonic() - began, 60)
+        stopped = self.shell(self.lifecycle, "stop", timeout=60)
+        self.assertEqual(stopped.returncode, 0, stopped.stdout + stopped.stderr)
+        self.assertEqual(self._daemon_pids_here(), [])
+
+    def test_real_daemon_stop_in_the_respawn_window_leaves_nothing_running(self) -> None:
+        # Stop between the daemon's death and the respawn: the supervisor is
+        # live without a daemon to ask. It is found through supervisor.pid,
+        # signalled, and nothing is respawned behind the stop.
+        self._daemon_engine(None)
+        self._start_daemon()
+        self.addCleanup(self._kill_real_daemons)
+        old_daemon = self._daemon_ready_pid()
+        supervisor = self._supervisor_pid()
+        os.kill(old_daemon, signal.SIGKILL)
+        self._wait_for(lambda: not Path(f"/proc/{old_daemon}").exists()
+                       or "Z" in Path(f"/proc/{old_daemon}/stat").read_text().split(")")[-1][:3],
+                       "the killed daemon was not reaped", timeout=10)
+        stopped = self.shell(self.lifecycle, "stop", timeout=60)
+        self.assertEqual(stopped.returncode, 0, stopped.stdout + stopped.stderr)
+        time.sleep(2.5)  # past the supervisor's one-second pause: nothing may come back
+        self.assertEqual(self._daemon_pids_here(), [], stopped.stdout + stopped.stderr)
+        self.assertTrue(
+            not Path(f"/proc/{supervisor}").exists()
+            or "Z" in Path(f"/proc/{supervisor}/stat").read_text().split(")")[-1][:3],
+            "the supervisor outlived stop",
+        )
+        self.assertEqual(
+            self._daemon_records(), {"daemon.pid": False, "daemon.ready": False, "ctl.sock": False}
+        )
+        self.assertFalse((self.real_var / "run/supervisor.pid").exists())
+        self.assertEqual(self.shell(self.lifecycle, "status").returncode, 3)
+
+    def test_real_daemon_is_seen_without_flock_and_the_shell_engine_steps_aside(self) -> None:
+        # The unit has no flock(1). Beside a live supervised daemon status is 0,
+        # a second start starts nothing, and the shell engine refuses to start
+        # (the supervisor is the first witness). Then the daemon runs on its
+        # own, unsupervised -- the case where daemon.lock itself is the only
+        # witness, probed with the bridge -- and a wedged one (SIGSTOP: it
+        # holds the lock and answers no ping) is still a holder that blocks the
+        # hooks, the shell engine and status, and is stopped by identity.
+        self._daemon_engine(None)
+        self._start_daemon()
+        self.addCleanup(self._kill_real_daemons)
+        no_flock = self._no_flock_environment()
+        daemon = self._daemon_ready_pid()
+        argv = [part.decode() for part in Path(f"/proc/{daemon}/cmdline").read_bytes().split(b"\0")[:-1]]
+        status = self.shell(self.lifecycle, "status", extra_environment=no_flock)
+        self.assertEqual(status.returncode, 0, status.stdout + status.stderr)
+        again = self.shell(self.lifecycle, "start", extra_environment={**no_flock, **self.DAEMON_START}, timeout=60)
+        self.assertEqual(again.returncode, 0, again.stdout + again.stderr)
+        self.assertIn("already running", again.stdout)
+        self.assertEqual(self._daemon_pids_here(), [daemon])
+        self.set_engine("shell\n")
+        refused = self.shell(self.lifecycle, "start", extra_environment=no_flock, timeout=60)
+        self.set_engine(None)
+        self.assertEqual(refused.returncode, 1, refused.stdout + refused.stderr)
+        self.assertIn("refusing to start the shell engine", refused.stdout)
+        self.assertEqual(self._daemon_pids_here(), [daemon])
+        self.assertFalse((self.real_var / "run/controller.pid").exists())
+        stopped = self.shell(self.lifecycle, "stop", timeout=60, extra_environment=no_flock)
+        self.assertEqual(stopped.returncode, 0, stopped.stdout + stopped.stderr)
+        self.assertEqual(self._daemon_pids_here(), [])
+
+        # The same daemon, unsupervised.
+        alone = subprocess.Popen(
+            argv, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, text=True,
+            preexec_fn=(
+                (lambda: (os.setgroups([]), os.setgid(self.drop_gid), os.setuid(self.drop_uid)))
+                if os.getuid() == 0 else None
+            ),
+        )
+        self.addCleanup(self._reap_fake, alone)
+        self._wait_for(lambda: self._daemon_ctl("ping").returncode == 0, "the unsupervised daemon never answered ping")
+        self.assertFalse((self.real_var / "run/supervisor.pid").exists())
+        # (--launch-daemon opens admission once the daemon answers; started by hand, so open it.)
+        opened = self.executable(self.real_target / "bin/sdsync-dsm-api", "--service-admission", "open")
+        self.assertEqual(opened.returncode, 0, opened.stderr)
+        self.assertEqual(self.shell(self.lifecycle, "status", extra_environment=no_flock).returncode, 0)
+        os.kill(alone.pid, signal.SIGSTOP)
+        try:
+            wedged = self.shell(self.lifecycle, "status", extra_environment=no_flock)
+            self.assertEqual(wedged.returncode, 2, wedged.stdout + wedged.stderr)
+            self.assertIn("holds", wedged.stderr)
+            self.assertIn("note: flock(1) is not installed", wedged.stderr)
+            for hook in ("preuninst", "preupgrade"):
+                refused = self.shell(self.lifecycle_dir / hook, extra_environment=no_flock)
+                self.assertEqual(refused.returncode, 1, f"{hook}: {refused.stdout}{refused.stderr}")
+                self.assertIn("the sync daemon is still running", refused.stdout, hook)
+            self.set_engine("shell\n")
+            refused = self.shell(self.lifecycle, "start", extra_environment=no_flock, timeout=60)
+            self.set_engine(None)
+            self.assertEqual(refused.returncode, 1, refused.stdout + refused.stderr)
+            self.assertIn(f"the sync daemon (PID {alone.pid}) holds", refused.stdout)
+            self.assertFalse((self.real_var / "run/controller.pid").exists())
+        finally:
+            os.kill(alone.pid, signal.SIGCONT)
+        stopped = self.shell(self.lifecycle, "stop", timeout=60, extra_environment=no_flock)
+        self.assertEqual(stopped.returncode, 0, stopped.stdout + stopped.stderr)
+        self._wait_for(lambda: alone.poll() is not None, "stop left the unsupervised daemon running", timeout=10)
+        self.assertEqual(self._daemon_pids_here(), [])
+        self.assertEqual(
+            self._daemon_records(), {"daemon.pid": False, "daemon.ready": False, "ctl.sock": False}
+        )
 
     def test_a_lock_that_no_tool_can_probe_is_named_and_the_records_decide(self) -> None:
         # No flock(1) and a bridge whose probe fails: status says why, the
