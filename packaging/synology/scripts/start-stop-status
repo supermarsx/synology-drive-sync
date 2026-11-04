@@ -1350,17 +1350,28 @@ daemon_wait_gone() {
             && daemon_process_still "$daemon_supervisor_pid" "$daemon_supervisor_start"; then
             daemon_still=true
         fi
-        [ "$daemon_still" = true ] || return 0
-        poll_expired "$1" && return 1
+        [ "$daemon_still" = true ] || { daemon_stop_charge_wait; return 0; }
+        poll_expired "$1" && { daemon_stop_charge_wait; return 1; }
         poll_wait
     done
 }
 
+# Without a readable clock the stop cannot tell how long a phase took, so it
+# charges each against the budget by what the phase can take: a wait the ticks
+# it slept (the poll loop counts them without a clock), ctl stop its wait_s.
+daemon_stop_charged=0
+daemon_stop_charge_wait() {
+    daemon_stop_charged=$((daemon_stop_charged + (poll_elapsed_ms + 999) / 1000))
+}
+
 # Sets daemon_stop_left_s to the whole seconds left of the stop budget
-# (daemon_grace, counted from daemon_stop_began), never below 0. Without a
-# readable clock it is the whole budget, which the caller has announced.
+# (daemon_grace, counted from daemon_stop_began), never below 0. When the clock
+# cannot be read -- at the start, which the caller announced, or now -- it is
+# the budget less what the phases so far were charged (daemon_stop_charged), so
+# the phases together still cannot take more than the budget.
 daemon_stop_left() {
-    daemon_stop_left_s=$daemon_grace
+    daemon_stop_left_s=$((daemon_grace - daemon_stop_charged))
+    [ "$daemon_stop_left_s" -ge 0 ] || daemon_stop_left_s=0
     [ -n "$daemon_stop_began" ] || return 0
     daemon_stop_now=$(date +%s 2>/dev/null || true)
     case $daemon_stop_now in ''|*[!0-9]*) return 0 ;; esac
@@ -1418,10 +1429,11 @@ stop_daemon_engine() {
     [ "$daemon_term_share" -ge 2 ] || daemon_term_share=2
     daemon_ctl_wait=$((daemon_grace - daemon_term_share - 5))
     [ "$daemon_ctl_wait" -ge 1 ] || daemon_ctl_wait=1
+    daemon_stop_charged=0
     daemon_stop_began=$(date +%s 2>/dev/null || true)
     case $daemon_stop_began in ''|*[!0-9]*)
         daemon_stop_began=
-        package_message "warning: the clock cannot be read; each stop phase gets its own share of the $daemon_grace s budget"
+        package_message "warning: the clock cannot be read; each stop phase is charged what it can take against the $daemon_grace s budget (ctl stop its wait, a wait the time it slept), so the stop still ends within it"
         ;;
     esac
     # The supervisor is found through its own record first: between a daemon's
@@ -1453,6 +1465,8 @@ stop_daemon_engine() {
     if [ "$daemon_identity" -eq 0 ] || api_path_exists "$daemon_socket"; then
         daemon_ctl_status=0
         daemon_ctl_reply=$(daemon_ctl stop "wait_s=$daemon_ctl_wait" 2>&1) || daemon_ctl_status=$?
+        # With no clock the whole wait is charged, whether or not it was taken.
+        daemon_stop_charged=$((daemon_stop_charged + daemon_ctl_wait))
         if [ "$daemon_ctl_status" -ne 0 ] && [ "$daemon_identity" -eq 0 ]; then
             if [ "$daemon_ctl_status" -eq 69 ]; then
                 package_message "warning: the daemon (PID $daemon_live_pid) did not answer ctl stop; signalling it"

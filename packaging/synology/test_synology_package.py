@@ -13809,13 +13809,11 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
         self.assertIn(f"removed stale daemon record {self.fhs / 'var/run/supervisor.pid'}", stopped.stdout)
         self.assertFalse((run / "supervisor.pid").exists())
 
-    def test_daemon_stop_has_one_deadline_across_ctl_stop_term_and_kill(self) -> None:
-        # ctl stop waited the whole grace, the wait after it another, the wait
-        # after TERM a third, then KILL: about 6 minutes at the default 120 s
-        # against the old 120. One deadline now covers all of it; KILL's own
-        # wait is the small margin on top.
+    def _stuck_daemon_stop(self, budget: int, **environment: str):
+        """Stop a daemon and supervisor that ignore TERM, behind a ctl stop that
+        is accepted and then waits its whole wait_s: the worst case for the
+        stop's single deadline. Returns (stop result, seconds, daemon, supervisor)."""
         self._daemon_engine(None)
-        budget = 8
         bridge = self.real_target / "bin/sdsync-dsm-api"
         source = bridge.read_text(encoding="utf-8")
         needle = "if len(sys.argv) >= 2 and sys.argv[1] in ('--launch-daemon'"
@@ -13841,9 +13839,17 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
         began = time.monotonic()
         stopped = self.shell(
             self.lifecycle, "stop", timeout=120,
-            extra_environment={"SDSYNC_DSM_STOP_TIMEOUT": str(budget)},
+            extra_environment={"SDSYNC_DSM_STOP_TIMEOUT": str(budget), **environment},
         )
-        elapsed = time.monotonic() - began
+        return stopped, time.monotonic() - began, daemon, supervisor
+
+    def test_daemon_stop_has_one_deadline_across_ctl_stop_term_and_kill(self) -> None:
+        # ctl stop waited the whole grace, the wait after it another, the wait
+        # after TERM a third, then KILL: about 6 minutes at the default 120 s
+        # against the old 120. One deadline now covers all of it; KILL's own
+        # wait is the small margin on top.
+        budget = 8
+        stopped, elapsed, daemon, supervisor = self._stuck_daemon_stop(budget)
         self.assertEqual(stopped.returncode, 0, stopped.stdout + stopped.stderr)
         self.assertLessEqual(
             elapsed, budget + 10 + 4,
@@ -13858,6 +13864,45 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
         )
         self.assertFalse((self.real_var / "run/supervisor.pid").exists())
         self.assertIn("service_stop_forced", (self.real_var / "log/controller.log").read_text(encoding="utf-8"))
+
+    def test_daemon_stop_keeps_one_deadline_when_the_clock_cannot_be_read(self) -> None:
+        # N-S6. With `date +%s` failing every phase was handed the whole budget
+        # (daemon_stop_left returned it unchanged): ctl stop's wait, the wait
+        # after it and the wait after TERM each took the full grace -- about
+        # 330 s at the default 120 -- and the console said each phase "gets its
+        # own share" of a budget it was not keeping. Without a clock each phase
+        # is charged what it can take (ctl stop its wait_s, a wait the ticks it
+        # slept), the total is bounded by the budget like a stop with a clock,
+        # and the message says that.
+        fake = self.root / "unreadable-clock-bin"
+        fake.mkdir()
+        date = fake / "date"
+        date.write_text(
+            "#!/bin/sh\n"
+            'case "${1:-}" in +%s) exit 1 ;; esac\n'
+            'exec /bin/date "$@"\n',
+            encoding="utf-8",
+        )
+        date.chmod(0o755)
+        budget = 16
+        stopped, elapsed, daemon, supervisor = self._stuck_daemon_stop(
+            budget, PATH=f"{fake}:{self.environment['PATH']}"
+        )
+        self.assertEqual(stopped.returncode, 0, stopped.stdout + stopped.stderr)
+        self.assertLessEqual(
+            elapsed, budget + 10 + 4,
+            f"stop took {elapsed:.1f} s against a {budget} s budget plus KILL's 10 s margin "
+            f"with no readable clock\n" + stopped.stdout + stopped.stderr,
+        )
+        self.assertGreaterEqual(elapsed, budget - 4, "the daemon was killed before it had its grace")
+        self.assertIn("the clock cannot be read", stopped.stdout)
+        self.assertNotIn("its own share", stopped.stdout, "the message still promises what it does not do")
+        self.assertIn("charged", stopped.stdout)
+        self.assertIsNotNone(daemon.poll(), "the daemon survived stop")
+        self.assertIsNotNone(supervisor.poll(), "the supervisor survived stop")
+        self.assertEqual(
+            self._daemon_records(), {"daemon.pid": False, "daemon.ready": False, "ctl.sock": False}
+        )
 
     def test_a_prepared_api_socket_with_no_server_is_stale_when_the_daemon_lock_is_free(self) -> None:
         # --serve binds api.sock at 0000 and activates it later; a kill in

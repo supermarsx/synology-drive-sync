@@ -211,7 +211,10 @@ the figure the shell engine's stop has always had; the Package Center's own stop
 documented by Synology and was not verified on a unit): `ctl stop` waits at most the budget less a
 sixth of it (at least 2 s) and 5 s, the daemon then gets the rest less that sixth to end, and TERM gets
 whatever remains. KILL's own 10 s wait is the only margin on top, so the worst case is the budget plus
-about 10 s. A daemon that does not
+about 10 s. Without a readable clock (`date +%s` fails) the stop says so and charges each phase what it
+can take against the same budget -- `ctl stop` its whole wait, a wait the seconds it slept -- so the
+worst case is the same; the cost is that a `ctl stop` that failed at once still leaves the later phases
+only the rest of the budget. A daemon that does not
 answer, or outlasts the budget, is sent TERM and then KILL, together with its supervisor, but only
 after its identity is proven from
 `run/daemon.ready` (PID, `/proc` start time, boot id, package uid, `--daemon` argv); an unprovable
