@@ -216,7 +216,11 @@ died without finishing” with a stale outcome. The bridge applies the same rule
 verdict does not wait for the controller (or survives a stopped one). An owner file that fails its
 ownership or mode check is *not* declared stale, because death cannot be proven. An owner record that
 was torn before the last boot (power loss mid-write) is recovered as dead rather than ending the
-controller.
+controller. The daemon publishes `run.lock/pid` by linking a staging file `run/.run.lock.pid.<pid>.<n>`
+and unlinking it; killed between the two, the owner file has two names. That reads as the owner's
+record, and recovering the dead owner removes the staging names that are the same inode and says so on
+stderr (`removed the staged lock owner record a crashed owner left beside …`); a file of another inode
+is left.
 
 A package **stop** is not a died run. The controller waits up to 60 seconds for a running sync to cancel
 cooperatively (`SDSYNC_DSM_RUNNER_STOP_GRACE`, 1 to 110 seconds, inside the 120-second lifecycle

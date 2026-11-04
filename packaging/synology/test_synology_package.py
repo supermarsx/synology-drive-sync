@@ -14252,6 +14252,85 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
         self.assertFalse(calls.exists() and calls.read_text(encoding="utf-8").strip(),
                          "supervisor.lock was probed beside a record that proves the supervisor")
 
+    def _crashed_run_lock(self, *, other_inode_sibling: bool = False) -> tuple[Path, Path, int]:
+        """run.lock/pid published for a dead owner, as the daemon's link(2) /
+        unlink(2) pair leaves it when the daemon dies between the two calls:
+        the owner file has two names, run.lock/pid and the staging sibling
+        run/.run.lock.pid.<pid>.<n>. Returns (lock directory, sibling, pid)."""
+        run = self.real_var / "run"
+        dead = subprocess.Popen(["sleep", "300"])
+        triple = self._identity_triple(dead.pid)
+        dead.kill()
+        dead.wait(timeout=10)
+        lock = run / "run.lock"
+        lock.mkdir(mode=0o700)
+        if os.getuid() == 0:
+            os.chown(lock, self.drop_uid, self.drop_gid)
+        sibling = run / f".run.lock.pid.{dead.pid}.1"
+        sibling.write_text(triple, encoding="ascii")
+        sibling.chmod(0o600)
+        if os.getuid() == 0:
+            os.chown(sibling, self.drop_uid, self.drop_gid)
+        os.link(sibling, lock / "pid")
+        if other_inode_sibling:
+            other = run / f".run.lock.pid.{dead.pid}.2"
+            other.write_text(triple, encoding="ascii")
+            other.chmod(0o600)
+            if os.getuid() == 0:
+                os.chown(other, self.drop_uid, self.drop_gid)
+        return lock, sibling, dead.pid
+
+    def test_stale_run_lock_recovery_removes_the_daemons_staged_sibling_and_names_it(self) -> None:
+        # The daemon publishes run.lock/pid by linking run/.run.lock.pid.<pid>.<n>
+        # and unlinking it. Killed between the two it leaves the owner file with
+        # two names. The lock reader already reads that as the owner's record
+        # (7722b3c); recovering the dead owner's lock removed run.lock/pid and
+        # left the sibling in run/ for good, unnamed. Recovery now removes the
+        # staging names that are that same inode, and says which; a sibling of
+        # another inode is not its to remove. Against the real daemon.
+        self._daemon_engine(None)
+        run = self.real_var / "run"
+        lock, sibling, dead_pid = self._crashed_run_lock(other_inode_sibling=True)
+        other = run / f".run.lock.pid.{dead_pid}.2"
+        status = self.shell(self.lifecycle, "status")
+        self.assertEqual(status.returncode, 1, status.stdout + status.stderr)
+        self.assertTrue(sibling.exists(), "a read-only status removed the staged record")
+        stopped = self.shell(self.lifecycle, "stop", timeout=60)
+        self.assertEqual(stopped.returncode, 0, stopped.stdout + stopped.stderr)
+        self.assertFalse(lock.exists(), "the stale run.lock survived stop")
+        self.assertFalse(sibling.exists(), "the staged owner record survived the recovery\n" + stopped.stdout + stopped.stderr)
+        self.assertIn(str(self.fhs / "var/run" / sibling.name), stopped.stdout + stopped.stderr)
+        self.assertNotIn(other.name, stopped.stdout + stopped.stderr)
+        self.assertTrue(other.exists(), "a staged file of another inode was removed")
+        other.unlink()
+        started = self._start_daemon()
+        self.assertEqual(self.shell(self.lifecycle, "status").returncode, 0)
+        self.assertEqual(
+            sorted(name for name in os.listdir(run) if name.startswith(".run.lock")), [],
+            "the start left staging files behind",
+        )
+        stopped = self.shell(self.lifecycle, "stop", timeout=60)
+        self.assertEqual(stopped.returncode, 0, stopped.stdout + stopped.stderr)
+
+    def test_a_live_owner_keeps_its_staged_run_lock_record(self) -> None:
+        # The same two names for a LIVE owner mid-publication: nothing is
+        # recovered, nothing removed, and the reader sees a live lock.
+        self._daemon_engine(None)
+        run = self.real_var / "run"
+        owner = self._spawn_fake("--plan")
+        lock = run / "run.lock"
+        lock.mkdir(mode=0o700)
+        if os.getuid() == 0:
+            os.chown(lock, self.drop_uid, self.drop_gid)
+        sibling = run / f".run.lock.pid.{owner.pid}.1"
+        self._write_run_record(sibling.name, self._identity_triple(owner.pid))
+        os.link(sibling, lock / "pid")
+        status = self.shell(self.lifecycle, "status")
+        self.assertEqual(status.returncode, 2, status.stdout + status.stderr)
+        self.assertTrue(sibling.exists())
+        self.assertTrue((lock / "pid").exists())
+        self.assertEqual((lock / "pid").stat().st_nlink, 2)
+
     def test_a_lock_that_no_tool_can_probe_is_named_and_the_records_decide(self) -> None:
         # No flock(1) and a bridge whose probe fails: status says why, the
         # hooks still stop at what the records show, and nothing is guessed.
