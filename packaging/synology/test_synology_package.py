@@ -23918,29 +23918,71 @@ fi
         self.assertNotEqual(refused.returncode, 0, refused.stdout)
         self.assertIn("unsafe", refused.stdout + refused.stderr)
 
+    #: Event names the controller log carries that are not a literal in the shape
+    #: src/daemon writes them in: built dynamically by the daemon, or written by
+    #: the lifecycle and controller shell.
+    SHELL_OR_DYNAMIC_EVENT_NAMES = frozenset({
+        "consumer_stderr", "routine_backend",
+        "daemon_lock_probe", "routine_watch_pid_mismatch", "service_stop_forced",
+        # fix7: the controller's own, written by the shell.
+        "poll_scratch_leftover_removed", "poll_scratch_leftover_unremovable",
+        "routine_watch_orphan_stopped", "routine_watch_orphan_unstoppable",
+        "routine_watch_guard_unavailable",
+    })
+
+    @staticmethod
+    def daemon_event_names_from_source() -> set[str]:
+        """The event names src/daemon logs, read from its string literals.
+
+        Files: src/daemon/*.rs except *_tests.rs and testkit.rs, each cut at its
+        inline test module (the first column-0 #[cfg(test)] whose next
+        non-attribute line starts with `mod `). A name is a literal
+        "[a-z][a-z0-9]*(_[a-z0-9]+)+" that is the argument right after
+        `Level::<Name>,`, or the second argument after it with a lowercase
+        category between, or the value of an `event:` field.
+        """
+        literal = r'"([a-z][a-z0-9]*(?:_[a-z0-9]+)+)"'
+        category = r'"[a-z]+"'
+        names: set[str] = set()
+        for path in sorted((REPOSITORY / "src/daemon").glob("*.rs")):
+            if path.name.endswith("_tests.rs") or path.name == "testkit.rs":
+                continue
+            text = path.read_text(encoding="utf-8")
+            inline_tests = re.search(r"^#\[cfg\(test\)\]\s*\n(?:#\[[^\n]*\]\s*\n)*mod ", text, re.M)
+            if inline_tests:
+                text = text[: inline_tests.start()]
+            for pattern in (
+                r"Level::\w+,\s*" + category + r"\s*,\s*" + literal,
+                r"Level::\w+,\s*" + literal,
+                r"\bevent:\s*" + literal,
+            ):
+                names.update(match.group(1) for match in re.finditer(pattern, text))
+        return names
+
     def test_controller_log_readers_accept_every_event_name_the_daemon_writes(self) -> None:
         # The daemon writes event names the shell never did. Neither the shell
         # writer nor the Logs read allowlists names; this pins that, so a reader
-        # that learned an allowlist later cannot silently drop them.
-        names = [
+        # that learned an allowlist later cannot silently drop them. The list is
+        # derived from the string literals in src/daemon, so a new event is
+        # exercised without anyone remembering to add it, and a renamed or
+        # removed one fails here instead of leaving a stale name.
+        derived = self.daemon_event_names_from_source()
+        self.assertGreater(len(derived), 60, "the derivation found too few events; the literal shapes changed")
+        previously_listed = [
             "service_superseded", "service_records_removed", "service_records_kept",
             "daemon_stderr_unavailable", "api_socket_stale_removed", "api_socket_stale_kept",
             "api_server_unwaitable", "audit_unavailable", "consumer_unkillable",
-            "consumer_stderr", "config_unreadable", "event_log_lock_stale",
+            "config_unreadable", "event_log_lock_stale",
             "event_log_rotation_failed", "ctl_accept_failed",
-            # fix6: the daemon's, and the lifecycle's own (daemon_lock_probe
-            # names the probe in use; routine_watch_pid_mismatch a wrapped PID).
             "control_file_unremovable", "event_log_rotation_deferred", "profile_state_unreadable",
             "config_forgotten", "service_degraded", "service_degraded_cleared",
             "api_server_respawn_held", "api_server_respawn_released",
-            "api_server_identity_unavailable", "daemon_lock_probe", "routine_watch_pid_mismatch",
+            "api_server_identity_unavailable",
             "ctl_peer_gone", "ctl_peer_unchecked", "ctl_reply_dropped", "ctl_socket_option_failed",
-            "routine_backend", "service_stop_forced",
-            # fix7: the poll's dead-owner cleanup and the fallback watcher's guard.
-            "poll_scratch_leftover_removed", "poll_scratch_leftover_unremovable",
-            "routine_watch_orphan_stopped", "routine_watch_orphan_unstoppable",
-            "routine_watch_guard_unavailable",
         ]
+        stale = [name for name in previously_listed if name not in derived]
+        self.assertEqual(stale, [], f"events the test used to cover are no longer written by src/daemon: {stale}")
+        names = sorted(derived | self.SHELL_OR_DYNAMIC_EVENT_NAMES)
         helper = self.root / "daemon-events-helper.sh"
         helper.write_text(
             "#!/bin/sh\nset -eu\n"
@@ -23955,13 +23997,13 @@ fi
         helper.chmod(0o755)
         if os.getuid() == 0:
             os.chown(helper, self.drop_uid, self.drop_gid)
-        written = self.shell(helper)
+        written = self.shell(helper, timeout=240)
         self.assertEqual(written.returncode, 0, written.stdout + written.stderr)
-        result, payload = self.api("logs", "--source", "controller", "--lines", "100")
+        result, payload = self.api("logs", "--source", "controller", "--lines", str(len(names) + 50))
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         text = "\n".join(payload["logs"][0]["lines"])
-        for name in names:
-            self.assertIn(f'"event":"{name}"', text, name)
+        missing = [name for name in names if f'"event":"{name}"' not in text]
+        self.assertEqual(missing, [], f"events written but not returned by api logs: {missing}\n{text[:2000]}")
 
     def test_free_text_request_id_is_never_read_as_a_request_tag(self) -> None:
         # ADV-B-5, writer half. A run's error line naming a file such as
