@@ -195,6 +195,80 @@ fn a_status_walk_publishes_the_phase_it_reached() {
     );
 }
 
+/// N-D4: a batch run (`sync --profiles a,b`, which is how the daemon runs every scheduled `all`
+/// run) publishes its record too. It published nothing, so the daemon's watchdog had only the
+/// I/O counters, which do not move while the core talks to the network, and a long scheduled
+/// run could be stopped as stalled. The record names the phase of the profile being worked on,
+/// with the same six keys a single-profile record carries.
+#[test]
+fn a_batch_run_publishes_the_phase_it_reached() {
+    let workspace = TestDir::new("progress-batch");
+    let password = workspace.write("password", PASSWORD);
+    let server = MockFileStation::start();
+    let mut tables = String::new();
+    for name in ["alpha", "beta"] {
+        let source = workspace.child(&format!("source-{name}"));
+        fs::create_dir_all(&source).expect("create a source");
+        fs::write(source.join(format!("{name}.txt")), name.as_bytes()).expect("write a payload");
+        server.add_directory(&format!("/team/{name}"));
+        // One `[profiles.<name>]` table per profile, as the package manager renders them.
+        tables.push_str(&format!(
+            "[profiles.{name}]\nsource = {source:?}\nremote = \"/team/{name}\"\nurl = {url:?}\n\
+             username = \"e2e-user\"\npassword-file = {password:?}\nno-vault = true\n\
+             allow-http = true\nprogress = \"never\"\n\n",
+            source = source.to_str().expect("UTF-8 source"),
+            url = server.base_url(),
+            password = password.to_str().expect("UTF-8 password path"),
+        ));
+    }
+    let config = workspace.write("config.toml", tables.as_bytes());
+    let records = workspace.child("progress");
+    fs::create_dir_all(&records).expect("create the progress directory");
+    let path = record_path(&records);
+
+    let output = run(&[
+        "--config",
+        config.to_str().expect("UTF-8 config path"),
+        "--progress-record",
+        path.to_str().expect("UTF-8 record path"),
+        "--output",
+        "ndjson",
+        "sync",
+        "--profiles",
+        "alpha,beta",
+        "--max-total-delete",
+        "0",
+        "--no-delete",
+    ]);
+    eprintln!(
+        "status={:?}\nstdout={}\nstderr={}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output.status.success(), "the batch itself must succeed");
+    let document = published(&path);
+    assert_eq!(document["schema"], "sdsync.dsm-request-progress.v1");
+    assert_eq!(document["request_id"], REQUEST_ID);
+    assert_eq!(document["job_id"], JOB_ID);
+    assert_eq!(
+        document["section"], "reconcile",
+        "the last profile's last phase: {document}"
+    );
+    let mut keys: Vec<&str> = document
+        .as_object()
+        .expect("the record is an object")
+        .keys()
+        .map(String::as_str)
+        .collect();
+    keys.sort_unstable();
+    assert_eq!(
+        keys,
+        ["count", "job_id", "request_id", "schema", "section", "updated_at"],
+        "a batch record carries the same six keys"
+    );
+}
+
 /// Without the flag, nothing is published and nothing is created.
 ///
 /// The other half of the contract: every invocation that is not a queued dashboard request -- a
