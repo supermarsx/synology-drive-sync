@@ -225,7 +225,9 @@ now belongs to another process, and stop and start remove them and name each pat
 daemon record <path>`). A held lock keeps the strict identity check above. The lock is probed with
 `flock -n`, or, on a unit without `flock(1)`, with the bridge's own `sdsync-dsm-api --daemon-lock-probe
 <path>` (the same non-blocking `flock`, read-only, released at once; exit `0` free, `3` held, `1` cannot
-probe, with a `daemon-lock-probe: <path>: <cause>` line on stderr). The probe in use is named once
+probe, with one `daemon-lock-probe: <path>: <cause>` line on stderr, in which a newline or any other control
+character of the path is written as an escape such as `
+`). The probe in use is named once
 per change in `controller.log` (`info` `daemon_lock_probe`, `tool=flock` or `tool=daemon-lock-probe
 flock=absent`; the last tool is kept in `run/daemon-lock-probe.tool`) and, for the bridge's, in a
 `note:` line on stderr. Only when neither can run (no `flock(1)` and no executable bridge, or the

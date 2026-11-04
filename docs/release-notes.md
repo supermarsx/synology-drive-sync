@@ -461,6 +461,23 @@ lists its own commits.
   another thread.
 - **CI** runs the package suite under dash and under bash as `/bin/sh`, each in three weight-balanced shards
   (the `packaging-suite` job).
+- **A killed daemon no longer leaves the dashboard amber.** After `kill -9` the daemon could not clear the
+  `degraded=` block it had written to `controller.state`, so the status snapshot kept serving
+  `controller.degraded` for a service that was not there. It is served only while the service the same
+  snapshot reports is `running` (a malformed block is still refused, live or not).
+- **`config_unreadable` forgets what nothing reads.** A dependency's profile state, and a removed
+  profile's fragment and state, used to stay listed until the daemon restarted; each now leaves the list
+  with a `config_forgotten` line (path and reason). A changed cause of an unreadable control directory
+  is named again and published (`was=` the earlier one).
+- **The event-log lock says why it was cleared**: the pid is gone, the pid was reused by another process,
+  or the record is from an earlier boot (it said "gone" for all three). A stale record is removed only
+  when its contents, not just its inode number, are the ones judged. Contention past a minute retries
+  once a minute, as the failure line says, and a failure that is not contention ends the count.
+- **`--daemon-lock-probe` writes one line**: control characters in the path it names are escaped.
+- **Checksum-index messages fit their cases.** `pair-index-unsafe` and `pair-index-cleanup-failed` no
+  longer describe only their commonest cause, a failed weekly sweep no longer calls an unreadable age
+  "older than 7 days", and a failed compaction or an index not served this run (`pair-index-compaction-failed`,
+  `pair-index-link-guard-unchecked`) are now said on the profile's index line instead of being dropped.
 
 ## Questions only a real NAS can answer
 
