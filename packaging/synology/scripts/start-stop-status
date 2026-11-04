@@ -303,30 +303,133 @@ hard_stop_exact_launched_child() {
 # in time -- the stop used to print "process was not force-killed" and exit 1 with
 # the services still running. It now forces what is left, in two steps so that a
 # controller that only waited on its runner can record that run itself:
-#   1. the runner (if its identity is the verified one) and its direct children,
-#      and the API service;
+#   1. the runner (if its identity is the verified one: the argv, and the start
+#      tick recorded when the stop first saw it) and its direct children, and
+#      the API service;
 #   2. the controller.
-# Every target is killed only after its identity is checked again; each KILL is
-# named. 0 when nothing unsafe was met, 1 when an identity could not be proven
-# (then nothing more is signalled).
+# Every target is killed only after its identity is checked again, by its start
+# tick, immediately before the KILL; the KILL's exit status is checked; and only
+# what was killed is reported as killed. Everything that is not killed is named
+# with its reason (an unreadable /proc entry, another owner, a reused PID, a
+# failed kill) rather than skipped in silence.
+
+# Kill PID $1, called $2, only while it still has start tick $3. Appends to
+# force_names a PID that was killed and to force_gone one that was already gone
+# or replaced; sets force_failed when a process that should have been killed
+# was not (the reason is printed). 0 unless that happened.
+force_kill_exact() {
+    force_kill_pid=$1
+    force_kill_label=$2
+    force_kill_start=$3
+    if ! read_process_stat_fields "$force_kill_pid"; then
+        if [ -e "/proc/$force_kill_pid" ]; then
+            package_message "not killing $force_kill_label PID $force_kill_pid: /proc/$force_kill_pid/stat cannot be read"
+            force_failed=true
+            return 1
+        fi
+        force_gone="${force_gone:+$force_gone, }$force_kill_label PID $force_kill_pid"
+        return 0
+    fi
+    if [ "$process_stat_start" != "$force_kill_start" ]; then
+        package_message "not killing $force_kill_label PID $force_kill_pid: its start tick is now $process_stat_start, not $force_kill_start (the PID was reused)"
+        force_gone="${force_gone:+$force_gone, }$force_kill_label PID $force_kill_pid"
+        return 0
+    fi
+    case $process_stat_state in
+        Z|X|x)
+            force_gone="${force_gone:+$force_gone, }$force_kill_label PID $force_kill_pid"
+            return 0
+            ;;
+    esac
+    force_kill_status=0
+    force_kill_output=$(kill -KILL "$force_kill_pid" 2>&1) || force_kill_status=$?
+    if [ "$force_kill_status" -eq 0 ]; then
+        force_names="${force_names:+$force_names, }$force_kill_label PID $force_kill_pid"
+        return 0
+    fi
+    # A target that exited between the check and kill(2) is not a failure; one
+    # that is still there is.
+    if read_process_stat_fields "$force_kill_pid"; then
+        force_kill_terminal=false
+        [ "$process_stat_start" = "$force_kill_start" ] || force_kill_terminal=true
+        case $process_stat_state in Z|X|x) force_kill_terminal=true ;; esac
+    else
+        force_kill_terminal=false
+        [ -e "/proc/$force_kill_pid" ] || force_kill_terminal=true
+    fi
+    if [ "$force_kill_terminal" = true ]; then
+        force_gone="${force_gone:+$force_gone, }$force_kill_label PID $force_kill_pid"
+        return 0
+    fi
+    package_message "could not kill $force_kill_label PID $force_kill_pid: kill exited $force_kill_status${force_kill_output:+ ($(one_safe_line "$force_kill_output"))}"
+    force_failed=true
+    return 1
+}
+
+force_report() {
+    [ -z "$force_names" ] || package_message "killed $force_names"
+    [ -z "$force_gone" ] || package_message "already gone before the KILL: $force_gone"
+    return 0
+}
+
 force_stop_runner_and_api() {
     force_names=
-    if [ "${run_active:-false}" = true ] && verified_service_pid_matches runner "$run_pid"; then
-        force_children=
-        for force_entry in /proc/[0-9]*; do
-            force_child=${force_entry#/proc/}
-            read_process_stat_fields "$force_child" || continue
-            [ "$process_stat_ppid" = "$run_pid" ] || continue
-            read_process_status_ids "$force_child" || continue
-            [ "$process_status_uid" = "$path_owner" ] || continue
-            force_children="$force_children $force_child"
-        done
-        kill -KILL "$run_pid" 2>/dev/null || true
-        force_names="runner PID $run_pid"
-        for force_child in $force_children; do
-            kill -KILL "$force_child" 2>/dev/null || true
-            force_names="$force_names, its child PID $force_child"
-        done
+    force_gone=
+    force_failed=false
+    if [ "${run_active:-false}" = true ]; then
+        force_runner_status=0
+        if [ -z "${run_start:-}" ]; then
+            package_message "refusing to kill runner PID $run_pid: its start tick was not captured when the stop began"
+            force_runner_status=1
+        elif ! verified_service_pid_matches runner "$run_pid"; then
+            if script_pid_absent_or_zombie "$run_pid"; then
+                force_gone="runner PID $run_pid"
+            else
+                package_message "refusing to kill runner PID $run_pid: it no longer matches the runner's identity"
+                force_runner_status=1
+            fi
+        elif ! read_process_stat_fields "$run_pid" || [ "$process_stat_start" != "$run_start" ]; then
+            # Its children are found by parent PID, so a runner PID that something
+            # else now holds must not lead to that process's children.
+            package_message "not killing runner PID $run_pid or its children: its start tick is not the $run_start recorded when the stop began (the PID was reused, or /proc/$run_pid/stat cannot be read)"
+            if [ -z "${process_stat_start:-}" ] && [ -e "/proc/$run_pid" ]; then
+                force_runner_status=1
+            else
+                force_gone="runner PID $run_pid"
+            fi
+        else
+            force_children=
+            force_unreadable=
+            for force_entry in /proc/[0-9]*; do
+                force_child=${force_entry#/proc/}
+                if ! read_process_stat_fields "$force_child"; then
+                    [ ! -e "$force_entry" ] || force_unreadable="$force_unreadable $force_child"
+                    continue
+                fi
+                [ "$process_stat_ppid" = "$run_pid" ] || continue
+                force_child_start=$process_stat_start
+                if ! read_process_status_ids "$force_child"; then
+                    [ ! -e "$force_entry" ] && continue
+                    package_message "not killing PID $force_child, a child of the runner: its owner cannot be read (${process_status_failure:-unknown cause})"
+                    force_failed=true
+                    continue
+                fi
+                if [ "$process_status_uid" != "$path_owner" ]; then
+                    package_message "not killing PID $force_child, a child of the runner: it belongs to uid $process_status_uid, not the package user (uid $path_owner)"
+                    continue
+                fi
+                force_children="$force_children $force_child:$force_child_start"
+            done
+            [ -z "$force_unreadable" ] \
+                || package_message "warning: /proc entries that could not be read were not checked for children of the runner:$force_unreadable"
+            force_kill_exact "$run_pid" runner "$run_start" || true
+            for force_child in $force_children; do
+                force_kill_exact "${force_child%%:*}" "its child" "${force_child#*:}" || true
+            done
+        fi
+        if [ "$force_runner_status" -ne 0 ]; then
+            force_failed=true
+        fi
     fi
     if [ "${api_active:-false}" = true ]; then
         force_api_status=0
@@ -335,20 +438,22 @@ force_stop_runner_and_api() {
         case $force_api_status in
             0)
                 api_pid_matches "$saved_api_pid" || {
+                    force_report
                     package_message "refusing to kill API PID $saved_api_pid: its executable identity changed"
                     return 1
                 }
-                kill -KILL "$saved_api_pid" 2>/dev/null || true
-                force_names="${force_names:+$force_names, }API service PID $saved_api_pid"
+                force_kill_exact "$saved_api_pid" "API service" "$saved_api_start" || true
                 ;;
             1) ;;
             *)
+                force_report
                 package_message "refusing to kill API PID $saved_api_pid: its identity cannot be proven"
                 return 1
                 ;;
         esac
     fi
-    [ -z "$force_names" ] || package_message "killed $force_names"
+    force_report
+    [ "$force_failed" != true ] || return 1
     return 0
 }
 
@@ -365,8 +470,13 @@ force_stop_controller() {
             return 1
             ;;
     esac
-    kill -KILL "$saved_pid" 2>/dev/null || true
-    package_message "killed controller PID $saved_pid"
+    force_names=
+    force_gone=
+    force_failed=false
+    force_kill_exact "$saved_pid" controller "$saved_controller_start" || true
+    force_report
+    [ "$force_failed" != true ] || return 1
+    return 0
 }
 
 signal_exact_controller_identity() {
@@ -1876,6 +1986,108 @@ start_daemon_engine() {
     exit 0
 }
 
+# Wait for the controller, the runner and the API service to be gone, and when
+# the stop budget (timeout, in seconds) runs out first, force what is left: the
+# runner and API at once, the controller 5 s later, then 10 s more before the
+# stop is called failed. 0 when all are gone, 1 when one is not or its identity
+# is in doubt (named).
+stop_wait_for_services() {
+    # Poll bucket A. The budget and the message the operator sees stay in
+    # seconds; only the sampling is finer.
+    load_poll_resolution
+    poll_reset
+    stop_force_stage=0
+    stop_forced_names=
+    stop_wait_limit=$timeout
+    while :; do
+        controller_still_active=false
+        run_still_active=false
+        api_still_active=false
+        if [ "$controller_active" = true ]; then
+            if [ -n "${saved_controller_start:-}" ] && [ -n "${saved_controller_boot:-}" ]; then
+                controller_wait_status=0
+                exact_controller_process_status "$saved_pid" "$saved_controller_start" \
+                    "$saved_controller_boot" || controller_wait_status=$?
+                case $controller_wait_status in
+                    0) controller_still_active=true ;;
+                    1) ;;
+                    *)
+                        package_message "controller identity became unsafe while stopping"
+                        return 1
+                        ;;
+                esac
+            else
+                package_message "controller stop identity was not captured"
+                return 1
+            fi
+        fi
+        if [ "$run_active" = true ] && script_pid_matches "$run_pid" "$runner"; then
+            run_still_active=true
+            # The runner is the process with the start tick the stop recorded;
+            # a zombie, or a PID that something else now holds, is not it.
+            if [ -n "${run_start:-}" ] && read_process_stat_fields "$run_pid"; then
+                [ "$process_stat_start" = "$run_start" ] || run_still_active=false
+                case $process_stat_state in Z|X|x) run_still_active=false ;; esac
+            fi
+        fi
+        if [ "$api_active" = true ]; then
+            api_wait_status=0
+            exact_controller_process_status "$saved_api_pid" "$saved_api_start" \
+                "$saved_api_boot" || api_wait_status=$?
+            case $api_wait_status in
+                0) api_still_active=true ;;
+                1) ;;
+                *)
+                    package_message "API process identity became unsafe while stopping"
+                    return 1
+                    ;;
+            esac
+        fi
+        [ "$controller_still_active" = true ] || [ "$run_still_active" = true ] || \
+            [ "$api_still_active" = true ] || break
+        if poll_expired "$stop_wait_limit"; then
+            # Past the budget: force what is left (see force_stop_runner_and_api).
+            case $stop_force_stage in
+                0)
+                    package_message "graceful stop timed out after $timeout seconds; killing what is left"
+                    append_controller_log_event error service_stop_forced \
+                        "engine=shell stage=runner_and_api controller_pid=${saved_pid:-none} runner_pid=${run_pid:-none} grace_s=$timeout" >/dev/null 2>&1 \
+                        || package_message "warning: the service_stop_forced event could not be written to the controller log"
+                    force_stop_runner_and_api || return 1
+                    stop_forced_names=$force_names
+                    stop_force_stage=1
+                    stop_wait_limit=5
+                    ;;
+                1)
+                    if [ "$controller_still_active" = true ]; then
+                        if [ -n "$stop_forced_names" ]; then
+                            package_message "the controller (PID ${saved_pid:-none}) did not exit within 5 seconds of the KILL of $stop_forced_names; killing it"
+                        else
+                            package_message "the controller (PID ${saved_pid:-none}) is still live 5 seconds after the stop budget ended; killing it"
+                        fi
+                        force_stop_controller || return 1
+                    else
+                        stop_still_live=
+                        [ "$run_still_active" != true ] || stop_still_live="runner PID ${run_pid:-none}"
+                        [ "$api_still_active" != true ] || stop_still_live="${stop_still_live:+$stop_still_live and }API service PID ${saved_api_pid:-none}"
+                        package_message "the controller has exited; ${stop_still_live:-a service} is still live 5 seconds after the KILL"
+                    fi
+                    stop_force_stage=2
+                    stop_wait_limit=10
+                    ;;
+                *)
+                    package_message "services remained live 10 seconds after KILL; the stop failed"
+                    return 1
+                    ;;
+            esac
+            poll_reset
+            continue
+        fi
+        poll_wait
+    done
+    return 0
+}
+
 case ${1:-} in
     prestart)
         # Each refusal names what is missing; DSM shows only "failed to start".
@@ -2262,6 +2474,7 @@ case ${1:-} in
         saved_api_boot=
         controller_active=false
         run_active=false
+        run_start=
         api_active=false
         api_stale_artifacts=false
         api_socket_before_stop=
@@ -2375,6 +2588,7 @@ case ${1:-} in
                 fi
             else
                 run_active=true
+                run_start=$(process_start_time "$run_pid" 2>/dev/null || true)
                 stop_transitioned=true
             fi
         fi
@@ -2569,80 +2783,7 @@ case ${1:-} in
             package_message "SDSYNC_DSM_STOP_TIMEOUT=$timeout is below the 1 s minimum; using 1 s"
             timeout=1
         fi
-        # Poll bucket A. The budget and the message the operator sees stay in
-        # seconds; only the sampling is finer.
-        load_poll_resolution
-        poll_reset
-        stop_force_stage=0
-        stop_wait_limit=$timeout
-        while :; do
-            controller_still_active=false
-            run_still_active=false
-            api_still_active=false
-            if [ "$controller_active" = true ]; then
-                if [ -n "${saved_controller_start:-}" ] && [ -n "${saved_controller_boot:-}" ]; then
-                    controller_wait_status=0
-                    exact_controller_process_status "$saved_pid" "$saved_controller_start" \
-                        "$saved_controller_boot" || controller_wait_status=$?
-                    case $controller_wait_status in
-                        0) controller_still_active=true ;;
-                        1) ;;
-                        *)
-                            package_message "controller identity became unsafe while stopping"
-                            exit 1
-                            ;;
-                    esac
-                else
-                    package_message "controller stop identity was not captured"
-                    exit 1
-                fi
-            fi
-            if [ "$run_active" = true ] && script_pid_matches "$run_pid" "$runner"; then
-                run_still_active=true
-            fi
-            if [ "$api_active" = true ]; then
-                api_wait_status=0
-                exact_controller_process_status "$saved_api_pid" "$saved_api_start" \
-                    "$saved_api_boot" || api_wait_status=$?
-                case $api_wait_status in
-                    0) api_still_active=true ;;
-                    1) ;;
-                    *)
-                        package_message "API process identity became unsafe while stopping"
-                        exit 1
-                        ;;
-                esac
-            fi
-            [ "$controller_still_active" = true ] || [ "$run_still_active" = true ] || \
-                [ "$api_still_active" = true ] || break
-            if poll_expired "$stop_wait_limit"; then
-                # Past the budget: force what is left (see force_stop_runner_and_api).
-                case $stop_force_stage in
-                    0)
-                        package_message "graceful stop timed out after $timeout seconds; killing what is left"
-                        append_controller_log_event error service_stop_forced \
-                            "engine=shell stage=runner_and_api controller_pid=${saved_pid:-none} runner_pid=${run_pid:-none} grace_s=$timeout" >/dev/null 2>&1 \
-                            || package_message "warning: the service_stop_forced event could not be written to the controller log"
-                        force_stop_runner_and_api || exit 1
-                        stop_force_stage=1
-                        stop_wait_limit=5
-                        ;;
-                    1)
-                        package_message "the controller (PID ${saved_pid:-none}) did not exit within 5 seconds of its runner's KILL; killing it"
-                        force_stop_controller || exit 1
-                        stop_force_stage=2
-                        stop_wait_limit=10
-                        ;;
-                    *)
-                        package_message "services remained live 10 seconds after KILL; the stop failed"
-                        exit 1
-                        ;;
-                esac
-                poll_reset
-                continue
-            fi
-            poll_wait
-        done
+        stop_wait_for_services || exit 1
         stale_run_lock_status=0
         acquire_private_process_lock "$run_lock" || stale_run_lock_status=$?
         case $stale_run_lock_status in

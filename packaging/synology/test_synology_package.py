@@ -14562,6 +14562,169 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
         self.assertGreaterEqual(waits[0], 1, report)
         self.assertLessEqual(waits[0], 24, f"ctl stop was given wait_s={waits[0]} after the budget had been spent on\n" + report)
 
+    # -- the forced stop of the shell engine (S3-18) ---------------------------
+    #
+    # The forced stop kills a wedged runner, its children and the API service.
+    # Its functions are run here with the stop's own definitions, in a harness
+    # that is the lifecycle script up to its dispatcher, so a KILL that fails,
+    # a PID that was replaced and an unreadable /proc entry can be staged.
+
+    def _spawn_runner_with_child(self) -> tuple[subprocess.Popen[str], int]:
+        """A process whose argv carries the runner's path, with a child of its own."""
+        runner = str(self.fhs / "target/libexec/sdsync-run")
+        code = (
+            "import subprocess, sys, time\n"
+            "child = subprocess.Popen(['/bin/sleep', '120'])\n"
+            "print(child.pid, flush=True)\n"
+            "time.sleep(120)\n"
+        )
+        process = subprocess.Popen(
+            [sys.executable, "-c", code, runner],
+            stdout=subprocess.PIPE,
+            text=True,
+            preexec_fn=(
+                (lambda: (os.setgroups([]), os.setgid(self.drop_gid), os.setuid(self.drop_uid)))
+                if os.getuid() == 0
+                else None
+            ),
+        )
+        self.addCleanup(self._reap_fake, process)
+        assert process.stdout is not None
+        child = int(process.stdout.readline())
+
+        def reap_child() -> None:
+            try:
+                os.kill(child, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+
+        self.addCleanup(reap_child)
+        return process, child
+
+    def _force_harness(self, body: str, runner_pid: int, child_pid: int, timeout: int = 90) -> subprocess.CompletedProcess[str]:
+        text = self.lifecycle.read_text(encoding="utf-8")
+        dispatcher = re.search(r"^case \$\{1:-\} in$", text, re.M)
+        self.assertIsNotNone(dispatcher)
+        runtime = (self.fhs / "target/libexec/sdsync-common").read_text(encoding="utf-8")
+        real = re.search(r"^read_process_stat_fields\(\) \{\n.*?^\}\n", runtime, re.M | re.S)
+        self.assertIsNotNone(real)
+        renamed = real.group(0).replace("read_process_stat_fields() {", "real_read_process_stat_fields() {", 1)
+        wrapper = (
+            "read_process_stat_fields() {\n"
+            '    if [ "$1" = "${unreadable_pid:-x}" ]; then\n'
+            "        process_stat_state= process_stat_start= process_stat_ppid=\n"
+            "        return 1\n"
+            "    fi\n"
+            '    real_read_process_stat_fields "$@" || return 1\n'
+            '    if [ "$1" = "${tick_pid:-x}" ]; then\n'
+            "        tick_seen=$((${tick_seen:-0} + 1))\n"
+            '        [ "$tick_seen" -lt "${tick_after:-1}" ] || process_stat_start=$((process_stat_start + 1))\n'
+            "    fi\n"
+            "}\n"
+        )
+        preamble = (
+            '. "$common_runtime"\nrequire_package_identity\n'
+            + renamed + wrapper
+            + f"run_pid={runner_pid}\nchild_pid={child_pid}\nrun_active=true\n"
+            'run_start=$(process_start_time "$run_pid")\n'
+            "api_active=false\ncontroller_active=false\n"
+        )
+        harness = self.lifecycle_dir / "force-harness"
+        harness.write_text(text[: dispatcher.start()] + preamble + body, encoding="utf-8")
+        harness.chmod(0o755)
+        return self.shell(harness, timeout=timeout)
+
+    def test_a_forced_stop_never_says_killed_when_the_kill_failed(self) -> None:
+        runner, child = self._spawn_runner_with_child()
+        done = self._force_harness(
+            'kill() { case $1 in -KILL) echo "kill: injected failure" >&2; return 1 ;; esac; command kill "$@"; }\n'
+            "rc=0; force_stop_runner_and_api || rc=$?\necho rc=$rc\n",
+            runner.pid, child,
+        )
+        report = done.stdout + done.stderr
+        self.assertIn("rc=1", report)
+        self.assertIn(f"could not kill runner PID {runner.pid}", report)
+        self.assertIn(f"could not kill its child PID {child}", report)
+        self.assertIn("injected failure", report)
+        self.assertNotRegex(report, r"\bkilled\b", report)
+        self.assertIsNone(runner.poll())
+
+    def test_a_forced_stop_rechecks_start_ticks_before_each_kill_and_names_every_skip(self) -> None:
+        # S3-18. The runner's children were killed by PID alone, the runner by
+        # an argv match alone, and a skip or a failed KILL was silent.
+        def alive(pid: int) -> bool:
+            try:
+                state = Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[0]
+            except OSError:
+                return False
+            return state not in ("Z", "X")
+
+        # The runner's PID now holds a process with another start tick: neither
+        # it nor the children found through its PID are touched.
+        runner, child = self._spawn_runner_with_child()
+        done = self._force_harness(
+            "run_start=$((run_start + 1))\nrc=0; force_stop_runner_and_api || rc=$?\necho rc=$rc\n",
+            runner.pid, child,
+        )
+        report = done.stdout + done.stderr
+        self.assertIn("rc=0", report)
+        self.assertIn(f"not killing runner PID {runner.pid} or its children", report)
+        self.assertNotRegex(report, r"\bkilled\b", report)
+        self.assertTrue(alive(runner.pid) and alive(child), report)
+
+        # A child whose start tick changes between the scan and the KILL.
+        runner, child = self._spawn_runner_with_child()
+        done = self._force_harness(
+            f"tick_pid={child}\ntick_after=2\nrc=0; force_stop_runner_and_api || rc=$?\necho rc=$rc\n",
+            runner.pid, child,
+        )
+        report = done.stdout + done.stderr
+        self.assertIn("rc=0", report)
+        self.assertIn(f"killed runner PID {runner.pid}", report)
+        self.assertIn(f"not killing its child PID {child}: its start tick is now", report)
+        self.assertNotRegex(report, rf"killed .*its child PID {child}", report)
+        self.assertTrue(alive(child), report)
+
+        # An entry of /proc that cannot be read is named, and not guessed at.
+        runner, child = self._spawn_runner_with_child()
+        done = self._force_harness(
+            f"unreadable_pid={child}\nrc=0; force_stop_runner_and_api || rc=$?\necho rc=$rc\n",
+            runner.pid, child,
+        )
+        report = done.stdout + done.stderr
+        self.assertIn(f"/proc entries that could not be read were not checked for children of the runner: {child}", report)
+        self.assertIn(f"killed runner PID {runner.pid}", report)
+        self.assertTrue(alive(child), report)
+
+        # A child that is gone by the time of its KILL is reported as gone.
+        runner, child = self._spawn_runner_with_child()
+        done = self._force_harness(
+            'kill() { case $1 in -KILL) command kill -KILL "$child_pid"; sleep 0.3 ;; esac; command kill "$@"; }\n'
+            "rc=0; force_stop_runner_and_api || rc=$?\necho rc=$rc\n",
+            runner.pid, child,
+        )
+        report = done.stdout + done.stderr
+        self.assertIn("rc=0", report)
+        self.assertIn(f"already gone before the KILL: its child PID {child}", report)
+
+    def test_a_forced_stop_with_the_controller_already_gone_does_not_claim_it_did_not_exit(self) -> None:
+        # S3-18. Stage 1 said "the controller did not exit within 5 seconds of
+        # its runner's KILL" whatever was left; here the controller is gone and
+        # a runner survives a KILL that does not take.
+        runner, child = self._spawn_runner_with_child()
+        done = self._force_harness(
+            "timeout=1\n"
+            'kill() { case $1 in -KILL) return 0 ;; esac; command kill "$@"; }\n'
+            "rc=0; stop_wait_for_services || rc=$?\necho rc=$rc\n",
+            runner.pid, child, timeout=120,
+        )
+        report = done.stdout + done.stderr
+        self.assertIn("rc=1", report)
+        self.assertIn("graceful stop timed out after 1 seconds", report)
+        self.assertIn(f"the controller has exited; runner PID {runner.pid} is still live 5 seconds after the KILL", report)
+        self.assertNotIn("did not exit", report)
+        self.assertIn("services remained live 10 seconds after KILL; the stop failed", report)
+
     # -- scenarios against the REAL daemon (fix5 review N-S7) ------------------
     #
     # The bridge mock passes --launch-daemon, --supervise, --daemon and --ctl
