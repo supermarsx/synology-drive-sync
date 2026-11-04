@@ -50,6 +50,8 @@ pub(crate) struct WatchSettings {
     pub(crate) slice: Duration,
     /// `false` forces the polling fallback (tests; non-Linux always polls).
     pub(crate) native: bool,
+    /// The longest the safety-net floor waits under a healthy native watch.
+    pub(crate) floor_max: Duration,
 }
 
 impl Default for WatchSettings {
@@ -62,6 +64,7 @@ impl Default for WatchSettings {
             source_recheck: Duration::from_secs(30),
             slice: Duration::from_millis(500),
             native: cfg!(target_os = "linux"),
+            floor_max: Duration::from_secs(3600),
         }
     }
 }
@@ -242,7 +245,7 @@ impl Worker {
     /// Arm the native watch and serve it until it fails or is stopped.
     #[cfg(target_os = "linux")]
     fn native(&self, source_missing: &mut bool, caught_up: &mut bool) -> Attempt {
-        use synology_drive_sync::watch::{Change, EventSet, LimitPolicy, TreeWatch, WatchOptions};
+        use synology_drive_sync::watch::{EventSet, LimitPolicy, TreeWatch, WatchOptions};
         let filter = match self.filter() {
             Ok(filter) => filter,
             Err(error) => return Attempt::Failed(error),
@@ -282,23 +285,26 @@ impl Worker {
         if !std::mem::replace(caught_up, true) && !self.catch_up() {
             return Attempt::Stopped;
         }
+        let mut floor = Floor::start(self);
         loop {
             if self.stopped() {
                 return Attempt::Stopped;
             }
             match tree.wait(self.settings.slice) {
                 Ok(changes) => {
-                    for change in changes {
-                        let event = match change {
-                            Change::Path { dir, .. } => ChangeEvent::Changed {
-                                routine: self.spec.routine.clone(),
-                                dir,
-                            },
-                            Change::Overflow => ChangeEvent::Overflow {
-                                routine: Some(self.spec.routine.clone()),
-                            },
-                        };
-                        if !self.emit(event) {
+                    if !self.forward(changes, &mut floor) {
+                        return Attempt::Stopped;
+                    }
+                    if floor.due() {
+                        // Changes made while the floor walked are drained
+                        // first, so they are not taken for ones inotify missed.
+                        let reading = floor.read(self);
+                        if let Ok(late) = tree.wait(Duration::ZERO)
+                            && !self.forward(late, &mut floor)
+                        {
+                            return Attempt::Stopped;
+                        }
+                        if !floor.compare(self, reading) {
                             return Attempt::Stopped;
                         }
                     }
@@ -317,6 +323,42 @@ impl Worker {
         }
     }
 
+    /// Deliver the watcher's changes, noting them for the floor.
+    #[cfg(target_os = "linux")]
+    fn forward(&self, changes: Vec<synology_drive_sync::watch::Change>, floor: &mut Floor) -> bool {
+        use synology_drive_sync::watch::Change;
+        for change in changes {
+            let event = match change {
+                Change::Path { dir, .. } => {
+                    floor.reported(&dir);
+                    ChangeEvent::Changed {
+                        routine: self.spec.routine.clone(),
+                        dir,
+                    }
+                }
+                Change::Overflow => {
+                    floor.overflowed();
+                    ChangeEvent::Overflow {
+                        routine: Some(self.spec.routine.clone()),
+                    }
+                }
+            };
+            if !self.emit(event) {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// How often the floor walks a healthy native watch: the routine's poll
+    /// interval, at least a minute and at most an hour.
+    fn floor(&self) -> Duration {
+        self.spec
+            .poll
+            .clamp(Duration::from_secs(60), Duration::from_secs(3600))
+            .min(self.settings.floor_max)
+    }
+
     #[cfg(not(target_os = "linux"))]
     fn native(&self, _source_missing: &mut bool, _caught_up: &mut bool) -> Attempt {
         Attempt::Failed(WatchError::Unavailable(
@@ -331,13 +373,6 @@ impl Worker {
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     fn catch_up(&self) -> bool {
         let routine = Some(self.spec.routine.clone());
-        let Some(since) = self.spec.last_success_epoch else {
-            return self.emit(ChangeEvent::Notice {
-                routine: self.spec.routine.clone(),
-                warn: false,
-                detail: "catch_up=whole_tree cause=no_successful_run_yet".to_owned(),
-            }) && self.emit(ChangeEvent::Overflow { routine });
-        };
         let filter = match self.filter() {
             Ok(filter) => Arc::new(filter),
             Err(error) => {
@@ -348,11 +383,40 @@ impl Worker {
                 }) && self.emit(ChangeEvent::Overflow { routine });
             }
         };
-        match newest_change(
+        let facts = newest_change(
             self.spec.source.clone(),
             filter,
             self.settings.walk_deadline,
-        ) {
+        );
+        if let Ok(facts) = &facts
+            && !facts.mounts.is_empty()
+            && !self.emit(ChangeEvent::Notice {
+                routine: self.spec.routine.clone(),
+                warn: false,
+                detail: format!(
+                    "nested_mounts={} first={} watched_by=poll_floor every_seconds={}",
+                    facts.mounts.len(),
+                    facts
+                        .mounts
+                        .iter()
+                        .take(5)
+                        .cloned()
+                        .collect::<Vec<_>>()
+                        .join(","),
+                    self.floor().as_secs()
+                ),
+            })
+        {
+            return false;
+        }
+        let Some(since) = self.spec.last_success_epoch else {
+            return self.emit(ChangeEvent::Notice {
+                routine: self.spec.routine.clone(),
+                warn: false,
+                detail: "catch_up=whole_tree cause=no_successful_run_yet".to_owned(),
+            }) && self.emit(ChangeEvent::Overflow { routine });
+        };
+        match facts.map(|facts| facts.newest) {
             Ok(Some(newest)) if newest + 2 < since as i64 => true,
             Ok(None) => true,
             Ok(Some(newest)) => {
@@ -496,14 +560,156 @@ enum PollEnd {
     Retry,
 }
 
+/// The safety net under a healthy native watch. inotify does not see writes
+/// that do not pass through this kernel's VFS (a CIFS/NFS folder mounted in a
+/// share, some bind and USB mounts) nor mmap writes that never close. A
+/// stat-only reading of the tree every floor period finds those; a directory
+/// whose contents moved without an event is synced and named
+/// (`watch_missed_change`, warn), which shows where inotify is blind.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+struct Floor {
+    filter: Option<Arc<Filter>>,
+    every: Duration,
+    next: std::time::Instant,
+    baseline: Option<super::poll::Reading>,
+    reported: std::collections::BTreeSet<String>,
+    overflowed: bool,
+    failing: bool,
+}
+
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+impl Floor {
+    fn start(worker: &Worker) -> Self {
+        let every = worker.floor();
+        let filter = worker.filter().ok().map(Arc::new);
+        let baseline = filter.as_ref().and_then(|filter| {
+            super::poll::read_with_deadline(
+                worker.spec.source.clone(),
+                Arc::clone(filter),
+                worker.settings.walk_deadline,
+            )
+            .ok()
+        });
+        Self {
+            filter,
+            every,
+            next: std::time::Instant::now() + every,
+            baseline,
+            reported: std::collections::BTreeSet::new(),
+            overflowed: false,
+            failing: false,
+        }
+    }
+
+    fn reported(&mut self, dir: &str) {
+        self.reported.insert(dir.to_owned());
+    }
+
+    fn overflowed(&mut self) {
+        self.overflowed = true;
+    }
+
+    fn due(&self) -> bool {
+        std::time::Instant::now() >= self.next
+    }
+
+    fn read(&mut self, worker: &Worker) -> Option<Result<super::poll::Reading, String>> {
+        self.next = std::time::Instant::now() + self.every;
+        let filter = self.filter.as_ref()?;
+        Some(
+            super::poll::read_with_deadline(
+                worker.spec.source.clone(),
+                Arc::clone(filter),
+                worker.settings.walk_deadline,
+            )
+            .map_err(|error| error.to_string()),
+        )
+    }
+
+    /// Whether inotify reported `dir`'s change: the directory itself, the
+    /// parent of a new one, or a directory below a removed one.
+    fn covered(&self, dir: &str) -> bool {
+        self.reported.iter().any(|reported| {
+            reported == dir || reported.is_empty() || dir.starts_with(&format!("{reported}/"))
+        })
+    }
+
+    /// Compare a fresh reading with the last; `false` when the control
+    /// thread is gone.
+    fn compare(
+        &mut self,
+        worker: &Worker,
+        reading: Option<Result<super::poll::Reading, String>>,
+    ) -> bool {
+        let reading = match reading {
+            None => return true,
+            Some(Ok(reading)) => reading,
+            Some(Err(cause)) => {
+                // Named once per episode; the native watch goes on.
+                if !std::mem::replace(&mut self.failing, true) {
+                    return worker.emit(ChangeEvent::Notice {
+                        routine: worker.spec.routine.clone(),
+                        warn: true,
+                        detail: format!("poll_floor_failed cause={cause}"),
+                    });
+                }
+                return true;
+            }
+        };
+        self.failing = false;
+        let mut alive = true;
+        if let Some(old) = &self.baseline
+            && !self.overflowed
+        {
+            let missed: Vec<String> = super::poll::changed_dirs(old, &reading)
+                .into_iter()
+                .filter(|dir| !self.covered(dir))
+                .collect();
+            if !missed.is_empty() {
+                alive = worker.emit(ChangeEvent::Notice {
+                    routine: worker.spec.routine.clone(),
+                    warn: true,
+                    detail: format!(
+                        "watch_missed_change dirs={} first={} floor_seconds={}",
+                        missed.len(),
+                        missed.iter().take(5).cloned().collect::<Vec<_>>().join(","),
+                        self.every.as_secs()
+                    ),
+                });
+                for dir in missed {
+                    alive = alive
+                        && worker.emit(ChangeEvent::Changed {
+                            routine: worker.spec.routine.clone(),
+                            dir,
+                        });
+                }
+            }
+        }
+        self.baseline = Some(reading);
+        self.reported.clear();
+        self.overflowed = false;
+        alive
+    }
+}
+
 /// The newest modification or status change (epoch seconds) of anything in
 /// the tree the filter keeps, read on a walker thread bounded by `deadline`.
 /// `Ok(None)` for an empty tree.
+/// What the arm-time walk learned.
+#[derive(Debug, Default)]
+struct TreeFacts {
+    /// The newest modification or status change (epoch seconds).
+    newest: Option<i64>,
+    /// Directories on another filesystem than the root (USB, bind, CIFS/NFS
+    /// mounts): inotify sees only this kernel's own writes there.
+    mounts: Vec<String>,
+}
+
 fn newest_change(
     root: PathBuf,
     filter: Arc<Filter>,
     deadline: Duration,
-) -> Result<Option<i64>, String> {
+) -> Result<TreeFacts, String> {
     let current = Arc::new(std::sync::Mutex::new(String::new()));
     let (tx, rx) = mpsc::channel();
     let walker_current = Arc::clone(&current);
@@ -529,8 +735,14 @@ fn walk_newest(
     root: &Path,
     filter: &Filter,
     current: &std::sync::Mutex<String>,
-) -> Result<Option<i64>, String> {
+) -> Result<TreeFacts, String> {
     let mut newest: Option<i64> = None;
+    let mut mounts = Vec::new();
+    #[cfg(unix)]
+    let root_device = {
+        use std::os::unix::fs::MetadataExt;
+        std::fs::metadata(root).ok().map(|metadata| metadata.dev())
+    };
     let mut pending = vec![String::new()];
     while let Some(relative) = pending.pop() {
         let dir = if relative.is_empty() {
@@ -567,11 +779,19 @@ fn walk_newest(
             }
             note_time(&mut newest, Some(&metadata));
             if is_dir {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::MetadataExt;
+                    if root_device.is_some_and(|device| device != metadata.dev()) {
+                        mounts.push(child.clone());
+                    }
+                }
                 pending.push(child);
             }
         }
     }
-    Ok(newest)
+    mounts.sort();
+    Ok(TreeFacts { newest, mounts })
 }
 
 fn note_time(newest: &mut Option<i64>, metadata: Option<&std::fs::Metadata>) {
@@ -662,6 +882,7 @@ mod tests {
             source_recheck: Duration::from_millis(200),
             slice: Duration::from_millis(100),
             native,
+            floor_max: Duration::from_secs(3600),
         }
     }
 
@@ -779,6 +1000,7 @@ mod tests {
             Duration::from_secs(10),
         )
         .unwrap()
+        .newest
         .unwrap();
         assert!((newest - now_epoch()).abs() < 120, "{newest}");
         // An excluded name does not count.
@@ -792,6 +1014,81 @@ mod tests {
         assert!(missing.starts_with("root_unreadable"), "{missing}");
         let _ = std::fs::remove_dir_all(&root);
         let _ = std::fs::remove_dir_all(&excluded);
+    }
+
+    /// The floor names and syncs what inotify did not report, and only that.
+    #[test]
+    fn the_floor_syncs_and_names_a_change_inotify_did_not_report() {
+        use super::super::poll::Reading;
+        let root = temp_tree("floor");
+        let (recorder, sink) = Recorder::new();
+        let worker = Worker {
+            spec: spec(&root, 9, Some(1)),
+            stop: Arc::new(AtomicBool::new(false)),
+            sink,
+            settings: settings(false),
+        };
+        let reading = |pairs: &[(&str, u64)]| Reading {
+            dirs: pairs.iter().map(|(d, h)| ((*d).to_owned(), *h)).collect(),
+            skipped: 0,
+            skip_sample: Vec::new(),
+        };
+        let mut floor = Floor {
+            filter: None,
+            every: Duration::from_secs(60),
+            next: std::time::Instant::now(),
+            baseline: Some(reading(&[("", 1), ("docs", 1), ("mnt", 1)])),
+            reported: std::collections::BTreeSet::new(),
+            overflowed: false,
+            failing: false,
+        };
+        // inotify saw docs; mnt (a CIFS mount, say) changed unseen.
+        floor.reported("docs");
+        assert!(floor.compare(
+            &worker,
+            Some(Ok(reading(&[("", 1), ("docs", 2), ("mnt", 2)])))
+        ));
+        let events = recorder.events.lock().unwrap().clone();
+        assert!(changed(&events, "mnt"), "{events:?}");
+        assert!(
+            !changed(&events, "docs"),
+            "reported changes are not repeated"
+        );
+        assert!(
+            events.iter().any(
+                |(_, e)| matches!(e, ChangeEvent::Notice { warn: true, detail, .. }
+                if detail.starts_with("watch_missed_change dirs=1 first=mnt"))
+            ),
+            "{events:?}"
+        );
+        // A reading that fails is named once, not every period.
+        assert!(floor.compare(&worker, Some(Err("walk_deadline path=mnt".into()))));
+        assert!(floor.compare(&worker, Some(Err("walk_deadline path=mnt".into()))));
+        let failures = recorder
+            .events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(_, e)| matches!(e, ChangeEvent::Notice { detail, .. } if detail.starts_with("poll_floor_failed")))
+            .count();
+        assert_eq!(failures, 1);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Nested mounts are found at arm time (Linux: /dev holds devpts, shm).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn nested_mounts_are_found_by_device() {
+        let filter = Arc::new(Filter::build(Path::new("/dev"), Vec::new()).unwrap());
+        let facts = newest_change(PathBuf::from("/dev"), filter, Duration::from_secs(10)).unwrap();
+        assert!(
+            facts
+                .mounts
+                .iter()
+                .any(|m| m == "pts" || m == "shm" || m == "mqueue"),
+            "{:?}",
+            facts.mounts
+        );
     }
 
     /// Linux: the native watch is named `inotify`/`ok`, the catch-up runs for a
