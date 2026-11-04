@@ -282,6 +282,7 @@ pub fn profile_excludes(fragment: &Path) -> Result<Vec<String>, WatchError> {
         return Err(failure(format!("larger than {FRAGMENT_LIMIT} bytes")));
     }
     let table: toml::Table = toml::from_str(&text).map_err(|error| failure(error.to_string()))?;
+    let table = profile_section(&table).map_err(failure)?;
     match table.get("excludes") {
         None => Ok(Vec::new()),
         Some(toml::Value::Array(items)) => items
@@ -294,6 +295,25 @@ pub fn profile_excludes(fragment: &Path) -> Result<Vec<String>, WatchError> {
             })
             .collect(),
         Some(_) => Err(failure("excludes is not an array".to_owned())),
+    }
+}
+
+/// The profile's own table in a fragment. The package manager writes each fragment as one
+/// `[profiles.<name>]` table (the shape `config.toml` merges); a flat fragment is read as is.
+/// Two profiles in one fragment is not a fragment.
+pub fn profile_section(table: &toml::Table) -> Result<&toml::Table, String> {
+    match table.get("profiles") {
+        None => Ok(table),
+        Some(toml::Value::Table(profiles)) => {
+            let mut sections = profiles.values();
+            match (sections.next(), sections.next()) {
+                (Some(toml::Value::Table(section)), None) => Ok(section),
+                (Some(_), None) => Err("the profile entry is not a table".to_owned()),
+                (None, _) => Err("the profiles table is empty".to_owned()),
+                (Some(_), Some(_)) => Err(format!("it holds {} profiles, not one", profiles.len())),
+            }
+        }
+        Some(_) => Err("profiles is not a table".to_owned()),
     }
 }
 
@@ -629,6 +649,45 @@ mod tests {
             Filter::build(&source, Vec::new()),
             Err(WatchError::SourceMissing { .. })
         ));
+    }
+
+    /// The manager writes `[profiles.<name>]`: the excludes under it are the
+    /// profile's (they were read as none, so excluded paths raised events).
+    #[test]
+    fn excludes_are_read_from_the_fragment_the_manager_writes() {
+        let dir = std::env::temp_dir().join(format!("sdsync-watch-shape-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let fragment = dir.join("photos.toml");
+        std::fs::write(
+            &fragment,
+            // The shape `sdsync-dsm configure-profile` renders, key for key.
+            "[profiles.photos]\nsource = \"/volume1/photos\"\nremote = \"/home/Drive/photos\"\n\
+             url = \"https://nas:5001/\"\nusername = \"photos-bot\"\n\
+             password-file = \"/var/secrets/photos.password\"\n\
+             totp-secret-file = \"/var/secrets/photos.totp\"\n\
+             no-vault = true\ncompare = \"size-mtime\"\njobs = 4\n\
+             excludes = [\"@eaDir/\", \"**/@eaDir/\", \"#recycle/\", \"*.tmp\", \"cache/\"]\n\
+             delete = false\nallow-empty-source = false\nmax-delete = 100\n\
+             retries = 3\ntimeout = 600\nconnect-timeout = 20\n\
+             allow-http = false\ndanger-accept-invalid-certs = false\n\
+             verbose = 0\nquiet = false\nlog-level = \"info\"\nlog-format = \"json\"\n\
+             remote-log-mode = \"off\"\nlog-file = \"/var/log/photos.log\"\n\
+             progress = \"off\"\noutput = \"json\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            profile_excludes(&fragment).unwrap(),
+            ["@eaDir/", "**/@eaDir/", "#recycle/", "*.tmp", "cache/"]
+        );
+        std::fs::write(
+            &fragment,
+            "[profiles.a]\nexcludes = []\n[profiles.b]\nexcludes = []\n",
+        )
+        .unwrap();
+        let error = profile_excludes(&fragment).unwrap_err().to_string();
+        assert!(error.contains("2 profiles"), "{error}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
