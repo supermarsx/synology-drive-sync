@@ -645,6 +645,36 @@ stop_failed_start_children() {
     done
 }
 
+# 0 when api.sock is a prepared (0000) socket with no server behind it: no
+# api.pid record, and nothing holds daemon.lock, so the API child that bound it
+# died between bind and activation. 1 when that cannot be said -- not a
+# prepared socket, an api.pid exists (its own rules apply), or daemon.lock is
+# held, or cannot be probed (the daemon judges its own socket).
+stale_prepared_api_socket() {
+    api_path_exists "$api_socket" || return 1
+    api_prepared_socket_safe >/dev/null 2>&1 || return 1
+    ! api_path_exists "$api_pid_file" || return 1
+    stale_prepared_lock=0
+    daemon_lock_held_status || stale_prepared_lock=$?
+    [ "$stale_prepared_lock" -eq 1 ]
+}
+
+# Remove such a socket, by the device and inode just captured, and say so.
+# 0 removed, 1 not stale (left alone), 2 stale but not removable (named).
+remove_stale_prepared_api_socket() {
+    stale_prepared_api_socket || return 1
+    stale_prepared_identity=$(api_socket_identity 2>/dev/null || true)
+    [ -n "$stale_prepared_identity" ] || {
+        package_message "stale prepared API socket $api_socket cannot be identified; not removed"
+        return 2
+    }
+    remove_safe_api_socket "$stale_prepared_identity" || {
+        package_message "stale prepared API socket $api_socket could not be removed"
+        return 2
+    }
+    package_message "removed stale API socket $api_socket (prepared, mode 0000; no API server and no daemon holds it)"
+}
+
 status_code() {
     failed_child_topology=0
     failed_start_markers_status || failed_child_topology=$?
@@ -731,10 +761,15 @@ status_code() {
             # Metadata alone cannot prove whether an untracked socket is live.
             # A prepared 0000 listener is recoverable only with its exact dead
             # package-owned PID record. Without that proof it is inconsistent.
-            api_prepared_socket_safe >/dev/null 2>&1 && return 2
-            # Classify only an exact final socket as restartable; the Rust bind
-            # path performs the bounded connect-refused check.
-            api_stale_socket_safe >/dev/null 2>&1 || return 2
+            # Unless no server can own it: no api.pid, no daemon.lock holder.
+            if api_prepared_socket_safe >/dev/null 2>&1; then
+                stale_prepared_api_socket || return 2
+                status_stale_api_socket=$api_socket
+            else
+                # Classify only an exact final socket as restartable; the Rust
+                # bind path performs the bounded connect-refused check.
+                api_stale_socket_safe >/dev/null 2>&1 || return 2
+            fi
             api_stale=true
         fi
     fi
@@ -913,10 +948,16 @@ prepare_api_start() {
             package_message "refusing unsafe untracked API socket: $api_socket"
             return 1
         }
-        api_prepared_socket_safe >/dev/null 2>&1 && {
-            package_message "refusing untracked prepared API socket without an exact dead PID record"
-            return 1
-        }
+        if api_prepared_socket_safe >/dev/null 2>&1; then
+            # No api.pid and no daemon.lock holder: the child that bound it is
+            # gone. Anything else keeps the refusal.
+            prepared_removal=0
+            remove_stale_prepared_api_socket || prepared_removal=$?
+            if [ "$prepared_removal" -eq 1 ]; then
+                package_message "refusing untracked prepared API socket without an exact dead PID record"
+            fi
+            [ "$prepared_removal" -eq 0 ] || return 1
+        fi
     fi
     # A dead PID plus socket is removed atomically by the Rust verifier above.
     # For an untracked final socket, the Rust bind path alone validates exact
@@ -1535,6 +1576,14 @@ start_daemon_engine() {
     esac
     stop_daemon_engine || {
         package_message "refusing to start over the records of a daemon that could not be stopped"
+        exit 1
+    }
+    # A prepared socket left by an API child that died before activation would
+    # make the new daemon's API keeper refuse to bind; the lock is free here.
+    daemon_prepared_removal=0
+    remove_stale_prepared_api_socket || daemon_prepared_removal=$?
+    [ "$daemon_prepared_removal" -le 1 ] || {
+        package_message "refusing to start over a stale prepared API socket that could not be removed"
         exit 1
     }
     start_event_pending=true
@@ -2228,7 +2277,17 @@ case ${1:-} in
                     package_message "refusing unsafe untracked API socket: $api_socket"
                     exit 1
                 }
-                api_stale_artifacts=true
+                if api_prepared_socket_safe >/dev/null 2>&1; then
+                    stop_prepared_removal=0
+                    remove_stale_prepared_api_socket || stop_prepared_removal=$?
+                    case $stop_prepared_removal in
+                        0) ;;
+                        1) api_stale_artifacts=true ;;
+                        *) exit 1 ;;
+                    esac
+                else
+                    api_stale_artifacts=true
+                fi
             fi
         fi
 
@@ -2455,9 +2514,13 @@ case ${1:-} in
             fi
             [ "$result" -ne 1 ] || [ -z "${daemon_status_stale:-}" ] \
                 || echo "stale daemon record of a daemon that is gone: $daemon_status_stale" >&2
+            [ "$result" -ne 1 ] || [ -z "${status_stale_api_socket:-}" ] \
+                || echo "stale API socket: $status_stale_api_socket (prepared, mode 0000; no API server and no daemon holds it)" >&2
         else
             status_code
             result=$?
+            [ "$result" -ne 1 ] || [ -z "${status_stale_api_socket:-}" ] \
+                || echo "stale API socket: $status_stale_api_socket (prepared, mode 0000; no API server and no daemon holds it)" >&2
         fi
         set -e
         if [ "$result" -eq 2 ] && controller_dead_with_live_api; then

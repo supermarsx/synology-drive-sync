@@ -13609,6 +13609,76 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
         self.assertFalse((self.real_var / "run/supervisor.pid").exists())
         self.assertIn("service_stop_forced", (self.real_var / "log/controller.log").read_text(encoding="utf-8"))
 
+    def test_a_prepared_api_socket_with_no_server_is_stale_when_the_daemon_lock_is_free(self) -> None:
+        # --serve binds api.sock at 0000 and activates it later; a kill in
+        # between leaves a socket nothing can connect to and no api.pid. That
+        # made status 2 and start and stop refuse. With daemon.lock free and
+        # no live API server it is stale: removed, and named.
+        self._daemon_engine(None)
+        run = self.real_var / "run"
+        socket_path = run / "api.sock"
+        self._free_daemon_lock()
+        self._bind_dead_socket(socket_path, 0o000)
+        status = self.shell(self.lifecycle, "status")
+        self.assertEqual(status.returncode, 1, status.stdout + status.stderr)
+        self.assertIn(f"stale API socket: {self.fhs / 'var/run/api.sock'}", status.stderr)
+        self.assertTrue(socket_path.exists(), "status removed a record; it only reports")
+        stopped = self.shell(self.lifecycle, "stop", timeout=60)
+        self.assertEqual(stopped.returncode, 0, stopped.stdout + stopped.stderr)
+        self.assertIn(f"removed stale API socket {self.fhs / 'var/run/api.sock'}", stopped.stdout)
+        self.assertFalse(socket_path.exists())
+        # Start removes it too, and goes on to start the daemon.
+        self._bind_dead_socket(socket_path, 0o000)
+        started = self._start_daemon()
+        self.assertIn(f"removed stale API socket {self.fhs / 'var/run/api.sock'}", started.stdout)
+        self.assertEqual(self.shell(self.lifecycle, "status").returncode, 0)
+        stopped = self.shell(self.lifecycle, "stop", timeout=60)
+        self.assertEqual(stopped.returncode, 0, stopped.stdout + stopped.stderr)
+
+    def test_a_prepared_api_socket_is_stale_under_the_shell_engine_too(self) -> None:
+        run = self.real_var / "run"
+        socket_path = run / "api.sock"
+        self._free_daemon_lock()
+        self._bind_dead_socket(socket_path, 0o000)
+        status = self.shell(self.lifecycle, "status")
+        self.assertEqual(status.returncode, 1, status.stdout + status.stderr)
+        self.assertIn(f"stale API socket: {self.fhs / 'var/run/api.sock'}", status.stderr)
+        stopped = self.shell(self.lifecycle, "stop", timeout=60)
+        self.assertEqual(stopped.returncode, 0, stopped.stdout + stopped.stderr)
+        self.assertIn(f"removed stale API socket {self.fhs / 'var/run/api.sock'}", stopped.stdout)
+        self.assertFalse(socket_path.exists())
+        self._bind_dead_socket(socket_path, 0o000)
+        started = self.shell(self.lifecycle, "start", timeout=60)
+        self.assertEqual(started.returncode, 0, self.lifecycle_failure_diagnostic(started))
+        self.assertIn(f"removed stale API socket {self.fhs / 'var/run/api.sock'}", started.stdout)
+        stopped = self.shell(self.lifecycle, "stop", timeout=60)
+        self.assertEqual(stopped.returncode, 0, stopped.stdout + stopped.stderr)
+
+    def test_a_prepared_api_socket_is_kept_while_a_daemon_or_an_api_server_may_own_it(self) -> None:
+        self._daemon_engine(None)
+        run = self.real_var / "run"
+        socket_path = run / "api.sock"
+        # A live process in api.pid: the socket may be its own.
+        self._free_daemon_lock()
+        server = self._spawn_fake("--serve")
+        self._write_run_record("api.pid", f"{server.pid}\n")
+        self._bind_dead_socket(socket_path, 0o000)
+        status = self.shell(self.lifecycle, "status")
+        self.assertEqual(status.returncode, 2, status.stdout + status.stderr)
+        stopped = self.shell(self.lifecycle, "stop", timeout=60)
+        self.assertEqual(stopped.returncode, 1, stopped.stdout + stopped.stderr)
+        self.assertTrue(socket_path.exists(), "a socket beside a live api.pid was removed")
+        self.assertNotIn("removed stale API socket", stopped.stdout)
+        (run / "api.pid").unlink()
+        # A held daemon.lock: the daemon judges its own socket.
+        holder = self._spawn_fake("--daemon", hold_lock=True)
+        status = self.shell(self.lifecycle, "status")
+        self.assertEqual(status.returncode, 2, status.stdout + status.stderr)
+        stopped = self.shell(self.lifecycle, "stop", timeout=60)
+        self.assertEqual(stopped.returncode, 1, stopped.stdout + stopped.stderr)
+        self.assertTrue(socket_path.exists(), "a socket beside a held daemon.lock was removed")
+        self.assertIsNone(holder.poll())
+
     def test_postupgrade_removes_shell_leftovers_only_under_the_daemon_engine(self) -> None:
         leftovers = [
             self.real_var / "state/controller-reload.pending",
