@@ -30,7 +30,11 @@ case $daemon_held_status in
         exit 1
         ;;
     3)
-        package_message "the sync daemon supervisor is still running (it is named by $supervisor_pid_file)"
+        if [ -n "${supervisor_witness_cause:-}" ]; then
+            package_message "the sync daemon supervisor is still running ($supervisor_witness_cause)"
+        else
+            package_message "the sync daemon supervisor is still running (it is named by $supervisor_pid_file)"
+        fi
         exit 1
         ;;
     2)

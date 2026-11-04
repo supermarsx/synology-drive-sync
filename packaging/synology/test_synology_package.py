@@ -13603,7 +13603,8 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
     # meets is met here too, without a real daemon.
 
     def _spawn_fake(
-        self, flag: str, *, hold_lock: bool = False, ignore_term: bool = False
+        self, flag: str, *, hold_lock: bool = False, ignore_term: bool = False,
+        lock: str = "daemon.lock",
     ) -> subprocess.Popen[str]:
         code = (
             "import fcntl, os, signal, sys, time\n"
@@ -13615,9 +13616,9 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
             "print('up', flush=True)\n"
             "time.sleep(600)\n"
         )
-        lock = str(self.real_var / "run/daemon.lock") if hold_lock else "-"
+        lock_path = str(self.real_var / "run" / lock) if hold_lock else "-"
         process = subprocess.Popen(
-            [sys.executable, "-c", code, flag, "ignore" if ignore_term else "default", lock],
+            [sys.executable, "-c", code, flag, "ignore" if ignore_term else "default", lock_path],
             stdout=subprocess.PIPE,
             text=True,
             preexec_fn=(
@@ -14064,6 +14065,85 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
         self.assertEqual(len(probes), 2, probes)
         self.assertIn("tool=flock", probes[1])
         self.assertNotIn("flock=absent", probes[1])
+
+    def test_supervisor_lock_is_the_second_witness_when_supervisor_pid_cannot_be_read(self) -> None:
+        # N-S4. A supervisor.pid that was malformed, unreadable or gone read as
+        # "no supervisor" (`2>/dev/null || return 1`): status said stale, the
+        # shell engine started beside it, and stop removed the records under a
+        # live supervisor that then respawned the daemon. The supervisor holds
+        # supervisor.lock for its whole life; held, a supervisor runs, and the
+        # record that could not say so is named.
+        self._daemon_engine(None)
+        run = self.real_var / "run"
+        self._free_daemon_lock()
+        supervisor = self._spawn_fake("--supervise", hold_lock=True, lock="supervisor.lock")
+        record = run / "supervisor.pid"
+        cases = {
+            "malformed": ("garbage\n", "is malformed"),
+            "truncated": ("%d\n" % supervisor.pid, "is malformed"),
+            "missing": (None, "names no live supervisor"),
+        }
+        for label, (content, cause) in cases.items():
+            with self.subTest(record=label):
+                record.unlink(missing_ok=True)
+                if content is not None:
+                    self._write_run_record("supervisor.pid", content)
+                status = self.shell(self.lifecycle, "status")
+                self.assertEqual(status.returncode, 2, status.stdout + status.stderr)
+                self.assertIn(str(self.fhs / "var/run/supervisor.lock"), status.stderr)
+                self.assertIn(cause, status.stderr)
+                for hook in ("preuninst", "preupgrade"):
+                    refused = self.shell(self.lifecycle_dir / hook)
+                    self.assertEqual(refused.returncode, 1, f"{hook}: {refused.stdout}{refused.stderr}")
+                    self.assertIn("supervisor is still running", refused.stdout, hook)
+                    self.assertIn(cause, refused.stdout, hook)
+                self.set_engine("shell\n")
+                started = self.shell(self.lifecycle, "start", timeout=60)
+                self.set_engine(None)
+                self.assertEqual(started.returncode, 1, started.stdout + started.stderr)
+                self.assertIn("refusing to start the shell engine", started.stdout)
+                self.assertIn(cause, started.stdout)
+                self.assertFalse((run / "controller.pid").exists(), "start launched services beside a supervisor")
+                stopped = self.shell(self.lifecycle, "stop", timeout=60)
+                self.assertEqual(stopped.returncode, 1, stopped.stdout + stopped.stderr)
+                self.assertIn("refusing to clean daemon records", stopped.stdout)
+                self.assertIn(cause, stopped.stdout)
+                self.assertIsNone(supervisor.poll(), "stop signalled a supervisor it could not identify")
+                self.assertEqual(record.exists(), content is not None, "stop removed a record under a live supervisor")
+        # The supervisor gone, the lock free: the same malformed record is
+        # stale, removed, and the removal says why it could not be trusted.
+        supervisor.kill()
+        supervisor.wait(timeout=10)
+        self._write_run_record("supervisor.pid", "garbage\n")
+        status = self.shell(self.lifecycle, "status")
+        self.assertEqual(status.returncode, 1, status.stdout + status.stderr)
+        stopped = self.shell(self.lifecycle, "stop", timeout=60)
+        self.assertEqual(stopped.returncode, 0, stopped.stdout + stopped.stderr)
+        self.assertIn(f"removed stale daemon record {self.fhs / 'var/run/supervisor.pid'}", stopped.stdout)
+        self.assertIn("is malformed", stopped.stdout)
+        self.assertFalse(record.exists())
+
+    def test_an_unreadable_supervisor_record_is_named_and_a_held_supervisor_lock_decides(self) -> None:
+        self._daemon_engine(None)
+        run = self.real_var / "run"
+        self._free_daemon_lock()
+        supervisor = self._spawn_fake("--supervise", hold_lock=True, lock="supervisor.lock")
+        record = self._write_run_record("supervisor.pid", self._identity_triple(supervisor.pid))
+        record.chmod(0o000)
+        try:
+            status = self.shell(self.lifecycle, "status")
+            self.assertEqual(status.returncode, 2, status.stdout + status.stderr)
+            self.assertIn("cannot be read", status.stderr)
+            self.assertIn("supervisor.lock", status.stderr)
+        finally:
+            record.chmod(0o600)
+        # A good record of a live supervisor is still the first witness: the
+        # supervisor.lock probe is not made at all.
+        calls = self._flock_probe_log()
+        status = self.shell(self.lifecycle, "status")
+        self.assertEqual(status.returncode, 2, status.stdout + status.stderr)
+        self.assertFalse(calls.exists() and calls.read_text(encoding="utf-8").strip(),
+                         "supervisor.lock was probed beside a record that proves the supervisor")
 
     def test_a_lock_that_no_tool_can_probe_is_named_and_the_records_decide(self) -> None:
         # No flock(1) and a bridge whose probe fails: status says why, the

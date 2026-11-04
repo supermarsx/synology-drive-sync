@@ -234,7 +234,15 @@ supervisor's own pid, start time and boot id) names a live supervisor: between a
 its respawn nobody holds the lock, and a probe that took it would make the respawning daemon give
 up. Status then reports `2`, the hooks refuse naming `supervisor.pid`, and stop signals that
 supervisor (TERM, then KILL after the grace) even when `daemon.ready` is absent, before it removes
-any record. A `supervisor.pid` naming no live supervisor is a stale record like the others. Stop stops whichever engine's processes are
+any record. A `supervisor.pid` naming no live supervisor is a stale record like the others, but one
+that cannot be read as a record at all -- malformed, unreadable, not a regular file -- is not "no
+supervisor": `run/supervisor.lock`, which the supervisor holds for its whole life, is the second
+witness. Held (or unprobeable beside such a record), a supervisor runs that the record does not
+identify: status reports `2`, the hooks and the shell engine's start refuse, and stop keeps every
+record ("refusing to clean daemon records: ..."), each naming what was wrong with the record and
+that the lock is held. Nothing is signalled on a supervisor only the lock shows; a daemon's own parent
+can still prove it. With the lock free the record is stale, and the removal names why it could not
+be trusted. Stop stops whichever engine's processes are
 present, both after an engine switch made while one was running. Status is `0` when the daemon
 answers `ctl ping` with admission open, `3` with no daemon records, and `1` when records of a daemon
 that is gone remain (named on stderr).

@@ -1145,6 +1145,8 @@ daemon_beside_shell_engine() {
             ;;
         3)
             shell_engine_daemon_note="the sync daemon supervisor (PID $supervisor_record_pid) named by $supervisor_pid_file is live"
+            [ -z "${supervisor_witness_cause:-}" ] \
+                || shell_engine_daemon_note="a sync daemon supervisor runs: $supervisor_witness_cause"
             return 0
             ;;
         2)
@@ -1284,7 +1286,16 @@ capture_daemon_supervisor() {
 # proven a supervisor: nothing is signalled on a guess.
 capture_supervisor_record() {
     daemon_supervisor_pid= daemon_supervisor_start=
-    daemon_supervisor_record_live || return 0
+    if ! daemon_supervisor_record_live; then
+        # A record that could not be read as one is not "no supervisor": when
+        # supervisor.lock shows one, say so. It cannot be identified, so it is
+        # not signalled here (a daemon's own parent can still prove it), and
+        # the records stay while it runs.
+        if [ -n "${supervisor_record_problem:-}" ] && daemon_supervisor_witness; then
+            package_message "warning: $supervisor_witness_cause; it is not signalled unless the daemon's parent proves it"
+        fi
+        return 0
+    fi
     capture_record_pid=$supervisor_record_pid
     capture_record_start=$supervisor_record_start
     capture_record_boot=$supervisor_record_boot
@@ -1498,7 +1509,11 @@ stop_daemon_engine() {
         return 1
     fi
     if [ "$daemon_held" -eq 3 ]; then
-        package_message "refusing to clean daemon records while the supervisor named by $supervisor_pid_file is live"
+        if [ -n "${supervisor_witness_cause:-}" ]; then
+            package_message "refusing to clean daemon records: $supervisor_witness_cause"
+        else
+            package_message "refusing to clean daemon records while the supervisor named by $supervisor_pid_file is live"
+        fi
         return 1
     fi
     for daemon_record in "$daemon_socket" "$daemon_ready_file" "$daemon_pid_file" \
@@ -1512,7 +1527,11 @@ stop_daemon_engine() {
             package_message "stale daemon record $daemon_record could not be removed"
             return 1
         }
-        package_message "removed stale daemon record $daemon_record"
+        daemon_record_why=
+        if [ "$daemon_record" = "$supervisor_pid_file" ] && [ -n "${supervisor_record_problem:-}" ]; then
+            daemon_record_why=" (it $supervisor_record_problem, and $supervisor_lock_file is free)"
+        fi
+        package_message "removed stale daemon record $daemon_record$daemon_record_why"
     done
 }
 
@@ -1537,6 +1556,8 @@ daemon_status_code() {
             ;;
         3)
             daemon_status_cause="the sync daemon supervisor named by $supervisor_pid_file is live; the daemon is not answering"
+            [ -z "${supervisor_witness_cause:-}" ] \
+                || daemon_status_cause="a sync daemon supervisor runs and the daemon is not answering: $supervisor_witness_cause"
             return 2
             ;;
     esac
