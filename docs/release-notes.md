@@ -150,6 +150,10 @@ lists its own commits.
   failure detail).
 - **A stop without a readable clock has one deadline.** Each phase is charged what it can take
   against `SDSYNC_DSM_STOP_TIMEOUT`, so the worst case is the same as with a clock.
+- **A shell-engine stop that outlasts `SDSYNC_DSM_STOP_TIMEOUT` kills what is left** (the runner and
+  its children, the API service, then the controller), logs `service_stop_forced` and names each KILL,
+  instead of exiting `1` with the services running.
+- **A stop no longer leaves a realtime poll's scratch directory** (`run/fingerprint.<pid>.<n>`).
 - **Recovering a dead `run.lock` owner removes the daemon's staged owner file** (`run/.run.lock.pid.<pid>.<n>`)
   and names it.
 - **The shell snapshot carries `controller.degraded`** (`reason`, `since_epoch`, `cause`) from the

@@ -1235,7 +1235,7 @@ daemon_beside_shell_engine() {
                     return 1
                     ;;
                 *)
-                    shell_engine_daemon_note="a sync daemon cannot be ruled out: $shell_engine_probe_cause, and $daemon_identity_cause"
+                    shell_engine_daemon_note="a sync daemon cannot be ruled out: $shell_engine_probe_cause, and ${daemon_identity_cause:-its records cannot be settled}"
                     return 0
                     ;;
             esac
