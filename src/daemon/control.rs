@@ -308,6 +308,14 @@ impl Blocked {
 /// How often one held trigger is logged.
 const SUPPRESSED_LOG_EVERY: Duration = Duration::from_secs(3600);
 
+/// `config_unreadable kept=` for a configuration document: what was read
+/// last stays in force.
+const KEPT_CONFIGURATION: &str = "the last configuration read";
+/// `kept=` for a profile's state record that cannot be read (N-D3).
+const KEPT_PROFILE_STATE: &str = "the record on disk, not rewritten";
+/// `kept=` for `run.state` read only to carry its aggregate forward.
+const KEPT_RUN_STATE: &str = "run.state is rewritten without the aggregate it carried";
+
 struct InFlightMutation {
     mutation: Mutation,
     started: Instant,
@@ -534,25 +542,45 @@ impl Control {
     /// I/O error, a document past its size bound) is `Err`, named once per
     /// episode with the path and cause, and never read as absent (S2-2).
     fn read_document(&mut self, path: &Path) -> Result<Option<Vec<u8>>, String> {
+        self.read_document_keeping(path, KEPT_CONFIGURATION)
+    }
+
+    /// [`Control::read_document`], naming what the caller keeps in place of
+    /// a document it cannot read (N-D3: "the last configuration read" is not
+    /// true of a state record).
+    fn read_document_keeping(
+        &mut self,
+        path: &Path,
+        kept: &str,
+    ) -> Result<Option<Vec<u8>>, String> {
         match read_document(path) {
             Ok(bytes) => {
                 self.readable_again(path);
                 Ok(bytes)
             }
             Err(cause) => {
-                self.unreadable_now(path, &cause);
+                self.unreadable_now_keeping(path, &cause, kept);
                 Err(cause)
             }
         }
     }
 
-    /// [`Control::read_document`] where the caller's documented default is the
-    /// right reading of an unreadable document too (it is named either way).
-    fn read_or_default(&mut self, path: &Path) -> Option<Vec<u8>> {
-        self.read_document(path).ok().flatten()
+    /// [`Control::read_document_keeping`] where the caller's documented
+    /// default is the right reading of an unreadable document too: it is
+    /// named, with `kept` saying what the caller does instead.
+    fn read_or_default(&mut self, path: &Path, kept: &str) -> Option<Vec<u8>> {
+        match self.read_document_keeping(path, kept) {
+            Ok(bytes) => bytes,
+            // Named by read_document_keeping, with what is kept.
+            Err(_) => None,
+        }
     }
 
     fn unreadable_now(&mut self, path: &Path, cause: &str) {
+        self.unreadable_now_keeping(path, cause, KEPT_CONFIGURATION);
+    }
+
+    fn unreadable_now_keeping(&mut self, path: &Path, cause: &str, kept: &str) {
         if self
             .unreadable
             .insert(path.to_path_buf(), cause.to_owned())
@@ -562,11 +590,30 @@ impl Control {
                 Level::Error,
                 "controller",
                 "config_unreadable",
-                format!(
-                    "path={} cause={cause} kept=the last configuration read",
-                    path.display()
-                ),
+                format!("path={} cause={cause} kept={kept}", path.display()),
             );
+        }
+    }
+
+    /// Forget the unreadable documents a removed routine leaves behind
+    /// (N-D8): nothing reads them again, so they were listed for good.
+    fn forget_unreadable(&mut self, routine: &str) {
+        let paths = [
+            self.paths.routines_dir.join(format!("{routine}.conf")),
+            self.routine_state_path(routine),
+        ];
+        for path in paths {
+            if self.unreadable.remove(&path).is_some() {
+                self.log(
+                    Level::Info,
+                    "controller",
+                    "config_forgotten",
+                    format!(
+                        "path={} cause=the routine was removed, so it is no longer read",
+                        path.display()
+                    ),
+                );
+            }
         }
     }
 
@@ -621,7 +668,7 @@ impl Control {
     /// rather than leave it reading Running (or stale) forever.
     fn reconcile_dead_run(&mut self, now: u64) {
         let path = self.paths.state_dir.join("run.state");
-        let Some(previous) = self.read_or_default(&path) else {
+        let Some(previous) = self.read_or_default(&path, "run.state is left as it is") else {
             return;
         };
         let doc = routines::KvDocument::parse(&previous, 64);
@@ -671,7 +718,10 @@ impl Control {
             now,
             self.schedule.interval,
             routines::parse_schedule_deadline(
-                self.read_or_default(&self.paths.state_dir.join("schedule.state"))
+                self.read_or_default(
+                    &self.paths.state_dir.join("schedule.state"),
+                    "the next scheduled run is computed afresh",
+                )
                     .as_deref(),
             ),
         );
@@ -984,6 +1034,7 @@ impl Control {
             {
                 changes.disarm(&name);
             }
+            self.forget_unreadable(&name);
         }
         for name in names {
             let existing = self.routines.remove(&name);
@@ -1014,7 +1065,10 @@ impl Control {
                     if fs::symlink_metadata(&path).is_ok_and(|m| m.file_type().is_symlink()) {
                         Err("symlink")
                     } else {
-                        match self.read_document(&path) {
+                        match self.read_document_keeping(
+                            &path,
+                            "the routine is held until its state can be read",
+                        ) {
                             Ok(bytes) => RoutineState::parse(bytes.as_deref()),
                             // Never a fresh state: that would reset the
                             // failure streak and the retry backoff.
@@ -1594,16 +1648,31 @@ impl Control {
             };
             let source = entry.source;
             let profile_state_dir = self.paths.profile_state_dir.clone();
-            let deps = move |list: &str| {
+            // N-D8: what each dependency read did, named after the evaluation
+            // (an unreadable record is not met, and was dropped unnamed).
+            let dependency_reads: std::cell::RefCell<Vec<(PathBuf, Result<(), String>)>> =
+                std::cell::RefCell::new(Vec::new());
+            let deps = |list: &str| {
                 routines::dependencies_allow(list, &|dep: &str| {
                     let path = profile_state_dir.join(format!("{dep}.state"));
-                    if fs::symlink_metadata(&path).ok()?.file_type().is_symlink() {
-                        return None;
+                    let read = match fs::symlink_metadata(&path) {
+                        // Absent: never completed. A symlink is not the
+                        // package's record: not met (as the shell reads it).
+                        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+                        Ok(metadata) if metadata.file_type().is_symlink() => Ok(None),
+                        Err(error) => Err(error.to_string()),
+                        Ok(_) => read_document(&path),
+                    };
+                    match read {
+                        Ok(bytes) => {
+                            dependency_reads.borrow_mut().push((path, Ok(())));
+                            bytes.map(|bytes| routines::profile_completion_state(&bytes))
+                        }
+                        Err(cause) => {
+                            dependency_reads.borrow_mut().push((path, Err(cause)));
+                            None
+                        }
                     }
-                    read_document(&path)
-                        .ok()
-                        .flatten()
-                        .map(|bytes| routines::profile_completion_state(&bytes))
                 })
             };
             let inputs = Inputs {
@@ -1618,6 +1687,16 @@ impl Control {
             };
             let mut effects = Vec::new();
             let verdict = routines::evaluate(&routine, &mut state, &inputs, &mut effects);
+            for (path, read) in dependency_reads.take() {
+                match read {
+                    Ok(()) => self.readable_again(&path),
+                    Err(cause) => self.unreadable_now_keeping(
+                        &path,
+                        &cause,
+                        "the dependency is not met until it can be read",
+                    ),
+                }
+            }
             match (&window, self.clock_episodes.contains(&name)) {
                 (Some(Ok(_)), true) => {
                     self.clock_episodes.remove(&name);
@@ -1846,7 +1925,7 @@ impl Control {
         }
         let operation = request.action.as_str();
         let run_state_path = self.paths.state_dir.join("run.state");
-        let previous = self.read_or_default(&run_state_path);
+        let previous = self.read_or_default(&run_state_path, KEPT_RUN_STATE);
         let mut record = RunRecord::running(&request.scope, static_operation(request.action), now);
         record.heartbeat = Some(now);
         record.heartbeat_source = Some("io");
@@ -1918,7 +1997,8 @@ impl Control {
                 None => {
                     let performance = self.paths.config_dir.join("performance.conf");
                     Some(performance_nice(
-                        self.read_or_default(&performance).as_deref(),
+                        self.read_or_default(&performance, "the Balanced performance level")
+                            .as_deref(),
                     ))
                 }
             },
@@ -2157,7 +2237,7 @@ impl Control {
         record.heartbeat = heartbeat;
         record.heartbeat_source = Some(active.heartbeat_source);
         let path = self.paths.state_dir.join("run.state");
-        let previous = self.read_or_default(&path);
+        let previous = self.read_or_default(&path, KEPT_RUN_STATE);
         let _ = self.write_state(&path, render_run_state(&record, previous.as_deref()));
     }
 
@@ -2218,7 +2298,27 @@ impl Control {
                     .paths
                     .profile_state_dir
                     .join(format!("{profile}.state"));
-                let previous = self.read_or_default(&path);
+                // N-D3: the record carries the failure streak and the last
+                // success; one that cannot be read is never rewritten from
+                // nothing (that reset 7 failures to 1). It is left as it is,
+                // named, and the run says its profile record was not written.
+                let previous = match self.read_document_keeping(&path, KEPT_PROFILE_STATE) {
+                    Ok(previous) => previous,
+                    Err(cause) => {
+                        self.log(
+                            Level::Error,
+                            "scheduler",
+                            "profile_state_unreadable",
+                            format!(
+                                "id={} profile={profile} path={} cause={cause} kept={KEPT_PROFILE_STATE}",
+                                request.id,
+                                path.display()
+                            ),
+                        );
+                        push_degraded(&mut active.degraded, "profile_state");
+                        continue;
+                    }
+                };
                 if let Some(bytes) = render_profile_state(&record, "sync", previous.as_deref())
                     && self.write_state(&path, bytes).is_err()
                 {
@@ -2343,7 +2443,7 @@ impl Control {
             );
         }
         let path = self.paths.state_dir.join("run.state");
-        let previous = self.read_or_default(&path);
+        let previous = self.read_or_default(&path, KEPT_RUN_STATE);
         let _ = self.write_state(&path, render_run_state(&record, previous.as_deref()));
         #[cfg(target_os = "linux")]
         if self.settings.publish_run_lock {
@@ -2438,7 +2538,10 @@ impl Control {
             .unwrap_or_else(|| "none".into());
         // Read before the routine is borrowed: an escalation's cooldown.
         let alerts = self.paths.config_dir.join("alerts.conf");
-        let cooldown = super::alerts::policy_cooldown(self.read_or_default(&alerts).as_deref());
+        let cooldown = super::alerts::policy_cooldown(
+            self.read_or_default(&alerts, "the default alert cooldown")
+                .as_deref(),
+        );
         let Some(entry) = self.routines.get_mut(name) else {
             self.log(
                 Level::Warn,
@@ -3000,8 +3103,16 @@ impl Control {
             .as_ref()
             .map(|a| a.profiles.clone())
             .unwrap_or_default();
-        let index: serde_json::Map<String, Value> = profile_names_in(&self.paths.profiles_dir)
-            .unwrap_or_default()
+        // N-D8: an unreadable profiles.d is not an empty one. `index` is then
+        // empty and `index_unavailable` says why.
+        let (names, index_unavailable) = match profile_names_in(&self.paths.profiles_dir) {
+            Ok(names) => (names, Value::Null),
+            Err(cause) => (
+                Vec::new(),
+                json!({"path": self.paths.profiles_dir.display().to_string(), "cause": cause}),
+            ),
+        };
+        let index: serde_json::Map<String, Value> = names
             .into_iter()
             .map(|name| {
                 let value = if busy.contains(&name) {
@@ -3039,6 +3150,7 @@ impl Control {
             "busy_profiles": self.active.as_ref().map(|a| a.profiles.clone()).unwrap_or_default(),
             "routines": routines,
             "index": index,
+            "index_unavailable": index_unavailable,
             // Documents that cannot be read now, each with its cause (S2-2).
             "config_unreadable": self
                 .unreadable
@@ -3160,7 +3272,7 @@ impl Control {
             record.detail = "run_unkillable: the core did not exit within the stop budget".into();
             record.outcome = Some(RunOutcome::Cancelled);
             let path = self.paths.state_dir.join("run.state");
-            let previous = self.read_or_default(&path);
+            let previous = self.read_or_default(&path, KEPT_RUN_STATE);
             let _ = self.write_state(&path, render_run_state(&record, previous.as_deref()));
         }
         self.write_controller_state(false);
