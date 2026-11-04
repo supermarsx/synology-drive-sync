@@ -516,3 +516,24 @@ test("the live progress regions are polite and separate from the assertive barri
     );
   }
 });
+
+test("a control directory the service cannot read is its own amber item, not the generic degradation", () => {
+  const context = {
+    snapshot: {
+      controller: {
+        degraded: {
+          reason: "control_dir_unreadable",
+          since_epoch: 1757548700,
+          cause: "/var/packages/synology-drive-sync/var/control/requests cannot be read (Permission denied (os error 13))"
+        }
+      }
+    },
+    nasTimeSuffix: () => ""
+  };
+  const item = computed.controllerDegradedItem.call(context);
+  assert.equal(item.level, "warn");
+  assert.match(item.title, /request queue/);
+  assert.match(item.detail, /control\/requests cannot be read/);
+  assert.match(item.detail, /control_dir_unreadable/);
+  assert.doesNotMatch(item.title, /reports a degradation/);
+});

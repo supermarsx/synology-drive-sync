@@ -4538,6 +4538,9 @@ export default {
       if (reason === "audit_unavailable") {
         return { id: "controller-audit-unavailable", level: "warn", title: "Dashboard operations are refused: the audit log cannot be reconciled", detail: `${when}${cause}. Saves, tests and other queued operations are answered "audit log unavailable" without running until it recovers. Review Logs for audit_reconcile_failed.` };
       }
+      if (reason === "control_dir_unreadable") {
+        return { id: "controller-control-dir-unreadable", level: "warn", title: "The service cannot read the dashboard's request queue", detail: `${when}${cause}. Requests the dashboard submitted are not seen until it can. Review Logs for control_dir_unreadable.` };
+      }
       return { id: `controller-degraded-${reason}`, level: "warn", title: `The sync service reports a degradation (${reason})`, detail: `${when}${cause}.` };
     },
     // One amber item per enabled realtime routine whose native watcher is not in use,
