@@ -5,8 +5,14 @@
 //! process-wide state that assumes it is alone, so it runs as its own child
 //! process, not as a thread of the daemon. The daemon keeps it alive:
 //! - start: the daemon is not ready (no `ctl.sock`, no `daemon.ready`) until
-//!   `api.sock` accepts a connection, within a deadline; otherwise the start
-//!   fails with the child's own last words;
+//!   the server has activated `api.sock` (`0000` -> `0600`, which it does only
+//!   once its workers run), within a deadline; otherwise the start fails with
+//!   the child's own last words. Nothing connects to probe it, so no probe is
+//!   ever recorded as a failed request (H10);
+//! - before each spawn, a socket left by a server that is gone is removed,
+//!   named: the daemon holds `daemon.lock` and has reaped its own server, so a
+//!   `0000` socket (killed between bind and activation, F8) or a refused `0600`
+//!   one is stale unless `api.pid` names a live shell-engine server;
 //! - a child that exits is named with its status and last stderr line and
 //!   restarted after a backoff (1 s doubling to 30 s, reset after 10 minutes
 //!   of service), each restart named;
@@ -15,10 +21,12 @@
 
 use std::collections::VecDeque;
 use std::ffi::OsString;
-use std::io::Read;
+use std::fs;
+use std::io::{self, Read};
+use std::os::unix::fs::{FileTypeExt, MetadataExt};
 use std::os::unix::net::UnixStream;
 use std::os::unix::process::{CommandExt, ExitStatusExt};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::mpsc;
@@ -48,6 +56,7 @@ impl ApiKeeper {
     pub(crate) fn start(
         exe: PathBuf,
         socket: PathBuf,
+        api_pid: PathBuf,
         env: Vec<(OsString, OsString)>,
         log: KeeperLog,
         ready_within: Duration,
@@ -58,6 +67,7 @@ impl ApiKeeper {
         let keeper = Keeper {
             exe,
             socket,
+            api_pid,
             env,
             log,
             stop: Arc::clone(&stop),
@@ -81,7 +91,7 @@ impl ApiKeeper {
             Err(_) => {
                 started.stop(Duration::from_secs(2));
                 Err(format!(
-                    "api.sock did not accept a connection within {} s",
+                    "api.sock was not activated within {} s",
                     ready_within.as_secs()
                 ))
             }
@@ -119,6 +129,8 @@ impl ApiKeeper {
 struct Keeper {
     exe: PathBuf,
     socket: PathBuf,
+    /// The shell engine's `api.pid`: a live server there owns `api.sock`.
+    api_pid: PathBuf,
     env: Vec<(OsString, OsString)>,
     log: KeeperLog,
     stop: Arc<AtomicBool>,
@@ -178,6 +190,9 @@ impl Keeper {
         let mut backoff = Duration::from_secs(1);
         let mut attempt: u32 = 0;
         while !self.stop.load(Ordering::SeqCst) {
+            // The previous server (if any) is reaped: what it left is stale.
+            self.clear_stale_socket();
+            let before = socket_identity(&self.socket);
             let (mut child, tail, reader) = match self.spawn() {
                 Ok(spawned) => spawned,
                 Err(error) => {
@@ -204,10 +219,14 @@ impl Keeper {
                 match child.try_wait() {
                     Ok(Some(status)) => break Some(status),
                     Ok(None) => {}
-                    Err(_) => break None,
+                    Err(error) => {
+                        // S3-5: never respawn over a child that may live on.
+                        self.put_down(&mut child, &error);
+                        break None;
+                    }
                 }
                 if ready.is_some()
-                    && UnixStream::connect(&self.socket).is_ok()
+                    && activated_since(&self.socket, before)
                     && let Some(ready) = ready.take()
                 {
                     let _ = ready.send(Ok(()));
@@ -282,6 +301,111 @@ impl Keeper {
         }
     }
 
+    /// A child that cannot be waited for: KILL it and reap it within a bound,
+    /// each step named, so a respawn never runs beside it unawares.
+    fn put_down(&self, child: &mut Child, error: &io::Error) {
+        let pid = child.id();
+        let killed = sys::kill_process(pid, libc::SIGKILL);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let reaped = loop {
+            match child.try_wait() {
+                Ok(Some(_)) => break true,
+                Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(50)),
+                _ => break false,
+            }
+        };
+        (self.log)(
+            Level::Error,
+            "api_server_unwaitable",
+            format!(
+                "pid={pid} cause={error} killed={} reaped={reaped}",
+                killed
+                    .as_ref()
+                    .map_or_else(|e| e.to_string(), |()| "yes".into())
+            ),
+        );
+    }
+
+    /// Remove `api.sock` when it is provably stale (F8): this daemon holds
+    /// `daemon.lock`, its own previous server is reaped, and `api.pid` names no
+    /// live shell-engine server. A socket owned by this uid with one link, at
+    /// `0000` (a server killed between bind and activation) or at `0600` with
+    /// nobody accepting, is removed and named; anything else is left and named.
+    fn clear_stale_socket(&self) {
+        let path = &self.socket;
+        let Ok(before) = fs::symlink_metadata(path) else {
+            return;
+        };
+        let mode = before.mode() & 0o7777;
+        let named = |level: Level, event: &'static str, cause: String| {
+            (self.log)(
+                level,
+                event,
+                format!("path={} mode={mode:04o} cause={cause}", path.display()),
+            );
+        };
+        if !before.file_type().is_socket()
+            || before.uid() != sys::geteuid()
+            || before.nlink() != 1
+            || !matches!(mode, 0o000 | 0o600)
+        {
+            named(
+                Level::Error,
+                "api_socket_stale_kept",
+                "not a socket of this package (type, owner, links or mode)".into(),
+            );
+            return;
+        }
+        if let Some(pid) = live_shell_server(&self.api_pid) {
+            named(
+                Level::Error,
+                "api_socket_stale_kept",
+                format!(
+                    "{} names live PID {pid}, a shell-engine API server",
+                    self.api_pid.display()
+                ),
+            );
+            return;
+        }
+        if mode == 0o600 {
+            match UnixStream::connect(path) {
+                Ok(_) => {
+                    named(
+                        Level::Error,
+                        "api_socket_stale_kept",
+                        "a server accepts on it".into(),
+                    );
+                    return;
+                }
+                Err(error) if error.kind() == io::ErrorKind::ConnectionRefused => {}
+                Err(error) if error.kind() == io::ErrorKind::NotFound => return,
+                Err(error) => {
+                    named(Level::Error, "api_socket_stale_kept", error.to_string());
+                    return;
+                }
+            }
+        }
+        // The same inode still: nothing replaced it while it was judged.
+        let same = fs::symlink_metadata(path)
+            .is_ok_and(|after| after.dev() == before.dev() && after.ino() == before.ino());
+        if !same {
+            return;
+        }
+        match fs::remove_file(path) {
+            Ok(()) => named(
+                Level::Warn,
+                "api_socket_stale_removed",
+                if mode == 0 {
+                    "a prepared socket whose server is gone".into()
+                } else {
+                    "a socket nobody accepts on".into()
+                },
+            ),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => named(Level::Error, "api_socket_stale_kept", error.to_string()),
+        }
+    }
+
     /// Sleep `total` in slices; `true` when told to stop.
     fn pause(&self, total: Duration) -> bool {
         let deadline = Instant::now() + total;
@@ -293,6 +417,39 @@ impl Keeper {
         }
         self.stop.load(Ordering::SeqCst)
     }
+}
+
+/// The socket's device and inode, if there is one.
+fn socket_identity(path: &Path) -> Option<(u64, u64)> {
+    fs::symlink_metadata(path)
+        .ok()
+        .filter(|m| m.file_type().is_socket())
+        .map(|m| (m.dev(), m.ino()))
+}
+
+/// Whether `path` is an activated (`0600`) socket other than `before`: the
+/// server activates its listener only once its workers run.
+fn activated_since(path: &Path, before: Option<(u64, u64)>) -> bool {
+    fs::symlink_metadata(path).is_ok_and(|m| {
+        m.file_type().is_socket()
+            && m.mode() & 0o7777 == 0o600
+            && Some((m.dev(), m.ino())) != before
+    })
+}
+
+/// The PID in the shell engine's `api.pid` when it names a live process.
+fn live_shell_server(api_pid: &Path) -> Option<u32> {
+    let text = fs::read_to_string(api_pid).ok()?;
+    let pid: u32 = text
+        .lines()
+        .next()?
+        .trim()
+        .parse()
+        .ok()
+        .filter(|p| *p > 1)?;
+    let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let state = stat.rsplit_once(") ")?.1.split_whitespace().next()?;
+    (!matches!(state, "Z" | "X" | "x")).then_some(pid)
 }
 
 #[cfg(test)]
@@ -320,6 +477,13 @@ mod tests {
         (log, events)
     }
 
+    /// Bind `socket` the way the server does once its workers run: `0600`.
+    fn activate(socket: &Path) -> UnixListener {
+        let listener = UnixListener::bind(socket).unwrap();
+        fs::set_permissions(socket, fs::Permissions::from_mode(0o600)).unwrap();
+        listener
+    }
+
     /// A server that dies before it binds fails the start with its own words.
     #[test]
     fn a_server_that_dies_before_binding_fails_the_start_by_name() {
@@ -328,6 +492,7 @@ mod tests {
         let error = match ApiKeeper::start(
             exe,
             dir.join("api.sock"),
+            dir.join("api.pid"),
             Vec::new(),
             log,
             Duration::from_secs(5),
@@ -351,29 +516,65 @@ mod tests {
         let error = ApiKeeper::start(
             exe,
             dir.join("api.sock"),
+            dir.join("api.pid"),
             Vec::new(),
             log,
             Duration::from_millis(500),
         )
         .err()
         .unwrap();
-        assert!(error.contains("did not accept"), "{error}");
+        assert!(error.contains("not activated"), "{error}");
         assert!(started.elapsed() < Duration::from_secs(6));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// A served socket makes the start succeed; a crash is named and the
-    /// server restarted; stop ends it within the grace.
+    /// An activated socket makes the start succeed, and nothing connects to
+    /// find out (H10: a probe's connect-and-drop was recorded by the server as
+    /// a failed request); a crash is named and the server restarted; stop ends
+    /// it within the grace.
     #[test]
-    fn a_crashed_server_is_named_and_restarted() {
+    fn a_crashed_server_is_named_and_restarted_and_readiness_never_connects() {
         let (_, dir) = script("serve", "");
         let socket = dir.join("api.sock");
-        // The test owns the socket; the "server" exits after a moment.
-        let listener = UnixListener::bind(&socket).unwrap();
         let (exe, exe_dir) = script("serve-exe", "sleep 0.3; echo 'worker panicked' >&2; exit 9");
         let (log, events) = quiet();
-        let keeper =
-            ApiKeeper::start(exe, socket, Vec::new(), log, Duration::from_secs(5)).unwrap();
+        // The "server" activates the socket a moment after it starts; what
+        // connects to it before the start returns is the readiness probe.
+        let started = Arc::new(AtomicBool::new(false));
+        let binder = {
+            let socket = socket.clone();
+            let started = Arc::clone(&started);
+            thread::spawn(move || {
+                thread::sleep(Duration::from_millis(100));
+                let listener = activate(&socket);
+                listener.set_nonblocking(true).unwrap();
+                let mut accepted = 0;
+                let until = Instant::now() + Duration::from_secs(5);
+                while !started.load(Ordering::SeqCst) && Instant::now() < until {
+                    if listener.accept().is_ok() {
+                        accepted += 1;
+                    }
+                    thread::sleep(Duration::from_millis(5));
+                }
+                // Anything the probe sent is still queued: drain it too.
+                while listener.accept().is_ok() {
+                    accepted += 1;
+                }
+                (listener, accepted)
+            })
+        };
+        let keeper = ApiKeeper::start(
+            exe,
+            socket.clone(),
+            dir.join("api.pid"),
+            Vec::new(),
+            log,
+            Duration::from_secs(5),
+        )
+        .unwrap();
+        started.store(true, Ordering::SeqCst);
+        let (listener, accepted) = binder.join().unwrap();
+        assert_eq!(accepted, 0, "readiness connected to the server");
         let deadline = Instant::now() + Duration::from_secs(10);
         loop {
             let seen = events.lock().unwrap().clone();
@@ -394,5 +595,70 @@ mod tests {
         drop(listener);
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_dir_all(&exe_dir);
+    }
+
+    fn keeper_at(dir: &Path, log: KeeperLog) -> Keeper {
+        Keeper {
+            exe: dir.join("server"),
+            socket: dir.join("api.sock"),
+            api_pid: dir.join("api.pid"),
+            env: Vec::new(),
+            log,
+            stop: Arc::new(AtomicBool::new(false)),
+            child: Arc::new(AtomicU32::new(0)),
+        }
+    }
+
+    /// F8: a server killed between bind and activation leaves `api.sock` at
+    /// `0000`, which every later server refused as unsafe, forever. The keeper
+    /// (holding daemon.lock, its own server reaped) removes it, named; a socket
+    /// someone may still own is kept, named.
+    #[test]
+    fn a_prepared_socket_left_by_a_dead_server_is_removed_by_name() {
+        let (_, dir) = script("stale", "");
+        let (log, events) = quiet();
+        let keeper = keeper_at(&dir, log);
+        let socket = dir.join("api.sock");
+        // 0000, nobody behind it.
+        drop(UnixListener::bind(&socket).unwrap());
+        fs::set_permissions(&socket, fs::Permissions::from_mode(0o000)).unwrap();
+        keeper.clear_stale_socket();
+        assert!(!socket.exists(), "{:?}", events.lock().unwrap());
+        assert!(
+            events
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|e| e.starts_with("api_socket_stale_removed") && e.contains("mode=0000")),
+            "{:?}",
+            events.lock().unwrap()
+        );
+        // 0600 and refused: stale too.
+        drop(activate(&socket));
+        keeper.clear_stale_socket();
+        assert!(!socket.exists());
+        // 0000 while api.pid names a live shell-engine server: kept, named.
+        drop(UnixListener::bind(&socket).unwrap());
+        fs::set_permissions(&socket, fs::Permissions::from_mode(0o000)).unwrap();
+        fs::write(dir.join("api.pid"), format!("{}\n", std::process::id())).unwrap();
+        keeper.clear_stale_socket();
+        assert!(fs::symlink_metadata(&socket).is_ok());
+        assert!(
+            events
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|e| e.starts_with("api_socket_stale_kept") && e.contains("shell-engine")),
+            "{:?}",
+            events.lock().unwrap()
+        );
+        fs::remove_file(dir.join("api.pid")).unwrap();
+        fs::remove_file(&socket).unwrap();
+        // 0600 with a server accepting: kept.
+        let live = activate(&socket);
+        keeper.clear_stale_socket();
+        assert!(socket.exists());
+        drop(live);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

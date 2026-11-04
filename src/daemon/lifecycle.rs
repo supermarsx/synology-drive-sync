@@ -690,6 +690,7 @@ pub(crate) fn run_daemon(options: &Options) -> ExitCode {
                 super::api_server::ApiKeeper::start(
                     exe,
                     PathBuf::from(super::super::API_SOCKET_PATH),
+                    options.var.join("run").join("api.pid"),
                     api_env.clone(),
                     log,
                     Duration::from_secs(15),
