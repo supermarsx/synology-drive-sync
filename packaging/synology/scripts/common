@@ -895,3 +895,79 @@ legacy_stale_run_lock_status() {
     fi
     return 0
 }
+
+# ---------------------------------------------------------------------------
+# Service engine
+#
+# var/state/engine names the engine the lifecycle runs: `daemon` (the default,
+# also when the file is absent) or `shell` (the controller and runner, kept for
+# one release as a fallback). The daemon reads the same file with the same
+# grammar: one word, with at most one trailing newline.
+
+daemon_pid_file=$runtime_root/daemon.pid
+daemon_ready_file=$runtime_root/daemon.ready
+daemon_lock_file=$runtime_root/daemon.lock
+daemon_socket=$runtime_root/ctl.sock
+service_engine_file=$package_var/state/engine
+
+# Sets service_engine (daemon or shell) and service_engine_problem: empty, or
+# why the file was not used. Anything but the two words is the daemon, and the
+# caller names the problem; it is never guessed silently.
+resolve_service_engine() {
+    service_engine=daemon
+    service_engine_problem=
+    [ -e "$service_engine_file" ] || [ -L "$service_engine_file" ] || return 0
+    if [ -L "$service_engine_file" ] || [ ! -f "$service_engine_file" ]; then
+        service_engine_problem="it is not a regular file"
+        return 0
+    fi
+    service_engine_size=$(wc -c 2>/dev/null < "$service_engine_file" | tr -d ' ')
+    case $service_engine_size in
+        ''|*[!0-9]*) service_engine_problem="it cannot be read"; return 0 ;;
+    esac
+    if [ "$service_engine_size" -gt 64 ]; then
+        service_engine_problem="it is $service_engine_size bytes"
+        return 0
+    fi
+    service_engine_content=$(cat "$service_engine_file" 2>/dev/null) || {
+        service_engine_problem="it cannot be read"
+        return 0
+    }
+    case $service_engine_content:$service_engine_size in
+        daemon:6|daemon:7) ;;
+        shell:5|shell:6) service_engine=shell ;;
+        *)
+            service_engine_problem="it holds '$(printf '%s' "$service_engine_content" |
+                LC_ALL=C tr -c 'A-Za-z0-9_.-' '?' | cut -c 1-32)', not daemon or shell"
+            ;;
+    esac
+}
+
+# Any record a daemon leaves while it runs. A clean daemon stop removes all
+# three; daemon.lock stays, and only a live holder of it means a daemon runs.
+daemon_artifacts_present() {
+    for daemon_artifact in "$daemon_socket" "$daemon_ready_file" "$daemon_pid_file"; do
+        if [ -e "$daemon_artifact" ] || [ -L "$daemon_artifact" ]; then
+            daemon_present_artifact=$daemon_artifact
+            return 0
+        fi
+    done
+    return 1
+}
+
+# 0 when a process holds daemon.lock, 1 when none does or the file is absent,
+# 2 when it cannot be told (no flock(1), or the probe itself failed). The probe
+# opens the existing file only; it never creates it. flock -n exits 1 exactly
+# when the lock is taken (util-linux and BusyBox alike).
+daemon_lock_held_status() {
+    [ -e "$daemon_lock_file" ] || [ -L "$daemon_lock_file" ] || return 1
+    [ -f "$daemon_lock_file" ] && [ ! -L "$daemon_lock_file" ] || return 2
+    command -v flock >/dev/null 2>&1 || return 2
+    daemon_lock_probe_status=0
+    flock -n "$daemon_lock_file" true 2>/dev/null || daemon_lock_probe_status=$?
+    case $daemon_lock_probe_status in
+        0) return 1 ;;
+        1) return 0 ;;
+        *) return 2 ;;
+    esac
+}

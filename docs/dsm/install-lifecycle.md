@@ -146,9 +146,10 @@ sudo -u "$PACKAGE_USER" -- "$MANAGER" plan personal
 
 ## Start, stop, and scheduling defaults
 
-Package Center start/stop controls two long-lived, unprivileged package-user processes: the local API
-service for the DSM dashboard and the controller for routines and queued work. Starting them does
-not enable a routine or contact a target. The legacy global interval schedule and every per-profile
+Package Center start/stop controls the long-lived, unprivileged package-user processes: by default
+the sync daemon, which serves the DSM dashboard's local API and runs routines and queued work; under
+the fallback shell engine, the local API service and the controller. Starting them does not enable a
+routine or contact a target. The legacy global interval schedule and every per-profile
 routine are disabled until explicitly configured and enabled.
 
 ```bash
@@ -156,6 +157,38 @@ sudo synopkg status synology-drive-sync
 sudo synopkg start synology-drive-sync
 sudo synopkg stop synology-drive-sync
 ```
+
+### Which engine runs
+
+`var/state/engine` (package-owned, one word) selects what start runs, and is read once per
+lifecycle command:
+
+| Content | Engine |
+| --- | --- |
+| absent, or `daemon` | the sync daemon (`sdsync-dsm-api --launch-daemon`): one supervised process that runs routines, queued work and every Plan/Run, and serves the dashboard API |
+| `shell` | the controller and runner of earlier releases, kept for one release as a fallback |
+| anything else | the daemon, after a `warn` `service_engine_invalid` event in `controller.log` and a console line naming the path and what the file holds |
+
+Under the shell engine, profiles the daemon held for a lasting condition (`state/lasting/<p>.state`)
+are not held: start says so once (`lasting_blocks_not_applied`, with the count).
+
+Daemon start keeps the shell start's lifecycle serialization, transition fence and admission steps:
+admission is closed, `--launch-daemon` waits for the daemon to answer `ctl ping` (and, in
+production, for the API socket), and admission is opened only then. A failed launch leaves admission
+closed, records `service_start_failed` with the launcher's cause, stops anything it half started,
+and exits `1`. Start refuses while shell-engine services are live.
+
+Daemon stop asks the daemon to stop (`ctl stop`, which lets a running sync end within its cancel
+grace). A daemon that does not answer, or outlasts `SDSYNC_DSM_STOP_TIMEOUT` (default 120 s), is
+sent TERM and then KILL, together with its supervisor, but only after its identity is proven from
+`run/daemon.ready` (PID, `/proc` start time, boot id, package uid, `--daemon` argv); an unprovable
+one is refused and named. Stop leaves no `daemon.pid`, `daemon.ready` or `ctl.sock` (`daemon.lock`
+stays; only a live holder of it means a daemon runs). Stop stops whichever engine's processes are
+present, both after an engine switch made while one was running. Status is `0` when the daemon
+answers `ctl ping` with admission open, `3` with no daemon records, and `1` when records of a daemon
+that is gone remain (named on stderr).
+
+### Shell engine stop
 
 Stop requests cooperative termination of the verified API service, controller, and any verified
 active runner. The lifecycle script validates recorded PIDs and the fixed socket before cleanup,
@@ -186,7 +219,11 @@ the Package Center upgrade; the path assumes DSM serializes the package transact
 package service UID remains trusted.
 
 DSM stops a running package before upgrade. Lifecycle scripts also refuse upgrade while a verified
-controller or foreground Plan/Run PID remains live. Profiles, credentials, routines, global schedule,
+controller or foreground Plan/Run PID remains live, while a process holds `run/daemon.lock`, or while
+`run/ctl.sock`, `run/daemon.ready` or `run/daemon.pid` remains. Under the daemon engine, `postupgrade`
+removes what the shell controller kept beside its runs and nothing retires under the daemon: the
+`state/controller-reload.pending` marker and `run/watch-*`, `run/poll-*` and `run/fingerprint.*`
+scratch files (one it cannot remove is named). The shell engine keeps them. Profiles, credentials, routines, global schedule,
 state, and logs are retained and validated with the new binary. If retained configuration is invalid,
 investigate it rather than replacing package-private files manually.
 

@@ -1054,6 +1054,400 @@ finish_start() {
     release_lifecycle_serialization >/dev/null 2>&1 || true
 }
 
+# ---------------------------------------------------------------------------
+# Service engine selection and the daemon engine
+#
+# Read once per lifecycle command. An engine file the lifecycle cannot use is
+# named in the controller log and on the console, and the daemon runs.
+select_service_engine() {
+    resolve_service_engine
+    [ -n "$service_engine_problem" ] || return 0
+    service_engine_detail="path=$service_engine_file cause=$service_engine_problem; the daemon engine runs"
+    package_message "warning: $service_engine_file is not used: $service_engine_problem; the daemon engine runs"
+    append_controller_log_event warn service_engine_invalid \
+        "$(one_safe_line "$service_engine_detail")" >/dev/null 2>&1 \
+        || package_message "warning: the service_engine_invalid event could not be written to the controller log"
+}
+
+# The shell engine applies no lasting blocks: a profile the daemon held for a
+# lasting condition (state/lasting/<p>.state) runs again under it. Said once
+# per start, never silently.
+note_lasting_blocks_under_shell() {
+    lasting_held=0
+    for lasting_record in "$state_root/lasting"/*.state; do
+        [ -f "$lasting_record" ] || continue
+        lasting_held=$((lasting_held + 1))
+    done
+    [ "$lasting_held" -gt 0 ] || return 0
+    package_message "warning: lasting blocks are not applied by the shell engine ($lasting_held profiles held under the daemon)"
+    append_controller_log_event warn lasting_blocks_not_applied \
+        "engine=shell profiles=$lasting_held path=$state_root/lasting" >/dev/null 2>&1 \
+        || package_message "warning: the lasting_blocks_not_applied event could not be written to the controller log"
+}
+
+daemon_ctl() {
+    "$api_server" --ctl "$@" --home "$package_home" --var "$package_var"
+}
+
+daemon_answers_ping() {
+    daemon_ctl ping >/dev/null 2>&1
+}
+
+# 0 when daemon.ready names a live daemon of this package: the PID, /proc start
+# time and boot id it published, the package uid, a --daemon argv, and the PID
+# daemon.pid names. Sets daemon_live_pid/start/boot. 1 when no daemon process
+# exists (no records, or records naming a process that is gone). 73 when that
+# cannot be proven, with the cause in daemon_identity_cause.
+daemon_identity_status() {
+    daemon_live_pid= daemon_live_start= daemon_live_boot= daemon_identity_cause=
+    daemon_recorded_pid=
+    if api_path_exists "$daemon_pid_file"; then
+        daemon_recorded_pid=$(script_pid "$daemon_pid_file" 2>/dev/null || true)
+        [ -n "$daemon_recorded_pid" ] || {
+            daemon_identity_cause="$daemon_pid_file holds no PID"
+            return 73
+        }
+    fi
+    if ! api_path_exists "$daemon_ready_file"; then
+        [ -n "$daemon_recorded_pid" ] || return 1
+        script_pid_absent_or_zombie "$daemon_recorded_pid" && return 1
+        daemon_identity_cause="$daemon_pid_file names live PID $daemon_recorded_pid, but $daemon_ready_file is absent"
+        return 73
+    fi
+    [ -f "$daemon_ready_file" ] && [ ! -L "$daemon_ready_file" ] \
+        && [ "$(stat -c '%u:%a:%h' "$daemon_ready_file" 2>/dev/null || true)" = "$path_owner:600:1" ] || {
+        daemon_identity_cause="$daemon_ready_file is not a package-owned 0600 regular file"
+        return 73
+    }
+    daemon_ready_pid= daemon_ready_start= daemon_ready_boot= daemon_ready_surplus=
+    {
+        IFS= read -r daemon_ready_pid || true
+        IFS= read -r daemon_ready_start || true
+        IFS= read -r daemon_ready_boot || true
+        IFS= read -r daemon_ready_surplus || true
+    } < "$daemon_ready_file"
+    is_pid "$daemon_ready_pid" && [ -z "$daemon_ready_surplus" ] \
+        && valid_boot_identity "$daemon_ready_boot" || {
+        daemon_identity_cause="$daemon_ready_file is not pid, start, boot"
+        return 73
+    }
+    case $daemon_ready_start in ''|*[!0-9]*|0)
+        daemon_identity_cause="$daemon_ready_file is not pid, start, boot"
+        return 73
+        ;;
+    esac
+    if [ -n "$daemon_recorded_pid" ] && [ "$daemon_recorded_pid" != "$daemon_ready_pid" ]; then
+        if script_pid_absent_or_zombie "$daemon_recorded_pid" \
+            && script_pid_absent_or_zombie "$daemon_ready_pid"; then
+            return 1
+        fi
+        daemon_identity_cause="$daemon_pid_file names PID $daemon_recorded_pid, $daemon_ready_file PID $daemon_ready_pid"
+        return 73
+    fi
+    daemon_process_status=0
+    process_identity_is_live "$daemon_ready_pid" "$daemon_ready_start" "$daemon_ready_boot" \
+        || daemon_process_status=$?
+    case $daemon_process_status in
+        0) ;;
+        1) return 1 ;;
+        *)
+            daemon_identity_cause="PID $daemon_ready_pid cannot be identified (${process_identity_cause:-unknown})"
+            return 73
+            ;;
+    esac
+    tr '\000' '\n' 2>/dev/null < "/proc/$daemon_ready_pid/cmdline" | grep -F -x -- '--daemon' >/dev/null 2>&1 || {
+        daemon_identity_cause="PID $daemon_ready_pid is live but is not a --daemon process"
+        return 73
+    }
+    daemon_live_pid=$daemon_ready_pid
+    daemon_live_start=$daemon_ready_start
+    daemon_live_boot=$daemon_ready_boot
+}
+
+# The respawning parent of the daemon (--supervise). It restarts a daemon that
+# dies by a signal, so the fallback stop signals it first. Sets
+# daemon_supervisor_pid/start, or leaves them empty when the parent is not one.
+capture_daemon_supervisor() {
+    daemon_supervisor_pid= daemon_supervisor_start=
+    read_process_stat_fields "$1" || return 0
+    daemon_parent=$process_stat_ppid
+    is_pid "$daemon_parent" || return 0
+    read_process_stat_fields "$daemon_parent" || return 0
+    daemon_parent_start=$process_stat_start
+    read_process_status_ids "$daemon_parent" || return 0
+    [ "$process_status_uid" = "$path_owner" ] || return 0
+    tr '\000' '\n' 2>/dev/null < "/proc/$daemon_parent/cmdline" | grep -F -x -- '--supervise' >/dev/null 2>&1 \
+        || return 0
+    daemon_supervisor_pid=$daemon_parent
+    daemon_supervisor_start=$daemon_parent_start
+}
+
+# 0 while PID $1 still has start time $2, 1 once it is gone or reused.
+daemon_process_still() {
+    read_process_stat_fields "$1" || return 1
+    [ "$process_stat_start" = "$2" ] || return 1
+    case $process_stat_state in Z|X|x) return 1 ;; esac
+    return 0
+}
+
+# Signal $2 to PID $1 only while it is still the process captured with start $3.
+daemon_signal_exact() {
+    daemon_process_still "$1" "$3" || return 0
+    kill "-$2" "$1" 2>/dev/null && return 0
+    # Gone between the check and kill(2) is not a failure; still there is.
+    daemon_process_still "$1" "$3" && return 1
+    return 0
+}
+
+# Wait up to $1 seconds for the captured daemon and supervisor to be gone.
+daemon_wait_gone() {
+    load_poll_resolution
+    poll_reset
+    while :; do
+        daemon_still=false
+        daemon_process_still "$daemon_live_pid" "$daemon_live_start" && daemon_still=true
+        if [ -n "$daemon_supervisor_pid" ] \
+            && daemon_process_still "$daemon_supervisor_pid" "$daemon_supervisor_start"; then
+            daemon_still=true
+        fi
+        [ "$daemon_still" = true ] || return 0
+        poll_expired "$1" && return 1
+        poll_wait
+    done
+}
+
+# Stop a daemon of this package: `ctl stop`, which lets a running sync end its
+# cancel grace and removes the daemon's records; then, if it is still there,
+# TERM and after the grace KILL, to the exact process daemon.ready names and to
+# its supervisor. Only a daemon whose identity is proven is ever signalled.
+# Leaves no daemon.pid, daemon.ready or ctl.sock behind. Sets
+# daemon_stop_transitioned when a live daemon was stopped.
+stop_daemon_engine() {
+    daemon_stop_transitioned=false
+    daemon_identity=0
+    daemon_identity_status || daemon_identity=$?
+    case $daemon_identity in
+        0)
+            capture_daemon_supervisor "$daemon_live_pid"
+            daemon_stop_transitioned=true
+            ;;
+        1) ;;
+        *)
+            package_message "refusing to stop an unverified daemon: $daemon_identity_cause"
+            return 1
+            ;;
+    esac
+    daemon_grace=${SDSYNC_DSM_STOP_TIMEOUT:-120}
+    case $daemon_grace in ''|*[!0-9]*) daemon_grace=120 ;; esac
+    [ "$daemon_grace" -ge 1 ] || daemon_grace=1
+    [ "$daemon_grace" -le 120 ] || daemon_grace=120
+    daemon_ctl_status=69
+    if [ "$daemon_identity" -eq 0 ] || api_path_exists "$daemon_socket"; then
+        daemon_ctl_status=0
+        daemon_ctl_reply=$(daemon_ctl stop "wait_s=$daemon_grace" 2>&1) || daemon_ctl_status=$?
+        if [ "$daemon_ctl_status" -ne 0 ] && [ "$daemon_identity" -eq 0 ]; then
+            if [ "$daemon_ctl_status" -eq 69 ]; then
+                package_message "warning: the daemon (PID $daemon_live_pid) did not answer ctl stop; signalling it"
+            else
+                package_message "warning: ctl stop failed (status $daemon_ctl_status: $(one_safe_line "$daemon_ctl_reply")); signalling the daemon"
+            fi
+        fi
+    fi
+    # After an accepted ctl stop the daemon gets the whole grace to end on its
+    # own; one that did not answer is signalled at once.
+    daemon_settled=false
+    if [ "$daemon_identity" -eq 0 ] && [ "$daemon_ctl_status" -eq 0 ] \
+        && daemon_wait_gone "$daemon_grace"; then
+        daemon_settled=true
+    fi
+    if [ "$daemon_identity" -eq 0 ] && [ "$daemon_settled" != true ]; then
+        if [ -n "$daemon_supervisor_pid" ]; then
+            daemon_signal_exact "$daemon_supervisor_pid" TERM "$daemon_supervisor_start" || {
+                package_message "the daemon supervisor (PID $daemon_supervisor_pid) could not be signalled"
+                return 1
+            }
+        fi
+        daemon_signal_exact "$daemon_live_pid" TERM "$daemon_live_start" || {
+            package_message "the daemon (PID $daemon_live_pid) could not be signalled"
+            return 1
+        }
+        if ! daemon_wait_gone "$daemon_grace"; then
+            package_message "the daemon (PID $daemon_live_pid) outlasted its $daemon_grace s grace after TERM; killing it"
+            append_controller_log_event error service_stop_forced \
+                "engine=daemon pid=$daemon_live_pid grace_s=$daemon_grace" >/dev/null 2>&1 || true
+            [ -z "$daemon_supervisor_pid" ] \
+                || daemon_signal_exact "$daemon_supervisor_pid" KILL "$daemon_supervisor_start" || true
+            daemon_signal_exact "$daemon_live_pid" KILL "$daemon_live_start" || true
+            daemon_wait_gone 10 || {
+                package_message "the daemon (PID $daemon_live_pid) remained live after KILL"
+                return 1
+            }
+        fi
+    fi
+    # Gone, or never there: what it left is stale. Remove only the records a
+    # clean stop removes, and only while no process holds daemon.lock.
+    daemon_held=0
+    daemon_lock_held_status || daemon_held=$?
+    if [ "$daemon_held" -eq 0 ]; then
+        package_message "refusing to clean daemon records while daemon.lock is held"
+        return 1
+    fi
+    for daemon_record in "$daemon_socket" "$daemon_ready_file" "$daemon_pid_file"; do
+        api_path_exists "$daemon_record" || continue
+        if [ -d "$daemon_record" ] && [ ! -L "$daemon_record" ]; then
+            package_message "refusing to remove $daemon_record: it is a directory"
+            return 1
+        fi
+        rm -f "$daemon_record" || {
+            package_message "stale daemon record $daemon_record could not be removed"
+            return 1
+        }
+    done
+}
+
+# 0 running (ping answers, admission open), 3 stopped (no daemon records, no
+# daemon), 1 stale records of a daemon that is gone, 2 anything else.
+daemon_status_code() {
+    if daemon_answers_ping; then
+        daemon_status_transition=$(package_transition_status 2>/dev/null) || return 2
+        [ "$daemon_status_transition" = open ] || return 2
+        daemon_status_admission=$(service_admission_status 2>/dev/null) || return 2
+        [ "$daemon_status_admission" = open ] || return 2
+        return 0
+    fi
+    daemon_status_held=0
+    daemon_lock_held_status || daemon_status_held=$?
+    [ "$daemon_status_held" -ne 0 ] || return 2
+    if daemon_artifacts_present; then
+        daemon_status_identity=0
+        daemon_identity_status || daemon_status_identity=$?
+        [ "$daemon_status_identity" -eq 1 ] || return 2
+        daemon_status_stale=$daemon_present_artifact
+        return 1
+    fi
+    return 3
+}
+
+daemon_launch_argv() {
+    set -- "$api_server" --launch-daemon
+    if [ "${SDSYNC_TEST_NO_SERVE_API:-}" = 1 ]; then
+        package_message "warning: SDSYNC_TEST_NO_SERVE_API=1: the daemon starts without the dashboard API (test fixtures only)"
+    else
+        set -- "$@" --serve-api
+    fi
+    set -- "$@" --home "$package_home" --var "$package_var" --core "$binary" --manager "$manager"
+    daemon_launch_status=0
+    daemon_launch_output=$("$@" 2>&1) || daemon_launch_status=$?
+}
+
+finish_daemon_start() {
+    trap '' HUP INT TERM
+    if [ "${daemon_start_committed:-false}" != true ] && [ "${daemon_launched:-false}" = true ]; then
+        # A daemon that came up after --launch-daemon gave up would run with
+        # admission closed; stop it so nothing runs half started.
+        stop_daemon_engine >/dev/null 2>&1 \
+            || package_message "warning: a partly started daemon could not be stopped; run stop"
+    fi
+    if [ "${start_event_pending:-false}" = true ]; then
+        append_lifecycle_event start_failed >/dev/null 2>&1 || \
+            package_message "warning: failed start could not be recorded in package Activity"
+        start_event_pending=false
+    fi
+    release_lifecycle_serialization >/dev/null 2>&1 || true
+}
+
+# The daemon engine's start: the same serialization, transition fence and
+# admission steps as the shell start, around one --launch-daemon.
+start_daemon_engine() {
+    daemon_start_committed=false
+    daemon_launched=false
+    start_event_pending=false
+    restart_event_pending=false
+    trap finish_daemon_start 0
+    trap 'exit 1' HUP INT TERM
+    acquire_lifecycle_serialization || exit 1
+    start_transition_state=$(package_transition_status) || {
+        package_message "cannot validate package transition state"
+        exit 1
+    }
+    [ "$start_transition_state" = open ] || {
+        package_message "cannot start while package $start_transition_state is in progress"
+        exit 1
+    }
+    if daemon_answers_ping; then
+        run_runtime_marker_fenced --service-admission open || {
+            package_message "running service admission state is unsafe"
+            exit 1
+        }
+        daemon_start_committed=true
+        release_lifecycle_serialization || exit 1
+        trap - 0 HUP INT TERM
+        package_message "the sync daemon is already running"
+        exit 0
+    fi
+    set +e
+    status_code
+    shell_engine_status=$?
+    set -e
+    case $shell_engine_status in
+        0|2)
+            package_message "refusing to start the daemon engine while shell-engine services are live or inconsistent (lifecycle status $shell_engine_status); run stop first"
+            exit 1
+            ;;
+    esac
+    run_runtime_marker_fenced --service-admission close || {
+        package_message "service admission could not be closed for startup"
+        exit 1
+    }
+    restart_marker_status=0
+    service_restart_pending || restart_marker_status=$?
+    case $restart_marker_status in
+        0) restart_event_pending=true ;;
+        1) ;;
+        *) package_message "warning: unsafe package restart marker will not affect service startup" ;;
+    esac
+    stop_daemon_engine || {
+        package_message "refusing to start over the records of a daemon that could not be stopped"
+        exit 1
+    }
+    start_event_pending=true
+    daemon_launched=true
+    daemon_launch_argv
+    if [ "$daemon_launch_status" -ne 0 ]; then
+        daemon_launch_cause=$(one_safe_line "$daemon_launch_output")
+        package_message "the sync daemon failed to start (status $daemon_launch_status): ${daemon_launch_cause:-no cause was printed}"
+        append_controller_log_event error service_start_failed \
+            "engine=daemon status=$daemon_launch_status cause=${daemon_launch_cause:-none}" >/dev/null 2>&1 \
+            || package_message "warning: the service_start_failed event could not be written to the controller log"
+        exit 1
+    fi
+    trap '' HUP INT TERM
+    run_runtime_marker_fenced --service-admission open || {
+        package_message "the sync daemon started but run admission could not be opened"
+        exit 1
+    }
+    daemon_start_committed=true
+    start_event_pending=false
+    append_lifecycle_event started >/dev/null 2>&1 || \
+        package_message "warning: successful start could not be recorded in package Activity"
+    if [ "$restart_event_pending" = true ]; then
+        if consume_service_stop_marker; then
+            append_lifecycle_event restarted >/dev/null 2>&1 || \
+                package_message "warning: successful restart could not be recorded in package Activity"
+        else
+            package_message "warning: successful restart marker could not be retired"
+        fi
+    fi
+    release_lifecycle_serialization || {
+        package_message "the sync daemon started but lifecycle serialization could not be released"
+        exit 1
+    }
+    trap - 0 HUP INT TERM
+    daemon_started_pid=$(script_pid "$daemon_pid_file" 2>/dev/null || true)
+    package_message "the sync daemon started as PID ${daemon_started_pid:-unknown}"
+    exit 0
+}
+
 case ${1:-} in
     prestart)
         # Each refusal names what is missing; DSM shows only "failed to start".
@@ -1071,6 +1465,9 @@ case ${1:-} in
         . "$common_runtime"
         require_package_identity
         ensure_layout
+        select_service_engine
+        [ "$service_engine" = shell ] || start_daemon_engine
+        note_lasting_blocks_under_shell
         start_committed=false
         launched_api_pid=
         launched_api_start=
@@ -1381,6 +1778,13 @@ case ${1:-} in
             package_message "service admission could not be closed before stop"
             exit 1
         }
+        # Whichever engine's processes are there are stopped: both, after the
+        # engine was switched while one was running.
+        select_service_engine
+        daemon_stop_transitioned=false
+        if [ "$service_engine" = daemon ] || daemon_artifacts_present; then
+            stop_daemon_engine || exit 1
+        fi
         failed_stop_status=0
         stop_failed_start_children || failed_stop_status=$?
         case $failed_stop_status in
@@ -1886,7 +2290,7 @@ case ${1:-} in
         # stop bookkeeping despite a late lifecycle signal so DSM cannot be
         # told the stop failed after the service is already down.
         trap '' HUP INT TERM
-        if [ "$stop_transitioned" = true ]; then
+        if [ "$stop_transitioned" = true ] || [ "$daemon_stop_transitioned" = true ]; then
             write_service_stop_marker || \
                 package_message "warning: services stopped but restart telemetry could not be armed"
             append_lifecycle_event stopped >/dev/null 2>&1 || \
@@ -1897,7 +2301,11 @@ case ${1:-} in
             exit 1
         }
         trap - 0 HUP INT TERM
-        package_message "API service, controller, and active plan/sync stopped gracefully"
+        if [ "$daemon_stop_transitioned" = true ] && [ "$stop_transitioned" != true ]; then
+            package_message "the sync daemon stopped"
+        else
+            package_message "API service, controller, and active plan/sync stopped gracefully"
+        fi
         exit 0
         ;;
     status)
@@ -1907,9 +2315,23 @@ case ${1:-} in
         trap 'release_lifecycle_serialization >/dev/null 2>&1 || true' 0
         trap 'exit 2' HUP INT TERM
         acquire_lifecycle_serialization >/dev/null 2>&1 || exit 2
+        # Status is polled; an unusable engine file is named by start and stop.
+        resolve_service_engine
         set +e
-        status_code
-        result=$?
+        if [ "$service_engine" = daemon ]; then
+            daemon_status_code
+            result=$?
+            if [ "$result" -eq 3 ]; then
+                # A shell-engine controller left running is still running.
+                status_code
+                result=$?
+            fi
+            [ "$result" -ne 1 ] || [ -z "${daemon_status_stale:-}" ] \
+                || echo "stale daemon record of a daemon that is gone: $daemon_status_stale" >&2
+        else
+            status_code
+            result=$?
+        fi
         set -e
         if [ "$result" -eq 2 ] && controller_dead_with_live_api; then
             record_controller_found_dead status

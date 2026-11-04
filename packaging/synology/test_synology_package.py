@@ -6,6 +6,7 @@ from __future__ import annotations
 import ast
 import concurrent.futures
 import copy
+import fcntl
 import io
 import json
 import os
@@ -1734,6 +1735,21 @@ class RuntimeTests(unittest.TestCase):
             self.real_target / "bin/sdsync-dsm-api", "--service-admission", "open"
         )
         self.assertEqual(opened.returncode, 0, opened.stderr)
+        # The lifecycle tests below were written for the shell controller and
+        # runner, which stay one release as the fallback engine. The daemon
+        # engine (the default: no engine file) has tests of its own.
+        self.set_engine("shell\n")
+
+    def set_engine(self, content: str | None) -> None:
+        """Write var/state/engine as the package user, or remove it (None)."""
+        engine = self.real_var / "state/engine"
+        engine.unlink(missing_ok=True)
+        if content is None:
+            return
+        engine.write_text(content, encoding="utf-8")
+        engine.chmod(0o600)
+        if os.getuid() == 0:
+            os.chown(engine, self.drop_uid, self.drop_gid)
 
     def write_api_mock(
         self,
@@ -1744,9 +1760,32 @@ class RuntimeTests(unittest.TestCase):
         consumer_tree_pid_file: Path | None = None,
         consumer_tree_ready_file: Path | None = None,
         consumer_tree_done_file: Path | None = None,
+        daemon_binary: Path | None = None,
     ) -> None:
         bridge = self.real_target / "bin/sdsync-dsm-api"
         consume = ""
+        daemon_passthrough = ""
+        if daemon_binary is not None:
+            # The daemon's flags run the real built bridge, which takes
+            # --home/--var and so works in this relocated fixture. Everything
+            # else stays this mock: the real bridge's admission, transition and
+            # audit paths are fixed to /var/packages. The daemon strips the
+            # environment of the manager it spawns, so the mock's own roots are
+            # baked in as defaults for those calls.
+            roots = {
+                "SYNOPKG_PKGDEST": str(self.fhs / "target"),
+                "SYNOPKG_PKGHOME": str(self.fhs / "home"),
+                "SYNOPKG_PKGVAR": str(self.fhs / "var"),
+                "SDSYNC_TEST_API_SOCKET": str(self.real_var / "run/api.sock"),
+            }
+            daemon_passthrough = (
+                "if len(sys.argv) >= 2 and sys.argv[1] in "
+                "('--launch-daemon', '--daemon', '--supervise', '--ctl'):\n"
+                f"    os.execv({str(daemon_binary)!r}, [{str(daemon_binary)!r}, *sys.argv[1:]])\n"
+                f"for _key, _value in {roots!r}.items():\n"
+                "    os.environ.setdefault(_key, _value)\n"
+                "\n"
+            )
         if queue_capture is not None and queue_lock is not None:
             argv_capture = ""
             if queue_argv_capture is not None:
@@ -1912,7 +1951,21 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
             "import sys\n"
             "import time\n"
             "\n"
-            "def run_mock_watch():\n"
+            "# A scripted daemon control socket: SDSYNC_TEST_FAKE_CTL names a\n"
+            "# directory; each --ctl call is appended to its `calls`, prints\n"
+            "# <verb>.reply and exits with <verb>.exit (0 when absent).\n"
+            "if len(sys.argv) >= 2 and sys.argv[1] == '--ctl' and os.environ.get('SDSYNC_TEST_FAKE_CTL'):\n"
+            "    fake_ctl = Path(os.environ['SDSYNC_TEST_FAKE_CTL'])\n"
+            "    fake_verb = sys.argv[2] if len(sys.argv) > 2 else ''\n"
+            "    with (fake_ctl / 'calls').open('a', encoding='utf-8') as fake_calls:\n"
+            "        fake_calls.write(' '.join(sys.argv[2:]) + '\\n')\n"
+            "    if (fake_ctl / f'{fake_verb}.reply').exists():\n"
+            "        sys.stdout.write((fake_ctl / f'{fake_verb}.reply').read_text(encoding='utf-8'))\n"
+            "    fake_exit = fake_ctl / f'{fake_verb}.exit'\n"
+            "    raise SystemExit(int(fake_exit.read_text(encoding='utf-8')) if fake_exit.exists() else 0)\n"
+            "\n"
+            + daemon_passthrough
+            + "def run_mock_watch():\n"
             "    # The package's own realtime watcher. With SDSYNC_TEST_NATIVE_WATCH\n"
             "    # naming the built sdsync-dsm-api, the real binary replaces this mock\n"
             "    # under the mock's own argv[0], so the controller's identity checks see\n"
@@ -12420,6 +12473,42 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
         finally:
             release()
 
+    def test_api_set_secret_beside_a_daemon_run_says_it_applies_next_run(self) -> None:
+        # The secret result is a fixed document, and it used to drop the note a
+        # save beside a run prints: a password saved mid-sync read as applied.
+        _, _, _, release = self._daemon_run_fixture()
+        try:
+            result, payload = self.api(
+                "set-secret", "--profile", "syncing", "--kind", "password", "--mode", "replace",
+                input_text="rotated-password\n",
+            )
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertIs(payload["has_password"], True, payload)
+            self.assertEqual(
+                payload["warnings"],
+                [{
+                    "code": "applies_next_run",
+                    "message": "profile syncing is syncing now; this change takes effect on its next run",
+                }],
+            )
+            self.assertNotIn("warning_code", payload)
+            # A profile the run does not cover has nothing to note.
+            result, payload = self.api(
+                "set-secret", "--profile", "other", "--kind", "password", "--mode", "replace",
+                input_text="other-password\n",
+            )
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertEqual(
+                set(payload),
+                {"schema", "ok", "message", "has_password", "has_totp", "has_remote_log_token"},
+            )
+        finally:
+            release()
+        self.assertEqual(
+            (self.real_home / "secrets/syncing.password").read_text(encoding="utf-8"),
+            "rotated-password\n",
+        )
+
     def test_daemon_run_refuses_confirmed_resync_but_not_read_only_commands(self) -> None:
         _, _, _, release = self._daemon_run_fixture()
         try:
@@ -12661,6 +12750,507 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
                 process.wait(timeout=5)
             os.close(master_fd)
             os.close(slave_fd)
+
+    # -- the daemon engine ---------------------------------------------------
+    #
+    # The default engine (no var/state/engine) launches the Rust daemon. These
+    # tests run the real built bridge for the daemon's flags (--launch-daemon,
+    # --supervise, --daemon, --ctl); the API child binds the fixed /var/packages
+    # path and cannot be relocated, so start runs without it here
+    # (SDSYNC_TEST_NO_SERVE_API=1, the lifecycle's one test hook).
+
+    DAEMON_START = {"SDSYNC_TEST_NO_SERVE_API": "1"}
+
+    def _daemon_binary(self) -> Path:
+        binary = select_validator_binary_path(
+            os.environ.get("SDSYNC_DAEMON_BINARY"),
+            [
+                REPOSITORY / "target/debug/sdsync-dsm-api",
+                REPOSITORY / "target/release/sdsync-dsm-api",
+            ],
+        )
+        if binary is None:
+            reason = (
+                "the daemon-engine tests need the real bridge: run `cargo build --locked` "
+                "(target/debug/sdsync-dsm-api) or set SDSYNC_DAEMON_BINARY"
+            )
+            if os.environ.get("CI") == "true":
+                self.fail(reason)
+            print(f"skipped {self.id()}: {reason}", file=sys.stderr)
+            self.skipTest(reason)
+        return binary
+
+    def _daemon_engine(self, engine: str | None = None) -> None:
+        """Select the daemon engine (engine file content, None = absent) with the real bridge.
+
+        The core is a stand-in that needs no environment (the daemon passes it
+        only an allowlist): it appends its argv to self.daemon_capture, and
+        while self.daemon_hold exists it signals self.daemon_ready and waits
+        for self.daemon_release.
+        """
+        binary = self._daemon_binary()
+        self.set_engine(engine)
+        self.write_api_mock(daemon_binary=binary)
+        self.daemon_capture = self.root / "daemon-core.args"
+        self.daemon_hold = self.root / "daemon-core.hold"
+        self.daemon_ready = self.root / "daemon-core.ready"
+        self.daemon_release = self.root / "daemon-core.release"
+        core = self.real_target / "bin/synology-drive-sync"
+        core.write_text(
+            "#!/bin/sh\n"
+            f'printf \'%s\\n\' "$*" >> {shlex.quote(str(self.daemon_capture))}\n'
+            'case " $* " in *" config validate "*) exit 0 ;; esac\n'
+            f"if [ -e {shlex.quote(str(self.daemon_hold))} ]; then\n"
+            f"    : > {shlex.quote(str(self.daemon_ready))}\n"
+            f"    while [ ! -e {shlex.quote(str(self.daemon_release))} ]; do /bin/sleep 0.05; done\n"
+            "fi\n"
+            "exit 0\n",
+            encoding="utf-8",
+        )
+        core.chmod(0o755)
+        if os.getuid() == 0:
+            os.chown(core, self.drop_uid, self.drop_gid)
+
+    def _daemon_ctl(self, *arguments: str, timeout: int = 30) -> subprocess.CompletedProcess[str]:
+        return self.executable(
+            self.real_target / "bin/sdsync-dsm-api", "--ctl", *arguments,
+            "--home", str(self.fhs / "home"), "--var", str(self.fhs / "var"),
+            timeout=timeout,
+        )
+
+    def _daemon_records(self) -> dict[str, bool]:
+        run = self.real_var / "run"
+        return {name: (run / name).exists() for name in ("daemon.pid", "daemon.ready", "ctl.sock")}
+
+    def _start_daemon(self) -> subprocess.CompletedProcess[str]:
+        started = self.shell(
+            self.lifecycle, "start", extra_environment=self.DAEMON_START, timeout=60
+        )
+        self.assertEqual(started.returncode, 0, self.lifecycle_failure_diagnostic(started)
+                         + bounded_file_tail(self.real_var / "log/daemon-stderr.log"))
+        return started
+
+    def _wait_for(self, predicate: Callable[[], bool], message: str, timeout: float = 20.0) -> None:
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if predicate():
+                return
+            time.sleep(0.05)
+        self.fail(message)
+
+    def test_daemon_engine_start_status_stop_and_the_hooks(self) -> None:
+        self._daemon_engine(None)
+        started = self._start_daemon()
+        self.assertIn("the sync daemon started as PID", started.stdout)
+        self.assertEqual(self.shell(self.lifecycle, "status").returncode, 0)
+        self.assertEqual(
+            self._daemon_records(), {"daemon.pid": True, "daemon.ready": True, "ctl.sock": True}
+        )
+        self.assertFalse((self.real_var / "run/controller.pid").exists())
+        again = self.shell(self.lifecycle, "start", extra_environment=self.DAEMON_START)
+        self.assertEqual(again.returncode, 0, again.stdout + again.stderr)
+        self.assertIn("already running", again.stdout)
+
+        # A running daemon is not a package that may be removed or upgraded.
+        for hook in ("preuninst", "preupgrade"):
+            refused = self.shell(self.lifecycle_dir / hook)
+            self.assertEqual(refused.returncode, 1, f"{hook}: {refused.stdout}{refused.stderr}")
+            self.assertIn("daemon", refused.stdout, hook)
+
+        stopped = self.shell(self.lifecycle, "stop", timeout=60)
+        self.assertEqual(stopped.returncode, 0, stopped.stdout + stopped.stderr)
+        self.assertEqual(self.shell(self.lifecycle, "status").returncode, 3)
+        self.assertEqual(
+            self._daemon_records(), {"daemon.pid": False, "daemon.ready": False, "ctl.sock": False}
+        )
+        activity = (self.real_var / "log/activity.log").read_text(encoding="utf-8")
+        self.assertIn("|service.started|", activity)
+        self.assertIn("|service.stopped|", activity)
+        # Stopped cleanly, the package may be removed: daemon.lock remains, unheld.
+        accepted = self.shell(
+            self.lifecycle_dir / "preuninst", extra_environment={"SYNOPKG_PKG_STATUS": "UNINSTALL"}
+        )
+        self.assertEqual(accepted.returncode, 0, accepted.stdout + accepted.stderr)
+
+    def test_daemon_engine_stop_signals_a_daemon_that_does_not_answer(self) -> None:
+        self._daemon_engine("daemon\n")
+        self._start_daemon()
+        ready = (self.real_var / "run/daemon.ready").read_text(encoding="ascii").split()
+        daemon_pid = int(ready[0])
+        # The control socket is gone: ctl stop cannot reach the daemon.
+        (self.real_var / "run/ctl.sock").unlink()
+        stopped = self.shell(self.lifecycle, "stop", timeout=60)
+        self.assertEqual(stopped.returncode, 0, stopped.stdout + stopped.stderr)
+        self.assertIn(f"the daemon (PID {daemon_pid}) did not answer ctl stop", stopped.stdout)
+        self._wait_for(lambda: not Path(f"/proc/{daemon_pid}").exists()
+                       or "Z" in Path(f"/proc/{daemon_pid}/stat").read_text().split(")")[-1][:3],
+                       "the daemon outlived the fallback stop", timeout=10)
+        self.assertEqual(self.shell(self.lifecycle, "status").returncode, 3)
+        self.assertEqual(
+            self._daemon_records(), {"daemon.pid": False, "daemon.ready": False, "ctl.sock": False}
+        )
+
+    def test_daemon_engine_runs_on_a_realtime_change_and_names_a_bogus_engine_file(self) -> None:
+        self._daemon_engine("bogus\n")
+        configured = self.configure("watched", self.source_one, "/home/Drive/Watched", True)
+        self.assertEqual(configured.returncode, 0, configured.stderr)
+        stored = self.shell(self.manager, "set-password", "watched", input_text="test-password\n")
+        self.assertEqual(stored.returncode, 0, stored.stderr)
+        routine = self.shell(
+            self.manager, "configure-routine", "--profile", "watched", "--enabled", "true",
+            "--action", "sync", "--mode", "realtime", "--debounce-seconds", "1",
+        )
+        self.assertEqual(routine.returncode, 0, routine.stderr)
+        started = self._start_daemon()
+        self.assertIn("is not used", started.stdout)
+        events = [
+            json.loads(line)
+            for line in (self.real_var / "log/controller.log").read_text(encoding="utf-8").splitlines()
+            if '"service_engine_invalid"' in line
+        ]
+        self.assertEqual(len(events), 1, events)
+        self.assertEqual(events[0]["level"], "warn")
+        self.assertIn("state/engine", events[0]["detail"])
+        self.assertIn("bogus", events[0]["detail"])
+        self.assertEqual(self.shell(self.lifecycle, "status").returncode, 0)
+
+        changed = self.source_one / "inbox"
+        changed.mkdir()
+        deadline = time.monotonic() + 45
+        scoped: list[str] = []
+        while time.monotonic() < deadline and not scoped:
+            (changed / "note.txt").write_text(f"{time.monotonic()}\n", encoding="utf-8")
+            for _ in range(40):
+                time.sleep(0.1)
+                if self.daemon_capture.exists():
+                    scoped = [
+                        line for line in self.daemon_capture.read_text(encoding="utf-8").splitlines()
+                        if " sync " in f" {line} " and "--profile watched" in line and "--scope" in line
+                    ]
+                    if scoped:
+                        break
+        self.assertTrue(
+            scoped,
+            "a realtime change did not reach the core with --scope: "
+            + (self.daemon_capture.read_text(encoding="utf-8") if self.daemon_capture.exists() else "(core never ran)")
+            + bounded_file_tail(self.real_var / "log/controller.log"),
+        )
+        stopped = self.shell(self.lifecycle, "stop", timeout=60)
+        self.assertEqual(stopped.returncode, 0, stopped.stdout + stopped.stderr)
+
+    def test_daemon_engine_saves_beside_a_held_run_and_publishes_its_scope(self) -> None:
+        self._daemon_engine(None)
+        for name, source, default in (
+            ("held", self.source_one, True),
+            ("other", self.source_two, False),
+        ):
+            configured = self.configure(name, source, f"/home/Drive/{name}", default)
+            self.assertEqual(configured.returncode, 0, configured.stderr)
+            stored = self.shell(self.manager, "set-password", name, input_text="test-password\n")
+            self.assertEqual(stored.returncode, 0, stored.stderr)
+        self._start_daemon()
+        run = self.real_var / "run"
+        scope = run / "run.scope"
+        self.daemon_hold.write_text("hold\n", encoding="utf-8")
+        try:
+            requested = self._daemon_ctl("run", "scope=held")
+            self.assertEqual(requested.returncode, 0, requested.stdout + requested.stderr)
+            self.wait_for_path(self.daemon_ready, "the held core did not start", timeout=20)
+            self._wait_for(scope.exists, "the daemon did not publish run.scope")
+
+            # The writer the shell reader trusts: a package-owned 0600 regular
+            # file whose first three lines are run.lock/pid's, then the profiles.
+            metadata = os.lstat(scope)
+            self.assertTrue(stat.S_ISREG(metadata.st_mode))
+            self.assertEqual(stat.S_IMODE(metadata.st_mode), 0o600)
+            self.assertEqual(metadata.st_uid, self.drop_uid)
+            self.assertEqual(metadata.st_nlink, 1)
+            lines = scope.read_text(encoding="ascii").splitlines()
+            owner = (run / "run.lock/pid").read_text(encoding="ascii").splitlines()
+            self.assertEqual(lines[:3], owner)
+            self.assertEqual(lines[3:], ["profiles=held"])
+
+            # Another profile: saved during the run, promptly, with nothing refused.
+            began = time.monotonic()
+            other = self.configure("other", self.source_two, "/home/Drive/Moved")
+            self.assertLess(time.monotonic() - began, 5, "a save waited for the run")
+            self.assertEqual(other.returncode, 0, other.stderr)
+            self.assertNotIn("run.scope ignored", other.stderr)
+            self.assertNotIn("planning/syncing", other.stderr)
+            self.assertNotIn("note:", other.stderr)
+            # The same through the daemon, which runs the manager itself.
+            began = time.monotonic()
+            through = self._daemon_ctl(
+                "mutate", "op=configure-profile", "profile=other",
+                "args=--name,other,--source," + str(self.source_two)
+                + ",--url,https://files.example.test/proxy/,--username,other-bot,--remote,/home/Drive/Again",
+            )
+            self.assertLess(time.monotonic() - began, 5, "a save through the daemon waited for the run")
+            self.assertEqual(through.returncode, 0, through.stdout + through.stderr)
+            self.assertIn(
+                'remote = "/home/Drive/Again"',
+                (self.real_home / "config/profiles.d/other.toml").read_text(encoding="utf-8"),
+            )
+
+            base = [
+                "configure-profile", "--name", "held", "--source", str(self.source_one),
+                "--url", "https://files.example.test/proxy/", "--username", "held-bot",
+                "--remote", "/home/Drive/held",
+            ]
+            tuned = self.shell(self.manager, *base, "--jobs", "4")
+            self.assertEqual(tuned.returncode, 0, tuned.stderr)
+            self.assertEqual(
+                tuned.stderr.strip().splitlines()[-1],
+                "note: profile held is syncing now; this change takes effect on its next run",
+            )
+            moved = self.shell(self.manager, *[
+                str(self.source_two) if value == str(self.source_one) else value for value in base
+            ])
+            self.assertEqual(moved.returncode, 75, moved.stderr)
+            self.assertEqual(len(moved.stderr.strip().splitlines()), 1, moved.stderr)
+            self.assertTrue(moved.stderr.startswith("profile_running: profile held "), moved.stderr)
+            self.assertIn("source", moved.stderr)
+            removed = self.shell(self.manager, "remove-profile", "held")
+            self.assertEqual(removed.returncode, 75, removed.stderr)
+            self.assertEqual(len(removed.stderr.strip().splitlines()), 1, removed.stderr)
+            self.assertTrue(removed.stderr.startswith("profile_running: profile held "), removed.stderr)
+            refused = self._daemon_ctl("mutate", "op=remove-profile", "profile=held", "args=held")
+            self.assertEqual(refused.returncode, 75, refused.stdout + refused.stderr)
+            self.assertIn("profile_running", refused.stdout)
+            enabled = self.shell(self.manager, "enable", "--interval", "600")
+            self.assertEqual(enabled.returncode, 0, enabled.stderr)
+            self.assertEqual(
+                enabled.stderr.strip().splitlines()[-1],
+                "note: a sync is running; this change takes effect on the next run",
+            )
+            result, payload = self.api(
+                "schedule", "--enabled", "false", "--interval", "900",
+                "--allow-delete", "false", "--max-total-delete", "100",
+            )
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertEqual(payload["warning_code"], "applies_next_run", payload)
+
+            # A scope that does not name the run.lock owner is not trusted.
+            genuine = scope.read_bytes()
+            forged = lines[:]
+            forged[1] = str(int(forged[1]) + 1)
+            staged = run / ".run.scope.forged"
+            staged.write_text("\n".join(forged) + "\n", encoding="ascii")
+            staged.chmod(0o600)
+            staged.replace(scope)
+            try:
+                distrusted = self.configure("other", self.source_two, "/home/Drive/Forged")
+                self.assertEqual(distrusted.returncode, 75, distrusted.stderr)
+                stderr_lines = distrusted.stderr.strip().splitlines()
+                self.assertEqual(
+                    [line for line in stderr_lines if line.startswith("run.scope ignored: ")],
+                    [stderr_lines[0]],
+                )
+                self.assertIn("does not name the run.lock owner", stderr_lines[0])
+                self.assertIn("planning/syncing", stderr_lines[-1])
+            finally:
+                staged.write_bytes(genuine)
+                staged.chmod(0o600)
+                staged.replace(scope)
+        finally:
+            self.daemon_release.write_text("release\n", encoding="utf-8")
+        self._wait_for(
+            lambda: not scope.exists() and not (run / "run.lock").exists(),
+            "the finished run left run.lock or run.scope behind",
+        )
+        stopped = self.shell(self.lifecycle, "stop", timeout=60)
+        self.assertEqual(stopped.returncode, 0, stopped.stdout + stopped.stderr)
+
+    def test_stop_after_an_engine_switch_stops_the_shell_services_too(self) -> None:
+        self._daemon_engine("shell\n")
+        started = self.shell(self.lifecycle, "start", timeout=30)
+        self.assertEqual(started.returncode, 0, self.lifecycle_failure_diagnostic(started))
+        controller_pid = (self.real_var / "run/controller.pid").read_text(encoding="ascii").strip()
+        # Switched to the daemon while the shell services run: status still
+        # reports them, and stop stops them.
+        self.set_engine(None)
+        self.assertEqual(self.shell(self.lifecycle, "status").returncode, 0)
+        stopped = self.shell(self.lifecycle, "stop", timeout=60)
+        self.assertEqual(stopped.returncode, 0, stopped.stdout + stopped.stderr)
+        self.assertFalse((self.real_var / "run/controller.pid").exists())
+        self.assertFalse(Path(f"/proc/{controller_pid}").exists()
+                         and "Z" not in Path(f"/proc/{controller_pid}/stat").read_text().split(")")[-1][:3])
+        self.assertEqual(self.shell(self.lifecycle, "status").returncode, 3)
+
+    def test_the_shell_engine_says_it_does_not_apply_lasting_blocks(self) -> None:
+        lasting = self.real_var / "state/lasting"
+        lasting.mkdir(mode=0o700)
+        for name in ("alpha", "beta"):
+            (lasting / f"{name}.state").write_text("reason=core_oom_killed\n", encoding="utf-8")
+        if os.getuid() == 0:
+            for path in (lasting, *lasting.iterdir()):
+                os.chown(path, self.drop_uid, self.drop_gid)
+        started = self.shell(self.lifecycle, "start", timeout=30)
+        self.assertEqual(started.returncode, 0, self.lifecycle_failure_diagnostic(started))
+        self.assertIn(
+            "lasting blocks are not applied by the shell engine (2 profiles held under the daemon)",
+            started.stdout,
+        )
+        events = [
+            json.loads(line)
+            for line in (self.real_var / "log/controller.log").read_text(encoding="utf-8").splitlines()
+            if '"lasting_blocks_not_applied"' in line
+        ]
+        self.assertEqual(len(events), 1, events)
+        self.assertEqual(events[0]["level"], "warn")
+        self.assertIn("profiles=2", events[0]["detail"])
+
+    def test_hooks_refuse_a_daemon_that_holds_its_lock_or_left_records(self) -> None:
+        run = self.real_var / "run"
+        lock = run / "daemon.lock"
+        lock.write_text("", encoding="utf-8")
+        lock.chmod(0o600)
+        with lock.open("r") as held:
+            fcntl.flock(held, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            for hook in ("preuninst", "preupgrade"):
+                refused = self.shell(self.lifecycle_dir / hook)
+                self.assertEqual(refused.returncode, 1, f"{hook}: {refused.stdout}{refused.stderr}")
+                self.assertIn(f"the sync daemon is still running (it holds {self.fhs / 'var/run/daemon.lock'})",
+                              refused.stdout, hook)
+        for record in ("daemon.ready", "daemon.pid", "ctl.sock"):
+            (run / record).write_text("1\n", encoding="utf-8")
+            for hook in ("preuninst", "preupgrade"):
+                refused = self.shell(self.lifecycle_dir / hook)
+                self.assertEqual(refused.returncode, 1, f"{hook}: {refused.stdout}{refused.stderr}")
+                self.assertIn(f"not fully stopped: {self.fhs / 'var/run' / record}", refused.stdout, hook)
+            (run / record).unlink()
+
+    def test_postupgrade_removes_shell_leftovers_only_under_the_daemon_engine(self) -> None:
+        leftovers = [
+            self.real_var / "state/controller-reload.pending",
+            self.real_var / "run/watch-alpha.pid",
+            self.real_var / "run/watch-alpha.failed",
+            self.real_var / "run/poll-alpha.result",
+            self.real_var / "run/fingerprint.123.1",
+        ]
+        kept = self.real_var / "state/controller.state"
+
+        def plant() -> None:
+            for path in [*leftovers, kept]:
+                path.write_text("x\n", encoding="utf-8")
+                path.chmod(0o600)
+                if os.getuid() == 0:
+                    os.chown(path, self.drop_uid, self.drop_gid)
+
+        plant()
+        under_shell = self.shell(self.lifecycle_dir / "postupgrade")
+        self.assertEqual(under_shell.returncode, 0, under_shell.stdout + under_shell.stderr)
+        for path in [*leftovers, kept]:
+            self.assertTrue(path.exists(), path)
+        self.set_engine(None)
+        under_daemon = self.shell(self.lifecycle_dir / "postupgrade")
+        self.assertEqual(under_daemon.returncode, 0, under_daemon.stdout + under_daemon.stderr)
+        for path in leftovers:
+            self.assertFalse(path.exists(), path)
+        self.assertTrue(kept.exists())
+
+    def _fake_ctl(self, **replies: tuple[int, str]) -> Path:
+        """Script the mock bridge's --ctl: verb -> (exit status, reply line)."""
+        fake = self.root / "fake-ctl"
+        fake.mkdir(exist_ok=True)
+        for verb, (status, reply) in replies.items():
+            (fake / f"{verb}.exit").write_text(f"{status}\n", encoding="utf-8")
+            (fake / f"{verb}.reply").write_text(reply + "\n", encoding="utf-8")
+        self.environment["SDSYNC_TEST_FAKE_CTL"] = str(fake)
+        return fake
+
+    def _ctl_calls(self, fake: Path) -> list[str]:
+        calls = fake / "calls"
+        return calls.read_text(encoding="utf-8").splitlines() if calls.exists() else []
+
+    def test_plan_and_run_forward_to_the_daemon_under_the_daemon_engine(self) -> None:
+        # Under the daemon engine a plan or run is the daemon's to execute: one
+        # run slot, its watchdog, one owner of run.lock. The shell runner would
+        # run the core beside it.
+        self.assertEqual(
+            self.configure("personal", self.source_one, "/home/Drive/Test", True).returncode, 0
+        )
+        self.set_engine(None)
+        fake = self._fake_ctl(
+            ping=(0, '{"ok":true}'),
+            run=(0, '{"ok":true,"id":7,"position":1}'),
+        )
+        audit_log = self.real_var / "log/audit.log"
+        before = len(audit_log.read_text(encoding="utf-8").splitlines())
+        ran = self.shell(self.manager, "run", "personal")
+        self.assertEqual(ran.returncode, 0, ran.stdout + ran.stderr)
+        self.assertIn("queued as run 7", ran.stdout)
+        planned = self.shell(self.manager, "plan", "--all", "--allow-delete", "--max-total-delete", "40")
+        self.assertEqual(planned.returncode, 0, planned.stdout + planned.stderr)
+        calls = self._ctl_calls(fake)
+        runs = [call for call in calls if call.startswith("run ")]
+        self.assertEqual(len(runs), 2, calls)
+        self.assertIn("scope=personal action=sync allow_delete=false", runs[0])
+        self.assertNotIn("max_total_delete", runs[0])
+        self.assertIn("scope=all action=plan allow_delete=true max_total_delete=40", runs[1])
+        for call in runs:
+            self.assertIn(f"--home {self.fhs / 'home'} --var {self.fhs / 'var'}", call)
+        # Nothing ran here: no core, no run lock of this process.
+        self.assertFalse(self.capture.exists() and " sync " in self.capture.read_text(encoding="utf-8"))
+        self.assertFalse((self.real_var / "run/run.lock").exists())
+        records = [
+            json.loads(line)
+            for line in audit_log.read_text(encoding="utf-8").splitlines()[before:]
+            if line
+        ]
+        self.assertEqual(
+            [(r["operation"], r["profile"], r["state"]) for r in records],
+            [("run", "personal", "requested"), ("run", "personal", "succeeded"),
+             ("plan", "all", "requested"), ("plan", "all", "succeeded")],
+        )
+
+        result, payload = self.api("action", "--kind", "run", "--scope", "personal")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIs(payload["ok"], True, payload)
+        self.assertEqual(payload["message"], "run queued", payload)
+        self.assertIn("queued as run 7", payload["output"])
+
+        # A refusal keeps its code and its busy shape.
+        self._fake_ctl(run=(1, '{"ok":false,"code":"stopping","detail":"the service is stopping and takes no new work"}'))
+        refused = self.shell(self.manager, "run", "personal")
+        self.assertEqual(refused.returncode, 75, refused.stdout + refused.stderr)
+        self.assertIn("stopping", refused.stderr)
+        result, payload = self.api("action", "--kind", "plan", "--scope", "personal")
+        self.assertEqual(result.returncode, 75, result.stdout + result.stderr)
+        self.assertEqual(payload["code"], "busy", payload)
+        self.assertIn("stopping", payload["output"])
+        self._fake_ctl(run=(1, '{"ok":false,"code":"scope_not_found","detail":"no profile has that name"}'))
+        missing = self.shell(self.manager, "run", "personal")
+        self.assertEqual(missing.returncode, 66, missing.stdout + missing.stderr)
+        self.assertIn("scope_not_found", missing.stderr)
+
+    def test_plan_and_run_refuse_when_the_daemon_engine_does_not_answer(self) -> None:
+        self.assertEqual(
+            self.configure("personal", self.source_one, "/home/Drive/Test", True).returncode, 0
+        )
+        self.set_engine("daemon\n")
+        fake = self._fake_ctl(
+            ping=(69, '{"ok":false,"code":"daemon_unreachable","detail":"connection refused"}'),
+        )
+        refused = self.shell(self.manager, "run", "personal")
+        self.assertEqual(refused.returncode, 75, refused.stdout + refused.stderr)
+        self.assertIn("the sync service is not running", refused.stderr)
+        self.assertEqual([call.split()[0] for call in self._ctl_calls(fake)], ["ping"])
+        self.assertFalse(self.capture.exists() and " sync " in self.capture.read_text(encoding="utf-8"))
+        result, payload = self.api("action", "--kind", "run", "--scope", "personal")
+        self.assertEqual(result.returncode, 75, result.stdout + result.stderr)
+        self.assertEqual(payload["code"], "busy", payload)
+        self.assertIn("the sync service is not running", payload["output"])
+
+    def test_plan_and_run_under_the_shell_engine_never_ask_the_daemon(self) -> None:
+        self.assertEqual(
+            self.configure("personal", self.source_one, "/home/Drive/Test", True).returncode, 0
+        )
+        fake = self._fake_ctl(ping=(0, '{"ok":true}'), run=(0, '{"ok":true,"id":1,"position":1}'))
+        planned = self.shell(self.manager, "plan", "personal")
+        # The shell runner answers, as it always did (here: no service, no admission).
+        self.assertNotIn("queued as run", planned.stdout)
+        self.assertEqual(self._ctl_calls(fake), [])
 
     def test_a_run_records_completion_only_for_the_profiles_it_covered(self) -> None:
         # The runner's own contract, tested on its own terms.
@@ -23328,7 +23918,12 @@ fi
         write_clock(clock, "700061\n")
         self.ctl_wait(pid_file.exists, "the core to start")
         core_pid = int(pid_file.read_text(encoding="utf-8").strip())
-        stopped = self.shell(self.lifecycle, "stop", timeout=150)
+        # The core takes 6 s to honour its cancel; the suite's 10 s stop budget
+        # left 4 s for everything else and ran out on a loaded runner.
+        stopped = self.shell(
+            self.lifecycle, "stop", timeout=150,
+            extra_environment={"SDSYNC_DSM_STOP_TIMEOUT": "30"},
+        )
         self.assertEqual(stopped.returncode, 0, stopped.stdout + stopped.stderr)
         self.assertTrue(term_seen.exists(), "the core was never asked to cancel")
         with self.assertRaises(ProcessLookupError):
@@ -25135,6 +25730,9 @@ SHARD_WEIGHTS = {
     "RuntimeTests.test_controller_dependency_deferral_then_success_and_retry_backoff": 21,
     "RuntimeTests.test_controller_interval_and_realtime_polling_fallback_trigger": 31,
     "RuntimeTests.test_controller_names_why_it_exited_and_why_a_launch_failed": 37,
+    "RuntimeTests.test_daemon_engine_runs_on_a_realtime_change_and_names_a_bogus_engine_file": 22,
+    "RuntimeTests.test_daemon_engine_saves_beside_a_held_run_and_publishes_its_scope": 24,
+    "RuntimeTests.test_daemon_engine_start_status_stop_and_the_hooks": 12,
     "RuntimeTests.test_daylight_saving_never_repeats_or_skips_a_window_day": 30,
     "RuntimeTests.test_ladder_exhaustion_escalation_honours_the_alert_cooldown": 40,
     "RuntimeTests.test_realtime_change_stays_pending_until_a_sync_of_it_succeeds": 22,
@@ -25144,6 +25742,7 @@ SHARD_WEIGHTS = {
     "RuntimeTests.test_runner_enforces_saved_risk_ceilings_and_rejects_dangling_policy": 21,
     "RuntimeTests.test_runner_records_an_operator_stop_without_alerting_or_counting_a_failure": 35,
     "RuntimeTests.test_saved_security_policy_applies_to_direct_cli_with_recovery_exception": 31,
+    "RuntimeTests.test_stop_after_an_engine_switch_stops_the_shell_services_too": 13,
     "RuntimeTests.test_stopped_service_allows_only_complete_security_policy_recovery": 27,
 }
 DEFAULT_SHARD_WEIGHT = 9

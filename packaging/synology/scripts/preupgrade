@@ -20,12 +20,29 @@ if [ -e "$management_lock" ] || [ -L "$management_lock" ]; then
     exit 1
 fi
 
+# The daemon engine: a process holding daemon.lock is a running daemon, and
+# any record a clean daemon stop removes is a topology that is not stopped.
+daemon_held_status=0
+daemon_lock_held_status || daemon_held_status=$?
+case $daemon_held_status in
+    0)
+        package_message "the sync daemon is still running (it holds $daemon_lock_file)"
+        exit 1
+        ;;
+    2)
+        if command -v flock >/dev/null 2>&1; then
+            package_message "the sync daemon lock cannot be checked: $daemon_lock_file"
+            exit 1
+        fi
+        ;;
+esac
 controller_start_file=$runtime_root/controller.starting
 failed_start_api_file=$runtime_root/failed-start.api
 failed_start_controller_file=$runtime_root/failed-start.controller
 for transition_artifact in "$controller_pid_file" "$controller_ready_file" \
     "$controller_start_file" "$controller_lock" "$api_pid_file" "$api_bound_file" \
-    "$api_ready_file" "$api_socket" "$failed_start_api_file" "$failed_start_controller_file"
+    "$api_ready_file" "$api_socket" "$failed_start_api_file" "$failed_start_controller_file" \
+    "$daemon_socket" "$daemon_ready_file" "$daemon_pid_file"
 do
     if [ -e "$transition_artifact" ] || [ -L "$transition_artifact" ]; then
         package_message "package service topology is not fully stopped: $transition_artifact"

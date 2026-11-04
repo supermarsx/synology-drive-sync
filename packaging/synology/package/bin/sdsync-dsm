@@ -476,7 +476,7 @@ begin_admitted() {
             configure-profile|remove-profile|set-default|configure-routine|remove-routine|\
             set-password|set-totp|set-remote-log-token|remove-password|remove-totp|\
             remove-remote-log-token|enable|disable|set-schedule|configure-alerts|\
-            configure-performance|configure-security-policy|doctor|resync)
+            configure-performance|configure-security-policy|doctor|resync|plan|run)
                 case $command_name in
                     configure-routine) direct_audit_operation=routine ;;
                     set-schedule|enable|disable) direct_audit_operation=schedule ;;
@@ -518,6 +518,14 @@ begin_admitted() {
                             *) valid_name "$resolved_doctor_audit_scope" && direct_audit_profile=$resolved_doctor_audit_scope ;;
                         esac
                         ;;
+                    plan|run)
+                        # Only under the daemon engine (forward_run_to_daemon);
+                        # the shell runner audits its own runs.
+                        case ${selected_scope:-} in
+                            all) direct_audit_profile=all ;;
+                            *) valid_name "${selected_scope:-}" && direct_audit_profile=$selected_scope ;;
+                        esac
+                        ;;
                     resync)
                         # It was outside this list, so mark_mutation_commit_started
                         # found no audit pending and every resync, plan or
@@ -554,6 +562,7 @@ begin_admitted() {
         73) echo "security policy is not a private complete document" >&2; exit 73 ;;
         *) echo "operation is disabled by the current security policy" >&2; exit 77 ;;
     esac
+    case ${command_name:-} in plan|run) return 0 ;; esac
     opposing_run_status=0
     private_process_lock_is_live "$run_lock" || opposing_run_status=$?
     if [ "$opposing_run_status" -eq 0 ]; then
@@ -1418,6 +1427,66 @@ remove_profile_leftovers() {
         leftover_error=$(rm -f -- "$leftover_path" 2>&1) && continue
         echo "warning: $leftover_path was not removed: $(one_safe_line "${leftover_error:-rm failed}")" >&2
     done
+}
+
+# The engine the lifecycle runs, by its grammar (scripts/common
+# resolve_service_engine): absent or `daemon` is the daemon, `shell` the shell
+# engine, anything else the daemon, named on stderr.
+manager_service_engine() {
+    manager_engine=daemon
+    manager_engine_file=$state_root/engine
+    [ -e "$manager_engine_file" ] || [ -L "$manager_engine_file" ] || return 0
+    manager_engine_size=
+    manager_engine_text=
+    if [ -f "$manager_engine_file" ] && [ ! -L "$manager_engine_file" ]; then
+        manager_engine_size=$(wc -c 2>/dev/null < "$manager_engine_file" | tr -d ' ')
+        manager_engine_text=$(head -c 64 "$manager_engine_file" 2>/dev/null) || manager_engine_text=
+    fi
+    case $manager_engine_text:$manager_engine_size in
+        daemon:6|daemon:7) ;;
+        shell:5|shell:6) manager_engine=shell ;;
+        *) echo "warning: $manager_engine_file is not daemon or shell; the daemon engine runs" >&2 ;;
+    esac
+}
+
+# Under the daemon engine a plan or run is the daemon's to execute: one run
+# slot, its watchdog, one owner of run.lock. The shell runner would run the
+# core beside it, so it is never the fallback: a daemon that does not answer
+# is a refusal that says so. The request is audited here (the runner audited
+# its own); the run's outcome arrives through run.state and Activity.
+forward_run_to_daemon() {
+    begin_operation "$@"
+    [ "$security_runtime_allow_operational_actions" = true ] \
+        || policy_denied "security policy blocks interactive doctor, plan, and run actions"
+    if ! "$api_bridge" --ctl ping --home "$package_home" --var "$package_var" >/dev/null 2>&1; then
+        echo "the sync service is not running: the daemon engine runs plans and runs, and it does not answer; start the package" >&2
+        exit 75
+    fi
+    set -- "$api_bridge" --ctl run "scope=$selected_scope" "action=$run_mode" \
+        "allow_delete=$allow_selected_delete"
+    [ "$selected_scope" != all ] || set -- "$@" "max_total_delete=$selected_max_total"
+    set -- "$@" --home "$package_home" --var "$package_var"
+    mark_mutation_commit_started || die "mandatory audit execution phase could not be recorded"
+    forward_status=0
+    forward_reply=$("$@" 2>&1) || forward_status=$?
+    forward_reply_line=$(one_safe_line "$forward_reply")
+    forward_id=$(printf '%s\n' "$forward_reply" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p' | sed -n '1p')
+    if [ "$forward_status" -eq 0 ] && [ -n "$forward_id" ]; then
+        echo "queued as run $forward_id: $command_name of $selected_scope; its outcome is recorded in run.state and Activity"
+        end_mutation succeeded
+        exit 0
+    fi
+    forward_code=$(printf '%s\n' "$forward_reply" | sed -n 's/.*"code":"\([a-z_]*\)".*/\1/p' | sed -n '1p')
+    case $forward_status:$forward_code in
+        69:*) forward_exit=75; forward_cause="the sync service is not running (it stopped answering)" ;;
+        75:*|*:stopping|*:busy|*:profile_running) forward_exit=75; forward_cause=${forward_code:-busy} ;;
+        *:scope_not_found) forward_exit=66; forward_cause=$forward_code ;;
+        0:*) forward_exit=73; forward_cause="the sync service accepted the request without naming its run" ;;
+        *) forward_exit=1; forward_cause=${forward_code:-refused} ;;
+    esac
+    echo "the sync service did not queue the $command_name of $selected_scope: $forward_cause${forward_reply_line:+ ($forward_reply_line)}" >&2
+    end_mutation failed
+    exit "$forward_exit"
 }
 
 read_secret_input() {
@@ -4788,8 +4857,21 @@ api_set_secret() {
     api_secret_boolean "$secret_root/$secret_profile.password"; result_password=$secret_boolean
     api_secret_boolean "$secret_root/$secret_profile.totp"; result_totp=$secret_boolean
     api_secret_boolean "$secret_root/$secret_profile.remote-log-token"; result_remote_token=$secret_boolean
-    printf '{"schema":"sdsync.dsm-result.v1","ok":true,"message":"secret state updated","has_password":%s,"has_totp":%s,"has_remote_log_token":%s}\n' \
-        "$result_password" "$result_totp" "$result_remote_token"
+    # The fixed secret document used to drop what the save said beside it: a
+    # credential stored during a sync read as already in use, and a warning
+    # (a pending terminal audit, a controller not reloaded) vanished. Both ride
+    # as `warnings`, the list form only.
+    secret_warnings=
+    if [ -n "${api_warning_code:-}" ]; then
+        [ -n "${api_warning:-}" ] || api_warning="The change was saved, but its warning could not be shown; see the package logs"
+        secret_warnings="{\"code\":$(json_quote "$api_warning_code"),\"message\":$(json_quote "$api_warning")}"
+    fi
+    if [ -n "${api_note:-}" ]; then
+        secret_warnings="${secret_warnings:+$secret_warnings,}{\"code\":\"applies_next_run\",\"message\":$(json_quote "$api_note")}"
+    fi
+    printf '{"schema":"sdsync.dsm-result.v1","ok":true,"message":"secret state updated","has_password":%s,"has_totp":%s,"has_remote_log_token":%s%s}\n' \
+        "$result_password" "$result_totp" "$result_remote_token" \
+        "${secret_warnings:+,\"warnings\":[$secret_warnings]}"
 }
 
 api_client_event() {
@@ -4917,8 +4999,13 @@ api_action() {
     api_capture false "$@"
     if [ "$api_exit" -eq 0 ]; then
         [ -n "$api_output" ] || api_output="$action_kind completed"
+        # Under the daemon engine the manager hands a plan or run to the
+        # daemon and returns once it is queued; the outcome arrives through
+        # run.state and Activity like any other run.
+        action_message="$action_kind completed"
+        case $api_output in "queued as run "*) action_message="$action_kind queued" ;; esac
         printf '{"schema":"sdsync.dsm-result.v1","ok":true,"message":%s,"status":"succeeded","exit_code":0,"scope":%s,"output":%s}\n' \
-            "$(json_quote "$action_kind completed")" "$(json_quote "$action_scope")" "$(json_quote "$api_output")"
+            "$(json_quote "$action_message")" "$(json_quote "$action_scope")" "$(json_quote "$api_output")"
     else
         api_map_exit_code "$api_exit"
         [ -n "$api_output" ] || api_output="$action_kind failed"
@@ -5311,6 +5398,8 @@ case $command_name in
         else
             runner_max_total=-
         fi
+        manager_service_engine
+        [ "$manager_engine" = shell ] || forward_run_to_daemon "$@"
         exec "$runner" "$run_mode" "$selected_scope" "$allow_selected_delete" foreground "$runner_max_total"
         ;;
     enable)
