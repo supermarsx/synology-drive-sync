@@ -484,6 +484,44 @@ mod tests {
         listener
     }
 
+    /// Close `listener` the way a server's death does, in a process that is
+    /// forking: another test's `Command::spawn` that forked while the socket was
+    /// open holds a copy of the listening descriptor until its child execs
+    /// (close-on-exec closes it then), and while any copy lives the kernel still
+    /// accepts connections on the path. That window is what made
+    /// `a_prepared_socket_left_by_a_dead_server_is_removed_by_name` fail one run
+    /// in a few hundred under load ("a server accepts on it"). The straggler is
+    /// that copy, held for `holds`.
+    ///
+    /// Returns once nothing accepts on `socket` any more (bounded, and failing
+    /// by name when it never happens): the scenario's precondition, "a server
+    /// that is gone", is made true here rather than assumed.
+    fn drop_listener_leaving_a_straggler(socket: &Path, listener: UnixListener, holds: Duration) {
+        let straggler = listener.try_clone().unwrap();
+        drop(listener);
+        thread::spawn(move || {
+            thread::sleep(holds);
+            drop(straggler);
+        });
+        let deadline = Instant::now() + holds + Duration::from_secs(10);
+        loop {
+            match UnixStream::connect(socket) {
+                Err(error) if error.kind() == io::ErrorKind::ConnectionRefused => return,
+                Err(error) => panic!(
+                    "{}: waiting for the listener to go: {error}",
+                    socket.display()
+                ),
+                Ok(_) => assert!(
+                    Instant::now() < deadline,
+                    "{} still accepts connections {:?} after its listener was dropped",
+                    socket.display(),
+                    holds + Duration::from_secs(10)
+                ),
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
     /// A server that dies before it binds fails the start with its own words.
     #[test]
     fn a_server_that_dies_before_binding_fails_the_start_by_name() {
@@ -634,7 +672,7 @@ mod tests {
             events.lock().unwrap()
         );
         // 0600 and refused: stale too.
-        drop(activate(&socket));
+        drop_listener_leaving_a_straggler(&socket, activate(&socket), Duration::from_millis(400));
         keeper.clear_stale_socket();
         assert!(!socket.exists(), "{:?}", events.lock().unwrap());
         // 0000 while api.pid names a live shell-engine server: kept, named.
