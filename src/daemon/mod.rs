@@ -10,6 +10,8 @@
 #![deny(clippy::unwrap_used, clippy::expect_used)]
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
+#[cfg(target_os = "linux")]
+pub(crate) mod api_server;
 pub(crate) mod changes;
 pub(crate) mod control;
 #[cfg(target_os = "linux")]

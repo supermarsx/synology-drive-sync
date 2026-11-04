@@ -49,6 +49,9 @@ pub(crate) struct Options {
     /// Watchdog and stop timings (`--stall-warn-seconds`, `--stall-kill-seconds`,
     /// `--cancel-grace-seconds`); the design defaults otherwise.
     pub(crate) timings: executor::Timings,
+    /// `--serve-api`: keep the dashboard's API server (`--serve`, api.sock)
+    /// running as a child; the daemon is not ready until it answers.
+    pub(crate) serve_api: bool,
 }
 
 impl Options {
@@ -60,6 +63,7 @@ impl Options {
             core: PathBuf::from(super::super::BINARY_PATH),
             manager: PathBuf::from(super::super::MANAGER_PATH),
             timings: executor::Timings::default(),
+            serve_api: false,
         };
         let mut rest = Vec::new();
         let mut items = arguments.iter();
@@ -87,6 +91,10 @@ impl Options {
                         seconds(items.next())?.min(Duration::from_secs(110));
                     continue;
                 }
+                "--serve-api" => {
+                    options.serve_api = true;
+                    continue;
+                }
                 _ => {}
             }
             let slot = match text {
@@ -109,7 +117,12 @@ impl Options {
 
     fn forward(&self) -> Vec<OsString> {
         let t = &self.timings;
-        vec![
+        let mut forwarded: Vec<OsString> = if self.serve_api {
+            vec!["--serve-api".into()]
+        } else {
+            Vec::new()
+        };
+        forwarded.extend([
             "--stall-warn-seconds".into(),
             t.stall_warn.as_secs().to_string().into(),
             "--stall-kill-seconds".into(),
@@ -124,7 +137,8 @@ impl Options {
             self.core.clone().into(),
             "--manager".into(),
             self.manager.clone().into(),
-        ]
+        ]);
+        forwarded
     }
 
     fn socket(&self) -> PathBuf {
@@ -446,6 +460,7 @@ pub(crate) fn run_daemon(options: &Options) -> ExitCode {
         },
     );
     let child_env = executor::allowlisted_env(std::env::vars_os());
+    let api_env = child_env.clone();
     let settings = Settings {
         child_env: child_env.clone(),
         timings: options.timings,
@@ -506,11 +521,53 @@ pub(crate) fn run_daemon(options: &Options) -> ExitCode {
         let _ = control.join();
         return ExitCode::from(1);
     }
+    // The dashboard's server first: a daemon whose dashboard cannot answer is
+    // not ready, and `--launch-daemon` (waiting for ctl.sock) says why.
+    let api = if options.serve_api {
+        let api_sink = FileSink::new(&log_root);
+        let log: super::api_server::KeeperLog = Arc::new(move |level, event, detail| {
+            let _ = api_sink.log(
+                epoch().unwrap_or(0),
+                &LogEvent {
+                    level,
+                    category: "controller",
+                    event,
+                    detail,
+                },
+            );
+        });
+        let started = std::env::current_exe()
+            .map_err(|error| format!("cannot find this executable: {error}"))
+            .and_then(|exe| {
+                super::api_server::ApiKeeper::start(
+                    exe,
+                    PathBuf::from(super::super::API_SOCKET_PATH),
+                    api_env.clone(),
+                    log,
+                    Duration::from_secs(15),
+                )
+            });
+        match started {
+            Ok(keeper) => Some(keeper),
+            Err(cause) => {
+                say(&format!("the dashboard API server did not start: {cause}"));
+                let _ = control::ask(&tx, control::Request::Stop, Duration::from_secs(60));
+                let _ = control.join();
+                remove_if_ours(&pid_file);
+                return ExitCode::from(1);
+            }
+        }
+    } else {
+        None
+    };
     let socket = options.socket();
     if let Err(error) = ctl::listen(&socket, uid, tx.clone(), mutation_deadline) {
         say(&format!("cannot serve {}: {error}", socket.display()));
         let _ = control::ask(&tx, control::Request::Stop, Duration::from_secs(60));
         let _ = control.join();
+        if let Some(api) = api {
+            api.stop(Duration::from_secs(5));
+        }
         remove_if_ours(&pid_file);
         return ExitCode::from(1);
     }
@@ -525,6 +582,9 @@ pub(crate) fn run_daemon(options: &Options) -> ExitCode {
     }
     drop(tx);
     let _ = control.join();
+    if let Some(api) = api {
+        api.stop(Duration::from_secs(5));
+    }
     // Clean stop: nothing an older pre-hook checks for is left behind (§3.4).
     for path in [&socket, &ready_file, &pid_file] {
         remove_if_ours(path);
