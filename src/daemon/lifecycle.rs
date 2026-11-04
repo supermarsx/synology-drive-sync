@@ -332,9 +332,20 @@ pub(crate) const SINGLETON_WAIT: Duration = Duration::from_secs(2);
 
 /// [`acquire_singleton`], retried every 100 ms for at most `wait`.
 pub(crate) fn acquire_singleton_within(var: &Path, wait: Duration) -> Result<Option<File>, String> {
+    acquire_lock_file_within(var, "daemon.lock", wait)
+}
+
+/// [`acquire_lock_file`], retried every 100 ms for at most `wait`: the shell's probe holds
+/// `daemon.lock` and `supervisor.lock` for the life of one `flock`, and a process that starts
+/// then is not a second one.
+fn acquire_lock_file_within(
+    var: &Path,
+    name: &str,
+    wait: Duration,
+) -> Result<Option<File>, String> {
     let deadline = Instant::now() + wait;
     loop {
-        match acquire_singleton(var)? {
+        match acquire_lock_file(var, name)? {
             Some(lock) => return Ok(Some(lock)),
             None if Instant::now() >= deadline => return Ok(None),
             None => thread::sleep(Duration::from_millis(100)),
@@ -1438,15 +1449,22 @@ pub(crate) fn run_supervise(options: &Options) -> ExitCode {
     };
     let sink = FileSink::new(&options.var.join("log"));
     // One supervisor per package: a second one (two starts at once) leaves,
-    // named, before it writes anything.
-    let _single = match acquire_lock_file(&options.var, "supervisor.lock") {
+    // named, before it writes anything. A lock held for a moment (the shell's
+    // probe) is waited out, like daemon.lock, so a start that races it is not
+    // mistaken for a second supervisor and leaves no daemon behind.
+    let _single = match acquire_lock_file_within(&options.var, "supervisor.lock", SINGLETON_WAIT) {
         Ok(Some(lock)) => lock,
         Ok(None) => {
+            let cause = format!(
+                "supervisor.lock is still held after {} s by another supervisor; this one leaves",
+                SINGLETON_WAIT.as_secs()
+            );
+            say(&cause);
             log_or_stderr(
                 &sink,
                 Level::Info,
                 "service_superseded",
-                "cause=supervisor.lock is held by another supervisor; this one leaves".into(),
+                format!("cause={cause}"),
             );
             return ExitCode::SUCCESS;
         }

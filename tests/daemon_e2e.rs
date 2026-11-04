@@ -725,6 +725,90 @@ fn a_supervisor_that_gives_up_removes_the_daemon_records() {
     );
 }
 
+/// Hold the flock on `lock` for `seconds` the way the shell's probe does, and return only once it
+/// is held (a `flock -n` of it reports it taken), so a test never races the holder's start.
+fn hold_lock(lock: &Path, seconds: u32) -> Child {
+    private_dir(lock.parent().unwrap());
+    fs::write(lock, b"").unwrap();
+    fs::set_permissions(lock, fs::Permissions::from_mode(0o600)).unwrap();
+    let holder = Command::new("flock")
+        .arg("-x")
+        .arg(lock)
+        .args(["sleep", &seconds.to_string()])
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let probe = Command::new("flock")
+            .arg("-n")
+            .arg(lock)
+            .arg("true")
+            .status()
+            .unwrap();
+        if probe.code() == Some(1) {
+            return holder;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the holder never took {}: the probe exited {probe}",
+            lock.display()
+        );
+        thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// A `supervisor.lock` held for a moment (the shell's probe) must not make a starting supervisor
+/// leave with exit 0 and no daemon: it rides the lock out like the daemon does `daemon.lock`.
+#[test]
+fn a_supervisor_lock_held_for_a_moment_does_not_make_the_supervisor_leave() {
+    let package = Package::new("supervisor-lock-moment");
+    let core = script(&package.p("core"), "exit 0");
+    let holder = hold_lock(&package.p("@appdata/run/supervisor.lock"), 1);
+    let mut supervise = Command::new(DAEMON)
+        .arg("--supervise")
+        .args(["--home".as_ref(), package.p("home").as_os_str()])
+        .args(["--var".as_ref(), package.p("var").as_os_str()])
+        .args(["--core".as_ref(), core.as_os_str()])
+        .env("PATH", "/usr/bin:/bin")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        if package.try_ask(&json!({"verb": "ping"})).is_some() {
+            break;
+        }
+        if let Some(status) = supervise.try_wait().unwrap() {
+            panic!(
+                "the supervisor left ({status}) with no daemon: {}",
+                package.log()
+            );
+        }
+        assert!(
+            Instant::now() < deadline,
+            "no daemon answered: {}",
+            package.log()
+        );
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        !package.log().contains("\"event\":\"service_superseded\""),
+        "a lock held for a moment is not a second supervisor: {}",
+        package.log()
+    );
+    // Stop it as the lifecycle does: TERM the supervisor, which stops its daemon.
+    Command::new("kill")
+        .args(["-TERM", &supervise.id().to_string()])
+        .status()
+        .unwrap();
+    let status = supervise.wait().unwrap();
+    assert!(status.success(), "{status}: {}", package.log());
+    let mut holder = holder;
+    let _ = holder.wait();
+}
+
 /// F4: the shell's `flock -n daemon.lock true` probe holds the lock for a
 /// moment; a daemon starting then waits it out instead of exiting 75.
 #[test]
