@@ -688,6 +688,55 @@ fn a_realtime_change_dispatches_a_scoped_run_after_its_debounce() {
     );
 }
 
+/// N-D5: the change source reports a new cause under the same backend and
+/// reason (the walk deadline growing is exactly that), and it was logged only when
+/// the backend or reason changed, so `walk_deadline_exceeded` never reached the
+/// controller log the UI points at.
+#[test]
+fn a_new_backend_cause_under_the_same_reason_is_logged() {
+    let h = realtime_harness("backend-detail");
+    h.wait_for("arm", Duration::from_secs(5), |h| {
+        armed_generation(h, "docs").is_some()
+    });
+    let report = |detail: &str| {
+        h.tx.send(Msg::Change(ChangeEvent::Backend {
+            routine: "docs".into(),
+            backend: Backend::Polling,
+            reason: BackendReason::WatchSetupFailed,
+            detail: detail.into(),
+        }))
+        .unwrap();
+    };
+    report("arm gave up");
+    report(
+        "arm gave up; walk_deadline_exceeded: the walk gave up after 120s in /x; \
+         next_walk_deadline_seconds=240",
+    );
+    let logged = |h: &Harness, needle: &str| {
+        h.logs()
+            .iter()
+            .any(|l| l.starts_with("routine_backend ") && l.contains(needle))
+    };
+    h.wait_for("the first cause", Duration::from_secs(5), |h| {
+        logged(h, "arm gave up")
+    });
+    h.wait_for("the grown deadline", Duration::from_secs(5), |h| {
+        logged(h, "walk_deadline_exceeded")
+    });
+    let line = h
+        .logs()
+        .into_iter()
+        .find(|l| l.contains("walk_deadline_exceeded"))
+        .unwrap();
+    assert!(
+        line.contains("profile=docs")
+            && line.contains("backend=polling")
+            && line.contains("reason=watch_setup_failed")
+            && line.contains("next_walk_deadline_seconds=240"),
+        "{line}"
+    );
+}
+
 /// I-3: a failed run keeps its change pending, and a change during a run is run
 /// again after it.
 #[test]
