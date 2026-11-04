@@ -1808,8 +1808,21 @@ class RuntimeTests(unittest.TestCase):
         stand-in follows the same contract. SDSYNC_TEST_LOCK_PROBE_FAIL makes it
         a probe that cannot probe, for the unit whose every tool is broken."""
         real = ""
-        if daemon_binary is not None and self.bridge_has_lock_probe(daemon_binary):
-            real = f"    os.execv({str(daemon_binary)!r}, [{str(daemon_binary)!r}, *sys.argv[1:]])\n"
+        if daemon_binary is not None:
+            # N-S7. The daemon-engine tests probe locks with the BUILT bridge. A
+            # bridge that cannot answer --daemon-lock-probe used to fall back,
+            # silently, to the Python stand-in below, and every "real daemon"
+            # scenario then ran against a probe the product does not ship.
+            self.assertTrue(
+                self.bridge_has_lock_probe(daemon_binary),
+                f"{daemon_binary} does not answer --daemon-lock-probe; the real-daemon tests would "
+                "silently probe with the Python stand-in. Rebuild it from this tree.",
+            )
+            real = (
+                "    if os.environ.get('SDSYNC_TEST_LOCK_PROBE_TRACE'):\n"
+                "        open(os.environ['SDSYNC_TEST_LOCK_PROBE_TRACE'], 'a').write('real\\n')\n"
+                f"    os.execv({str(daemon_binary)!r}, [{str(daemon_binary)!r}, *sys.argv[1:]])\n"
+            )
         return (
             "if len(sys.argv) >= 2 and sys.argv[1] == '--daemon-lock-probe':\n"
             "    _probe_path = sys.argv[2] if len(sys.argv) > 2 else ''\n"
@@ -1819,8 +1832,10 @@ class RuntimeTests(unittest.TestCase):
             "    if os.environ.get('SDSYNC_TEST_LOCK_PROBE_HANG'):\n"
             "        time.sleep(120)\n"
             + real
-            + "    try:\n"
-            "        _probe_fd = os.open(_probe_path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)\n"
+            + "    if os.environ.get('SDSYNC_TEST_LOCK_PROBE_TRACE'):\n"
+            "        open(os.environ['SDSYNC_TEST_LOCK_PROBE_TRACE'], 'a').write('python\\n')\n"
+            "    try:\n"
+            "        _probe_fd =os.open(_probe_path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)\n"
             "        try:\n"
             "            if not stat.S_ISREG(os.fstat(_probe_fd).st_mode):\n"
             "                raise OSError('not a regular file')\n"
@@ -14409,7 +14424,8 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
         # names the probe in use once, not once per command.
         self._daemon_engine(None)
         run = self.real_var / "run"
-        no_flock = self._no_flock_environment()
+        trace = self.root / "lock-probe-trace"
+        no_flock = self._no_flock_environment(SDSYNC_TEST_LOCK_PROBE_TRACE=str(trace))
         self._free_daemon_lock()
         reused = self._spawn_fake("--sleeper")
         self._seed_reused_pid_daemon_records(reused.pid)
@@ -14449,6 +14465,10 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
         self.assertIn("tool=daemon-lock-probe", probes[0])
         self.assertIn("flock=absent", probes[0])
         self.assertEqual((run / "daemon-lock-probe.tool").read_text(encoding="utf-8"), "daemon-lock-probe\n")
+        # Every probe above was the built bridge's own, never the Python stand-in.
+        traced = trace.read_text(encoding="utf-8").split()
+        self.assertTrue(traced, "no probe was traced")
+        self.assertEqual(set(traced), {"real"}, traced)
         for _ in range(2):
             self.assertEqual(self.shell(self.lifecycle, "status").returncode, 3)
         probes = self.event_details("daemon_lock_probe")
@@ -15119,6 +15139,87 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
             self._daemon_records(), {"daemon.pid": False, "daemon.ready": False, "ctl.sock": False}, report
         )
         self.assertFalse((self.real_var / "run/supervisor.pid").exists(), report)
+        self.assertEqual(self.shell(self.lifecycle, "status").returncode, 3)
+
+    def test_real_daemon_with_a_manager_rendered_realtime_profile_survives_a_kill_and_stops_clean(self) -> None:
+        # N-S7. The scenarios above run a daemon with no profile at all. This one
+        # has what a NAS has: a profile and a realtime routine rendered by the
+        # real manager (not written by hand), on the DSM-shaped roots where
+        # home, var and target are symlinks to @apphome, @appdata and @appstore,
+        # so the daemon's argv, its watcher and its core all see the aliased
+        # paths. A change reaches the core, the daemon is killed outright and
+        # respawned, a change reaches the core again, and a stop leaves nothing.
+        self._daemon_engine(None)
+        for alias in ("home", "var", "target"):
+            self.assertTrue((self.fhs / alias).is_symlink(), f"{alias} is not a symlink: the fixture is not DSM-shaped")
+        configured = self.configure("watched", self.source_one, "/home/Drive/Watched", True)
+        self.assertEqual(configured.returncode, 0, configured.stderr)
+        stored = self.shell(self.manager, "set-password", "watched", input_text="test-password\n")
+        self.assertEqual(stored.returncode, 0, stored.stderr)
+        routine = self.shell(
+            self.manager, "configure-routine", "--profile", "watched", "--enabled", "true",
+            "--action", "sync", "--mode", "realtime", "--debounce-seconds", "1",
+        )
+        self.assertEqual(routine.returncode, 0, routine.stderr)
+        fragment = self.real_home / "config/profiles.d/watched.toml"
+        self.assertIn("[profiles.watched]", fragment.read_text(encoding="utf-8"))
+        conf = self.real_home / "config/routines.d/watched.conf"
+        self.assertIn("mode=realtime", conf.read_text(encoding="utf-8"))
+        self._start_daemon()
+        self.addCleanup(self._kill_real_daemons)
+        daemon = self._daemon_ready_pid()
+        argv = [part.decode() for part in Path(f"/proc/{daemon}/cmdline").read_bytes().split(b"\0")[:-1]]
+        self.assertEqual(argv[argv.index("--home") + 1], str(self.fhs / "home"), argv)
+        self.assertEqual(argv[argv.index("--var") + 1], str(self.fhs / "var"), argv)
+
+        def scoped_syncs() -> int:
+            if not self.daemon_capture.exists():
+                return 0
+            return sum(
+                1 for line in self.daemon_capture.read_text(encoding="utf-8").splitlines()
+                if " sync " in f" {line} " and "--profile watched" in line and "--scope" in line
+            )
+
+        def change_until_synced(label: str, already: int) -> None:
+            inbox = self.source_one / label
+            inbox.mkdir(exist_ok=True)
+            deadline = time.monotonic() + 60
+            while time.monotonic() < deadline and scoped_syncs() <= already:
+                (inbox / "note.txt").write_text(f"{time.monotonic()}\n", encoding="utf-8")
+                for _ in range(40):
+                    time.sleep(0.1)
+                    if scoped_syncs() > already:
+                        return
+            self.fail(
+                f"a realtime change ({label}) did not reach the core with --scope: "
+                + bounded_file_tail(self.real_var / "log/controller.log")
+                + bounded_file_tail(self.real_var / "log/daemon-stderr.log")
+            )
+
+        change_until_synced("before", 0)
+        first = scoped_syncs()
+        # kill -9: the supervisor respawns the daemon, whose watcher re-arms.
+        os.kill(daemon, signal.SIGKILL)
+        def respawned() -> bool:
+            try:
+                ready = self._daemon_ready_pid()
+            except (OSError, ValueError):
+                return False
+            return ready != daemon and self._daemon_pids_here() == [ready]
+
+        self._wait_for(
+            respawned,
+            "no single respawned daemon\n" + bounded_file_tail(self.real_var / "log/daemon-stderr.log"),
+            timeout=40,
+        )
+        self.assertEqual(self.shell(self.lifecycle, "status").returncode, 0)
+        change_until_synced("after", first)
+        stopped = self.shell(self.lifecycle, "stop", timeout=60)
+        self.assertEqual(stopped.returncode, 0, stopped.stdout + stopped.stderr)
+        self.assertEqual(self._daemon_pids_here(), [])
+        self.assertEqual(
+            self._daemon_records(), {"daemon.pid": False, "daemon.ready": False, "ctl.sock": False}
+        )
         self.assertEqual(self.shell(self.lifecycle, "status").returncode, 3)
 
     def test_real_daemon_is_seen_without_flock_and_the_shell_engine_steps_aside(self) -> None:
