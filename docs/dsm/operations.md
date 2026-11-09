@@ -235,7 +235,13 @@ for the controller's whole shutdown, not only the runner's grace. If it ends wit
 live, the stop does not exit `1` with them running: it says `graceful stop timed out after N seconds;
 killing what is left`, logs `service_stop_forced` (`error`, `engine=shell`), kills the runner (found
 by its verified identity) with its direct children and the API service, gives the controller 5 more
-seconds to record the run and exit, and kills it too, naming each KILL. A service that is still live
+seconds to record the run and exit, and kills it too, naming each KILL. Each target is killed only after
+its start tick is read again immediately before the KILL (the runner by its argv and the start tick the stop
+recorded when it first saw it, and its children found only through a runner that passed); `kill`'s status
+is checked, so "killed ..." lists only what was killed, and everything not killed is named with its reason
+(`not killing ...`: a replaced PID, another owner, an unreadable `/proc` entry; `could not kill ...`, which
+fails the stop; `already gone before the KILL: ...`). When the controller has already exited the stop says
+which service is still live rather than that the controller did not exit. A service that is still live
 10 seconds after KILL fails the stop. A run ended this way is not a clean cancellation.
 
 A run read as stale is never reported as running anywhere in the snapshot: the legacy `run.state`,
@@ -554,6 +560,8 @@ knowing when reading it:
 | `runner_stop_forced` | A package stop had to kill a runner after its 60-second cancellation grace (`warn`; `grace=`, `exit=`) |
 | `runner_wait_guard_failed` / `runner_wait_guard_recovered` | The helper that watches a running sync for the controller could not start or stop (`phase=start` or `stop`, `status=`, `pid=`; `error`, once per episode per phase) / worked again (`warn`). The controller keeps scheduling and polls the run once a second until it ends |
 | `controller_blocked_by_stalled_run` | A run has shown no progress for 30 minutes and holds everything behind it (`error`, once per run) |
+| `poll_scratch_leftover_removed` / `poll_scratch_leftover_unremovable` | A realtime poll was killed outright and left `run/fingerprint.<controller pid>.<poll pid>.<start tick>.<n>`; the controller removed it before the next poll (`warn`) or could not (`error`), with `path=`, `owner_pid=` and the cause |
+| `routine_watch_orphan_stopped` / `routine_watch_orphan_unstoppable` / `routine_watch_guard_unavailable` | The controller was killed outright and its `inotifywait` fallback watcher was stopped by its guard job (`warn`, `profile=`, `pid=`), could not be signalled (`error`), or the guard could not be started because the controller's own start time was unreadable (`warn`). The package's own watcher dies with its parent by itself |
 | `runtime_leftovers_pruned` | At start the controller removed leftover capture, admission and fingerprint files of processes that are no longer live (`count=`, `unremovable=`; `info`, `warn` when some could not be removed) |
 | `run_state_write_failed` | The runner could not write its final `run.state` after three attempts one second apart (`attempts=3 outcome= exit=`); it kept its outcome in `state/run.unrecorded` |
 | `run_state_recovered` | The controller found a dead run, matched it to `run.unrecorded` by start time and scope, and published the runner's real outcome (with `degraded=...,run_state`, reason `run_state_write_failed`) instead of `failed/runner_died`; no Activity failure and no alert, because the runner already wrote both |

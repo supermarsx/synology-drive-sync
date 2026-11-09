@@ -1603,6 +1603,75 @@ ensure_realtime_watcher() {
     realtime_backend=inotify
     realtime_watcher_pid=$watcher_pid
     realtime_watcher_reason=ok
+    # The package's own watcher asks the kernel to kill it with its parent; an
+    # inotifywait cannot, and outlived a controller that was killed outright.
+    [ "${inotify_native:-false}" = true ] || spawn_realtime_watcher_guard "$watcher_profile" "$watcher_pid"
+}
+
+# What stops a fallback inotifywait when the controller is killed outright
+# (SIGKILL, the OOM killer), which the controller's own stop path cannot. One
+# small background job per such watcher: it watches the controller's PID and
+# start tick and the watcher's, ends quietly when the watcher is gone first (a
+# normal stop), and otherwise TERMs the watcher the moment the controller is
+# gone, and logs that with the PID.
+realtime_watcher_guard_log() {
+    # The controller's event writer takes a lock under $$, which here is the
+    # controller that just died; one line appended to the log is the record, and
+    # a failure to append is said on stderr, which is controller.log.
+    guard_log_epoch=$(epoch_now) || guard_log_epoch=0
+    guard_log_line=$(printf '{"epoch":%s,"level":%s,"category":"controller","event":%s,"detail":%s}' \
+        "$guard_log_epoch" "$(json_quote "$1")" "$(json_quote "$2")" "$(json_quote "$3")")
+    if [ -f "$controller_log" ] && [ ! -L "$controller_log" ]; then
+        printf '%s\n' "$guard_log_line" >> "$controller_log" && return 0
+    fi
+    printf 'controller log event %s could not be appended to %s: level=%s %s\n' "$2" "$controller_log" "$1" "$3" >&2
+    return 0
+}
+
+realtime_watcher_guard() {
+    guard_profile=$1
+    guard_watcher=$2
+    guard_watcher_start=$3
+    guard_controller=$4
+    guard_controller_start=$5
+    trap - 0
+    trap 'exit 0' HUP INT TERM
+    while :; do
+        read_process_stat_fields "$guard_watcher" || exit 0
+        [ "$process_stat_start" = "$guard_watcher_start" ] || exit 0
+        case $process_stat_state in Z|X|x) exit 0 ;; esac
+        if ! read_process_stat_fields "$guard_controller" \
+            || [ "$process_stat_start" != "$guard_controller_start" ]; then
+            break
+        fi
+        case $process_stat_state in Z|X|x) break ;; esac
+        sleep 1
+    done
+    read_process_stat_fields "$guard_watcher" || exit 0
+    [ "$process_stat_start" = "$guard_watcher_start" ] || exit 0
+    if kill -TERM "$guard_watcher"; then
+        realtime_watcher_guard_log warn routine_watch_orphan_stopped \
+            "profile=$guard_profile pid=$guard_watcher cause=the controller (PID $guard_controller) ended without stopping its watcher"
+    else
+        realtime_watcher_guard_log error routine_watch_orphan_unstoppable \
+            "profile=$guard_profile pid=$guard_watcher cause=the controller (PID $guard_controller) ended and the watcher could not be signalled"
+    fi
+    exit 0
+}
+
+spawn_realtime_watcher_guard() {
+    guard_spawn_profile=$1
+    guard_spawn_pid=$2
+    # A watcher that is already gone needs no guard: the failure ladder names it.
+    read_process_stat_fields "$guard_spawn_pid" || return 0
+    guard_spawn_start=$process_stat_start
+    if ! read_process_stat_fields "$$"; then
+        controller_log_event warn routine_watch_guard_unavailable \
+            "profile=$guard_spawn_profile pid=$guard_spawn_pid cause=the controller's own start time could not be read, so its watcher would outlive a kill of the controller" || :
+        return 0
+    fi
+    realtime_watcher_guard "$guard_spawn_profile" "$guard_spawn_pid" "$guard_spawn_start" "$$" "$process_stat_start" \
+        < /dev/null &
 }
 
 # DSM does not ship inotify-tools, so the package brings its own watcher: the
@@ -1727,6 +1796,44 @@ consume_realtime_event() {
 # walking process is acted on at once: the handler stops find and removes the
 # private temporaries, instead of the walk outliving the controller that asked
 # for it by however long a large share takes to stat.
+# Remove the scratch directories of polls of this controller that no longer
+# exist: fingerprint.<controller>.<poll pid>.<poll start tick>.<n> whose owner is
+# gone or is another process by now (a poll killed outright cannot clean up
+# after itself). A live poll's directory is never touched. Each removal is
+# logged with its path and cause, and so is one that cannot be removed.
+fingerprint_remove_dead_scratch_directories() {
+    for fingerprint_dead_path in "$runtime_root"/fingerprint.$$.*.*.*; do
+        [ -e "$fingerprint_dead_path" ] || [ -L "$fingerprint_dead_path" ] || continue
+        fingerprint_dead_name=${fingerprint_dead_path##*/}
+        fingerprint_dead_rest=${fingerprint_dead_name#fingerprint.$$.}
+        fingerprint_dead_pid=${fingerprint_dead_rest%%.*}
+        fingerprint_dead_rest=${fingerprint_dead_rest#*.}
+        fingerprint_dead_start=${fingerprint_dead_rest%%.*}
+        case $fingerprint_dead_pid.$fingerprint_dead_start in ''|*[!0-9.]*|.*|*.) continue ;; esac
+        ! runtime_leftover_owner_is_live "$fingerprint_dead_pid" "$fingerprint_dead_start" || continue
+        if [ -L "$fingerprint_dead_path" ] || [ -f "$fingerprint_dead_path" ]; then
+            fingerprint_dead_removed=true
+            rm -f "$fingerprint_dead_path" || fingerprint_dead_removed=false
+        elif [ -d "$fingerprint_dead_path" ]; then
+            for fingerprint_dead_entry in "$fingerprint_dead_path"/metadata "$fingerprint_dead_path"/stderr \
+                "$fingerprint_dead_path"/sorted "$fingerprint_dead_path"/checksum; do
+                [ ! -f "$fingerprint_dead_entry" ] || [ -L "$fingerprint_dead_entry" ] || rm -f "$fingerprint_dead_entry" || :
+            done
+            fingerprint_dead_removed=true
+            rmdir "$fingerprint_dead_path" || fingerprint_dead_removed=false
+        else
+            continue
+        fi
+        if [ "$fingerprint_dead_removed" = true ]; then
+            controller_log_event warn poll_scratch_leftover_removed \
+                "path=$fingerprint_dead_path owner_pid=$fingerprint_dead_pid cause=the poll that made it ended without cleaning up" || :
+        else
+            controller_log_event error poll_scratch_leftover_unremovable \
+                "path=$fingerprint_dead_path owner_pid=$fingerprint_dead_pid cause=the poll that made it is gone but the directory could not be removed" || :
+        fi
+    done
+}
+
 fingerprint_reading() {
     fingerprint_source=$1
     if ! command -v find >/dev/null 2>&1 || ! command -v sort >/dev/null 2>&1 ||
@@ -1753,6 +1860,7 @@ fingerprint_reading() {
     fingerprint_find_pid=
     fingerprint_find_start=
     fingerprint_self_pid=
+    fingerprint_self_start=
     fingerprint_signal_seen=false
     fingerprint_cleanup() {
         [ -n "$fingerprint_temp_dir" ] || return 0
@@ -1769,8 +1877,20 @@ fingerprint_reading() {
     }
     trap fingerprint_cleanup 0
     trap 'fingerprint_signal_seen=true' HUP INT TERM
+    # The directory is named for the poll that makes it -- this subshell's PID
+    # and start tick, after the controller's PID (which $$ still is here) -- so
+    # a poll killed outright (SIGKILL, the OOM killer) leaves a directory whose
+    # owner can be proven gone, and the next poll removes it. They were named
+    # fingerprint.<controller pid>.<n>, nobody could tell whose, and after 32
+    # of them every poll failed with 73 until the controller restarted.
+    IFS=' ' read -r fingerprint_self_pid _fingerprint_self_rest < /proc/self/stat || fingerprint_self_pid=
+    if ! read_process_stat_fields "$fingerprint_self_pid"; then
+        echo "the poll could not read its own process identity from /proc/self/stat" >&2
+        return 73
+    fi
+    fingerprint_self_start=$process_stat_start
     while [ "$fingerprint_attempt" -lt 32 ]; do
-        fingerprint_candidate=$runtime_root/fingerprint.$$.$fingerprint_attempt
+        fingerprint_candidate=$runtime_root/fingerprint.$$.$fingerprint_self_pid.$fingerprint_self_start.$fingerprint_attempt
         if mkdir "$fingerprint_candidate" 2>/dev/null; then
             fingerprint_temp_dir=$fingerprint_candidate
             fingerprint_metadata=$fingerprint_temp_dir/metadata
@@ -1783,7 +1903,6 @@ fingerprint_reading() {
     done
     [ -n "$fingerprint_temp_dir" ] || { echo "no poll scratch directory could be created in $runtime_root" >&2; return 73; }
     chmod 700 "$fingerprint_temp_dir" || { echo "the poll scratch directory $fingerprint_temp_dir could not be made private" >&2; return 73; }
-    IFS=' ' read -r fingerprint_self_pid _fingerprint_self_rest < /proc/self/stat || fingerprint_self_pid=
     trap fingerprint_interrupted HUP INT TERM
     [ "$fingerprint_signal_seen" = false ] || exit 143
 
@@ -1950,6 +2069,11 @@ start_poll_job() {
     poll_job_errors=$runtime_root/poll-$start_poll_profile.errors
     [ ! -L "$poll_job_result" ] && [ ! -L "$poll_job_output" ] && [ ! -L "$poll_job_errors" ] || return 73
     rm -f "$poll_job_result" "$poll_job_output" "$poll_job_errors" "$poll_job_result.tmp" || return 73
+    # No poll runs now, so any scratch directory of this controller's polls
+    # belongs to one that was killed outright; remove them here, where the
+    # controller can log it (a poll subshell shares the controller's PID, and
+    # with it the event log's lock identity).
+    fingerprint_remove_dead_scratch_directories
     (
         trap - USR2 ALRM
         poll_job_status=0

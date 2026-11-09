@@ -1808,17 +1808,34 @@ class RuntimeTests(unittest.TestCase):
         stand-in follows the same contract. SDSYNC_TEST_LOCK_PROBE_FAIL makes it
         a probe that cannot probe, for the unit whose every tool is broken."""
         real = ""
-        if daemon_binary is not None and self.bridge_has_lock_probe(daemon_binary):
-            real = f"    os.execv({str(daemon_binary)!r}, [{str(daemon_binary)!r}, *sys.argv[1:]])\n"
+        if daemon_binary is not None:
+            # N-S7. The daemon-engine tests probe locks with the BUILT bridge. A
+            # bridge that cannot answer --daemon-lock-probe used to fall back,
+            # silently, to the Python stand-in below, and every "real daemon"
+            # scenario then ran against a probe the product does not ship.
+            self.assertTrue(
+                self.bridge_has_lock_probe(daemon_binary),
+                f"{daemon_binary} does not answer --daemon-lock-probe; the real-daemon tests would "
+                "silently probe with the Python stand-in. Rebuild it from this tree.",
+            )
+            real = (
+                "    if os.environ.get('SDSYNC_TEST_LOCK_PROBE_TRACE'):\n"
+                "        open(os.environ['SDSYNC_TEST_LOCK_PROBE_TRACE'], 'a').write('real\\n')\n"
+                f"    os.execv({str(daemon_binary)!r}, [{str(daemon_binary)!r}, *sys.argv[1:]])\n"
+            )
         return (
             "if len(sys.argv) >= 2 and sys.argv[1] == '--daemon-lock-probe':\n"
             "    _probe_path = sys.argv[2] if len(sys.argv) > 2 else ''\n"
             "    if os.environ.get('SDSYNC_TEST_LOCK_PROBE_FAIL'):\n"
             "        sys.stderr.write(f'daemon-lock-probe: {_probe_path}: test hook: the probe is disabled\\n')\n"
             "        raise SystemExit(1)\n"
+            "    if os.environ.get('SDSYNC_TEST_LOCK_PROBE_HANG'):\n"
+            "        time.sleep(120)\n"
             + real
-            + "    try:\n"
-            "        _probe_fd = os.open(_probe_path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)\n"
+            + "    if os.environ.get('SDSYNC_TEST_LOCK_PROBE_TRACE'):\n"
+            "        open(os.environ['SDSYNC_TEST_LOCK_PROBE_TRACE'], 'a').write('python\\n')\n"
+            "    try:\n"
+            "        _probe_fd =os.open(_probe_path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)\n"
             "        try:\n"
             "            if not stat.S_ISREG(os.fstat(_probe_fd).st_mode):\n"
             "                raise OSError('not a regular file')\n"
@@ -4183,8 +4200,10 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
         controller_state = self.real_var / "state/controller.state"
         base = "state=running\npid=111\nnext_run_epoch=0\nactive_pid=0\nupdated_epoch=100\n"
 
-        def write(extra: str) -> None:
-            controller_state.write_text(base + extra, encoding="utf-8")
+        def write(extra: str | bytes) -> None:
+            controller_state.write_bytes(
+                base.encode("utf-8") + (extra if isinstance(extra, bytes) else extra.encode("utf-8"))
+            )
             controller_state.chmod(0o600)
             if os.getuid() == 0:
                 os.chown(controller_state, self.drop_uid, self.drop_gid)
@@ -4193,8 +4212,24 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
         plain, plain_payload = self.api("snapshot")
         self.assertEqual(plain.returncode, 0, plain.stdout + plain.stderr)
         self.assertNotIn("degraded", plain_payload["controller"], plain.stdout)
+        # S3-3. The block is served only while the service is running: with
+        # no daemon it is absent (not null) -- and a malformed set is refused
+        # all the same.
+        write("degraded=audit_unavailable\ndegraded_since=90\ndegraded_cause=audit outbox: No space left on device\n")
+        stopped, stopped_payload = self.api("snapshot")
+        self.assertEqual(stopped.returncode, 0, stopped.stdout + stopped.stderr)
+        self.assertEqual(stopped_payload["service"]["state"], "stopped", stopped.stdout)
+        self.assertNotIn("degraded", stopped_payload["controller"], stopped.stdout)
+        write("degraded=audit_unavailable\n")
+        refused_stopped, refused_stopped_payload = self.api("snapshot")
+        self.assertEqual(refused_stopped.returncode, 73, refused_stopped.stdout + refused_stopped.stderr)
+        self.assertEqual(refused_stopped_payload["code"], "corrupt_state", refused_stopped.stdout)
+        # A running service: daemon.ready names a live process of the package user.
+        daemon = self._spawn_fake("--daemon")
+        self._write_run_record("daemon.ready", self._identity_triple(daemon.pid))
         write("degraded=audit_unavailable\ndegraded_since=90\ndegraded_cause=audit outbox: No space left on device\n")
         amber, amber_payload = self.api("snapshot")
+        self.assertEqual(amber_payload["service"], {"state": "running", "pid": daemon.pid}, amber.stdout)
         self.assertEqual(amber.returncode, 0, amber.stdout + amber.stderr)
         self.assertEqual(
             amber_payload["controller"],
@@ -4216,6 +4251,12 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
         quoted, quoted_payload = self.api("snapshot")
         self.assertEqual(quoted.returncode, 0, quoted.stdout + quoted.stderr)
         self.assertEqual(quoted_payload["controller"]["degraded"]["cause"], 'say "quote" and \\back')
+        # Well-formed UTF-8 of every width, and a since of exactly 0, are served.
+        write("degraded=audit_unavailable\ndegraded_since=0\ndegraded_cause=caf\u00e9 \u20ac \U0001f600\n")
+        wide, wide_payload = self.api("snapshot")
+        self.assertEqual(wide.returncode, 0, wide.stdout + wide.stderr)
+        self.assertEqual(wide_payload["controller"]["degraded"]["cause"], "caf\u00e9 \u20ac \U0001f600")
+        self.assertEqual(wide_payload["controller"]["degraded"]["since_epoch"], 0)
         malformed = {
             "a partial set": "degraded=audit_unavailable\n",
             "a cause without a reason": "degraded_since=90\ndegraded_cause=x\n",
@@ -4224,6 +4265,14 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
             "a non-numeric since": "degraded=audit_unavailable\ndegraded_since=soon\ndegraded_cause=x\n",
             "a cause over 512 bytes": "degraded=audit_unavailable\ndegraded_since=90\ndegraded_cause=" + "x" * 513 + "\n",
             "a duplicated reason": "degraded=a\ndegraded=b\ndegraded_since=90\ndegraded_cause=x\n",
+            # S3-20. The in-process rung refuses these; the shell served them
+            # (007 as invalid JSON, the bytes as a document that is not UTF-8).
+            "a since with leading zeros": "degraded=audit_unavailable\ndegraded_since=007\ndegraded_cause=x\n",
+            "a since of all zeros": "degraded=audit_unavailable\ndegraded_since=00\ndegraded_cause=x\n",
+            "a cause that is not UTF-8": b"degraded=audit_unavailable\ndegraded_since=90\ndegraded_cause=bad \xff\xfe bytes\n",
+            "a cause with an overlong encoding": b"degraded=audit_unavailable\ndegraded_since=90\ndegraded_cause=x\xc0\x80\n",
+            "a cause with a surrogate": b"degraded=audit_unavailable\ndegraded_since=90\ndegraded_cause=x\xed\xa0\x80\n",
+            "a cause cut inside a character": b"degraded=audit_unavailable\ndegraded_since=90\ndegraded_cause=x\xe2\x82\n",
         }
         for label, extra in malformed.items():
             with self.subTest(malformed=label):
@@ -4231,6 +4280,18 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
                 refused, refused_payload = self.api("snapshot")
                 self.assertEqual(refused.returncode, 73, refused.stdout + refused.stderr)
                 self.assertEqual(refused_payload["code"], "corrupt_state", refused.stdout)
+        # kill -9: the record stays, the process is gone, and the amber goes with it.
+        write("degraded=audit_unavailable\ndegraded_since=90\ndegraded_cause=audit outbox: No space left on device\n")
+        served, _ = self.api("snapshot")
+        self.assertEqual(served.returncode, 0, served.stdout + served.stderr)
+        self.assertIn('"degraded":{', served.stdout)
+        daemon.kill()
+        daemon.wait(timeout=10)
+        killed, killed_payload = self.api("snapshot")
+        self.assertEqual(killed.returncode, 0, killed.stdout + killed.stderr)
+        self.assertEqual(killed_payload["service"]["state"], "stopped", killed.stdout)
+        self.assertEqual(killed_payload["controller"]["state"], "running", killed.stdout)
+        self.assertNotIn("degraded", killed_payload["controller"], killed.stdout)
 
     def test_api_logs_selected_source_and_aggregate_output_are_capture_bounded(self) -> None:
         payload = "x" * 7000
@@ -8177,6 +8238,112 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
             "a stop left poll scratch directories behind\n" + stopped.stdout + stopped.stderr
             + bounded_file_tail(self.real_var / "log/controller.log"),
         )
+
+    def test_a_poll_killed_outright_leaves_no_scratch_directory_for_the_next_poll(self) -> None:
+        # S3-22. A poll subshell killed by SIGKILL (the OOM killer) cannot run
+        # its cleanup trap, and its run/fingerprint.<controller pid>.<n> stayed
+        # for the controller's whole life; 32 of them and every later poll
+        # failed with 73. The directory now carries its owner's PID and start
+        # tick, and the next poll removes one whose owner is gone, naming it.
+        self.assertEqual(
+            self.configure("watch", self.source_two, "/home/Drive/Watch", True).returncode, 0
+        )
+        (self.source_two / "first.txt").write_text("one\n", encoding="utf-8")
+        realtime, _ = self.api(
+            "routine", "--profile", "watch", "--enabled", "true", "--action", "sync",
+            "--mode", "realtime", "--interval", "60", "--weekdays", "1,2,3,4,5,6,7",
+            "--time-window-start", "00:00", "--time-window-end", "23:59",
+            "--debounce-seconds", "1", "--retry-count", "1", "--retry-backoff-seconds", "10",
+            "--poll-seconds", "5", "--allow-delete", "false", "--max-total-delete", "100",
+        )
+        self.assertEqual(realtime.returncode, 0, realtime.stderr)
+        held = self.root / "killed-poll-held"
+        shim_bin = self.root / "killed-poll-bin"
+        shim_bin.mkdir(mode=0o700)
+        shim = shim_bin / "chmod"
+        shim.write_text(
+            "#!/bin/sh\n"
+            'case "${2:-}" in\n'
+            "  */fingerprint.*)\n"
+            f"    printf '%s %s %s\\n' \"$PPID\" \"$$\" \"$2\" >> {shlex.quote(str(held))}\n"
+            f"    if [ \"$(wc -l < {shlex.quote(str(held))})\" -le 1 ]; then /bin/sleep 120; fi ;;\n"
+            "esac\n"
+            'exec /bin/chmod "$@"\n',
+            encoding="utf-8",
+        )
+        shim.chmod(0o755)
+        if os.getuid() == 0:
+            os.chown(shim_bin, self.drop_uid, self.drop_gid)
+            os.chown(shim, self.drop_uid, self.drop_gid)
+        environment = self.fast_clock_environment(step=31)
+        environment["PATH"] = f"{shim_bin}:{environment['PATH']}"
+        started = self.shell(self.lifecycle, "start", extra_environment=environment, timeout=30)
+        self.assertEqual(started.returncode, 0, started.stdout + started.stderr)
+        self._wait_for(held.exists, "no poll walk reached its scratch directory", timeout=30)
+        poll, shim_pid, leaked = held.read_text(encoding="utf-8").split()[:3]
+        self.addCleanup(lambda: subprocess.run(["kill", "-KILL", shim_pid], check=False, capture_output=True))
+        self.assertTrue(Path(leaked).is_dir(), leaked)
+        os.kill(int(poll), signal.SIGKILL)
+        self._wait_for(
+            lambda: len(held.read_text(encoding="utf-8").splitlines()) >= 2,
+            "no later poll made a scratch directory\n" + bounded_file_tail(self.real_var / "log/controller.log"),
+            timeout=60,
+        )
+        self.assertFalse(
+            Path(leaked).exists(),
+            f"the dead poll's scratch directory {leaked} was left behind\n"
+            + bounded_file_tail(self.real_var / "log/controller.log"),
+        )
+        removed = self.event_details("poll_scratch_leftover_removed")
+        self.assertTrue(any(f"path={leaked}" in detail and f"owner_pid={poll}" in detail for detail in removed), removed)
+        stopped = self.shell(self.lifecycle, "stop", timeout=60)
+        self.assertEqual(stopped.returncode, 0, stopped.stdout + stopped.stderr)
+        self.assertEqual(sorted((self.real_var / "run").glob("fingerprint.*")), [])
+
+    def test_killing_the_controller_stops_its_inotifywait_fallback_watcher(self) -> None:
+        # S3-22. The package's own watcher is killed with its parent by the
+        # kernel; an inotifywait fallback was not, and outlived a controller
+        # that was killed outright. A guard per fallback watcher stops it.
+        self._without_the_package_watcher()
+        self._realtime_watch_profile()
+        environment, _clock = self.realtime_watcher_environment(label="orphan")
+        started = self.shell(self.lifecycle, "start", extra_environment=environment, timeout=15)
+        self.assertEqual(started.returncode, 0, started.stdout + started.stderr)
+        pid_path = self.real_var / "run/watch-watch.pid"
+        state_path = self.real_var / "state/routines/watch.state"
+        deadline = time.monotonic() + 15
+        while time.monotonic() < deadline:
+            state_text = state_path.read_text(encoding="utf-8") if state_path.exists() else ""
+            if pid_path.is_file() and "backend=inotify" in state_text:
+                break
+            time.sleep(0.03)
+        else:
+            self.fail("the inotifywait fallback was never adopted")
+        watcher = int(pid_path.read_text(encoding="utf-8").strip())
+        controller = int((self.real_var / "run/controller.pid").read_text(encoding="utf-8").split()[0])
+        os.kill(controller, signal.SIGKILL)
+
+        def watcher_gone() -> bool:
+            try:
+                state = Path(f"/proc/{watcher}/stat").read_text(encoding="ascii").rsplit(") ", 1)[1].split()[0]
+            except OSError:
+                return True
+            return state in ("Z", "X")
+
+        self._wait_for(
+            watcher_gone,
+            f"the inotifywait watcher (PID {watcher}) outlived the controller\n"
+            + bounded_file_tail(self.real_var / "log/controller.log"),
+            timeout=20,
+        )
+        self._wait_for(
+            lambda: any(f"pid={watcher} " in detail for detail in self.event_details("routine_watch_orphan_stopped")),
+            "the guard did not log that it stopped the orphaned watcher\n"
+            + bounded_file_tail(self.real_var / "log/controller.log"),
+            timeout=10,
+        )
+        stopped = self.shell(self.lifecycle, "stop", timeout=60)
+        self.assertEqual(stopped.returncode, 0, stopped.stdout + stopped.stderr)
 
     def test_realtime_poll_reports_unreadable_subtree_without_dispatch(self) -> None:
         # Row 1. chmod 000 on a subdirectory makes find's walk fail with a
@@ -13785,12 +13952,18 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
 
     def _spawn_fake(
         self, flag: str, *, hold_lock: bool = False, ignore_term: bool = False,
-        lock: str = "daemon.lock",
+        lock: str = "daemon.lock", argv_extra: tuple[str, ...] = (),
+        term_delay: float = 0.0,
     ) -> subprocess.Popen[str]:
         code = (
             "import fcntl, os, signal, sys, time\n"
             "if sys.argv[2] == 'ignore':\n"
             "    signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+            "elif sys.argv[2].startswith('delay:'):\n"
+            "    def _slow_exit(*_):\n"
+            "        time.sleep(float(sys.argv[2][6:]))\n"
+            "        os._exit(0)\n"
+            "    signal.signal(signal.SIGTERM, _slow_exit)\n"
             "if sys.argv[3] != '-':\n"
             "    fd = os.open(sys.argv[3], os.O_RDWR | os.O_CREAT, 0o600)\n"
             "    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)\n"
@@ -13799,7 +13972,11 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
         )
         lock_path = str(self.real_var / "run" / lock) if hold_lock else "-"
         process = subprocess.Popen(
-            [sys.executable, "-c", code, flag, "ignore" if ignore_term else "default", lock_path],
+            [
+                sys.executable, "-c", code, flag,
+                "ignore" if ignore_term else (f"delay:{term_delay}" if term_delay else "default"),
+                lock_path, *argv_extra,
+            ],
             stdout=subprocess.PIPE,
             text=True,
             preexec_fn=(
@@ -14247,7 +14424,8 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
         # names the probe in use once, not once per command.
         self._daemon_engine(None)
         run = self.real_var / "run"
-        no_flock = self._no_flock_environment()
+        trace = self.root / "lock-probe-trace"
+        no_flock = self._no_flock_environment(SDSYNC_TEST_LOCK_PROBE_TRACE=str(trace))
         self._free_daemon_lock()
         reused = self._spawn_fake("--sleeper")
         self._seed_reused_pid_daemon_records(reused.pid)
@@ -14287,6 +14465,10 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
         self.assertIn("tool=daemon-lock-probe", probes[0])
         self.assertIn("flock=absent", probes[0])
         self.assertEqual((run / "daemon-lock-probe.tool").read_text(encoding="utf-8"), "daemon-lock-probe\n")
+        # Every probe above was the built bridge's own, never the Python stand-in.
+        traced = trace.read_text(encoding="utf-8").split()
+        self.assertTrue(traced, "no probe was traced")
+        self.assertEqual(set(traced), {"real"}, traced)
         for _ in range(2):
             self.assertEqual(self.shell(self.lifecycle, "status").returncode, 3)
         probes = self.event_details("daemon_lock_probe")
@@ -14372,6 +14554,346 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
         self.assertEqual(status.returncode, 2, status.stdout + status.stderr)
         self.assertFalse(calls.exists() and calls.read_text(encoding="utf-8").strip(),
                          "supervisor.lock was probed beside a record that proves the supervisor")
+
+    def test_a_lock_probe_that_hangs_is_cut_off_after_five_seconds_and_named(self) -> None:
+        # S3-15. Neither probe tool had a time limit: a flock(1) or a bridge
+        # probe wedged on a stuck filesystem hung every status, hook and stop.
+        # Both run under timeout(1) when it exists; on expiry the probe says 2
+        # ("cannot be told") and the cause names the tool and the limit.
+        self._daemon_engine(None)
+        self._free_daemon_lock()
+        reused = self._spawn_fake("--sleeper")
+        self._seed_reused_pid_daemon_records(reused.pid)
+        lock = self.fhs / "var/run/daemon.lock"
+        for label, environment in (
+            ("bridge probe", self._no_flock_environment(SDSYNC_TEST_LOCK_PROBE_HANG="1")),
+            ("flock", None),
+        ):
+            with self.subTest(tool=label):
+                if environment is None:
+                    # A flock(1) that never returns, in front of the real one.
+                    shim = self.fake_system_bin / "flock"
+                    shim.write_text("#!/bin/sh\nexec /bin/sleep 120\n", encoding="utf-8")
+                    shim.chmod(0o755)
+                    environment = {}
+                began = time.monotonic()
+                status = self.shell(self.lifecycle, "status", timeout=60, extra_environment=environment)
+                elapsed = time.monotonic() - began
+                report = status.stdout + status.stderr
+                self.assertEqual(status.returncode, 2, report)
+                self.assertLess(elapsed, 30, f"the probe was not cut off: {elapsed:.1f} s\n{report}")
+                self.assertGreaterEqual(elapsed, 4, f"the probe was cut off too early\n{report}")
+                self.assertIn(f"{lock} cannot be probed", status.stderr, report)
+                self.assertIn("timed out after 5 s", status.stderr, report)
+                self.assertIn("flock -n" if label == "flock" else "--daemon-lock-probe", status.stderr, report)
+                refused = self.shell(
+                    self.lifecycle_dir / "preuninst", timeout=60, extra_environment=environment
+                )
+                self.assertEqual(refused.returncode, 1, refused.stdout + refused.stderr)
+                self.assertIn("timed out after 5 s", refused.stdout + refused.stderr)
+        (self.fake_system_bin / "flock").unlink()  # the tearDown stop must not wait on it
+        self.assertIsNone(reused.poll())
+
+    def _make_unusable_supervisor_lock(self, kind: str) -> Path:
+        lock = self.real_var / "run/supervisor.lock"
+        self._clear_supervisor_lock()
+        if kind == "directory":
+            lock.mkdir(mode=0o700)
+        elif kind == "full directory":
+            lock.mkdir(mode=0o700)
+            (lock / "stray").write_text("x\n", encoding="utf-8")
+        elif kind == "symlink":
+            lock.symlink_to(self.root / "no-such-target")
+        elif kind == "fifo":
+            os.mkfifo(lock, 0o600)
+        elif kind == "unreadable file":
+            lock.write_text("", encoding="utf-8")
+            lock.chmod(0o000)
+        else:
+            raise AssertionError(kind)
+        return lock
+
+    def _clear_supervisor_lock(self) -> None:
+        lock = self.real_var / "run/supervisor.lock"
+        if lock.is_dir() and not lock.is_symlink():
+            shutil.rmtree(lock)
+        elif lock.exists() or lock.is_symlink():
+            if not lock.is_symlink():
+                lock.chmod(0o600)
+            lock.unlink()
+
+    def test_a_malformed_supervisor_record_beside_an_unusable_lock_heals_when_no_supervisor_runs(self) -> None:
+        # S3-16. supervisor.pid malformed and supervisor.lock a directory, a
+        # symlink, a fifo or mode 000 gave no witness at all, and "a supervisor
+        # cannot be ruled out" refused status, the hooks, start and stop for
+        # good. When no process runs --supervise for this package's var
+        # directory nothing can hold the lock: stop removes the bad record and
+        # makes the lock usable again (or prints the exact command), and says so.
+        self._daemon_engine(None)
+        run = self.real_var / "run"
+        lock_name = str(self.fhs / "var/run/supervisor.lock")
+        for kind in ("directory", "symlink", "fifo", "unreadable file"):
+            with self.subTest(lock=kind):
+                self._free_daemon_lock()
+                self._write_run_record("supervisor.pid", "garbage\n")
+                lock = self._make_unusable_supervisor_lock(kind)
+                status = self.shell(self.lifecycle, "status")
+                report = status.stdout + status.stderr
+                self.assertEqual(status.returncode, 1, report)
+                self.assertNotIn("cannot be ruled out", report)
+                self.assertIn("stale daemon record of a daemon that is gone", status.stderr, report)
+                self.assertTrue(lock.exists() or lock.is_symlink(), "status repaired something; it only reports")
+                refused = self.shell(self.lifecycle_dir / "preuninst")
+                self.assertNotIn("supervisor is still running", refused.stdout, refused.stdout + refused.stderr)
+                stopped = self.shell(self.lifecycle, "stop", timeout=60)
+                report = stopped.stdout + stopped.stderr
+                self.assertEqual(stopped.returncode, 0, report)
+                self.assertFalse((run / "supervisor.pid").exists(), report)
+                self.assertIn(f"removed stale daemon record {self.fhs / 'var/run/supervisor.pid'}", stopped.stdout, report)
+                self.assertIn(lock_name, stopped.stdout, "the repair of the lock is not named\n" + report)
+                usable = (not lock.exists() and not lock.is_symlink()) or (
+                    lock.is_file() and not lock.is_symlink() and os.access(lock, os.R_OK)
+                )
+                self.assertTrue(usable, f"supervisor.lock is still {kind}\n{report}")
+                self.assertEqual(self.shell(self.lifecycle, "status").returncode, 3)
+        # The repaired lock is one a supervisor can take.
+        self._start_daemon()
+        self.assertEqual(self.shell(self.lifecycle, "status").returncode, 0)
+        stopped = self.shell(self.lifecycle, "stop", timeout=60)
+        self.assertEqual(stopped.returncode, 0, stopped.stdout + stopped.stderr)
+
+    def test_an_unusable_supervisor_lock_that_cannot_be_repaired_prints_the_exact_command(self) -> None:
+        self._daemon_engine(None)
+        self._free_daemon_lock()
+        self._write_run_record("supervisor.pid", "garbage\n")
+        lock = self._make_unusable_supervisor_lock("full directory")
+        stopped = self.shell(self.lifecycle, "stop", timeout=60)
+        report = stopped.stdout + stopped.stderr
+        self.assertEqual(stopped.returncode, 0, report)
+        self.assertIn(f"rm -r -- '{self.fhs / 'var/run/supervisor.lock'}'", stopped.stdout, report)
+        self.assertTrue((lock / "stray").exists(), "a directory with contents was removed")
+        self._clear_supervisor_lock()
+
+    def test_a_live_supervisor_keeps_a_malformed_record_and_an_unusable_lock_refused(self) -> None:
+        # The scan that lets the stop heal must see a supervisor that is there.
+        self._daemon_engine(None)
+        self._free_daemon_lock()
+        supervisor = self._spawn_fake("--supervise", argv_extra=("--var", str(self.fhs / "var")))
+        self._write_run_record("supervisor.pid", "garbage\n")
+        lock = self._make_unusable_supervisor_lock("directory")
+        status = self.shell(self.lifecycle, "status")
+        self.assertEqual(status.returncode, 2, status.stdout + status.stderr)
+        self.assertIn(f"PID {supervisor.pid}", status.stderr, status.stdout + status.stderr)
+        stopped = self.shell(self.lifecycle, "stop", timeout=60)
+        self.assertEqual(stopped.returncode, 1, stopped.stdout + stopped.stderr)
+        self.assertIn("refusing to clean daemon records", stopped.stdout)
+        self.assertIn(f"PID {supervisor.pid}", stopped.stdout)
+        self.assertTrue(lock.is_dir(), "the lock was repaired beside a live supervisor")
+        self.assertTrue((self.real_var / "run/supervisor.pid").exists())
+        self.assertIsNone(supervisor.poll(), "stop signalled a supervisor it could not identify")
+        self._clear_supervisor_lock()
+
+    def test_the_ctl_stop_wait_is_recomputed_from_what_is_left_after_the_orphan_supervisor_phase(self) -> None:
+        # The ctl stop wait was fixed at the top of the stop (budget - TERM
+        # share - 5) and then handed over whole after the orphan-supervisor
+        # phase had already spent part of the budget. It is the remaining
+        # budget's now.
+        self._daemon_engine(None)
+        wait_file = self.root / "ctl-stop-wait"
+        bridge = self.real_target / "bin/sdsync-dsm-api"
+        source = bridge.read_text(encoding="utf-8")
+        needle = "if len(sys.argv) >= 2 and sys.argv[1] in ('--launch-daemon'"
+        self.assertEqual(source.count(needle), 1, "the mock's daemon passthrough changed")
+        bridge.write_text(
+            source.replace(
+                needle,
+                "if len(sys.argv) >= 3 and sys.argv[1] == '--ctl' and sys.argv[2] == 'stop':\n"
+                "    _wait = [a[7:] for a in sys.argv if a.startswith('wait_s=')]\n"
+                f"    open({str(wait_file)!r}, 'a').write(_wait[0] + chr(10))\n"
+                "    raise SystemExit(0)\n" + needle,
+                1,
+            ),
+            encoding="utf-8",
+        )
+        self._free_daemon_lock()
+        supervisor = self._spawn_fake("--supervise", term_delay=6)
+        self._write_run_record("supervisor.pid", self._identity_triple(supervisor.pid))
+        self._bind_dead_socket(self.real_var / "run/ctl.sock", 0o600)
+        stopped = self.shell(
+            self.lifecycle, "stop", timeout=120, extra_environment={"SDSYNC_DSM_STOP_TIMEOUT": "40"}
+        )
+        report = stopped.stdout + stopped.stderr
+        self.assertEqual(stopped.returncode, 0, report)
+        self.assertIsNotNone(supervisor.poll())
+        waits = [int(line) for line in wait_file.read_text(encoding="utf-8").split()]
+        self.assertEqual(len(waits), 1, report)
+        # 40 s budget, a 6 s TERM share, 5 s of margin: 29 before the supervisor
+        # took its 6 s; at most 23 after.
+        self.assertGreaterEqual(waits[0], 1, report)
+        self.assertLessEqual(waits[0], 24, f"ctl stop was given wait_s={waits[0]} after the budget had been spent on\n" + report)
+
+    # -- the forced stop of the shell engine (S3-18) ---------------------------
+    #
+    # The forced stop kills a wedged runner, its children and the API service.
+    # Its functions are run here with the stop's own definitions, in a harness
+    # that is the lifecycle script up to its dispatcher, so a KILL that fails,
+    # a PID that was replaced and an unreadable /proc entry can be staged.
+
+    def _spawn_runner_with_child(self) -> tuple[subprocess.Popen[str], int]:
+        """A process whose argv carries the runner's path, with a child of its own."""
+        runner = str(self.fhs / "target/libexec/sdsync-run")
+        code = (
+            "import subprocess, sys, time\n"
+            "child = subprocess.Popen(['/bin/sleep', '120'])\n"
+            "print(child.pid, flush=True)\n"
+            "time.sleep(120)\n"
+        )
+        process = subprocess.Popen(
+            [sys.executable, "-c", code, runner],
+            stdout=subprocess.PIPE,
+            text=True,
+            preexec_fn=(
+                (lambda: (os.setgroups([]), os.setgid(self.drop_gid), os.setuid(self.drop_uid)))
+                if os.getuid() == 0
+                else None
+            ),
+        )
+        self.addCleanup(self._reap_fake, process)
+        assert process.stdout is not None
+        child = int(process.stdout.readline())
+
+        def reap_child() -> None:
+            try:
+                os.kill(child, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+
+        self.addCleanup(reap_child)
+        return process, child
+
+    def _force_harness(self, body: str, runner_pid: int, child_pid: int, timeout: int = 90) -> subprocess.CompletedProcess[str]:
+        text = self.lifecycle.read_text(encoding="utf-8")
+        dispatcher = re.search(r"^case \$\{1:-\} in$", text, re.M)
+        self.assertIsNotNone(dispatcher)
+        runtime = (self.fhs / "target/libexec/sdsync-common").read_text(encoding="utf-8")
+        real = re.search(r"^read_process_stat_fields\(\) \{\n.*?^\}\n", runtime, re.M | re.S)
+        self.assertIsNotNone(real)
+        renamed = real.group(0).replace("read_process_stat_fields() {", "real_read_process_stat_fields() {", 1)
+        wrapper = (
+            "read_process_stat_fields() {\n"
+            '    if [ "$1" = "${unreadable_pid:-x}" ]; then\n'
+            "        process_stat_state= process_stat_start= process_stat_ppid=\n"
+            "        return 1\n"
+            "    fi\n"
+            '    real_read_process_stat_fields "$@" || return 1\n'
+            '    if [ "$1" = "${tick_pid:-x}" ]; then\n'
+            "        tick_seen=$((${tick_seen:-0} + 1))\n"
+            '        [ "$tick_seen" -lt "${tick_after:-1}" ] || process_stat_start=$((process_stat_start + 1))\n'
+            "    fi\n"
+            "}\n"
+        )
+        preamble = (
+            '. "$common_runtime"\nrequire_package_identity\n'
+            + renamed + wrapper
+            + f"run_pid={runner_pid}\nchild_pid={child_pid}\nrun_active=true\n"
+            'run_start=$(process_start_time "$run_pid")\n'
+            "api_active=false\ncontroller_active=false\n"
+        )
+        harness = self.lifecycle_dir / "force-harness"
+        harness.write_text(text[: dispatcher.start()] + preamble + body, encoding="utf-8")
+        harness.chmod(0o755)
+        return self.shell(harness, timeout=timeout)
+
+    def test_a_forced_stop_never_says_killed_when_the_kill_failed(self) -> None:
+        runner, child = self._spawn_runner_with_child()
+        done = self._force_harness(
+            'kill() { case $1 in -KILL) echo "kill: injected failure" >&2; return 1 ;; esac; command kill "$@"; }\n'
+            "rc=0; force_stop_runner_and_api || rc=$?\necho rc=$rc\n",
+            runner.pid, child,
+        )
+        report = done.stdout + done.stderr
+        self.assertIn("rc=1", report)
+        self.assertIn(f"could not kill runner PID {runner.pid}", report)
+        self.assertIn(f"could not kill its child PID {child}", report)
+        self.assertIn("injected failure", report)
+        self.assertNotRegex(report, r"\bkilled\b", report)
+        self.assertIsNone(runner.poll())
+
+    def test_a_forced_stop_rechecks_start_ticks_before_each_kill_and_names_every_skip(self) -> None:
+        # S3-18. The runner's children were killed by PID alone, the runner by
+        # an argv match alone, and a skip or a failed KILL was silent.
+        def alive(pid: int) -> bool:
+            try:
+                state = Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[0]
+            except OSError:
+                return False
+            return state not in ("Z", "X")
+
+        # The runner's PID now holds a process with another start tick: neither
+        # it nor the children found through its PID are touched.
+        runner, child = self._spawn_runner_with_child()
+        done = self._force_harness(
+            "run_start=$((run_start + 1))\nrc=0; force_stop_runner_and_api || rc=$?\necho rc=$rc\n",
+            runner.pid, child,
+        )
+        report = done.stdout + done.stderr
+        self.assertIn("rc=0", report)
+        self.assertIn(f"not killing runner PID {runner.pid} or its children", report)
+        self.assertNotRegex(report, r"\bkilled\b", report)
+        self.assertTrue(alive(runner.pid) and alive(child), report)
+
+        # A child whose start tick changes between the scan and the KILL.
+        runner, child = self._spawn_runner_with_child()
+        done = self._force_harness(
+            f"tick_pid={child}\ntick_after=2\nrc=0; force_stop_runner_and_api || rc=$?\necho rc=$rc\n",
+            runner.pid, child,
+        )
+        report = done.stdout + done.stderr
+        self.assertIn("rc=0", report)
+        self.assertIn(f"killed runner PID {runner.pid}", report)
+        self.assertIn(f"not killing its child PID {child}: its start tick is now", report)
+        self.assertNotRegex(report, rf"killed .*its child PID {child}", report)
+        self.assertTrue(alive(child), report)
+
+        # An entry of /proc that cannot be read is named, and not guessed at.
+        runner, child = self._spawn_runner_with_child()
+        done = self._force_harness(
+            f"unreadable_pid={child}\nrc=0; force_stop_runner_and_api || rc=$?\necho rc=$rc\n",
+            runner.pid, child,
+        )
+        report = done.stdout + done.stderr
+        self.assertIn(f"/proc entries that could not be read were not checked for children of the runner: {child}", report)
+        self.assertIn(f"killed runner PID {runner.pid}", report)
+        self.assertTrue(alive(child), report)
+
+        # A child that is gone by the time of its KILL is reported as gone.
+        runner, child = self._spawn_runner_with_child()
+        done = self._force_harness(
+            'kill() { case $1 in -KILL) command kill -KILL "$child_pid"; sleep 0.3 ;; esac; command kill "$@"; }\n'
+            "rc=0; force_stop_runner_and_api || rc=$?\necho rc=$rc\n",
+            runner.pid, child,
+        )
+        report = done.stdout + done.stderr
+        self.assertIn("rc=0", report)
+        self.assertIn(f"already gone before the KILL: its child PID {child}", report)
+
+    def test_a_forced_stop_with_the_controller_already_gone_does_not_claim_it_did_not_exit(self) -> None:
+        # S3-18. Stage 1 said "the controller did not exit within 5 seconds of
+        # its runner's KILL" whatever was left; here the controller is gone and
+        # a runner survives a KILL that does not take.
+        runner, child = self._spawn_runner_with_child()
+        done = self._force_harness(
+            "timeout=1\n"
+            'kill() { case $1 in -KILL) return 0 ;; esac; command kill "$@"; }\n'
+            "rc=0; stop_wait_for_services || rc=$?\necho rc=$rc\n",
+            runner.pid, child, timeout=120,
+        )
+        report = done.stdout + done.stderr
+        self.assertIn("rc=1", report)
+        self.assertIn("graceful stop timed out after 1 seconds", report)
+        self.assertIn(f"the controller has exited; runner PID {runner.pid} is still live 5 seconds after the KILL", report)
+        self.assertNotIn("did not exit", report)
+        self.assertIn("services remained live 10 seconds after KILL; the stop failed", report)
 
     # -- scenarios against the REAL daemon (fix5 review N-S7) ------------------
     #
@@ -14583,6 +15105,121 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
             self._daemon_records(), {"daemon.pid": False, "daemon.ready": False, "ctl.sock": False}
         )
         self.assertFalse((self.real_var / "run/supervisor.pid").exists())
+        self.assertEqual(self.shell(self.lifecycle, "status").returncode, 3)
+
+    def test_real_daemon_stop_in_the_respawn_window_with_a_malformed_supervisor_record_succeeds_once(self) -> None:
+        # S3-17. With supervisor.pid malformed the supervisor was only known
+        # through supervisor.lock, so a stop in the window between the
+        # daemon's death and the respawn found no daemon, could not identify
+        # the supervisor, and refused to clean the records ("rc 1"); only a
+        # second stop, after the respawn, worked. The stop waits for the
+        # respawn (bounded by its budget), then stops the daemon and the
+        # supervisor its parent proves.
+        self._daemon_engine(None)
+        self._start_daemon()
+        self.addCleanup(self._kill_real_daemons)
+        old_daemon = self._daemon_ready_pid()
+        supervisor = self._supervisor_pid()
+        self._write_run_record("supervisor.pid", "garbage\n")
+        os.kill(old_daemon, signal.SIGKILL)
+        self._wait_for(lambda: not Path(f"/proc/{old_daemon}").exists()
+                       or "Z" in Path(f"/proc/{old_daemon}/stat").read_text().split(")")[-1][:3],
+                       "the killed daemon was not reaped", timeout=10)
+        stopped = self.shell(self.lifecycle, "stop", timeout=90)
+        report = stopped.stdout + stopped.stderr
+        self.assertEqual(stopped.returncode, 0, report)
+        time.sleep(2.5)  # past the supervisor's one-second pause: nothing may come back
+        self.assertEqual(self._daemon_pids_here(), [], report)
+        self.assertTrue(
+            not Path(f"/proc/{supervisor}").exists()
+            or "Z" in Path(f"/proc/{supervisor}/stat").read_text().split(")")[-1][:3],
+            "the supervisor outlived stop\n" + report,
+        )
+        self.assertEqual(
+            self._daemon_records(), {"daemon.pid": False, "daemon.ready": False, "ctl.sock": False}, report
+        )
+        self.assertFalse((self.real_var / "run/supervisor.pid").exists(), report)
+        self.assertEqual(self.shell(self.lifecycle, "status").returncode, 3)
+
+    def test_real_daemon_with_a_manager_rendered_realtime_profile_survives_a_kill_and_stops_clean(self) -> None:
+        # N-S7. The scenarios above run a daemon with no profile at all. This one
+        # has what a NAS has: a profile and a realtime routine rendered by the
+        # real manager (not written by hand), on the DSM-shaped roots where
+        # home, var and target are symlinks to @apphome, @appdata and @appstore,
+        # so the daemon's argv, its watcher and its core all see the aliased
+        # paths. A change reaches the core, the daemon is killed outright and
+        # respawned, a change reaches the core again, and a stop leaves nothing.
+        self._daemon_engine(None)
+        for alias in ("home", "var", "target"):
+            self.assertTrue((self.fhs / alias).is_symlink(), f"{alias} is not a symlink: the fixture is not DSM-shaped")
+        configured = self.configure("watched", self.source_one, "/home/Drive/Watched", True)
+        self.assertEqual(configured.returncode, 0, configured.stderr)
+        stored = self.shell(self.manager, "set-password", "watched", input_text="test-password\n")
+        self.assertEqual(stored.returncode, 0, stored.stderr)
+        routine = self.shell(
+            self.manager, "configure-routine", "--profile", "watched", "--enabled", "true",
+            "--action", "sync", "--mode", "realtime", "--debounce-seconds", "1",
+        )
+        self.assertEqual(routine.returncode, 0, routine.stderr)
+        fragment = self.real_home / "config/profiles.d/watched.toml"
+        self.assertIn("[profiles.watched]", fragment.read_text(encoding="utf-8"))
+        conf = self.real_home / "config/routines.d/watched.conf"
+        self.assertIn("mode=realtime", conf.read_text(encoding="utf-8"))
+        self._start_daemon()
+        self.addCleanup(self._kill_real_daemons)
+        daemon = self._daemon_ready_pid()
+        argv = [part.decode() for part in Path(f"/proc/{daemon}/cmdline").read_bytes().split(b"\0")[:-1]]
+        self.assertEqual(argv[argv.index("--home") + 1], str(self.fhs / "home"), argv)
+        self.assertEqual(argv[argv.index("--var") + 1], str(self.fhs / "var"), argv)
+
+        def scoped_syncs() -> int:
+            if not self.daemon_capture.exists():
+                return 0
+            return sum(
+                1 for line in self.daemon_capture.read_text(encoding="utf-8").splitlines()
+                if " sync " in f" {line} " and "--profile watched" in line and "--scope" in line
+            )
+
+        def change_until_synced(label: str, already: int) -> None:
+            inbox = self.source_one / label
+            inbox.mkdir(exist_ok=True)
+            deadline = time.monotonic() + 60
+            while time.monotonic() < deadline and scoped_syncs() <= already:
+                (inbox / "note.txt").write_text(f"{time.monotonic()}\n", encoding="utf-8")
+                for _ in range(40):
+                    time.sleep(0.1)
+                    if scoped_syncs() > already:
+                        return
+            self.fail(
+                f"a realtime change ({label}) did not reach the core with --scope: "
+                + bounded_file_tail(self.real_var / "log/controller.log")
+                + bounded_file_tail(self.real_var / "log/daemon-stderr.log")
+            )
+
+        change_until_synced("before", 0)
+        first = scoped_syncs()
+        # kill -9: the supervisor respawns the daemon, whose watcher re-arms.
+        os.kill(daemon, signal.SIGKILL)
+        def respawned() -> bool:
+            try:
+                ready = self._daemon_ready_pid()
+            except (OSError, ValueError):
+                return False
+            return ready != daemon and self._daemon_pids_here() == [ready]
+
+        self._wait_for(
+            respawned,
+            "no single respawned daemon\n" + bounded_file_tail(self.real_var / "log/daemon-stderr.log"),
+            timeout=40,
+        )
+        self.assertEqual(self.shell(self.lifecycle, "status").returncode, 0)
+        change_until_synced("after", first)
+        stopped = self.shell(self.lifecycle, "stop", timeout=60)
+        self.assertEqual(stopped.returncode, 0, stopped.stdout + stopped.stderr)
+        self.assertEqual(self._daemon_pids_here(), [])
+        self.assertEqual(
+            self._daemon_records(), {"daemon.pid": False, "daemon.ready": False, "ctl.sock": False}
+        )
         self.assertEqual(self.shell(self.lifecycle, "status").returncode, 3)
 
     def test_real_daemon_is_seen_without_flock_and_the_shell_engine_steps_aside(self) -> None:
@@ -19229,9 +19866,9 @@ fi
         lifecycle_source = self.lifecycle.read_text(encoding="utf-8")
         self.assertEqual(
             lifecycle_source.count(
-                '                    exact_controller_process_status "$saved_pid" '
+                '                exact_controller_process_status "$saved_pid" '
                 '"$saved_controller_start" \\\n'
-                '                        "$saved_controller_boot" || '
+                '                    "$saved_controller_boot" || '
                 "controller_wait_status=$?"
             ),
             1,
@@ -23382,25 +24019,71 @@ fi
         self.assertNotEqual(refused.returncode, 0, refused.stdout)
         self.assertIn("unsafe", refused.stdout + refused.stderr)
 
+    #: Event names the controller log carries that are not a literal in the shape
+    #: src/daemon writes them in: built dynamically by the daemon, or written by
+    #: the lifecycle and controller shell.
+    SHELL_OR_DYNAMIC_EVENT_NAMES = frozenset({
+        "consumer_stderr", "routine_backend",
+        "daemon_lock_probe", "routine_watch_pid_mismatch", "service_stop_forced",
+        # fix7: the controller's own, written by the shell.
+        "poll_scratch_leftover_removed", "poll_scratch_leftover_unremovable",
+        "routine_watch_orphan_stopped", "routine_watch_orphan_unstoppable",
+        "routine_watch_guard_unavailable",
+    })
+
+    @staticmethod
+    def daemon_event_names_from_source() -> set[str]:
+        """The event names src/daemon logs, read from its string literals.
+
+        Files: src/daemon/*.rs except *_tests.rs and testkit.rs, each cut at its
+        inline test module (the first column-0 #[cfg(test)] whose next
+        non-attribute line starts with `mod `). A name is a literal
+        "[a-z][a-z0-9]*(_[a-z0-9]+)+" that is the argument right after
+        `Level::<Name>,`, or the second argument after it with a lowercase
+        category between, or the value of an `event:` field.
+        """
+        literal = r'"([a-z][a-z0-9]*(?:_[a-z0-9]+)+)"'
+        category = r'"[a-z]+"'
+        names: set[str] = set()
+        for path in sorted((REPOSITORY / "src/daemon").glob("*.rs")):
+            if path.name.endswith("_tests.rs") or path.name == "testkit.rs":
+                continue
+            text = path.read_text(encoding="utf-8")
+            inline_tests = re.search(r"^#\[cfg\(test\)\]\s*\n(?:#\[[^\n]*\]\s*\n)*mod ", text, re.M)
+            if inline_tests:
+                text = text[: inline_tests.start()]
+            for pattern in (
+                r"Level::\w+,\s*" + category + r"\s*,\s*" + literal,
+                r"Level::\w+,\s*" + literal,
+                r"\bevent:\s*" + literal,
+            ):
+                names.update(match.group(1) for match in re.finditer(pattern, text))
+        return names
+
     def test_controller_log_readers_accept_every_event_name_the_daemon_writes(self) -> None:
         # The daemon writes event names the shell never did. Neither the shell
         # writer nor the Logs read allowlists names; this pins that, so a reader
-        # that learned an allowlist later cannot silently drop them.
-        names = [
+        # that learned an allowlist later cannot silently drop them. The list is
+        # derived from the string literals in src/daemon, so a new event is
+        # exercised without anyone remembering to add it, and a renamed or
+        # removed one fails here instead of leaving a stale name.
+        derived = self.daemon_event_names_from_source()
+        self.assertGreater(len(derived), 60, "the derivation found too few events; the literal shapes changed")
+        previously_listed = [
             "service_superseded", "service_records_removed", "service_records_kept",
             "daemon_stderr_unavailable", "api_socket_stale_removed", "api_socket_stale_kept",
             "api_server_unwaitable", "audit_unavailable", "consumer_unkillable",
-            "consumer_stderr", "config_unreadable", "event_log_lock_stale",
+            "config_unreadable", "event_log_lock_stale",
             "event_log_rotation_failed", "ctl_accept_failed",
-            # fix6: the daemon's, and the lifecycle's own (daemon_lock_probe
-            # names the probe in use; routine_watch_pid_mismatch a wrapped PID).
             "control_file_unremovable", "event_log_rotation_deferred", "profile_state_unreadable",
             "config_forgotten", "service_degraded", "service_degraded_cleared",
             "api_server_respawn_held", "api_server_respawn_released",
-            "api_server_identity_unavailable", "daemon_lock_probe", "routine_watch_pid_mismatch",
+            "api_server_identity_unavailable",
             "ctl_peer_gone", "ctl_peer_unchecked", "ctl_reply_dropped", "ctl_socket_option_failed",
-            "routine_backend", "service_stop_forced",
         ]
+        stale = [name for name in previously_listed if name not in derived]
+        self.assertEqual(stale, [], f"events the test used to cover are no longer written by src/daemon: {stale}")
+        names = sorted(derived | self.SHELL_OR_DYNAMIC_EVENT_NAMES)
         helper = self.root / "daemon-events-helper.sh"
         helper.write_text(
             "#!/bin/sh\nset -eu\n"
@@ -23415,13 +24098,13 @@ fi
         helper.chmod(0o755)
         if os.getuid() == 0:
             os.chown(helper, self.drop_uid, self.drop_gid)
-        written = self.shell(helper)
+        written = self.shell(helper, timeout=240)
         self.assertEqual(written.returncode, 0, written.stdout + written.stderr)
-        result, payload = self.api("logs", "--source", "controller", "--lines", "100")
+        result, payload = self.api("logs", "--source", "controller", "--lines", str(len(names) + 50))
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         text = "\n".join(payload["logs"][0]["lines"])
-        for name in names:
-            self.assertIn(f'"event":"{name}"', text, name)
+        missing = [name for name in names if f'"event":"{name}"' not in text]
+        self.assertEqual(missing, [], f"events written but not returned by api logs: {missing}\n{text[:2000]}")
 
     def test_free_text_request_id_is_never_read_as_a_request_tag(self) -> None:
         # ADV-B-5, writer half. A run's error line naming a file such as

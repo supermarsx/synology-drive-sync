@@ -4342,6 +4342,38 @@ api_routine_json() {
         "$routine_next" "$routine_last_success" "$routine_last_poll"
 }
 
+# 0 when daemon.ready names a daemon that is still that process (the in-process
+# rung's `daemon_identity`): a package-owned 0600 single-link file of at most 96
+# bytes holding exactly pid, start tick and boot id, the current boot, and a PID
+# that answers kill -0 with that start tick. Sets snapshot_daemon_pid. 1 for no
+# record, one that is not that, or a process that is gone -- the shell
+# controller's proof is asked next, as it is in-process.
+snapshot_daemon_live() {
+    snapshot_daemon_pid=
+    snapshot_ready_file=$runtime_root/daemon.ready
+    [ -f "$snapshot_ready_file" ] && [ ! -L "$snapshot_ready_file" ] || return 1
+    snapshot_ready_meta=$(stat -c '%u:%a:%h:%s' "$snapshot_ready_file" 2>/dev/null) || return 1
+    case $snapshot_ready_meta in "$path_owner":600:1:*) ;; *) return 1 ;; esac
+    snapshot_ready_size=${snapshot_ready_meta##*:}
+    case $snapshot_ready_size in ''|*[!0-9]*) return 1 ;; esac
+    [ "$snapshot_ready_size" -le 96 ] || return 1
+    snapshot_ready_pid= snapshot_ready_start= snapshot_ready_boot= snapshot_ready_extra=
+    {
+        IFS= read -r snapshot_ready_pid || return 1
+        IFS= read -r snapshot_ready_start || return 1
+        IFS= read -r snapshot_ready_boot || return 1
+        ! IFS= read -r snapshot_ready_extra || return 1
+    } 2>/dev/null < "$snapshot_ready_file" || return 1
+    is_pid "$snapshot_ready_pid" || return 1
+    case $snapshot_ready_start in ''|*[!0-9]*|0) return 1 ;; esac
+    valid_boot_identity "$snapshot_ready_boot" || return 1
+    snapshot_current_boot=$(boot_identity 2>/dev/null) || return 1
+    [ "$snapshot_current_boot" = "$snapshot_ready_boot" ] || return 1
+    kill -0 "$snapshot_ready_pid" 2>/dev/null || return 1
+    [ "$(process_start_time "$snapshot_ready_pid" 2>/dev/null || true)" = "$snapshot_ready_start" ] || return 1
+    snapshot_daemon_pid=$snapshot_ready_pid
+}
+
 api_snapshot() {
     [ "$#" -eq 0 ] || api_error invalid_request "snapshot accepts no arguments" 64
     # Kept ahead of the cache so a corrupt policy still fails the request in
@@ -4352,7 +4384,10 @@ api_snapshot() {
     generated_epoch=$(epoch_now)
     case $generated_epoch in ''|*[!0-9]*) api_error unavailable "system clock is unavailable" 69 ;; esac
     service_pid=0 service_state=stopped
-    if [ -e "$controller_pid_file" ] || [ -L "$controller_pid_file" ]; then
+    if snapshot_daemon_live; then
+        # The daemon engine: daemon.ready names the exact process.
+        service_pid=$snapshot_daemon_pid service_state=running
+    elif [ -e "$controller_pid_file" ] || [ -L "$controller_pid_file" ]; then
         [ ! -L "$controller_pid_file" ] && [ -f "$controller_pid_file" ] || api_error unsafe_state "unsafe controller PID file" 73
         service_pid=$(read_pid "$controller_pid_file" 2>/dev/null || true)
         [ -n "$service_pid" ] || api_error corrupt_state "controller PID file is malformed" 73
@@ -4379,7 +4414,10 @@ api_snapshot() {
     # small documents that an operator can rewrite in place -- sampling only a
     # boundary line cannot see an edit that leaves the last line alone, and the
     # whole set is a few kilobytes against the ~1000 spawns being removed.
+    # controller.degraded is served only while the service is running (S3-3), so
+    # the document differs by that state and the two are cached apart.
     snapshot_cache_key=snapshot
+    [ "$service_state" != running ] || snapshot_cache_key=snapshot-running
     snapshot_cache_flight=false
     snapshot_cache_usable=true
     # The private roots are fingerprinted too. Their identity decides
@@ -4450,12 +4488,21 @@ api_snapshot() {
     controller_degraded_json=
     if [ -n "$controller_degraded$controller_degraded_since$controller_degraded_cause" ]; then
         case $controller_degraded in ''|*[!a-z_]*) api_error corrupt_state "invalid controller degraded reason" 73 ;; esac
-        case $controller_degraded_since in ''|*[!0-9]*) api_error corrupt_state "invalid controller degraded_since" 73 ;; esac
+        # A JSON number has no leading zeros (007 would make the document
+        # invalid), and the in-process rung refuses both of these, so this one does.
+        case $controller_degraded_since in ''|*[!0-9]*|0[0-9]*) api_error corrupt_state "invalid controller degraded_since" 73 ;; esac
         [ -n "$controller_degraded_cause" ] || api_error corrupt_state "controller degraded_cause is missing or empty" 73
         controller_degraded_cause_bytes=$(printf '%s' "$controller_degraded_cause" | wc -c | tr -d ' ')
         [ "$controller_degraded_cause_bytes" -le 512 ] || api_error corrupt_state "controller degraded_cause exceeds its safe bound" 73
-        controller_degraded_json=$(printf ',"degraded":{"reason":%s,"since_epoch":%s,"cause":%s}' \
-            "$(json_quote "$controller_degraded")" "$controller_degraded_since" "$(json_quote "$controller_degraded_cause")")
+        valid_utf8 "$controller_degraded_cause" || api_error corrupt_state "controller degraded_cause is not valid UTF-8" 73
+        # The set is validated whatever the service is doing. It is served only
+        # while the service this document reports is running: after kill -9 the
+        # daemon cannot take back the block it left, and the dashboard would stay
+        # amber for a service that is not there. (The in-process rung, the same.)
+        if [ "$service_state" = running ]; then
+            controller_degraded_json=$(printf ',"degraded":{"reason":%s,"since_epoch":%s,"cause":%s}' \
+                "$(json_quote "$controller_degraded")" "$controller_degraded_since" "$(json_quote "$controller_degraded_cause")")
+        fi
     fi
     api_load_kv "$run_state" state never; run_status=$kv_value
     api_load_kv "$run_state" started_epoch 0; run_started=$kv_value
