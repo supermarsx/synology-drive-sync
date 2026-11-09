@@ -478,6 +478,17 @@ lists its own commits.
   longer describe only their commonest cause, a failed weekly sweep no longer calls an unreadable age
   "older than 7 days", and a failed compaction or an index not served this run (`pair-index-compaction-failed`,
   `pair-index-link-guard-unchecked`) are now said on the profile's index line instead of being dropped.
+- **The control socket cannot be starved by a client that never sends a request.** When 128 connections are
+  waiting to send their request, the oldest is dropped (told `ctl_busy`, logged once per episode as
+  `ctl_unread_evicted`) instead of the new one being refused, so `ping` and `stop` are served during a
+  reconnect flood. `stop` has two slots of its own; waiting stops no longer fill the slots `ping` and `status`
+  use. Connections that send nothing are logged once per episode (`ctl_empty_requests_ended` carries the count).
+- **Backend reports are logged once per cause.** `routine_backend` no longer writes a line per reading for a
+  polling tree whose skipped entries change every time; the report that ends the episode carries
+  `suppressed_reports=N`. `backend_detail` keeps the end of a long detail (`next_walk_deadline_seconds=N`).
+- **A busy walk cap is not an unwalkable tree.** While the process-wide walk cap refuses a routine's arm it
+  reports `backend=none` (nothing watches or polls it), a second episode is reported, and the start-up
+  catch-up waits its turn (`catch_up=deferred`, staggered by routine) instead of syncing the whole tree.
 
 ## Questions only a real NAS can answer
 

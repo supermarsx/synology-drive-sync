@@ -34,7 +34,8 @@ use std::time::{Duration, Instant};
 use serde_json::{Value, json};
 
 use super::changes::{
-    ArmSpec, ChangeEvent, ChangeSink, ChangeSource, ChangeSourceFactory, DirtySet,
+    Admit, ArmSpec, BackendReports, ChangeEvent, ChangeSink, ChangeSource, ChangeSourceFactory,
+    DirtySet, bound_detail,
 };
 use super::events::{ActivityRow, EventSink, LogEvent};
 use super::executor::{
@@ -285,8 +286,11 @@ struct Entry {
     source: SourceStatus,
     backend: Option<(Backend, BackendReason)>,
     /// The change source's last account of the backend (N-D5): its cause,
-    /// one line, at most 240 bytes. Cleared when the routine is re-armed.
+    /// one line, at most 240 bytes (the tail is kept). Cleared when the routine
+    /// is re-armed.
     backend_detail: Option<String>,
+    /// Which backend reports were logged and which counted (S3-12).
+    backend_reports: BackendReports,
     /// What the change source is watching for this routine, if anything.
     armed: Option<ArmSpec>,
     /// When the safety-net whole-tree run is next due (design §2.3: inotify
@@ -1222,6 +1226,7 @@ impl Control {
                 source: SourceStatus::Ok,
                 backend: None,
                 backend_detail: None,
+                backend_reports: BackendReports::default(),
                 armed: None,
                 full_due: None,
             });
@@ -1283,6 +1288,7 @@ impl Control {
                         }
                         entry.armed = Some(wanted);
                         entry.backend_detail = None;
+                        self.end_backend_episode(&name, &mut entry);
                     }
                     (None, Some(_)) => {
                         if let Some(changes) = self.changes.as_mut() {
@@ -1290,6 +1296,7 @@ impl Control {
                         }
                         entry.armed = None;
                         entry.backend_detail = None;
+                        self.end_backend_episode(&name, &mut entry);
                         entry.dirty = DirtySet::default();
                     }
                     (None, None) => {}
@@ -2863,16 +2870,36 @@ impl Control {
 
     // ------------------------------------------------------------ changes
 
+    /// A routine was re-armed or disarmed: its backend episode is over, and
+    /// the reports it did not log are said now (S3-12).
+    fn end_backend_episode(&mut self, name: &str, entry: &mut Entry) {
+        if let Some((backend, reason, suppressed)) = entry.backend_reports.end() {
+            self.log(
+                Level::Info,
+                "scheduler",
+                "routine_backend",
+                format!(
+                    "profile={name} backend={} reason={} suppressed_reports={suppressed} \
+                     episode_ended=rearmed",
+                    backend.as_str(),
+                    reason.as_str()
+                ),
+            );
+        }
+    }
+
     fn change(&mut self, event: ChangeEvent) {
         let now = Instant::now();
         // N-D5: the backend's cause is carried into `ctl status`
-        // (`backend_detail`), whatever the log below makes of the report.
+        // (`backend_detail`), whatever the log below makes of the report. Cut
+        // at 240 bytes with its tail kept: `next_walk_deadline_seconds` is
+        // near the end (S3-12).
         if let ChangeEvent::Backend {
             routine, detail, ..
         } = &event
             && let Some(entry) = self.routines.get_mut(routine)
         {
-            let detail = sanitize_detail(detail.trim(), 240);
+            let detail = bound_detail(&sanitize_detail(detail.trim(), usize::MAX), 240);
             entry.backend_detail = (!detail.is_empty()).then_some(detail);
         }
         match event {
@@ -2906,21 +2933,36 @@ impl Control {
                 // entries skipped), and that account is the one thing the log
                 // carries: logging on (backend, reason) alone dropped
                 // `walk_deadline_exceeded`, the token the dashboard points at.
-                let known = self.routines.get_mut(&routine).map(|entry| {
+                // S3-12: one cause is one episode. A source whose account
+                // changes on every reading (the skipped entries of a polling
+                // tree) logs the first report, counts the rest, and the report
+                // that ends the episode says how many it did not log.
+                let admitted = self.routines.get_mut(&routine).map(|entry| {
                     entry.backend.replace((backend, reason));
+                    entry.backend_reports.admit(backend, reason, &detail)
                 });
-                if known.is_some() {
+                if let Some(Admit::Log { previous }) = admitted {
                     let level = if reason == BackendReason::Ok {
                         Level::Info
                     } else {
                         Level::Warn
                     };
+                    let ended = previous
+                        .map(|(b, r, suppressed)| {
+                            format!(
+                                "; suppressed_reports={suppressed} previous_backend={} \
+                                 previous_reason={}",
+                                b.as_str(),
+                                r.as_str()
+                            )
+                        })
+                        .unwrap_or_default();
                     self.log(
                         level,
                         "scheduler",
                         "routine_backend",
                         format!(
-                            "profile={routine} backend={} reason={} {detail}",
+                            "profile={routine} backend={} reason={} {detail}{ended}",
                             backend.as_str(),
                             reason.as_str()
                         ),

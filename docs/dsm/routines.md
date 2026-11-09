@@ -96,7 +96,7 @@ for a copy to settle. A vanished entry or an unreadable subdirectory is a named 
 and every walk has a deadline. Editing a realtime profile's source or excludes replaces the watch
 (`routine_rearmed`). When the daemon starts, and when the native watch is armed again, it syncs the
 whole tree once if the source changed after the last success. The controller log carries
-`routine_backend` (every change of backend, with the cause), `routine_watch_notice` (named skips)
+`routine_backend` (a change of backend or cause; a run of reports with one cause is one line, and the report that ends it counts the others as `suppressed_reports=N`), `routine_watch_notice` (named skips)
 and `routine_rearmed`. A healthy native watch has a safety-net floor: a stat-only reading of the tree every
 min(the routine's poll interval, 1 hour), and never more often than once a minute. A directory that changed without an
 inotify event is synced and named (`watch_missed_change dirs=N first=… floor_seconds=…`, `warn`, under
@@ -134,11 +134,18 @@ routine stays amber (`watch_setup_failed`) and the whole tree is synced at most 
 (every poll interval if that is longer, and at most hourly); a tree that cannot be walked is
 expensive to sync, so it is not synced once a minute, and what the poller has learned (the grown
 deadline, when the tree was last synced whole) survives the daemon's native-watch retries. Every
-backend report is logged as a `routine_backend` line, so the growth is in `controller.log`.
+new backend account is logged as a `routine_backend` line (a polling tree whose skipped entries change on every reading is one episode, not a line per reading), so the growth is in `controller.log`.
 Disarming a routine ends its walk at once (the floor's walks too), and the process runs at most 16
 directory walks at a time. A walk refused by that cap is named as the cap (`walk_cap`: other
 routines are arming, or walks abandoned on a stalled disk have not returned) and is tried again
-within 15 seconds, not after the 10-minute polling backoff. If the kernel drops
+within 15 seconds, not after the 10-minute polling backoff. While the cap refuses the arm nothing
+watches or polls the tree, so the routine reports `backend=none` with `reason=watch_setup_failed`
+(not `polling`), and a second cap episode after a successful arm is reported again. The start-up
+catch-up walk is refused the same way: it is named (`catch_up=deferred cause=walk_cap`), asked for
+again after about 15 to 30 seconds (staggered by routine name, so routines refused together do not
+return together) and does not sync the whole tree for it; `catch_up=resumed` says when it went
+through. Only a cap that refuses for 10 minutes ends in a whole-tree sync, named
+(`catch_up=whole_tree cause=walk_cap`). If the kernel drops
 events (`IN_Q_OVERFLOW`), the watcher re-walks the tree to restore its watches and reports that the whole
 tree must be treated as changed, so a run is triggered. The watcher keeps about 6 MiB of
 memory at 20,000 directories and about 16 MiB at 100,000. A directory created while watching is added to
@@ -219,7 +226,8 @@ not infer native realtime support from the requested `mode=realtime` alone.
 
 Under the daemon engine, `sdsync-dsm-api --ctl status` carries the cause behind the reason: each entry of
 `routines` has `backend_detail`, the detail of the routine's latest backend report (at most 240 bytes,
-`null` when there is none, cleared when the routine is armed or disarmed), and every report is also a
+with the end kept and the middle cut: `next_walk_deadline_seconds=N` survives; `null` when there is
+none, cleared when the routine is armed or disarmed), and each new cause is also a
 `routine_backend` line in `controller.log`.
 
 ## Retry and backoff
