@@ -143,6 +143,8 @@ pub struct TreeWatch {
     limit_note: Option<String>,
     deadline: Duration,
     reader: Arc<dyn DirReader>,
+    /// Set by the owner to end a walk in progress (the routine was disarmed).
+    stop: Option<Arc<AtomicBool>>,
 }
 
 /// Every mask bit the tree asks for. `IN_ONLYDIR` and `IN_DONT_FOLLOW` make a directory replaced
@@ -286,13 +288,24 @@ fn walk(
 impl TreeWatch {
     /// Watch `root` and every directory beneath it that the filter does not exclude.
     pub fn arm(root: &Path, options: WatchOptions) -> Result<Self, WatchError> {
-        Self::arm_with(root, options, Arc::new(FsReader))
+        Self::arm_with(root, options, Arc::new(FsReader), None)
+    }
+
+    /// [`TreeWatch::arm`], with every walk (the arming and each later one) ended as soon as
+    /// `stop` is set: a routine disarmed mid-walk does not keep walking until the deadline.
+    pub fn arm_until(
+        root: &Path,
+        options: WatchOptions,
+        stop: Arc<AtomicBool>,
+    ) -> Result<Self, WatchError> {
+        Self::arm_with(root, options, Arc::new(FsReader), Some(stop))
     }
 
     pub(crate) fn arm_with(
         root: &Path,
         options: WatchOptions,
         reader: Arc<dyn DirReader>,
+        stop: Option<Arc<AtomicBool>>,
     ) -> Result<Self, WatchError> {
         let (budget, limit_note) = match options.limit {
             LimitPolicy::Unchecked => (
@@ -366,6 +379,7 @@ impl TreeWatch {
             limit_note,
             deadline: options.setup_deadline,
             reader,
+            stop,
         };
         tree.rewalk()?;
         Ok(tree)
@@ -597,6 +611,11 @@ impl TreeWatch {
     /// nothing can interrupt it. The thread is abandoned, not killed: it notices the cancellation
     /// when its call returns, if it ever does, and releases what it armed.
     fn walk_bounded(&self, starts: Vec<Start>, already: u64) -> Result<Vec<Walked>, WatchError> {
+        // H9: abandoned walks are capped process-wide, shared with the daemon's other walks.
+        let slot = super::walk_slot().map_err(|live| WatchError::WalkCap {
+            path: self.root.clone(),
+            live,
+        })?;
         let (sender, receiver) = mpsc::channel();
         let cancel = Arc::new(AtomicBool::new(false));
         let progress = Arc::new(Mutex::new(
@@ -614,6 +633,7 @@ impl TreeWatch {
         std::thread::Builder::new()
             .name("sdsync-watch-walk".to_owned())
             .spawn(move || {
+                let _slot = slot;
                 let result = walk(
                     &inotify,
                     mask,
@@ -638,7 +658,36 @@ impl TreeWatch {
                 path: self.root.clone(),
                 detail: format!("cannot start the directory walk: {error}"),
             })?;
-        match receiver.recv_timeout(self.deadline) {
+        let give_up_at = std::time::Instant::now() + self.deadline;
+        let waited = loop {
+            let left = give_up_at.saturating_duration_since(std::time::Instant::now());
+            // H9: the owner's stop is looked at while the walk runs.
+            if self
+                .stop
+                .as_ref()
+                .is_some_and(|stop| stop.load(Ordering::SeqCst))
+            {
+                cancel.store(true, Ordering::Release);
+                return Err(WatchError::Setup {
+                    path: self.root.clone(),
+                    detail: "the watch was stopped during its directory walk".to_owned(),
+                });
+            }
+            if left.is_zero() {
+                break Err(mpsc::RecvTimeoutError::Timeout);
+            }
+            let slice = if self.stop.is_some() {
+                left.min(Duration::from_millis(100))
+            } else {
+                left
+            };
+            match receiver.recv_timeout(slice) {
+                Ok(result) => break Ok(result),
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(disconnected) => break Err(disconnected),
+            }
+        };
+        match waited {
             Ok(result) => result,
             Err(mpsc::RecvTimeoutError::Timeout) => {
                 cancel.store(true, Ordering::Release);
@@ -863,6 +912,7 @@ mod tests {
                 setup_deadline: deadline,
             },
             reader,
+            None,
         )
         .err()
         .expect("a blocked walk must not arm");
@@ -886,6 +936,53 @@ mod tests {
             "{line}"
         );
         assert!(line.ends_with("stuck/slow"), "{line}");
+        let _ = release.send(());
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// H9: a watch stopped while its walk is blocked ends at once, not at the
+    /// (possibly long, grown) deadline; the abandoned walk is cancelled.
+    #[test]
+    fn a_stop_during_a_blocked_walk_ends_the_arm_at_once() {
+        let root = std::env::temp_dir().join(format!(
+            "sdsync-watch-stop-{}-{}",
+            std::process::id(),
+            Instant::now().elapsed().as_nanos()
+        ));
+        std::fs::create_dir_all(root.join("stuck/slow/below")).unwrap();
+        let (release, receiver) = mpsc::channel();
+        let reader = Arc::new(BlockedReader {
+            release: Mutex::new(receiver),
+        });
+        let stop = Arc::new(AtomicBool::new(false));
+        let stopper = {
+            let stop = Arc::clone(&stop);
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(300));
+                stop.store(true, Ordering::SeqCst);
+            })
+        };
+        let started = Instant::now();
+        let failure = TreeWatch::arm_with(
+            &root,
+            WatchOptions {
+                filter: Filter::build(&root, Vec::new()).unwrap(),
+                events: EventSet::all(),
+                limit: LimitPolicy::Unchecked,
+                setup_deadline: Duration::from_secs(60),
+            },
+            reader,
+            Some(stop),
+        )
+        .err()
+        .expect("a stopped walk must not arm");
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "{:?}",
+            started.elapsed()
+        );
+        assert!(failure.to_string().contains("stopped during"), "{failure}");
+        stopper.join().unwrap();
         let _ = release.send(());
         std::fs::remove_dir_all(&root).unwrap();
     }

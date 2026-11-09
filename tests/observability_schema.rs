@@ -652,6 +652,25 @@ fn schema_event_reasons_match_the_core_enum_exactly() {
     assert_eq!(published, core);
 }
 
+/// The published verified-pair index issue codes and the core's vocabulary are one list, so a
+/// condition the index names cannot reach a result a schema validator would refuse.
+#[test]
+fn schema_pair_index_issue_codes_match_the_core_vocabulary_exactly() {
+    let schema: Value = serde_json::from_str(SCHEMA_TEXT).expect("schema must be valid JSON");
+    let published =
+        schema["$defs"]["pairIndex"]["properties"]["issues"]["items"]["properties"]["code"]["enum"]
+            .as_array()
+            .expect("pair-index issue codes are an enum")
+            .iter()
+            .map(|value| value.as_str().expect("codes are strings").to_owned())
+            .collect::<Vec<_>>();
+    let core = synology_drive_sync::pair_index::ISSUE_CODES
+        .iter()
+        .map(|code| (*code).to_owned())
+        .collect::<Vec<_>>();
+    assert_eq!(published, core);
+}
+
 /// The published event-code vocabulary and the core's closed enum are one list, in either
 /// direction, so a new event cannot reach a log a schema validator would refuse.
 #[test]

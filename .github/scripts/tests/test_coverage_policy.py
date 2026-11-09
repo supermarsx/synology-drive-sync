@@ -171,7 +171,7 @@ class CoveragePolicyTests(unittest.TestCase):
         config = root / ".config"
         config.mkdir(exist_ok=True)
         (config / "coverage.env").write_text(
-            "RUST_TOOLCHAIN=1.88.0\n"
+            "RUST_TOOLCHAIN=1.90.0\n"
             "CARGO_LLVM_COV_VERSION=0.9.0\n"
             "COVERAGE_MIN_LINES=90\n"
             "COVERAGE_MIN_LINES=1\n"

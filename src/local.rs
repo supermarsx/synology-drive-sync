@@ -70,6 +70,48 @@ pub fn file_identity(_metadata: &fs::Metadata) -> FileIdentity {
     FileIdentity::default()
 }
 
+/// A file's modification and status-change times in nanoseconds, where the platform exposes both.
+///
+/// The status-change time (`st_ctime`) is the fact that makes stored evidence about a file safe to
+/// reuse: `write(2)`, `truncate(2)`, `rename(2)` onto the path and `utimes(2)` all set it to "now",
+/// and no unprivileged call can set it back. An in-place rewrite that restores the modification
+/// time afterwards (`touch -r`, `cp -p`, `rsync --inplace -t`) therefore keeps size, mtime and
+/// inode and still moves this. A verified-pair record keyed without it served a stale digest for
+/// exactly that edit (perf-design §2.1, case L1).
+///
+/// Both are zero where the platform exposes no status-change time (Windows `symlink_metadata`, and
+/// directories, which are never content-compared). [`Self::is_known`] is then false, and nothing
+/// may be inferred from two unknown values comparing equal.
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
+pub struct ChangeTimes {
+    pub mtime_ns: i64,
+    pub ctime_ns: i64,
+}
+
+impl ChangeTimes {
+    pub fn is_known(self) -> bool {
+        self.ctime_ns != 0
+    }
+}
+
+/// Read the nanosecond times out of metadata the caller already holds. Unix only; see
+/// [`ChangeTimes`].
+#[cfg(unix)]
+pub fn change_times(metadata: &fs::Metadata) -> ChangeTimes {
+    use std::os::unix::fs::MetadataExt as _;
+    let nanos =
+        |seconds: i64, nanos: i64| seconds.saturating_mul(1_000_000_000).saturating_add(nanos);
+    ChangeTimes {
+        mtime_ns: nanos(metadata.mtime(), metadata.mtime_nsec()),
+        ctime_ns: nanos(metadata.ctime(), metadata.ctime_nsec()),
+    }
+}
+
+#[cfg(not(unix))]
+pub fn change_times(_metadata: &fs::Metadata) -> ChangeTimes {
+    ChangeTimes::default()
+}
+
 #[derive(Clone, Debug)]
 pub struct LocalEntry {
     pub relative: String,
@@ -80,6 +122,8 @@ pub struct LocalEntry {
     /// Device and inode, where the platform exposes them. Default elsewhere, and default for
     /// directories, which are never content-compared.
     pub identity: FileIdentity,
+    /// Nanosecond mtime and ctime, where the platform exposes them. See [`ChangeTimes`].
+    pub times: ChangeTimes,
     pub content_md5: Option<ContentMd5>,
 }
 
@@ -893,6 +937,7 @@ pub fn entry_at(root: &Path, relative: &str) -> Result<Option<LocalEntry>> {
             size: 0,
             mtime_ms: 0,
             identity: FileIdentity::default(),
+            times: Default::default(),
             content_md5: None,
         }));
     }
@@ -923,6 +968,7 @@ pub fn entry_at(root: &Path, relative: &str) -> Result<Option<LocalEntry>> {
         size: metadata.len(),
         mtime_ms,
         identity: file_identity(&metadata),
+        times: change_times(&metadata),
         kind: EntryKind::File,
         full_path,
         content_md5: None,
@@ -1097,7 +1143,11 @@ where
     H: FingerprintHasher,
     F: FnMut(&mut H, &[u8]),
 {
-    verify_entry_snapshot(entry)?;
+    // Before the open, ctime is not compared: a file made unreadable since the scan (chmod moves
+    // ctime) must still be reported by its open failure, the lasting permission deferral, rather
+    // than as a transient change. The open handle's check just below compares it before the
+    // first byte is read, so the read is bracketed by ctime all the same.
+    verify_entry_snapshot_without_ctime(entry)?;
     let mut file = fs::File::open(&entry.full_path).map_err(|source| Error::FileIo {
         path: entry.full_path.clone(),
         source,
@@ -1139,6 +1189,14 @@ impl FingerprintHasher for Md5ContentHasher {
 }
 
 fn verify_entry_snapshot(entry: &LocalEntry) -> Result<()> {
+    verify_entry_snapshot_with(entry, true)
+}
+
+fn verify_entry_snapshot_without_ctime(entry: &LocalEntry) -> Result<()> {
+    verify_entry_snapshot_with(entry, false)
+}
+
+fn verify_entry_snapshot_with(entry: &LocalEntry, compare_ctime: bool) -> Result<()> {
     let metadata = fs::symlink_metadata(&entry.full_path).map_err(|source| Error::FileIo {
         path: entry.full_path.clone(),
         source,
@@ -1146,7 +1204,7 @@ fn verify_entry_snapshot(entry: &LocalEntry) -> Result<()> {
     if is_link_or_reparse(&entry.full_path, &metadata) {
         return Err(Error::SourceChanged(entry.full_path.clone()));
     }
-    verify_metadata_snapshot(entry, &metadata)
+    verify_metadata_snapshot_with(entry, &metadata, compare_ctime)
 }
 
 fn verify_open_snapshot(entry: &LocalEntry, file: &fs::File) -> Result<()> {
@@ -1158,6 +1216,14 @@ fn verify_open_snapshot(entry: &LocalEntry, file: &fs::File) -> Result<()> {
 }
 
 fn verify_metadata_snapshot(entry: &LocalEntry, metadata: &fs::Metadata) -> Result<()> {
+    verify_metadata_snapshot_with(entry, metadata, true)
+}
+
+fn verify_metadata_snapshot_with(
+    entry: &LocalEntry,
+    metadata: &fs::Metadata,
+    compare_ctime: bool,
+) -> Result<()> {
     let modified = metadata.modified().map_err(|source| Error::FileIo {
         path: entry.full_path.clone(),
         source,
@@ -1167,6 +1233,12 @@ fn verify_metadata_snapshot(entry: &LocalEntry, metadata: &fs::Metadata) -> Resu
         .ok()
         .and_then(|duration| i64::try_from(duration.as_millis()).ok());
     if !metadata.is_file() || metadata.len() != entry.size || millis != Some(entry.mtime_ms) {
+        return Err(Error::SourceChanged(entry.full_path.clone()));
+    }
+    // "Unchanged during the read" includes the status-change time where it is known, so a digest
+    // taken under these checks is evidence about exactly the ctime it is recorded with. A rewrite
+    // that restores size and mtime moves ctime (see [`ChangeTimes`]).
+    if compare_ctime && entry.times.is_known() && change_times(metadata) != entry.times {
         return Err(Error::SourceChanged(entry.full_path.clone()));
     }
     Ok(())
@@ -1437,6 +1509,7 @@ fn scan_dir(
                     size: 0,
                     mtime_ms: 0,
                     identity: FileIdentity::default(),
+                    times: Default::default(),
                     content_md5: None,
                 },
                 context.budget,
@@ -1486,6 +1559,7 @@ fn scan_dir(
                         size: metadata.len(),
                         mtime_ms,
                         identity: file_identity(&metadata),
+                        times: change_times(&metadata),
                         content_md5: None,
                     },
                     context.budget,
@@ -1779,6 +1853,45 @@ mod tests {
     use std::io::Write;
 
     use super::*;
+
+    /// perf-design §2.1, case L1: one byte rewritten in place with the mtime put back keeps size,
+    /// mtime and inode, and still moves ctime, which the snapshot check now compares.
+    #[cfg(unix)]
+    #[test]
+    fn an_in_place_rewrite_with_its_mtime_restored_is_seen_through_ctime() {
+        let directory = std::env::temp_dir().join(format!(
+            "sdsync-ctime-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("file.bin");
+        fs::write(&path, b"0123456789").unwrap();
+        let rules = IgnoreRules::build(&directory, &[]).unwrap();
+        let inventory = scan(&directory, &rules, &CancellationToken::default()).unwrap();
+        let entry = inventory.entries["file.bin"].clone();
+        assert!(entry.times.is_known() && entry.identity.is_known());
+        let modified = fs::metadata(&path).unwrap().modified().unwrap();
+        // The status-change clock must tick past the scan's value.
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let mut file = fs::OpenOptions::new().write(true).open(&path).unwrap();
+        file.write_all(b"X").unwrap();
+        file.set_modified(modified).unwrap();
+        drop(file);
+        let metadata = fs::metadata(&path).unwrap();
+        assert_eq!(metadata.len(), entry.size);
+        assert_eq!(file_identity(&metadata), entry.identity);
+        assert_eq!(change_times(&metadata).mtime_ns, entry.times.mtime_ns);
+        assert_ne!(change_times(&metadata).ctime_ns, entry.times.ctime_ns);
+        assert!(matches!(
+            hash_file_md5_snapshot(&entry, &CancellationToken::default()),
+            Err(Error::SourceChanged(_))
+        ));
+        let _ = fs::remove_dir_all(&directory);
+    }
 
     /// Walk one directory unscoped and unbudgeted, as the recursion does.
     fn walk_dir(
@@ -2212,6 +2325,7 @@ mod tests {
                     size: 0,
                     mtime_ms: 0,
                     identity: FileIdentity::default(),
+                    times: Default::default(),
                     content_md5: None,
                 },
             );
@@ -2972,6 +3086,7 @@ mod tests {
                 size: 0,
                 mtime_ms: 0,
                 identity: FileIdentity::default(),
+                times: Default::default(),
                 content_md5: None,
             },
         );
@@ -3015,8 +3130,10 @@ mod tests {
         fs::write(root.join("private/secret.txt"), b"secret").unwrap();
         fs::write(root.join("keep.txt"), b"payload").unwrap();
         fs::set_permissions(root.join("private"), fs::Permissions::from_mode(0o000)).unwrap();
-        if fs::read_dir(root.join("private")).is_ok() {
-            eprintln!("skipping: this account can list a mode-000 folder (root)");
+        if crate::testkit::permissions_do_not_bind(
+            "an_unlistable_folder_is_withheld_as_permission_denied",
+            &root.join("private"),
+        ) {
             fs::set_permissions(root.join("private"), fs::Permissions::from_mode(0o755)).unwrap();
             fs::remove_dir_all(root).unwrap();
             return;
@@ -3278,19 +3395,19 @@ mod tests {
             .clone();
 
         fs::set_permissions(&target, fs::Permissions::from_mode(0o000)).unwrap();
+        if crate::testkit::permissions_do_not_bind(
+            "hashing_reports_the_open_failure_when_read_permission_is_denied",
+            &target,
+        ) {
+            fs::set_permissions(&target, fs::Permissions::from_mode(0o644)).unwrap();
+            fs::remove_dir_all(root).unwrap();
+            return;
+        }
         let result = hash_file_snapshot(&entry, &CancellationToken::default());
         // Restore permissions unconditionally: cleanup needs it, and a root-owned CI runner
         // that ignores mode bits must not leave an unreadable fixture behind either way.
         fs::set_permissions(&target, fs::Permissions::from_mode(0o644)).unwrap();
 
-        if result.is_ok() {
-            eprintln!(
-                "skipping hashing_reports_the_open_failure_when_read_permission_is_denied: \
-                 running with privileges that bypass file permissions"
-            );
-            fs::remove_dir_all(root).unwrap();
-            return;
-        }
         assert!(matches!(
             result,
             Err(Error::FileIo { path, .. }) if path == entry.full_path

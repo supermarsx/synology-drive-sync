@@ -6,7 +6,277 @@ changes below are in the first release built after the audit fix round documente
 [observability reference](observability.md). Older notes are not kept here: each release's GitHub page
 lists its own commits.
 
+## Unreleased: the daemon is the DSM service engine
+
+- **The Rust daemon replaces the shell controller and runner.** `sdsync-dsm-api --daemon`
+  (launched by `--launch-daemon --serve-api`) keeps the schedule, the realtime watchers, the dashboard
+  queue and the dashboard's API service in one process. The shell engine stays for this release as a
+  fallback: write `shell` to `var/state/engine`, then stop the package and run it again. Any other
+  content is named (`service_engine`, and an amber item on the Overview) and the daemon runs. The About
+  page and the dashboard's outcomes show the engine. Lasting blocks (below) are not applied by the shell
+  engine. See [Service engine](dsm/operations.md#service-engine).
+- **Realtime routines use the native inotify watcher inside the daemon.** Polling is the
+  fallback, named `watch_limit`, `watch_unavailable` or `watch_setup_failed`, and the daemon tries
+  the native watch again after 10 minutes, doubling up to every 6 hours. Beside a healthy watch a
+  stat-only floor reading (every min(the routine's poll interval, 1 hour), at most once a minute)
+  syncs and names any directory that changed without an event (`watch_missed_change`, `warn`; a failed
+  reading is `poll_floor_failed`), nested mounts are listed at arm time (`nested_mounts`, `info`), and
+  every armed routine syncs its whole tree once every 24 hours (`routine_full_reconcile`). The polling fallback reports
+  from one differing reading instead of two identical ones. A vanished entry or an unreadable
+  subdirectory is a named skip and every walk has a deadline. Editing a realtime profile's source or
+  excludes re-arms its watch. A start-up catch-up syncs the whole tree when it changed after the last
+  success. New `controller.log` events: `routine_rearmed`, `routine_watch_notice`, `routine_backend`.
+  See [Routines](dsm/routines.md#realtime-mode-and-fallback).
+- **Saves and dashboard jobs no longer wait for a sync.** The dashboard queue runs in lanes beside any
+  sync: one serialized job (saves), two concurrent (status walks, Doctor, actions) and two connection
+  probes, with deadlines of 10 minutes, 6 hours and 3 minutes. A job past its deadline is answered
+  `consumer_failed`, or, for a save, left outcome-unknown, as a dead worker is. New events:
+  `control_consumer_failed`, `control_consumer_outcome_unknown`, `control_request_rejected`,
+  `control_file_expired`.
+- **A save during a sync commits and says it takes effect on the next run** (`applies_next_run`). Only
+  a change that would touch a running profile is refused, with exit `75` and a message starting
+  `profile_running:`: remove, set-default, remove-routine, a change of URL, username, source, remote,
+  compare mode, deletion settings or excludes, removing its secrets, and a confirmed resync. Doctor no
+  longer holds the management lock (a Doctor `--write-test` against a running profile is still
+  refused), a plan-only resync takes no lock, and an interactive `set-password` reads the secret
+  before it takes the lock. A daemon run publishes `var/run/run.scope` naming its profiles, and never
+  starts while `management.lock` is live (`run_deferred`, `reason=lock_busy`). The shell engine keeps
+  the whole-package refusal. See [Saves beside a daemon run](dsm/operations.md#saves-beside-a-daemon-run).
+- **A daemon run is gated and audited like a shell run.** The mandatory audit, the security-policy
+  gates and the secret checks apply, with the same reasons (`policy_*`, `password_missing`,
+  `secret_unsafe`, `audit_unavailable`). A daemon pointed at a tree that is not a package runs
+  unaudited and says so (`service_audit`).
+- **`sdsync-dsm plan` and `run` hand the run to the daemon and wait for it.** Under the daemon engine
+  the command queues the run, waits for it, and exits with the sync's own exit status (`0`, `3`
+  partial, `1`, ...), so scripts read the same status as before. `--wait-seconds S` (default 86400)
+  bounds the wait; when it runs out the run goes on and the command exits `75`, naming
+  `sdsync-dsm status`. `--no-wait` returns once the run is queued. The dashboard's Plan and Run never
+  wait. A daemon that does not answer is refused (`the sync service is not running`, exit `75`), never
+  run by the old runner. See [CLI parity](dsm/cli-parity.md).
+- **Failure alerts** go through the package's alert policy, counter, notifier and Log Center as
+  before, and an escalation follows the policy's cooldown. A delivery that fails is logged as
+  `alert_unavailable` with its channel and cause.
+- **The verified-pair index is on by default for daemon runs** (`--pair-index var/state/cache/pairs`,
+  one `<profile>.redb`). `index:` appears in `ctl status` and in the dashboard: state, entries, hits,
+  misses, canary, refreshed and the worst issue with its path and cause. A damaged index is named
+  (`pair-index-corrupt`), set aside and rebuilt; one retired by re-creating the profile with another
+  source, remote or NAS is named as information. `remove-profile` deletes the `.redb`, its quarantined
+  copies, the lasting block and the alerts state. The result's `pair_index` has a new `entries` field.
+  See [Verified-pair index](pair-index.md#on-a-dsm-package).
+- **An out-of-memory kill is a lasting block.** An exit `137` is `core_oom_killed` (the cgroup's
+  counter moved) or `core_killed`, never `core_failed`, and the detail names the memory a run could
+  use. After `core_oom_killed` the daemon holds the profile (`var/state/lasting/<profile>.state`): no
+  retries and no automatic runs, and each held trigger is logged at most once an hour
+  (`routine_suppressed`). **Run now**, or a change to the profile's settings or the performance level,
+  lifts the hold; a save that changes nothing does not. It survives restarts, an unreadable record is
+  named and still holds, and the dashboard shows an amber **not synced until you fix this**. See
+  [Lasting block](dsm/operations.md#lasting-block-after-an-out-of-memory-kill).
+- **An HTTP request that timed out is `timeout`, not `network`**, and its message leads with the
+  innermost cause. See [Observability](observability.md).
+- **The API service is a supervised child of the daemon.** The package is not ready until `api.sock`
+  answers; a crash is named (`api_server_exited`) and restarted with a backoff (`api_server_restarted`).
+- **New dashboard labels** for the reasons `run_stalled`, `launch_failed`, `state_unwritable`,
+  `consumer_timeout` and `lasting_state_unreadable`. The daemon ends a run with no progress for 45
+  minutes as `run_stalled`.
+- **`service_layout`** logs the home and var roots as named and as resolved. DSM's aliases are followed
+  one level only; the target must be a directory owned by the package user and not writable by group or
+  others, and a refusal names both paths.
+- **A password, TOTP seed or remote-log token saved while that profile syncs** says it takes effect on
+  the next run (`applies_next_run`).
+- **Log rotation by the daemon takes the shell's `event-log.lock`.** A rotation that cannot be made
+  keeps the line and writes `var/state/log-rotation.failed`.
+
+### Daemon fixes from the integration review
+
+- **A crash can no longer wedge start or stop.**
+  - `run.lock/` never holds anything but `pid`, not even for an instant.
+  - `daemon.pid` names the daemon by PID, start time and boot id.
+  - A start that fails once it holds `daemon.lock` (including a `daemon.ready` it cannot write) is
+    named `service_start_failed` and removes its records.
+  - The supervisor publishes `supervisor.pid` and, when it gives up, removes the dead daemon's
+    records (`service_records_removed`).
+  - `--launch-daemon` stops the supervisor it started when the daemon is not ready, and shows the
+    daemon's last stderr line, which `log/daemon-stderr.log` keeps (1 MiB, shown in the controller
+    logs).
+  - A daemon waits out the lifecycle's own `daemon.lock` probe instead of exiting.
+- **No log line waits on `event-log.lock`.** An empty lock directory is free; a dead or torn owner
+  is cleared; a live one skips the rotation, which is tried again in 5 s and is a failure only after
+  a minute. Each case is named (`event_log_rotation_deferred`, `event_log_rotation_failed`,
+  `event_log_lock_stale`).
+- **The dashboard queue never waits forever.**
+  - A failing audit reconcile is named once and backed off. Waiting jobs are answered
+    `audit_unavailable` after 30 s, a new named failure with its own dashboard guidance.
+  - A worker that outlives KILL frees its lane (`consumer_unkillable`).
+  - Workers' stderr reaches `controller.log` (`consumer_stderr`).
+- **An unreadable configuration file is named, not read as absent.**
+  - It is named `config_unreadable` with its path and cause, and the last good configuration stays
+    in force.
+  - An unreadable routine conf no longer disarms realtime, and an unreadable `routines.d` no longer
+    reads as no routines.
+  - An unreadable routine state is held, not reset.
+- **A realtime source too large to walk within 2 minutes is still synced.**
+  - The walk and arm deadlines grow, named (`walk_deadline_exceeded`), up to 30 minutes.
+  - Meanwhile the routine stays amber (`watch_setup_failed`) and the whole tree is synced at most
+    every 15 minutes (every poll interval if that is longer, at most hourly), not once a minute.
+    The grown deadline and that cadence survive the native-watch retries.
+  - Every backend report is logged (`routine_backend`), so `walk_deadline_exceeded` and skipped
+    entries reach `controller.log`.
+  - A disarmed routine's walks end at once, and all walks share one cap of 16; a walk the cap
+    refuses is named as the cap (`walk_cap`) and retried within 15 s.
+- **The control socket keeps room for `ping` and `status`.**
+  - One deadline covers a whole request.
+  - `ping`, `status` and `stop` have reserved slots; `wait` and `mutate` are limited to 16 of 32.
+  - A connection counts only once its verb is read, and a waiter whose client hung up frees its
+    slot (`ctl_peer_gone`).
+  - A client's connect is bounded.
+  - Accept failures are named and backed off.
+- **Runs:**
+  - An all-profiles run passes the core the profiles its `run.scope` lists, not `--all-profiles`.
+  - The watchdog reads the core's progress record, which socket I/O does not bypass.
+  - A cancel or stop that arrives before the core starts keeps it from starting.
+  - `run.lock` is published and removed on the bounded state writer.
+- **The API service:**
+  - A server killed before it activated `api.sock` no longer blocks every restart
+    (`api_socket_stale_removed`).
+  - Readiness no longer connects (that connect was logged as a failed request).
+  - An API child that cannot be waited for is KILLed and reaped before a restart.
+
+### Daemon fixes from the fix5 review
+
+- **`run.lock/pid` is renamed into place**, so a crash can no longer leave it with a second link.
+- **The audit log's state is on the Overview.** While the dashboard queue cannot reconcile the audit
+  log for more than 30 s, `controller.state` carries `degraded=audit_unavailable`, `degraded_since=`
+  and `degraded_cause=`, the snapshot's `controller.degraded`, and an amber item says queued operations
+  are refused until it recovers (`service_degraded` / `service_degraded_cleared`). A recovered audit
+  log is no longer refused for the rest of its backoff: a job is refused only on an attempt made after
+  it arrived, and an open episode is retried even with nothing waiting.
+- **A profile state that cannot be read is not rewritten.** Its failure streak and last success stay
+  as they are (`profile_state_unreadable`, `degraded=profile_state`). `config_unreadable` says what
+  stands instead (`kept=`), a dependency's unreadable state is named, a removed routine's unreadable
+  records are forgotten (`config_forgotten`), and `ctl status` names an unreadable `profiles.d`
+  (`index_unavailable`).
+- **A scheduled all-profiles run publishes its progress record**, so the watchdog no longer takes a
+  long network phase of a batch for a stall.
+- **A file the dashboard queue cannot remove is named** (`control_file_unremovable`), a secret
+  sidecar included; `control_file_expired` is logged only for a file that is gone.
+- **Log rotation:** an episode ends when the log is found rotated, so a later failure is named again;
+  a torn owner record is reported as torn; a record cleared as stale is checked to be the one judged.
+- **Bounded waits:** a configuration save whose manager outlives KILL, or whose grandchild holds its
+  stderr, no longer holds the save's reply. A full control-socket backlog is named, not reported as
+  "Transport endpoint is not connected".
+- **The API service child** is signalled only while its pid still names it, and is not respawned beside
+  one that could not be proven gone (`api_server_respawn_held`).
+- **`sdsync-dsm-api --daemon-lock-probe <path>`** answers what `flock -n` does on `daemon.lock` (0 free,
+  3 held, 1 cannot probe, named on stderr) for a NAS whose BusyBox has no `flock`.
+
+### Lifecycle script fixes from the second review
+
+- **The shell engine no longer starts beside a daemon it cannot see.** When `daemon.lock` cannot be
+  probed, start and status ask the identity check on the daemon's records, as stop does: a live
+  daemon, or one the check cannot rule out, blocks, and the refusal says why.
+- **A unit without `flock(1)` still sees the daemon.** The lock is probed with
+  `sdsync-dsm-api --daemon-lock-probe <path>`, and the probe in use is named once per change in
+  `controller.log` (`daemon_lock_probe`). Status names why a lock could not be probed.
+- **A malformed or unreadable `supervisor.pid` no longer reads as "no supervisor".**
+  `supervisor.lock`, which the supervisor holds for its life, is the second witness; start, the
+  hooks and stop refuse naming it, and a stale record's removal names why it could not be trusted.
+- **The controller signals only its own watcher.** A pid file naming another child of the controller
+  (a wrapped PID) is left alone and named (`routine_watch_pid_mismatch`, or `pid_reused` in the
+  failure detail).
+- **A stop without a readable clock has one deadline.** Each phase is charged what it can take
+  against `SDSYNC_DSM_STOP_TIMEOUT`, so the worst case is the same as with a clock.
+- **A shell-engine stop that outlasts `SDSYNC_DSM_STOP_TIMEOUT` kills what is left** (the runner and
+  its children, the API service, then the controller), logs `service_stop_forced` and names each KILL,
+  instead of exiting `1` with the services running.
+- **A stop no longer leaves a realtime poll's scratch directory** (`run/fingerprint.<pid>.<n>`).
+- **Recovering a dead `run.lock` owner removes the daemon's staged owner file** (`run/.run.lock.pid.<pid>.<n>`)
+  and names it.
+- **The shell snapshot carries `controller.degraded`** (`reason`, `since_epoch`, `cause`) from the
+  daemon's three optional `controller.state` lines, and refuses a malformed set as `corrupt_state`.
+
+### Follow-ups from the integration
+
+- **An unreadable request queue is named, not read as empty.** A control directory the daemon cannot
+  read is logged once per episode with its path and cause (`control_dir_unreadable`, then
+  `control_dir_recovered`), raised as `controller.degraded` (`control_dir_unreadable`) and shown in
+  amber.
+- **`pair-index-plan-clock-unbounded`** (information) names how many pairs the run's carry did not
+  serve because the NAS clock of the plan pass was more than 20 s from this host's; they were checked
+  live. The count is also in the result's `reconciliation.plan_clock_unbounded`.
+- **A supervisor waits out a `supervisor.lock` held for a moment** (2 s, like `daemon.lock`) instead of
+  leaving with exit 0 and no daemon; if the lock is still held it says so on stderr and as
+  `service_superseded`.
+- **`--launch-daemon` returns when `daemon.ready` is published**, not on the socket's first ping.
+- A control-socket connect failure names the socket path once.
+
+### Verified-pair index: correctness fixes
+
+- **A write through a shared memory mapping is no longer missed.** Linux moves a file's times only
+  when a mapped write first dirties a page, so for up to about 35 s after a change (the kernel's
+  writeback interval) the content can change again with every fact unchanged. The index took such a
+  file as settled after 2 s and could skip its upload indefinitely. The racy window is now
+  `dirty_expire_centisecs` + `dirty_writeback_centisecs` from `/proc/sys/vm` + 25 s, at least 2 s:
+  60 s with the defaults, and 60 s on macOS and the NAS side. An unreadable setting is
+  `pair-index-writeback-unknown` (60 s); periodic writeback switched off is
+  `pair-index-writeback-unbounded`, and nothing local is served. **The first run after upgrading
+  verifies every pair live**: indexes written before are retired by name (`pair-index-retired`,
+  semantics epoch 1, the two-second window). A file changed within a minute of a run is read live
+  once more on the next run.
+- **A NAS clock that disagrees with this host's is not trusted.** The `Date` header of `MD5.start`
+  more than 20 s outside this host's clock during the pass (a proxy, a NAS with the wrong time) makes
+  the pair racy and is named once per run, `pair-index-nas-clock-skewed`.
+- **Reconciliation carries fewer digests on trust.** A pair is carried from the plan pass only when
+  the NAS listing has a change time for it and neither side changed within the racy window of the
+  read that produced its digest.
+- **A damaged index heals itself.** A file redb repaired, one that fails a check on any open, and
+  one with a record that does not decode are set aside and rebuilt on the spot, and nothing read from
+  them is served (`pair-index-corrupt`); before, a repair found mid-run kept serving, and one
+  undecodable record disabled the index until the file was deleted by hand. redb 4.4 can also crash
+  while opening a file with a damaged allocator page: the crash is recorded beside the file
+  (`<profile>.redb.panicked`) and the next run sets the file aside, so one crashed run heals it.
+- **The index file is verified once per run**, not on every reopen: a reopen within the run trusts a
+  file that is exactly as the run left it (identity, length, times and redb's header). On an armv7 NAS
+  this removes three or four full reads of the file per run.
+- **Quarantined copies that cannot be removed are named** (`pair-index-cleanup-failed`), and past
+  three such copies a damaged file is deleted instead of kept.
+- **A profile name over 64 characters gets an index** (`<first 48 characters>-<16 hex of its
+  SHA-256>.redb`) instead of `pair-index-unsafe` on every run.
+- **A panic from this program no longer retires a healthy index.** Only a panic raised in redb's own
+  sources is recorded beside the file. A panic record or a quarantined copy that cannot be examined
+  is now named with its path and cause (`pair-index-unsafe`, `pair-index-cleanup-failed`) instead of
+  being passed over.
+- **Reconciliation applies the 20 s NAS-clock bound too**: a pair whose plan-time `MD5.start` clock
+  stood further outside this host's clock is verified live rather than carried.
+- **Index size and the racy window are documented as measured.** A dense pair costs its path plus
+  about 125 bytes; the file on disk is 1.1 to 4 times that. The window's assumptions (steady
+  clocks, a flusher that drains within the margin) and the re-hash cost of a realtime routine are
+  in [Verified-pair index](pair-index.md#what-it-can-and-cannot-do).
+- New `pair_index.issues` codes: `pair-index-writeback-unknown`, `pair-index-writeback-unbounded`,
+  `pair-index-nas-clock-skewed`, `pair-index-cleanup-failed`. See
+  [Verified-pair index](pair-index.md#when-it-cannot-be-used).
+
 ## Read this before upgrading
+
+- **Rust 1.90 or newer is needed to build from source** (was 1.88). The verified-pair index uses redb
+  4.4, which reports a damaged file as an error instead of crashing, and needs 1.90.
+- **Post-run reconciliation no longer re-reads the whole tree.** It still re-lists both sides in full,
+  but verifies live only the pairs the run touched plus a canary of 25; untouched pairs whose facts
+  did not move keep the plan pass's digests. A run that changed two files in 1,000 now asks the NAS for
+  27 checksums during reconciliation instead of 1,000. The result's new `reconciliation` object counts
+  both; `--reconcile full` restores the old pass. See
+  [Comparison, exclusions, and deletion](configuration/safety.md).
+- **A file whose permissions or attributes change while it is being read is deferred.** The checks
+  that bracket a read now include the status-change time, so a `chmod`, `chown` or extended-attribute
+  change during the read defers that file to the next run (`source-changed`) instead of uploading a
+  digest taken across the change.
+- **A tree too large for the memory a run may use is refused by name.** The run estimates its peak
+  memory after the local walk and again after the listing, against the cgroup limit and
+  `MemAvailable`. Over budget, it syncs nothing, exits `0` and reports one lasting deferral of `.`
+  with reason `tree-too-large-for-memory`, naming the entry counts, the estimate and the fix (split
+  the profile). On a DSM package a core killed with exit `137` is now recorded as `core_oom_killed`
+  (the cgroup's OOM counter moved) or `core_killed`, instead of `core_failed`.
+- **`--pair-index DIR` is new** (opt-in on the command line, Unix only; on by default for DSM daemon
+  runs). See [Verified-pair index](pair-index.md).
 
 - **Excluded files that already leaked to the NAS stay there; delete them by hand.** Exclude matching
   now covers cases an earlier release missed (a composed `é` rule against a decomposed `é` folder, a
@@ -39,9 +309,13 @@ lists its own commits.
   numbers) and polled; only root can raise that limit, which is optional (see
   [Raising the inotify watch limit](dsm/troubleshooting.md#raising-the-inotify-watch-limit)). The
   watch budget is 80% of that limit minus what the package user already holds. An `inotifywait` is now
-  only a fallback, used if the package binary fails its executable checks. The setup walk has a
+  only a fallback, used if the package binary fails its executable checks. (Under the daemon engine
+  the watcher runs inside the daemon and `inotifywait` is not used.) The setup walk has a
   120-second deadline that names the directory it was stuck on, and a kernel event overflow triggers a
-  full re-walk. A realtime routine that is not watched natively is now an amber item on the Overview.
+  full re-walk. Under the shell engine, a watcher the controller has just spawned is no longer
+  mistaken for a dead one before it has started: it is not counted as a failure, a package stop stops
+  it, and one that has not started 30 seconds after its spawn is stopped and named
+  (`routine_watch_failed`, `start_timeout`). A realtime routine that is not watched natively is now an amber item on the Overview.
   The watcher uses about 6 MiB at 20,000 directories and about 16 MiB at 100,000.
   `sdsync-dsm-api --watch-probe <folder>`, run as the package user, shows what inotify sees on a share;
   see [Troubleshooting](dsm/troubleshooting.md#probe-what-inotify-sees-on-a-share) and probe 20 in the

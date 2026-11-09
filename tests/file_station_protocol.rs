@@ -1374,6 +1374,7 @@ fn upload_source(directory: &TestDir, name: &str, contents: &[u8]) -> LocalEntry
         kind: EntryKind::File,
         size: contents.len() as u64,
         identity: FileIdentity::default(),
+        times: Default::default(),
         content_md5: None,
     }
 }

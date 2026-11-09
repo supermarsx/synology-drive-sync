@@ -46,6 +46,7 @@ chmod 0755 "$tool"
 # Reviewed exceptions (2026-10-22): RUSTSEC-2026-0370 (zvariant), -0371 (zbus_names) and
 # -0372 (zvariant_derive) are "unmaintained" notices, not vulnerabilities. The crates are
 # Linux-only and transitive via zbus-secret-service-keyring-store 1.0.1 -> secret-service
-# 5.2.0 -> zbus 5.19; no released maintained path exists (zbus 6 needs Rust 1.89, above our
-# MSRV 1.88). Revisit when the store moves to zbus 6 and MSRV is >= 1.89, then drop these.
+# 5.2.0 -> zbus 5.19; no released maintained path exists: zbus 6 needs Rust 1.89, which the
+# 1.90 MSRV now meets, but the keyring store still pins zbus 5. Revisit when the store moves to
+# zbus 6, then drop these.
 "$tool" audit --file Cargo.lock --deny warnings --color never     --ignore RUSTSEC-2026-0370 --ignore RUSTSEC-2026-0371 --ignore RUSTSEC-2026-0372

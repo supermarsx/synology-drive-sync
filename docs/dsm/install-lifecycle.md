@@ -146,9 +146,10 @@ sudo -u "$PACKAGE_USER" -- "$MANAGER" plan personal
 
 ## Start, stop, and scheduling defaults
 
-Package Center start/stop controls two long-lived, unprivileged package-user processes: the local API
-service for the DSM dashboard and the controller for routines and queued work. Starting them does
-not enable a routine or contact a target. The legacy global interval schedule and every per-profile
+Package Center start/stop controls the long-lived, unprivileged package-user processes: by default
+the sync daemon, which serves the DSM dashboard's local API and runs routines and queued work; under
+the fallback shell engine, the local API service and the controller. Starting them does not enable a
+routine or contact a target. The legacy global interval schedule and every per-profile
 routine are disabled until explicitly configured and enabled.
 
 ```bash
@@ -157,10 +158,108 @@ sudo synopkg start synology-drive-sync
 sudo synopkg stop synology-drive-sync
 ```
 
+### Which engine runs
+
+`var/state/engine` (package-owned, one word) selects what start runs, and is read once per
+lifecycle command:
+
+| Content | Engine |
+| --- | --- |
+| absent, or `daemon` | the sync daemon (`sdsync-dsm-api --launch-daemon`): one supervised process that runs routines, queued work and every Plan/Run, and serves the dashboard API |
+| `shell` | the controller and runner of earlier releases, kept for one release as a fallback |
+| anything else | the daemon, after a `warn` `service_engine_invalid` event in `controller.log` and a console line naming the path and what the file holds |
+
+The shell engine steps aside from a daemon: while a process holds `daemon.lock`, or a live
+supervisor (`run/supervisor.pid`) is about to respawn one, start refuses ("refusing to start the shell
+engine: the sync daemon (PID n) holds ...") and status reports `2` with the same line on stderr.
+Stop the package first, or remove `var/state/engine` to run the daemon engine. A lock that cannot be
+probed (see below) is decided by the identity check on the daemon's records, the one stop uses: a
+live daemon, or one the check cannot rule out, blocks, and the refusal says the lock could not be
+probed and why; only "no record names a live daemon" goes on, with a warning on stderr.
+
+Under the shell engine, profiles the daemon held for a lasting condition (`state/lasting/<p>.state`)
+are not held: start says so once (`lasting_blocks_not_applied`, with the count).
+
+Daemon start keeps the shell start's lifecycle serialization, transition fence and admission steps:
+admission is closed, `--launch-daemon` waits for the daemon to answer `ctl ping` (and, in
+production, for the API socket), and admission is opened only then. A failed launch leaves admission
+closed, records `service_start_failed` with the launcher's cause, stops anything it half started,
+and exits `1`. Start refuses while shell-engine services are live.
+
+What the daemon engine keeps under `var/run`, and when each goes:
+
+| Record | What it holds | Removed |
+| --- | --- | --- |
+| `daemon.lock` | an `flock` held by the live `--daemon` process | never; only a live holder means a daemon runs |
+| `daemon.pid`, `daemon.ready` | the daemon's PID, `/proc` start time and boot id, one per line (`daemon.ready` once it answers) | by a clean stop; by a start that fails once it holds `daemon.lock` (named `service_start_failed step=… path=… cause=…`, including a `daemon.ready` that cannot be written); by the supervisor when it gives up |
+| `supervisor.pid`, `supervisor.lock` | the `--supervise` process's PID, start time and boot id; an `flock` held for its life (one supervisor per package) | `supervisor.pid` when the supervisor exits |
+
+The supervisor restarts a daemon that crashes at most 5 times in 10 minutes. When it gives up, it
+removes the dead daemon's `daemon.pid`, `daemon.ready` and `ctl.sock` under `daemon.lock`
+(`service_records_removed`, or `service_records_kept` with the cause). A daemon that finds
+`daemon.lock` held waits up to 2 s before it exits `75`. The supervisor then leaves
+(`service_superseded`) if another daemon answers, and otherwise counts it as a crash
+(`cause=daemon_lock_held`). `--launch-daemon` stops the supervisor it started when the daemon does
+not answer within 30 s. The daemon's own stderr is kept in `log/daemon-stderr.log`, capped at
+1 MiB with one rotation and shown first in the controller log source. Its last line is relayed into
+`service_restarted` and `service_start_failed` as `last_stderr=`, and into the launcher's failure
+line.
+
+Daemon stop asks the daemon to stop (`ctl stop`, which lets a running sync end within its cancel
+grace). The whole stop runs on one budget, `SDSYNC_DSM_STOP_TIMEOUT` (default and maximum 120 s,
+the figure the shell engine's stop has always had; the Package Center's own stop deadline is not
+documented by Synology and was not verified on a unit): `ctl stop` waits at most the budget less a
+sixth of it (at least 2 s) and 5 s, the daemon then gets the rest less that sixth to end, and TERM gets
+whatever remains. KILL's own 10 s wait is the only margin on top, so the worst case is the budget plus
+about 10 s. Without a readable clock (`date +%s` fails) the stop says so and charges each phase what it
+can take against the same budget -- `ctl stop` its whole wait, a wait the seconds it slept -- so the
+worst case is the same; the cost is that a `ctl stop` that failed at once still leaves the later phases
+only the rest of the budget. A daemon that does not
+answer, or outlasts the budget, is sent TERM and then KILL, together with its supervisor, but only
+after its identity is proven from
+`run/daemon.ready` (PID, `/proc` start time, boot id, package uid, `--daemon` argv); an unprovable
+one is refused and named. Stop leaves no `daemon.pid`, `daemon.ready` or `ctl.sock` (`daemon.lock`
+stays; only a live holder of it means a daemon runs). When nobody holds `daemon.lock`, no daemon
+exists: whatever `daemon.pid`, `daemon.ready` and `ctl.sock` say is stale even if the PID they name
+now belongs to another process, and stop and start remove them and name each path (`removed stale
+daemon record <path>`). A held lock keeps the strict identity check above. The lock is probed with
+`flock -n`, or, on a unit without `flock(1)`, with the bridge's own `sdsync-dsm-api --daemon-lock-probe
+<path>` (the same non-blocking `flock`, read-only, released at once; exit `0` free, `3` held, `1` cannot
+probe, with a `daemon-lock-probe: <path>: <cause>` line on stderr). The probe in use is named once
+per change in `controller.log` (`info` `daemon_lock_probe`, `tool=flock` or `tool=daemon-lock-probe
+flock=absent`; the last tool is kept in `run/daemon-lock-probe.tool`) and, for the bridge's, in a
+`note:` line on stderr. Only when neither can run (no `flock(1)` and no executable bridge, or the
+probe fails) is the lock "cannot be told": the strict identity check applies, status reports `2` and
+names why on stderr, and the pre-upgrade and pre-uninstall hooks refuse unless the cause is that no
+tool exists at all (then the records they also check decide, with a warning). The probe itself
+holds the lock for one call, and it is never made while `run/supervisor.pid` (the
+supervisor's own pid, start time and boot id) names a live supervisor: between a daemon's death and
+its respawn nobody holds the lock, and a probe that took it would make the respawning daemon give
+up. Status then reports `2`, the hooks refuse naming `supervisor.pid`, and stop signals that
+supervisor (TERM, then KILL after the grace) even when `daemon.ready` is absent, before it removes
+any record. A `supervisor.pid` naming no live supervisor is a stale record like the others, but one
+that cannot be read as a record at all -- malformed, unreadable, not a regular file -- is not "no
+supervisor": `run/supervisor.lock`, which the supervisor holds for its whole life, is the second
+witness. Held (or unprobeable beside such a record), a supervisor runs that the record does not
+identify: status reports `2`, the hooks and the shell engine's start refuse, and stop keeps every
+record ("refusing to clean daemon records: ..."), each naming what was wrong with the record and
+that the lock is held. Nothing is signalled on a supervisor only the lock shows; a daemon's own parent
+can still prove it. With the lock free the record is stale, and the removal names why it could not
+be trusted. Stop stops whichever engine's processes are
+present, both after an engine switch made while one was running. Status is `0` when the daemon
+answers `ctl ping` with admission open, `3` with no daemon records, and `1` when records of a daemon
+that is gone remain (named on stderr).
+
+### Shell engine stop
+
 Stop requests cooperative termination of the verified API service, controller, and any verified
 active runner. The lifecycle script validates recorded PIDs and the fixed socket before cleanup,
-waits for shutdown, and refuses to signal an untrusted PID or force-kill after a timeout. Profile,
-secret, routine, and schedule mutations are serialized and refuse to race an active Plan or Run.
+waits for shutdown, and refuses to signal an untrusted PID. The wait is bounded by
+`SDSYNC_DSM_STOP_TIMEOUT` (default and maximum 120 s; a larger value is clamped and named); past
+it the stop kills what is left, by verified identity (the runner and its children, the API service,
+then the controller), logs `service_stop_forced` and says so, instead of exiting `1` with services
+running. Profile, secret, routine, and schedule mutations are serialized and refuse to race an active
+Plan or Run.
 
 ## Upgrade, rollback, and uninstall
 
@@ -186,7 +285,11 @@ the Package Center upgrade; the path assumes DSM serializes the package transact
 package service UID remains trusted.
 
 DSM stops a running package before upgrade. Lifecycle scripts also refuse upgrade while a verified
-controller or foreground Plan/Run PID remains live. Profiles, credentials, routines, global schedule,
+controller or foreground Plan/Run PID remains live, while a process holds `run/daemon.lock`, or while
+`run/ctl.sock`, `run/daemon.ready` or `run/daemon.pid` remains. Under the daemon engine, `postupgrade`
+removes what the shell controller kept beside its runs and nothing retires under the daemon: the
+`state/controller-reload.pending` marker and `run/watch-*`, `run/poll-*` and `run/fingerprint.*`
+scratch files (one it cannot remove is named). The shell engine keeps them. Profiles, credentials, routines, global schedule,
 state, and logs are retained and validated with the new binary. If retained configuration is invalid,
 investigate it rather than replacing package-private files manually.
 

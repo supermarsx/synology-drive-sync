@@ -3,10 +3,16 @@
 pub mod api;
 pub mod batch;
 pub mod cancel;
+pub mod digest_evidence;
 pub mod error;
+pub mod evidence_dir;
 pub mod integrity;
 pub mod local;
+pub mod memory_budget;
 pub mod observability;
+pub mod pair_index;
+#[cfg(unix)]
+pub mod pair_index_redb;
 pub mod path;
 pub mod plan;
 pub mod progress;
@@ -348,6 +354,14 @@ fn install_ring_provider_once() -> core::result::Result<(), &'static str> {
          other providers can block for minutes on kernels without getrandom(2)",
     )
 }
+
+/// The daemon's unit-test helpers that are not about the daemon: a test that needs a mode-000 path
+/// to refuse reads skips loudly where the user ignores modes (root), never in silence.
+#[cfg(all(test, unix))]
+// The file is shared with the daemon's tests; which helpers a platform's library tests use differs.
+#[allow(dead_code)]
+#[path = "daemon/testkit.rs"]
+pub(crate) mod testkit;
 
 #[cfg(test)]
 mod tests {

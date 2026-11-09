@@ -44,8 +44,8 @@ administrator's ACL instead of the package user's real source access.
 | Remove routine | `remove-routine NAME` |
 | DSM notification policy | `configure-alerts ...` |
 | Doctor | `doctor [NAME|--all] [--level LEVEL] [--write-test]` |
-| Plan | `plan [NAME|--all] [--allow-delete] [--max-total-delete N]` |
-| Run | `run [NAME|--all] [--allow-delete] [--max-total-delete N]` |
+| Plan | `plan [NAME|--all] [--allow-delete] [--max-total-delete N] [--no-wait|--wait-seconds S]` |
+| Run | `run [NAME|--all] [--allow-delete] [--max-total-delete N] [--no-wait|--wait-seconds S]` |
 | Service/run snapshot | `status` |
 | Bounded logs | `logs [LINES]` |
 | Package paths | `paths` |
@@ -57,6 +57,26 @@ it to Extensive, but new automation should pass both flags. `--allow-delete` app
 Plan/Run, and `--max-total-delete` applies to an all-profile deletion action. Inapplicable or
 trailing options are rejected rather than ignored. See [Health and Doctor](operations.md#health-and-doctor)
 for source behavior, independent target execution, and bounded section evidence.
+
+Under the daemon engine (no `var/state/engine`, or `daemon`), `plan` and `run`, and the dashboard's
+Plan and Run, do not start a runner: the manager audits the request and hands it to the sync daemon
+(`ctl run`), which runs it in its one run slot under its watchdog.
+
+- **On the command line, `plan` and `run` wait for that run** and exit with the run's own exit status,
+  as the runner did: `0`, `3` for partial, `1` for a failure, and so on. They print
+  `queued as run N: …` and then `run N finished: <outcome> (<reason>), exit E: <detail>`.
+  `--wait-seconds S` (1 to 86400, default 86400) bounds the wait. If the run has not finished by then,
+  it goes on: the command says so, names `sdsync-dsm status` to follow it, and exits `75`. If the
+  daemon stops answering during the wait, the command also exits `75` and says the run may go on.
+- **`--no-wait`** returns as soon as the run is queued (`queued as run N: …`, exit `0`).
+- **The dashboard never waits.** Its Plan and Run (`api action`) return `plan queued` or `run queued`,
+  and the outcome arrives through `run.state` and Activity like any other run's.
+
+A daemon that does not answer is a refusal, `the sync service is not running`, exit `75`; there is no
+fallback to the runner. A refusal by the daemon names its code: `stopping`, `busy` or
+`profile_running` exit `75`, `scope_not_found` exit `66`, anything else exit `1`. Doctor and a
+confirmed resync still run in the manager. Under the shell engine nothing changed: the runner runs in
+the foreground, and `--no-wait` and `--wait-seconds` are accepted and named as ignored.
 
 `configure-profile` is a complete replacement of the named profile's non-secret settings. It covers
 the dashboard's target, sync, safety, network, TLS, local-output, and remote-observability fields,
@@ -135,7 +155,11 @@ A mutation result (`sdsync.dsm-result.v1` with `"ok": true`) may carry `"warning
 sixteen `{"code", "message"}` entries meaning *the change is saved, but something it depends on did not
 complete*. `controller_reload_failed` says the running controller was not told to reload, so the
 previous schedule, routines or policy stay in effect until the package service restarts or a later save
-reloads it. A manager that prints the older single pair `warning_code` and `warning` is accepted and
+reloads it. `applies_next_run` is the one entry that is not a shortfall: the change was committed while a
+sync was running and takes effect on the next run (the notice is headed *Saved, takes effect on the next
+run* when it is the only entry). The fixed `set-secret` result (`has_password`, `has_totp`,
+`has_remote_log_token`) carries the same `warnings` list when a credential is stored for a profile a
+daemon run is syncing, or the save printed a warning. A manager that prints the older single pair `warning_code` and `warning` is accepted and
 normalised into `warnings`, so the dashboard only ever sees the list. The bridge records each entry as
 one `mutation_warning` record in `api.log` and shows the dashboard a red *Saved, but it is not fully in
 effect* notice with the message; a warning line that sanitises to nothing is shown as "The change was saved,
@@ -238,7 +262,7 @@ code rather than served.
 | `66` | Required profile, configuration, or protected credential is absent |
 | `69` | Installed executable or required runtime facility is unavailable |
 | `73` | Unsafe package path, state, lock, log, queue, or untrusted PID |
-| `75` | Another management or Plan/Run operation is active; a deferral, retried, not a failure |
+| `75` | Another management or Plan/Run operation is active; a deferral, retried, not a failure. Beside a daemon run the refusal is narrowed to what would change the running profiles and begins `profile_running:` ([operations](operations.md#saves-beside-a-daemon-run)) |
 | `76` | A configuration change that needs the running controller to reload (`configure-routine`, `remove-routine`, `enable` / `set-schedule` with an interval, `configure-performance`) was **saved and audited as succeeded**, but the controller could not be told to reload it. stderr names the reason and PID |
 | `77` | Command was not run as the DSM package identity |
 | `78` | The package supervisor refused to start the core (binary identity mismatch); the core never ran, and one `supervised core refused: <code>` line is printed |

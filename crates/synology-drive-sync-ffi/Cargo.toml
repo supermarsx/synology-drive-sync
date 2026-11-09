@@ -2,7 +2,7 @@
 name = "synology-drive-sync-ffi"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.88"
+rust-version = "1.90"
 description = "Stable C ABI for the synology-drive-sync synchronous SDK"
 license = "MIT"
 repository = "https://github.com/supermarsx/synology-drive-sync"

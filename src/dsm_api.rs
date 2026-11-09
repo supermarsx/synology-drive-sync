@@ -49,6 +49,11 @@ use synology_drive_sync::progress_record::ProgressRecorder;
 use synology_drive_sync::status_cache;
 use synology_drive_sync::vault::{generate_totp, parse_totp_secret};
 
+/// The Phase-2 daemon (`--daemon`). A child of this module so its golden tests can
+/// read its state files through the snapshot and outcome readers below.
+#[path = "daemon/mod.rs"]
+mod daemon;
+
 const PACKAGE_ROOT: &str = "/var/packages/synology-drive-sync/target";
 const PACKAGE_HOME: &str = "/var/packages/synology-drive-sync/home";
 const PACKAGE_VAR: &str = "/var/packages/synology-drive-sync/var";
@@ -397,7 +402,7 @@ const _: () = assert!(
 // their own, without leaving items behind that exist only to be checked and would otherwise
 // need an `#[allow(dead_code)]` marking a constant unused whose whole purpose is to be used.
 //
-// Verified on 1.88.0 and stable: clean under `-D warnings`, and still fails the build when
+// Verified on 1.90.0 and stable: clean under `-D warnings`, and still fails the build when
 // the invariant is violated.
 #[cfg(target_os = "linux")]
 #[allow(clippy::assertions_on_constants)]
@@ -5922,7 +5927,7 @@ mod linux_socket {
         fs::remove_file(path).map_err(|_| BridgeError::unsafe_runtime())
     }
 
-    fn connect_with_timeout(path: &Path, timeout: Duration) -> io::Result<UnixStream> {
+    pub(crate) fn connect_with_timeout(path: &Path, timeout: Duration) -> io::Result<UnixStream> {
         let path_bytes = path.as_os_str().as_bytes();
         // sockaddr_un paths are NUL-terminated. Abstract sockets are outside the
         // fixed filesystem contract used by this bridge.
@@ -5955,24 +5960,51 @@ mod linux_socket {
             *destination = *source as libc::c_char;
         }
 
-        // SAFETY: address is initialized, the descriptor is live, and the full
-        // Linux sockaddr_un size includes the terminating zero from initialization.
-        let connected = unsafe {
-            libc::connect(
-                stream.as_raw_fd(),
-                (&address as *const libc::sockaddr_un).cast(),
-                mem::size_of::<libc::sockaddr_un>() as libc::socklen_t,
-            )
-        };
-        if connected != 0 {
-            let error = io::Error::last_os_error();
-            if !matches!(
-                error.raw_os_error(),
-                Some(libc::EINPROGRESS | libc::EAGAIN | libc::EALREADY)
-            ) {
-                return Err(error);
+        let deadline = Instant::now()
+            .checked_add(timeout)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "invalid timeout"))?;
+        let mut pause = Duration::from_millis(5);
+        loop {
+            // SAFETY: address is initialized, the descriptor is live, and the full
+            // Linux sockaddr_un size includes the terminating zero from initialization.
+            let connected = unsafe {
+                libc::connect(
+                    stream.as_raw_fd(),
+                    (&address as *const libc::sockaddr_un).cast(),
+                    mem::size_of::<libc::sockaddr_un>() as libc::socklen_t,
+                )
+            };
+            if connected == 0 {
+                break;
             }
-            wait_for_connect(&stream, timeout)?;
+            let error = io::Error::last_os_error();
+            match error.raw_os_error() {
+                Some(libc::EINPROGRESS | libc::EALREADY) => {
+                    wait_for_connect(&stream, timeout)?;
+                    break;
+                }
+                // N-D12: on a Unix socket EAGAIN is the listener's backlog being full, and the
+                // connect has not started: there is nothing in progress to wait for, and the
+                // socket is still unconnected (taking it for connected made the first write
+                // fail as "Transport endpoint is not connected"). Tried again until the
+                // deadline, then named for what it is.
+                Some(libc::EAGAIN) => {
+                    let now = Instant::now();
+                    if now >= deadline {
+                        return Err(io::Error::new(
+                            io::ErrorKind::TimedOut,
+                            format!(
+                                "{}: the listener's backlog stayed full for {} ms (connect: {error})",
+                                path.display(),
+                                timeout.as_millis()
+                            ),
+                        ));
+                    }
+                    std::thread::sleep(pause.min(deadline.duration_since(now)));
+                    pause = (pause * 2).min(Duration::from_millis(50));
+                }
+                _ => return Err(error),
+            }
         }
         stream.set_nonblocking(false)?;
         Ok(stream)
@@ -6130,6 +6162,102 @@ mod linux_socket {
 
     fn same_inode(first: &fs::Metadata, second: &fs::Metadata) -> bool {
         first.st_dev() == second.st_dev() && first.st_ino() == second.st_ino()
+    }
+
+    #[cfg(test)]
+    mod connect_tests {
+        use super::*;
+
+        /// A listener that never accepts, with a backlog of one.
+        fn deaf_listener(path: &Path) -> std::os::fd::OwnedFd {
+            use std::os::fd::FromRawFd as _;
+            let path_bytes = path.as_os_str().as_bytes();
+            // SAFETY: zero is a valid initial representation for sockaddr_un.
+            let mut address = unsafe { mem::zeroed::<libc::sockaddr_un>() };
+            address.sun_family = libc::AF_UNIX as libc::sa_family_t;
+            for (destination, source) in address.sun_path.iter_mut().zip(path_bytes) {
+                *destination = *source as libc::c_char;
+            }
+            // SAFETY: plain socket calls on a descriptor this function owns.
+            unsafe {
+                let fd = libc::socket(libc::AF_UNIX, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0);
+                assert!(fd >= 0, "socket: {}", io::Error::last_os_error());
+                let fd = std::os::fd::OwnedFd::from_raw_fd(fd);
+                assert_eq!(
+                    libc::bind(
+                        fd.as_raw_fd(),
+                        (&address as *const libc::sockaddr_un).cast(),
+                        mem::size_of::<libc::sockaddr_un>() as libc::socklen_t,
+                    ),
+                    0,
+                    "bind: {}",
+                    io::Error::last_os_error()
+                );
+                assert_eq!(
+                    libc::listen(fd.as_raw_fd(), 1),
+                    0,
+                    "listen: {}",
+                    io::Error::last_os_error()
+                );
+                fd
+            }
+        }
+
+        /// N-D12: a listener whose backlog is full answers a non-blocking
+        /// connect with EAGAIN, and the connect has not started. It was taken
+        /// for one in progress, so an unconnected stream came back and the
+        /// first write failed as "Transport endpoint is not connected". It is
+        /// retried within the timeout and then named for what it is.
+        #[test]
+        fn a_full_backlog_is_named_never_an_unconnected_stream() {
+            let dir = std::env::temp_dir().join(format!(
+                "sdsync-backlog-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            fs::create_dir_all(&dir).unwrap();
+            let path = dir.join("deaf.sock");
+            let _listener = deaf_listener(&path);
+            let mut kept = Vec::new();
+            let mut refused = None;
+            for attempt in 0..64 {
+                let began = Instant::now();
+                match connect_with_timeout(&path, Duration::from_millis(300)) {
+                    Ok(stream) => {
+                        let peer = stream.peer_addr();
+                        assert!(
+                            peer.is_ok(),
+                            "connect {attempt} returned a stream that is not connected: {peer:?}"
+                        );
+                        kept.push(stream);
+                    }
+                    Err(error) => {
+                        refused = Some((attempt, error, began.elapsed()));
+                        break;
+                    }
+                }
+            }
+            let (attempt, error, took) =
+                refused.expect("a backlog of one is full within 64 connects");
+            eprintln!(
+                "connect {attempt} refused after {took:?}: {error} ({:?})",
+                error.kind()
+            );
+            assert_eq!(error.kind(), io::ErrorKind::TimedOut, "{error}");
+            assert!(
+                error.to_string().contains("backlog") && error.to_string().contains("deaf.sock"),
+                "the cause and the path are named: {error}"
+            );
+            assert!(
+                took >= Duration::from_millis(250) && took < Duration::from_secs(3),
+                "retried within the timeout, then refused: {took:?}"
+            );
+            drop(kept);
+            let _ = fs::remove_dir_all(&dir);
+        }
     }
 }
 
@@ -7994,8 +8122,24 @@ fn validate_set_secret_manager_result(value: &Value) -> BridgeResult<()> {
         "has_totp",
         "has_remote_log_token",
     ];
-    if root.len() != EXACT_FIELDS.len()
-        || root.keys().any(|key| !EXACT_FIELDS.contains(&key.as_str()))
+    // One optional member: the warnings a committed save carries (it was saved
+    // while that profile syncs, `applies_next_run`; a `warning:` line the
+    // manager printed; a reload that did not land), held to the same grammar
+    // and bounds as every other result's. Refusing them would turn a committed
+    // save into a 503. Their text cannot carry the secret: the manager's whole
+    // output is refused if it holds it (`parse_manager_result`).
+    let warnings = match root.get("warnings") {
+        None => 0,
+        Some(Value::Array(_)) => {
+            validate_result_warnings(root)?;
+            1
+        }
+        Some(_) => return Err(BridgeError::new(ErrorKind::Unavailable)),
+    };
+    if root.len() != EXACT_FIELDS.len() + warnings
+        || root
+            .keys()
+            .any(|key| !EXACT_FIELDS.contains(&key.as_str()) && key != "warnings")
         || root.get("schema").and_then(Value::as_str) != Some("sdsync.dsm-result.v1")
         || root.get("ok").and_then(Value::as_bool) != Some(true)
         || root.get("message").and_then(Value::as_str) != Some("secret state updated")
@@ -8363,6 +8507,9 @@ enum ControllerFailureCause {
     SecretClaimFailed,
     ConsumerFailed,
     ConsumerWroteNoResult,
+    /// The daemon's queue could not reconcile the audit outbox for longer than
+    /// its bound, so the job was answered instead of held (never started).
+    AuditUnavailable,
 }
 
 impl ControllerFailureCause {
@@ -8372,6 +8519,7 @@ impl ControllerFailureCause {
             "secret_claim_failed" => Some(Self::SecretClaimFailed),
             "consumer_failed" => Some(Self::ConsumerFailed),
             "consumer_wrote_no_result" => Some(Self::ConsumerWroteNoResult),
+            "audit_unavailable" => Some(Self::AuditUnavailable),
             _ => None,
         }
     }
@@ -8382,6 +8530,7 @@ impl ControllerFailureCause {
             Self::SecretClaimFailed => "secret_claim_failed",
             Self::ConsumerFailed => "consumer_failed",
             Self::ConsumerWroteNoResult => "consumer_wrote_no_result",
+            Self::AuditUnavailable => "audit_unavailable",
         }
     }
 
@@ -8396,6 +8545,9 @@ impl ControllerFailureCause {
             Self::ConsumerFailed => "The operation was terminated before it finished.",
             Self::ConsumerWroteNoResult => {
                 "The operation ended without recording a result of its own."
+            }
+            Self::AuditUnavailable => {
+                "The package audit log could not be reconciled, so this request was never started."
             }
         }
     }
@@ -8412,11 +8564,12 @@ impl ControllerFailureCause {
     }
 }
 
-const CONTROLLER_FAILURE_CODES: [&str; 4] = [
+const CONTROLLER_FAILURE_CODES: [&str; 5] = [
     "classification_failed",
     "secret_claim_failed",
     "consumer_failed",
     "consumer_wrote_no_result",
+    "audit_unavailable",
 ];
 
 /// Every code the package itself can publish as the cause of a terminal failure.
@@ -10107,6 +10260,20 @@ mod linux_files {
             })),
             _ => Ok(None),
         }
+    }
+
+    /// The daemon's `daemon.ready` (pid, start tick, boot id, published once its
+    /// control thread runs and `ctl.sock` answers): `Some((pid, live))` when a
+    /// record is published, `live` only when that exact process still runs.
+    pub(super) fn daemon_identity(
+        path: &Path,
+        package_uid: u32,
+    ) -> BridgeResult<Option<(u32, bool)>> {
+        let Some(identity) = read_published_identity(path, package_uid, true)? else {
+            return Ok(None);
+        };
+        let live = process_identity_is_live(identity.pid, identity.start, &identity.boot)?;
+        Ok(Some((identity.pid, live)))
     }
 
     /// `private_process_lock_is_live`: whether the private lock directory names
@@ -13275,6 +13442,76 @@ fn record_pre_relay_activity(stage: &str, code: &str, status: u16) -> BridgeResu
     }
 }
 
+/// `--daemon-lock-probe <path>`: what `{ flock -n 8; } 8< <path>` answers, for a shell without
+/// flock(1) (N-S5). The path is opened read-only, never created and never through a symlink
+/// (`O_RDONLY|O_CLOEXEC|O_NOFOLLOW`, plus `O_NONBLOCK` so a FIFO planted there cannot hold the
+/// probe), must be a regular file, and is tried with `flock(LOCK_EX|LOCK_NB)`; a lock taken is
+/// released at once (`LOCK_UN`, then the close).
+///
+/// Exit 0: free. Exit 3: held (`EWOULDBLOCK`). Exit 1: it cannot be probed (absent, not a
+/// regular file, a symlink, denied, any other error), with one stderr line
+/// `daemon-lock-probe: <path>: <cause>`. Nothing is written to stdout.
+fn daemon_lock_probe(arguments: &[OsString]) -> ExitCode {
+    let [path] = arguments else {
+        eprintln!(
+            "daemon-lock-probe: usage: sdsync-dsm-api --daemon-lock-probe <path> (given {} arguments)",
+            arguments.len()
+        );
+        return ExitCode::from(1);
+    };
+    let path = Path::new(path);
+    let refuse = |cause: &str| {
+        eprintln!(
+            "daemon-lock-probe: {}: {}",
+            path.display(),
+            cause.replace(['\n', '\r'], " ")
+        );
+        ExitCode::from(1)
+    };
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::fd::AsRawFd;
+        use std::os::unix::fs::OpenOptionsExt;
+        let file = match fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
+            .open(path)
+        {
+            Ok(file) => file,
+            Err(error) if error.raw_os_error() == Some(libc::ELOOP) => {
+                return refuse(&format!("a symbolic link, not followed ({error})"));
+            }
+            Err(error) => return refuse(&error.to_string()),
+        };
+        match file.metadata() {
+            Ok(metadata) if metadata.file_type().is_file() => {}
+            Ok(_) => return refuse("not a regular file"),
+            Err(error) => return refuse(&error.to_string()),
+        }
+        // SAFETY: flock on a live descriptor this function owns, with fixed operations.
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+            // SAFETY: as above. Closing the descriptor releases it as well; an error here is
+            // named because the shell must not be told "free" for a lock this probe still holds.
+            if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_UN) } != 0 {
+                return refuse(&format!(
+                    "the probe's own lock could not be released: {}",
+                    io::Error::last_os_error()
+                ));
+            }
+            return ExitCode::SUCCESS;
+        }
+        let error = io::Error::last_os_error();
+        if error.raw_os_error() == Some(libc::EWOULDBLOCK) {
+            return ExitCode::from(3);
+        }
+        refuse(&error.to_string())
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        refuse("only available on Linux")
+    }
+}
+
 pub(crate) fn main_entry() -> ExitCode {
     // The realtime watcher and its probe touch no network and no package state, so they are
     // dispatched before anything else this process sets up.
@@ -13286,6 +13523,11 @@ pub(crate) fn main_entry() -> ExitCode {
         Some(mode) if mode == "--watch-probe" => {
             return synology_drive_sync::watch::cli::probe_main(&early.collect::<Vec<_>>());
         }
+        // The shell's `flock -n` probe of daemon.lock where BusyBox has no flock(1) (N-S5): no
+        // config, no password, no network, so nothing else is set up for it either.
+        Some(mode) if mode == "--daemon-lock-probe" => {
+            return daemon_lock_probe(&early.collect::<Vec<_>>());
+        }
         _ => {}
     }
     // Same reasoning as the CLI: install the TLS provider first, and refuse to
@@ -13296,6 +13538,9 @@ pub(crate) fn main_entry() -> ExitCode {
         return ExitCode::from(1);
     }
     let arguments = std::env::args_os().skip(1).collect::<Vec<_>>();
+    if let Some(code) = daemon::dispatch(&arguments) {
+        return code;
+    }
     if arguments.is_empty() {
         let is_get = std::env::var("REQUEST_METHOD").is_ok_and(|method| method == "GET");
         let response = match run_cgi() {
@@ -16160,6 +16405,14 @@ fn snapshot_service_identity(
     paths: &PackagePaths<'_>,
     package_uid: u32,
 ) -> BridgeResult<(&'static str, u32)> {
+    // The daemon engine: `daemon.ready` names the exact process (pid, start
+    // tick, boot). A record whose process is gone falls through to the shell
+    // controller's proof, which then reads stopped unless that one runs.
+    if let Some((pid, true)) =
+        linux_files::daemon_identity(&paths.run_dir.join("daemon.ready"), package_uid)?
+    {
+        return Ok(("running", pid));
+    }
     let pid_file = paths.run_dir.join("controller.pid");
     let Some(pid) = linux_files::controller_pid_file_value(&pid_file, package_uid)? else {
         return Ok(("stopped", 0));
@@ -16783,6 +17036,28 @@ fn snapshot_document(
     let controller_next = manager_kv(controller, "next_run_epoch", "0")?;
     let controller_active = manager_kv(controller, "active_pid", "0")?;
     let controller_updated = manager_kv(controller, "updated_epoch", "0")?;
+    // H2: the service's degradation (`degraded=`, `degraded_since=`, `degraded_cause=`), all
+    // three or none. Absent is no member; a partial or malformed set is corrupt, never shown
+    // half-read.
+    let controller_degraded = manager_kv_optional(controller, "degraded", "")?;
+    let controller_degraded_since = manager_kv_optional(controller, "degraded_since", "")?;
+    let controller_degraded_cause = manager_kv_optional(controller, "degraded_cause", "")?;
+    let degraded_present = [
+        &controller_degraded,
+        &controller_degraded_since,
+        &controller_degraded_cause,
+    ]
+    .map(|value| !value.is_empty());
+    if degraded_present.iter().any(|present| *present)
+        && (!degraded_present.iter().all(|present| *present)
+            || !controller_degraded
+                .iter()
+                .all(|byte| byte.is_ascii_lowercase() || *byte == b'_')
+            || !digits(&controller_degraded_since)
+            || controller_degraded_cause.len() > 512)
+    {
+        return Err(PACKAGE_STATE_CORRUPT);
+    }
     if !matches!(controller_status.as_slice(), b"running" | b"stopped")
         || ![
             &controller_pid,
@@ -16904,6 +17179,15 @@ fn snapshot_document(
     push_raw_member(&mut document, "active_pid", &controller_active);
     document.push(b',');
     push_raw_member(&mut document, "updated_epoch", &controller_updated);
+    if !controller_degraded.is_empty() {
+        document.extend_from_slice(b",\"degraded\":{");
+        push_quoted_member(&mut document, "reason", &controller_degraded);
+        document.push(b',');
+        push_raw_member(&mut document, "since_epoch", &controller_degraded_since);
+        document.push(b',');
+        push_quoted_member(&mut document, "cause", &controller_degraded_cause);
+        document.push(b'}');
+    }
     document.extend_from_slice(b"},\"run\":{");
     push_quoted_member(&mut document, "state", &run_status);
     document.push(b',');
@@ -17843,9 +18127,59 @@ fn profile_outcome_value(
         "deferred_files": deferred,
         "warnings": warnings,
         "status_cache": trust,
+        "index": profile_index_value(&record, errors),
     });
     merge_facts(&mut value, facts);
     value
+}
+
+/// The verified-pair index line of a profile record (`index_*`, written by the daemon from the
+/// run's `pair_index` report), or `null` for a run that did not use the index (or an older
+/// writer). A key that is present but malformed is named, never shown.
+#[cfg(target_os = "linux")]
+fn profile_index_value(record: &OutcomeRecord<'_>, errors: &mut OutcomeErrors) -> Value {
+    let Some(state) = record.text("index_state", errors) else {
+        return Value::Null;
+    };
+    if !matches!(
+        state.as_slice(),
+        b"off" | b"cold" | b"warm" | b"refreshed" | b"unusable" | b"local-only"
+    ) {
+        errors.push(record.source, "malformed");
+        return Value::Null;
+    }
+    let issue = record.text("index_issue", errors).and_then(|code| {
+        let valid = code.len() <= 64
+            && code.starts_with(b"pair-index-")
+            && code.iter().all(|b| b.is_ascii_lowercase() || *b == b'-');
+        if valid {
+            String::from_utf8(code).ok()
+        } else {
+            errors.push(record.source, "malformed");
+            None
+        }
+    });
+    let issue_detail = record
+        .text("index_issue_detail", errors)
+        .and_then(|detail| {
+            if detail.len() <= 160 && detail.iter().all(|b| (b' '..=b'~').contains(b)) {
+                String::from_utf8(detail).ok()
+            } else {
+                errors.push(record.source, "malformed");
+                None
+            }
+        });
+    json!({
+        "state": String::from_utf8_lossy(&state),
+        "entries": record.number("index_entries", errors),
+        "hits": record.number("index_hits", errors),
+        "misses": record.number("index_misses", errors),
+        "canary_checked": record.number("index_canary_checked", errors),
+        "canary_mismatches": record.number("index_canary_mismatches", errors),
+        "refreshed": state.as_slice() == b"refreshed",
+        "issue": issue,
+        "issue_detail": issue_detail,
+    })
 }
 
 /// `detail=` in a profile record: the core's error line for that profile (S-18), written by the
@@ -17989,6 +18323,8 @@ fn outcomes_value(paths: &PackagePaths<'_>, package_uid: u32) -> Value {
         .map(|name| profile_outcome_value(paths, package_uid, name, &run, &mut errors))
         .collect::<Vec<_>>();
     let routines = routine_outcomes_value(paths, package_uid, &mut errors);
+    let lasting = lasting_outcomes_value(paths, package_uid, &names, &mut errors);
+    let engine = engine_outcome_value(paths, package_uid, &mut errors);
     let cache = status_cache_health_value(paths, &names, &mut errors);
     let controller_reload = controller_reload_value(paths, package_uid, &mut errors);
     json!({
@@ -17998,9 +18334,112 @@ fn outcomes_value(paths: &PackagePaths<'_>, package_uid: u32) -> Value {
         "alerts": alerts,
         "profiles": profiles,
         "routines": routines,
+        "lasting": lasting,
+        "engine": engine,
         "status_cache_health": cache,
         "errors": errors.into_value(),
     })
+}
+
+/// Profiles the daemon holds after a lasting, user-fixable failure (an out-of-memory kill), from
+/// its private `state/lasting/<profile>.state`: what happened, since when, and that Run now or a
+/// change to the profile's settings or the performance level lifts it. A record that cannot be
+/// read is shown as held and unreadable, never as lifted.
+#[cfg(target_os = "linux")]
+fn lasting_outcomes_value(
+    paths: &PackagePaths<'_>,
+    package_uid: u32,
+    names: &[String],
+    errors: &mut OutcomeErrors,
+) -> Value {
+    let mut held = Vec::new();
+    for name in names {
+        let source = format!("lasting/{name}.state");
+        let document = match linux_files::read_optional_private_document(
+            &paths
+                .state_dir
+                .join("lasting")
+                .join(format!("{name}.state")),
+            package_uid,
+            4096,
+        ) {
+            Ok(Some(document)) => document,
+            Ok(None) => continue,
+            Err(_) => {
+                errors.push(&source, "unsafe_file");
+                held.push(json!({
+                    "profile": name, "reason": "lasting_state_unreadable",
+                    "error": "the record is not a private package file",
+                }));
+                continue;
+            }
+        };
+        held.push(match daemon::lasting::Lasting::parse(&document) {
+            Ok(lasting) => json!({
+                "profile": name,
+                "reason": lasting.reason,
+                "detail": sanitize_outcome_line(&lasting.detail),
+                "since_epoch": lasting.since,
+                "clears_on": "run_now_or_settings_change",
+            }),
+            Err(cause) => {
+                errors.push(&source, "malformed");
+                json!({
+                    "profile": name, "reason": "lasting_state_unreadable",
+                    "error": sanitize_outcome_line(&cause), "clears_on": "run_now",
+                })
+            }
+        });
+    }
+    Value::Array(held)
+}
+
+/// Which service engine `start` runs: the Rust daemon unless `state/engine` says `shell` (the
+/// one-release fallback). A file that says anything else is named and the daemon runs; it is
+/// never silently read as either.
+#[cfg(target_os = "linux")]
+fn engine_outcome_value(
+    paths: &PackagePaths<'_>,
+    package_uid: u32,
+    errors: &mut OutcomeErrors,
+) -> Value {
+    let (file, detail) = match linux_files::read_optional_private_document(
+        &paths.state_dir.join("engine"),
+        package_uid,
+        64,
+    ) {
+        Ok(None) => ("absent", None),
+        Ok(Some(bytes)) => match daemon::engine_word(&bytes) {
+            Ok(word) => (word, None),
+            Err(cause) => {
+                errors.push("engine", "malformed");
+                ("invalid", Some(sanitize_outcome_line(&cause)))
+            }
+        },
+        Err(_) => {
+            errors.push("engine", "unsafe_file");
+            (
+                "invalid",
+                Some("state/engine is not a private package file".to_owned()),
+            )
+        }
+    };
+    json!({
+        "active": if file == "shell" { "shell" } else { "daemon" },
+        "file": file,
+        "detail": detail,
+    })
+}
+
+/// One printable line of at most 240 bytes, for text that reaches the dashboard verbatim.
+#[cfg(target_os = "linux")]
+fn sanitize_outcome_line(text: &str) -> String {
+    let mut line: String = text
+        .chars()
+        .map(|c| if (' '..='~').contains(&c) { c } else { ' ' })
+        .collect();
+    line.truncate(240);
+    line
 }
 
 /// A token-shaped value, or `None` for the writers' `none` placeholder and for an absent key.
@@ -18539,10 +18978,20 @@ fn log_source_files(log_root: &Path, source: LogSource) -> Vec<PathBuf> {
         LogSource::RunStderr => ("run-stderr.log", 3),
         LogSource::All => return Vec::new(),
     };
-    let mut files = (1..=rotations)
-        .rev()
-        .map(|index| log_root.join(format!("{name}.{index}")))
-        .collect::<Vec<_>>();
+    let mut files = Vec::new();
+    if source == LogSource::Controller {
+        // The daemon engine's own stderr (`--supervise` keeps it, 1 MiB and one
+        // rotation): raw lines, which read as errors. Placed before the
+        // controller's own generations, as the oldest; the supervisor relays a
+        // dying daemon's last line into controller.log too (`last_stderr=`).
+        files.push(log_root.join("daemon-stderr.log.1"));
+        files.push(log_root.join("daemon-stderr.log"));
+    }
+    files.extend(
+        (1..=rotations)
+            .rev()
+            .map(|index| log_root.join(format!("{name}.{index}"))),
+    );
     files.push(log_root.join(name));
     files
 }
@@ -21127,6 +21576,7 @@ mod tests {
             ("secret_claim_failed", false),
             ("consumer_failed", true),
             ("consumer_wrote_no_result", true),
+            ("audit_unavailable", false),
         ] {
             let cause = ControllerFailureCause::parse(word).expect("declared causes parse");
             assert_eq!(
@@ -33197,11 +33647,40 @@ mod tests {
         // A future token the shell learns is not a 503.
         let future = entry(json!("audit_reconciliation_pending"), json!("later"));
         assert!(parse_manager_result(&serde_json::to_vec(&future).unwrap(), None).is_ok());
-        // The secret-shaped exact result does not grow the member.
-        let secret = json!({"schema":"sdsync.dsm-result.v1","ok":true,"message":"secret state updated",
+        // The secret-shaped exact result grows only by `warnings`: a committed
+        // save's warnings reach the dashboard, never a 503.
+        let with = |warnings: Value| {
+            json!({"schema":"sdsync.dsm-result.v1","ok":true,"message":"secret state updated",
+                   "has_password":true,"has_totp":false,"has_remote_log_token":false,
+                   "warnings":warnings})
+        };
+        for warnings in [
+            json!([{"code":"manager_warning","message":"warning: the old token file was kept"}]),
+            json!([{"code":"controller_reload_failed","message":"not reloaded"}]),
+            json!([{"code":"manager_warning","message":"warning: kept"},
+                   {"code":"controller_reload_failed","message":"not reloaded"},
+                   {"code":"applies_next_run","message":"takes effect on its next run"}]),
+        ] {
+            validate_set_secret_manager_result(&with(warnings.clone())).unwrap();
+        }
+        // Held to the warnings grammar: not a list, empty, or a bad code is refused.
+        for bad in [
+            json!("text"),
+            json!([]),
+            json!([{"code":"Not A Token","message":"x"}]),
+        ] {
+            assert!(validate_set_secret_manager_result(&with(bad)).is_err());
+        }
+        let during_a_sync = json!({"schema":"sdsync.dsm-result.v1","ok":true,"message":"secret state updated",
                             "has_password":true,"has_totp":false,"has_remote_log_token":false,
-                            "warnings":[{"code":"manager_warning","message":"text"}]});
-        assert!(validate_set_secret_manager_result(&secret).is_err());
+                            "warnings":[{"code":"applies_next_run",
+                                         "message":"profile nightly is syncing now; this change takes effect on its next run"}]});
+        validate_set_secret_manager_result(&during_a_sync).unwrap();
+        let mixed = json!({"schema":"sdsync.dsm-result.v1","ok":true,"message":"secret state updated",
+                            "has_password":true,"has_totp":false,"has_remote_log_token":false,
+                            "warnings":[{"code":"applies_next_run","message":"later"},
+                                        {"code":"manager_warning","message":"text"}]});
+        validate_set_secret_manager_result(&mixed).unwrap();
     }
 
     /// The reader accepts every operation the writer can put on a queued response envelope.

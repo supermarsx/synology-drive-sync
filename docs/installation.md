@@ -197,7 +197,7 @@ The last form creates the directory when needed and writes the root page plus a 
 
 ## Build from source
 
-Rust 1.88 or newer is required:
+Rust 1.90 or newer is required:
 
 ```bash
 git clone https://github.com/supermarsx/synology-drive-sync.git

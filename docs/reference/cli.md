@@ -5,8 +5,8 @@ The explicit command tree is preferred. Run `synology-drive-sync --help` and
 
 | Command | Purpose and mutation boundary |
 | --- | --- |
-| `sync SOURCE REMOTE` | Apply one finite local-to-remote synchronization. Remote-only entries remain unless deletion is explicitly armed. |
-| `plan SOURCE REMOTE` | Build and print the same plan without mutation. `--exit-code` returns 10 when work is pending. |
+| `sync SOURCE REMOTE` | Apply one finite local-to-remote synchronization. Remote-only entries remain unless deletion is explicitly armed. `--pair-index DIR` keeps verified-pair evidence so unchanged files are not read again; see [Verified-pair index](../pair-index.md). |
+| `plan SOURCE REMOTE` | Build and print the same plan without mutation. `--exit-code` returns 10 when work is pending. A plan reads and writes `--pair-index` evidence too, so it warms the next sync. |
 | `status` | Compare both sides and list what needs attention, in bounded pages with whole-scope totals. Read-only. `--status-cache DIR` reuses stored content digests for unchanged files; see [Status digest cache](../status-cache.md). |
 | `status-rollup --status-cache DIR` | Print the totals recorded by the last full `status` pass, per profile and combined. Scans nothing: no local walk, no DSM access, one small file read per profile. |
 | `doctor source [SOURCE] [--hash]` | Local-only source validation; `--hash` reads and verifies every payload file. No DSM access. |

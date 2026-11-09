@@ -24,6 +24,7 @@
 
 - [Command reference](reference/cli.md)
 - [Status digest cache](status-cache.md)
+- [Verified-pair index](pair-index.md)
 - [Diagnostics and multi-profile batches](diagnostics-and-batch.md)
 - [Local, mapped-drive, and SMB sources](local-and-smb-sources.md)
 - [Scheduling overview](operations/scheduling.md)

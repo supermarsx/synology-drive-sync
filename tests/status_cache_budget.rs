@@ -147,6 +147,7 @@ fn inventories(with_digests: bool) -> (LocalInventory, RemoteInventory) {
                     device: 2049,
                     inode: 1_000_000 + index as u64,
                 },
+                times: Default::default(),
                 content_md5: with_digests.then(|| digest(index)),
             },
         );
@@ -158,6 +159,9 @@ fn inventories(with_digests: bool) -> (LocalInventory, RemoteInventory) {
                 kind: EntryKind::File,
                 size: 4096,
                 mtime_seconds: 1_600_000_000,
+                ctime_seconds: None,
+                crtime_seconds: None,
+                digest_nas_time: None,
                 mount_point_type: None,
                 content_md5: with_digests.then(|| digest(index)),
             },

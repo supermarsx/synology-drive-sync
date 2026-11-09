@@ -374,7 +374,8 @@ test("B-4 refreshLogs records how long a read took and how many failed in a row"
 test("C-E6 lasting refusals say the entry is not synced until the user acts, never 'retried'", () => {
   for (const name of [
     "remote-refused", "remote-skipped", "unsupported-entry", "case-rename-pending", "delete-not-permitted",
-    "local-permission-denied", "type-conflict", "protected-descendant", "remote-link"
+    "local-permission-denied", "type-conflict", "protected-descendant", "remote-link",
+    "tree-too-large-for-memory"
   ]) {
     const { text, known } = reasonCopy(name);
     assert.equal(known, true, name);

@@ -156,6 +156,21 @@ if [ -f "$config_file" ]; then
         exit 1
     }
 fi
+# Under the daemon engine nothing reads or retires what the shell controller
+# kept beside its runs: the reload-pending marker (the dashboard would go on
+# reporting a save as not applied) and its watcher, poll and fingerprint
+# scratch files. The shell engine keeps them; preupgrade has already proven
+# that no controller is running.
+resolve_service_engine
+if [ "$service_engine" = daemon ]; then
+    for shell_leftover in "$state_root/controller-reload.pending" "$runtime_root"/watch-* \
+        "$runtime_root"/poll-* "$runtime_root"/fingerprint.*
+    do
+        [ -e "$shell_leftover" ] || [ -L "$shell_leftover" ] || continue
+        shell_leftover_error=$(rm -f -- "$shell_leftover" 2>&1) && continue
+        package_message "warning: shell-engine leftover $shell_leftover was not removed: $(one_safe_line "${shell_leftover_error:-rm failed}")"
+    done
+fi
 "$api_bridge" --package-transition clear || {
     package_message "upgrade completed but its transition marker could not be retired"
     exit 1

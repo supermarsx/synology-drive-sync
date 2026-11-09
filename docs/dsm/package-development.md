@@ -113,7 +113,7 @@ dedicated CI packaging gate also rebuilds twice and compares bundle hashes for d
 
 ## Native x86-64 example
 
-Build both binaries with Rust 1.88 or newer and a matching musl linker:
+Build both binaries with Rust 1.90 or newer and a matching musl linker:
 
 ```bash
 rustup target add x86_64-unknown-linux-musl
@@ -141,15 +141,15 @@ copying a path blindly.
 
 ## ARMv7 cross-build example
 
-The supported release/local cross-build path uses Rust 1.88.0, Zig 0.16.0, and
+The supported release/local cross-build path uses Rust 1.90.0, Zig 0.16.0, and
 `cargo-zigbuild` 0.23.3:
 
 ```bash
-rustup toolchain install 1.88.0 --profile minimal \
+rustup toolchain install 1.90.0 --profile minimal \
   --target armv7-unknown-linux-musleabihf
 cargo install --locked cargo-zigbuild --version 0.23.3
 
-cargo +1.88.0 zigbuild \
+cargo +1.90.0 zigbuild \
   --release --locked \
   --package synology-drive-sync \
   --bins \
@@ -260,6 +260,15 @@ be bash (4.4 on DSM 7), dash and BusyBox read a builtin `read` a byte at a time 
 (`SDSYNC_TEST_SHARD=0/3`, `1/3` and `2/3`), balanced by the measured per-test weights in `SHARD_WEIGHTS`
 in the suite, which also checks that every test lands in exactly one shard; the shell-sensitive tests also
 loop over each shell the host has.
+
+The suite's fixture writes `var/state/engine` = `shell`, so the lifecycle tests written for the
+controller and runner keep exercising that engine. The daemon-engine tests select the daemon and run
+the real `target/debug/sdsync-dsm-api` from `cargo build --locked` (or `SDSYNC_DAEMON_BINARY`) for the
+daemon's flags; without it they fail under CI (`CI=true`) and are skipped, with the reason printed,
+locally. The daemon's API child binds the fixed `/var/packages` path and cannot be relocated into the
+fixture, so those tests start the lifecycle with `SDSYNC_TEST_NO_SERVE_API=1`: `start-stop-status`
+then omits `--serve-api` and prints a warning that it did. It is the lifecycle's only test hook and
+accepts only the value `1`; never set it on a NAS, where it leaves the dashboard without its API.
 New shell must stay POSIX `sh` and BusyBox `ash` compatible, including 32-bit arithmetic on armv7.
 Negative tests deliberately tamper with architecture, helper identity, symlinks, permissions,
 reserved resources, notifier arguments, UI security markers, icons, and archive fields. They

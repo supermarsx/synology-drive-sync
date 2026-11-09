@@ -386,133 +386,21 @@ fn is_cache_owned(name: &std::ffi::OsStr) -> bool {
 ///
 /// `Ok(n)` with the number of cache files a directory written before the marker existed already
 /// held when it was adopted, so the caller can name the adoption; 0 when nothing was adopted.
+/// The rules are [`crate::evidence_dir`]'s, shared with the verified-pair index.
 fn claim_directory(directory: &Path) -> Result<usize, String> {
-    let marker = directory.join(CACHE_MARKER);
-    let refuse = |why: String| {
-        format!(
-            "not a dedicated status-cache directory: {why}; point --status-cache at a directory \
-             used for nothing else"
-        )
-    };
-    if marker_is_ours(&marker, &refuse)? {
-        return Ok(0);
-    }
-
-    let entries = fs::read_dir(directory).map_err(|error| {
-        format!(
-            "{} could not be listed to check it is dedicated to the cache: {error}",
-            directory.display()
-        )
-    })?;
-    let mut foreign = Vec::new();
-    let mut count = 0_usize;
-    let mut owned = 0_usize;
-    for entry in entries {
-        let entry = entry.map_err(|error| {
-            format!(
-                "{} could not be listed to check it is dedicated to the cache: {error}",
-                directory.display()
-            )
-        })?;
-        if is_cache_owned(&entry.file_name()) {
-            owned += 1;
-        } else {
-            count += 1;
-            if foreign.len() < 3 {
-                foreign.push(entry.file_name().to_string_lossy().into_owned());
-            }
-        }
-    }
-    if count > 0 {
-        let more = if count > foreign.len() {
-            format!(" and {} more", count - foreign.len())
-        } else {
-            String::new()
-        };
-        return Err(refuse(format!(
-            "it has no {CACHE_MARKER} marker and holds {count} entr{} the cache did not write ({}{more})",
-            if count == 1 { "y" } else { "ies" },
-            foreign.join(", ")
-        )));
-    }
-
-    let written = (|| -> std::io::Result<()> {
-        let mut options = fs::OpenOptions::new();
-        options.write(true).create_new(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt as _;
-            options.mode(0o600);
-        }
-        let mut file = options.open(&marker)?;
-        file.write_all(SCHEMA.as_bytes())?;
-        file.write_all(b"\n")?;
-        file.sync_all()
-    })();
-    match written {
-        Ok(()) => Ok(owned),
-        // Another status pass claimed the directory between the check and the write.
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-            if marker_is_ours(&marker, &refuse)? {
-                Ok(0)
-            } else {
-                Err(refuse(format!(
-                    "{} appeared with unexpected contents",
-                    marker.display()
-                )))
-            }
-        }
-        Err(error) => Err(format!(
-            "the {CACHE_MARKER} marker could not be written in {}: {error}",
-            directory.display()
-        )),
-    }
-}
-
-/// `Ok(true)` when `marker` is a cache marker, `Ok(false)` when there is none, and an error
-/// (already phrased as a refusal) when something else is sitting at that name.
-fn marker_is_ours(marker: &Path, refuse: &dyn Fn(String) -> String) -> Result<bool, String> {
-    // Another pass may be part-way through writing the marker it just created; give it a moment
-    // rather than call an empty file foreign.
-    for attempt in 0..5 {
-        let metadata = match fs::symlink_metadata(marker) {
-            Ok(metadata) => metadata,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
-            Err(error) => {
-                return Err(format!(
-                    "{} could not be examined: {error}",
-                    marker.display()
-                ));
-            }
-        };
-        if !metadata.is_file() {
-            return Err(refuse(format!(
-                "{} is not a regular file",
-                marker.display()
-            )));
-        }
-        let mut head = Vec::new();
-        fs::File::open(marker)
-            .and_then(|file| {
-                std::io::Read::read_to_end(&mut std::io::Read::take(file, 256), &mut head)
-            })
-            .map_err(|error| format!("{} could not be read: {error}", marker.display()))?;
-        if head.starts_with(CACHE_MARKER_PREFIX.as_bytes()) {
-            return Ok(true);
-        }
-        if head.is_empty() && attempt < 4 {
-            std::thread::sleep(std::time::Duration::from_millis(20));
-            continue;
-        }
-        return Err(refuse(format!(
-            "{} was not written by this cache",
-            marker.display()
-        )));
-    }
-    Err(refuse(format!(
-        "{} was not written by this cache",
-        marker.display()
-    )))
+    crate::evidence_dir::claim_directory(
+        directory,
+        &crate::evidence_dir::DirectorySpec {
+            marker: CACHE_MARKER,
+            marker_prefix: CACHE_MARKER_PREFIX,
+            marker_line: SCHEMA,
+            kind: "status-cache",
+            flag: "--status-cache",
+            subject: "the cache",
+            this: "this cache",
+            owns: &is_cache_owned,
+        },
+    )
 }
 
 /// Everything needed to decide whether a stored file describes *this* query.
@@ -1751,31 +1639,12 @@ fn create_private(path: &Path) -> std::io::Result<fs::File> {
 /// A directory is usable only if it is a real directory, not a symbolic link, and grants no write
 /// access to group or other. See [`StatusCache::open_validated`] for why ownership is not compared.
 fn directory_is_private(path: &Path) -> Result<(), String> {
-    let metadata = fs::symlink_metadata(path).map_err(|error| error.to_string())?;
-    if !metadata.is_dir() {
-        return Err("not a directory (a link or a file)".to_owned());
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt as _;
-        if metadata.mode() & 0o022 != 0 {
-            return Err("writable by group or other".to_owned());
-        }
-    }
-    Ok(())
+    crate::evidence_dir::directory_is_private(path)
 }
 
-/// The profile name becomes a filename, so it is constrained exactly as the package's own
-/// `cache_name_is_safe` constrains a cache key: no traversal, no separators, nothing hidden.
-///
-/// The DSM manager validates profile names before this is ever reached. Re-checking here is what
-/// makes the property hold for any other caller too, rather than depending on one of them.
+/// The profile name becomes a filename. See [`crate::evidence_dir::name_is_safe`].
 fn name_is_safe(name: &str) -> bool {
-    if name.is_empty() || name.len() > 64 || name.starts_with('.') || name.contains("..") {
-        return false;
-    }
-    name.bytes()
-        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+    crate::evidence_dir::name_is_safe(name)
 }
 
 fn encode_identity(identity: FileIdentity) -> String {
@@ -2243,6 +2112,7 @@ mod tests {
                     device: 2049,
                     inode,
                 },
+                times: Default::default(),
                 content_md5: None,
             },
         );
@@ -2254,6 +2124,9 @@ mod tests {
                 kind: EntryKind::File,
                 size,
                 mtime_seconds: mtime_ms.div_euclid(1000),
+                ctime_seconds: None,
+                crtime_seconds: None,
+                digest_nas_time: None,
                 mount_point_type: None,
                 content_md5: None,
             },
