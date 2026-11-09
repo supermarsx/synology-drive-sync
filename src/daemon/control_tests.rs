@@ -160,6 +160,14 @@ const T0: u64 = 1_780_000_000;
 /// has been seen not to log its first line within five seconds: the waits in
 /// `failed_partial_busy_cancelled_runs_keep_the_change_pending` were that flake.
 const PATIENT: Duration = Duration::from_secs(30);
+// Why 30 s and not 5: the control thread's own state writes are bounded at
+// STATE_WRITE_DEADLINE (10 s) because an fsync can legitimately stall that long on a
+// loaded runner (macOS fsync is F_FULLFSYNC), so a harness that gives up on the
+// thread after 5 s mistakes the contract's slowest case for a hang. Measured on Linux
+// beside twelve busy loops on three cpus, every wait but the deliberate ones (a real
+// debounce) ends in under 400 ms, so the budget costs nothing unless a test fails.
+// What the budget is NOT for: a wait that polls `launched() == N` can be overshot by a
+// second launch (the routine a lifted block releases): count with `>=`.
 
 fn grace() -> Duration {
     Duration::from_millis(300)
@@ -261,7 +269,7 @@ impl Harness {
     }
 
     fn ask(&self, request: Request) -> Value {
-        ask(&self.tx, request, Duration::from_secs(5))
+        ask(&self.tx, request, PATIENT)
     }
 
     fn timed(&self, request: Request) -> (Value, Duration) {
@@ -636,7 +644,7 @@ fn two_runs_never_overlap_across_routine_dashboard_and_cli() {
 fn runs_publish_a_progress_record_the_watchdog_reads() {
     let h = Harness::new("progress", |home, _| profile(home, "alpha"));
     assert_eq!(h.ask(run("alpha"))["ok"], true);
-    h.wait_for("the run", Duration::from_secs(5), |h| h.launched() == 1);
+    h.wait_for("the run", PATIENT, |h| h.launched() >= 1);
     let world = h.world.lock().unwrap();
     let spec = &world.launched[0];
     let record = spec
@@ -683,7 +691,7 @@ fn ctl_answers_and_mutations_complete_while_a_sync_runs() {
         stop_takes: Duration::ZERO,
     };
     assert_eq!(h.ask(run("alpha"))["ok"], true);
-    h.wait_for("the run", Duration::from_secs(5), |h| h.launched() == 1);
+    h.wait_for("the run", PATIENT, |h| h.launched() >= 1);
     for _ in 0..20 {
         let (status, took) = h.timed(Request::Status);
         assert!(took < Duration::from_secs(1), "{took:?}");
@@ -713,7 +721,7 @@ fn ctl_answers_and_mutations_complete_while_a_sync_runs() {
     assert_eq!(other["ok"], true);
     assert_eq!(h.mutations.calls.load(Ordering::SeqCst), 2);
     assert_eq!(h.ask(Request::Cancel { id: None })["state"], "stopping");
-    h.wait_for("the cancel", Duration::from_secs(5), Harness::idle);
+    h.wait_for("the cancel", PATIENT, Harness::idle);
     let run_state = h.state("run.state");
     assert!(
         run_state.contains("state=failed\n")
@@ -734,7 +742,7 @@ fn stop_within_budget_and_forced_kill_reads_cancelled() {
         stop_takes: grace() + Duration::from_millis(100),
     };
     assert_eq!(h.ask(run("alpha"))["ok"], true);
-    h.wait_for("the run", Duration::from_secs(5), |h| h.launched() == 1);
+    h.wait_for("the run", PATIENT, |h| h.launched() >= 1);
     let start = Instant::now();
     let answer = h.stop();
     let took = start.elapsed();
@@ -764,7 +772,7 @@ fn no_new_run_after_term() {
         stop_takes: Duration::from_millis(200),
     };
     assert_eq!(h.ask(run("alpha"))["ok"], true);
-    h.wait_for("the run", Duration::from_secs(5), |h| h.launched() == 1);
+    h.wait_for("the run", PATIENT, |h| h.launched() >= 1);
     let _ = h.tx.send(Msg::Signal(15));
     let refused = h.ask(run("alpha"));
     // Either the refusal, or the control thread already finished stopping.
@@ -800,7 +808,7 @@ fn change(h: &Harness, dir: &str) {
 fn a_realtime_change_dispatches_a_scoped_run_after_its_debounce() {
     let h = realtime_harness("scope");
     let source = volume_source(&h.root, "docs");
-    h.wait_for("arm", Duration::from_secs(5), |h| {
+    h.wait_for("arm", PATIENT, |h| {
         h.changes
             .calls
             .lock()
@@ -817,9 +825,7 @@ fn a_realtime_change_dispatches_a_scoped_run_after_its_debounce() {
     let start = Instant::now();
     change(&h, "Projects/2026/q4");
     change(&h, "Projects/2026/q3");
-    h.wait_for("the dispatch", Duration::from_secs(5), |h| {
-        h.launched() == 1
-    });
+    h.wait_for("the dispatch", PATIENT, |h| h.launched() == 1);
     assert!(
         start.elapsed() >= Duration::from_millis(900),
         "debounced: {:?}",
@@ -835,7 +841,7 @@ fn a_realtime_change_dispatches_a_scoped_run_after_its_debounce() {
             .any(|w| w[0] == "--scope" && w[1] == "Projects/2026"),
         "{args:?}"
     );
-    h.wait_for("idle", Duration::from_secs(5), Harness::idle);
+    h.wait_for("idle", PATIENT, Harness::idle);
     let state = h.state("routines/docs.state");
     assert!(
         state.contains("state=succeeded\n") && state.contains("backend=inotify\n"),
@@ -850,9 +856,7 @@ fn a_realtime_change_dispatches_a_scoped_run_after_its_debounce() {
 #[test]
 fn a_new_backend_cause_under_the_same_reason_is_logged() {
     let h = realtime_harness("backend-detail");
-    h.wait_for("arm", Duration::from_secs(5), |h| {
-        armed_generation(h, "docs").is_some()
-    });
+    h.wait_for("arm", PATIENT, |h| armed_generation(h, "docs").is_some());
     let report = |detail: &str| {
         h.tx.send(Msg::Change(ChangeEvent::Backend {
             routine: "docs".into(),
@@ -872,10 +876,8 @@ fn a_new_backend_cause_under_the_same_reason_is_logged() {
             .iter()
             .any(|l| l.starts_with("routine_backend ") && l.contains(needle))
     };
-    h.wait_for("the first cause", Duration::from_secs(5), |h| {
-        logged(h, "arm gave up")
-    });
-    h.wait_for("the grown deadline", Duration::from_secs(5), |h| {
+    h.wait_for("the first cause", PATIENT, |h| logged(h, "arm gave up"));
+    h.wait_for("the grown deadline", PATIENT, |h| {
         logged(h, "walk_deadline_exceeded")
     });
     let line = h
@@ -904,7 +906,7 @@ fn failed_partial_busy_cancelled_runs_keep_the_change_pending() {
             stop_takes: Duration::ZERO,
         };
         change(&h, "a");
-        h.wait_for("the dispatch", PATIENT, |h| h.launched() == 1);
+        h.wait_for("the dispatch", PATIENT, |h| h.launched() >= 1);
         h.wait_for("idle", PATIENT, Harness::idle);
         let status = h.ask(Request::Status);
         assert_eq!(
@@ -920,7 +922,7 @@ fn failed_partial_busy_cancelled_runs_keep_the_change_pending() {
         stop_takes: Duration::ZERO,
     };
     change(&h, "a");
-    h.wait_for("the dispatch", PATIENT, |h| h.launched() == 1);
+    h.wait_for("the dispatch", PATIENT, |h| h.launched() >= 1);
     h.ask(Request::Cancel { id: None });
     h.wait_for("idle", PATIENT, Harness::idle);
     assert_eq!(
@@ -941,7 +943,7 @@ fn failed_partial_busy_cancelled_runs_keep_the_change_pending() {
         stop_takes: Duration::ZERO,
     };
     change(&h, "a");
-    h.wait_for("the first run", PATIENT, |h| h.launched() == 1);
+    h.wait_for("the first run", PATIENT, |h| h.launched() >= 1);
     change(&h, "b");
     h.wait_for("the second run", PATIENT, |h| h.launched() == 2);
     let args = h.world.lock().unwrap().launched[1]
@@ -962,9 +964,7 @@ fn an_overflow_runs_the_whole_tree() {
     change(&h, "a/b");
     let _ =
         h.tx.send(Msg::Change(ChangeEvent::Overflow { routine: None }));
-    h.wait_for("the dispatch", Duration::from_secs(5), |h| {
-        h.launched() == 1
-    });
+    h.wait_for("the dispatch", PATIENT, |h| h.launched() == 1);
     let args = h.world.lock().unwrap().launched[0]
         .args
         .iter()
@@ -989,9 +989,7 @@ fn every_failure_has_log_and_state() {
         stop_takes: Duration::ZERO,
     };
     h.ask(run("alpha"));
-    h.wait_for("the run", Duration::from_secs(5), |h| {
-        h.launched() == 1 && h.idle()
-    });
+    h.wait_for("the run", PATIENT, |h| h.launched() == 1 && h.idle());
     let run_state = h.state("run.state");
     assert!(
         run_state.contains("reason=core_failed\ndetail=error: fake failure\n"),
@@ -1026,7 +1024,7 @@ fn a_dead_daemons_running_record_is_reconciled() {
         )
         .unwrap();
     });
-    h.wait_for("reconcile", Duration::from_secs(5), |h| {
+    h.wait_for("reconcile", PATIENT, |h| {
         h.state("run.state").contains("reason=runner_died")
     });
     assert!(
@@ -1147,9 +1145,7 @@ fn a_lasting_block_holds_the_routine_across_a_restart() {
         due_alpha(home, var);
         plant_block(var);
     });
-    h.wait_for("the hold", Duration::from_secs(5), |h| {
-        suppressed_logs(h) == 1
-    });
+    h.wait_for("the hold", PATIENT, |h| suppressed_logs(h) == 1);
     h.advance(1);
     h.advance(1);
     thread::sleep(Duration::from_millis(300));
@@ -1174,9 +1170,7 @@ fn a_no_op_save_keeps_the_block_and_a_real_change_lifts_it() {
         plant_block(var);
     });
     let fragment = h.root.join("home/config/profiles.d/alpha.toml");
-    h.wait_for("the hold", Duration::from_secs(5), |h| {
-        suppressed_logs(h) == 1
-    });
+    h.wait_for("the hold", PATIENT, |h| suppressed_logs(h) == 1);
     write_atomic(&fragment, alpha_fragment(&h.root, &[]));
     let _ = h.ask(Request::Reload);
     assert_eq!(
@@ -1186,7 +1180,7 @@ fn a_no_op_save_keeps_the_block_and_a_real_change_lifts_it() {
     assert!(h.var.join("state/lasting/alpha.state").exists());
     write_atomic(&fragment, alpha_fragment(&h.root, &[("max-delete", "50")]));
     let _ = h.ask(Request::Reload);
-    h.wait_for("the run", Duration::from_secs(5), |h| h.launched() == 1);
+    h.wait_for("the run", PATIENT, |h| h.launched() >= 1);
     assert!(!h.var.join("state/lasting/alpha.state").exists());
     assert!(
         h.logs()
@@ -1205,9 +1199,7 @@ fn run_now_lifts_the_block_and_a_second_kill_blocks_again() {
         due_alpha(home, var);
         plant_block(var);
     });
-    h.wait_for("the hold", Duration::from_secs(5), |h| {
-        suppressed_logs(h) == 1
-    });
+    h.wait_for("the hold", PATIENT, |h| suppressed_logs(h) == 1);
     *h.plan.lock().unwrap() = Plan {
         finish_after: Some(Duration::from_millis(30)),
         exit: 137,
@@ -1215,8 +1207,8 @@ fn run_now_lifts_the_block_and_a_second_kill_blocks_again() {
     };
     h.world.lock().unwrap().oom_proven = true;
     assert_eq!(h.ask(run("alpha"))["ok"], true);
-    h.wait_for("the run", Duration::from_secs(5), |h| h.launched() >= 1);
-    h.wait_for("idle", Duration::from_secs(5), Harness::idle);
+    h.wait_for("the run", PATIENT, |h| h.launched() >= 1);
+    h.wait_for("idle", PATIENT, Harness::idle);
     assert_eq!(h.launched(), 1, "only Run now ran: the routine stayed held");
     let profile = h.state("profiles/alpha.state");
     assert!(
@@ -1245,9 +1237,7 @@ fn a_removed_profile_takes_its_block_with_it() {
         due_alpha(home, var);
         plant_block(var);
     });
-    h.wait_for("the hold", Duration::from_secs(5), |h| {
-        suppressed_logs(h) == 1
-    });
+    h.wait_for("the hold", PATIENT, |h| suppressed_logs(h) == 1);
     fs::remove_file(h.root.join("home/config/profiles.d/alpha.toml")).unwrap();
     let _ = h.ask(Request::Reload);
     assert!(!h.var.join("state/lasting/alpha.state").exists());
@@ -1269,6 +1259,37 @@ fn a_removed_profile_takes_its_block_with_it() {
     );
 }
 
+/// Run now lifts a block and so releases the due routine it held: two runs follow, the
+/// requested one and the routine's. A test that polled `launched() == 1` missed the moment
+/// between them whenever it was slow to look (CI, macOS aarch64: `timed out waiting for the
+/// run` with `run_started id=2 origin=routine` in the events). A slow observer sees both.
+#[test]
+fn run_now_beside_a_due_routine_runs_twice_for_an_observer_that_looks_late() {
+    let h = Harness::new("lasting-late-observer", |home, var| {
+        due_alpha(home, var);
+        fs::create_dir_all(var.join("state/lasting")).unwrap();
+        fs::write(
+            var.join("state/lasting/alpha.state"),
+            "garbage
+",
+        )
+        .unwrap();
+    });
+    h.wait_for("the hold", PATIENT, |h| suppressed_logs(h) == 1);
+    assert_eq!(h.ask(run("alpha"))["ok"], true);
+    // Looking late: both runs have started and finished by now.
+    thread::sleep(Duration::from_millis(600));
+    h.wait_for("the first run", PATIENT, |h| h.launched() >= 1);
+    h.wait_for("idle", PATIENT, Harness::idle);
+    assert_eq!(
+        h.launched(),
+        2,
+        "Run now, then the routine it released: {:?}",
+        h.logs()
+    );
+    assert!(!h.var.join("state/lasting/alpha.state").exists());
+}
+
 /// A corrupt record is named and still holds: never read as lifted.
 #[test]
 fn a_corrupt_block_record_is_named_and_still_holds() {
@@ -1277,9 +1298,7 @@ fn a_corrupt_block_record_is_named_and_still_holds() {
         fs::create_dir_all(var.join("state/lasting")).unwrap();
         fs::write(var.join("state/lasting/alpha.state"), "garbage\n").unwrap();
     });
-    h.wait_for("the hold", Duration::from_secs(5), |h| {
-        suppressed_logs(h) == 1
-    });
+    h.wait_for("the hold", PATIENT, |h| suppressed_logs(h) == 1);
     assert_eq!(h.launched(), 0);
     let status = h.ask(Request::Status);
     assert_eq!(
@@ -1300,7 +1319,7 @@ fn a_corrupt_block_record_is_named_and_still_holds() {
     assert_eq!(named, 1, "named once, not every turn");
     // Run now still lifts it.
     assert_eq!(h.ask(run("alpha"))["ok"], true);
-    h.wait_for("the run", Duration::from_secs(5), |h| h.launched() == 1);
+    h.wait_for("the run", PATIENT, |h| h.launched() >= 1);
     assert!(!h.var.join("state/lasting/alpha.state").exists());
 }
 
@@ -1314,11 +1333,11 @@ fn an_oom_killed_routine_run_blocks_instead_of_retrying() {
         stop_takes: Duration::ZERO,
     };
     h.world.lock().unwrap().oom_proven = true;
-    h.wait_for("the run", Duration::from_secs(5), |h| h.launched() == 1);
-    h.wait_for("the block", Duration::from_secs(5), |h| {
+    h.wait_for("the run", PATIENT, |h| h.launched() >= 1);
+    h.wait_for("the block", PATIENT, |h| {
         h.var.join("state/lasting/alpha.state").exists()
     });
-    h.wait_for("the routine record", Duration::from_secs(5), |h| {
+    h.wait_for("the routine record", PATIENT, |h| {
         h.state("routines/alpha.state").contains(
             "last_reason=core_oom_killed
 ",
@@ -1356,9 +1375,7 @@ fn armed_generation(h: &Harness, routine: &str) -> Option<u64> {
 #[test]
 fn an_edited_realtime_source_is_rearmed_and_old_events_are_dropped() {
     let h = realtime_harness("rearm");
-    h.wait_for("arm", Duration::from_secs(5), |h| {
-        armed_generation(h, "docs").is_some()
-    });
+    h.wait_for("arm", PATIENT, |h| armed_generation(h, "docs").is_some());
     let first = armed_generation(&h, "docs").unwrap();
     let moved = h.root.join("sysroot/volume2/docs");
     // Whole or not at all, as the manager replaces a fragment: the daemon reads it
@@ -1373,7 +1390,7 @@ fn an_edited_realtime_source_is_rearmed_and_old_events_are_dropped() {
         ),
     );
     let _ = h.ask(Request::Reload);
-    h.wait_for("re-arm", Duration::from_secs(5), |h| {
+    h.wait_for("re-arm", PATIENT, |h| {
         h.changes
             .calls
             .lock()
@@ -1415,9 +1432,7 @@ fn an_edited_realtime_source_is_rearmed_and_old_events_are_dropped() {
             dir: "new".into(),
         },
     ));
-    h.wait_for("the dispatch", Duration::from_secs(5), |h| {
-        h.launched() == 1
-    });
+    h.wait_for("the dispatch", PATIENT, |h| h.launched() == 1);
     let args = h.world.lock().unwrap().launched[0]
         .args
         .iter()
@@ -1433,9 +1448,7 @@ fn an_edited_realtime_source_is_rearmed_and_old_events_are_dropped() {
 #[test]
 fn an_unchanged_reload_keeps_the_watch() {
     let h = realtime_harness("keep");
-    h.wait_for("arm", Duration::from_secs(5), |h| {
-        armed_generation(h, "docs").is_some()
-    });
+    h.wait_for("arm", PATIENT, |h| armed_generation(h, "docs").is_some());
     let _ = h.ask(Request::Reload);
     let _ = h.ask(Request::Reload);
     let arms = h
@@ -1524,7 +1537,7 @@ fn a_run_never_starts_while_management_lock_is_live() {
     )
     .unwrap();
     assert_eq!(h.ask(run("all"))["ok"], true);
-    h.wait_for("the deferral", Duration::from_secs(5), |h| {
+    h.wait_for("the deferral", PATIENT, |h| {
         h.logs()
             .iter()
             .any(|l| l.starts_with("run_deferred ") && l.contains(&format!("process {pid}")))
@@ -1540,7 +1553,7 @@ fn a_run_never_starts_while_management_lock_is_live() {
         stop_takes: Duration::ZERO,
     };
     assert_eq!(h.ask(run("all"))["ok"], true);
-    h.wait_for("the run", Duration::from_secs(5), |h| h.launched() == 1);
+    h.wait_for("the run", PATIENT, |h| h.launched() >= 1);
     let scope = fs::read_to_string(run_dir.join("run.scope")).unwrap();
     let lock = fs::read_to_string(run_dir.join("run.lock/pid")).unwrap();
     assert_eq!(
@@ -1548,7 +1561,7 @@ fn a_run_never_starts_while_management_lock_is_live() {
         format!("{lock}profiles=alpha,beta\n"),
         "all is expanded"
     );
-    h.wait_for("idle", Duration::from_secs(5), Harness::idle);
+    h.wait_for("idle", PATIENT, Harness::idle);
     assert!(!run_dir.join("run.lock").exists() && !run_dir.join("run.scope").exists());
 }
 
@@ -1577,9 +1590,9 @@ fn alerts_follow_the_runners_rules_and_escalations_their_cooldown() {
         stop_takes: Duration::ZERO,
     };
     let launched = |n: usize| move |h: &Harness| h.launched() >= n && h.idle();
-    h.wait_for("the first failure", Duration::from_secs(5), launched(1));
+    h.wait_for("the first failure", PATIENT, launched(1));
     h.advance(11);
-    h.wait_for("the first escalation", Duration::from_secs(5), |h| {
+    h.wait_for("the first escalation", PATIENT, |h| {
         h.alerts
             .calls
             .lock()
@@ -1597,11 +1610,11 @@ fn alerts_follow_the_runners_rules_and_escalations_their_cooldown() {
     );
     // The next interval exhausts the ladder again inside the 600 s cooldown:
     // no second escalation, and the hold is said.
-    h.wait_for("idle", Duration::from_secs(5), Harness::idle);
+    h.wait_for("idle", PATIENT, Harness::idle);
     h.advance(61);
-    h.wait_for("the third run", Duration::from_secs(5), launched(3));
+    h.wait_for("the third run", PATIENT, launched(3));
     h.advance(11);
-    h.wait_for("the held escalation", Duration::from_secs(5), |h| {
+    h.wait_for("the held escalation", PATIENT, |h| {
         h.logs()
             .iter()
             .any(|l| l.starts_with("routine_escalation_cooldown profile=alpha"))
@@ -1633,9 +1646,7 @@ fn an_armed_realtime_routine_syncs_its_whole_tree_once_a_period() {
         },
         |settings| settings.full_reconcile_every = Duration::from_secs(2),
     );
-    h.wait_for("arm", Duration::from_secs(5), |h| {
-        armed_generation(h, "docs").is_some()
-    });
+    h.wait_for("arm", PATIENT, |h| armed_generation(h, "docs").is_some());
     let _ = h.tx.send(Msg::Change(ChangeEvent::Backend {
         routine: "docs".into(),
         backend: Backend::Inotify,
@@ -1671,7 +1682,7 @@ fn runs_wait_for_service_admission() {
         due_alpha(home, var);
         fs::write(var.join("run/service.closed"), "closed\n").unwrap();
     });
-    h.wait_for("the deferral", Duration::from_secs(5), |h| {
+    h.wait_for("the deferral", PATIENT, |h| {
         h.logs()
             .iter()
             .any(|l| l.starts_with("run_deferred ") && l.contains("reason=admission_refused"))
@@ -1686,7 +1697,7 @@ fn runs_wait_for_service_admission() {
     assert_eq!(h.ask(run("alpha"))["code"], "admission_closed");
     fs::remove_file(h.var.join("run/package.transition")).unwrap();
     assert_eq!(h.ask(run("alpha"))["ok"], true);
-    h.wait_for("the run", Duration::from_secs(5), |h| h.launched() >= 1);
+    h.wait_for("the run", PATIENT, |h| h.launched() >= 1);
 }
 
 /// `wait` answers with the run's own exit and outcome, or names a timeout.
@@ -1748,7 +1759,7 @@ fn runs_are_given_the_pair_index_directory() {
         |settings| settings.pair_index_dir = Some(PathBuf::from("/var/state/cache/pairs")),
     );
     assert_eq!(h.ask(run("alpha"))["ok"], true);
-    h.wait_for("the run", Duration::from_secs(5), |h| h.launched() == 1);
+    h.wait_for("the run", PATIENT, |h| h.launched() >= 1);
     let args = h.world.lock().unwrap().launched[0]
         .args
         .iter()
@@ -1779,7 +1790,7 @@ fn unreadable_configuration_is_named_and_never_read_as_absent() {
             .iter()
             .any(|c| c.starts_with("arm docs"))
     };
-    h.wait_for("arm", Duration::from_secs(5), armed);
+    h.wait_for("arm", PATIENT, armed);
     let conf = h.root.join("home/config/routines.d/docs.conf");
     fs::set_permissions(&conf, fs::Permissions::from_mode(0o000)).unwrap();
     if super::super::testkit::permissions_do_not_bind(
@@ -1795,9 +1806,7 @@ fn unreadable_configuration_is_named_and_never_read_as_absent() {
             .count()
     };
     let _ = h.ask(Request::Reload);
-    h.wait_for("the conf named", Duration::from_secs(5), |h| {
-        named(h, "docs.conf") == 1
-    });
+    h.wait_for("the conf named", PATIENT, |h| named(h, "docs.conf") == 1);
     for _ in 0..3 {
         let _ = h.ask(Request::Wake);
     }
@@ -1826,7 +1835,7 @@ fn unreadable_configuration_is_named_and_never_read_as_absent() {
     let dir = h.root.join("home/config/routines.d");
     fs::set_permissions(&dir, fs::Permissions::from_mode(0o000)).unwrap();
     let _ = h.ask(Request::Reload);
-    h.wait_for("the directory named", Duration::from_secs(5), |h| {
+    h.wait_for("the directory named", PATIENT, |h| {
         named(h, "routines.d cause=") == 1
     });
     assert!(!disarmed(&h), "an unreadable directory is not an empty one");
@@ -1837,7 +1846,7 @@ fn unreadable_configuration_is_named_and_never_read_as_absent() {
     fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
     fs::set_permissions(&conf, fs::Permissions::from_mode(0o600)).unwrap();
     let _ = h.ask(Request::Reload);
-    h.wait_for("the recovery named", Duration::from_secs(5), |h| {
+    h.wait_for("the recovery named", PATIENT, |h| {
         h.logs()
             .iter()
             .any(|l| l.starts_with("config_recovered") && l.contains("docs.conf"))
@@ -1868,12 +1877,12 @@ fn an_unreadable_routine_state_is_held_not_reset() {
     ) {
         return;
     }
-    h.wait_for("the state named", Duration::from_secs(5), |h| {
+    h.wait_for("the state named", PATIENT, |h| {
         h.logs()
             .iter()
             .any(|l| l.starts_with("config_unreadable") && l.contains("routines/alpha.state"))
     });
-    h.wait_for("the hold named", Duration::from_secs(5), |h| {
+    h.wait_for("the hold named", PATIENT, |h| {
         h.logs()
             .iter()
             .any(|l| l.starts_with("routine_state_invalid profile=alpha field=unreadable"))
@@ -1915,7 +1924,7 @@ fn an_unreadable_profile_state_is_kept_not_reset() {
         stop_takes: Duration::ZERO,
     };
     h.ask(run("alpha"));
-    h.wait_for("the run", Duration::from_secs(5), |h| {
+    h.wait_for("the run", PATIENT, |h| {
         h.launched() == 1 && h.idle() && h.state("run.state").contains("state=failed\n")
     });
     fs::set_permissions(&state, fs::Permissions::from_mode(0o600)).unwrap();
@@ -1952,7 +1961,7 @@ fn an_unreadable_profile_state_is_kept_not_reset() {
 #[test]
 fn the_audit_health_is_published_in_controller_state() {
     let h = Harness::new("audit-health", |home, _| profile(home, "alpha"));
-    h.wait_for("the first controller.state", Duration::from_secs(5), |h| {
+    h.wait_for("the first controller.state", PATIENT, |h| {
         h.state("controller.state").starts_with("state=running\n")
     });
     let degraded = super::super::state::ControllerDegraded {
@@ -1961,7 +1970,7 @@ fn the_audit_health_is_published_in_controller_state() {
         cause: "the audit log could not be reconciled (exit=73)".into(),
     };
     h.tx.send(Msg::AuditHealth(Some(degraded.clone()))).unwrap();
-    h.wait_for("the degradation written", Duration::from_secs(5), |h| {
+    h.wait_for("the degradation written", PATIENT, |h| {
         h.state("controller.state")
             .contains("degraded=audit_unavailable\n")
     });
@@ -1975,16 +1984,14 @@ fn the_audit_health_is_published_in_controller_state() {
     // Every later rewrite keeps it while it lasts (here: a run's end).
     h.advance(1);
     h.ask(run("alpha"));
-    h.wait_for("the run", Duration::from_secs(5), |h| {
-        h.launched() == 1 && h.idle()
-    });
-    h.wait_for("the rewrite keeps it", Duration::from_secs(5), |h| {
+    h.wait_for("the run", PATIENT, |h| h.launched() == 1 && h.idle());
+    h.wait_for("the rewrite keeps it", PATIENT, |h| {
         let state = h.state("controller.state");
         state.contains(&format!("updated_epoch={}\n", T0 + 1))
             && state.contains("degraded=audit_unavailable\n")
     });
     h.tx.send(Msg::AuditHealth(None)).unwrap();
-    h.wait_for("the degradation cleared", Duration::from_secs(5), |h| {
+    h.wait_for("the degradation cleared", PATIENT, |h| {
         !h.state("controller.state").contains("degraded")
     });
     let logs = h.logs();
@@ -2009,7 +2016,7 @@ fn the_audit_health_is_published_in_controller_state() {
 #[test]
 fn a_degradation_whose_cause_changes_is_republished() {
     let h = Harness::new("audit-cause", |home, _| profile(home, "alpha"));
-    h.wait_for("the first controller.state", Duration::from_secs(5), |h| {
+    h.wait_for("the first controller.state", PATIENT, |h| {
         h.state("controller.state").starts_with("state=running\n")
     });
     let degraded = |cause: &str| super::super::state::ControllerDegraded {
@@ -2021,14 +2028,14 @@ fn a_degradation_whose_cause_changes_is_republished() {
         "the audit log could not be reconciled (exit=73)",
     ))))
     .unwrap();
-    h.wait_for("exit=73 written", Duration::from_secs(5), |h| {
+    h.wait_for("exit=73 written", PATIENT, |h| {
         h.state("controller.state").contains("(exit=73)\n")
     });
     h.tx.send(Msg::AuditHealth(Some(degraded(
         "the audit log could not be reconciled (exit=69)",
     ))))
     .unwrap();
-    h.wait_for("exit=69 written", Duration::from_secs(5), |h| {
+    h.wait_for("exit=69 written", PATIENT, |h| {
         h.state("controller.state").contains("(exit=69)\n")
     });
     let state = h.state("controller.state");
@@ -2061,9 +2068,7 @@ fn a_degradation_whose_cause_changes_is_republished() {
 #[test]
 fn status_carries_the_backends_detail() {
     let h = realtime_harness("backend-detail");
-    h.wait_for("arm", Duration::from_secs(5), |h| {
-        armed_generation(h, "docs").is_some()
-    });
+    h.wait_for("arm", PATIENT, |h| armed_generation(h, "docs").is_some());
     let detail = |h: &Harness| {
         h.ask(Request::Status)["routines"]
             .as_array()
@@ -2082,9 +2087,7 @@ fn status_carries_the_backends_detail() {
             detail: account.into(),
         }))
         .unwrap();
-        h.wait_for("the detail in status", Duration::from_secs(5), |h| {
-            detail(h) == account
-        });
+        h.wait_for("the detail in status", PATIENT, |h| detail(h) == account);
     }
 }
 
@@ -2094,9 +2097,7 @@ fn status_carries_the_backends_detail() {
 #[test]
 fn a_long_backend_detail_keeps_its_tail() {
     let h = realtime_harness("backend-tail");
-    h.wait_for("arm", Duration::from_secs(5), |h| {
-        armed_generation(h, "docs").is_some()
-    });
+    h.wait_for("arm", PATIENT, |h| armed_generation(h, "docs").is_some());
     let long = format!(
         "inotify unavailable: {}; walk_deadline_exceeded: the walk gave up after 120s in /x; \
          next_walk_deadline_seconds=240",
@@ -2117,9 +2118,7 @@ fn a_long_backend_detail_keeps_its_tail() {
             .and_then(|r| r["backend_detail"].as_str().map(str::to_owned))
             .unwrap_or_default()
     };
-    h.wait_for("the detail in status", Duration::from_secs(5), |h| {
-        !detail(h).is_empty()
-    });
+    h.wait_for("the detail in status", PATIENT, |h| !detail(h).is_empty());
     let kept = detail(&h);
     assert!(kept.len() <= 240, "{} bytes: {kept}", kept.len());
     assert!(
@@ -2139,9 +2138,7 @@ fn a_long_backend_detail_keeps_its_tail() {
 #[test]
 fn a_flapping_backend_cause_is_logged_once_per_episode() {
     let h = realtime_harness("backend-episode");
-    h.wait_for("arm", Duration::from_secs(5), |h| {
-        armed_generation(h, "docs").is_some()
-    });
+    h.wait_for("arm", PATIENT, |h| armed_generation(h, "docs").is_some());
     let report = |backend: Backend, reason: BackendReason, detail: String| {
         h.tx.send(Msg::Change(ChangeEvent::Backend {
             routine: "docs".into(),
@@ -2166,7 +2163,7 @@ fn a_flapping_backend_cause_is_logged_once_per_episode() {
         BackendReason::Ok,
         "12 directories watched".into(),
     );
-    h.wait_for("the recovery line", Duration::from_secs(5), |h| {
+    h.wait_for("the recovery line", PATIENT, |h| {
         h.logs()
             .iter()
             .any(|l| l.starts_with("routine_backend ") && l.contains("reason=ok"))
@@ -2233,7 +2230,7 @@ fn an_unreadable_dependency_state_is_named() {
     ) {
         return;
     }
-    h.wait_for("the dependency named", Duration::from_secs(5), |h| {
+    h.wait_for("the dependency named", PATIENT, |h| {
         unreadable_paths(h)
             .iter()
             .any(|p| p.contains("profiles/beta.state") && p.contains("ermission denied"))
@@ -2253,12 +2250,12 @@ fn an_unreadable_dependency_state_is_named() {
     fs::set_permissions(&state, fs::Permissions::from_mode(0o600)).unwrap();
     // The deferred routine is evaluated again at its next check.
     h.advance(3600);
-    h.wait_for("the recovery", Duration::from_secs(5), |h| {
+    h.wait_for("the recovery", PATIENT, |h| {
         h.logs()
             .iter()
             .any(|l| l.starts_with("config_recovered") && l.contains("profiles/beta.state"))
     });
-    h.wait_for("the run once it can be read", Duration::from_secs(5), |h| {
+    h.wait_for("the run once it can be read", PATIENT, |h| {
         h.launched() == 1
     });
 }
@@ -2282,14 +2279,14 @@ fn a_removed_routines_unreadable_record_is_forgotten() {
     ) {
         return;
     }
-    h.wait_for("the state named", Duration::from_secs(5), |h| {
+    h.wait_for("the state named", PATIENT, |h| {
         unreadable_paths(h)
             .iter()
             .any(|p| p.contains("routines/alpha.state"))
     });
     fs::remove_file(h.root.join("home/config/routines.d/alpha.conf")).unwrap();
     let _ = h.ask(Request::Reload);
-    h.wait_for("the record forgotten", Duration::from_secs(5), |h| {
+    h.wait_for("the record forgotten", PATIENT, |h| {
         !unreadable_paths(h)
             .iter()
             .any(|p| p.contains("routines/alpha.state"))
@@ -2332,7 +2329,7 @@ fn a_dependency_state_nobody_depends_on_any_more_is_forgotten() {
     ) {
         return;
     }
-    h.wait_for("the dependency named", Duration::from_secs(5), |h| {
+    h.wait_for("the dependency named", PATIENT, |h| {
         unreadable_paths(h)
             .iter()
             .any(|p| p.contains("profiles/beta.state"))
@@ -2344,7 +2341,7 @@ fn a_dependency_state_nobody_depends_on_any_more_is_forgotten() {
         b"enabled=true\nmode=interval\ninterval_seconds=60\ndepends_on=\n",
     );
     let _ = h.ask(Request::Reload);
-    h.wait_for("the entry forgotten", Duration::from_secs(5), |h| {
+    h.wait_for("the entry forgotten", PATIENT, |h| {
         !unreadable_paths(h)
             .iter()
             .any(|p| p.contains("profiles/beta.state"))
@@ -2379,7 +2376,7 @@ fn a_removed_profiles_unreadable_state_is_forgotten() {
         return;
     }
     assert_eq!(h.ask(run("beta"))["ok"], true);
-    h.wait_for("the state named", Duration::from_secs(5), |h| {
+    h.wait_for("the state named", PATIENT, |h| {
         unreadable_paths(h)
             .iter()
             .any(|p| p.contains("profiles/beta.state"))
@@ -2395,7 +2392,7 @@ fn a_removed_profiles_unreadable_state_is_forgotten() {
     );
     fs::remove_file(h.root.join("home/config/profiles.d/beta.toml")).unwrap();
     let _ = h.ask(Request::Reload);
-    h.wait_for("the entry forgotten", Duration::from_secs(5), |h| {
+    h.wait_for("the entry forgotten", PATIENT, |h| {
         !unreadable_paths(h)
             .iter()
             .any(|p| p.contains("profiles/beta.state"))
