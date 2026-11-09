@@ -278,7 +278,28 @@ impl FileSink {
         match outcome {
             Ok(()) => self.end_episode(path),
             Err(event_lock::TakeError::Held(cause)) => self.contended(path, now, &cause),
-            Err(event_lock::TakeError::Failed(cause)) => self.failed(path, now, &cause),
+            Err(event_lock::TakeError::Failed(cause)) => {
+                self.failed(path, now, &cause);
+                // A failure that is not contention ends the streak of refusals
+                // it interrupts: a writer that appears later is a new deferral,
+                // counted from its own first refusal, not the old minute.
+                self.end_contention_streak(path);
+            }
+        }
+    }
+
+    /// The refusals in a row by a live writer are over for `path`.
+    fn end_contention_streak(&self, path: &Path) {
+        match ROTATION_TROUBLE.lock() {
+            Ok(mut trouble) => {
+                if let Some(episode) = trouble.get_mut(path) {
+                    episode.contended_since = None;
+                }
+            }
+            Err(_) => eprintln!(
+                "sdsyncd: the log rotation state is poisoned; {} keeps its contention streak",
+                path.display()
+            ),
         }
     }
 
@@ -311,7 +332,7 @@ impl FileSink {
 
     /// A live (or not yet provably stale) writer holds the lock.
     fn contended(&self, path: &Path, now: Instant, cause: &str) {
-        let (since, noted, reported) = {
+        let (held_for, noted, reported) = {
             let Ok(mut trouble) = ROTATION_TROUBLE.lock() else {
                 // Without the episode state this is a failure, named.
                 self.failed(path, now, cause);
@@ -324,11 +345,19 @@ impl FileSink {
                 reported: false,
             });
             let since = *entry.contended_since.get_or_insert(now);
-            entry.retry_at = now + CONTENTION_RETRY;
+            let held_for = now.duration_since(since);
+            // Contention that has outlasted the minute is the failure the log
+            // names with `retry_seconds=60`: it is retried on that schedule,
+            // not every few seconds as a deferral is.
+            entry.retry_at = now
+                + if held_for >= ROTATION_BACKOFF {
+                    ROTATION_BACKOFF
+                } else {
+                    CONTENTION_RETRY
+                };
             let noted = std::mem::replace(&mut entry.deferred_noted, true);
-            (since, noted, entry.reported)
+            (held_for, noted, entry.reported)
         };
-        let held_for = now.duration_since(since);
         if held_for >= ROTATION_BACKOFF {
             if !reported {
                 self.failed(path, now, &format!("{cause}, for {} s", held_for.as_secs()));
@@ -560,9 +589,42 @@ mod event_lock {
         Vanished,
         /// A live writer (or one not provably dead): the cause names it.
         Held(String),
-        /// Provably stale, with the cause and the record judged, by device and
-        /// inode, so the recovery removes that record and no other.
-        Stale(String, (u64, u64)),
+        /// Provably stale, with the cause and the record judged, so the
+        /// recovery removes that record and no other.
+        Stale(String, Judged),
+    }
+
+    /// The owner record a judgement was made on: its device and inode, and what
+    /// it said. Device and inode alone are not an identity: a filesystem hands
+    /// a freed inode number to the next file it creates, so a live writer's new
+    /// record can carry the number of the stale one just cleared. The contents
+    /// are checked too, before anything is removed.
+    pub(super) struct Judged {
+        pub(super) identity: (u64, u64),
+        pub(super) text: String,
+    }
+
+    /// Why a well-formed owner record is not a live writer's, in the words the
+    /// log needs: the record is from another boot, its pid now belongs to
+    /// another process (the pid was reused), or the pid is gone. Calling all
+    /// three "gone" sent an operator looking for a process that was running.
+    fn why_stale(lines: &[&str]) -> String {
+        let pid = lines[0];
+        let recorded_start: u64 = lines[1].parse().unwrap_or(0);
+        let this_boot = fs::read_to_string("/proc/sys/kernel/random/boot_id").ok();
+        if this_boot.is_some_and(|boot| boot.trim() != lines[2]) {
+            return format!("its owner record (PID {pid}) was written in an earlier boot");
+        }
+        match pid
+            .parse::<u32>()
+            .ok()
+            .map(super::super::super::linux_files::process_start)
+        {
+            Some(Ok(actual)) if actual != recorded_start => format!(
+                "its owner PID {pid} now belongs to another process (the PID was reused: start tick {actual}, recorded {recorded_start})"
+            ),
+            _ => format!("its owner PID {pid} is gone"),
+        }
     }
 
     /// Judge the owner record at `owner`.
@@ -580,15 +642,36 @@ mod event_lock {
                 owner.display()
             )));
         }
-        let recorded = (metadata.dev(), metadata.ino());
-        // An unreadable record is not an empty (torn) one: it could name a
-        // live writer, so it is never cleared as stale.
-        let text = match fs::read_to_string(owner) {
-            Ok(text) => text,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                return Ok(Owner::Vanished);
+        // The identity and the text of one open file, so they describe the same
+        // record even if the path is replaced meanwhile. An unreadable record
+        // is not an empty (torn) one: it could name a live writer, so it is
+        // never cleared as stale.
+        let (recorded, text) = {
+            use std::io::Read as _;
+            use std::os::unix::fs::OpenOptionsExt as _;
+            let read = fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+                .open(owner)
+                .and_then(|mut file| {
+                    let opened = file.metadata()?;
+                    let mut text = String::new();
+                    file.read_to_string(&mut text)?;
+                    Ok(((opened.dev(), opened.ino()), text))
+                });
+            match read {
+                Ok(read) => read,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    return Ok(Owner::Vanished);
+                }
+                Err(error) => {
+                    return Err(TakeError::Failed(format!("{}: {error}", owner.display())));
+                }
             }
-            Err(error) => return Err(TakeError::Failed(format!("{}: {error}", owner.display()))),
+        };
+        let judged = || Judged {
+            identity: recorded,
+            text: text.clone(),
         };
         let lines: Vec<&str> = text.lines().collect();
         let well_formed = lines.len() == 3
@@ -603,14 +686,14 @@ mod event_lock {
                     lines[0]
                 ))
             } else {
-                Owner::Stale(format!("its owner PID {} is gone", lines[0]), recorded)
+                Owner::Stale(why_stale(&lines), judged())
             });
         }
         // Torn: written before this boot, or unchanged across a settle.
         if boot_epoch().is_some_and(|boot| metadata.mtime() < boot) {
             return Ok(Owner::Stale(
                 "a torn owner record from before this boot".into(),
-                recorded,
+                judged(),
             ));
         }
         let torn = || {
@@ -637,7 +720,7 @@ mod event_lock {
                         "a torn owner record unchanged for {} s",
                         TORN_SETTLED.as_secs()
                     ),
-                    recorded,
+                    judged(),
                 ))
             }
             Some((earlier, _)) if earlier == identity => Ok(torn()),
@@ -727,7 +810,7 @@ mod event_lock {
                         lock.display(),
                         boot.trim()
                     ));
-                    if recover(&owner, &recovery, judged)? {
+                    if recover(&owner, &recovery, &judged)? {
                         cleared.push(cause);
                     }
                 }
@@ -745,9 +828,17 @@ mod event_lock {
     /// have cleared it and a live writer linked its own in between. That one
     /// is put back; if it cannot be (a third writer took the lock), the
     /// displaced record is kept at `recovery` and the failure names it.
+    /// "The record judged" means its device, inode and contents all agree:
+    /// an inode number is reused as soon as a file is freed, so a live
+    /// writer's record can carry the number of the stale one that was just
+    /// cleared, and only its contents tell them apart.
     /// `Ok(true)` when the judged record was removed, `Ok(false)` when there
     /// was nothing (left) to clear.
-    fn recover(owner: &Path, recovery: &Path, judged: (u64, u64)) -> Result<bool, TakeError> {
+    pub(super) fn recover(
+        owner: &Path,
+        recovery: &Path,
+        judged: &Judged,
+    ) -> Result<bool, TakeError> {
         match fs::rename(owner, recovery) {
             Ok(()) => {}
             // Another contender cleared it first.
@@ -759,26 +850,50 @@ mod event_lock {
                 )));
             }
         }
-        let renamed = fs::symlink_metadata(recovery)
-            .map(|metadata| (metadata.dev(), metadata.ino()))
-            .map_err(|error| format!("{}: {error}", recovery.display()))?;
-        if renamed == judged {
+        // What was renamed: one open file's identity and text, read together.
+        let renamed = {
+            use std::io::Read as _;
+            use std::os::unix::fs::OpenOptionsExt as _;
+            fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+                .open(recovery)
+                .and_then(|mut file| {
+                    let opened = file.metadata()?;
+                    let mut text = String::new();
+                    file.read_to_string(&mut text)?;
+                    Ok(((opened.dev(), opened.ino()), text))
+                })
+        };
+        // Anything short of the judged record's identity AND contents is a
+        // record this call must not remove; one that cannot even be read back
+        // cannot be proven to be the judged one, so it is put back as well.
+        let different = match &renamed {
+            Ok((identity, text)) if *identity == judged.identity && *text == judged.text => None,
+            Ok((identity, _)) if *identity == judged.identity => Some(
+                "a record with the same inode number but other contents (the inode was reused)"
+                    .to_owned(),
+            ),
+            Ok(_) => Some("a different record".to_owned()),
+            Err(error) => Some(format!("a record that could not be read back ({error})")),
+        };
+        let Some(different) = different else {
             fs::remove_file(recovery)
                 .map_err(|error| format!("{}: {error}", recovery.display()))?;
             return Ok(true);
-        }
+        };
         // Not the record judged: restored, and the lock is held by it.
         match fs::hard_link(recovery, owner) {
             Ok(()) => {
                 fs::remove_file(recovery)
                     .map_err(|error| format!("{}: {error}", recovery.display()))?;
                 Err(TakeError::Held(format!(
-                    "{} was replaced by a new owner record while it was being cleared; it was put back",
+                    "{} was replaced by {different} while it was being cleared; it was put back",
                     owner.display()
                 )))
             }
             Err(error) => Err(TakeError::Failed(format!(
-                "{} was replaced by a new owner record while it was being cleared and could not be put back ({error}); it is kept at {}",
+                "{} was replaced by {different} while it was being cleared and could not be put back ({error}); it is kept at {}",
                 owner.display(),
                 recovery.display()
             ))),
@@ -1022,7 +1137,14 @@ mod tests {
             },
         )
         .unwrap();
-        assert!(began.elapsed() < std::time::Duration::from_secs(1));
+        // The claim is that no line waits for the lock (the wait it replaced was
+        // 10 s), not that a loaded runner finishes six appends within one second:
+        // a second was a flake. Half the old wait still proves it.
+        assert!(
+            began.elapsed() < std::time::Duration::from_secs(5),
+            "six lines took {:?}: one of them waited for the live owner's lock",
+            began.elapsed()
+        );
         assert!(!root.join("log/activity.log.1").exists());
         let activity = fs::read_to_string(root.join("log/activity.log")).unwrap();
         assert!(activity.ends_with("line 4\n"), "every line is kept");
@@ -1251,6 +1373,238 @@ mod tests {
         );
         let _ = holder.kill();
         let _ = holder.wait();
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// A `sleep` that owns `lock` as a shell writer would: its pid, start tick
+    /// and the boot id in the lock's `pid` record.
+    #[cfg(target_os = "linux")]
+    fn lock_held_by_sleep(lock: &Path) -> std::process::Child {
+        fs::create_dir_all(lock).unwrap();
+        let holder = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let start = super::super::super::linux_files::process_start(holder.id()).unwrap();
+        let boot = fs::read_to_string("/proc/sys/kernel/random/boot_id").unwrap();
+        fs::write(
+            lock.join("pid"),
+            format!("{}\n{start}\n{}\n", holder.id(), boot.trim()),
+        )
+        .unwrap();
+        holder
+    }
+
+    /// What the open episode for `path` says: whether its failure was named, how
+    /// long a live writer has refused it in a row, and how long until the next
+    /// attempt. Read and released at once, so a failing assertion in a test can
+    /// never poison the state every other test shares.
+    #[cfg(target_os = "linux")]
+    fn episode_of(path: &Path) -> Option<(bool, Option<std::time::Duration>, std::time::Duration)> {
+        let trouble = ROTATION_TROUBLE.lock().unwrap_or_else(|e| e.into_inner());
+        trouble.get(path).map(|episode| {
+            (
+                episode.reported,
+                episode.contended_since.map(|since| since.elapsed()),
+                episode.retry_at.saturating_duration_since(Instant::now()),
+            )
+        })
+    }
+
+    /// Make the next attempt on `path` due now, without waiting out a backoff.
+    #[cfg(target_os = "linux")]
+    fn due_now(path: &Path, contended_for: Option<std::time::Duration>) {
+        let mut trouble = ROTATION_TROUBLE.lock().unwrap_or_else(|e| e.into_inner());
+        let trouble = trouble
+            .get_mut(path)
+            .unwrap_or_else(|| panic!("no episode open for {}", path.display()));
+        let past = Instant::now()
+            .checked_sub(std::time::Duration::from_secs(1))
+            .expect("the monotonic clock is past one second");
+        trouble.retry_at = past;
+        if let Some(held) = contended_for {
+            trouble.contended_since = Some(
+                Instant::now()
+                    .checked_sub(held)
+                    .expect("the monotonic clock is past the hold"),
+            );
+        }
+    }
+
+    /// S3-4: contention is counted from its first refusal in a row. A failure
+    /// that is not contention (the lock cannot be used at all) ends the streak,
+    /// so a writer that shows up later is a new deferral, not the same minute.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_failure_that_is_not_contention_ends_the_contention_streak() {
+        let root = var_tree("streak");
+        let lock = root.join("run/event-log.lock");
+        let mut holder = lock_held_by_sleep(&lock);
+        activity_over_limit(&root);
+        let sink = FileSink::new(&root.join("log"));
+        let path = root.join("log/activity.log");
+        sink.activity(1, &started(1)).unwrap();
+        due_now(&path, Some(std::time::Duration::from_secs(30)));
+        // The lock directory is wedged: a failure, not contention.
+        let _ = holder.kill();
+        let _ = holder.wait();
+        fs::remove_dir_all(&lock).unwrap();
+        fs::create_dir_all(lock.join("stray")).unwrap();
+        sink.activity(2, &started(2)).unwrap();
+        probe_line(&sink);
+        let (reported, streak, _) = episode_of(&path).expect("the failure opened an episode");
+        assert!(reported, "the failure was named");
+        assert!(
+            streak.is_none(),
+            "a failure that is not contention left the old streak standing: {streak:?}"
+        );
+        // A writer returns: its first refusal starts a fresh count.
+        fs::remove_dir_all(&lock).unwrap();
+        let mut holder = lock_held_by_sleep(&lock);
+        due_now(&path, None);
+        sink.activity(3, &started(3)).unwrap();
+        let (_, streak, _) = episode_of(&path).expect("the episode is open");
+        assert!(
+            streak.is_some_and(|held| held < std::time::Duration::from_secs(5)),
+            "the new deferral counts from now, not from the old streak: {streak:?}"
+        );
+        let _ = holder.kill();
+        let _ = holder.wait();
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// S3-4: the failure line says `retry_seconds=60`. Contention that has
+    /// outlasted the minute is that failure, and it must retry on that
+    /// schedule: it retried every 5 s, twelve times what the line claimed.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn contention_past_the_minute_retries_on_the_schedule_the_failure_names() {
+        let root = var_tree("backoff-claim");
+        let lock = root.join("run/event-log.lock");
+        let mut holder = lock_held_by_sleep(&lock);
+        activity_over_limit(&root);
+        let sink = FileSink::new(&root.join("log"));
+        let path = root.join("log/activity.log");
+        sink.activity(1, &started(1)).unwrap();
+        let minute_and_more = ROTATION_BACKOFF + std::time::Duration::from_secs(1);
+        due_now(&path, Some(minute_and_more));
+        sink.activity(2, &started(2)).unwrap();
+        probe_line(&sink);
+        let controller = fs::read_to_string(root.join("log/controller.log")).unwrap();
+        assert!(
+            controller.contains("event_log_rotation_failed")
+                && controller.contains("retry_seconds=60"),
+            "{controller}"
+        );
+        // Still held on the next attempt: nothing new is said, and the retry
+        // is still a minute away.
+        due_now(&path, None);
+        sink.activity(3, &started(3)).unwrap();
+        let (_, _, wait) = episode_of(&path).expect("the episode is open");
+        assert!(
+            wait >= std::time::Duration::from_secs(55),
+            "the failure line promised 60 s, the next attempt is due in {wait:?}"
+        );
+        let _ = holder.kill();
+        let _ = holder.wait();
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// S3-4: an owner record whose pid is alive but is another process (the
+    /// start tick differs: pid reuse) or whose boot id is not this boot's is
+    /// stale, and the log says which of the two it is. It said "PID gone" for
+    /// both, though the pid answered.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_reused_owner_pid_is_not_called_gone() {
+        let boot = fs::read_to_string("/proc/sys/kernel/random/boot_id").unwrap();
+        let me = std::process::id();
+        let real_start = super::super::super::linux_files::process_start(me).unwrap();
+        for (label, record, wanted) in [
+            (
+                "reused",
+                format!("{me}\n{}\n{}\n", real_start + 1, boot.trim()),
+                "reused",
+            ),
+            (
+                "other-boot",
+                format!("{me}\n{real_start}\n00000000-0000-0000-0000-000000000000\n"),
+                "boot",
+            ),
+        ] {
+            let root = var_tree(label);
+            let lock = root.join("run/event-log.lock");
+            fs::create_dir_all(&lock).unwrap();
+            fs::write(lock.join("pid"), record).unwrap();
+            activity_over_limit(&root);
+            let sink = FileSink::new(&root.join("log"));
+            sink.activity(1, &started(1)).unwrap();
+            probe_line(&sink);
+            let controller = fs::read_to_string(root.join("log/controller.log")).unwrap();
+            eprintln!("{label}: {controller}");
+            assert!(root.join("log/activity.log.1").exists(), "{label}: rotated");
+            let stale = controller
+                .lines()
+                .find(|line| line.contains("event_log_lock_stale"))
+                .unwrap_or_else(|| panic!("{label}: the clearing is named: {controller}"));
+            assert!(
+                stale.contains(wanted) && !stale.contains("is gone"),
+                "{label}: wanted {wanted:?} and not \"is gone\": {stale}"
+            );
+            assert!(
+                stale.contains(&me.to_string()),
+                "{label}: names the pid: {stale}"
+            );
+            let _ = fs::remove_dir_all(&root);
+        }
+    }
+
+    /// S3-6: the stale record is identified by device, inode AND contents. A
+    /// freed inode number is reused, so a live writer's new record can carry the
+    /// number of the stale one that was just judged; removing it by number alone
+    /// would take a live writer's lock. It is put back, named, and only the
+    /// record whose contents are the judged ones is removed.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn recovery_removes_only_a_record_whose_contents_are_the_judged_ones() {
+        use std::os::unix::fs::MetadataExt as _;
+        let root = var_tree("recover-contents");
+        let lock = root.join("run/event-log.lock");
+        fs::create_dir_all(&lock).unwrap();
+        let owner = lock.join("pid");
+        let recovery = root.join("run/event-log.lock.recover.test");
+        let live = "4242\n9\nboot-b\n";
+        fs::write(&owner, live).unwrap();
+        let metadata = fs::metadata(&owner).unwrap();
+        // Judged stale: the same device and inode number, other contents.
+        let stale = event_lock::Judged {
+            identity: (metadata.dev(), metadata.ino()),
+            text: "42\n7\nboot-a\n".into(),
+        };
+        match event_lock::recover(&owner, &recovery, &stale) {
+            Err(event_lock::TakeError::Held(why)) => assert!(
+                why.contains("other contents") && why.contains("put back"),
+                "{why}"
+            ),
+            Err(event_lock::TakeError::Failed(why)) => panic!("failed instead of held: {why}"),
+            Ok(removed) => panic!("a record with other contents was removed ({removed})"),
+        }
+        assert_eq!(
+            fs::read_to_string(&owner).unwrap(),
+            live,
+            "the live writer's record is back"
+        );
+        assert!(!recovery.exists(), "nothing left at the recovery name");
+        // The record that really was judged is removed.
+        let judged = event_lock::Judged {
+            identity: (metadata.dev(), metadata.ino()),
+            text: live.into(),
+        };
+        assert!(matches!(
+            event_lock::recover(&owner, &recovery, &judged),
+            Ok(true)
+        ));
+        assert!(!owner.exists() && !recovery.exists());
         let _ = fs::remove_dir_all(&root);
     }
 

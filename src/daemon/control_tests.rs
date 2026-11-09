@@ -154,6 +154,13 @@ static NEXT: AtomicU64 = AtomicU64::new(0);
 
 const T0: u64 = 1_780_000_000;
 
+/// How long a test that waits on a real debounce (a second of wall clock) or a real
+/// run waits for it. A wait only costs this long when it is about to fail, and the
+/// control thread of a loaded runner (twelve busy loops beside the whole suite)
+/// has been seen not to log its first line within five seconds: the waits in
+/// `failed_partial_busy_cancelled_runs_keep_the_change_pending` were that flake.
+const PATIENT: Duration = Duration::from_secs(30);
+
 fn grace() -> Duration {
     Duration::from_millis(300)
 }
@@ -388,8 +395,156 @@ fn profile_with(home: &Path, name: &str, settings: &[(&str, &str)]) {
     .unwrap();
 }
 
+/// The shipped manager's `routines.d/<name>.conf`, as `configure-routine --profile
+/// <name>` renders it: every key it writes, in its order, with its defaults. The e2e
+/// test `the_unit_harness_routine_template_is_what_the_real_manager_renders`
+/// (tests/routine_template_drift.rs) re-renders it with the real shell manager, in
+/// every mode, and fails when the two drift apart.
+const MANAGER_ROUTINE: &str = include_str!("testdata/manager-routine.conf");
+
+/// Write `routines.d/<name>.conf` as the manager would: its whole key set, with
+/// `conf` (`key=value` lines) replacing the manager's value for each key it names.
+/// A key the manager does not write is a test bug and panics, so a setting can
+/// never be silently dropped, and a conf of three or four keys that no manager
+/// ever produced cannot hide what the daemon does with a real one.
 fn routine(home: &Path, name: &str, conf: &str) {
-    fs::write(home.join(format!("config/routines.d/{name}.conf")), conf).unwrap();
+    let mut wanted: Vec<(&str, &str)> = conf
+        .lines()
+        .filter(|line| !line.is_empty())
+        .map(|line| {
+            line.split_once('=')
+                .unwrap_or_else(|| panic!("`{line}` is not a key=value line"))
+        })
+        .collect();
+    let mut text = String::new();
+    for line in MANAGER_ROUTINE.lines() {
+        let key = line.split_once('=').map_or(line, |(key, _)| key);
+        match wanted.iter().position(|(wanted, _)| *wanted == key) {
+            Some(at) => {
+                let (key, value) = wanted.remove(at);
+                text.push_str(&format!("{key}={value}\n"));
+            }
+            None => {
+                text.push_str(line);
+                text.push('\n');
+            }
+        }
+    }
+    assert!(
+        wanted.is_empty(),
+        "the manager's routine has no such key (or it is given twice): {wanted:?}\n{MANAGER_ROUTINE}"
+    );
+    fs::write(home.join(format!("config/routines.d/{name}.conf")), text).unwrap();
+}
+
+/// The harness writes the manager's whole routine, overrides applied in place, and
+/// refuses a key the manager does not write.
+#[test]
+fn the_harness_writes_routines_with_the_managers_key_set() {
+    let root = std::env::temp_dir().join(format!(
+        "sdsyncd-routine-keys-{}-{}",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::SeqCst)
+    ));
+    let home = root.join("home");
+    fs::create_dir_all(home.join("config/routines.d")).unwrap();
+    routine(
+        &home,
+        "alpha",
+        "enabled=false\nmode=realtime\ndebounce_seconds=1\n",
+    );
+    let written = fs::read_to_string(home.join("config/routines.d/alpha.conf")).unwrap();
+    let keys = |text: &str| -> Vec<String> {
+        text.lines()
+            .map(|l| l.split_once('=').map_or(l, |(k, _)| k).to_owned())
+            .collect()
+    };
+    assert_eq!(keys(&written), keys(MANAGER_ROUTINE), "{written}");
+    assert!(
+        written.contains("enabled=false\n")
+            && written.contains("mode=realtime\n")
+            && written.contains("debounce_seconds=1\n")
+            && written.contains("retry_count=5\n"),
+        "overrides in place, the manager's defaults elsewhere:\n{written}"
+    );
+    let refused = std::panic::catch_unwind(|| routine(&home, "beta", "enabled=true\nbogus=1\n"));
+    fs::remove_dir_all(&root).unwrap();
+    assert!(
+        refused.is_err(),
+        "a key the manager does not write was accepted"
+    );
+}
+
+/// Replace `path` whole, as the shipped manager does (a private temporary beside
+/// it, then a rename). A running daemon reads these documents on its own
+/// schedule: a plain `fs::write` truncates first, so a read in between sees a
+/// torn document (the cause of a flake in the re-arm test).
+fn write_atomic(path: &Path, contents: impl AsRef<[u8]>) {
+    let name = path
+        .file_name()
+        .unwrap_or_else(|| panic!("{} has no file name", path.display()))
+        .to_string_lossy();
+    let temporary = path.with_file_name(format!(".{name}.tmp{}", std::process::id()));
+    fs::write(&temporary, contents)
+        .unwrap_or_else(|e| panic!("write {}: {e}", temporary.display()));
+    fs::rename(&temporary, path).unwrap_or_else(|e| {
+        panic!(
+            "rename {} over {}: {e}",
+            temporary.display(),
+            path.display()
+        )
+    });
+}
+
+/// The property the re-arm flake lacked: a reader that opens the path at any moment sees
+/// one whole document, never an empty or half-written file. (With `fs::write`, which
+/// truncates and then writes, the same reader sees both within a few hundred rewrites.)
+#[test]
+fn write_atomic_never_shows_a_reader_a_torn_document() {
+    let dir = std::env::temp_dir().join(format!(
+        "sdsyncd-atomic-{}-{}",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::SeqCst)
+    ));
+    fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("fragment.toml");
+    let documents = [
+        format!("# a\n{}", "a = 1\n".repeat(2000)),
+        format!("# b\n{}", "b = 2\n".repeat(3000)),
+    ];
+    write_atomic(&path, &documents[0]);
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let reader = {
+        let (path, stop, documents) = (path.clone(), Arc::clone(&stop), documents.clone());
+        thread::spawn(move || {
+            let mut torn = Vec::new();
+            let mut reads = 0_u64;
+            while !stop.load(Ordering::SeqCst) {
+                let text = fs::read_to_string(&path)
+                    .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+                reads += 1;
+                if !documents.contains(&text) && torn.len() < 3 {
+                    torn.push(format!(
+                        "{} bytes starting {:?}",
+                        text.len(),
+                        &text[..text.len().min(12)]
+                    ));
+                }
+            }
+            (reads, torn)
+        })
+    };
+    for round in 0..400 {
+        write_atomic(&path, &documents[round % 2]);
+    }
+    stop.store(true, Ordering::SeqCst);
+    let (reads, torn) = reader.join().unwrap();
+    fs::remove_dir_all(&dir).unwrap();
+    assert!(reads > 0, "the reader never ran");
+    assert!(
+        torn.is_empty(),
+        "{reads} reads, torn documents seen: {torn:?}"
+    );
 }
 
 fn run(scope: &str) -> Request {
@@ -749,10 +904,8 @@ fn failed_partial_busy_cancelled_runs_keep_the_change_pending() {
             stop_takes: Duration::ZERO,
         };
         change(&h, "a");
-        h.wait_for("the dispatch", Duration::from_secs(5), |h| {
-            h.launched() == 1
-        });
-        h.wait_for("idle", Duration::from_secs(5), Harness::idle);
+        h.wait_for("the dispatch", PATIENT, |h| h.launched() == 1);
+        h.wait_for("idle", PATIENT, Harness::idle);
         let status = h.ask(Request::Status);
         assert_eq!(
             status["routines"][0]["pending_change"], true,
@@ -767,11 +920,9 @@ fn failed_partial_busy_cancelled_runs_keep_the_change_pending() {
         stop_takes: Duration::ZERO,
     };
     change(&h, "a");
-    h.wait_for("the dispatch", Duration::from_secs(5), |h| {
-        h.launched() == 1
-    });
+    h.wait_for("the dispatch", PATIENT, |h| h.launched() == 1);
     h.ask(Request::Cancel { id: None });
-    h.wait_for("idle", Duration::from_secs(5), Harness::idle);
+    h.wait_for("idle", PATIENT, Harness::idle);
     assert_eq!(
         h.ask(Request::Status)["routines"][0]["pending_change"],
         true
@@ -790,13 +941,9 @@ fn failed_partial_busy_cancelled_runs_keep_the_change_pending() {
         stop_takes: Duration::ZERO,
     };
     change(&h, "a");
-    h.wait_for("the first run", Duration::from_secs(5), |h| {
-        h.launched() == 1
-    });
+    h.wait_for("the first run", PATIENT, |h| h.launched() == 1);
     change(&h, "b");
-    h.wait_for("the second run", Duration::from_secs(8), |h| {
-        h.launched() == 2
-    });
+    h.wait_for("the second run", PATIENT, |h| h.launched() == 2);
     let args = h.world.lock().unwrap().launched[1]
         .args
         .iter()
@@ -1030,14 +1177,14 @@ fn a_no_op_save_keeps_the_block_and_a_real_change_lifts_it() {
     h.wait_for("the hold", Duration::from_secs(5), |h| {
         suppressed_logs(h) == 1
     });
-    fs::write(&fragment, alpha_fragment(&h.root, &[])).unwrap();
+    write_atomic(&fragment, alpha_fragment(&h.root, &[]));
     let _ = h.ask(Request::Reload);
     assert_eq!(
         h.ask(Request::Status)["lasting"]["alpha"]["reason"],
         "core_oom_killed"
     );
     assert!(h.var.join("state/lasting/alpha.state").exists());
-    fs::write(&fragment, alpha_fragment(&h.root, &[("max-delete", "50")])).unwrap();
+    write_atomic(&fragment, alpha_fragment(&h.root, &[("max-delete", "50")]));
     let _ = h.ask(Request::Reload);
     h.wait_for("the run", Duration::from_secs(5), |h| h.launched() == 1);
     assert!(!h.var.join("state/lasting/alpha.state").exists());
@@ -1214,15 +1361,17 @@ fn an_edited_realtime_source_is_rearmed_and_old_events_are_dropped() {
     });
     let first = armed_generation(&h, "docs").unwrap();
     let moved = h.root.join("sysroot/volume2/docs");
-    fs::write(
-        h.root.join("home/config/profiles.d/docs.toml"),
+    // Whole or not at all, as the manager replaces a fragment: the daemon reads it
+    // on its own schedule, and a plain `fs::write` truncates first, so a read in
+    // between parsed a torn fragment (`routine_invalid field=profile_max_delete`).
+    write_atomic(
+        &h.root.join("home/config/profiles.d/docs.toml"),
         fragment(
             &h.root,
             "docs",
             &[("source", &format!("\"{}\"", slashed(&moved)))],
         ),
-    )
-    .unwrap();
+    );
     let _ = h.ask(Request::Reload);
     h.wait_for("re-arm", Duration::from_secs(5), |h| {
         h.changes
@@ -1735,20 +1884,6 @@ fn an_unreadable_routine_state_is_held_not_reset() {
 
 // ---------------------------------------------------------------- fix6-core
 
-/// Whether permissions bind for this process. As root they do not, and a test
-/// that needs an unreadable file says so on stderr instead of passing quietly.
-#[cfg(unix)]
-fn permissions_bind(path: &Path, test: &str) -> bool {
-    if fs::read(path).is_ok() {
-        eprintln!(
-            "SKIP {test}: {} is readable at mode 000 (running as root); nothing is proved",
-            path.display()
-        );
-        return false;
-    }
-    true
-}
-
 /// N-D3: an unreadable profile state is never rewritten from nothing. Read as
 /// absent, a failed run reset `consecutive_failures` 7 to 1 and
 /// `last_success_epoch` to 0, and the log said the last configuration was
@@ -1768,7 +1903,10 @@ fn an_unreadable_profile_state_is_kept_not_reset() {
         fs::set_permissions(&state, fs::Permissions::from_mode(0o000)).unwrap();
     });
     let state = h.var.join("state/profiles/alpha.state");
-    if !permissions_bind(&state, "an_unreadable_profile_state_is_kept_not_reset") {
+    if super::super::testkit::permissions_do_not_bind(
+        "an_unreadable_profile_state_is_kept_not_reset",
+        &state,
+    ) {
         return;
     }
     *h.plan.lock().unwrap() = Plan {
@@ -1865,6 +2003,58 @@ fn the_audit_health_is_published_in_controller_state() {
     );
 }
 
+/// S3-2: a degradation that lasts but whose cause moves (the reconcile failed
+/// with exit 73, now 69) is republished with the new cause and the same start;
+/// controller.state must not keep the cause of the first failure.
+#[test]
+fn a_degradation_whose_cause_changes_is_republished() {
+    let h = Harness::new("audit-cause", |home, _| profile(home, "alpha"));
+    h.wait_for("the first controller.state", Duration::from_secs(5), |h| {
+        h.state("controller.state").starts_with("state=running\n")
+    });
+    let degraded = |cause: &str| super::super::state::ControllerDegraded {
+        reason: "audit_unavailable",
+        since: T0 - 40,
+        cause: cause.into(),
+    };
+    h.tx.send(Msg::AuditHealth(Some(degraded(
+        "the audit log could not be reconciled (exit=73)",
+    ))))
+    .unwrap();
+    h.wait_for("exit=73 written", Duration::from_secs(5), |h| {
+        h.state("controller.state").contains("(exit=73)\n")
+    });
+    h.tx.send(Msg::AuditHealth(Some(degraded(
+        "the audit log could not be reconciled (exit=69)",
+    ))))
+    .unwrap();
+    h.wait_for("exit=69 written", Duration::from_secs(5), |h| {
+        h.state("controller.state").contains("(exit=69)\n")
+    });
+    let state = h.state("controller.state");
+    let logs = h.logs();
+    eprintln!("{state}\n{logs:#?}");
+    assert!(!state.contains("exit=73"), "the old cause stayed: {state}");
+    assert!(
+        state.contains(&format!("degraded_since={}\n", T0 - 40)),
+        "one episode keeps its start: {state}"
+    );
+    // Each cause is named in the log with the episode's start.
+    for exit in ["exit=73", "exit=69"] {
+        assert_eq!(
+            logs.iter()
+                .filter(
+                    |l| l.starts_with("service_degraded reason=audit_unavailable")
+                        && l.contains(&format!("since={}", T0 - 40))
+                        && l.contains(exit)
+                )
+                .count(),
+            1,
+            "{exit}: {logs:#?}"
+        );
+    }
+}
+
 /// N-D5 (status half, asked by fix6-watch): the change source's account of
 /// a degraded backend reaches `ctl status` as `backend_detail`, the latest
 /// one, even when backend and reason did not change.
@@ -1930,7 +2120,10 @@ fn an_unreadable_dependency_state_is_named() {
         fs::set_permissions(&state, fs::Permissions::from_mode(0o000)).unwrap();
     });
     let state = h.var.join("state/profiles/beta.state");
-    if !permissions_bind(&state, "an_unreadable_dependency_state_is_named") {
+    if super::super::testkit::permissions_do_not_bind(
+        "an_unreadable_dependency_state_is_named",
+        &state,
+    ) {
         return;
     }
     h.wait_for("the dependency named", Duration::from_secs(5), |h| {
@@ -1976,7 +2169,10 @@ fn a_removed_routines_unreadable_record_is_forgotten() {
         fs::set_permissions(&state, fs::Permissions::from_mode(0o000)).unwrap();
     });
     let state = h.var.join("state/routines/alpha.state");
-    if !permissions_bind(&state, "a_removed_routines_unreadable_record_is_forgotten") {
+    if super::super::testkit::permissions_do_not_bind(
+        "a_removed_routines_unreadable_record_is_forgotten",
+        &state,
+    ) {
         return;
     }
     h.wait_for("the state named", Duration::from_secs(5), |h| {
@@ -2001,6 +2197,112 @@ fn a_removed_routines_unreadable_record_is_forgotten() {
     );
 }
 
+/// S3-1: an unreadable dependency state stayed in `config_unreadable` after the
+/// routine that depended on it stopped doing so (its `depends_on` edited away),
+/// until the daemon restarted, and its `kept=` text kept claiming a dependency
+/// that no longer exists. The profile is still there: only the dependency read
+/// is gone, so the entry goes with it, named.
+#[cfg(unix)]
+#[test]
+fn a_dependency_state_nobody_depends_on_any_more_is_forgotten() {
+    use std::os::unix::fs::PermissionsExt;
+    let h = Harness::new("dependency-dropped", |home, var| {
+        profile(home, "beta");
+        due_alpha(home, var);
+        routine(
+            home,
+            "alpha",
+            "enabled=true\nmode=interval\ninterval_seconds=60\ndepends_on=beta\n",
+        );
+        let state = var.join("state/profiles/beta.state");
+        fs::write(&state, "state=succeeded\n").unwrap();
+        fs::set_permissions(&state, fs::Permissions::from_mode(0o000)).unwrap();
+    });
+    let state = h.var.join("state/profiles/beta.state");
+    if super::super::testkit::permissions_do_not_bind(
+        "a_dependency_state_nobody_depends_on_any_more_is_forgotten",
+        &state,
+    ) {
+        return;
+    }
+    h.wait_for("the dependency named", Duration::from_secs(5), |h| {
+        unreadable_paths(h)
+            .iter()
+            .any(|p| p.contains("profiles/beta.state"))
+    });
+    // The operator drops the dependency (the manager's configure-routine
+    // replaces the file whole).
+    write_atomic(
+        &h.root.join("home/config/routines.d/alpha.conf"),
+        b"enabled=true\nmode=interval\ninterval_seconds=60\ndepends_on=\n",
+    );
+    let _ = h.ask(Request::Reload);
+    h.wait_for("the entry forgotten", Duration::from_secs(5), |h| {
+        !unreadable_paths(h)
+            .iter()
+            .any(|p| p.contains("profiles/beta.state"))
+    });
+    let logs = h.logs();
+    eprintln!("{logs:#?}\n{:#}", h.ask(Request::Status));
+    let forgotten = logs
+        .iter()
+        .find(|l| l.starts_with("config_forgotten") && l.contains("profiles/beta.state"))
+        .unwrap_or_else(|| panic!("the forgetting is named with its path: {logs:#?}"));
+    assert!(forgotten.contains("depends"), "{forgotten}");
+}
+
+/// S3-1: a removed profile's own state record, unreadable when a run tried to
+/// update it, stayed listed too.
+#[cfg(unix)]
+#[test]
+fn a_removed_profiles_unreadable_state_is_forgotten() {
+    use std::os::unix::fs::PermissionsExt;
+    let h = Harness::new("removed-profile-state", |home, var| {
+        profile(home, "alpha");
+        profile(home, "beta");
+        let state = var.join("state/profiles/beta.state");
+        fs::write(&state, "state=succeeded\n").unwrap();
+        fs::set_permissions(&state, fs::Permissions::from_mode(0o000)).unwrap();
+    });
+    let state = h.var.join("state/profiles/beta.state");
+    if super::super::testkit::permissions_do_not_bind(
+        "a_removed_profiles_unreadable_state_is_forgotten",
+        &state,
+    ) {
+        return;
+    }
+    assert_eq!(h.ask(run("beta"))["ok"], true);
+    h.wait_for("the state named", Duration::from_secs(5), |h| {
+        unreadable_paths(h)
+            .iter()
+            .any(|p| p.contains("profiles/beta.state"))
+    });
+    // A profile that still exists keeps its entry: the record is still read.
+    let _ = h.ask(Request::Reload);
+    assert!(
+        unreadable_paths(&h)
+            .iter()
+            .any(|p| p.contains("profiles/beta.state")),
+        "{:?}",
+        unreadable_paths(&h)
+    );
+    fs::remove_file(h.root.join("home/config/profiles.d/beta.toml")).unwrap();
+    let _ = h.ask(Request::Reload);
+    h.wait_for("the entry forgotten", Duration::from_secs(5), |h| {
+        !unreadable_paths(h)
+            .iter()
+            .any(|p| p.contains("profiles/beta.state"))
+    });
+    let logs = h.logs();
+    eprintln!("{logs:#?}");
+    assert!(
+        logs.iter().any(|l| l.starts_with("config_forgotten")
+            && l.contains("profiles/beta.state")
+            && l.contains("profile was removed")),
+        "{logs:#?}"
+    );
+}
+
 /// N-D8: `ctl status` read an unreadable profiles.d as no profiles
 /// (`profile_names_in(..).unwrap_or_default()`), so `index` was silently
 /// empty. It says the index list is unavailable, with the path and cause.
@@ -2013,11 +2315,10 @@ fn status_names_an_unreadable_profile_directory() {
     });
     let dir = h.root.join("home/config/profiles.d");
     fs::set_permissions(&dir, fs::Permissions::from_mode(0o000)).unwrap();
-    if fs::read_dir(&dir).is_ok() {
-        eprintln!(
-            "SKIP status_names_an_unreadable_profile_directory: {} is readable at mode 000 (running as root)",
-            dir.display()
-        );
+    if super::super::testkit::permissions_do_not_bind(
+        "status_names_an_unreadable_profile_directory",
+        &dir,
+    ) {
         fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
         return;
     }

@@ -3825,9 +3825,11 @@ mod tests {
         use std::os::unix::fs::PermissionsExt as _;
         let scratch = Scratch::new();
         fs::set_permissions(&scratch.0, fs::Permissions::from_mode(0o500)).expect("chmod");
-        if fs::File::create(scratch.0.join("probe")).is_ok() {
+        if crate::testkit::write_permissions_do_not_bind(
+            "a_marker_that_cannot_be_written_is_a_published_refusal",
+            &scratch.0,
+        ) {
             fs::set_permissions(&scratch.0, fs::Permissions::from_mode(0o700)).expect("chmod");
-            eprintln!("skipped: the directory stayed writable (running as root)");
             return;
         }
         let result = StatusCache::open(options(&scratch.0), NOW);
