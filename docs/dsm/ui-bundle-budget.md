@@ -35,8 +35,9 @@ stylesheet is now spent as a lever, and the numbers say so:
   `from`/`to`, `minmax(112px, 0.72fr)`, newline-anchored selectors, and the 260/220-char keyframe
   windows. No minifier has a knob for any of them.
 
-The bundle exceeds the 512,000-byte hint by about 117.1 KB (629,111 bytes; the figures below are older and
-were not all re-measured). The round that added the amber for an unreadable request queue, the
+The bundle exceeds the 512,000-byte hint by about 117.6 KB (629,641 bytes; the figures below are older and
+were not all re-measured). Round 7 grew it by 530 bytes from 629,111 (reworded index-issue copy and
+two more index labels, `pair-index-compaction-failed` and `pair-index-link-guard-unchecked`; the stylesheet did not move: 124,494 bytes). The round before that, which added the amber for an unreadable request queue, the
 watcher guidance copy and the reason labels grew it by 1,819 bytes from 627,292 (the stylesheet did not
 move: 124,494 bytes). It was about 104.3 KB over (616,344 bytes) before that, and about 91.1 KB over before
 the third fix round described [below](#what-the-third-fix-round-cost), about 62.1 KB over before the
@@ -48,7 +49,7 @@ realtime routine surfaced its `backend_reason` and last-poll age, the manual Ref
 diffing were fixed, and the Activity search box was debounced; about 28.5 KB over before the
 Activity route split into event-lens tabs; about 19.6 KB over before the in-service read failures
 were named; about 10.0 KB over before queued progress landed; and about 21.7 KB over before the
-stylesheet was condensed. Any further reduction has to come out of the JavaScript: at ~504.6 KB
+stylesheet was condensed. Any further reduction has to come out of the JavaScript: at ~505.1 KB
 excluding the embedded stylesheet (~491.9 KB at the time of the figures above, ~479.3 KB before the third fix round, ~451.2 KB before the audit fix round), that is where the remaining headroom is, and there is no second
 stylesheet-shaped win behind it.
 

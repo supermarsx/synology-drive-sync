@@ -209,6 +209,27 @@ lists its own commits.
 - **`--launch-daemon` returns when `daemon.ready` is published**, not on the socket's first ping.
 - A control-socket connect failure names the socket path once.
 
+### Shell lifecycle follow-ups (fix7)
+
+- **A hung lock probe is cut off.** `flock -n` and the bridge's `--daemon-lock-probe` run under `timeout 5`
+  when `timeout(1)` works; on expiry the lock is "cannot be told" with the cause `timed out after 5 s`.
+- **Two bad supervisor witnesses no longer refuse for good.** A malformed `supervisor.pid` beside an
+  unusable `supervisor.lock` (a directory, symlink, fifo, mode `000`) is settled by looking for a
+  `--supervise` process of the package: none, and stop removes the record and repairs the lock (or prints
+  the exact command); one, and it is named. A stop in the respawn window with a malformed
+  `supervisor.pid` waits for the respawn and succeeds in one call. The `ctl stop` wait is computed from the
+  budget that is left.
+- **The forced stop of the shell engine checks and names.** Each target's start tick is read again
+  immediately before its KILL, the runner is verified by its start tick, `kill`'s status is checked ("killed"
+  lists only what was killed), every skip is named, and a controller that already exited is not reported as
+  one that did not.
+- **The shell snapshot refuses what the in-process one refuses** (`degraded_since` with leading zeros, a
+  `degraded_cause` that is not UTF-8) and serves `controller.degraded` only while the service runs; it also
+  reads `daemon.ready` for `service.state`, as the in-process rung does.
+- **A poll killed outright no longer leaks for the controller's life** (its scratch directory is named for it
+  and removed by the next poll), and **an `inotifywait` fallback watcher is stopped when the controller is
+  killed**.
+
 ### Verified-pair index: correctness fixes
 
 - **A write through a shared memory mapping is no longer missed.** Linux moves a file's times only
@@ -461,6 +482,34 @@ lists its own commits.
   another thread.
 - **CI** runs the package suite under dash and under bash as `/bin/sh`, each in three weight-balanced shards
   (the `packaging-suite` job).
+- **A killed daemon no longer leaves the dashboard amber.** After `kill -9` the daemon could not clear the
+  `degraded=` block it had written to `controller.state`, so the status snapshot kept serving
+  `controller.degraded` for a service that was not there. It is served only while the service the same
+  snapshot reports is `running` (a malformed block is still refused, live or not).
+- **`config_unreadable` forgets what nothing reads.** A dependency's profile state, and a removed
+  profile's fragment and state, used to stay listed until the daemon restarted; each now leaves the list
+  with a `config_forgotten` line (path and reason). A changed cause of an unreadable control directory
+  is named again and published (`was=` the earlier one).
+- **The event-log lock says why it was cleared**: the pid is gone, the pid was reused by another process,
+  or the record is from an earlier boot (it said "gone" for all three). A stale record is removed only
+  when its contents, not just its inode number, are the ones judged. Contention past a minute retries
+  once a minute, as the failure line says, and a failure that is not contention ends the count.
+- **`--daemon-lock-probe` writes one line**: control characters in the path it names are escaped.
+- **Checksum-index messages fit their cases.** `pair-index-unsafe` and `pair-index-cleanup-failed` no
+  longer describe only their commonest cause, a failed weekly sweep no longer calls an unreadable age
+  "older than 7 days", and a failed compaction or an index not served this run (`pair-index-compaction-failed`,
+  `pair-index-link-guard-unchecked`) are now said on the profile's index line instead of being dropped.
+- **The control socket cannot be starved by a client that never sends a request.** When 128 connections are
+  waiting to send their request, the oldest is dropped (told `ctl_busy`, logged once per episode as
+  `ctl_unread_evicted`) instead of the new one being refused, so `ping` and `stop` are served during a
+  reconnect flood. `stop` has two slots of its own; waiting stops no longer fill the slots `ping` and `status`
+  use. Connections that send nothing are logged once per episode (`ctl_empty_requests_ended` carries the count).
+- **Backend reports are logged once per cause.** `routine_backend` no longer writes a line per reading for a
+  polling tree whose skipped entries change every time; the report that ends the episode carries
+  `suppressed_reports=N`. `backend_detail` keeps the end of a long detail (`next_walk_deadline_seconds=N`).
+- **A busy walk cap is not an unwalkable tree.** While the process-wide walk cap refuses a routine's arm it
+  reports `backend=none` (nothing watches or polls it), a second episode is reported, and the start-up
+  catch-up waits its turn (`catch_up=deferred`, staggered by routine) instead of syncing the whole tree.
 
 ## Questions only a real NAS can answer
 

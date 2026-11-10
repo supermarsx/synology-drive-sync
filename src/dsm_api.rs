@@ -13442,6 +13442,20 @@ fn record_pre_relay_activity(stage: &str, code: &str, status: u16) -> BridgeResu
     }
 }
 
+/// `text` with every control character (newline, carriage return, escape, DEL, the C1 range)
+/// written as a visible escape, so it can sit on one stderr line.
+fn escape_control_bytes(text: &str) -> String {
+    text.chars()
+        .map(|c| {
+            if c.is_control() {
+                c.escape_default().to_string()
+            } else {
+                c.to_string()
+            }
+        })
+        .collect()
+}
+
 /// `--daemon-lock-probe <path>`: what `{ flock -n 8; } 8< <path>` answers, for a shell without
 /// flock(1) (N-S5). The path is opened read-only, never created and never through a symlink
 /// (`O_RDONLY|O_CLOEXEC|O_NOFOLLOW`, plus `O_NONBLOCK` so a FIFO planted there cannot hold the
@@ -13460,11 +13474,15 @@ fn daemon_lock_probe(arguments: &[OsString]) -> ExitCode {
         return ExitCode::from(1);
     };
     let path = Path::new(path);
+    // One line for the shell to read: the path comes from the caller and is
+    // not ours to trust, so a newline or another control byte in it is written
+    // as an escape (`\n`, `\u{1b}`), never raw (S3-7). A byte that is not UTF-8
+    // shows as U+FFFD.
     let refuse = |cause: &str| {
         eprintln!(
             "daemon-lock-probe: {}: {}",
-            path.display(),
-            cause.replace(['\n', '\r'], " ")
+            escape_control_bytes(&path.to_string_lossy()),
+            escape_control_bytes(cause)
         );
         ExitCode::from(1)
     };
@@ -17179,7 +17197,14 @@ fn snapshot_document(
     push_raw_member(&mut document, "active_pid", &controller_active);
     document.push(b',');
     push_raw_member(&mut document, "updated_epoch", &controller_updated);
-    if !controller_degraded.is_empty() {
+    // The block is the daemon's own claim about itself, and a daemon killed outright
+    // (kill -9, an OOM kill) cannot take it back: controller.state keeps `state=running` and
+    // the `degraded=` lines it last wrote. Served from a dead service it would leave the
+    // dashboard amber for a service that is not there (S3-3), so it is served only while the
+    // service this same document reports is `running`. The set was validated above whatever
+    // the liveness, so a malformed record is still refused, not hidden. The shell rung applies
+    // the same rule (`service.state` = running), which keeps the two rungs byte-equal.
+    if !controller_degraded.is_empty() && service_state == "running" {
         document.extend_from_slice(b",\"degraded\":{");
         push_quoted_member(&mut document, "reason", &controller_degraded);
         document.push(b',');
@@ -23345,6 +23370,87 @@ mod tests {
         let stopped = assert_snapshot_parity(&fixture);
         assert_eq!(stopped["service"]["state"], "stopped");
         assert_eq!(stopped["service"]["pid"], 0);
+    }
+
+    /// S3-3: a daemon killed outright (`kill -9`) cannot clear the `degraded=` block it left in
+    /// controller.state, which still says `state=running`. The block is the daemon's own claim,
+    /// so it is served only while the service is live (the daemon's `daemon.ready` names a
+    /// running process): after the kill the snapshot has no `controller.degraded` and the
+    /// dashboard is not left amber for a service that is not there. A malformed set is still
+    /// refused whatever the liveness, as before.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_degraded_block_of_a_dead_daemon_is_not_served() {
+        let fixture = TestShellPackageFixture::new("snapshot-degraded-liveness");
+        fixture.write_config(
+            &fixture.config_dir.join("security.conf"),
+            &security_policy_document(),
+        );
+        let policy = SecurityPolicyArgs::default();
+        fixture.write_config(
+            &fixture.state_dir.join("controller.state"),
+            "state=running\npid=4321\nnext_run_epoch=0\nactive_pid=0\nupdated_epoch=100\n\
+             degraded=audit_unavailable\ndegraded_since=90\ndegraded_cause=audit outbox: No space left on device\n",
+        );
+        fixture.hand_over();
+        let read = |what: &str| -> Value {
+            let bytes = snapshot_document(&fixture.paths(), fixture.package_uid(), &policy)
+                .unwrap_or_else(|error| panic!("{what}: the snapshot failed: {error:?}"));
+            serde_json::from_slice(&bytes).unwrap()
+        };
+
+        // No daemon at all: stopped, so the leftover block is not served.
+        let absent = read("no daemon");
+        assert_eq!(absent["service"]["state"], "stopped", "{absent}");
+        assert_eq!(absent["controller"]["state"], "running", "{absent}");
+        assert!(
+            absent["controller"].get("degraded").is_none(),
+            "a block left by a service that is not there is served as live amber: {absent}"
+        );
+
+        // A live daemon with its published identity: the block is its own and is served.
+        let mut live = fixture.spawn_long_lived();
+        let pid = live.id();
+        let start = linux_files::process_start(pid).unwrap();
+        let boot = fs::read_to_string("/proc/sys/kernel/random/boot_id")
+            .unwrap()
+            .trim()
+            .to_owned();
+        fixture.write_config(
+            &fixture.run_dir.join("daemon.ready"),
+            &format!("{pid}\n{start}\n{boot}\n"),
+        );
+        fixture.hand_over();
+        let running = read("live daemon");
+        assert_eq!(running["service"]["state"], "running", "{running}");
+        assert_eq!(
+            running["controller"]["degraded"],
+            json!({
+                "reason": "audit_unavailable",
+                "since_epoch": 90,
+                "cause": "audit outbox: No space left on device"
+            }),
+            "{running}"
+        );
+
+        // kill -9: the record stays, the process is gone.
+        live.kill().unwrap();
+        live.wait().unwrap();
+        let killed = read("killed daemon");
+        assert_eq!(killed["service"]["state"], "stopped", "{killed}");
+        assert!(killed["controller"].get("degraded").is_none(), "{killed}");
+
+        // A malformed set is refused whether or not the service is live.
+        fixture.write_config(
+            &fixture.state_dir.join("controller.state"),
+            "state=running\npid=4321\nnext_run_epoch=0\nactive_pid=0\nupdated_epoch=100\n\
+             degraded=audit_unavailable\n",
+        );
+        fixture.hand_over();
+        assert!(
+            snapshot_document(&fixture.paths(), fixture.package_uid(), &policy).is_err(),
+            "a partial set is refused even for a dead service"
+        );
     }
 
     /// Fault-injection row 17 for `activity`: the same read, answered by the

@@ -31,6 +31,79 @@ const PASSWORD: &[u8] = b"correct horse battery staple\n";
 const REQUEST_ID: &str = "0123456789abcdef0123456789abcdef";
 const JOB_ID: &str = "00060f5e12345678fedcba98765432100123456789abcdef";
 
+/// The package manager's `[profiles.<name>]` table, with `@ROOT@`, `@SOURCE@` and `@NAME@` to fill.
+/// `tests/daemon_e2e.rs` re-renders it with the real shell manager and fails when the two drift
+/// apart, so this is the manager's output and not this file's idea of it.
+const MANAGER_PROFILE: &str = include_str!("../src/daemon/testdata/manager-profile.toml");
+
+/// [`MANAGER_PROFILE`] for `name`, with `overrides` (key, TOML value text) replacing the manager's
+/// value for that key. A key the manager does not render is a test bug and panics, so an override
+/// can never be silently dropped.
+fn manager_table(root: &Path, name: &str, source: &Path, overrides: &[(&str, String)]) -> String {
+    let slashed = |path: &Path| path.to_str().expect("UTF-8 path").replace('\\', "/");
+    let mut text = MANAGER_PROFILE
+        .replace("@SOURCE@", &slashed(source))
+        .replace("@ROOT@", &slashed(root))
+        .replace("@NAME@", name);
+    for (key, value) in overrides {
+        let prefix = format!("{key} = ");
+        let mut found = false;
+        text = text
+            .lines()
+            .map(|line| {
+                if line.starts_with(&prefix) {
+                    found = true;
+                    format!("{prefix}{value}")
+                } else {
+                    line.to_owned()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n";
+        assert!(found, "the manager's table has no `{key}` line:\n{text}");
+    }
+    text
+}
+
+/// The keys of the tables in `text`, in order.
+fn table_keys(text: &str) -> Vec<String> {
+    text.lines()
+        .filter(|line| !line.starts_with('['))
+        .filter_map(|line| line.split_once(" = ").map(|(key, _)| key.to_owned()))
+        .collect()
+}
+
+/// The keys of the manager's table that `text` does not have.
+fn keys_the_manager_renders_but_this_lacks(text: &str) -> Vec<String> {
+    let have = table_keys(text);
+    table_keys(MANAGER_PROFILE)
+        .into_iter()
+        .filter(|key| !have.contains(key))
+        .collect()
+}
+
+/// The check above sees what the old hand-written table (eight keys) left out of the manager's
+/// (the negative control for the fixture).
+#[test]
+fn the_old_trimmed_table_lacked_most_of_the_managers_keys() {
+    let trimmed = "[profiles.alpha]\nsource = \"/s\"\nremote = \"/team/alpha\"\nurl = \"http://x\"\n\
+                   username = \"u\"\npassword-file = \"/p\"\nno-vault = true\nallow-http = true\n\
+                   progress = \"never\"\n";
+    let missing = keys_the_manager_renders_but_this_lacks(trimmed);
+    assert_eq!(
+        missing.len(),
+        table_keys(MANAGER_PROFILE).len() - 8,
+        "missing: {missing:?}"
+    );
+    let rendered = manager_table(Path::new("/pkg"), "alpha", Path::new("/vol/alpha"), &[]);
+    assert!(
+        keys_the_manager_renders_but_this_lacks(&rendered).is_empty(),
+        "{rendered}"
+    );
+    assert!(rendered.starts_with("[profiles.alpha]\n"), "{rendered}");
+}
+
 fn run(arguments: &[&str]) -> Output {
     let environment = TestDir::new("progress-environment");
     for directory in ["home", "appdata", "local-appdata", "xdg"] {
@@ -206,21 +279,38 @@ fn a_batch_run_publishes_the_phase_it_reached() {
     let password = workspace.write("password", PASSWORD);
     let server = MockFileStation::start();
     let mut tables = String::new();
+    // The manager's tables name a log file under the package's `var/log`, which the package lays
+    // out before any profile exists.
+    fs::create_dir_all(workspace.child("package").join("var").join("log"))
+        .expect("create the package log directory");
     for name in ["alpha", "beta"] {
         let source = workspace.child(&format!("source-{name}"));
         fs::create_dir_all(&source).expect("create a source");
         fs::write(source.join(format!("{name}.txt")), name.as_bytes()).expect("write a payload");
         server.add_directory(&format!("/team/{name}"));
-        // One `[profiles.<name>]` table per profile, as the package manager renders them.
-        tables.push_str(&format!(
-            "[profiles.{name}]\nsource = {source:?}\nremote = \"/team/{name}\"\nurl = {url:?}\n\
-             username = \"e2e-user\"\npassword-file = {password:?}\nno-vault = true\n\
-             allow-http = true\nprogress = \"never\"\n\n",
-            source = source.to_str().expect("UTF-8 source"),
-            url = server.base_url(),
-            password = password.to_str().expect("UTF-8 password path"),
+        // One `[profiles.<name>]` table per profile, exactly as the package manager renders it
+        // (a hand-trimmed table of eight keys hid every other key the manager adds).
+        tables.push_str(&manager_table(
+            &workspace.child("package"),
+            name,
+            &source,
+            &[
+                ("remote", format!("{:?}", format!("/team/{name}"))),
+                ("url", format!("{:?}", server.base_url())),
+                ("username", format!("{:?}", "e2e-user")),
+                (
+                    "password-file",
+                    format!("{:?}", password.to_str().expect("UTF-8 password path")),
+                ),
+            ],
         ));
+        tables.push('\n');
     }
+    let missing = keys_the_manager_renders_but_this_lacks(&tables);
+    assert!(
+        missing.is_empty(),
+        "the batch config must carry every key the manager renders; lacks {missing:?}:\n{tables}"
+    );
     let config = workspace.write("config.toml", tables.as_bytes());
     let records = workspace.child("progress");
     fs::create_dir_all(&records).expect("create the progress directory");

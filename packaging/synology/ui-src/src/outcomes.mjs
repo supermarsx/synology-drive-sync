@@ -162,19 +162,21 @@ const RECORD_ERROR_COPY = Object.freeze({
 // The verified-pair (checksum) index a profile's last run used. States are the closed list the
 // package writes; the issue codes below are the warning-level ones it names, in plain words.
 const INDEX_STATES = Object.freeze(["off", "cold", "warm", "refreshed", "unusable", "local-only"]);
-const INDEX_INFO_ISSUES = Object.freeze(["pair-index-retired", "pair-index-not-applicable", "pair-index-unsupported-platform", "pair-index-plan-clock-unbounded"]);
+const INDEX_INFO_ISSUES = Object.freeze(["pair-index-retired", "pair-index-not-applicable", "pair-index-unsupported-platform", "pair-index-plan-clock-unbounded", "pair-index-compaction-failed", "pair-index-link-guard-unchecked"]);
 const INDEX_INFO_NOTES = Object.freeze({
   "pair-index-retired": "rebuilt, it belonged to another source or remote",
   "pair-index-not-applicable": "not used for this profile",
   "pair-index-unsupported-platform": "not supported on this platform",
-  "pair-index-plan-clock-unbounded": "some files were checked live again because the destination's clock is more than 20 seconds from this NAS's; check the time settings"
+  "pair-index-plan-clock-unbounded": "some files were checked live again because the destination's clock is more than 20 seconds from this NAS's; check the time settings",
+  "pair-index-compaction-failed": "the index file could not be compacted this run and stays larger than it needs to be; it still works",
+  "pair-index-link-guard-unchecked": "stored checksums were not used this run because the destination listed some folders without a real path, so every file was checked live"
 });
 const INDEX_ISSUE_COPY =Object.freeze({
   "pair-index-corrupt": "the checksum index was damaged; it was set aside and rebuilt from this run, so every file was checked live",
   "pair-index-locked": "another process was using the checksum index, so this run did not use it and every file was checked live",
   "pair-index-readonly": "the checksum index is on a read-only location, so it could not be used or updated and every file was checked live",
   "pair-index-store-failed": "the checksum index could not be saved, so the next run checks files live again",
-  "pair-index-unsafe": "the checksum index failed its ownership or mode check, so it was not used and every file was checked live",
+  "pair-index-unsafe": "the checksum index (or the record of an earlier crash beside it) could not be examined or failed its safety check (a link, or the wrong owner or mode), so it was not used and every file was checked live",
   "pair-index-directory-unusable": "the folder that holds the checksum index could not be used, so every file was checked live",
   "pair-index-unbound": "the checksum index belongs to a different source or destination, so it was not used and every file was checked live",
   "pair-index-format-unsupported": "the checksum index was written in a format or version this package does not read, so it was not used and every file was checked live",
@@ -182,7 +184,7 @@ const INDEX_ISSUE_COPY =Object.freeze({
   "pair-index-writeback-unknown": "this NAS's writeback setting could not be read, so files changed in the last minute are treated as unsettled and checked live",
   "pair-index-writeback-unbounded": "periodic writeback is switched off on this NAS (vm.dirty_writeback_centisecs is 0), so the checksum index cannot tell when a changed file has settled and every file was checked live",
   "pair-index-nas-clock-skewed": "the destination's clock (or a proxy's in front of it) is more than 20 seconds from this NAS's, so the files it reported were checked live again; check the time settings",
-  "pair-index-cleanup-failed": "a set-aside copy of the checksum index could not be removed and is using disk space; the path is in the detail",
+  "pair-index-cleanup-failed": "a set-aside copy of the checksum index, or the record of a crash in it, could not be cleaned up, so it may stay and use disk space; the path and the reason are in the detail",
   "pair-index-remote-ctime-static": "the destination did not show this run's write in a file's change time, so the destination's checksums are always computed live and only the local read is skipped"
 });
 

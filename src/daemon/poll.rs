@@ -405,6 +405,13 @@ fn wait_walk(
     }
     let give_up_at = Instant::now() + deadline;
     loop {
+        // A disarm ends the wait before any result is looked at: a walk that happened to finish
+        // just before the flag was read must not be reported as one the routine still wants (it
+        // made `the_floors_walk_honours_a_disarm` fail about 3 runs in 100 under load).
+        if stop.is_some_and(|stop| stop.load(Ordering::SeqCst)) {
+            cancel.store(true, Ordering::Relaxed);
+            return Waited::Stopped;
+        }
         let remaining = give_up_at.saturating_duration_since(Instant::now());
         let slice = if stop.is_some() {
             remaining.min(WALK_SLICE)
@@ -1351,7 +1358,23 @@ mod tests {
         let gone = dir.path().join("src.gone");
         fs::rename(&root, &gone).unwrap();
         fs::remove_dir_all(&gone).unwrap();
-        let failure = harness.next();
+        // A reading that was walking `src` when it was renamed away reports what it saw: a named
+        // skip (a `WatchLimit` account that now lists the skipped entry) or a change. Those are
+        // correct, belong to the tree being taken apart, and come before the failure this test
+        // waits for; under load a walk is often in the middle of it.
+        let failure = loop {
+            let event = harness.next();
+            let mid_walk = match &event {
+                ChangeEvent::Changed { .. } => true,
+                ChangeEvent::Backend { reason, detail, .. } => {
+                    *reason == BackendReason::WatchLimit && detail.contains("skipped")
+                }
+                _ => false,
+            };
+            if !mid_walk {
+                break event;
+            }
+        };
         let ChangeEvent::Backend { reason, detail, .. } = failure else {
             panic!("expected the failure, got {failure:?}");
         };
@@ -1526,9 +1549,10 @@ mod tests {
                 dir.path().to_path_buf(),
                 filter(dir.path(), &[]),
                 PollConfig {
+                    // The walks here are instant; a 60 ms deadline failed whenever the machine was busy.
                     interval: Duration::from_millis(20),
-                    walk_deadline: Duration::from_millis(60),
-                    walk_deadline_max: Duration::from_millis(240),
+                    walk_deadline: Duration::from_secs(5),
+                    walk_deadline_max: Duration::from_secs(5),
                     degraded_every: Duration::from_secs(30),
                     reason: BackendReason::WatchSetupFailed,
                     detail: "arm gave up".to_owned(),

@@ -225,7 +225,10 @@ now belongs to another process, and stop and start remove them and name each pat
 daemon record <path>`). A held lock keeps the strict identity check above. The lock is probed with
 `flock -n`, or, on a unit without `flock(1)`, with the bridge's own `sdsync-dsm-api --daemon-lock-probe
 <path>` (the same non-blocking `flock`, read-only, released at once; exit `0` free, `3` held, `1` cannot
-probe, with a `daemon-lock-probe: <path>: <cause>` line on stderr). The probe in use is named once
+probe, with one `daemon-lock-probe: <path>: <cause>` line on stderr, in which a newline or any other control
+character of the path is written as an escape such as `\n`). Either runs under `timeout 5` when
+`timeout(1)` passes a command's exit status through (it is checked once): a probe wedged on a stuck
+filesystem is "cannot be told" with the cause `timed out after 5 s`, never read as held or free. The probe in use is named once
 per change in `controller.log` (`info` `daemon_lock_probe`, `tool=flock` or `tool=daemon-lock-probe
 flock=absent`; the last tool is kept in `run/daemon-lock-probe.tool`) and, for the bridge's, in a
 `note:` line on stderr. Only when neither can run (no `flock(1)` and no executable bridge, or the
@@ -244,8 +247,17 @@ witness. Held (or unprobeable beside such a record), a supervisor runs that the 
 identify: status reports `2`, the hooks and the shell engine's start refuse, and stop keeps every
 record ("refusing to clean daemon records: ..."), each naming what was wrong with the record and
 that the lock is held. Nothing is signalled on a supervisor only the lock shows; a daemon's own parent
-can still prove it. With the lock free the record is stale, and the removal names why it could not
-be trusted. Stop stops whichever engine's processes are
+can still prove it. A stop in the window between the daemon's death and its respawn waits (half of
+what is left of its budget, at most 20 s) for that supervisor to respawn the daemon whose parent proves
+it, then stops both, so it succeeds in one call. With the lock free the record is stale, and the removal
+names why it could not be trusted. When the lock file itself is the problem as well -- a directory, a
+symlink, a fifo, or a file the package user cannot read -- the record and the lock are two bad witnesses
+and used to refuse for good: the lifecycle now looks for a process whose argv has `--supervise` and the
+package's var path. None, and nothing can hold the lock: status reports the record as stale, and stop
+removes it and repairs the lock (a link, a fifo or an empty directory is removed, an unreadable file gets
+mode `0600`), saying which, or prints the exact command (`rm -r -- '<path>'`, `chmod 600 '<path>'`) when
+it cannot. A live `--supervise` process (named by PID) or a `/proc` entry that cannot be read keeps the
+refusal. Stop stops whichever engine's processes are
 present, both after an engine switch made while one was running. Status is `0` when the daemon
 answers `ctl ping` with admission open, `3` with no daemon records, and `1` when records of a daemon
 that is gone remain (named on stderr).

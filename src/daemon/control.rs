@@ -34,7 +34,8 @@ use std::time::{Duration, Instant};
 use serde_json::{Value, json};
 
 use super::changes::{
-    ArmSpec, ChangeEvent, ChangeSink, ChangeSource, ChangeSourceFactory, DirtySet,
+    Admit, ArmSpec, BackendReports, ChangeEvent, ChangeSink, ChangeSource, ChangeSourceFactory,
+    DirtySet, bound_detail,
 };
 use super::events::{ActivityRow, EventSink, LogEvent};
 use super::executor::{
@@ -285,8 +286,11 @@ struct Entry {
     source: SourceStatus,
     backend: Option<(Backend, BackendReason)>,
     /// The change source's last account of the backend (N-D5): its cause,
-    /// one line, at most 240 bytes. Cleared when the routine is re-armed.
+    /// one line, at most 240 bytes (the tail is kept). Cleared when the routine
+    /// is re-armed.
     backend_detail: Option<String>,
+    /// Which backend reports were logged and which counted (S3-12).
+    backend_reports: BackendReports,
     /// What the change source is watching for this routine, if anything.
     armed: Option<ArmSpec>,
     /// When the safety-net whole-tree run is next due (design §2.3: inotify
@@ -321,6 +325,18 @@ const KEPT_CONFIGURATION: &str = "the last configuration read";
 const KEPT_PROFILE_STATE: &str = "the record on disk, not rewritten";
 /// `kept=` for `run.state` read only to carry its aggregate forward.
 const KEPT_RUN_STATE: &str = "run.state is rewritten without the aggregate it carried";
+/// `kept=` for a dependency's profile state that cannot be read while a routine
+/// is evaluated (N-D8). It is also how a dependency-only entry is told from a
+/// profile's own record, so the entry can be forgotten when no routine depends
+/// on that profile any more (S3-1).
+const KEPT_DEPENDENCY: &str = "the dependency is not met until it can be read";
+
+/// One document that cannot be read now: why, and what the reader kept
+/// instead (the `kept=` of its `config_unreadable` line).
+struct Unreadable {
+    cause: String,
+    kept: String,
+}
 
 struct InFlightMutation {
     mutation: Mutation,
@@ -370,7 +386,7 @@ pub(crate) struct Control {
     lasting_reported: HashSet<String>,
     /// Configuration and state documents that could not be read, with the
     /// cause: each named once per episode, and its recovery named (S2-2).
-    unreadable: BTreeMap<PathBuf, String>,
+    unreadable: BTreeMap<PathBuf, Unreadable>,
     /// The service's degradation, published in controller.state (H2).
     audit_degraded: Option<ControllerDegraded>,
     last_controller_write: Option<Instant>,
@@ -592,11 +608,11 @@ impl Control {
     }
 
     fn unreadable_now_keeping(&mut self, path: &Path, cause: &str, kept: &str) {
-        if self
-            .unreadable
-            .insert(path.to_path_buf(), cause.to_owned())
-            .is_none()
-        {
+        let now = Unreadable {
+            cause: cause.to_owned(),
+            kept: kept.to_owned(),
+        };
+        if self.unreadable.insert(path.to_path_buf(), now).is_none() {
             self.log(
                 Level::Error,
                 "controller",
@@ -606,23 +622,92 @@ impl Control {
         }
     }
 
-    /// Forget the unreadable documents a removed routine leaves behind
-    /// (N-D8): nothing reads them again, so they were listed for good.
-    fn forget_unreadable(&mut self, routine: &str) {
-        let paths = [
-            self.paths.routines_dir.join(format!("{routine}.conf")),
-            self.routine_state_path(routine),
-        ];
-        for path in paths {
+    /// Forget the unreadable documents nothing reads any more (N-D8, S3-1):
+    /// otherwise they stay listed in `config_unreadable` until the daemon
+    /// restarts. Each is judged by what reads it:
+    ///
+    /// - a routine's `.conf` and routine state: the routine;
+    /// - a profile's fragment: the profile, or a routine of that name;
+    /// - a profile's state: the profile, or a routine that depends on it. One
+    ///   named only by a dependency read (`kept=` [`KEPT_DEPENDENCY`]) goes as
+    ///   soon as no routine depends on the profile, though the profile stays.
+    ///
+    /// A profile directory that cannot be listed settles nothing about
+    /// profiles, so their entries stay (the listing failure is `ctl status`'s
+    /// `index_unavailable`). The forgetting is named with the path and why.
+    fn forget_unreadable(&mut self) {
+        if self.unreadable.is_empty() {
+            return;
+        }
+        // A listing that fails is named by `profile_list` (config_unreadable on the
+        // directory) and settles nothing here.
+        let profiles: Option<HashSet<String>> = match self.profile_list() {
+            Ok(names) => Some(names.into_iter().collect()),
+            Err(_) => None,
+        };
+        let depended: HashSet<String> = self
+            .routines
+            .values()
+            .filter_map(|entry| entry.routine.as_ref().ok()?.as_ref())
+            .flat_map(|routine| routine.depends_on.split(','))
+            .filter(|name| !name.is_empty())
+            .map(str::to_owned)
+            .collect();
+        let named = |path: &Path, suffix: &str| -> Option<String> {
+            path.file_name()?
+                .to_str()?
+                .strip_suffix(suffix)
+                .map(str::to_owned)
+        };
+        let mut gone: Vec<(PathBuf, &'static str)> = Vec::new();
+        for (path, entry) in &self.unreadable {
+            let Some(parent) = path.parent() else {
+                continue;
+            };
+            let removed_routine = |name: &str| !self.routines.contains_key(name);
+            let removed_profile = |name: &str| {
+                profiles
+                    .as_ref()
+                    .is_some_and(|profiles| !profiles.contains(name))
+            };
+            let why = if parent == self.paths.routines_dir {
+                named(path, ".conf")
+                    .filter(|name| removed_routine(name))
+                    .map(|_| "the routine was removed, so it is no longer read")
+            } else if parent == self.paths.routine_state_dir {
+                named(path, ".state")
+                    .filter(|name| removed_routine(name))
+                    .map(|_| "the routine was removed, so it is no longer read")
+            } else if parent == self.paths.profiles_dir {
+                named(path, ".toml")
+                    .filter(|name| removed_routine(name) && removed_profile(name))
+                    .map(|_| "the profile was removed, so it is no longer read")
+            } else if parent == self.paths.profile_state_dir {
+                named(path, ".state").and_then(|name| {
+                    if depended.contains(&name) {
+                        None
+                    } else if removed_profile(&name) {
+                        Some("the profile was removed, so it is no longer read")
+                    } else if entry.kept == KEPT_DEPENDENCY {
+                        Some("no routine depends on the profile any more, so it is no longer read")
+                    } else {
+                        None
+                    }
+                })
+            } else {
+                None
+            };
+            if let Some(why) = why {
+                gone.push((path.clone(), why));
+            }
+        }
+        for (path, why) in gone {
             if self.unreadable.remove(&path).is_some() {
                 self.log(
                     Level::Info,
                     "controller",
                     "config_forgotten",
-                    format!(
-                        "path={} cause=the routine was removed, so it is no longer read",
-                        path.display()
-                    ),
+                    format!("path={} cause={why}", path.display()),
                 );
             }
         }
@@ -1091,7 +1176,6 @@ impl Control {
             {
                 changes.disarm(&name);
             }
-            self.forget_unreadable(&name);
         }
         for name in names {
             let existing = self.routines.remove(&name);
@@ -1142,6 +1226,7 @@ impl Control {
                 source: SourceStatus::Ok,
                 backend: None,
                 backend_detail: None,
+                backend_reports: BackendReports::default(),
                 armed: None,
                 full_due: None,
             });
@@ -1203,6 +1288,7 @@ impl Control {
                         }
                         entry.armed = Some(wanted);
                         entry.backend_detail = None;
+                        self.end_backend_episode(&name, &mut entry);
                     }
                     (None, Some(_)) => {
                         if let Some(changes) = self.changes.as_mut() {
@@ -1210,6 +1296,7 @@ impl Control {
                         }
                         entry.armed = None;
                         entry.backend_detail = None;
+                        self.end_backend_episode(&name, &mut entry);
                         entry.dirty = DirtySet::default();
                     }
                     (None, None) => {}
@@ -1217,6 +1304,7 @@ impl Control {
             }
             self.routines.insert(name, entry);
         }
+        self.forget_unreadable();
         if why != "turn" {
             // A reload starts the once-per-field reporting again, so a fix that
             // does not take is reported again.
@@ -1759,11 +1847,7 @@ impl Control {
             for (path, read) in dependency_reads.take() {
                 match read {
                     Ok(()) => self.readable_again(&path),
-                    Err(cause) => self.unreadable_now_keeping(
-                        &path,
-                        &cause,
-                        "the dependency is not met until it can be read",
-                    ),
+                    Err(cause) => self.unreadable_now_keeping(&path, &cause, KEPT_DEPENDENCY),
                 }
             }
             match (&window, self.clock_episodes.contains(&name)) {
@@ -2786,16 +2870,36 @@ impl Control {
 
     // ------------------------------------------------------------ changes
 
+    /// A routine was re-armed or disarmed: its backend episode is over, and
+    /// the reports it did not log are said now (S3-12).
+    fn end_backend_episode(&mut self, name: &str, entry: &mut Entry) {
+        if let Some((backend, reason, suppressed)) = entry.backend_reports.end() {
+            self.log(
+                Level::Info,
+                "scheduler",
+                "routine_backend",
+                format!(
+                    "profile={name} backend={} reason={} suppressed_reports={suppressed} \
+                     episode_ended=rearmed",
+                    backend.as_str(),
+                    reason.as_str()
+                ),
+            );
+        }
+    }
+
     fn change(&mut self, event: ChangeEvent) {
         let now = Instant::now();
         // N-D5: the backend's cause is carried into `ctl status`
-        // (`backend_detail`), whatever the log below makes of the report.
+        // (`backend_detail`), whatever the log below makes of the report. Cut
+        // at 240 bytes with its tail kept: `next_walk_deadline_seconds` is
+        // near the end (S3-12).
         if let ChangeEvent::Backend {
             routine, detail, ..
         } = &event
             && let Some(entry) = self.routines.get_mut(routine)
         {
-            let detail = sanitize_detail(detail.trim(), 240);
+            let detail = bound_detail(&sanitize_detail(detail.trim(), usize::MAX), 240);
             entry.backend_detail = (!detail.is_empty()).then_some(detail);
         }
         match event {
@@ -2829,21 +2933,36 @@ impl Control {
                 // entries skipped), and that account is the one thing the log
                 // carries: logging on (backend, reason) alone dropped
                 // `walk_deadline_exceeded`, the token the dashboard points at.
-                let known = self.routines.get_mut(&routine).map(|entry| {
+                // S3-12: one cause is one episode. A source whose account
+                // changes on every reading (the skipped entries of a polling
+                // tree) logs the first report, counts the rest, and the report
+                // that ends the episode says how many it did not log.
+                let admitted = self.routines.get_mut(&routine).map(|entry| {
                     entry.backend.replace((backend, reason));
+                    entry.backend_reports.admit(backend, reason, &detail)
                 });
-                if known.is_some() {
+                if let Some(Admit::Log { previous }) = admitted {
                     let level = if reason == BackendReason::Ok {
                         Level::Info
                     } else {
                         Level::Warn
                     };
+                    let ended = previous
+                        .map(|(b, r, suppressed)| {
+                            format!(
+                                "; suppressed_reports={suppressed} previous_backend={} \
+                                 previous_reason={}",
+                                b.as_str(),
+                                r.as_str()
+                            )
+                        })
+                        .unwrap_or_default();
                     self.log(
                         level,
                         "scheduler",
                         "routine_backend",
                         format!(
-                            "profile={routine} backend={} reason={} {detail}",
+                            "profile={routine} backend={} reason={} {detail}{ended}",
                             backend.as_str(),
                             reason.as_str()
                         ),
@@ -3237,7 +3356,7 @@ impl Control {
             "config_unreadable": self
                 .unreadable
                 .iter()
-                .map(|(path, cause)| json!({"path": path.display().to_string(), "cause": cause}))
+                .map(|(path, entry)| json!({"path": path.display().to_string(), "cause": entry.cause}))
                 .collect::<Vec<Value>>(),
             "lasting": self
                 .blocked

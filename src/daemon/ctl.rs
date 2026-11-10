@@ -18,23 +18,29 @@
 //!
 //! - a connection that has not yet sent its verb takes only a cheap "unread"
 //!   place (its thread, cut at the read deadline), never a verb slot, so idle
-//!   connections cannot make `ping` fail;
-//! - once the verb is parsed it takes a slot by class: `ping`, `status` and
-//!   `stop` have reserved slots that nothing else can use, `wait` and `mutate`
-//!   are capped within the general slots, and everything else takes a general
-//!   one;
+//!   connections cannot make `ping` fail. When the unread table is full the
+//!   oldest unread connection is dropped, by name, to make room for the new
+//!   one (S3-8): a client that reconnects without ever sending a verb loses its
+//!   own connections, never a real client's turn;
+//! - once the verb is parsed it takes a slot by class: `ping` and `status`
+//!   have reserved slots that nothing else can use, `stop` has two of its own
+//!   (a stop waits up to `wait_s`, so it must not hold the ping slots, S3-9),
+//!   `wait` and `mutate` are capped within the general slots, and everything
+//!   else takes a general one;
 //! - a verb waiting on the control thread watches its peer: a client that has
 //!   gone away frees its slot, and the listener logs `ctl_peer_gone`.
 //!
 //! Linux only.
 
+use std::collections::VecDeque;
 use std::io::{self, BufRead, BufReader, Read, Write};
+use std::net::Shutdown;
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError, Sender};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -59,12 +65,19 @@ const MAX_CONNECTIONS: usize = 32;
 /// Of those, how many may be long verbs (`wait`, `mutate`); the rest stay free
 /// for quick ones (F6s).
 const MAX_LONG_REQUESTS: usize = 16;
-/// Slots only `ping`, `status` and `stop` can use, beyond the general ones, so
-/// neither CLI waiters nor a flood of other verbs can starve them (F6s).
+/// Slots only `ping` and `status` can use, beyond the general ones, so neither
+/// CLI waiters nor a flood of other verbs can starve them (F6s).
 const MAX_PRIORITY_REQUESTS: usize = 8;
+/// Slots only `stop` can use (S3-9). A stop waits for the daemon to wind down,
+/// up to its `wait_s`, so eight of them held the whole shared reserve and made
+/// ping and status answer `ctl_busy`. A stop over these is told so by name.
+const MAX_STOP_REQUESTS: usize = 2;
 /// Connections that have not yet sent a whole request line. Each is a thread
-/// cut at [`READ_DEADLINE`]; more are refused by name.
+/// cut at [`READ_DEADLINE`]; past this the oldest is dropped for the newest.
 const MAX_UNREAD_CONNECTIONS: usize = 128;
+/// How long an episode of dropped empty connections, or of evictions, goes
+/// without a new one before it is over and its count is logged (S3-8, S3-10).
+const EPISODE_QUIET: Duration = Duration::from_secs(30);
 /// How often a verb waiting on the control thread looks at its peer.
 const PEER_CHECK: Duration = Duration::from_millis(250);
 /// How long a client waits for its connection to be accepted.
@@ -161,20 +174,128 @@ pub(crate) fn parse_request(
     Ok((request, ANSWER_DEADLINE))
 }
 
-fn answer(stream: &mut UnixStream, value: &Value, log: &CtlLog) {
+/// What an [`Episode`] reports when it is over.
+struct EpisodeEnd {
+    count: u64,
+    lasted: Duration,
+}
+
+/// What [`Episode::note`] found.
+enum Noted {
+    /// A new episode began; the caller logs this event in full. `previous` is
+    /// an earlier episode that went quiet and was not reported yet.
+    Begins { previous: Option<EpisodeEnd> },
+    /// The episode was already under way: counted, not logged.
+    Counted,
+}
+
+/// A run of the same event, logged once (S3-8, S3-10): the first is written in
+/// full, the rest are counted, and once no new one has come for `quiet` the
+/// episode's count is written by [`Episode::ended`]. Nothing is dropped: what
+/// is not written at the time is in the count.
+struct Episode {
+    quiet: Duration,
+    state: Mutex<Option<EpisodeState>>,
+}
+
+struct EpisodeState {
+    began: Instant,
+    last: Instant,
+    count: u64,
+}
+
+impl Episode {
+    fn new(quiet: Duration) -> Self {
+        Self {
+            quiet,
+            state: Mutex::new(None),
+        }
+    }
+
+    fn note(&self) -> Noted {
+        let now = Instant::now();
+        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        match state.as_mut() {
+            Some(open) if now.duration_since(open.last) < self.quiet => {
+                open.last = now;
+                open.count += 1;
+                Noted::Counted
+            }
+            _ => {
+                let previous = state.take().map(|old| EpisodeEnd {
+                    count: old.count,
+                    lasted: old.last.duration_since(old.began),
+                });
+                *state = Some(EpisodeState {
+                    began: now,
+                    last: now,
+                    count: 1,
+                });
+                Noted::Begins { previous }
+            }
+        }
+    }
+
+    /// The episode, once it has been quiet for `quiet`.
+    fn ended(&self) -> Option<EpisodeEnd> {
+        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        if state
+            .as_ref()
+            .is_some_and(|open| open.last.elapsed() >= self.quiet)
+        {
+            return state.take().map(|old| EpisodeEnd {
+                count: old.count,
+                lasted: old.last.duration_since(old.began),
+            });
+        }
+        None
+    }
+}
+
+fn answer(stream: &UnixStream, value: &Value, log: &CtlLog, slots: &Slots) {
     let mut line = value.to_string();
     line.push('\n');
+    let mut writer = stream;
     // A client that went away loses its reply, but the loss is named.
-    if let Err(error) = stream.write_all(line.as_bytes()) {
+    if let Err(error) = writer.write_all(line.as_bytes()) {
+        let code = value["code"].as_str().unwrap_or("ok");
+        // S3-10: a connect-and-close with no request is one line per episode,
+        // not one per connection (a probe or a port scan can make thousands).
+        if code == "empty_request" {
+            match slots.empty_requests.note() {
+                Noted::Counted => return,
+                Noted::Begins { previous } => {
+                    if let Some(end) = previous {
+                        log_episode_end(log, "ctl_empty_requests_ended", &end);
+                    }
+                    log(
+                        Level::Info,
+                        "ctl_reply_dropped",
+                        format!(
+                            "code={code} cause={error}; further connections that send no \
+                             request are counted, not logged, until none comes for {} s \
+                             (ctl_empty_requests_ended)",
+                            slots.empty_requests.quiet.as_secs()
+                        ),
+                    );
+                    return;
+                }
+            }
+        }
         log(
             Level::Info,
             "ctl_reply_dropped",
-            format!(
-                "code={} cause={error}",
-                value["code"].as_str().unwrap_or("ok")
-            ),
+            format!("code={code} cause={error}"),
         );
     }
+}
+
+fn log_episode_end(log: &CtlLog, event: &'static str, end: &EpisodeEnd) {
+    log(
+        Level::Info,
+        event,
+        format!("count={} over_ms={}", end.count, end.lasted.as_millis()),
+    );
 }
 
 /// Where a connection stands, and so which places it holds.
@@ -182,8 +303,10 @@ fn answer(stream: &mut UnixStream, value: &Value, log: &CtlLog) {
 enum Place {
     /// Connected, verb not yet parsed.
     Unread,
-    /// `ping`, `status`, `stop`: reserved slots.
+    /// `ping`, `status`: reserved slots.
     Priority,
+    /// `stop`: two reserved slots of its own.
+    Stop,
     /// `wait`, `mutate`: a general slot and a long one.
     Long,
     /// Everything else: a general slot.
@@ -192,7 +315,8 @@ enum Place {
 
 fn place_of(request: &Request) -> Place {
     match request {
-        Request::Ping | Request::Status | Request::Stop => Place::Priority,
+        Request::Ping | Request::Status => Place::Priority,
+        Request::Stop => Place::Stop,
         Request::Wait { .. } | Request::Mutate(_) => Place::Long,
         _ => Place::General,
     }
@@ -214,13 +338,31 @@ fn verb_word(request: &Request) -> &'static str {
     }
 }
 
-/// How many places each kind holds right now.
+/// An unread connection the table can drop to make room (S3-8).
+struct UnreadEntry {
+    id: u64,
+    stream: Arc<UnixStream>,
+    evicted: Arc<AtomicBool>,
+}
+
+/// The connections that have not yet sent their request, oldest first.
 #[derive(Default)]
+struct UnreadTable {
+    next_id: u64,
+    entries: VecDeque<UnreadEntry>,
+}
+
+/// How many places each kind holds right now.
 struct Slots {
-    unread: AtomicUsize,
+    unread: Mutex<UnreadTable>,
     general: AtomicUsize,
     long: AtomicUsize,
     priority: AtomicUsize,
+    stop: AtomicUsize,
+    /// Dropped replies to connections that sent no request (S3-10).
+    empty_requests: Episode,
+    /// Unread connections dropped for a newer one (S3-8).
+    evictions: Episode,
 }
 
 /// One more in `counter` if it is under `cap`.
@@ -233,12 +375,64 @@ fn increment(counter: &AtomicUsize, cap: usize) -> bool {
 }
 
 impl Slots {
+    fn new(episode_quiet: Duration) -> Self {
+        Self {
+            unread: Mutex::new(UnreadTable::default()),
+            general: AtomicUsize::new(0),
+            long: AtomicUsize::new(0),
+            priority: AtomicUsize::new(0),
+            stop: AtomicUsize::new(0),
+            empty_requests: Episode::new(episode_quiet),
+            evictions: Episode::new(episode_quiet),
+        }
+    }
+
+    /// An unread place for `stream`. A full table drops its oldest entry for
+    /// this one and returns it: the caller shuts it down and says so (S3-8).
+    fn take_unread(self: &Arc<Self>, stream: &Arc<UnixStream>) -> (Held, Option<UnreadEntry>) {
+        let mut table = self.unread.lock().unwrap_or_else(PoisonError::into_inner);
+        let victim = if table.entries.len() >= MAX_UNREAD_CONNECTIONS {
+            table.entries.pop_front()
+        } else {
+            None
+        };
+        if let Some(victim) = &victim {
+            victim.evicted.store(true, Ordering::SeqCst);
+        }
+        let id = table.next_id;
+        table.next_id += 1;
+        let evicted = Arc::new(AtomicBool::new(false));
+        table.entries.push_back(UnreadEntry {
+            id,
+            stream: Arc::clone(stream),
+            evicted: Arc::clone(&evicted),
+        });
+        let held = Held {
+            slots: Arc::clone(self),
+            place: Place::Unread,
+            ticket: Some(Ticket { id, evicted }),
+        };
+        (held, victim)
+    }
+
+    /// Log the end of an episode that has gone quiet (called whenever a
+    /// request is served, so the count is written soon after the last event).
+    fn report_ended_episodes(&self, log: &CtlLog) {
+        if let Some(end) = self.empty_requests.ended() {
+            log_episode_end(log, "ctl_empty_requests_ended", &end);
+        }
+        if let Some(end) = self.evictions.ended() {
+            log_episode_end(log, "ctl_unread_eviction_ended", &end);
+        }
+    }
+
     /// The places for `place`, all or none; they are given back when the
-    /// returned guard drops.
+    /// returned guard drops. (An unread place is [`Slots::take_unread`].)
     fn take(self: &Arc<Self>, place: Place) -> Option<Held> {
         let taken = match place {
-            Place::Unread => increment(&self.unread, MAX_UNREAD_CONNECTIONS),
+            Place::Unread => false,
             Place::Priority => increment(&self.priority, MAX_PRIORITY_REQUESTS),
+            Place::Stop => increment(&self.stop, MAX_STOP_REQUESTS),
             Place::General => increment(&self.general, MAX_CONNECTIONS),
             Place::Long => {
                 if increment(&self.general, MAX_CONNECTIONS) {
@@ -256,28 +450,60 @@ impl Slots {
         taken.then(|| Held {
             slots: Arc::clone(self),
             place,
+            ticket: None,
         })
     }
+}
+
+/// An unread connection's claim on the table, and whether it was dropped.
+struct Ticket {
+    id: u64,
+    evicted: Arc<AtomicBool>,
 }
 
 /// Places taken for one connection, given back when it drops.
 struct Held {
     slots: Arc<Slots>,
     place: Place,
+    ticket: Option<Ticket>,
+}
+
+impl Held {
+    /// Whether the table dropped this unread connection for a newer one.
+    fn was_evicted(&self) -> bool {
+        self.ticket
+            .as_ref()
+            .is_some_and(|ticket| ticket.evicted.load(Ordering::SeqCst))
+    }
 }
 
 impl Drop for Held {
     fn drop(&mut self) {
         let slots = &self.slots;
         match self.place {
-            Place::Unread => slots.unread.fetch_sub(1, Ordering::SeqCst),
-            Place::Priority => slots.priority.fetch_sub(1, Ordering::SeqCst),
-            Place::General => slots.general.fetch_sub(1, Ordering::SeqCst),
+            Place::Unread => {
+                if let Some(ticket) = &self.ticket {
+                    let mut table = slots.unread.lock().unwrap_or_else(PoisonError::into_inner);
+                    // Already gone when it was evicted.
+                    if let Some(at) = table.entries.iter().position(|e| e.id == ticket.id) {
+                        table.entries.remove(at);
+                    }
+                }
+            }
+            Place::Priority => {
+                slots.priority.fetch_sub(1, Ordering::SeqCst);
+            }
+            Place::Stop => {
+                slots.stop.fetch_sub(1, Ordering::SeqCst);
+            }
+            Place::General => {
+                slots.general.fetch_sub(1, Ordering::SeqCst);
+            }
             Place::Long => {
                 slots.long.fetch_sub(1, Ordering::SeqCst);
-                slots.general.fetch_sub(1, Ordering::SeqCst)
+                slots.general.fetch_sub(1, Ordering::SeqCst);
             }
-        };
+        }
     }
 }
 
@@ -285,11 +511,16 @@ impl Drop for Held {
 fn full_detail(place: Place) -> String {
     match place {
         Place::Unread => format!(
-            "{MAX_UNREAD_CONNECTIONS} connections are already waiting to send their request"
+            "evicted: {MAX_UNREAD_CONNECTIONS} connections were waiting to send their request, \
+             and this one was the oldest"
         ),
         Place::Priority => {
-            format!("{MAX_PRIORITY_REQUESTS} ping, status or stop requests are already waiting")
+            format!("{MAX_PRIORITY_REQUESTS} ping or status requests are already waiting")
         }
+        Place::Stop => format!(
+            "{MAX_STOP_REQUESTS} stop requests are already waiting for the daemon to stop; \
+             one of them is answered when it has"
+        ),
         Place::Long => format!(
             "{MAX_LONG_REQUESTS} long requests (wait, mutate) are already waiting, or \
              {MAX_CONNECTIONS} requests are already being served"
@@ -365,17 +596,18 @@ fn ask_while_connected(
 
 // Read one request line within one deadline for the whole line (H5): each
 /// read gets only what is left of it. `Ok("")` at end of input.
-fn read_request_line(stream: &mut UnixStream, within: Duration) -> io::Result<String> {
+fn read_request_line(stream: &UnixStream, within: Duration) -> io::Result<String> {
     let deadline = Instant::now() + within;
     let mut bytes = Vec::new();
     let mut chunk = [0_u8; 4096];
+    let mut reader = stream;
     loop {
         let left = deadline.saturating_duration_since(Instant::now());
         if left.is_zero() {
             return Err(io::Error::new(io::ErrorKind::TimedOut, "request deadline"));
         }
         stream.set_read_timeout(Some(left))?;
-        let read = match stream.read(&mut chunk) {
+        let read = match reader.read(&mut chunk) {
             Ok(read) => read,
             Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
             Err(error) => return Err(error),
@@ -405,7 +637,7 @@ fn read_request_line(stream: &mut UnixStream, within: Duration) -> io::Result<St
 /// request line is parsed (or has failed), so an idle connection never holds a
 /// verb slot.
 fn serve(
-    mut stream: UnixStream,
+    stream: Arc<UnixStream>,
     uid: u32,
     tx: &Sender<Msg>,
     mutation_deadline: Duration,
@@ -413,21 +645,24 @@ fn serve(
     log: &CtlLog,
     unread: Held,
 ) {
-    match sys::peer_uid(&stream) {
+    let stream: &UnixStream = &stream;
+    match sys::peer_uid(stream) {
         Ok(peer) if peer == uid => {}
         Ok(peer) => {
             answer(
-                &mut stream,
+                stream,
                 &json!({"ok": false, "code": "peer_refused", "detail": format!("uid {peer} is not the package uid")}),
                 log,
+                slots,
             );
             return;
         }
         Err(error) => {
             answer(
-                &mut stream,
+                stream,
                 &json!({"ok": false, "code": "peer_unverified", "detail": error.to_string()}),
                 log,
+                slots,
             );
             return;
         }
@@ -439,7 +674,7 @@ fn serve(
             format!("option=write_timeout cause={error}; a reply to this client may block"),
         );
     }
-    let line = read_request_line(&mut stream, READ_DEADLINE);
+    let line = read_request_line(stream, READ_DEADLINE);
     let parsed = match &line {
         Ok(line) if line.trim().is_empty() => {
             Err(json!({"ok": false, "code": "empty_request", "detail": "no request line"}))
@@ -458,6 +693,21 @@ fn serve(
         }
         Err(error) => Err(json!({"ok": false, "code": "bad_request", "detail": error.to_string()})),
     };
+    // An episode of empty connections or evictions that has gone quiet is
+    // reported by the next request read, before its reply (S3-8, S3-10).
+    if parsed.is_ok() {
+        slots.report_ended_episodes(log);
+    }
+    // S3-8: a connection the table dropped for a newer one had its input shut
+    // down, so what it sent is cut short. A request that did arrive whole is
+    // served; anything else is answered as the eviction it was, not as an
+    // empty or bad request.
+    let parsed = match parsed {
+        Err(_) if unread.was_evicted() => {
+            Err(json!({"ok": false, "code": "ctl_busy", "detail": full_detail(Place::Unread)}))
+        }
+        other => other,
+    };
     // The verb is known (or the request has failed): the connection no longer
     // takes an unread place, and takes the slot its verb needs instead.
     drop(unread);
@@ -466,7 +716,7 @@ fn serve(
         Ok((request, deadline)) => {
             let place = place_of(&request);
             match slots.take(place) {
-                Some(_held) => ask_while_connected(&stream, tx, request, deadline, log),
+                Some(_held) => ask_while_connected(stream, tx, request, deadline, log),
                 None => {
                     Some(json!({"ok": false, "code": "ctl_busy", "detail": full_detail(place)}))
                 }
@@ -474,7 +724,7 @@ fn serve(
         }
     };
     if let Some(reply) = reply {
-        answer(&mut stream, &reply, log);
+        answer(stream, &reply, log, slots);
     }
 }
 
@@ -487,6 +737,19 @@ pub(crate) fn listen(
     mutation_deadline: Duration,
     log: CtlLog,
 ) -> io::Result<thread::JoinHandle<()>> {
+    listen_with(path, uid, tx, mutation_deadline, log, EPISODE_QUIET)
+}
+
+/// [`listen`] with the quiet period that ends an episode of dropped empty
+/// connections or evictions (tests shorten it).
+pub(crate) fn listen_with(
+    path: &Path,
+    uid: u32,
+    tx: Sender<Msg>,
+    mutation_deadline: Duration,
+    log: CtlLog,
+    episode_quiet: Duration,
+) -> io::Result<thread::JoinHandle<()>> {
     match std::fs::symlink_metadata(path) {
         Ok(_) => std::fs::remove_file(path)?,
         Err(error) if error.kind() == io::ErrorKind::NotFound => {}
@@ -494,7 +757,7 @@ pub(crate) fn listen(
     }
     let listener = UnixListener::bind(path)?;
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
-    let slots = Arc::new(Slots::default());
+    let slots = Arc::new(Slots::new(episode_quiet));
     let socket = path.to_path_buf();
     thread::Builder::new()
         .name("sdsyncd-ctl".into())
@@ -504,7 +767,7 @@ pub(crate) fn listen(
             let accept_failing = AtomicBool::new(false);
             let spawn_failing = AtomicBool::new(false);
             for stream in listener.incoming() {
-                let mut stream = match stream {
+                let stream = match stream {
                     Ok(stream) => {
                         if accept_failing.swap(false, Ordering::SeqCst) {
                             log(
@@ -513,7 +776,7 @@ pub(crate) fn listen(
                                 format!("path={}", socket.display()),
                             );
                         }
-                        stream
+                        Arc::new(stream)
                     }
                     Err(error) => {
                         if !accept_failing.swap(true, Ordering::SeqCst) {
@@ -532,31 +795,22 @@ pub(crate) fn listen(
                     }
                 };
                 // A connection that has not sent its verb takes an unread place,
-                // never a verb slot (F6s).
-                let Some(unread) = slots.take(Place::Unread) else {
-                    if let Err(error) = stream.set_write_timeout(Some(READ_DEADLINE)) {
-                        log(
-                            Level::Warn,
-                            "ctl_socket_option_failed",
-                            format!("option=write_timeout cause={error}"),
-                        );
-                    }
-                    answer(
-                        &mut stream,
-                        &json!({"ok": false, "code": "ctl_busy", "detail": full_detail(Place::Unread)}),
-                        &log,
-                    );
-                    continue;
-                };
+                // never a verb slot (F6s). A full table drops its oldest entry
+                // for this one (S3-8): refusing the new connection let a client
+                // that reconnected without ever sending a verb keep every place.
+                let (unread, victim) = slots.take_unread(&stream);
+                if let Some(victim) = victim {
+                    evict(&slots, &log, &socket, &victim);
+                }
                 let tx = tx.clone();
                 let thread_slots = Arc::clone(&slots);
                 let thread_log = Arc::clone(&log);
-                let refused = stream.try_clone();
+                let thread_stream = Arc::clone(&stream);
                 let spawned = thread::Builder::new()
                     .name("sdsyncd-ctl-conn".into())
                     .spawn(move || {
                         serve(
-                            stream,
+                            thread_stream,
                             uid,
                             &tx,
                             mutation_deadline,
@@ -582,35 +836,61 @@ pub(crate) fn listen(
                                 ),
                             );
                         }
-                        match refused {
-                            Ok(mut stream) => {
-                                if let Err(option) = stream.set_write_timeout(Some(READ_DEADLINE)) {
-                                    log(
-                                        Level::Warn,
-                                        "ctl_socket_option_failed",
-                                        format!("option=write_timeout cause={option}"),
-                                    );
-                                }
-                                answer(
-                                    &mut stream,
-                                    &json!({"ok": false, "code": "ctl_busy", "detail": format!("no thread to serve it: {error}")}),
-                                    &log,
-                                );
-                            }
-                            Err(clone) => log(
-                                Level::Error,
-                                "ctl_accept_failed",
-                                format!(
-                                    "path={} cause=the refused connection could not be answered: {clone}",
-                                    socket.display()
-                                ),
-                            ),
+                        if let Err(option) = stream.set_write_timeout(Some(READ_DEADLINE)) {
+                            log(
+                                Level::Warn,
+                                "ctl_socket_option_failed",
+                                format!("option=write_timeout cause={option}"),
+                            );
                         }
+                        answer(
+                            &stream,
+                            &json!({"ok": false, "code": "ctl_busy", "detail": format!("no thread to serve it: {error}")}),
+                            &log,
+                            &slots,
+                        );
                         thread::sleep(ACCEPT_BACKOFF);
                     }
                 }
             }
         })
+}
+
+/// Drop the oldest unread connection to make room (S3-8). Its input is shut
+/// down so its thread wakes at once; the thread answers `ctl_busy`. The first
+/// eviction of an episode is logged in full, the rest are counted.
+fn evict(slots: &Slots, log: &CtlLog, socket: &Path, victim: &UnreadEntry) {
+    if let Err(error) = victim.stream.shutdown(Shutdown::Read) {
+        log(
+            Level::Warn,
+            "ctl_socket_option_failed",
+            format!(
+                "option=shutdown path={} cause={error}; the evicted connection is held until \
+                 its {} s read deadline",
+                socket.display(),
+                READ_DEADLINE.as_secs()
+            ),
+        );
+    }
+    match slots.evictions.note() {
+        Noted::Counted => {}
+        Noted::Begins { previous } => {
+            if let Some(end) = previous {
+                log_episode_end(log, "ctl_unread_eviction_ended", &end);
+            }
+            log(
+                Level::Warn,
+                "ctl_unread_evicted",
+                format!(
+                    "path={} cause={MAX_UNREAD_CONNECTIONS} connections were waiting to send a \
+                     request, so the oldest is dropped for each new one; further evictions are \
+                     counted until none comes for {} s (ctl_unread_eviction_ended)",
+                    socket.display(),
+                    slots.evictions.quiet.as_secs()
+                ),
+            );
+        }
+    }
 }
 
 /// "cannot connect to <path>: <cause>", the path said once: a full backlog already names the
@@ -1119,6 +1399,294 @@ mod tests {
                 .any(|l| l.starts_with("ctl_peer_gone")),
             "{:?}",
             lines.lock().unwrap()
+        );
+        remove_dir(&dir);
+    }
+
+    /// A stand-in control thread that answers ping and status at once and holds
+    /// every stop (a daemon that is slow to wind down) and every other request.
+    fn stop_holding_control() -> Sender<Msg> {
+        let (tx, rx) = mpsc::channel::<Msg>();
+        thread::spawn(move || {
+            let mut held = Vec::new();
+            for message in rx {
+                if let Msg::Ctl(request, reply) = message {
+                    if matches!(request, Request::Ping | Request::Status) {
+                        let _ = reply.send(json!({"ok": true, "pong": true}));
+                    } else {
+                        held.push(reply);
+                    }
+                }
+            }
+        });
+        tx
+    }
+
+    /// One text reply line, or what went wrong reading it.
+    fn reply_line(stream: &UnixStream, within: Duration) -> String {
+        stream.set_read_timeout(Some(within)).unwrap();
+        let mut text = String::new();
+        match BufReader::new(stream).read_line(&mut text) {
+            Ok(_) => text,
+            Err(error) => format!("<no reply: {error}>"),
+        }
+    }
+
+    /// Ask until the verb is served (a client that is told `ctl_busy` asks
+    /// again, as the CLI does); `(attempts, reply)` or the last failure.
+    fn ask_until_served(
+        path: &Path,
+        verb: &Value,
+        within: Duration,
+    ) -> Result<(u32, Value), String> {
+        let started = Instant::now();
+        let mut attempts = 0;
+        loop {
+            attempts += 1;
+            let outcome = request(path, verb, Duration::from_secs(8));
+            match &outcome {
+                Ok(reply) if reply["pong"] == true => return Ok((attempts, reply.clone())),
+                _ if started.elapsed() > within => {
+                    return Err(format!(
+                        "{verb} was not served in {within:?} ({attempts} attempts); last: {outcome:?}"
+                    ));
+                }
+                _ => thread::sleep(Duration::from_millis(5)),
+            }
+        }
+    }
+
+    /// S3-8: a full unread table refused every new connection, so a same-uid
+    /// client that reconnected without ever sending a verb starved ping and
+    /// stop. The oldest unread connection is dropped, by name, instead.
+    #[test]
+    fn a_full_unread_table_evicts_the_oldest_instead_of_refusing_ping() {
+        let dir = socket_dir("evict");
+        let path = dir.join("ctl.sock");
+        let (log, lines) = recording_log();
+        listen(
+            &path,
+            sys::geteuid(),
+            holding_control(),
+            Duration::from_secs(1),
+            log,
+        )
+        .unwrap();
+        let idle: Vec<UnixStream> = (0..MAX_UNREAD_CONNECTIONS)
+            .map(|_| UnixStream::connect(&path).unwrap())
+            .collect();
+        thread::sleep(Duration::from_millis(500));
+        let started = Instant::now();
+        let reply = request(&path, &json!({"verb":"ping"}), Duration::from_secs(5)).unwrap();
+        assert_eq!(
+            reply["pong"],
+            true,
+            "ping with {MAX_UNREAD_CONNECTIONS} silent connections: {reply} after {:?}",
+            started.elapsed()
+        );
+        // The oldest silent connection was told why it went; the newest was kept.
+        let first = reply_line(&idle[0], Duration::from_secs(2));
+        assert!(
+            first.contains("ctl_busy") && first.contains("evicted"),
+            "the oldest connection's reply: {first:?}"
+        );
+        let last = reply_line(
+            &idle[MAX_UNREAD_CONNECTIONS - 1],
+            Duration::from_millis(200),
+        );
+        assert!(
+            last.starts_with("<no reply"),
+            "the newest silent connection is still waiting for its turn, got {last:?}"
+        );
+        let seen = lines.lock().unwrap().clone();
+        assert!(
+            seen.iter().any(|l| l.starts_with("ctl_unread_evicted")),
+            "the eviction is named in the log: {seen:?}"
+        );
+        drop(idle);
+        remove_dir(&dir);
+    }
+
+    /// S3-8, the reviewer's flood: 160 same-uid clients reconnect without
+    /// sending anything. 0 of 142 pings got through; each is served now.
+    #[test]
+    fn a_reconnect_flood_cannot_starve_ping_or_stop() {
+        let dir = socket_dir("flood");
+        let path = dir.join("ctl.sock");
+        listen(
+            &path,
+            sys::geteuid(),
+            holding_control(),
+            Duration::from_secs(1),
+            quiet_log(),
+        )
+        .unwrap();
+        let over = Arc::new(AtomicBool::new(false));
+        let flooders: Vec<_> = (0..MAX_UNREAD_CONNECTIONS + 32)
+            .map(|_| {
+                let (path, over) = (path.clone(), Arc::clone(&over));
+                thread::spawn(move || {
+                    while !over.load(Ordering::SeqCst) {
+                        match UnixStream::connect(&path) {
+                            Ok(mut stream) => {
+                                let _ = stream.set_read_timeout(Some(Duration::from_millis(200)));
+                                let mut chunk = [0_u8; 256];
+                                while !over.load(Ordering::SeqCst)
+                                    && stream.read(&mut chunk).is_err()
+                                {
+                                }
+                            }
+                            Err(_) => thread::sleep(Duration::from_millis(20)),
+                        }
+                    }
+                })
+            })
+            .collect();
+        thread::sleep(Duration::from_millis(500));
+        let started = Instant::now();
+        let (mut pings, mut stops, mut worst_attempts) = (0, 0, 0);
+        let mut failures = Vec::new();
+        while started.elapsed() < Duration::from_secs(4) {
+            for (verb, served) in [
+                (json!({"verb":"ping"}), &mut pings),
+                (json!({"verb":"stop","wait_s":5}), &mut stops),
+            ] {
+                match ask_until_served(&path, &verb, Duration::from_secs(5)) {
+                    Ok((attempts, _)) => {
+                        *served += 1;
+                        worst_attempts = worst_attempts.max(attempts);
+                    }
+                    Err(failure) => failures.push(failure),
+                }
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+        over.store(true, Ordering::SeqCst);
+        for flooder in flooders {
+            flooder.join().unwrap();
+        }
+        assert!(
+            failures.is_empty() && pings > 5 && stops > 5,
+            "pings served {pings}, stops served {stops}, worst attempts {worst_attempts}, \
+             failures: {failures:?}"
+        );
+        remove_dir(&dir);
+    }
+
+    /// S3-9: eight waiting stops held the shared reserve for up to `wait_s`,
+    /// so ping and status failed behind them. Stop has slots of its own, and a
+    /// stop over them is told so by name.
+    #[test]
+    fn waiting_stops_cannot_block_ping_or_status() {
+        let dir = socket_dir("stops");
+        let path = dir.join("ctl.sock");
+        listen(
+            &path,
+            sys::geteuid(),
+            stop_holding_control(),
+            Duration::from_secs(1),
+            quiet_log(),
+        )
+        .unwrap();
+        let mut stops = Vec::new();
+        for _ in 0..MAX_PRIORITY_REQUESTS + 4 {
+            let mut stream = UnixStream::connect(&path).unwrap();
+            stream
+                .write_all(b"{\"verb\":\"stop\",\"wait_s\":30}\n")
+                .unwrap();
+            stops.push(stream);
+        }
+        thread::sleep(Duration::from_millis(500));
+        for verb in [json!({"verb":"ping"}), json!({"verb":"status"})] {
+            let reply = request(&path, &verb, Duration::from_secs(5)).unwrap();
+            assert_eq!(
+                reply["pong"],
+                true,
+                "{verb} behind {} waiting stops: {reply}",
+                stops.len()
+            );
+        }
+        // The stops over the reserve were told by name; the reserved ones wait.
+        let mut refused = 0;
+        for stop in &stops {
+            let text = reply_line(stop, Duration::from_millis(50));
+            if text.contains("ctl_busy") {
+                assert!(text.contains("stop"), "the refusal names stop: {text}");
+                refused += 1;
+            }
+        }
+        assert_eq!(
+            refused,
+            stops.len() - MAX_STOP_REQUESTS,
+            "{MAX_STOP_REQUESTS} stops wait, the other {} are told so",
+            stops.len() - MAX_STOP_REQUESTS
+        );
+        drop(stops);
+        remove_dir(&dir);
+    }
+
+    /// S3-10: a connect-and-close with no request wrote one Info line per
+    /// connection. The first of an episode is logged in full, the rest are
+    /// counted, and the end of the episode is reported with the count.
+    #[test]
+    fn empty_connections_are_logged_once_per_episode() {
+        let dir = socket_dir("empty");
+        let path = dir.join("ctl.sock");
+        let (log, lines) = recording_log();
+        listen_with(
+            &path,
+            sys::geteuid(),
+            holding_control(),
+            Duration::from_secs(1),
+            log,
+            Duration::from_millis(600),
+        )
+        .unwrap();
+        const EMPTY: usize = 60;
+        for _ in 0..EMPTY {
+            drop(UnixStream::connect(&path).unwrap());
+        }
+        // A request served once the episode has been quiet ends it, with its count. How long that
+        // takes depends on the load the test runs under (every connection thread has to finish
+        // its failed reply first), so ask until the end is reported.
+        let count_of = |line: &str| -> usize {
+            line.split("count=")
+                .nth(1)
+                .and_then(|rest| rest.split_whitespace().next())
+                .and_then(|n| n.parse().ok())
+                .unwrap_or_else(|| panic!("no count in {line:?}"))
+        };
+        let give_up = Instant::now() + Duration::from_secs(20);
+        let (seen, counted) = loop {
+            thread::sleep(Duration::from_millis(250));
+            let reply = request(&path, &json!({"verb":"ping"}), Duration::from_secs(5)).unwrap();
+            assert_eq!(reply["pong"], true, "{reply}");
+            let seen = lines.lock().unwrap().clone();
+            let counted: usize = seen
+                .iter()
+                .filter(|l| l.starts_with("ctl_empty_requests_ended"))
+                .map(|l| count_of(l))
+                .sum();
+            if counted >= EMPTY - 2 || Instant::now() > give_up {
+                break (seen, counted);
+            }
+        };
+        let dropped = seen
+            .iter()
+            .filter(|l| l.starts_with("ctl_reply_dropped") && l.contains("code=empty_request"))
+            .count();
+        let ended = seen
+            .iter()
+            .filter(|l| l.starts_with("ctl_empty_requests_ended"))
+            .count();
+        assert!(
+            counted >= EMPTY - 2,
+            "the end lines count the episode's connections ({EMPTY} made, {counted} counted): {seen:?}"
+        );
+        // One logged line per episode (a loaded machine may split it, never into one per connection).
+        assert!(
+            (1..=3).contains(&dropped) && (dropped == ended || dropped == ended + 1),
+            "{EMPTY} empty connections wrote {dropped} drop lines and {ended} end lines: {seen:?}"
         );
         remove_dir(&dir);
     }
