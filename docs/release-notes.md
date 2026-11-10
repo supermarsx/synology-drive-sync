@@ -275,6 +275,13 @@ lists its own commits.
 - New `pair_index.issues` codes: `pair-index-writeback-unknown`, `pair-index-writeback-unbounded`,
   `pair-index-nas-clock-skewed`, `pair-index-cleanup-failed`. See
   [Verified-pair index](pair-index.md#when-it-cannot-be-used).
+- **The About page shows which package build is installed.** A new **Installed package build** row
+  under **Build identity** names the CPU architecture and the target the binary was compiled for, for
+  example `armv8 (aarch64-unknown-linux-musl)` or `armv7 (armv7-unknown-linux-musleabihf)`. The
+  snapshot's `package` member gains `target` and `arch` beside `version`; all three are compiled in
+  and none is read from `INFO`. A build whose target has no Synology architecture reads `Not a
+  Synology package build (<target>)`, and a package API that reports neither reads `Not reported by
+  package API`. See [Compatibility](dsm/compatibility.md#four-release-spks).
 
 ## Read this before upgrading
 

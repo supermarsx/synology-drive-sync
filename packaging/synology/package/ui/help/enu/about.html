@@ -20,6 +20,7 @@
     <dt>Repository</dt><dd><a href="https://github.com/supermarsx/synology-drive-sync" target="_blank" rel="noopener noreferrer">github.com/supermarsx/synology-drive-sync</a></dd>
     <dt>License</dt><dd><a href="https://github.com/supermarsx/synology-drive-sync/blob/main/license.md" target="_blank" rel="noopener noreferrer">MIT</a></dd>
     <dt>Installed package version</dt><dd>The AppWindow displays the immutable compile-time package version reported by the authenticated snapshot API.</dd>
+    <dt>Installed package build</dt><dd>The CPU architecture this package was built for, such as <code>armv7</code> or <code>armv8</code>, followed by the Rust target it was compiled for, for example <code>armv8 (aarch64-unknown-linux-musl)</code>. Both are fixed when the package is built and are reported by the authenticated snapshot API; the AppWindow does not read the mutable package <code>INFO</code> file or guess from the NAS model. <code>Not a Synology package build (&lt;target&gt;)</code> means the binary was compiled for a target that has no Synology package architecture, such as a developer build. <code>Not reported by package API</code> means the package API did not report a build identity, as an older package does not.</dd>
     <dt>Core source version</dt><dd><code>0.1.0</code> from <code>Cargo.toml</code></dd>
     <dt>DSM UI build version</dt><dd><code>1.0.0</code> from <code>ui-src/package.json</code></dd>
     <dt>API schema</dt><dd><code>sdsync.dsm-api.v1</code></dd>

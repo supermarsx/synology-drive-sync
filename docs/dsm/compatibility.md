@@ -65,6 +65,15 @@ model/architecture input.
 `armv7l` NAS uses the `armv7` release asset. The embedded binary is static little-endian ARMv7-A,
 ELF32, EABI5, hard-float; an ARM64 or soft-float executable cannot be made compatible by renaming it.
 
+To see which of the four builds is installed, open the package's **About** page: the **Installed
+package build** row under **Build identity** shows the SPK architecture and the embedded Rust target
+in the last two columns above, for example `armv8 (aarch64-unknown-linux-musl)` or `armv7
+(armv7-unknown-linux-musleabihf)`. The `armv7` label is the release asset's architecture, not the
+seven-token `INFO` arch list. The value is compiled into the binary and reported by the snapshot's
+`package.target` and `package.arch`; it is not read from `INFO`, so an edited `INFO` cannot change it.
+A target outside the table reads `Not a Synology package build (<target>)`, and a package API that
+reports neither reads `Not reported by package API`.
+
 ARMv5/88f628x and PowerPC devices are intentionally not mapped to a DSM 7 package. Their supported
 DSM generations and toolchains require a separate legacy DSM 6 design. `noarch` is also incorrect:
 the package contains two matching native ELF executables, the core and the authenticated API helper.
