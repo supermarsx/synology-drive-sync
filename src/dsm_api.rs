@@ -5862,9 +5862,7 @@ mod linux_socket {
                 BridgeError::unsafe_runtime()
             }
         })?;
-        if package_uid == 0
-            || !metadata.file_type().is_socket()
-            || metadata.st_uid() != package_uid
+        if package_uid == 0 || !metadata.file_type().is_socket() || metadata.st_uid() != package_uid
         {
             return Err(BridgeError::unsafe_runtime());
         }
@@ -5872,18 +5870,34 @@ mod linux_socket {
         // count together). Reading the active and prepared contracts separately
         // lets a legitimate 0000 -> 0600 activation occur between the reads,
         // falsely turning readiness into a terminal unsafe-runtime failure.
-        //
-        // `bind_inaccessible` publishes the 0000 socket by hard-linking it from
-        // a private staging name and removes that name only afterwards, so for
-        // an instant on every server start the published socket has TWO links.
-        // That window is the server still preparing, exactly like the 0000 state
-        // that follows it, and is retried. It is tolerated only at 0000 (nothing
-        // can connect to it) and only for the one staging link: an active 0600
-        // socket, or any third link, is still someone else's hard link and stays
-        // terminal.
-        match (metadata.st_mode() & 0o7777, metadata.st_nlink()) {
-            (0o600, 1) => Ok(metadata),
-            (0o000, 1 | BIND_STAGING_LINKS) => Err(BridgeError::new(ErrorKind::Unavailable)),
+        classify_connectable(metadata.st_mode() & 0o7777, metadata.st_nlink()).map(|()| metadata)
+    }
+
+    /// The lifecycle state of a package-owned socket at the API path, from one snapshot of
+    /// its mode and link count. `Ok` is connectable, `Unavailable` is the server still
+    /// coming up or going away (retried within the CGI window), and `unsafe_runtime` is
+    /// terminal.
+    ///
+    /// Every state our own server passes through is named here:
+    /// - 0600, one link: active.
+    /// - 0000, one link: prepared, before the lifecycle commit.
+    /// - 0000, two links: `bind_inaccessible` publishes the socket by hard-linking it from a
+    ///   private staging name and removes that name afterwards, so for an instant on every
+    ///   server start the published socket has the name plus the staging link. Only at 0000
+    ///   (nothing can connect to it) and only for that one staging link.
+    /// - 0000 or 0600, no links: the name is being unlinked (a failed start's
+    ///   `remove_new_socket`, or a shutdown); `stat` can return the inode after the unlink
+    ///   dropped its last link. Nothing can connect to it, and the next look finds the name
+    ///   gone, which is Unavailable too.
+    ///
+    /// Anything else, such as an active socket with a second link, a third link, or any
+    /// other mode, is someone else's doing and stays unsafe.
+    fn classify_connectable(mode: u32, links: u64) -> BridgeResult<()> {
+        match (mode, links) {
+            (0o600, 1) => Ok(()),
+            (0o000, 1 | BIND_STAGING_LINKS) | (0o000 | 0o600, 0) => {
+                Err(BridgeError::new(ErrorKind::Unavailable))
+            }
             _ => Err(BridgeError::unsafe_runtime()),
         }
     }
@@ -6326,21 +6340,21 @@ mod linux_socket {
 
             let client_path = path.clone();
             let client = std::thread::spawn(move || {
-                let started = Instant::now();
                 let stream = connect_for_cgi(&client_path, uid, Duration::from_secs(5));
-                (stream, started.elapsed())
+                (stream, Instant::now())
             });
             std::thread::sleep(Duration::from_millis(200));
             // The rest of bind_inaccessible, bind_prepared and activation, in the server's order.
+            let window_closes = Instant::now();
             fs::remove_file(&staged).unwrap();
             fs::remove_dir(&staging).unwrap();
             let identity = prepared_socket_metadata(&path, uid).unwrap();
             activate_prepared(&path, uid, &identity).unwrap();
-            let (stream, waited) = client.join().unwrap();
+            let (stream, connected) = client.join().unwrap();
             let stream = stream.expect("the CGI connects once the server has activated");
             assert!(
-                waited >= Duration::from_millis(150),
-                "the CGI waited for the window instead of racing it: {waited:?}"
+                connected >= window_closes,
+                "the CGI waited for the window instead of racing it"
             );
             let (accepted, _) = listener.accept().unwrap();
             drop(accepted);
@@ -6349,9 +6363,33 @@ mod linux_socket {
             let _ = fs::remove_dir_all(&dir);
         }
 
+        /// Every (mode, links) the classifier can be asked about, against the states our own
+        /// server passes through. Nothing outside that list is retried, and nothing on it is
+        /// terminal.
+        #[test]
+        fn the_lifecycle_classifier_names_every_state_the_server_passes_through() {
+            for mode in 0..=0o7777_u32 {
+                for links in 0..=4_u64 {
+                    let expected = match (mode, links) {
+                        (0o600, 1) => None,
+                        (0o000, 0..=2) | (0o600, 0) => Some(ErrorKind::Unavailable),
+                        _ => Some(ErrorKind::UnsafeRuntime),
+                    };
+                    assert_eq!(
+                        classify_connectable(mode, links)
+                            .err()
+                            .map(|error| error.kind),
+                        expected,
+                        "mode {mode:04o}, {links} links"
+                    );
+                }
+            }
+        }
+
         /// The same window through the real publisher: a reader stats the name in a tight loop
-        /// while the production `bind_prepared` + `activate_prepared` run repeatedly. Whatever
-        /// instant it lands on, the answer is ready or readiness-pending, never `unsafe_runtime`.
+        /// while the production `bind_prepared` + `activate_prepared` run and the socket is
+        /// then unlinked, repeatedly. Whatever instant it lands on (two links while staging,
+        /// no links mid-unlink), the answer is ready or pending, never `unsafe_runtime`.
         /// (Which instants it lands on is the scheduler's choice; the deterministic test above
         /// is the one that pins the staging window itself.)
         #[test]
@@ -6431,7 +6469,10 @@ mod linux_socket {
                     .kind,
                 ErrorKind::UnsafeRuntime
             );
-            assert!(refused.elapsed() < Duration::from_secs(2), "terminal, not retried");
+            assert!(
+                refused.elapsed() < Duration::from_secs(2),
+                "terminal, not retried"
+            );
             fs::remove_file(&third).unwrap();
 
             // An active (0600) socket with a second link is never the staging window.
@@ -6443,7 +6484,10 @@ mod linux_socket {
                     .kind,
                 ErrorKind::UnsafeRuntime
             );
-            assert!(refused.elapsed() < Duration::from_secs(2), "terminal, not retried");
+            assert!(
+                refused.elapsed() < Duration::from_secs(2),
+                "terminal, not retried"
+            );
 
             // Neither 0000 nor 0600, with the staging link present or not.
             for links_removed in [false, true] {
