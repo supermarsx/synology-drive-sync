@@ -556,6 +556,7 @@
                   <div><dt>Repository</dt><dd><a :href="aboutMetadata.repository" target="_blank" rel="noopener noreferrer">GitHub</a></dd></div>
                   <div><dt>License</dt><dd><a :href="aboutMetadata.licenseUrl" target="_blank" rel="noopener noreferrer">{{ aboutMetadata.license }}</a></dd></div>
                   <div><dt>Installed package version</dt><dd><code>{{ installedPackageVersion }}</code></dd></div>
+                  <div><dt>Installed package build</dt><dd><code>{{ installedPackageBuild }}</code></dd></div>
                   <div v-if="serviceEngineLabel"><dt>Service engine</dt><dd><code>{{ serviceEngineLabel }}</code></dd></div>
                   <div><dt>Core source version</dt><dd><code>{{ aboutMetadata.coreVersion }}</code></dd></div>
                   <div><dt>DSM UI build version</dt><dd><code>{{ aboutMetadata.uiVersion }}</code></dd></div>
@@ -3147,6 +3148,25 @@ function doctorTroubleshootingText(report, title, output) {
   return sanitizedTroubleshootingText(lines.join("\n"), TROUBLESHOOTING_RECORD_LIMIT);
 }
 
+// The same wording the installed-version row uses when the snapshot carries no
+// package identity, so an older bridge reads one way across both rows.
+const PACKAGE_BUILD_UNREPORTED = "Not reported by package API";
+const PACKAGE_BUILD_FIELD_LIMIT = 128;
+
+// The installed package build for the About page, from the snapshot's
+// package.target (the compiled-in Rust triple) and package.arch (the Synology
+// architecture label the bridge maps it to, null for a build that is not a
+// package target). Nothing is inferred: an absent value is named, never guessed.
+function installedPackageBuildLabel(snapshot) {
+  const identity = snapshot && snapshot.package && typeof snapshot.package === "object" ? snapshot.package : {};
+  const arch = boundedText(identity.arch, "").slice(0, PACKAGE_BUILD_FIELD_LIMIT);
+  const target = boundedText(identity.target, "").slice(0, PACKAGE_BUILD_FIELD_LIMIT);
+  if (arch && target) return `${arch} (${target})`;
+  if (arch) return arch;
+  if (target) return `Not a Synology package build (${target})`;
+  return PACKAGE_BUILD_UNREPORTED;
+}
+
 function defaultSecurityPolicy() {
   return {
     policy_version: null,
@@ -4109,6 +4129,7 @@ export default {
     capabilities() { return this.snapshot && this.snapshot.capabilities && typeof this.snapshot.capabilities === "object" ? this.snapshot.capabilities : {}; },
     securityPolicy() { return normalizedSecurityPolicy(this.snapshot && this.snapshot.security_policy); },
     installedPackageVersion() { return boundedText(this.snapshot && this.snapshot.package && this.snapshot.package.version, "Not reported by package API"); },
+    installedPackageBuild() { return installedPackageBuildLabel(this.snapshot); },
     // A stale reading is a page the window itself calls history. A CSRF read can
     // succeed again while the snapshot read is still hanging, and the buttons must
     // not contradict the dimmed page beside them.
