@@ -35,8 +35,10 @@ stylesheet is now spent as a lever, and the numbers say so:
   `from`/`to`, `minmax(112px, 0.72fr)`, newline-anchored selectors, and the 260/220-char keyframe
   windows. No minifier has a knob for any of them.
 
-The bundle exceeds the 512,000-byte hint by about 117.6 KB (629,641 bytes; the figures below are older and
-were not all re-measured). Round 7 grew it by 530 bytes from 629,111 (reworded index-issue copy and
+The bundle exceeds the 512,000-byte hint by about 118.0 KB (630,045 bytes; the figures below are older and
+were not all re-measured). The About page's installed-package-build row (one `<dt>`/`<dd>` pair, the
+`installedPackageBuildLabel` helper and its computed) grew it by 404 bytes from 629,641; the stylesheet did not
+move: 124,494 bytes. Round 7 grew it by 530 bytes from 629,111 (reworded index-issue copy and
 two more index labels, `pair-index-compaction-failed` and `pair-index-link-guard-unchecked`; the stylesheet did not move: 124,494 bytes). The round before that, which added the amber for an unreadable request queue, the
 watcher guidance copy and the reason labels grew it by 1,819 bytes from 627,292 (the stylesheet did not
 move: 124,494 bytes). It was about 104.3 KB over (616,344 bytes) before that, and about 91.1 KB over before
