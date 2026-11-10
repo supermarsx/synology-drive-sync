@@ -28348,13 +28348,17 @@ mod tests {
         let fixture = TestControlFixture::new("cgi-socket-retry");
         let socket = fixture.root.join("api.sock");
         let delayed_socket = socket.clone();
+        // The clock starts before the server thread does: on a starved runner the spawning
+        // thread can be descheduled between `spawn` and the next statement for longer than
+        // the 25 ms of slack below, so a clock started after `spawn` timed from too late and
+        // read under 75 ms although the server had slept its full 100 ms.
+        let started = Instant::now();
         let server = std::thread::spawn(move || {
             std::thread::sleep(Duration::from_millis(100));
             let listener = linux_socket::bind(&delayed_socket, uid).unwrap();
             let (stream, _) = listener.accept().unwrap();
             assert_eq!(linux_socket::peer_credentials(&stream).unwrap().uid, uid);
         });
-        let started = Instant::now();
         let client = linux_socket::connect_for_cgi(&socket, uid, Duration::from_secs(1)).unwrap();
         assert!(started.elapsed() >= Duration::from_millis(75));
         drop(client);
