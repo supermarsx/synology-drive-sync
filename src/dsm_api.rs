@@ -44,6 +44,7 @@ use zeroize::{Zeroize, Zeroizing};
 use synology_drive_sync::Error as SyncError;
 #[cfg(target_os = "linux")]
 use synology_drive_sync::api::{ApiClient, ClientOptions};
+use synology_drive_sync::observability::BUILD;
 use synology_drive_sync::progress_record::ProgressRecorder;
 #[cfg(target_os = "linux")]
 use synology_drive_sync::status_cache;
@@ -7495,11 +7496,18 @@ fn sanitize_manager_document(
     match action {
         ReadAction::Snapshot => {
             let root = value.as_object_mut().ok_or(MANAGER_OUTPUT_INVALID)?;
-            // This value is embedded by build.rs and cannot be influenced by
-            // the package INFO file or any mutable DSM runtime state.
+            // These values are embedded by build.rs and cannot be influenced by
+            // the package INFO file or any mutable DSM runtime state. `arch` is
+            // the Synology label for the compiled-in target, or JSON null for a
+            // build that is not a package target; it is never guessed, and the
+            // dashboard shows that case by name.
             root.insert(
                 "package".to_owned(),
-                json!({ "version": env!("SDSYNC_VERSION") }),
+                json!({
+                    "version": env!("SDSYNC_VERSION"),
+                    "target": BUILD.target,
+                    "arch": BUILD.package_arch(),
+                }),
             );
             root.insert(
                 "capabilities".to_owned(),
@@ -34383,6 +34391,29 @@ mod tests {
         .unwrap();
         let value: Value = serde_json::from_slice(&snapshot).unwrap();
         assert_eq!(value["package"]["version"], env!("SDSYNC_VERSION"));
+        // The installed build identity is the compiled-in target and the label the closed
+        // mapping gives it, never anything read from INFO. `arch` is JSON null, not absent, for
+        // a build that is not a package target, so the UI can tell "not a package build" from
+        // "an older bridge that reports neither".
+        assert_eq!(value["package"]["target"], BUILD.target);
+        assert_eq!(value["package"]["arch"], json!(BUILD.package_arch()));
+        assert_eq!(
+            value["package"].as_object().unwrap().len(),
+            3,
+            "package carries exactly version, target and arch"
+        );
+        // The shell manager's own `package` member, if it ever grew one, cannot pre-empt the
+        // compiled-in identity: the bridge overwrites it on both rungs.
+        let forged = parse_and_sanitize_manager_json(
+            br#"{"schema":"sdsync.dsm-api.v1","package":{"version":"0","target":"forged","arch":"armv8"}}"#,
+            &ReadAction::Snapshot,
+            None,
+            Some(&SecurityPolicyArgs::default()),
+        )
+        .unwrap();
+        let forged: Value = serde_json::from_slice(&forged).unwrap();
+        assert_eq!(forged["package"]["target"], BUILD.target);
+        assert_eq!(forged["package"]["version"], env!("SDSYNC_VERSION"));
         assert_eq!(value["capabilities"]["mutations"], true);
         assert_eq!(value["capabilities"]["private_queue"], true);
         assert_eq!(value["capabilities"]["request_reconciliation"], true);
