@@ -718,11 +718,30 @@ service_admission_status() {
 }
 
 read_controller_start_lease() {
-    [ -e "$controller_start_file" ] || [ -L "$controller_start_file" ] || return 1
-    [ -f "$controller_start_file" ] && [ ! -L "$controller_start_file" ] || return 73
-    [ -n "$path_owner" ] || return 73
-    controller_start_metadata=$(stat -c '%u:%a:%h' "$controller_start_file" 2>/dev/null || true)
-    [ "$controller_start_metadata" = "$path_owner:600:1" ] || return 73
+    controller_start_look=0
+    while :; do
+        [ -e "$controller_start_file" ] || [ -L "$controller_start_file" ] || return 1
+        [ -f "$controller_start_file" ] && [ ! -L "$controller_start_file" ] || return 73
+        [ -n "$path_owner" ] || return 73
+        controller_start_metadata=$(stat -c '%u:%a:%h' "$controller_start_file" 2>/dev/null || true)
+        [ "$controller_start_metadata" != "$path_owner:600:1" ] || break
+        # A link count of 0 is not an unsafe file. The lifecycle script commits
+        # this lease by renaming a new file over it, and a reader that looked the
+        # path up just before the rename gets the old file's attributes just after
+        # it: well formed, owned and private, and with no links left because it is
+        # no longer the file the path names. It was refused as unsafe, which ended
+        # a controller (or, in the bridge's own copy of this read, the API service)
+        # that was waiting for exactly this commit, and the start failed as
+        # "committed services failed to publish final readiness" about one start
+        # in several hundred on a loaded machine. The path names the new file by
+        # now, so look again. Bounded: a lease that keeps being replaced, or one
+        # that really has no links, is refused as before.
+        controller_start_look=$((controller_start_look + 1))
+        if [ "$controller_start_metadata" = "$path_owner:600:0" ] && [ "$controller_start_look" -lt 8 ]; then
+            continue
+        fi
+        return 73
+    done
     controller_start_size=$(wc -c 2>/dev/null < "$controller_start_file" | tr -d ' ')
     case $controller_start_size in ''|*[!0-9]*) return 73 ;; esac
     [ "$controller_start_size" -le 112 ] || return 73

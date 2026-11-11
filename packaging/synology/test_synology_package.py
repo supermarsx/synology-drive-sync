@@ -2794,6 +2794,12 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
             "            except (FileNotFoundError, UnicodeError):\n"
             "                server.close()\n"
             "                raise SystemExit(73)\n"
+            # The commit renames a new file over the lease. An lstat that looked the path
+            # up just before the rename reports the old file with no links left; that is
+            # the file the path used to name, not an unsafe one, so look again. The real
+            # service does the same (read_private_file_with_link_contract_observed).
+            "            if lease_metadata.st_nlink == 0:\n"
+            "                continue\n"
             "            if (not stat.S_ISREG(lease_metadata.st_mode) or stat.S_IMODE(lease_metadata.st_mode) != 0o600\n"
             "                    or lease_metadata.st_uid != os.getuid() or lease_metadata.st_nlink != 1):\n"
             "                server.close()\n"
@@ -22439,6 +22445,126 @@ fi
             if consumer.poll() is None:
                 consumer.terminate()
                 consumer.wait(timeout=5)
+
+    def install_lease_rename_race_shim(self) -> Path:
+        """A `stat` that models a reader losing the race with the commit rename.
+
+        The lifecycle script commits `controller.starting` by renaming a new file
+        over it. A reader whose lookup landed just before the rename gets the old
+        file's attributes just after it: owned, private, well formed, and with no
+        links left, because it is no longer the file the path names. This puts that
+        observation under the test's control instead of leaving it to a scheduler:
+        `SDSYNC_TEST_LEASE_RACE` names a counter file, and a look at the lease's
+        owner/mode/link count (the one `read_controller_start_lease` takes) reports
+        link count 0 on every odd call, or on every call in `always` mode. Every
+        other call, and every other path, is the real stat.
+        """
+        shim = self.fake_system_bin / "stat"
+        shim.write_text(
+            "#!/bin/sh\n"
+            "real=/usr/bin/stat\n"
+            '[ -x "$real" ] || real=/bin/stat\n'
+            'if [ -n "${SDSYNC_TEST_LEASE_RACE:-}" ]; then\n'
+            '    case "$*" in\n'
+            "        *%u:%a:%h*controller.starting)\n"
+            '            for last do :; done\n'
+            '            echo "$$" >> "$SDSYNC_TEST_LEASE_RACE"\n'
+            '            calls=$(wc -l < "$SDSYNC_TEST_LEASE_RACE")\n'
+            '            if [ "${SDSYNC_TEST_LEASE_RACE_MODE:-alternate}" = always ] \\\n'
+            '                || [ $((calls % 2)) -eq 1 ]; then\n'
+            "                printf '%s:600:0\\n' \"$(\"$real\" -c %u \"$last\")\"\n"
+            "                exit 0\n"
+            "            fi\n"
+            "            ;;\n"
+            "    esac\n"
+            "fi\n"
+            'exec "$real" "$@"\n',
+            encoding="utf-8",
+        )
+        shim.chmod(0o755)
+        if os.getuid() == 0:
+            os.chown(shim, self.drop_uid, self.drop_gid)
+        return shim
+
+    def lease_read_helper(self, body: str) -> Path:
+        helper = self.root / "lease-read-helper.sh"
+        helper.write_text(
+            "#!/bin/sh\nset -eu\n"
+            f'. "{self.real_target / "libexec/sdsync-common"}"\n'
+            "ensure_layout\n"
+            "printf '4242\\n123456\\n00000000-0000-0000-0000-000000000000\\n' > \"$controller_start_file\"\n"
+            'chmod 0600 "$controller_start_file"\n'
+            + body,
+            encoding="utf-8",
+        )
+        helper.chmod(0o755)
+        if os.getuid() == 0:
+            os.chown(helper, self.drop_uid, self.drop_gid)
+        return helper
+
+    def test_the_lease_read_looks_again_when_the_commit_rename_races_it(self) -> None:
+        # The race behind `committed services failed to publish final readiness`:
+        # a reader of controller.starting that straddles the commit rename saw link
+        # count 0 and called the lease unsafe, which ended the controller (or the
+        # API service) waiting for that very commit. The first look reports the
+        # race; the read must look again and return the lease.
+        self.install_lease_rename_race_shim()
+        counter = self.root / "lease-race.calls"
+        helper = self.lease_read_helper(
+            "status=0\n"
+            "read_controller_start_lease || status=$?\n"
+            'echo "status=$status phase=${controller_start_phase:-none} pid=${controller_start_pid:-none}"\n'
+        )
+        result = self.shell(helper, extra_environment={"SDSYNC_TEST_LEASE_RACE": str(counter)})
+        report = result.stdout + result.stderr
+        self.assertEqual(result.returncode, 0, report)
+        self.assertIn("status=0 phase=prepared pid=4242", result.stdout, report)
+        self.assertEqual(
+            len(counter.read_text(encoding="ascii").splitlines()), 2,
+            f"one look lost the race and one more found the lease: {report}",
+        )
+
+    def test_a_lease_that_never_regains_a_link_is_refused_after_a_bounded_number_of_looks(self) -> None:
+        # The retry must not turn a genuinely unlinked lease into an accepted one,
+        # and must not loop for ever on a path that keeps being replaced.
+        self.install_lease_rename_race_shim()
+        counter = self.root / "lease-race-always.calls"
+        helper = self.lease_read_helper(
+            "status=0\n"
+            "read_controller_start_lease || status=$?\n"
+            'echo "status=$status"\n'
+        )
+        result = self.shell(
+            helper,
+            extra_environment={
+                "SDSYNC_TEST_LEASE_RACE": str(counter),
+                "SDSYNC_TEST_LEASE_RACE_MODE": "always",
+            },
+        )
+        report = result.stdout + result.stderr
+        self.assertEqual(result.returncode, 0, report)
+        self.assertIn("status=73", result.stdout, report)
+        self.assertEqual(len(counter.read_text(encoding="ascii").splitlines()), 8, report)
+
+    def test_a_start_survives_every_reader_of_the_lease_losing_the_commit_rename_race(self) -> None:
+        # The shell side of the start protocol end to end: the lifecycle script's own
+        # reads and the controller's (the commit wait, the pre-lock and committed
+        # checks) each meet link count 0 on their first look. Before the fix the
+        # first of them refused the lease and the start failed as `committed
+        # services failed to publish final readiness`, one start in a few hundred
+        # on a loaded machine and never in isolation.
+        self.install_lease_rename_race_shim()
+        counter = self.root / "start-lease-race.calls"
+        started = self.shell(
+            self.lifecycle, "start", timeout=60,
+            extra_environment={"SDSYNC_TEST_LEASE_RACE": str(counter)},
+        )
+        self.assertEqual(started.returncode, 0, self.lifecycle_failure_diagnostic(started))
+        # The shim really ran for several readers, not only for one.
+        self.assertGreaterEqual(len(counter.read_text(encoding="ascii").splitlines()), 4)
+        self.assertEqual(self.shell(self.lifecycle, "status").returncode, 0)
+        stopped = self.shell(self.lifecycle, "stop", timeout=30)
+        self.assertEqual(stopped.returncode, 0, stopped.stdout + stopped.stderr)
 
     def test_failed_controller_start_rolls_back_api_service(self) -> None:
         controller = self.real_target / "libexec/sdsync-controller"
