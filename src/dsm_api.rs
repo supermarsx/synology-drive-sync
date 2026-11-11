@@ -5351,6 +5351,10 @@ mod linux_socket {
     use std::os::unix::fs::{FileTypeExt, OpenOptionsExt, PermissionsExt};
     use std::os::unix::net::{UnixListener, UnixStream};
 
+    /// Link count of the published socket while `bind_inaccessible` still holds its
+    /// staging name: the socket name itself plus that one staging link.
+    const BIND_STAGING_LINKS: u64 = 2;
+
     enum ConnectAttemptError {
         Retryable,
         Terminal(BridgeError),
@@ -5859,20 +5863,42 @@ mod linux_socket {
                 BridgeError::unsafe_runtime()
             }
         })?;
-        if package_uid == 0
-            || !metadata.file_type().is_socket()
-            || metadata.st_uid() != package_uid
-            || metadata.st_nlink() != 1
+        if package_uid == 0 || !metadata.file_type().is_socket() || metadata.st_uid() != package_uid
         {
             return Err(BridgeError::unsafe_runtime());
         }
-        // Classify the lifecycle state from one metadata snapshot. Reading the
-        // active and prepared contracts separately lets a legitimate 0000 ->
-        // 0600 activation occur between the reads, falsely turning readiness
-        // into a terminal unsafe-runtime failure.
-        match metadata.st_mode() & 0o7777 {
-            0o600 => Ok(metadata),
-            0o000 => Err(BridgeError::new(ErrorKind::Unavailable)),
+        // Classify the lifecycle state from one metadata snapshot (mode and link
+        // count together). Reading the active and prepared contracts separately
+        // lets a legitimate 0000 -> 0600 activation occur between the reads,
+        // falsely turning readiness into a terminal unsafe-runtime failure.
+        classify_connectable(metadata.st_mode() & 0o7777, metadata.st_nlink()).map(|()| metadata)
+    }
+
+    /// The lifecycle state of a package-owned socket at the API path, from one snapshot of
+    /// its mode and link count. `Ok` is connectable, `Unavailable` is the server still
+    /// coming up or going away (retried within the CGI window), and `unsafe_runtime` is
+    /// terminal.
+    ///
+    /// Every state our own server passes through is named here:
+    /// - 0600, one link: active.
+    /// - 0000, one link: prepared, before the lifecycle commit.
+    /// - 0000, two links: `bind_inaccessible` publishes the socket by hard-linking it from a
+    ///   private staging name and removes that name afterwards, so for an instant on every
+    ///   server start the published socket has the name plus the staging link. Only at 0000
+    ///   (nothing can connect to it) and only for that one staging link.
+    /// - 0000 or 0600, no links: the name is being unlinked (a failed start's
+    ///   `remove_new_socket`, or a shutdown); `stat` can return the inode after the unlink
+    ///   dropped its last link. Nothing can connect to it, and the next look finds the name
+    ///   gone, which is Unavailable too.
+    ///
+    /// Anything else, such as an active socket with a second link, a third link, or any
+    /// other mode, is someone else's doing and stays unsafe.
+    fn classify_connectable(mode: u32, links: u64) -> BridgeResult<()> {
+        match (mode, links) {
+            (0o600, 1) => Ok(()),
+            (0o000, 1 | BIND_STAGING_LINKS) | (0o000 | 0o600, 0) => {
+                Err(BridgeError::new(ErrorKind::Unavailable))
+            }
             _ => Err(BridgeError::unsafe_runtime()),
         }
     }
@@ -6257,6 +6283,239 @@ mod linux_socket {
                 "retried within the timeout, then refused: {took:?}"
             );
             drop(kept);
+            let _ = fs::remove_dir_all(&dir);
+        }
+
+        /// What `bind_inaccessible` publishes for an instant: the staged socket hard-linked
+        /// to `path` at 0000 while the staging name still exists, so `api.sock` is a package
+        /// socket at 0000 with TWO links. Returns the listener, the staged name and its
+        /// directory; the caller removes them to end the window, as `bind_inaccessible` does.
+        fn publish_with_staging_link(dir: &Path, path: &Path) -> (UnixListener, PathBuf, PathBuf) {
+            use std::os::unix::fs::DirBuilderExt as _;
+            let staging = dir.join("staging");
+            fs::DirBuilder::new().mode(0o700).create(&staging).unwrap();
+            let staged = staging.join("s");
+            let listener = UnixListener::bind(&staged).unwrap();
+            fs::set_permissions(&staged, fs::Permissions::from_mode(0o000)).unwrap();
+            fs::hard_link(&staged, path).unwrap();
+            (listener, staged, staging)
+        }
+
+        fn connect_test_dir(label: &str) -> PathBuf {
+            let dir = std::env::temp_dir().join(format!(
+                "sdsync-{label}-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            fs::create_dir_all(&dir).unwrap();
+            dir
+        }
+
+        /// The CI flake (msrv job, `cgi_socket_retry_is_bounded_and_never_retries_unsafe_metadata`):
+        /// a CGI that stats `api.sock` between the server's `link` and the removal of the staging
+        /// name saw a package socket at 0000 with `st_nlink == 2` and was refused as
+        /// `unsafe_runtime`, though that is a state the server passes through on every start.
+        /// The window is held open here instead of raced: it is Unavailable, retried, and the
+        /// connect succeeds once the server has finished publishing and activated.
+        #[test]
+        fn a_cgi_retries_through_the_bind_staging_link_window() {
+            // SAFETY: this identity call has no pointer arguments or preconditions.
+            let uid = unsafe { libc::geteuid() };
+            if uid == 0 {
+                return;
+            }
+            let dir = connect_test_dir("staging-window");
+            let path = dir.join("api.sock");
+            let (listener, staged, staging) = publish_with_staging_link(&dir, &path);
+            let observed = fs::symlink_metadata(&path).unwrap();
+            assert_eq!(observed.st_nlink(), 2, "the window being reproduced");
+            assert_eq!(observed.st_mode() & 0o7777, 0o000);
+            assert_eq!(
+                connectable_socket_metadata(&path, uid).unwrap_err().kind,
+                ErrorKind::Unavailable,
+                "the server's own staging window is readiness, not a security failure"
+            );
+
+            let client_path = path.clone();
+            let client = std::thread::spawn(move || {
+                let stream = connect_for_cgi(&client_path, uid, Duration::from_secs(5));
+                (stream, Instant::now())
+            });
+            std::thread::sleep(Duration::from_millis(200));
+            // The rest of bind_inaccessible, bind_prepared and activation, in the server's order.
+            let window_closes = Instant::now();
+            fs::remove_file(&staged).unwrap();
+            fs::remove_dir(&staging).unwrap();
+            let identity = prepared_socket_metadata(&path, uid).unwrap();
+            activate_prepared(&path, uid, &identity).unwrap();
+            let (stream, connected) = client.join().unwrap();
+            let stream = stream.expect("the CGI connects once the server has activated");
+            assert!(
+                connected >= window_closes,
+                "the CGI waited for the window instead of racing it"
+            );
+            let (accepted, _) = listener.accept().unwrap();
+            drop(accepted);
+            drop(stream);
+            drop(listener);
+            let _ = fs::remove_dir_all(&dir);
+        }
+
+        /// Every (mode, links) the classifier can be asked about, against the states our own
+        /// server passes through. Nothing outside that list is retried, and nothing on it is
+        /// terminal.
+        #[test]
+        fn the_lifecycle_classifier_names_every_state_the_server_passes_through() {
+            for mode in 0..=0o7777_u32 {
+                for links in 0..=4_u64 {
+                    let expected = match (mode, links) {
+                        (0o600, 1) => None,
+                        (0o000, 0..=2) | (0o600, 0) => Some(ErrorKind::Unavailable),
+                        _ => Some(ErrorKind::UnsafeRuntime),
+                    };
+                    assert_eq!(
+                        classify_connectable(mode, links)
+                            .err()
+                            .map(|error| error.kind),
+                        expected,
+                        "mode {mode:04o}, {links} links"
+                    );
+                }
+            }
+        }
+
+        /// The same window through the real publisher: a reader stats the name in a tight loop
+        /// while the production `bind_prepared` + `activate_prepared` run and the socket is
+        /// then unlinked, repeatedly. Whatever instant it lands on (two links while staging,
+        /// no links mid-unlink), the answer is ready or pending, never `unsafe_runtime`.
+        /// (Which instants it lands on is the scheduler's choice; the deterministic test above
+        /// is the one that pins the staging window itself.)
+        #[test]
+        fn a_reader_never_sees_unsafe_runtime_while_the_server_publishes() {
+            // SAFETY: this identity call has no pointer arguments or preconditions.
+            let uid = unsafe { libc::geteuid() };
+            if uid == 0 {
+                return;
+            }
+            let dir = connect_test_dir("publish-reader");
+            fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
+            let path = dir.join("api.sock");
+            let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let reader = {
+                let (path, done) = (path.clone(), done.clone());
+                std::thread::spawn(move || {
+                    let (mut states, mut unsafe_states) = (0_u64, Vec::new());
+                    while !done.load(AtomicOrdering::Relaxed) {
+                        match connectable_socket_metadata(&path, uid) {
+                            Ok(_) => states += 1,
+                            Err(error) if error.kind == ErrorKind::Unavailable => states += 1,
+                            Err(error) => unsafe_states.push(error.kind),
+                        }
+                    }
+                    (states, unsafe_states)
+                })
+            };
+            for _ in 0..300 {
+                let (listener, identity) = bind_prepared(&path, uid).unwrap();
+                activate_prepared(&path, uid, &identity).unwrap();
+                drop(listener);
+                fs::remove_file(&path).unwrap();
+            }
+            done.store(true, AtomicOrdering::Relaxed);
+            let (states, unsafe_states) = reader.join().unwrap();
+            assert!(
+                unsafe_states.is_empty(),
+                "{} of {states} observations were refused as unsafe: {:?}",
+                unsafe_states.len(),
+                &unsafe_states[..unsafe_states.len().min(3)]
+            );
+            let _ = fs::remove_dir_all(&dir);
+        }
+
+        /// The state the staging window is classified as must stay exact: a second link is
+        /// tolerated only at 0000 and only for the one staging name. An active socket with an
+        /// extra link, a third link, or any other mode is still terminal, and the window itself
+        /// is bounded and named when the staging name never goes away.
+        #[test]
+        fn only_the_staging_window_is_retried_every_other_link_state_stays_unsafe() {
+            // SAFETY: this identity call has no pointer arguments or preconditions.
+            let uid = unsafe { libc::geteuid() };
+            if uid == 0 {
+                return;
+            }
+            let dir = connect_test_dir("staging-unsafe");
+            let path = dir.join("api.sock");
+            let (listener, staged, staging) = publish_with_staging_link(&dir, &path);
+
+            // A staging name that never goes away: bounded, then named Unavailable.
+            let bounded = Instant::now();
+            assert_eq!(
+                connect_for_cgi(&path, uid, Duration::from_millis(150))
+                    .unwrap_err()
+                    .kind,
+                ErrorKind::Unavailable
+            );
+            assert!(bounded.elapsed() >= Duration::from_millis(125));
+
+            // Three links at 0000 are not the staging window.
+            let third = dir.join("third");
+            fs::hard_link(&path, &third).unwrap();
+            let refused = Instant::now();
+            assert_eq!(
+                connect_for_cgi(&path, uid, Duration::from_secs(5))
+                    .unwrap_err()
+                    .kind,
+                ErrorKind::UnsafeRuntime
+            );
+            assert!(
+                refused.elapsed() < Duration::from_secs(2),
+                "terminal, not retried"
+            );
+            fs::remove_file(&third).unwrap();
+
+            // An active (0600) socket with a second link is never the staging window.
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+            let refused = Instant::now();
+            assert_eq!(
+                connect_for_cgi(&path, uid, Duration::from_secs(5))
+                    .unwrap_err()
+                    .kind,
+                ErrorKind::UnsafeRuntime
+            );
+            assert!(
+                refused.elapsed() < Duration::from_secs(2),
+                "terminal, not retried"
+            );
+
+            // Neither 0000 nor 0600, with the staging link present or not.
+            for links_removed in [false, true] {
+                if links_removed {
+                    fs::remove_file(&staged).unwrap();
+                    fs::remove_dir(&staging).unwrap();
+                }
+                fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+                assert_eq!(
+                    connectable_socket_metadata(&path, uid).unwrap_err().kind,
+                    ErrorKind::UnsafeRuntime
+                );
+            }
+
+            // A one-link 0000 socket is still readiness, and a foreign owner is still unsafe.
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o000)).unwrap();
+            assert_eq!(
+                connectable_socket_metadata(&path, uid).unwrap_err().kind,
+                ErrorKind::Unavailable
+            );
+            assert_eq!(
+                connectable_socket_metadata(&path, uid.wrapping_add(1))
+                    .unwrap_err()
+                    .kind,
+                ErrorKind::UnsafeRuntime
+            );
+            drop(listener);
             let _ = fs::remove_dir_all(&dir);
         }
     }
@@ -28403,13 +28662,17 @@ mod tests {
         let fixture = TestControlFixture::new("cgi-socket-retry");
         let socket = fixture.root.join("api.sock");
         let delayed_socket = socket.clone();
+        // The clock starts before the server thread does: on a starved runner the spawning
+        // thread can be descheduled between `spawn` and the next statement for longer than
+        // the 25 ms of slack below, so a clock started after `spawn` timed from too late and
+        // read under 75 ms although the server had slept its full 100 ms.
+        let started = Instant::now();
         let server = std::thread::spawn(move || {
             std::thread::sleep(Duration::from_millis(100));
             let listener = linux_socket::bind(&delayed_socket, uid).unwrap();
             let (stream, _) = listener.accept().unwrap();
             assert_eq!(linux_socket::peer_credentials(&stream).unwrap().uid, uid);
         });
-        let started = Instant::now();
         let client = linux_socket::connect_for_cgi(&socket, uid, Duration::from_secs(1)).unwrap();
         assert!(started.elapsed() >= Duration::from_millis(75));
         drop(client);
