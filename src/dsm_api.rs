@@ -10515,14 +10515,37 @@ mod linux_files {
         maximum: usize,
         append_only: bool,
     ) -> BridgeResult<Option<(File, Vec<u8>)>> {
+        open_private_log_file_observed(path, package_uid, maximum, append_only, |_| {})
+    }
+
+    /// `open_private_log_file`, with the same observer and the same second look as
+    /// `read_private_file_with_link_contract_observed`: a document replaced by rename while it
+    /// is read reaches `fstat` with no links, which is the file the path used to name and not an
+    /// unsafe one, and the dashboard answered it as `config_file_unsafe` until the next read.
+    pub(super) fn open_private_log_file_observed(
+        path: &Path,
+        package_uid: u32,
+        maximum: usize,
+        append_only: bool,
+        mut between_open_and_stat: impl FnMut(usize),
+    ) -> BridgeResult<Option<(File, Vec<u8>)>> {
         let mut options = OpenOptions::new();
         options.read(true).custom_flags(NOFOLLOW_CLOEXEC);
-        let mut file = match options.open(path) {
-            Ok(file) => file,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
-            Err(_) => return Err(BridgeError::unsafe_runtime()),
+        let mut look = 0;
+        let (mut file, metadata) = loop {
+            let file = match options.open(path) {
+                Ok(file) => file,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+                Err(_) => return Err(BridgeError::unsafe_runtime()),
+            };
+            between_open_and_stat(look);
+            let metadata = file.metadata().map_err(|_| BridgeError::unsafe_runtime())?;
+            look += 1;
+            if metadata.st_nlink() == 0 && look < REPLACED_DURING_READ_LOOKS {
+                continue;
+            }
+            break (file, metadata);
         };
-        let metadata = file.metadata().map_err(|_| BridgeError::unsafe_runtime())?;
         if !metadata.file_type().is_file()
             || metadata.st_uid() != package_uid
             || metadata.st_mode() & 0o7777 != 0o600
@@ -21052,6 +21075,42 @@ mod tests {
         );
         assert!(refused.is_err());
         assert_eq!(looks, 1, "link count 2 is refused on the first look");
+    }
+
+    /// The dashboard's own document reads have the same window: the shell writes state documents
+    /// by renaming a new file over the old one, and a read that straddled it answered the whole
+    /// page's section as `config_file_unsafe` until the next read.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_document_replaced_while_it_is_read_is_read_again() {
+        // SAFETY: geteuid has no pointer arguments or preconditions.
+        let uid = unsafe { libc::geteuid() };
+        let scratch = ScratchDirectory::new("document-race");
+        let document = scratch.0.join("controller.state");
+        write_private_record(&document, b"state=running\n");
+
+        let mut looks = 0;
+        let read =
+            linux_files::open_private_log_file_observed(&document, uid, 1024, false, |look| {
+                looks += 1;
+                if look == 0 {
+                    replace_private_record(&document, b"state=stopped\n");
+                }
+            })
+            .unwrap_or_else(|_| panic!("a document replaced during the read must be read again"))
+            .expect("the document is present");
+        assert_eq!(read.1, b"state=stopped\n");
+        assert_eq!(looks, 2, "exactly one further look");
+
+        // A document that really has two links is refused on the first look.
+        fs::hard_link(&document, scratch.0.join("alias")).unwrap();
+        let mut looks = 0;
+        let refused =
+            linux_files::open_private_log_file_observed(&document, uid, 1024, false, |_| {
+                looks += 1
+            });
+        assert!(refused.is_err());
+        assert_eq!(looks, 1);
     }
 
     /// Both `--exec-supervised-core` layouts parse, and the flag is optional in both directions.
