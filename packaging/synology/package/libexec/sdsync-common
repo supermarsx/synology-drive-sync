@@ -798,30 +798,44 @@ publish_controller_start_lease() {
         SDSYNC_DSM_CONTROLLER_START_PARENT_TICKS SDSYNC_DSM_CONTROLLER_START_PARENT_BOOT
 }
 
+# Every refusal names its cause in controller_start_cause, so a controller that
+# gives up waiting for its lifecycle parent says which of the checks failed
+# instead of only that the parent "did not commit". The cause is a fixed word;
+# it never carries a path or a value read from a record.
+controller_start_cause=
 controller_start_lease_identity_matches_parent() {
     expected_start_parent=${SDSYNC_DSM_CONTROLLER_START_PARENT_PID:-}
     expected_start_ticks=${SDSYNC_DSM_CONTROLLER_START_PARENT_TICKS:-}
     expected_start_boot=${SDSYNC_DSM_CONTROLLER_START_PARENT_BOOT:-}
-    is_pid "$expected_start_parent" || return 73
-    case $expected_start_ticks in ''|*[!0-9]*|0) return 73 ;; esac
-    valid_boot_identity "$expected_start_boot" || return 73
-    [ "${PPID:-0}" = "$expected_start_parent" ] || return 73
+    is_pid "$expected_start_parent" || { controller_start_cause=parent_environment_invalid; return 73; }
+    case $expected_start_ticks in ''|*[!0-9]*|0) controller_start_cause=parent_environment_invalid; return 73 ;; esac
+    valid_boot_identity "$expected_start_boot" || { controller_start_cause=parent_environment_invalid; return 73; }
+    [ "${PPID:-0}" = "$expected_start_parent" ] || { controller_start_cause=parent_pid_changed; return 73; }
     [ "$controller_start_pid" = "$expected_start_parent" ] \
         && [ "$controller_start_ticks" = "$expected_start_ticks" ] \
-        && [ "$controller_start_boot" = "$expected_start_boot" ] || return 73
+        && [ "$controller_start_boot" = "$expected_start_boot" ] || { controller_start_cause=lease_names_another_parent; return 73; }
+    controller_start_parent_status=0
     process_identity_is_live "$controller_start_pid" "$controller_start_ticks" \
-        "$controller_start_boot" || return 73
+        "$controller_start_boot" || controller_start_parent_status=$?
+    case $controller_start_parent_status in
+        0) return 0 ;;
+        1) controller_start_cause=parent_gone ;;
+        *) controller_start_cause=parent_unprovable_${process_identity_cause:-unknown} ;;
+    esac
+    return 73
 }
 
 controller_start_lease_matches_parent() {
-    read_controller_start_lease || return 73
-    [ "$controller_start_phase" = prepared ] || return 73
+    controller_start_cause=
+    read_controller_start_lease || { controller_start_cause=lease_unreadable; return 73; }
+    [ "$controller_start_phase" = prepared ] || { controller_start_cause=lease_phase_unexpected; return 73; }
     controller_start_lease_identity_matches_parent
 }
 
 controller_start_lease_committed_matches_parent() {
-    read_controller_start_lease || return 73
-    [ "$controller_start_phase" = committed ] || return 73
+    controller_start_cause=
+    read_controller_start_lease || { controller_start_cause=lease_unreadable; return 73; }
+    [ "$controller_start_phase" = committed ] || { controller_start_cause=lease_phase_unexpected; return 73; }
     controller_start_lease_identity_matches_parent
 }
 
@@ -839,13 +853,22 @@ controller_start_lease_committed_matches_parent() {
 # for one lease wait. If the helpers ever need a shared home, that is the
 # change to make, not a duplicate.
 wait_for_controller_start_commit() {
+    controller_start_cause=
     while :; do
-        read_controller_start_lease || return 73
+        controller_start_read_status=0
+        read_controller_start_lease || controller_start_read_status=$?
+        if [ "$controller_start_read_status" -ne 0 ]; then
+            case $controller_start_read_status in
+                1) controller_start_cause=lease_absent ;;
+                *) controller_start_cause=lease_unsafe_or_malformed ;;
+            esac
+            return 73
+        fi
         controller_start_lease_identity_matches_parent || return 73
         case $controller_start_phase in
             committed) return 0 ;;
             prepared) sleep 1 ;;
-            *) return 73 ;;
+            *) controller_start_cause=lease_phase_unknown; return 73 ;;
         esac
     done
 }

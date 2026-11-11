@@ -13650,7 +13650,18 @@ pub(crate) fn main_entry() -> ExitCode {
             })();
             match result {
                 Ok(()) => ExitCode::SUCCESS,
-                Err(_) => ExitCode::FAILURE,
+                // The service's stderr is api.log. A startup that fails here used to leave
+                // nothing there, so the lifecycle script could say only that the services did
+                // not become ready, never why. The code is a fixed token: no path, argument or
+                // record content is echoed.
+                Err(error) => {
+                    let _ = writeln!(
+                        io::stderr(),
+                        "sdsync-dsm-api: supervised API service stopped: {}",
+                        resolved_error_code(error, None, None)
+                    );
+                    ExitCode::FAILURE
+                }
             }
         }
         #[cfg(not(target_os = "linux"))]
@@ -13684,7 +13695,16 @@ pub(crate) fn main_entry() -> ExitCode {
             })();
             match result {
                 Ok(()) => ExitCode::SUCCESS,
-                Err(_) => ExitCode::FAILURE,
+                // The controller's stderr is controller.log: the same reason as above, for the
+                // refusal that happens before the controller script is exec'd.
+                Err(error) => {
+                    let _ = writeln!(
+                        io::stderr(),
+                        "sdsync-dsm-api: supervised controller refused: {}",
+                        resolved_error_code(error, None, None)
+                    );
+                    ExitCode::FAILURE
+                }
             }
         }
         #[cfg(not(target_os = "linux"))]

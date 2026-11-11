@@ -2699,6 +2699,13 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
             "    raise SystemExit(0)\n"
             "\n"
             "serve_supervised = len(sys.argv) == 5 and sys.argv[1] == '--serve-supervised'\n"
+            "def api_die(reason):\n"
+            "    # Every refusal of the supervised mock names itself in api.log: an exit 73\n"
+            "    # with no words is what made a start that failed one time in a thousand\n"
+            "    # look like a service that never started.\n"
+            "    sys.stderr.write('sdsync-dsm-api mock: refused (' + reason + ')\\n')\n"
+            "    sys.stderr.flush()\n"
+            "    raise SystemExit(73)\n"
             "if sys.argv[1:] == ['--serve'] or serve_supervised:\n"
             "    if serve_supervised:\n"
             "        expected_parent = int(sys.argv[2])\n"
@@ -2709,10 +2716,10 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
             "        current_boot = Path('/proc/sys/kernel/random/boot_id').read_text(encoding='ascii').strip()\n"
             "        if (os.getppid() != expected_parent or process_start(expected_parent) != expected_parent_start\n"
             "                or current_boot != expected_boot):\n"
-            "            raise SystemExit(73)\n"
+            "            api_die('parent_identity_at_start')\n"
             "        api_libc = ctypes.CDLL(None, use_errno=True)\n"
             "        if api_libc.prctl(1, signal.SIGKILL, 0, 0, 0) != 0 or os.getppid() != expected_parent:\n"
-            "            raise SystemExit(73)\n"
+            "            api_die('pdeathsig_arm')\n"
             "        term_observed = os.environ.get('SDSYNC_TEST_API_TERM_OBSERVED')\n"
             "        if term_observed:\n"
             "            def observe_early_term(_signum, _frame):\n"
@@ -2724,7 +2731,7 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
             "            Path(pre_pid_ready).write_text(f'{os.getpid()}\\n', encoding='ascii')\n"
             "            while not Path(pre_pid_release).exists():\n"
             "                if os.getppid() != expected_parent:\n"
-            "                    raise SystemExit(73)\n"
+            "                    api_die('parent_changed_before_pid')\n"
             "                time.sleep(0.01)\n"
             "        pid_path = Path(os.environ['SYNOPKG_PKGVAR']) / 'run/api.pid'\n"
             "        descriptor = os.open(pid_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)\n"
@@ -2743,7 +2750,7 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
             "before.st_uid == os.getuid() and before.st_nlink == 1 and "
             "mode in (0o000, 0o600))\n"
             "        if not safe:\n"
-            "            raise SystemExit(73)\n"
+            "            api_die('socket_unsafe')\n"
             "        if mode == 0o600:\n"
             "            probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)\n"
             "            probe.settimeout(0.25)\n"
@@ -2756,7 +2763,7 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
             "                before = None\n"
             "            except OSError:\n"
             "                probe.close()\n"
-            "                raise SystemExit(73)\n"
+            "                api_die('socket_probe_failed')\n"
             "            else:\n"
             "                probe.close()\n"
             "                raise SystemExit(75)\n"
@@ -2766,7 +2773,7 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
             "before.st_mode, before.st_nlink) != "
             "(after.st_dev, after.st_ino, after.st_uid, after.st_gid, "
             "after.st_mode, after.st_nlink):\n"
-            "                raise SystemExit(73)\n"
+            "                api_die('socket_changed')\n"
             "            os.unlink(socket_path)\n"
             "    server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)\n"
             "    server.bind(socket_path)\n"
@@ -2776,7 +2783,7 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
             "    if serve_supervised:\n"
             "        if os.getppid() != expected_parent or process_start(expected_parent) != expected_parent_start:\n"
             "            server.close()\n"
-            "            raise SystemExit(73)\n"
+            "            api_die('parent_identity_after_bind')\n"
             "        identity = f'{os.getpid()}\\n{process_start(os.getpid())}\\n{current_boot}\\n'\n"
             "        bound_path = Path(os.environ['SYNOPKG_PKGVAR']) / 'run/api.bound'\n"
             "        bound_path.write_text(identity, encoding='ascii')\n"
@@ -2787,13 +2794,13 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
             "        while True:\n"
             "            if os.getppid() != expected_parent or process_start(expected_parent) != expected_parent_start:\n"
             "                server.close()\n"
-            "                raise SystemExit(73)\n"
+            "                api_die('parent_identity_in_commit_wait')\n"
             "            try:\n"
             "                lease_metadata = os.lstat(lease_path)\n"
             "                lease = lease_path.read_text(encoding='ascii')\n"
             "            except (FileNotFoundError, UnicodeError):\n"
             "                server.close()\n"
-            "                raise SystemExit(73)\n"
+            "                api_die('lease_missing')\n"
             # The commit renames a new file over the lease. An lstat that looked the path
             # up just before the rename reports the old file with no links left; that is
             # the file the path used to name, not an unsafe one, so look again. The real
@@ -2803,19 +2810,22 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
             "            if (not stat.S_ISREG(lease_metadata.st_mode) or stat.S_IMODE(lease_metadata.st_mode) != 0o600\n"
             "                    or lease_metadata.st_uid != os.getuid() or lease_metadata.st_nlink != 1):\n"
             "                server.close()\n"
-            "                raise SystemExit(73)\n"
+            "                api_die('lease_metadata')\n"
             "            if lease == committed_lease:\n"
             "                break\n"
             "            if lease != prepared_lease:\n"
             "                server.close()\n"
-            "                raise SystemExit(73)\n"
+            "                api_die('lease_unrecognized')\n"
             "            time.sleep(0.02)\n"
             "        if api_libc.prctl(1, 0, 0, 0, 0) != 0 or os.getppid() != expected_parent:\n"
             "            server.close()\n"
-            "            raise SystemExit(73)\n"
+            "            api_die('pdeathsig_disarm')\n"
             "        if lease_path.read_text(encoding='ascii') != committed_lease:\n"
             "            server.close()\n"
-            "            raise SystemExit(73)\n"
+            "            api_die('lease_changed_after_commit')\n"
+            "        if os.environ.get('SDSYNC_TEST_API_REFUSE_AFTER_COMMIT'):\n"
+            "            server.close()\n"
+            "            api_die('refused_after_commit_by_test')\n"
             "        post_commit_ready = os.environ.get('SDSYNC_TEST_API_POST_COMMIT_READY')\n"
             "        post_commit_release = os.environ.get('SDSYNC_TEST_API_POST_COMMIT_RELEASE')\n"
             "        if post_commit_ready:\n"
@@ -21965,6 +21975,17 @@ fi
                 self.fail("API did not reach failed-marker barrier")
             stdout, stderr = started.communicate(timeout=15)
             self.assertEqual(started.returncode, 1, stdout + stderr)
+            # The API service is alive but never published readiness: the budget
+            # ran out, and the failure says so and says which record is missing.
+            self.assertRegex(
+                stdout,
+                r"startup diagnostic: stage=final_readiness reason=timeout "
+                r"controller_child=exact controller_exit=running "
+                r"controller_lock=exact controller_ready=(missing|exact) "
+                r"lease=committed api_child=exact api_exit=running "
+                r"api_pid=exact api_bound=present api_ready=missing "
+                r"api_socket=prepared\n",
+            )
             marker = self.real_var / "run/failed-start.api"
             self.assertTrue(marker.is_file())
             self.assertIn(f"api\n{api_pid}\n", marker.read_text(encoding="ascii"))
@@ -22565,6 +22586,70 @@ fi
         self.assertEqual(self.shell(self.lifecycle, "status").returncode, 0)
         stopped = self.shell(self.lifecycle, "stop", timeout=30)
         self.assertEqual(stopped.returncode, 0, stopped.stdout + stopped.stderr)
+
+    def test_a_controller_that_stops_waiting_for_the_commit_says_why(self) -> None:
+        # "controller lifecycle parent did not commit startup" named no cause, so a
+        # controller that gave up looked the same whether the lease was gone, belonged
+        # to another parent or its parent could not be proven.
+        helper = self.lease_read_helper(
+            "controller_start_cause=\n"
+            "SDSYNC_DSM_CONTROLLER_START_PARENT_PID=4242\n"
+            "SDSYNC_DSM_CONTROLLER_START_PARENT_TICKS=123456\n"
+            "SDSYNC_DSM_CONTROLLER_START_PARENT_BOOT=00000000-0000-0000-0000-000000000000\n"
+            "export SDSYNC_DSM_CONTROLLER_START_PARENT_PID SDSYNC_DSM_CONTROLLER_START_PARENT_TICKS "
+            "SDSYNC_DSM_CONTROLLER_START_PARENT_BOOT\n"
+            "status=0\n"
+            "wait_for_controller_start_commit || status=$?\n"
+            'echo "parent_not_ours status=$status cause=$controller_start_cause"\n'
+            'rm -f "$controller_start_file"\n'
+            "status=0\n"
+            "wait_for_controller_start_commit || status=$?\n"
+            'echo "lease_gone status=$status cause=$controller_start_cause"\n'
+            "printf '4242\\n123456\\n00000000-0000-0000-0000-000000000000\\n' > \"$controller_start_file\"\n"
+            'chmod 0600 "$controller_start_file"\n'
+            "printf 'oops\\n' >> \"$controller_start_file\"\n"
+            "status=0\n"
+            "wait_for_controller_start_commit || status=$?\n"
+            'echo "lease_malformed status=$status cause=$controller_start_cause"\n'
+        )
+        result = self.shell(helper)
+        report = result.stdout + result.stderr
+        self.assertEqual(result.returncode, 0, report)
+        # This helper's parent is the test's shell, not pid 4242.
+        self.assertIn("parent_not_ours status=73 cause=parent_pid_changed", result.stdout, report)
+        self.assertIn("lease_gone status=73 cause=lease_absent", result.stdout, report)
+        self.assertIn("lease_malformed status=73 cause=lease_unsafe_or_malformed", result.stdout, report)
+
+    def test_an_api_service_that_exits_after_the_commit_is_named_in_the_start_failure(self) -> None:
+        # The start failure used to say only that the committed services did not
+        # become ready. It now says which one went and how it ended, and the API
+        # service's own refusal is in api.log instead of nowhere.
+        started = self.shell(
+            self.lifecycle, "start", timeout=60,
+            extra_environment={"SDSYNC_TEST_API_REFUSE_AFTER_COMMIT": "1"},
+        )
+        report = self.lifecycle_failure_diagnostic(started)
+        self.assertEqual(started.returncode, 1, report)
+        self.assertIn("committed services failed to publish final readiness", started.stdout, report)
+        diagnostics = [
+            line for line in started.stdout.splitlines()
+            if line.startswith("startup diagnostic: stage=final_readiness ")
+        ]
+        self.assertEqual(len(diagnostics), 1, report)
+        self.assertRegex(
+            diagnostics[0],
+            r"^startup diagnostic: stage=final_readiness reason=api_exited "
+            r"controller_child=exact controller_exit=running "
+            r"controller_lock=(exact|missing) controller_ready=(missing|exact) "
+            r"lease=(committed|missing) api_child=absent api_exit=73 "
+            r"api_pid=(exact|missing) api_bound=present api_ready=missing "
+            r"api_socket=(prepared|missing)$",
+            report,
+        )
+        self.assertNotIn(str(self.root), diagnostics[0])
+        api_log = (self.real_var / "log/api.log").read_text(encoding="utf-8")
+        self.assertIn("refused (refused_after_commit_by_test)", api_log, report)
+        self.assertEqual(self.shell(self.lifecycle, "status").returncode, 3)
 
     def test_failed_controller_start_rolls_back_api_service(self) -> None:
         controller = self.real_target / "libexec/sdsync-controller"
