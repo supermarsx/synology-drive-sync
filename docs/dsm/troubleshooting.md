@@ -258,6 +258,23 @@ line from the Package Center start details or package log, together with the bou
 `exact`, `missing`, `absent`, `mismatch`, `prepared`, `unverified`, or `unsafe` for the controller
 PID/child/lock and API PID/bound/socket checks; they contain no request query, cookie, token, secret,
 or filesystem path.
+
+A start that fails after both services were committed ends with `committed services failed to publish
+final readiness`, now preceded by a `startup diagnostic: stage=final_readiness` line. Its `reason` is
+`timeout` (both services stayed up and the start budget ran out), `api_exited` or `controller_exited`
+(one of them ended; `api_exit` or `controller_exit` is its exit status, `running` while it is still
+there and `unknown` when the status is no longer available). The record fields (`controller_ready`,
+`lease`, `api_bound`, `api_ready`, `api_socket`) show which publication is missing, so the line says
+which service stopped and which record it never wrote. The service's own last words are in `api.log`
+(`sdsync-dsm-api: supervised API service stopped: <code>`) or `controller.log`. A controller that gives up
+waiting for the start commit now says `(cause: ...)` after `controller lifecycle parent did not commit
+startup`, using one fixed word such as `lease_absent`, `parent_pid_changed` or `parent_gone`.
+
+Releases before this change could occasionally fail a start with `api_exited` and no `api.log` line (in
+the packaging tests roughly one start in a few hundred under load, more often on a slow machine), then
+start normally on the next attempt: the service read the start lease at the instant the lifecycle
+script replaced it and took the replaced file's missing link for an unsafe file. Starting the package
+again was the correct response; the read now looks again.
 Do not hand-create readiness files, remove locks, broaden socket permissions, or run either service
 as root. Those changes erase the evidence and bypass the package's fail-closed identity checks.
 

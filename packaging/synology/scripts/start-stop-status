@@ -222,6 +222,161 @@ report_controller_precommit_diagnostics() {
     package_message "startup diagnostic: controller_pid=$diagnostic_controller_pid controller_child=$diagnostic_controller_child controller_lock=$diagnostic_controller_lock api_pid=$diagnostic_api_pid api_bound=$diagnostic_api_bound api_socket=$diagnostic_api_socket"
 }
 
+# Sets final_exit_value to the exit status of a launched child that is already
+# dead, "running" while it is not, and "unknown" when the shell no longer has
+# it. `wait` on a live child would block, so it is only called once the child
+# is gone or a zombie. It is a plain call, never a command substitution: a
+# subshell is not the parent and could not wait for the child.
+final_readiness_child_exit() {
+    final_exit_pid=$1
+    final_exit_value=running
+    if script_pid_live "$final_exit_pid" && ! script_pid_absent_or_zombie "$final_exit_pid"; then
+        return 0
+    fi
+    final_exit_status=0
+    wait "$final_exit_pid" 2>/dev/null || final_exit_status=$?
+    case $final_exit_status in
+        127) final_exit_value=unknown ;;
+        *) final_exit_value=$final_exit_status ;;
+    esac
+}
+
+# One fixed-value line, like report_controller_precommit_diagnostics, for the
+# last wait: committed services that never both reached final readiness. It
+# names which service and which record is missing, and whether a child died
+# (with its exit status) or the budget simply ran out, so a failed start is
+# never reported as only "failed to publish final readiness". Values are fixed
+# words and numbers; no path, request, cookie or secret can appear.
+report_final_readiness_diagnostics() {
+    final_reason=$1
+
+    final_controller_child=exact
+    final_status=0
+    launched_child_identity_status "$launched_controller_pid" \
+        "$launched_controller_start" "$launched_controller_boot" || final_status=$?
+    case $final_status in 0) ;; 1) final_controller_child=absent ;; *) final_controller_child=unsafe ;; esac
+    final_controller_exit=running
+    if [ "$final_controller_child" != exact ]; then
+        final_readiness_child_exit "$launched_controller_pid"
+        final_controller_exit=$final_exit_value
+    fi
+
+    final_api_child=exact
+    final_status=0
+    launched_child_identity_status "$launched_api_pid" \
+        "$launched_api_start" "$launched_api_boot" || final_status=$?
+    case $final_status in 0) ;; 1) final_api_child=absent ;; *) final_api_child=unsafe ;; esac
+    final_api_exit=running
+    if [ "$final_api_child" != exact ]; then
+        final_readiness_child_exit "$launched_api_pid"
+        final_api_exit=$final_exit_value
+    fi
+
+    final_lease=missing
+    final_status=0
+    read_controller_start_lease || final_status=$?
+    case $final_status in
+        0) final_lease=$controller_start_phase ;;
+        1) final_lease=missing ;;
+        *) final_lease=unsafe ;;
+    esac
+
+    final_controller_lock=missing
+    final_status=0
+    private_process_lock_is_live "$controller_lock" || final_status=$?
+    case $final_status in
+        0)
+            if [ "${lock_owner_legacy:-true}" = false ] \
+                && [ "$lock_owner_pid" = "$launched_controller_pid" ] \
+                && [ "$lock_owner_start" = "$launched_controller_start" ] \
+                && [ "$lock_owner_boot" = "$launched_controller_boot" ]; then
+                final_controller_lock=exact
+            else
+                final_controller_lock=mismatch
+            fi
+            ;;
+        1) final_controller_lock=missing ;;
+        *) final_controller_lock=unsafe ;;
+    esac
+
+    final_controller_ready=missing
+    final_status=0
+    read_controller_ready_identity || final_status=$?
+    case $final_status in
+        0)
+            if [ "$controller_ready_pid" = "$launched_controller_pid" ] \
+                && [ "$controller_ready_start" = "$launched_controller_start" ] \
+                && [ "$controller_ready_boot" = "$launched_controller_boot" ]; then
+                final_controller_ready=exact
+            else
+                final_controller_ready=mismatch
+            fi
+            ;;
+        1) final_controller_ready=missing ;;
+        *) final_controller_ready=unsafe ;;
+    esac
+
+    final_api_pid=missing
+    final_status=0
+    api_pid_file_safe >/dev/null 2>&1 || final_status=$?
+    if [ "$final_status" -eq 0 ]; then
+        if [ "$(api_pid 2>/dev/null || true)" = "$launched_api_pid" ]; then
+            final_api_pid=exact
+        else
+            final_api_pid=mismatch
+        fi
+    elif api_path_exists "$api_pid_file"; then
+        final_api_pid=unsafe
+    fi
+
+    final_api_bound=missing
+    final_status=0
+    read_api_bound_identity || final_status=$?
+    case $final_status in
+        0) final_api_bound=present ;;
+        1) final_api_bound=missing ;;
+        *) final_api_bound=unsafe ;;
+    esac
+
+    final_api_ready=missing
+    final_status=0
+    read_api_ready_identity || final_status=$?
+    case $final_status in
+        0)
+            if [ "$api_ready_pid" = "$launched_api_pid" ] \
+                && [ "$api_ready_start" = "$launched_api_start" ] \
+                && [ "$api_ready_boot" = "$launched_api_boot" ]; then
+                final_api_ready=exact
+            else
+                final_api_ready=mismatch
+            fi
+            ;;
+        1) final_api_ready=missing ;;
+        *) final_api_ready=unsafe ;;
+    esac
+
+    final_api_socket=missing
+    if api_path_exists "$api_socket"; then
+        if [ -S "$api_socket" ] && [ ! -L "$api_socket" ]; then
+            final_socket_mode=$(stat -c '%a' "$api_socket" 2>/dev/null || true)
+            final_socket_identity=$(stat -c '%d:%i' "$api_socket" 2>/dev/null || true)
+            case $final_socket_mode in
+                0) final_api_socket=prepared ;;
+                600) final_api_socket=active ;;
+                *) final_api_socket=unsafe ;;
+            esac
+            if [ "$final_api_socket" != unsafe ] \
+                && [ "$final_socket_identity" != "$launched_api_socket_identity" ]; then
+                final_api_socket=replaced
+            fi
+        else
+            final_api_socket=unsafe
+        fi
+    fi
+
+    package_message "startup diagnostic: stage=final_readiness reason=$final_reason controller_child=$final_controller_child controller_exit=$final_controller_exit controller_lock=$final_controller_lock controller_ready=$final_controller_ready lease=$final_lease api_child=$final_api_child api_exit=$final_api_exit api_pid=$final_api_pid api_bound=$final_api_bound api_ready=$final_api_ready api_socket=$final_api_socket"
+}
+
 # Return 0 only for the exact still-running direct child, 1 only after exact
 # absence or a verified zombie, and 73 for replacement/uninspectable state.
 # The PPid check is retained across the permitted Rust-to-controller exec.
@@ -2353,6 +2508,7 @@ case ${1:-} in
             exit 1
         }
         services_ready=false
+        final_readiness_reason=timeout
         # Poll bucket A -- see the note on the API readiness loop above.
         count=0
         poll_reset
@@ -2402,11 +2558,12 @@ case ${1:-} in
                 package_message "API service and controller started as PIDs $launched_api_pid and $launched_controller_pid"
                 exit 0
             fi
-            script_pid_live "$launched_controller_pid" || break
-            script_pid_live "$launched_api_pid" || break
+            script_pid_live "$launched_controller_pid" || { final_readiness_reason=controller_exited; break; }
+            script_pid_live "$launched_api_pid" || { final_readiness_reason=api_exited; break; }
             poll_wait
             count=$((poll_elapsed_ms / 1000))
         done
+        report_final_readiness_diagnostics "$final_readiness_reason"
         package_message "committed services failed to publish final readiness"
         exit 1
         ;;
