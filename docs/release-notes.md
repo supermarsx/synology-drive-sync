@@ -12,8 +12,8 @@ lists its own commits.
   readiness`.** The API service and the controller each read the start lease (`controller.starting`)
   while the lifecycle script commits it by renaming a new file over it. A read that landed in that
   instant saw the old file with no links left and refused it as unsafe, so the service exited and the
-  start failed, about one start in a few hundred on a slow or loaded NAS and never twice in a row. The
-  read now looks again. A start that does fail after the commit names the service that stopped, how it
+  start failed. The next attempt started normally. It was rare (a few hundred starts apart in the
+  tests, more often on a slow or loaded machine). The read now looks again. A start that does fail after the commit names the service that stopped, how it
   ended and which record it never wrote (`startup diagnostic: stage=final_readiness ...`), and the
   API service's own refusal is in `api.log`. See
   [Start failures](dsm/troubleshooting.md).

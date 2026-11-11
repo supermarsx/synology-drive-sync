@@ -270,10 +270,11 @@ which service stopped and which record it never wrote. The service's own last wo
 waiting for the start commit now says `(cause: ...)` after `controller lifecycle parent did not commit
 startup`, using one fixed word such as `lease_absent`, `parent_pid_changed` or `parent_gone`.
 
-Releases before this change could fail a start with `api_exited` and no `api.log` line about one start in
-a few hundred on a slow or loaded NAS, then start normally on the next attempt: the service read the
-start lease at the instant the lifecycle script replaced it and took the replaced file's missing link
-for an unsafe file. Starting the package again was the correct response; the read now looks again.
+Releases before this change could occasionally fail a start with `api_exited` and no `api.log` line (in
+the packaging tests roughly one start in a few hundred under load, more often on a slow machine), then
+start normally on the next attempt: the service read the start lease at the instant the lifecycle
+script replaced it and took the replaced file's missing link for an unsafe file. Starting the package
+again was the correct response; the read now looks again.
 Do not hand-create readiness files, remove locks, broaden socket permissions, or run either service
 as root. Those changes erase the evidence and bypass the package's fail-closed identity checks.
 
