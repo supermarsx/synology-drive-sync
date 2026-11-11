@@ -619,7 +619,32 @@ pub const BUILD: BuildIdentity = BuildIdentity {
     commit: env!("SDSYNC_BUILD_COMMIT"),
 };
 
+/// The Synology package architecture label for a Rust target triple, or `None` when the triple is
+/// not one the DSM package ships.
+///
+/// This is a closed match and must agree, in both directions, with `ARCHITECTURES` in
+/// `packaging/synology/build_spk.py` (the Python package suite reads both as text and compares
+/// them). The label is the DSM `arch` family a user recognises on a NAS, so the aarch64 build is
+/// `armv8` and the hard-float ARMv7 build is `armv7`. A triple outside the table (a developer's
+/// glibc or Windows build) is `None`: it is reported as "not a package build", never guessed.
+#[must_use]
+pub fn package_arch_for_target(target: &str) -> Option<&'static str> {
+    match target {
+        "x86_64-unknown-linux-musl" => Some("x86_64"),
+        "i686-unknown-linux-musl" => Some("i686"),
+        "armv7-unknown-linux-musleabihf" => Some("armv7"),
+        "aarch64-unknown-linux-musl" => Some("armv8"),
+        _ => None,
+    }
+}
+
 impl BuildIdentity {
+    /// The package architecture label of this binary's compiled-in target.
+    #[must_use]
+    pub fn package_arch(self) -> Option<&'static str> {
+        package_arch_for_target(self.target)
+    }
+
     fn json_value(self) -> serde_json::Value {
         serde_json::json!({
             "name": self.name,
@@ -2628,6 +2653,44 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
+
+    /// Every Rust target the package build ships maps to the Synology architecture label that
+    /// `packaging/synology/build_spk.py` names for it. The label is what a user recognises on a
+    /// NAS ("armv8"), not the triple, and a guess here would tell a user the wrong thing.
+    #[test]
+    fn package_arch_labels_every_shipped_target() {
+        for (target, label) in [
+            ("x86_64-unknown-linux-musl", "x86_64"),
+            ("i686-unknown-linux-musl", "i686"),
+            ("armv7-unknown-linux-musleabihf", "armv7"),
+            ("aarch64-unknown-linux-musl", "armv8"),
+        ] {
+            assert_eq!(package_arch_for_target(target), Some(label), "{target}");
+        }
+    }
+
+    #[test]
+    fn package_arch_is_absent_for_a_target_the_package_does_not_ship() {
+        for target in [
+            "x86_64-unknown-linux-gnu",
+            "x86_64-pc-windows-msvc",
+            "aarch64-apple-darwin",
+            "armv7-unknown-linux-gnueabihf",
+            // A label is never matched as a triple, and a near miss is not a match.
+            "armv8",
+            "x86_64-unknown-linux-musl ",
+            "X86_64-UNKNOWN-LINUX-MUSL",
+            "unknown",
+            "",
+        ] {
+            assert_eq!(package_arch_for_target(target), None, "{target:?}");
+        }
+    }
+
+    #[test]
+    fn build_identity_reports_the_arch_of_its_own_compiled_in_target() {
+        assert_eq!(BUILD.package_arch(), package_arch_for_target(BUILD.target));
+    }
 
     #[test]
     fn explicit_log_level_has_strict_precedence() {

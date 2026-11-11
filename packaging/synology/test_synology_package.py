@@ -592,6 +592,52 @@ class BuilderTests(unittest.TestCase):
         self.assertIn("lifecycle-equivalent 26.7-26.10", selector)
         self.assertNotIn("byte-equivalent 26.7-26.10", selector)
 
+    def test_rust_package_arch_mapping_equals_build_spk_architectures(self) -> None:
+        """The About page's arch label and the package builder name the same four builds.
+
+        ``package_arch_for_target`` in src/observability.rs is a closed ``match`` from the
+        compiled-in Rust target to the Synology architecture label, and ``ARCHITECTURES`` in
+        build_spk.py is what the builder stamps into INFO. They are two copies of one table, so
+        this reads the Rust arms as text and compares them with the Python table in both
+        directions: a target added or relabelled on either side alone fails here.
+        """
+        from build_spk import ARCHITECTURES
+
+        source = (REPOSITORY / "src/observability.rs").read_text(encoding="utf-8")
+        start = source.index("pub fn package_arch_for_target(")
+        body_start = source.index("match target {", start)
+        body_end = source.index("\n    }\n}", body_start)
+        body = source[body_start:body_end]
+        arms = re.findall(r'^[ \t]*"([^"]+)"[ \t]*=>[ \t]*Some\("([^"]+)"\),[ \t]*$', body, re.MULTILINE)
+        self.assertEqual(
+            len(arms),
+            len({target for target, _ in arms}),
+            "a target is matched twice",
+        )
+        rust = dict(arms)
+        python = {contract.rust_target: name for name, contract in ARCHITECTURES.items()}
+        self.assertEqual(
+            len(python),
+            len(ARCHITECTURES),
+            "two architectures share a Rust target",
+        )
+        self.assertEqual(rust, python)
+        # Closed: every other target is None, and no arm yields anything but a label above.
+        self.assertRegex(body, r'(?m)^[ \t]*_[ \t]*=>[ \t]*None,[ \t]*$', "the match must end in an explicit None arm")
+        residue = re.sub(r'^[ \t]*"[^"]+"[ \t]*=>[ \t]*Some\("[^"]+"\),[ \t]*$', "", body, flags=re.MULTILINE)
+        self.assertEqual(
+            re.sub(r"\s+", " ", residue).strip(),
+            "match target { _ => None,",
+            "the match carries an arm the cross-check does not read",
+        )
+        # The label is what a user knows, never a uname machine name.
+        self.assertNotIn("armv7l", set(rust.values()))
+
+        # The snapshot writer takes the label from that mapping and the target from the build.
+        bridge = (REPOSITORY / "src/dsm_api.rs").read_text(encoding="utf-8")
+        self.assertIn('"target": BUILD.target,', bridge)
+        self.assertIn('"arch": BUILD.package_arch(),', bridge)
+
     def test_integrated_profile_help_tracks_mutable_output_contract(self) -> None:
         profile_help = (
             REPOSITORY / "packaging/synology/package/ui/help/enu/profiles.html"
