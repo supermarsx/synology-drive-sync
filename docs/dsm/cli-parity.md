@@ -128,6 +128,18 @@ deliberately reports:
 }
 ```
 
+The bridge, never the manager, writes the snapshot's `package` member, on both read rungs, in
+`sanitize_manager_document`: `{"version", "target", "arch"}`. `version` is the compiled-in package
+version, `target` is the compiled-in Rust target triple (`SDSYNC_BUILD_TARGET`), and `arch` is the
+Synology architecture label that triple maps to (`x86_64`, `i686`, `armv7`, or `armv8` for
+`aarch64-unknown-linux-musl`), or JSON `null` when the target is not one the package ships, such as a
+glibc or Windows developer build. All three are build-time constants, so none is read from `INFO` or
+any mutable DSM state, a `package` member printed by a manager is overwritten, and the manager's
+`api snapshot` does not emit it: the shell and in-service documents stay byte-identical after
+sanitising. The mapping is a closed `match` in `src/observability.rs`, and a Python test compares
+its arms with `ARCHITECTURES` in `build_spk.py` in both directions. The About page's **Installed
+package build** row is the only consumer.
+
 Only the package-user API service returns true capabilities and `private_queue=true` after the
 DSM-launched package-UID CGI has authenticated the cookie once and crossed the fixed peer-verified
 `0600` socket. The service then validates the strict relay/request, independently resolves the exact

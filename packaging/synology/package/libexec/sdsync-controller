@@ -4728,12 +4728,12 @@ trap request_runner_wait_poll ALRM
 trap cleanup_controller 0
 
 controller_start_lease_matches_parent || {
-    echo "controller startup lease is absent, stale, or not owned by the lifecycle parent" >&2
+    echo "controller startup lease is absent, stale, or not owned by the lifecycle parent (cause: ${controller_start_cause:-unknown})" >&2
     exit 73
 }
 acquire_controller_lock
 controller_start_lease_matches_parent || {
-    echo "controller startup lease was cancelled before lock ownership" >&2
+    echo "controller startup lease was cancelled before lock ownership (cause: ${controller_start_cause:-unknown})" >&2
     exit 73
 }
 reconcile_audit_outbox || {
@@ -4822,12 +4822,12 @@ write_controller_state running "$$" 0 0
 # After commit, a parent crash is recoverable from the exact PID/lock/socket
 # topology, so the long-lived controller may safely ignore SIGUSR1.
 wait_for_controller_start_commit || {
-    echo "controller lifecycle parent did not commit startup" >&2
+    echo "controller lifecycle parent did not commit startup (cause: ${controller_start_cause:-unknown})" >&2
     exit 73
 }
 trap '' USR1
 controller_start_lease_committed_matches_parent || {
-    echo "controller startup commit changed before readiness" >&2
+    echo "controller startup commit changed before readiness (cause: ${controller_start_cause:-unknown})" >&2
     exit 73
 }
 publish_controller_ready

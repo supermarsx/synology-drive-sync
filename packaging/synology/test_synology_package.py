@@ -592,6 +592,52 @@ class BuilderTests(unittest.TestCase):
         self.assertIn("lifecycle-equivalent 26.7-26.10", selector)
         self.assertNotIn("byte-equivalent 26.7-26.10", selector)
 
+    def test_rust_package_arch_mapping_equals_build_spk_architectures(self) -> None:
+        """The About page's arch label and the package builder name the same four builds.
+
+        ``package_arch_for_target`` in src/observability.rs is a closed ``match`` from the
+        compiled-in Rust target to the Synology architecture label, and ``ARCHITECTURES`` in
+        build_spk.py is what the builder stamps into INFO. They are two copies of one table, so
+        this reads the Rust arms as text and compares them with the Python table in both
+        directions: a target added or relabelled on either side alone fails here.
+        """
+        from build_spk import ARCHITECTURES
+
+        source = (REPOSITORY / "src/observability.rs").read_text(encoding="utf-8")
+        start = source.index("pub fn package_arch_for_target(")
+        body_start = source.index("match target {", start)
+        body_end = source.index("\n    }\n}", body_start)
+        body = source[body_start:body_end]
+        arms = re.findall(r'^[ \t]*"([^"]+)"[ \t]*=>[ \t]*Some\("([^"]+)"\),[ \t]*$', body, re.MULTILINE)
+        self.assertEqual(
+            len(arms),
+            len({target for target, _ in arms}),
+            "a target is matched twice",
+        )
+        rust = dict(arms)
+        python = {contract.rust_target: name for name, contract in ARCHITECTURES.items()}
+        self.assertEqual(
+            len(python),
+            len(ARCHITECTURES),
+            "two architectures share a Rust target",
+        )
+        self.assertEqual(rust, python)
+        # Closed: every other target is None, and no arm yields anything but a label above.
+        self.assertRegex(body, r'(?m)^[ \t]*_[ \t]*=>[ \t]*None,[ \t]*$', "the match must end in an explicit None arm")
+        residue = re.sub(r'^[ \t]*"[^"]+"[ \t]*=>[ \t]*Some\("[^"]+"\),[ \t]*$', "", body, flags=re.MULTILINE)
+        self.assertEqual(
+            re.sub(r"\s+", " ", residue).strip(),
+            "match target { _ => None,",
+            "the match carries an arm the cross-check does not read",
+        )
+        # The label is what a user knows, never a uname machine name.
+        self.assertNotIn("armv7l", set(rust.values()))
+
+        # The snapshot writer takes the label from that mapping and the target from the build.
+        bridge = (REPOSITORY / "src/dsm_api.rs").read_text(encoding="utf-8")
+        self.assertIn('"target": BUILD.target,', bridge)
+        self.assertIn('"arch": BUILD.package_arch(),', bridge)
+
     def test_integrated_profile_help_tracks_mutable_output_contract(self) -> None:
         profile_help = (
             REPOSITORY / "packaging/synology/package/ui/help/enu/profiles.html"
@@ -2699,6 +2745,13 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
             "    raise SystemExit(0)\n"
             "\n"
             "serve_supervised = len(sys.argv) == 5 and sys.argv[1] == '--serve-supervised'\n"
+            "def api_die(reason):\n"
+            "    # Every refusal of the supervised mock names itself in api.log: an exit 73\n"
+            "    # with no words is what made a start that failed one time in a thousand\n"
+            "    # look like a service that never started.\n"
+            "    sys.stderr.write('sdsync-dsm-api mock: refused (' + reason + ')\\n')\n"
+            "    sys.stderr.flush()\n"
+            "    raise SystemExit(73)\n"
             "if sys.argv[1:] == ['--serve'] or serve_supervised:\n"
             "    if serve_supervised:\n"
             "        expected_parent = int(sys.argv[2])\n"
@@ -2709,10 +2762,10 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
             "        current_boot = Path('/proc/sys/kernel/random/boot_id').read_text(encoding='ascii').strip()\n"
             "        if (os.getppid() != expected_parent or process_start(expected_parent) != expected_parent_start\n"
             "                or current_boot != expected_boot):\n"
-            "            raise SystemExit(73)\n"
+            "            api_die('parent_identity_at_start')\n"
             "        api_libc = ctypes.CDLL(None, use_errno=True)\n"
             "        if api_libc.prctl(1, signal.SIGKILL, 0, 0, 0) != 0 or os.getppid() != expected_parent:\n"
-            "            raise SystemExit(73)\n"
+            "            api_die('pdeathsig_arm')\n"
             "        term_observed = os.environ.get('SDSYNC_TEST_API_TERM_OBSERVED')\n"
             "        if term_observed:\n"
             "            def observe_early_term(_signum, _frame):\n"
@@ -2724,7 +2777,7 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
             "            Path(pre_pid_ready).write_text(f'{os.getpid()}\\n', encoding='ascii')\n"
             "            while not Path(pre_pid_release).exists():\n"
             "                if os.getppid() != expected_parent:\n"
-            "                    raise SystemExit(73)\n"
+            "                    api_die('parent_changed_before_pid')\n"
             "                time.sleep(0.01)\n"
             "        pid_path = Path(os.environ['SYNOPKG_PKGVAR']) / 'run/api.pid'\n"
             "        descriptor = os.open(pid_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)\n"
@@ -2743,7 +2796,7 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
             "before.st_uid == os.getuid() and before.st_nlink == 1 and "
             "mode in (0o000, 0o600))\n"
             "        if not safe:\n"
-            "            raise SystemExit(73)\n"
+            "            api_die('socket_unsafe')\n"
             "        if mode == 0o600:\n"
             "            probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)\n"
             "            probe.settimeout(0.25)\n"
@@ -2756,7 +2809,7 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
             "                before = None\n"
             "            except OSError:\n"
             "                probe.close()\n"
-            "                raise SystemExit(73)\n"
+            "                api_die('socket_probe_failed')\n"
             "            else:\n"
             "                probe.close()\n"
             "                raise SystemExit(75)\n"
@@ -2766,7 +2819,7 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
             "before.st_mode, before.st_nlink) != "
             "(after.st_dev, after.st_ino, after.st_uid, after.st_gid, "
             "after.st_mode, after.st_nlink):\n"
-            "                raise SystemExit(73)\n"
+            "                api_die('socket_changed')\n"
             "            os.unlink(socket_path)\n"
             "    server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)\n"
             "    server.bind(socket_path)\n"
@@ -2776,7 +2829,7 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
             "    if serve_supervised:\n"
             "        if os.getppid() != expected_parent or process_start(expected_parent) != expected_parent_start:\n"
             "            server.close()\n"
-            "            raise SystemExit(73)\n"
+            "            api_die('parent_identity_after_bind')\n"
             "        identity = f'{os.getpid()}\\n{process_start(os.getpid())}\\n{current_boot}\\n'\n"
             "        bound_path = Path(os.environ['SYNOPKG_PKGVAR']) / 'run/api.bound'\n"
             "        bound_path.write_text(identity, encoding='ascii')\n"
@@ -2787,29 +2840,38 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
             "        while True:\n"
             "            if os.getppid() != expected_parent or process_start(expected_parent) != expected_parent_start:\n"
             "                server.close()\n"
-            "                raise SystemExit(73)\n"
+            "                api_die('parent_identity_in_commit_wait')\n"
             "            try:\n"
             "                lease_metadata = os.lstat(lease_path)\n"
             "                lease = lease_path.read_text(encoding='ascii')\n"
             "            except (FileNotFoundError, UnicodeError):\n"
             "                server.close()\n"
-            "                raise SystemExit(73)\n"
+            "                api_die('lease_missing')\n"
+            # The commit renames a new file over the lease. An lstat that looked the path
+            # up just before the rename reports the old file with no links left; that is
+            # the file the path used to name, not an unsafe one, so look again. The real
+            # service does the same (read_private_file_with_link_contract_observed).
+            "            if lease_metadata.st_nlink == 0:\n"
+            "                continue\n"
             "            if (not stat.S_ISREG(lease_metadata.st_mode) or stat.S_IMODE(lease_metadata.st_mode) != 0o600\n"
             "                    or lease_metadata.st_uid != os.getuid() or lease_metadata.st_nlink != 1):\n"
             "                server.close()\n"
-            "                raise SystemExit(73)\n"
+            "                api_die('lease_metadata')\n"
             "            if lease == committed_lease:\n"
             "                break\n"
             "            if lease != prepared_lease:\n"
             "                server.close()\n"
-            "                raise SystemExit(73)\n"
+            "                api_die('lease_unrecognized')\n"
             "            time.sleep(0.02)\n"
             "        if api_libc.prctl(1, 0, 0, 0, 0) != 0 or os.getppid() != expected_parent:\n"
             "            server.close()\n"
-            "            raise SystemExit(73)\n"
+            "            api_die('pdeathsig_disarm')\n"
             "        if lease_path.read_text(encoding='ascii') != committed_lease:\n"
             "            server.close()\n"
-            "            raise SystemExit(73)\n"
+            "            api_die('lease_changed_after_commit')\n"
+            "        if os.environ.get('SDSYNC_TEST_API_REFUSE_AFTER_COMMIT'):\n"
+            "            server.close()\n"
+            "            api_die('refused_after_commit_by_test')\n"
             "        post_commit_ready = os.environ.get('SDSYNC_TEST_API_POST_COMMIT_READY')\n"
             "        post_commit_release = os.environ.get('SDSYNC_TEST_API_POST_COMMIT_RELEASE')\n"
             "        if post_commit_ready:\n"
@@ -21959,6 +22021,17 @@ fi
                 self.fail("API did not reach failed-marker barrier")
             stdout, stderr = started.communicate(timeout=15)
             self.assertEqual(started.returncode, 1, stdout + stderr)
+            # The API service is alive but never published readiness: the budget
+            # ran out, and the failure says so and says which record is missing.
+            self.assertRegex(
+                stdout,
+                r"startup diagnostic: stage=final_readiness reason=timeout "
+                r"controller_child=exact controller_exit=running "
+                r"controller_lock=exact controller_ready=(missing|exact) "
+                r"lease=committed api_child=exact api_exit=running "
+                r"api_pid=exact api_bound=present api_ready=missing "
+                r"api_socket=prepared\n",
+            )
             marker = self.real_var / "run/failed-start.api"
             self.assertTrue(marker.is_file())
             self.assertIn(f"api\n{api_pid}\n", marker.read_text(encoding="ascii"))
@@ -22439,6 +22512,190 @@ fi
             if consumer.poll() is None:
                 consumer.terminate()
                 consumer.wait(timeout=5)
+
+    def install_lease_rename_race_shim(self) -> Path:
+        """A `stat` that models a reader losing the race with the commit rename.
+
+        The lifecycle script commits `controller.starting` by renaming a new file
+        over it. A reader whose lookup landed just before the rename gets the old
+        file's attributes just after it: owned, private, well formed, and with no
+        links left, because it is no longer the file the path names. This puts that
+        observation under the test's control instead of leaving it to a scheduler:
+        `SDSYNC_TEST_LEASE_RACE` names a counter file, and a look at the lease's
+        owner/mode/link count (the one `read_controller_start_lease` takes) reports
+        link count 0 on every odd call, or on every call in `always` mode. Every
+        other call, and every other path, is the real stat.
+        """
+        shim = self.fake_system_bin / "stat"
+        shim.write_text(
+            "#!/bin/sh\n"
+            "real=/usr/bin/stat\n"
+            '[ -x "$real" ] || real=/bin/stat\n'
+            'if [ -n "${SDSYNC_TEST_LEASE_RACE:-}" ]; then\n'
+            '    case "$*" in\n'
+            "        *%u:%a:%h*controller.starting)\n"
+            '            for last do :; done\n'
+            '            echo "$$" >> "$SDSYNC_TEST_LEASE_RACE"\n'
+            '            calls=$(wc -l < "$SDSYNC_TEST_LEASE_RACE")\n'
+            '            if [ "${SDSYNC_TEST_LEASE_RACE_MODE:-alternate}" = always ] \\\n'
+            '                || [ $((calls % 2)) -eq 1 ]; then\n'
+            "                printf '%s:600:0\\n' \"$(\"$real\" -c %u \"$last\")\"\n"
+            "                exit 0\n"
+            "            fi\n"
+            "            ;;\n"
+            "    esac\n"
+            "fi\n"
+            'exec "$real" "$@"\n',
+            encoding="utf-8",
+        )
+        shim.chmod(0o755)
+        if os.getuid() == 0:
+            os.chown(shim, self.drop_uid, self.drop_gid)
+        return shim
+
+    def lease_read_helper(self, body: str) -> Path:
+        helper = self.root / "lease-read-helper.sh"
+        helper.write_text(
+            "#!/bin/sh\nset -eu\n"
+            f'. "{self.real_target / "libexec/sdsync-common"}"\n'
+            "ensure_layout\n"
+            "printf '4242\\n123456\\n00000000-0000-0000-0000-000000000000\\n' > \"$controller_start_file\"\n"
+            'chmod 0600 "$controller_start_file"\n'
+            + body,
+            encoding="utf-8",
+        )
+        helper.chmod(0o755)
+        if os.getuid() == 0:
+            os.chown(helper, self.drop_uid, self.drop_gid)
+        return helper
+
+    def test_the_lease_read_looks_again_when_the_commit_rename_races_it(self) -> None:
+        # The race behind `committed services failed to publish final readiness`:
+        # a reader of controller.starting that straddles the commit rename saw link
+        # count 0 and called the lease unsafe, which ended the controller (or the
+        # API service) waiting for that very commit. The first look reports the
+        # race; the read must look again and return the lease.
+        self.install_lease_rename_race_shim()
+        counter = self.root / "lease-race.calls"
+        helper = self.lease_read_helper(
+            "status=0\n"
+            "read_controller_start_lease || status=$?\n"
+            'echo "status=$status phase=${controller_start_phase:-none} pid=${controller_start_pid:-none}"\n'
+        )
+        result = self.shell(helper, extra_environment={"SDSYNC_TEST_LEASE_RACE": str(counter)})
+        report = result.stdout + result.stderr
+        self.assertEqual(result.returncode, 0, report)
+        self.assertIn("status=0 phase=prepared pid=4242", result.stdout, report)
+        self.assertEqual(
+            len(counter.read_text(encoding="ascii").splitlines()), 2,
+            f"one look lost the race and one more found the lease: {report}",
+        )
+
+    def test_a_lease_that_never_regains_a_link_is_refused_after_a_bounded_number_of_looks(self) -> None:
+        # The retry must not turn a genuinely unlinked lease into an accepted one,
+        # and must not loop for ever on a path that keeps being replaced.
+        self.install_lease_rename_race_shim()
+        counter = self.root / "lease-race-always.calls"
+        helper = self.lease_read_helper(
+            "status=0\n"
+            "read_controller_start_lease || status=$?\n"
+            'echo "status=$status"\n'
+        )
+        result = self.shell(
+            helper,
+            extra_environment={
+                "SDSYNC_TEST_LEASE_RACE": str(counter),
+                "SDSYNC_TEST_LEASE_RACE_MODE": "always",
+            },
+        )
+        report = result.stdout + result.stderr
+        self.assertEqual(result.returncode, 0, report)
+        self.assertIn("status=73", result.stdout, report)
+        self.assertEqual(len(counter.read_text(encoding="ascii").splitlines()), 8, report)
+
+    def test_a_start_survives_every_reader_of_the_lease_losing_the_commit_rename_race(self) -> None:
+        # The shell side of the start protocol end to end: the lifecycle script's own
+        # reads and the controller's (the commit wait, the pre-lock and committed
+        # checks) each meet link count 0 on their first look. Before the fix the
+        # first of them refused the lease and the start failed as `committed
+        # services failed to publish final readiness`, one start in a few hundred
+        # on a loaded machine and never in isolation.
+        self.install_lease_rename_race_shim()
+        counter = self.root / "start-lease-race.calls"
+        started = self.shell(
+            self.lifecycle, "start", timeout=60,
+            extra_environment={"SDSYNC_TEST_LEASE_RACE": str(counter)},
+        )
+        self.assertEqual(started.returncode, 0, self.lifecycle_failure_diagnostic(started))
+        # The shim really ran for several readers, not only for one.
+        self.assertGreaterEqual(len(counter.read_text(encoding="ascii").splitlines()), 4)
+        self.assertEqual(self.shell(self.lifecycle, "status").returncode, 0)
+        stopped = self.shell(self.lifecycle, "stop", timeout=30)
+        self.assertEqual(stopped.returncode, 0, stopped.stdout + stopped.stderr)
+
+    def test_a_controller_that_stops_waiting_for_the_commit_says_why(self) -> None:
+        # "controller lifecycle parent did not commit startup" named no cause, so a
+        # controller that gave up looked the same whether the lease was gone, belonged
+        # to another parent or its parent could not be proven.
+        helper = self.lease_read_helper(
+            "controller_start_cause=\n"
+            "SDSYNC_DSM_CONTROLLER_START_PARENT_PID=4242\n"
+            "SDSYNC_DSM_CONTROLLER_START_PARENT_TICKS=123456\n"
+            "SDSYNC_DSM_CONTROLLER_START_PARENT_BOOT=00000000-0000-0000-0000-000000000000\n"
+            "export SDSYNC_DSM_CONTROLLER_START_PARENT_PID SDSYNC_DSM_CONTROLLER_START_PARENT_TICKS "
+            "SDSYNC_DSM_CONTROLLER_START_PARENT_BOOT\n"
+            "status=0\n"
+            "wait_for_controller_start_commit || status=$?\n"
+            'echo "parent_not_ours status=$status cause=$controller_start_cause"\n'
+            'rm -f "$controller_start_file"\n'
+            "status=0\n"
+            "wait_for_controller_start_commit || status=$?\n"
+            'echo "lease_gone status=$status cause=$controller_start_cause"\n'
+            "printf '4242\\n123456\\n00000000-0000-0000-0000-000000000000\\n' > \"$controller_start_file\"\n"
+            'chmod 0600 "$controller_start_file"\n'
+            "printf 'oops\\n' >> \"$controller_start_file\"\n"
+            "status=0\n"
+            "wait_for_controller_start_commit || status=$?\n"
+            'echo "lease_malformed status=$status cause=$controller_start_cause"\n'
+        )
+        result = self.shell(helper)
+        report = result.stdout + result.stderr
+        self.assertEqual(result.returncode, 0, report)
+        # This helper's parent is the test's shell, not pid 4242.
+        self.assertIn("parent_not_ours status=73 cause=parent_pid_changed", result.stdout, report)
+        self.assertIn("lease_gone status=73 cause=lease_absent", result.stdout, report)
+        self.assertIn("lease_malformed status=73 cause=lease_unsafe_or_malformed", result.stdout, report)
+
+    def test_an_api_service_that_exits_after_the_commit_is_named_in_the_start_failure(self) -> None:
+        # The start failure used to say only that the committed services did not
+        # become ready. It now says which one went and how it ended, and the API
+        # service's own refusal is in api.log instead of nowhere.
+        started = self.shell(
+            self.lifecycle, "start", timeout=60,
+            extra_environment={"SDSYNC_TEST_API_REFUSE_AFTER_COMMIT": "1"},
+        )
+        report = self.lifecycle_failure_diagnostic(started)
+        self.assertEqual(started.returncode, 1, report)
+        self.assertIn("committed services failed to publish final readiness", started.stdout, report)
+        diagnostics = [
+            line for line in started.stdout.splitlines()
+            if line.startswith("startup diagnostic: stage=final_readiness ")
+        ]
+        self.assertEqual(len(diagnostics), 1, report)
+        self.assertRegex(
+            diagnostics[0],
+            r"^startup diagnostic: stage=final_readiness reason=api_exited "
+            r"controller_child=exact controller_exit=running "
+            r"controller_lock=(exact|missing) controller_ready=(missing|exact) "
+            r"lease=(committed|missing) api_child=absent api_exit=73 "
+            r"api_pid=(exact|missing) api_bound=present api_ready=missing "
+            r"api_socket=(prepared|missing)$",
+            report,
+        )
+        self.assertNotIn(str(self.root), diagnostics[0])
+        api_log = (self.real_var / "log/api.log").read_text(encoding="utf-8")
+        self.assertIn("refused (refused_after_commit_by_test)", api_log, report)
+        self.assertEqual(self.shell(self.lifecycle, "status").returncode, 3)
 
     def test_failed_controller_start_rolls_back_api_service(self) -> None:
         controller = self.real_target / "libexec/sdsync-controller"

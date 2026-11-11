@@ -8,6 +8,16 @@ lists its own commits.
 
 ## Unreleased: the daemon is the DSM service engine
 
+- **A shell-engine start no longer fails at random with `committed services failed to publish final
+  readiness`.** The API service and the controller each read the start lease (`controller.starting`)
+  while the lifecycle script commits it by renaming a new file over it. A read that landed in that
+  instant saw the old file with no links left and refused it as unsafe, so the service exited and the
+  start failed. The next attempt started normally. It was rare (a few hundred starts apart in the
+  tests, more often on a slow or loaded machine). The read now looks again. A start that does fail after the commit names the service that stopped, how it
+  ended and which record it never wrote (`startup diagnostic: stage=final_readiness ...`), and the
+  API service's own refusal is in `api.log`. See
+  [Start failures](dsm/troubleshooting.md).
+
 - **The Rust daemon replaces the shell controller and runner.** `sdsync-dsm-api --daemon`
   (launched by `--launch-daemon --serve-api`) keeps the schedule, the realtime watchers, the dashboard
   queue and the dashboard's API service in one process. The shell engine stays for this release as a
@@ -275,6 +285,13 @@ lists its own commits.
 - New `pair_index.issues` codes: `pair-index-writeback-unknown`, `pair-index-writeback-unbounded`,
   `pair-index-nas-clock-skewed`, `pair-index-cleanup-failed`. See
   [Verified-pair index](pair-index.md#when-it-cannot-be-used).
+- **The About page shows which package build is installed.** A new **Installed package build** row
+  under **Build identity** names the CPU architecture and the target the binary was compiled for, for
+  example `armv8 (aarch64-unknown-linux-musl)` or `armv7 (armv7-unknown-linux-musleabihf)`. The
+  snapshot's `package` member gains `target` and `arch` beside `version`; all three are compiled in
+  and none is read from `INFO`. A build whose target has no Synology architecture reads `Not a
+  Synology package build (<target>)`, and a package API that reports neither reads `Not reported by
+  package API`. See [Compatibility](dsm/compatibility.md#four-release-spks).
 
 ## Read this before upgrading
 

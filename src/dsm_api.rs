@@ -44,6 +44,7 @@ use zeroize::{Zeroize, Zeroizing};
 use synology_drive_sync::Error as SyncError;
 #[cfg(target_os = "linux")]
 use synology_drive_sync::api::{ApiClient, ClientOptions};
+use synology_drive_sync::observability::BUILD;
 use synology_drive_sync::progress_record::ProgressRecorder;
 #[cfg(target_os = "linux")]
 use synology_drive_sync::status_cache;
@@ -7754,11 +7755,18 @@ fn sanitize_manager_document(
     match action {
         ReadAction::Snapshot => {
             let root = value.as_object_mut().ok_or(MANAGER_OUTPUT_INVALID)?;
-            // This value is embedded by build.rs and cannot be influenced by
-            // the package INFO file or any mutable DSM runtime state.
+            // These values are embedded by build.rs and cannot be influenced by
+            // the package INFO file or any mutable DSM runtime state. `arch` is
+            // the Synology label for the compiled-in target, or JSON null for a
+            // build that is not a package target; it is never guessed, and the
+            // dashboard shows that case by name.
             root.insert(
                 "package".to_owned(),
-                json!({ "version": env!("SDSYNC_VERSION") }),
+                json!({
+                    "version": env!("SDSYNC_VERSION"),
+                    "target": BUILD.target,
+                    "arch": BUILD.package_arch(),
+                }),
             );
             root.insert(
                 "capabilities".to_owned(),
@@ -10774,14 +10782,37 @@ mod linux_files {
         maximum: usize,
         append_only: bool,
     ) -> BridgeResult<Option<(File, Vec<u8>)>> {
+        open_private_log_file_observed(path, package_uid, maximum, append_only, |_| {})
+    }
+
+    /// `open_private_log_file`, with the same observer and the same second look as
+    /// `read_private_file_with_link_contract_observed`: a document replaced by rename while it
+    /// is read reaches `fstat` with no links, which is the file the path used to name and not an
+    /// unsafe one, and the dashboard answered it as `config_file_unsafe` until the next read.
+    pub(super) fn open_private_log_file_observed(
+        path: &Path,
+        package_uid: u32,
+        maximum: usize,
+        append_only: bool,
+        mut between_open_and_stat: impl FnMut(usize),
+    ) -> BridgeResult<Option<(File, Vec<u8>)>> {
         let mut options = OpenOptions::new();
         options.read(true).custom_flags(NOFOLLOW_CLOEXEC);
-        let mut file = match options.open(path) {
-            Ok(file) => file,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
-            Err(_) => return Err(BridgeError::unsafe_runtime()),
+        let mut look = 0;
+        let (mut file, metadata) = loop {
+            let file = match options.open(path) {
+                Ok(file) => file,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+                Err(_) => return Err(BridgeError::unsafe_runtime()),
+            };
+            between_open_and_stat(look);
+            let metadata = file.metadata().map_err(|_| BridgeError::unsafe_runtime())?;
+            look += 1;
+            if metadata.st_nlink() == 0 && look < REPLACED_DURING_READ_LOOKS {
+                continue;
+            }
+            break (file, metadata);
         };
-        let metadata = file.metadata().map_err(|_| BridgeError::unsafe_runtime())?;
         if !metadata.file_type().is_file()
             || metadata.st_uid() != package_uid
             || metadata.st_mode() & 0o7777 != 0o600
@@ -13309,39 +13340,86 @@ mod linux_files {
         read_private_file_with_link_contract(path, package_uid, maximum, true)
     }
 
+    /// How many times a read looks again at a path whose file was replaced under it.
+    ///
+    /// One further look is enough in practice: the rename that replaced the file is already
+    /// complete when the descriptor's link count reads zero. Eight is a bound, not an
+    /// expectation, so a path that keeps being replaced cannot hold a reader forever.
+    const REPLACED_DURING_READ_LOOKS: usize = 8;
+
     fn read_private_file_with_link_contract(
         path: &Path,
         package_uid: u32,
         maximum: usize,
         require_single_link: bool,
     ) -> BridgeResult<Zeroizing<Vec<u8>>> {
-        let mut options = OpenOptions::new();
-        options.read(true).custom_flags(NOFOLLOW_CLOEXEC);
-        let mut file = options.open(path).map_err(|error| {
-            if error.kind() == io::ErrorKind::NotFound {
-                BridgeError::new(ErrorKind::Unavailable)
-            } else {
-                BridgeError::unsafe_runtime()
+        read_private_file_with_link_contract_observed(
+            path,
+            package_uid,
+            maximum,
+            require_single_link,
+            |_| {},
+        )
+    }
+
+    /// The read, with `between_open_and_stat` called after each open and before the descriptor
+    /// is inspected (with the zero-based look number), so a test can replace the file in exactly
+    /// the window where the race lives.
+    ///
+    /// A path that is atomically replaced (`rename(2)` over an existing file, which is how the
+    /// package commits `controller.starting`) leaves the file a reader already opened with no
+    /// links at all. Opening and then inspecting the descriptor is two steps, so a reader that
+    /// straddles the rename sees link count 0 on a file that was perfectly well formed a moment
+    /// earlier. That is not an unsafe file, it is a file that is no longer the one the path
+    /// names, and the remedy is to open the path again. Treating it as unsafe made the API
+    /// service refuse its own startup lease and exit, which the lifecycle script then reported
+    /// as `committed services failed to publish final readiness`.
+    ///
+    /// Only the single-link contract looks at the count, so only it looks again. A file that
+    /// still has no links after every look is refused exactly as before.
+    pub(super) fn read_private_file_with_link_contract_observed(
+        path: &Path,
+        package_uid: u32,
+        maximum: usize,
+        require_single_link: bool,
+        mut between_open_and_stat: impl FnMut(usize),
+    ) -> BridgeResult<Zeroizing<Vec<u8>>> {
+        let mut look = 0;
+        loop {
+            let mut options = OpenOptions::new();
+            options.read(true).custom_flags(NOFOLLOW_CLOEXEC);
+            let mut file = options.open(path).map_err(|error| {
+                if error.kind() == io::ErrorKind::NotFound {
+                    BridgeError::new(ErrorKind::Unavailable)
+                } else {
+                    BridgeError::unsafe_runtime()
+                }
+            })?;
+            between_open_and_stat(look);
+            let metadata = file.metadata().map_err(|_| BridgeError::unsafe_runtime())?;
+            look += 1;
+            if require_single_link && metadata.st_nlink() == 0 && look < REPLACED_DURING_READ_LOOKS
+            {
+                continue;
             }
-        })?;
-        let metadata = file.metadata().map_err(|_| BridgeError::unsafe_runtime())?;
-        if !metadata.file_type().is_file()
-            || metadata.st_uid() != package_uid
-            || metadata.st_mode() & 0o7777 != 0o600
-            || (require_single_link && metadata.st_nlink() != 1)
-            || metadata.len() > maximum as u64
-        {
-            return Err(BridgeError::unsafe_runtime());
+            if !metadata.file_type().is_file()
+                || metadata.st_uid() != package_uid
+                || metadata.st_mode() & 0o7777 != 0o600
+                || (require_single_link && metadata.st_nlink() != 1)
+                || metadata.len() > maximum as u64
+            {
+                return Err(BridgeError::unsafe_runtime());
+            }
+            let mut bytes = Zeroizing::new(Vec::with_capacity(metadata.len() as usize));
+            Read::by_ref(&mut file)
+                .take((maximum + 1) as u64)
+                .read_to_end(&mut bytes)
+                .map_err(|_| BridgeError::unsafe_runtime())?;
+            if bytes.len() > maximum || bytes.len() as u64 != metadata.len() {
+                return Err(BridgeError::unsafe_runtime());
+            }
+            return Ok(bytes);
         }
-        let mut bytes = Zeroizing::new(Vec::with_capacity(metadata.len() as usize));
-        Read::by_ref(&mut file)
-            .take((maximum + 1) as u64)
-            .read_to_end(&mut bytes)
-            .map_err(|_| BridgeError::unsafe_runtime())?;
-        if bytes.len() > maximum || bytes.len() as u64 != metadata.len() {
-            return Err(BridgeError::unsafe_runtime());
-        }
-        Ok(bytes)
     }
 
     fn read_optional_private_file(
@@ -13862,7 +13940,18 @@ pub(crate) fn main_entry() -> ExitCode {
             })();
             match result {
                 Ok(()) => ExitCode::SUCCESS,
-                Err(_) => ExitCode::FAILURE,
+                // The service's stderr is api.log. A startup that fails here used to leave
+                // nothing there, so the lifecycle script could say only that the services did
+                // not become ready, never why. The code is a fixed token: no path, argument or
+                // record content is echoed.
+                Err(error) => {
+                    let _ = writeln!(
+                        io::stderr(),
+                        "sdsync-dsm-api: supervised API service stopped: {}",
+                        resolved_error_code(error, None, None)
+                    );
+                    ExitCode::FAILURE
+                }
             }
         }
         #[cfg(not(target_os = "linux"))]
@@ -13896,7 +13985,16 @@ pub(crate) fn main_entry() -> ExitCode {
             })();
             match result {
                 Ok(()) => ExitCode::SUCCESS,
-                Err(_) => ExitCode::FAILURE,
+                // The controller's stderr is controller.log: the same reason as above, for the
+                // refusal that happens before the controller script is exec'd.
+                Err(error) => {
+                    let _ = writeln!(
+                        io::stderr(),
+                        "sdsync-dsm-api: supervised controller refused: {}",
+                        resolved_error_code(error, None, None)
+                    );
+                    ExitCode::FAILURE
+                }
             }
         }
         #[cfg(not(target_os = "linux"))]
@@ -21108,6 +21206,178 @@ mod tests {
             LongPollSlot::try_acquire().is_some(),
             "the lane must be reusable once its slots are released"
         );
+    }
+
+    /// A private directory for one test, removed when the guard drops.
+    #[cfg(target_os = "linux")]
+    struct ScratchDirectory(PathBuf);
+
+    #[cfg(target_os = "linux")]
+    impl ScratchDirectory {
+        fn new(label: &str) -> Self {
+            let dir = std::env::temp_dir().join(format!(
+                "sdsync-{label}-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            fs::create_dir_all(&dir).unwrap();
+            Self(dir)
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    impl Drop for ScratchDirectory {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn write_private_record(path: &Path, bytes: &[u8]) {
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(path)
+            .unwrap();
+        file.write_all(bytes).unwrap();
+    }
+
+    /// Replace `path` the way the lifecycle script commits `controller.starting`: write a
+    /// sibling, then `rename(2)` it over the old file.
+    #[cfg(target_os = "linux")]
+    fn replace_private_record(path: &Path, bytes: &[u8]) {
+        let sibling = path.with_extension("replacement");
+        let _ = fs::remove_file(&sibling);
+        write_private_record(&sibling, bytes);
+        fs::rename(&sibling, path).unwrap();
+    }
+
+    /// The race behind `committed services failed to publish final readiness`, made
+    /// deterministic.
+    ///
+    /// The API service polls `controller.starting` every 20 ms while the lifecycle script
+    /// replaces it once, with a rename, to commit. A read is an open and then an inspection of the
+    /// descriptor, so a poll that straddled the rename inspected the old file after it had lost
+    /// its last link: link count 0, refused as unsafe, the service exited, and the start failed
+    /// about one time in a few hundred on a loaded machine and never in isolation. The hook runs
+    /// in exactly that window.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_read_that_straddles_the_commit_rename_looks_again_instead_of_refusing() {
+        // SAFETY: geteuid has no pointer arguments or preconditions.
+        let uid = unsafe { libc::geteuid() };
+        let scratch = ScratchDirectory::new("commit-race");
+        let lease = scratch.0.join("controller.starting");
+        write_private_record(&lease, b"prepared\n");
+
+        let mut looks = Vec::new();
+        let read = linux_files::read_private_file_with_link_contract_observed(
+            &lease,
+            uid,
+            112,
+            true,
+            |look| {
+                looks.push(look);
+                if look == 0 {
+                    replace_private_record(&lease, b"committed\n");
+                }
+            },
+        )
+        .unwrap_or_else(|_| panic!("a read that straddled the rename must look again"));
+        assert_eq!(read.as_slice(), b"committed\n");
+        assert_eq!(looks, vec![0, 1], "exactly one further look");
+    }
+
+    /// The same read, replaced under it on every look: the retry is bounded and the file is
+    /// then refused exactly as a file with no links always was, so the loop cannot hold a
+    /// reader for ever and does not turn a genuinely unlinked file into an accepted one.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_path_that_keeps_being_replaced_is_refused_after_a_bounded_number_of_looks() {
+        // SAFETY: geteuid has no pointer arguments or preconditions.
+        let uid = unsafe { libc::geteuid() };
+        let scratch = ScratchDirectory::new("commit-race-bounded");
+        let lease = scratch.0.join("controller.starting");
+        write_private_record(&lease, b"prepared\n");
+
+        let mut looks = 0;
+        let refused = linux_files::read_private_file_with_link_contract_observed(
+            &lease,
+            uid,
+            112,
+            true,
+            |_| {
+                looks += 1;
+                replace_private_record(&lease, b"prepared\n");
+            },
+        );
+        assert!(refused.is_err(), "a path replaced on every look is refused");
+        assert_eq!(looks, 8, "the number of looks is bounded");
+    }
+
+    /// The other half of the same property: a file whose link count really is not one is still
+    /// refused at once, so the retry does not weaken the single-link contract it sits beside.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_hard_linked_record_is_still_refused_without_looking_again() {
+        // SAFETY: geteuid has no pointer arguments or preconditions.
+        let uid = unsafe { libc::geteuid() };
+        let scratch = ScratchDirectory::new("commit-race-linked");
+        let lease = scratch.0.join("controller.starting");
+        write_private_record(&lease, b"prepared\n");
+        fs::hard_link(&lease, scratch.0.join("alias")).unwrap();
+
+        let mut looks = 0;
+        let refused = linux_files::read_private_file_with_link_contract_observed(
+            &lease,
+            uid,
+            112,
+            true,
+            |_| looks += 1,
+        );
+        assert!(refused.is_err());
+        assert_eq!(looks, 1, "link count 2 is refused on the first look");
+    }
+
+    /// The dashboard's own document reads have the same window: the shell writes state documents
+    /// by renaming a new file over the old one, and a read that straddled it answered the whole
+    /// page's section as `config_file_unsafe` until the next read.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_document_replaced_while_it_is_read_is_read_again() {
+        // SAFETY: geteuid has no pointer arguments or preconditions.
+        let uid = unsafe { libc::geteuid() };
+        let scratch = ScratchDirectory::new("document-race");
+        let document = scratch.0.join("controller.state");
+        write_private_record(&document, b"state=running\n");
+
+        let mut looks = 0;
+        let read =
+            linux_files::open_private_log_file_observed(&document, uid, 1024, false, |look| {
+                looks += 1;
+                if look == 0 {
+                    replace_private_record(&document, b"state=stopped\n");
+                }
+            })
+            .unwrap_or_else(|_| panic!("a document replaced during the read must be read again"))
+            .expect("the document is present");
+        assert_eq!(read.1, b"state=stopped\n");
+        assert_eq!(looks, 2, "exactly one further look");
+
+        // A document that really has two links is refused on the first look.
+        fs::hard_link(&document, scratch.0.join("alias")).unwrap();
+        let mut looks = 0;
+        let refused =
+            linux_files::open_private_log_file_observed(&document, uid, 1024, false, |_| {
+                looks += 1
+            });
+        assert!(refused.is_err());
+        assert_eq!(looks, 1);
     }
 
     /// Both `--exec-supervised-core` layouts parse, and the flag is optional in both directions.
@@ -34646,6 +34916,29 @@ mod tests {
         .unwrap();
         let value: Value = serde_json::from_slice(&snapshot).unwrap();
         assert_eq!(value["package"]["version"], env!("SDSYNC_VERSION"));
+        // The installed build identity is the compiled-in target and the label the closed
+        // mapping gives it, never anything read from INFO. `arch` is JSON null, not absent, for
+        // a build that is not a package target, so the UI can tell "not a package build" from
+        // "an older bridge that reports neither".
+        assert_eq!(value["package"]["target"], BUILD.target);
+        assert_eq!(value["package"]["arch"], json!(BUILD.package_arch()));
+        assert_eq!(
+            value["package"].as_object().unwrap().len(),
+            3,
+            "package carries exactly version, target and arch"
+        );
+        // The shell manager's own `package` member, if it ever grew one, cannot pre-empt the
+        // compiled-in identity: the bridge overwrites it on both rungs.
+        let forged = parse_and_sanitize_manager_json(
+            br#"{"schema":"sdsync.dsm-api.v1","package":{"version":"0","target":"forged","arch":"armv8"}}"#,
+            &ReadAction::Snapshot,
+            None,
+            Some(&SecurityPolicyArgs::default()),
+        )
+        .unwrap();
+        let forged: Value = serde_json::from_slice(&forged).unwrap();
+        assert_eq!(forged["package"]["target"], BUILD.target);
+        assert_eq!(forged["package"]["version"], env!("SDSYNC_VERSION"));
         assert_eq!(value["capabilities"]["mutations"], true);
         assert_eq!(value["capabilities"]["private_queue"], true);
         assert_eq!(value["capabilities"]["request_reconciliation"], true);
