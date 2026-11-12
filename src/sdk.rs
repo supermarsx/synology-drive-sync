@@ -1503,7 +1503,7 @@ impl Engine {
                     racy: crate::pair_index::RacyWindows::for_host(),
                     clock_unbounded: Default::default(),
                 };
-                let (rebuilt, reconciliation_deferred, evidence) = reconciliation_plan(
+                let rebuilt = reconciliation_plan(
                     &client,
                     request,
                     &root,
@@ -1512,18 +1512,27 @@ impl Engine {
                     carry,
                     cancellation,
                 )?;
-                reconciliation = Some(ReconciliationSummary::from_report(&evidence));
-                merge_deferred(&mut deferred, reconciliation_deferred);
+                reconciliation = Some(ReconciliationSummary::from_report(&rebuilt.evidence));
+                merge_deferred(&mut deferred, rebuilt.deferred);
                 // The command line's rules exactly, so an embedding application cannot fail a run
                 // the CLI reports as a success, or the reverse.
-                sync::ensure_reconciled(
-                    &plan.source_root,
+                let verdict = sync::ensure_reconciled(
                     &plan,
-                    &rebuilt,
-                    started_at,
+                    &rebuilt.plan,
+                    sync::ReconcileObservations {
+                        root: &root,
+                        first_local: &local,
+                        first_remote: &remote,
+                        first_incomplete: &incomplete_directories,
+                        rebuilt_remote: &rebuilt.remote,
+                        rebuilt_incomplete: &rebuilt.incomplete_directories,
+                    },
                     &sync::DeferralIndex::from_records(&deferred),
                 )
                 .map_err(SdkError::from_core)?;
+                // A path the tree changed under while the run worked is named, as the CLI names
+                // it: a transient deferral the next run carries.
+                merge_deferred(&mut deferred, verdict.deferred);
             }
             emit(
                 cancellation,
@@ -1699,11 +1708,7 @@ fn reconciliation_plan(
     run_options: &PlanOptions,
     mut carry: crate::digest_evidence::PlanCarry<'_>,
     cancellation: &CancellationToken,
-) -> SdkResult<(
-    SyncPlan,
-    Vec<sync::DeferredPath>,
-    crate::digest_evidence::EvidenceReport,
-)> {
+) -> SdkResult<RebuiltPass> {
     check_cancellation(cancellation)?;
     let mut local =
         local::scan(&request.source, rules, cancellation).map_err(SdkError::from_core)?;
@@ -1760,7 +1765,24 @@ fn reconciliation_plan(
     );
     let named_in_plan = sync::deferrals_in_plan_skips(&plan, &deferred);
     deferred.extend(named_in_plan);
-    Ok((plan, deferred, evidence))
+    Ok(RebuiltPass {
+        plan,
+        deferred,
+        evidence,
+        remote,
+        incomplete_directories: scanned.incomplete_directories,
+    })
+}
+
+/// The reconciliation pass: its plan, and what `ensure_reconciled` compares with the run's own
+/// scan.
+struct RebuiltPass {
+    plan: SyncPlan,
+    deferred: Vec<sync::DeferredPath>,
+    evidence: crate::digest_evidence::EvidenceReport,
+    /// The pass's listing and its short folders.
+    remote: crate::api::RemoteInventory,
+    incomplete_directories: Vec<String>,
 }
 
 fn summarize_plan(plan: &SyncPlan) -> PlanSummary {

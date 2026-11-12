@@ -347,9 +347,8 @@ Rename.`
 exists again, or a kept deletion beneath a directory left it non-empty. `kept_deletes_uploaded` counts
 the files among those that the same run then uploaded, so the mirror converged rather than deferring
 to a later run; their bytes are included in `upload_bytes`. `changed_during_run` counts entries the
-post-run reconciliation pass still found, all of them local files modified after the run began — the
-destination matches the source as it was when the run started, which is the only instant a run can be
-asked about. `failed` is `true` when the run failed *after* performing the work these counts describe;
+post-run reconciliation pass still found that the run's first scan proves changed while the run
+worked; each is also among `deferred`, by name, as a transient deferral, so the run is partial. `failed` is `true` when the run failed *after* performing the work these counts describe;
 the document is emitted either way, because a run that uploaded nine hundred files and then could not
 reconcile has nine hundred uploads worth reporting. `server_copy_fallback_bytes` is the amount that may still be uploaded
 only when a planned server copy cannot be started; it is deliberately separate from
@@ -516,10 +515,13 @@ remote checksums failed with the same cause, so the NAS rather than these files 
 problem: <cause>; files: a, b, c", with the cause's own event reason. A fatal digest error names the
 remote file as a `(file "<remote path>")` suffix.
 
-Post-run reconciliation excuses, as `changed_during_run`, a local file modified after the run began,
-a local file deleted during a `--delete` run (when the run did not schedule that deletion and either
-wrote at or beneath the path or found the remote entry older than the run), anything related to a
-deferred path, and an mtime-only difference on a file this run wrote.
+Post-run reconciliation excuses anything related to a deferred path and an mtime-only difference on
+a file this run wrote. It names, as `changed_during_run` and as transient deferrals, only what the
+run's first scan proves changed while the run worked: a path the first walk did not hold (a file moved
+in keeps an old modification time), one whose local facts moved, one deleted locally, and a NAS entry
+that appeared, vanished or changed where the run did not write it. Everything else fails the run as
+`reconciliation_pending`, naming the first five operations with their action, path and cause; the
+first path is the failure's `path`.
 
 NDJSON uses a streaming contract rather than splitting the JSON object mechanically. Records are
 ordered as follows:

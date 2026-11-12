@@ -293,6 +293,27 @@ lists its own commits.
   Synology package build (<target>)`, and a package API that reports neither reads `Not reported by
   package API`. See [Compatibility](dsm/compatibility.md#four-release-spks).
 
+### Reconciliation, the index on a failed run, and Doctor (fix8-core)
+
+- **A file moved into the source while a run works no longer fails the run.** A move or a copy keeps
+  the file's old modification time, so reconciliation could not tell it from a file the run had
+  failed to upload, and the run failed with `final reconciliation found 1 pending in-scope
+  operations`, retried, and alerted. Reconciliation now judges what is left against the run's first
+  scan: a path the first walk did not hold, one whose local facts moved, one deleted locally, and a
+  NAS entry another hand changed are named as transient deferrals (`source-changed`,
+  `source-vanished`, `remote-changed`). The run is partial (exit `3`), raises no alert, and the next
+  run carries them. A modification time after the run began no longer excuses anything by itself.
+  See [Comparison, exclusions, and deletion](configuration/safety.md).
+- **A reconciliation failure names its paths.** It used to give only a count, which also included
+  entries it had excused, and advised inspecting a fresh plan that no longer showed them. The
+  message now counts only the unconverged operations and names the first five with action, path and
+  cause, for example `final reconciliation did not converge on 1 in-scope path(s): upload
+  docs/a.pdf (in the first scan, unchanged since, and the NAS still differs)`. The first path is the
+  result record's `error.path` and the `run.failed` event's `path`, and each named path is logged as
+  an `entry.skipped` warning with reason `reconciliation_pending`. Exit `1` is kept for a deletion
+  the run made that did not take, a write the NAS still disagrees with, a path in the first scan
+  that still differs, an unresolved type conflict or rename, and a missing destination root.
+
 ## Read this before upgrading
 
 - **Rust 1.90 or newer is needed to build from source** (was 1.88). The verified-pair index uses redb

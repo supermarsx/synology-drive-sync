@@ -855,7 +855,7 @@
           "$ref": "#/$defs/nonNegativeInteger"
         },
         "changed_during_run": {
-          "description": "Entries the post-run reconciliation pass still found, all of them local files modified after the run began. The destination matches the source as it was when the run started, which is the only instant a run can be asked about.",
+          "description": "Entries the post-run reconciliation pass still found that the run's first scan proves changed while the run worked (a path the first walk did not hold, local facts that moved, a local deletion, or a NAS entry another hand changed). Each is also in `deferred`, by name, as a transient deferral, so the run is partial.",
           "$ref": "#/$defs/nonNegativeInteger"
         },
         "failed": {

@@ -176,12 +176,23 @@ disagrees makes the same pass verify every pair live and is named (`reconcile-ca
 What this gives up is a NAS content change during the run that leaves size, mtime and change time all
 unchanged, which a write through the kernel cannot do; when the NAS reports no change time, a
 same-size, same-mtime rewrite by another writer during the run is seen by the next run instead.
-`--reconcile full` (command line only) restores the exhaustive pass. A file written locally *while
-the run was working* is the exception: the run was never going to
-carry bytes that did not exist when it read the tree, so an entry whose local modification time is
-after the run's start instant is reported under `changed_during_run` and the run succeeds. Anything
-else -- a remaining deletion, a remaining server copy, or an upload of a file older than the run --
-is still a failure, because those mean the run did not do what it planned.
+`--reconcile full` (command line only) restores the exhaustive pass.
+
+Reconciliation judges what is left against the run's **first scan**, never against a clock. A path
+the first walk did not hold (written, or moved or copied in while the run worked, which keeps an old
+modification time), a path whose local kind, size, modification time or file identity moved since
+the first walk, a path deleted locally while the run worked, and a NAS entry that appeared, vanished
+or changed since the first listing where this run did not write, delete or rename it (and both
+listings were whole there) changed while the run worked. Each is counted in `changed_during_run`
+and named as a transient deferral (`source-changed`, `source-vanished` or `remote-changed`): the run
+is partial (exit `3`), no alert is raised, and the next run carries it. Anything else is still a
+failure (exit `1`), because it means the run did not do what it planned: a deletion this run made
+that did not take, a write this run made that the NAS still disagrees with, a path in the first scan,
+unchanged since, whose NAS copy still differs, a type conflict or case-only rename left unresolved,
+and a missing destination root. The failure names the first five operations with their action, path
+and cause (`upload docs/a.pdf (in the first scan, unchanged since, and the NAS still differs)`),
+counts only those that nothing excused, and puts the first path in the result record's `error.path`;
+each named path is also logged as an `entry.skipped` warning with reason `reconciliation_pending`.
 
 A run that fails after performing some of its work still reports that work. The plan and the counts
 of what completed are printed before the failure is returned, and the machine-readable result carries

@@ -1565,7 +1565,7 @@ fn write_sync_batch_output_to<W: Write>(writer: &mut W, render: SyncBatchRender<
                     if completion.changed_during_run > 0 {
                         writeln!(
                             writer,
-                            "{} local file(s) were written while the run was working and are not on the NAS yet.",
+                            "{} path(s) changed while the run was working; each is named below and carried by the next run.",
                             completion.changed_during_run,
                         )
                         .map_err(output_error)?;
@@ -1763,8 +1763,8 @@ fn changes_completion(changes: bool, cancelled: bool, changes_exit_code: bool) -
 #[derive(Clone, Debug, Default)]
 struct SyncCompletion {
     report: ExecutionReport,
-    /// Entries the rebuilt plan still held, all of them explained by the local tree changing while
-    /// the run worked: files written after it began, or deleted while it was working.
+    /// Entries the rebuilt plan still held that the first scan proves changed while the run
+    /// worked. Each is also among [`Self::deferred`], by name, as a transient deferral.
     changed_during_run: usize,
     /// True when the run failed after performing some of this work.
     failed: bool,
@@ -2137,7 +2137,7 @@ fn write_resync_output_to<W: Write>(
                 if completion.changed_during_run > 0 {
                     writeln!(
                         writer,
-                        "{} local file(s) were written while the run was working and are not on the NAS yet.",
+                        "{} path(s) changed while the run was working; each is named below and carried by the next run.",
                         completion.changed_during_run,
                     )
                     .map_err(output_error)?;
@@ -2839,8 +2839,8 @@ fn prepare_and_run_sync_reporting(
     plan_out: &mut Option<SyncPlan>,
     completion_out: &mut Option<SyncCompletion>,
 ) -> Result<()> {
-    // Read before the first scan, so "was this written while the run was working" has an answer that
-    // predates every observation the run made.
+    // Read before the first scan: the carry's racy rule and the canary's seed date from an instant
+    // that predates every observation the run made.
     let started_at = std::time::SystemTime::now();
     cancellation.check()?;
     let root = RemoteRoot::parse(&settings.remote)?;
@@ -3280,7 +3280,7 @@ fn prepare_and_run_sync_reporting(
             clock_unbounded: Default::default(),
         });
         let carrying = carry.is_some();
-        let (reconciliation, reconciliation_deferred, evidence) = build_reconciliation_plan(
+        let rebuilt = build_reconciliation_plan(
             &client,
             settings,
             &root,
@@ -3295,6 +3295,13 @@ fn prepare_and_run_sync_reporting(
             },
             cancellation,
         )?;
+        let RebuiltPlan {
+            plan: reconciliation,
+            deferred: reconciliation_deferred,
+            evidence,
+            remote: rebuilt_remote,
+            incomplete_directories: rebuilt_incomplete,
+        } = rebuilt;
         let completion = completion_out
             .as_mut()
             .expect("the completion was recorded before reconciliation");
@@ -3311,14 +3318,30 @@ fn prepare_and_run_sync_reporting(
         // A file that could not be re-read for reconciliation is not proven converged. It is named
         // like any other deferral rather than failing a run whose work was verified piece by piece.
         completion.add_deferred(reconciliation_deferred);
-        let verdict = sync::ensure_reconciled(
-            &plan.source_root,
+        let verdict = match sync::ensure_reconciled(
             plan,
             &reconciliation,
-            started_at,
+            sync::ReconcileObservations {
+                root: &root,
+                first_local: &local,
+                first_remote: &remote,
+                first_incomplete: &incomplete_directories,
+                rebuilt_remote: &rebuilt_remote,
+                rebuilt_incomplete: &rebuilt_incomplete,
+            },
             &sync::DeferralIndex::from_records(&completion.deferred),
-        )?;
+        ) {
+            Ok(verdict) => verdict,
+            Err(error) => {
+                log_reconciliation_pending(&settings.output, logger.as_ref(), profile, &error);
+                return Err(error);
+            }
+        };
+        drop(rebuilt_remote);
         completion.changed_during_run = verdict.changed_during_run;
+        // Each path the tree changed under is named, as a transient deferral: the run is partial
+        // and the next run carries it.
+        completion.add_deferred(verdict.deferred);
         cancellation.check()?;
         if let Some(session) = index_session.take() {
             index_report = Some(session.commit(Some(&local), Some(&touched), scope.is_root()));
@@ -3884,7 +3907,7 @@ fn build_reconciliation_plan(
     run_options: &PlanOptions,
     inputs: ReconcileInputs<'_, '_>,
     cancellation: &CancellationToken,
-) -> Result<(SyncPlan, Vec<DeferredPath>, EvidenceReport)> {
+) -> Result<RebuiltPlan> {
     cancellation.check()?;
     // Reconciliation re-asks the question the run just answered, so it must cover exactly the
     // same scope. A whole-tree reconciliation after a scoped run would report every out-of-scope
@@ -3972,7 +3995,71 @@ fn build_reconciliation_plan(
     let named_in_plan = sync::deferrals_in_plan_skips(&plan, &deferred);
     deferred.extend(named_in_plan);
     cancellation.check()?;
-    Ok((plan, deferred, evidence))
+    Ok(RebuiltPlan {
+        plan,
+        deferred,
+        evidence,
+        remote,
+        incomplete_directories: scanned.incomplete_directories,
+    })
+}
+
+/// The reconciliation pass: its plan, and what `ensure_reconciled` compares with the first scan.
+struct RebuiltPlan {
+    plan: SyncPlan,
+    deferred: Vec<DeferredPath>,
+    evidence: EvidenceReport,
+    /// The pass's listing, kept until the verdict: a NAS entry that appeared, vanished or changed
+    /// since the run's own listing is a change made while the run worked.
+    remote: api::RemoteInventory,
+    incomplete_directories: Vec<String>,
+}
+
+/// Name every operation reconciliation could not excuse: one warning record per named path, with
+/// its action and cause on standard error. The failure itself is logged as `run.failed`, whose
+/// `path` is the first of them.
+fn log_reconciliation_pending(
+    output: &config::ResolvedOutput,
+    logger: Option<&Arc<EventLogger>>,
+    profile: &str,
+    error: &Error,
+) {
+    let Error::ReconciliationPending { operations, named } = error else {
+        return;
+    };
+    for operation in named {
+        if !output.quiet {
+            eprintln!(
+                "warning: final reconciliation: {} {:?} did not converge: {}",
+                operation.action,
+                if operation.relative.is_empty() {
+                    "."
+                } else {
+                    operation.relative.as_str()
+                },
+                operation.cause
+            );
+        }
+        let event = LogEvent::new(EventLogLevel::Warn, EventCode::EntrySkipped)
+            .reason(EventReason::ReconciliationPending)
+            .profile(profile)
+            .path(if operation.relative.is_empty() {
+                "."
+            } else {
+                operation.relative.as_str()
+            });
+        // The run is already failing with this error; a log write that also fails is named on
+        // standard error rather than replacing the cause the operator needs.
+        if let Err(log_error) = log_event(logger, event)
+            && !output.quiet
+        {
+            eprintln!("warning: could not log a pending reconciliation path: {log_error}");
+        }
+    }
+    let unnamed = operations.saturating_sub(named.len());
+    if unnamed > 0 && !output.quiet {
+        eprintln!("warning: final reconciliation: {unnamed} more operation(s) did not converge");
+    }
 }
 fn run_doctor(settings: config::ResolvedDoctor, record: Option<&Path>) -> Result<ExitCode> {
     let cancellation = attach_progress_record(
@@ -8289,7 +8376,7 @@ fn write_completion_human_to<W: Write>(
     if completion.changed_during_run > 0 {
         writeln!(
             writer,
-            "{} local file(s) were written while the run was working and are not on the NAS yet; the destination matches the source as it was when the run began.",
+            "{} path(s) changed while the run was working; each is named below and carried by the next run.",
             completion.changed_during_run,
         )
         .map_err(output_error)?;
@@ -12180,17 +12267,9 @@ mod tests {
     /// An empty rebuilt plan is convergence, and a create the run should have performed is not.
     #[test]
     fn final_reconciliation_rejects_any_remaining_in_scope_action() {
-        let absent = std::env::temp_dir().join(format!(
-            "sdsync-reconcile-absent-{}-{:?}",
-            std::process::id(),
-            std::thread::current().id()
-        ));
-        let now = std::time::SystemTime::now();
         assert_eq!(
-            reconcile(&absent, &empty_plan(), &empty_plan(), now).unwrap(),
-            sync::Reconciliation {
-                changed_during_run: 0
-            }
+            reconcile(&empty_plan(), &empty_plan(), &first_scan_of(&empty_plan())).unwrap(),
+            sync::Reconciliation::default()
         );
         let mut pending = empty_plan();
         pending.creates.push(plan::CreateAction {
@@ -12198,32 +12277,102 @@ mod tests {
             remote_path: "/share/root/late".to_owned(),
             reason: plan::ChangeReason::MissingRemote,
         });
-        // The directory does not exist locally, so nothing dates it to after the run began and the
-        // only honest answer is that convergence was not established.
-        assert!(matches!(
-            reconcile(&absent, &empty_plan(), &pending, now),
-            Err(Error::ReconciliationPending { operations: 1 })
-        ));
+        // The directory was in the first walk and the NAS lacked it then and lacks it now: the
+        // run did not do what it planned, and nothing about the tree explains it.
+        let error = reconcile(&empty_plan(), &pending, &first_scan_of(&pending)).unwrap_err();
+        assert!(
+            matches!(&error, Error::ReconciliationPending { operations: 1, named } if named[0].relative == "late"),
+            "{error}"
+        );
+        assert_eq!(error_exit_code(&error), 1);
+    }
+
+    /// The first scan a run took, as reconciliation compares with it.
+    struct FirstScan {
+        root: RemoteRoot,
+        local: local::LocalInventory,
+        remote: api::RemoteInventory,
+        rebuilt_remote: api::RemoteInventory,
+    }
+
+    /// The scans of a tree that did not change while the run worked: the first walk holds every
+    /// local entry `rebuilt` names, with the facts it names them by, and neither NAS listing holds
+    /// anything.
+    fn first_scan_of(rebuilt: &SyncPlan) -> FirstScan {
+        let mut entries = BTreeMap::new();
+        for action in &rebuilt.uploads {
+            entries.insert(action.local.relative.clone(), action.local.clone());
+        }
+        for action in &rebuilt.copies {
+            entries.insert(action.to_relative.clone(), action.local.clone());
+        }
+        for relative in rebuilt
+            .creates
+            .iter()
+            .map(|action| &action.relative)
+            .chain(rebuilt.renames.iter().map(|action| &action.relative))
+        {
+            let mut directory = local_entry_modified_at(relative, 1_700_000_000_000);
+            directory.kind = local::EntryKind::Directory;
+            entries.insert(relative.clone(), directory);
+        }
+        // A type conflict: the local entry is the other kind.
+        for action in &rebuilt.pre_deletes {
+            let mut other = local_entry_modified_at(&action.local_relative, 1_700_000_000_000);
+            if action.kind == local::EntryKind::File {
+                other.kind = local::EntryKind::Directory;
+            }
+            entries.insert(action.local_relative.clone(), other);
+        }
+        let empty = || api::RemoteInventory {
+            root_exists: true,
+            entries: BTreeMap::new(),
+        };
+        FirstScan {
+            root: RemoteRoot::parse("/share/root").unwrap(),
+            local: local::LocalInventory {
+                root: std::path::PathBuf::from("/srv/exports"),
+                entries,
+                skipped: Vec::new(),
+            },
+            remote: empty(),
+            rebuilt_remote: empty(),
+        }
     }
 
     /// The shared verdict with nothing deferred, as most of these tests want it.
     fn reconcile(
-        source_root: &Path,
         executed: &SyncPlan,
         rebuilt: &SyncPlan,
-        started_at: std::time::SystemTime,
+        first: &FirstScan,
     ) -> Result<sync::Reconciliation> {
         sync::ensure_reconciled(
-            source_root,
             executed,
             rebuilt,
-            started_at,
+            sync::ReconcileObservations {
+                root: &first.root,
+                first_local: &first.local,
+                first_remote: &first.remote,
+                first_incomplete: &[],
+                rebuilt_remote: &first.rebuilt_remote,
+                rebuilt_incomplete: &[],
+            },
             &sync::DeferralIndex::default(),
         )
     }
 
-    /// A file written locally *during* the run is convergence as of the instant the run began, and
-    /// the only instant a run can be asked about.
+    fn upload_of(local: local::LocalEntry) -> plan::UploadAction {
+        plan::UploadAction {
+            remote_path: format!("/share/root/{}", local.relative),
+            local,
+            reason: plan::ChangeReason::MissingRemote,
+            expected_remote: None,
+        }
+    }
+
+    /// A file written locally *during* the run (it was in the first walk with older facts) is
+    /// named as a change during the run, a transient deferral the next run carries, never a
+    /// failure.
     ///
     /// This was the most reachable failure in the engine. The reconciliation scan happens minutes to
     /// hours after the first one, so a scheduled sync of a working directory failed whenever a build
@@ -12231,57 +12380,92 @@ mod tests {
     /// planned operation verified, every mutation performed, exit 1, and a monitoring system
     /// reporting a failed backup for a backup that worked.
     #[test]
-    fn a_file_written_during_the_run_is_converged_as_of_the_runs_start() {
-        let started_at = std::time::SystemTime::now() - Duration::from_secs(60);
-        let mut plan = empty_plan();
-        plan.uploads.push(plan::UploadAction {
-            local: local_entry_modified_at(
-                "late.log",
-                i64::try_from(
-                    std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap()
-                        .as_millis(),
-                )
-                .unwrap(),
-            ),
-            remote_path: "/share/root/late.log".to_owned(),
-            reason: plan::ChangeReason::MissingRemote,
-            expected_remote: None,
-        });
+    fn a_file_written_during_the_run_is_a_named_transient_deferral() {
+        let mut rebuilt = empty_plan();
+        rebuilt.uploads.push(upload_of(local_entry_modified_at(
+            "late.log",
+            1_700_000_090_000,
+        )));
+        let mut first = first_scan_of(&empty_plan());
+        first.local.entries.insert(
+            "late.log".to_owned(),
+            local_entry_modified_at("late.log", 1_700_000_000_000),
+        );
 
-        let verdict = reconcile(Path::new("."), &empty_plan(), &plan, started_at)
+        let verdict = reconcile(&empty_plan(), &rebuilt, &first)
             .expect("a file written during the run must not fail the run");
 
-        assert_eq!(
-            verdict,
-            sync::Reconciliation {
-                changed_during_run: 1
-            }
+        assert_eq!(verdict.changed_during_run, 1);
+        assert_eq!(verdict.deferred.len(), 1);
+        assert_eq!(verdict.deferred[0].relative, "late.log");
+        assert_eq!(verdict.deferred[0].reason, sync::DeferReason::SourceChanged);
+        assert!(!verdict.deferred[0].reason.is_lasting());
+    }
+
+    /// The field failure behind "final reconciliation found 1 pending in-scope operations": a file
+    /// moved or copied into the source while the run worked keeps its old modification time, so
+    /// the run could not tell it from one it had failed to upload. Absent from the first walk, it
+    /// provably changed after the run planned: named, and carried by the next run.
+    #[test]
+    fn a_file_moved_in_with_an_old_mtime_during_the_run_is_a_named_transient_deferral() {
+        let mut rebuilt = empty_plan();
+        rebuilt.uploads.push(upload_of(local_entry_modified_at(
+            "inbox/moved.pdf",
+            1_600_000_000_000,
+        )));
+
+        let verdict = reconcile(&empty_plan(), &rebuilt, &first_scan_of(&empty_plan()))
+            .expect("a file moved in during the run is not a failure");
+
+        assert_eq!(verdict.deferred.len(), 1);
+        assert_eq!(verdict.deferred[0].relative, "inbox/moved.pdf");
+        assert_eq!(verdict.deferred[0].reason, sync::DeferReason::SourceChanged);
+        assert!(
+            verdict.deferred[0]
+                .detail
+                .contains("not in the run's first scan"),
+            "{}",
+            verdict.deferred[0].detail
         );
     }
 
-    /// A file that predates the run, still missing remotely, means the run did not do what it
-    /// planned. That is the case reconciliation exists for and it stays a failure.
+    /// A file that was in the first walk, has not changed since, and is still missing remotely
+    /// means the run did not do what it planned. That is the case reconciliation exists for: it
+    /// stays a failure, and the failure names the path and the cause wherever it is reported.
     #[test]
-    fn a_file_older_than_the_run_that_is_still_missing_remains_a_failure() {
-        let started_at = std::time::SystemTime::now();
-        let mut plan = empty_plan();
-        plan.uploads.push(plan::UploadAction {
-            local: local_entry_modified_at("early.bin", 1_700_000_000_000),
-            remote_path: "/share/root/early.bin".to_owned(),
-            reason: plan::ChangeReason::MissingRemote,
-            expected_remote: None,
-        });
+    fn a_file_in_the_first_scan_that_is_still_missing_remains_a_named_failure() {
+        let mut rebuilt = empty_plan();
+        rebuilt.uploads.push(upload_of(local_entry_modified_at(
+            "early.bin",
+            1_700_000_000_000,
+        )));
 
-        assert!(matches!(
-            reconcile(Path::new("."), &empty_plan(), &plan, started_at),
-            Err(Error::ReconciliationPending { operations: 1 })
-        ));
+        let error = reconcile(&empty_plan(), &rebuilt, &first_scan_of(&rebuilt)).unwrap_err();
+
+        assert_eq!(error_exit_code(&error), 1);
+        assert_eq!(
+            error.to_string(),
+            "final reconciliation did not converge on 1 in-scope path(s): upload early.bin (in \
+             the first scan, unchanged since, and the NAS still differs)"
+        );
+        assert_eq!(
+            failure_path(&error, Some(Path::new("/srv/exports"))).as_deref(),
+            Some("early.bin")
+        );
+        let record = failure_record(&error, Path::new("/srv/exports"));
+        assert_eq!(record["code"], "reconciliation_pending");
+        assert_eq!(record["path"], "early.bin");
+        assert!(
+            record["detail"]
+                .as_str()
+                .unwrap()
+                .contains("upload early.bin"),
+            "{record}"
+        );
     }
 
     /// A deletion this run scheduled, still pending afterwards, means the delete did not take.
-    /// That stays a failure however recently anything was touched.
+    /// That stays a failure, by name, however recently anything was touched.
     #[test]
     fn a_remaining_deletion_the_run_scheduled_is_never_excused() {
         let mut plan = empty_plan();
@@ -12301,30 +12485,26 @@ mod tests {
             destination_guard: None,
         });
 
-        assert!(matches!(
-            reconcile(
-                Path::new("."),
-                &plan,
-                &plan,
-                std::time::SystemTime::now() - Duration::from_secs(600)
-            ),
-            Err(Error::ReconciliationPending { operations: 1 })
-        ));
+        let error = reconcile(&plan, &plan, &first_scan_of(&plan)).unwrap_err();
+        assert_eq!(error_exit_code(&error), 1);
+        assert!(
+            error
+                .to_string()
+                .contains("delete extra (this run deleted it and the NAS still holds it)"),
+            "{error}"
+        );
     }
 
     /// N-4: a file the run uploaded and the user then deleted locally is remote-only afterwards.
-    /// The run's own plan proves it existed when the tree was read, so it is a change made while
-    /// the run worked, not a failure.
+    /// It was in the run's first walk, so it is a deletion made while the run worked: named as
+    /// `source-vanished`, which the next run mirrors, not a failure.
     #[test]
     fn a_file_deleted_locally_after_its_upload_is_a_change_during_the_run() {
-        let started_at = std::time::SystemTime::now();
         let mut executed = empty_plan();
-        executed.uploads.push(plan::UploadAction {
-            local: local_entry_modified_at("build/output.tmp", 1_700_000_000_000),
-            remote_path: "/share/root/build/output.tmp".to_owned(),
-            reason: plan::ChangeReason::MissingRemote,
-            expected_remote: None,
-        });
+        executed.uploads.push(upload_of(local_entry_modified_at(
+            "build/output.tmp",
+            1_700_000_000_000,
+        )));
         let mut rebuilt = empty_plan();
         rebuilt.post_deletes.push(plan::DeleteAction {
             relative: "build/output.tmp".to_owned(),
@@ -12342,11 +12522,12 @@ mod tests {
             destination_guard: None,
         });
 
+        let verdict = reconcile(&executed, &rebuilt, &first_scan_of(&executed)).unwrap();
+        assert_eq!(verdict.changed_during_run, 1);
+        assert_eq!(verdict.deferred[0].relative, "build/output.tmp");
         assert_eq!(
-            reconcile(Path::new("."), &executed, &rebuilt, started_at).unwrap(),
-            sync::Reconciliation {
-                changed_during_run: 1
-            }
+            verdict.deferred[0].reason,
+            sync::DeferReason::SourceVanished
         );
     }
 
@@ -12354,33 +12535,38 @@ mod tests {
     /// is not a second failure.
     #[test]
     fn a_deferred_path_is_excused_by_reconciliation() {
-        let started_at = std::time::SystemTime::now();
         let mut rebuilt = empty_plan();
         rebuilt.uploads.push(plan::UploadAction {
-            local: local_entry_modified_at("mail/outlook.pst", 1_700_000_000_000),
-            remote_path: "/share/root/mail/outlook.pst".to_owned(),
             reason: plan::ChangeReason::SizeDiffers,
-            expected_remote: None,
+            ..upload_of(local_entry_modified_at(
+                "mail/outlook.pst",
+                1_700_000_000_000,
+            ))
         });
+        let first = first_scan_of(&rebuilt);
         let mut deferred = sync::DeferralIndex::default();
         deferred.insert("mail/outlook.pst", sync::DeferReason::SourceChanged);
 
         assert_eq!(
             sync::ensure_reconciled(
-                Path::new("."),
                 &empty_plan(),
                 &rebuilt,
-                started_at,
+                sync::ReconcileObservations {
+                    root: &first.root,
+                    first_local: &first.local,
+                    first_remote: &first.remote,
+                    first_incomplete: &[],
+                    rebuilt_remote: &first.rebuilt_remote,
+                    rebuilt_incomplete: &[],
+                },
                 &deferred
             )
             .unwrap(),
-            sync::Reconciliation {
-                changed_during_run: 0
-            }
+            sync::Reconciliation::default()
         );
         assert!(matches!(
-            reconcile(Path::new("."), &empty_plan(), &rebuilt, started_at),
-            Err(Error::ReconciliationPending { operations: 1 })
+            reconcile(&empty_plan(), &rebuilt, &first),
+            Err(Error::ReconciliationPending { operations: 1, .. })
         ));
     }
 
@@ -12432,15 +12618,13 @@ mod tests {
             "2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a"
         );
 
-        assert!(matches!(
-            reconcile(
-                Path::new("."),
-                &empty_plan(),
-                &plan,
-                std::time::SystemTime::now()
-            ),
-            Err(Error::ReconciliationPending { operations: 5 })
-        ));
+        // Nothing changed under the run (the first scan holds every path as the rebuild found
+        // it), so all five are unconverged; the first five are named.
+        let error = reconcile(&empty_plan(), &plan, &first_scan_of(&plan)).unwrap_err();
+        assert!(
+            matches!(&error, Error::ReconciliationPending { operations: 5, named } if named.len() == 5),
+            "{error}"
+        );
         assert_eq!(
             json_object_keys(&value["actions"]["creates"][0]),
             BTreeSet::from(["reason", "relative", "remote_path"])
@@ -13183,7 +13367,7 @@ mod tests {
         // The three conditional lines, each printed only when it happened. A zero would read as a
         // warning about nothing on every run, and a failure must not read as a completed sync.
         assert!(!completed.contains("planned deletion(s) were kept"));
-        assert!(!completed.contains("were written while the run was working"));
+        assert!(!completed.contains("changed while the run was working"));
         let eventful = rendered_human(sync_output(
             &plan,
             Some(&SyncCompletion {
@@ -13220,7 +13404,7 @@ mod tests {
             "{eventful}"
         );
         assert!(
-            eventful.contains("3 local file(s) were written while the run was working"),
+            eventful.contains("3 path(s) changed while the run was working"),
             "{eventful}"
         );
         let unchanged = rendered_human(sync_output(

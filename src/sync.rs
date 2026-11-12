@@ -3461,14 +3461,34 @@ pub fn withhold_deletions_in_incomplete_listings(
 }
 
 /// What a post-execution reconciliation pass established.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct Reconciliation {
-    /// Entries the rebuilt plan holds that are explained by the tree changing while the run worked:
-    /// a local file written after the run began, or a local file deleted while it was working.
-    ///
-    /// Converged as of the instant the run started, which is the only instant a run can be asked
-    /// about. Zero on the ordinary path.
+    /// How many entries of the rebuilt plan are explained by the tree changing while the run
+    /// worked, each one proven against the run's first scan. Zero on the ordinary path.
     pub changed_during_run: usize,
+    /// Those entries, by name: transient deferrals (`source-changed`, `source-vanished` or
+    /// `remote-changed`), so the run is partial and the next run carries them.
+    pub deferred: Vec<DeferredPath>,
+}
+
+/// What the run saw before it planned, and what the reconciliation pass saw after it worked.
+///
+/// The first scan is the only evidence that can tell "the tree changed while the run worked" from
+/// "the run did not do what it planned": a path the first walk or listing did not hold, or held
+/// with other facts, changed after the run planned, whatever its modification time says.
+#[derive(Clone, Copy)]
+pub struct ReconcileObservations<'scan> {
+    pub root: &'scan RemoteRoot,
+    /// The run's own walk, as the plan used it (paths it withheld are among its skips).
+    pub first_local: &'scan LocalInventory,
+    /// The run's own listing, as the plan used it.
+    pub first_remote: &'scan RemoteInventory,
+    /// Folders the first listing returned short, `""` for the root.
+    pub first_incomplete: &'scan [String],
+    /// The reconciliation pass's listing.
+    pub rebuilt_remote: &'scan RemoteInventory,
+    /// Folders the reconciliation listing returned short.
+    pub rebuilt_incomplete: &'scan [String],
 }
 
 /// Plan options for the reconciliation pass, which observes and never acts.
@@ -3503,54 +3523,131 @@ pub fn reconciliation_options(run: &PlanOptions, compare: CompareMode) -> PlanOp
 /// Shared by the command line and the SDK, so an embedding application cannot fail a run the CLI
 /// reports as a success, or the reverse.
 ///
-/// Requiring the rebuilt plan to be **empty** made this the most reachable failure in the engine.
-/// The rebuild is a second full local scan taken minutes to hours after the first, so any file
-/// written locally in between appears in it. The question a run can answer is "is the destination
-/// what the source was when I started", so an entry is excused when:
+/// The rebuild is a second full scan taken minutes to hours after the first, so it sees whatever
+/// changed in between. An entry of the rebuilt plan is **excused** when it is, lies beneath, or
+/// holds a path this run deferred by name, or when it is a re-upload, for its modification time
+/// alone, of a file this run wrote and verified (DSM did not keep the time it was sent; reported
+/// as `mtime_not_kept`).
 ///
-/// - it is, lies beneath, or holds a path this run **deferred** by name. It is already reported,
-///   with its reason, and the next run plans it afresh.
-/// - it is an upload, or a copy, of a local file whose modification time is after `started_at`:
-///   this run was never going to carry those bytes.
-/// - it is a create of a directory whose modification time is after `started_at`.
-/// - it is a re-upload, for its modification time alone, of a file this run itself wrote and
-///   verified by size and digest: DSM did not keep the time the run sent. That is reported as
-///   `mtime_not_kept`, not as a failure to converge.
-/// - it is a deletion of a remote entry that **this run did not schedule for deletion**, while
-///   either the run itself uploaded or created at or beneath that path, or the remote entry
-///   predates `started_at`. With deletion enabled, the run's own plan proves the path existed
-///   locally when the run read the tree — otherwise the run would have deleted it — so it is a
-///   local deletion made while the run was working.
+/// An entry is **changed during the run** only when the first scan proves it: the path was not in
+/// the first walk (written, moved or copied in while the run worked, which keeps an old
+/// modification time), its local facts (kind, size, modification time, file identity) moved since
+/// the first walk, it was in the first walk and is gone now (a local deletion), or its NAS entry
+/// appeared, vanished or changed since the first listing where this run neither wrote, deleted nor
+/// renamed it and both listings were complete there. Each is returned as a named transient
+/// deferral: the run is partial (exit 3) and the next run carries it. A modification time after
+/// the run began proves nothing by itself: a clock ahead of the host's would have excused a file
+/// the run never converged.
 ///
-/// Everything else is still a failure, and deliberately: a deletion this run scheduled that did
-/// not take, an upload of a file older than `started_at` that the destination still disagrees
-/// with, a type conflict, a missing destination root.
+/// Everything else is [`Error::ReconciliationPending`], naming the first paths with their action
+/// and cause, and counting only these: a deletion this run made that did not take, a write this
+/// run made that the destination still disagrees with, a path in the first scan, unchanged since,
+/// whose destination still differs, a type conflict or rename the run did not resolve, and a
+/// missing destination root.
 pub fn ensure_reconciled(
-    source_root: &std::path::Path,
     executed: &SyncPlan,
     rebuilt: &SyncPlan,
-    started_at: std::time::SystemTime,
+    observed: ReconcileObservations<'_>,
     deferred: &DeferralIndex,
 ) -> Result<Reconciliation> {
     if rebuilt.is_empty() {
         return Ok(Reconciliation::default());
     }
-    let pending = || reconciliation_pending(rebuilt);
-    let mut changed_during_run = 0;
     // Indexed once. Asked per rebuilt action, a scan of the executed plan made reconciliation
     // quadratic in exactly the case it is most needed for: a DSM that does not keep upload times
     // rebuilds a plan holding every upload the run made.
     let written = ExecutedWrites::index(executed);
-    // A rename the run could not make is named; one it did not plan is pending like anything else.
+    let first = FirstScan::index(observed, executed);
+    let mut verdict = Verdict::default();
     for action in &rebuilt.renames {
-        if !deferred.relates_to(&action.relative) {
-            return Err(pending());
+        if deferred.relates_to(&action.relative) {
+            continue;
+        }
+        if written.renamed(&action.from_relative) {
+            verdict.pending("rename", &action.relative, CAUSE_RENAME_NOT_TAKEN);
+        } else if first.local_absent(&action.relative) {
+            verdict.changed(&action.relative, ChangeProof::LocalAppeared);
+        } else if first.remote_changed(&action.from_relative) {
+            verdict.changed(&action.relative, ChangeProof::RemoteChanged);
+        } else {
+            verdict.pending("rename", &action.relative, CAUSE_RENAME_UNRESOLVED);
         }
     }
     for action in &rebuilt.pre_deletes {
-        if !deferred.relates_to(&action.relative) {
-            return Err(pending());
+        if deferred.relates_to(&action.relative) {
+            continue;
         }
+        if written.deleted(&action.relative) {
+            verdict.pending(
+                "type-conflict-delete",
+                &action.relative,
+                CAUSE_DELETE_NOT_TAKEN,
+            );
+            continue;
+        }
+        match first.local(&action.local_relative) {
+            FirstLocal::Absent => {
+                verdict.changed(&action.relative, ChangeProof::LocalAppeared);
+                continue;
+            }
+            // The first walk held the kind the NAS has: no conflict then, so the local entry was
+            // replaced by the other kind while the run worked.
+            FirstLocal::Entry(entry) if entry.kind == action.kind => {
+                verdict.changed(&action.relative, ChangeProof::LocalChanged);
+                continue;
+            }
+            FirstLocal::Entry(_) | FirstLocal::Withheld => {}
+        }
+        if first.remote_changed(&action.relative) {
+            verdict.changed(&action.relative, ChangeProof::RemoteChanged);
+        } else {
+            verdict.pending(
+                "type-conflict-delete",
+                &action.relative,
+                CAUSE_CONFLICT_UNRESOLVED,
+            );
+        }
+    }
+    for action in &rebuilt.creates {
+        // The root itself is never explained this way: a missing destination root is a failure
+        // whatever changed.
+        if action.relative.is_empty() {
+            verdict.pending("create", "", CAUSE_ROOT_MISSING);
+            continue;
+        }
+        if deferred.relates_to(&action.relative) {
+            continue;
+        }
+        match first.local(&action.relative) {
+            FirstLocal::Absent => {
+                verdict.changed(&action.relative, ChangeProof::LocalAppeared);
+                continue;
+            }
+            FirstLocal::Entry(entry) if entry.kind != crate::local::EntryKind::Directory => {
+                verdict.changed(&action.relative, ChangeProof::LocalChanged);
+                continue;
+            }
+            FirstLocal::Entry(_) | FirstLocal::Withheld => {}
+        }
+        if written.created(&action.relative) {
+            verdict.pending("create", &action.relative, CAUSE_CREATE_NOT_TAKEN);
+        } else if first.remote_changed_at(&action.remote_path) {
+            verdict.changed(&action.relative, ChangeProof::RemoteChanged);
+        } else {
+            verdict.pending("create", &action.relative, CAUSE_STILL_MISSING);
+        }
+    }
+    for action in &rebuilt.copies {
+        if deferred.relates_to(&action.to_relative) {
+            continue;
+        }
+        verdict.file(
+            "copy",
+            &action.local,
+            &action.to_remote_path,
+            &first,
+            &written,
+        );
     }
     for action in &rebuilt.uploads {
         if deferred.relates_to(&action.local.relative) {
@@ -3565,57 +3662,273 @@ pub fn ensure_reconciled(
         {
             continue;
         }
-        if !modified_after(action.local.mtime_ms, started_at) {
-            return Err(pending());
-        }
-        changed_during_run += 1;
+        verdict.file(
+            "upload",
+            &action.local,
+            &action.remote_path,
+            &first,
+            &written,
+        );
     }
-    for action in &rebuilt.copies {
-        if deferred.relates_to(&action.to_relative) {
-            continue;
-        }
-        if !modified_after(action.local.mtime_ms, started_at) {
-            return Err(pending());
-        }
-        changed_during_run += 1;
-    }
-    for action in &rebuilt.creates {
-        if deferred.relates_to(&action.relative) {
-            continue;
-        }
-        // The root itself is never dateable this way, and a missing destination root is a failure
-        // regardless of when anything was touched.
-        if action.relative.is_empty() {
-            return Err(pending());
-        }
-        let metadata =
-            std::fs::symlink_metadata(source_root.join(&action.relative)).map_err(|_| pending())?;
-        let modified = metadata.modified().map_err(|_| pending())?;
-        if modified <= started_at {
-            return Err(pending());
-        }
-        changed_during_run += 1;
-    }
-    let started_seconds = started_at
-        .duration_since(std::time::UNIX_EPOCH)
-        .ok()
-        .and_then(|elapsed| i64::try_from(elapsed.as_secs()).ok());
     for action in &rebuilt.post_deletes {
         if deferred.relates_to(&action.relative) {
             continue;
         }
         if written.deleted(&action.relative) {
-            return Err(pending());
+            verdict.pending("delete", &action.relative, CAUSE_DELETE_NOT_TAKEN);
+            continue;
         }
-        let written_by_run = written.at_or_beneath(&action.relative);
-        let predates_run =
-            started_seconds.is_some_and(|started| action.snapshot.mtime_seconds <= started);
-        if !written_by_run && !predates_run {
-            return Err(pending());
+        // Absent locally now. In the first walk, it was deleted locally while the run worked.
+        if !first.local_absent(&action.local_relative) {
+            verdict.changed(&action.relative, ChangeProof::LocalVanished);
+        } else if first.remote_changed(&action.relative) {
+            verdict.changed(&action.relative, ChangeProof::RemoteChanged);
+        } else {
+            verdict.pending("delete", &action.relative, CAUSE_NOT_DELETED);
         }
-        changed_during_run += 1;
     }
-    Ok(Reconciliation { changed_during_run })
+    verdict.finish()
+}
+
+const CAUSE_DELETE_NOT_TAKEN: &str = "this run deleted it and the NAS still holds it";
+const CAUSE_WRITE_NOT_TAKEN: &str = "this run wrote it and the NAS still differs";
+const CAUSE_CREATE_NOT_TAKEN: &str = "this run created it and the NAS still lacks it";
+const CAUSE_RENAME_NOT_TAKEN: &str = "this run renamed it and the NAS still has the old spelling";
+const CAUSE_RENAME_UNRESOLVED: &str =
+    "in the first scan, unchanged since, and the case-only rename is still pending";
+const CAUSE_CONFLICT_UNRESOLVED: &str =
+    "in the first scan, unchanged since, and the NAS still holds the other kind";
+const CAUSE_STILL_DIFFERS: &str = "in the first scan, unchanged since, and the NAS still differs";
+const CAUSE_STILL_MISSING: &str = "in the first scan, unchanged since, and the NAS still lacks it";
+const CAUSE_NOT_DELETED: &str =
+    "in the first scan, absent locally, and not deleted from the NAS by this run";
+const CAUSE_ROOT_MISSING: &str = "the destination root is missing";
+
+/// What the first scan proves about a rebuilt entry.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ChangeProof {
+    /// Not in the first walk.
+    LocalAppeared,
+    /// In the first walk with other facts.
+    LocalChanged,
+    /// In the first walk, absent now.
+    LocalVanished,
+    /// The NAS entry appeared, vanished or changed since the first listing.
+    RemoteChanged,
+}
+
+impl ChangeProof {
+    fn deferral(self, relative: &str) -> DeferredPath {
+        let (reason, detail) = match self {
+            Self::LocalAppeared => (
+                DeferReason::SourceChanged,
+                "not in the run's first scan: written, moved or copied in while the run was \
+                 working (a move or copy keeps an old modification time); the next run carries it",
+            ),
+            Self::LocalChanged => (
+                DeferReason::SourceChanged,
+                "changed since the run's first scan (kind, size, modification time or file \
+                 identity); the next run carries it",
+            ),
+            Self::LocalVanished => (
+                DeferReason::SourceVanished,
+                "in the run's first scan and deleted locally while the run was working; the next \
+                 run mirrors the deletion",
+            ),
+            Self::RemoteChanged => (
+                DeferReason::RemoteChanged,
+                "the NAS entry appeared, vanished or changed since the run's first listing, and \
+                 this run did not write it; the next run compares it again",
+            ),
+        };
+        DeferredPath {
+            relative: relative.to_owned(),
+            reason,
+            detail: detail.to_owned(),
+        }
+    }
+}
+
+/// The verdict being collected: every unexcused operation, not just the first.
+#[derive(Default)]
+struct Verdict {
+    deferred: Vec<DeferredPath>,
+    named: HashSet<String>,
+    pending: usize,
+    pending_named: Vec<crate::error::PendingOperation>,
+}
+
+impl Verdict {
+    fn changed(&mut self, relative: &str, proof: ChangeProof) {
+        // A path can be in two rebuilt actions (a type change is a deletion and an upload): it is
+        // named once.
+        if self.named.insert(relative.to_owned()) {
+            self.deferred.push(proof.deferral(relative));
+        }
+    }
+
+    fn pending(&mut self, action: &'static str, relative: &str, cause: &'static str) {
+        self.pending += 1;
+        if self.pending_named.len() < crate::error::RECONCILIATION_PENDING_NAMED {
+            self.pending_named.push(crate::error::PendingOperation {
+                action,
+                relative: relative.to_owned(),
+                cause,
+            });
+        }
+    }
+
+    /// An upload or a copy of `local` to `remote_path`.
+    fn file(
+        &mut self,
+        action: &'static str,
+        local: &LocalEntry,
+        remote_path: &str,
+        first: &FirstScan<'_>,
+        written: &ExecutedWrites<'_>,
+    ) {
+        let relative = local.relative.as_str();
+        match first.local(relative) {
+            FirstLocal::Absent => return self.changed(relative, ChangeProof::LocalAppeared),
+            FirstLocal::Entry(before) if local_facts_moved(before, local) => {
+                return self.changed(relative, ChangeProof::LocalChanged);
+            }
+            FirstLocal::Entry(_) | FirstLocal::Withheld => {}
+        }
+        if written.exactly(relative) {
+            self.pending(action, relative, CAUSE_WRITE_NOT_TAKEN);
+        } else if first.remote_changed_at(remote_path) {
+            self.changed(relative, ChangeProof::RemoteChanged);
+        } else {
+            self.pending(action, relative, CAUSE_STILL_DIFFERS);
+        }
+    }
+
+    fn finish(self) -> Result<Reconciliation> {
+        if self.pending > 0 {
+            return Err(Error::ReconciliationPending {
+                operations: self.pending,
+                named: self.pending_named,
+            });
+        }
+        Ok(Reconciliation {
+            changed_during_run: self.deferred.len(),
+            deferred: self.deferred,
+        })
+    }
+}
+
+/// Whether the local facts a comparison rests on moved between two observations of one path.
+fn local_facts_moved(before: &LocalEntry, now: &LocalEntry) -> bool {
+    before.kind != now.kind
+        || before.size != now.size
+        || before.mtime_ms != now.mtime_ms
+        || (before.identity.is_known()
+            && now.identity.is_known()
+            && before.identity != now.identity)
+}
+
+/// What the first walk held at a path.
+enum FirstLocal<'scan> {
+    Entry(&'scan LocalEntry),
+    /// The path, or a folder above it, was walked and then withheld or skipped by name: present,
+    /// with facts the plan did not use.
+    Withheld,
+    /// Not in the first walk.
+    Absent,
+}
+
+/// The first scan, indexed for the questions reconciliation asks of it.
+struct FirstScan<'scan> {
+    observed: ReconcileObservations<'scan>,
+    skipped: HashSet<&'scan str>,
+    /// What the run wrote, deleted or renamed on the NAS: a NAS change there, or beneath it, is the
+    /// run's own and proves nothing about the tree.
+    touched: crate::digest_evidence::TouchedPaths,
+}
+
+impl<'scan> FirstScan<'scan> {
+    fn index(observed: ReconcileObservations<'scan>, executed: &SyncPlan) -> Self {
+        let skipped = observed
+            .first_local
+            .skipped
+            .iter()
+            .map(|entry| entry.relative.as_str())
+            .collect();
+        Self {
+            observed,
+            skipped,
+            touched: crate::digest_evidence::TouchedPaths::from_run(executed, &[]),
+        }
+    }
+
+    fn local(&self, relative: &str) -> FirstLocal<'scan> {
+        if let Some(entry) = self.observed.first_local.entries.get(relative) {
+            return FirstLocal::Entry(entry);
+        }
+        let mut candidate = relative;
+        loop {
+            if self.skipped.contains(candidate) {
+                return FirstLocal::Withheld;
+            }
+            match candidate.rfind('/') {
+                Some(slash) => candidate = &candidate[..slash],
+                None => return FirstLocal::Absent,
+            }
+        }
+    }
+
+    fn local_absent(&self, relative: &str) -> bool {
+        matches!(self.local(relative), FirstLocal::Absent)
+    }
+
+    fn remote_changed_at(&self, remote_path: &str) -> bool {
+        self.observed
+            .root
+            .relative(remote_path)
+            .is_ok_and(|relative| self.remote_changed(&relative))
+    }
+
+    /// Whether the NAS entry at `relative` (root-relative, the NAS spelling) provably appeared,
+    /// vanished or changed between the two listings, by a hand other than this run's.
+    fn remote_changed(&self, relative: &str) -> bool {
+        if self.touched.touches(relative) {
+            return false;
+        }
+        let before = self.observed.first_remote.entries.get(relative);
+        let after = self.observed.rebuilt_remote.entries.get(relative);
+        match (before, after) {
+            (Some(before), Some(after)) => {
+                before.kind != after.kind
+                    || (before.kind == crate::local::EntryKind::File
+                        && (before.size != after.size
+                            || before.mtime_seconds != after.mtime_seconds))
+            }
+            // Absence proves something only where both listings were whole.
+            (Some(_), None) | (None, Some(_)) => {
+                listed_completely(relative, self.observed.first_incomplete)
+                    && listed_completely(relative, self.observed.rebuilt_incomplete)
+            }
+            (None, None) => false,
+        }
+    }
+}
+
+/// Whether every folder above `relative`, the root included, was listed in full.
+fn listed_completely(relative: &str, incomplete: &[String]) -> bool {
+    if incomplete.is_empty() {
+        return true;
+    }
+    let mut parent = relative;
+    loop {
+        parent = parent.rfind('/').map_or("", |slash| &parent[..slash]);
+        if incomplete.iter().any(|folder| folder == parent) {
+            return false;
+        }
+        if parent.is_empty() {
+            return true;
+        }
+    }
 }
 
 /// What the executed plan wrote and deleted, indexed for the per-action questions reconciliation
@@ -3623,10 +3936,12 @@ pub fn ensure_reconciled(
 struct ExecutedWrites<'plan> {
     /// Paths an upload or a copy wrote.
     exact: HashSet<&'plan str>,
-    /// Paths an upload, a copy or a create wrote, and every folder above one.
-    at_or_above: HashSet<&'plan str>,
     /// Paths a pre- or post-deletion was scheduled for.
     deleted: HashSet<&'plan str>,
+    /// Directories a create was scheduled for.
+    created: HashSet<&'plan str>,
+    /// NAS entries (as the plan found them) a case-only rename was scheduled for.
+    renamed: HashSet<&'plan str>,
 }
 
 impl<'plan> ExecutedWrites<'plan> {
@@ -3642,22 +3957,6 @@ impl<'plan> ExecutedWrites<'plan> {
                     .map(|action| action.to_relative.as_str()),
             )
             .collect();
-        let mut at_or_above = HashSet::new();
-        for written in exact.iter().copied().chain(
-            executed
-                .creates
-                .iter()
-                .map(|action| action.relative.as_str()),
-        ) {
-            let mut current = written;
-            // Stops at the first folder already present: everything above it is present too.
-            while at_or_above.insert(current) {
-                match current.rfind('/') {
-                    Some(slash) => current = &current[..slash],
-                    None => break,
-                }
-            }
-        }
         let deleted = executed
             .post_deletes
             .iter()
@@ -3666,8 +3965,17 @@ impl<'plan> ExecutedWrites<'plan> {
             .collect();
         Self {
             exact,
-            at_or_above,
             deleted,
+            created: executed
+                .creates
+                .iter()
+                .map(|action| action.relative.as_str())
+                .collect(),
+            renamed: executed
+                .renames
+                .iter()
+                .map(|action| action.from_relative.as_str())
+                .collect(),
         }
     }
 
@@ -3675,39 +3983,17 @@ impl<'plan> ExecutedWrites<'plan> {
         self.exact.contains(relative)
     }
 
-    /// Whether the run wrote `relative` or anything beneath it.
-    fn at_or_beneath(&self, relative: &str) -> bool {
-        self.at_or_above.contains(relative)
-    }
-
     fn deleted(&self, relative: &str) -> bool {
         self.deleted.contains(relative)
     }
-}
 
-fn reconciliation_pending(plan: &SyncPlan) -> Error {
-    Error::ReconciliationPending {
-        operations: plan.pre_deletes.len()
-            + plan.creates.len()
-            + plan.copies.len()
-            + plan.uploads.len()
-            + plan.post_deletes.len()
-            + plan.renames.len(),
+    fn created(&self, relative: &str) -> bool {
+        self.created.contains(relative)
     }
-}
 
-/// Whether a recorded millisecond modification time is strictly after `started_at`.
-///
-/// Compared in milliseconds against the same epoch the scan records, so the comparison cannot
-/// disagree with the value the inventory holds. A time the clock cannot express relative to the
-/// epoch is treated as *not* after the start, which fails the run: the safe direction for a
-/// judgement about whether work was left undone.
-pub fn modified_after(mtime_ms: i64, started_at: std::time::SystemTime) -> bool {
-    started_at
-        .duration_since(std::time::UNIX_EPOCH)
-        .ok()
-        .and_then(|elapsed| i64::try_from(elapsed.as_millis()).ok())
-        .is_some_and(|started_ms| mtime_ms > started_ms)
+    fn renamed(&self, from_relative: &str) -> bool {
+        self.renamed.contains(from_relative)
+    }
 }
 
 #[cfg(test)]
@@ -6504,29 +6790,20 @@ mod tests {
         let mut rebuilt = executed.clone();
         rebuilt.uploads[0].reason = ChangeReason::MtimeDiffers;
 
-        let started_at = std::time::SystemTime::now();
+        let scans = Scans::of_tree(&[local("file.txt")]);
         assert_eq!(
-            ensure_reconciled(
-                std::path::Path::new("."),
-                &executed,
-                &rebuilt,
-                started_at,
-                &DeferralIndex::default()
-            )
-            .unwrap(),
-            Reconciliation::default()
+            scans.verdict(&executed, &rebuilt, &DeferralIndex::default()),
+            Ok(Reconciliation::default())
         );
         rebuilt.uploads[0].reason = ChangeReason::ContentDiffers;
-        assert!(matches!(
-            ensure_reconciled(
-                std::path::Path::new("."),
-                &executed,
-                &rebuilt,
-                started_at,
-                &DeferralIndex::default()
-            ),
-            Err(Error::ReconciliationPending { operations: 1 })
-        ));
+        assert_eq!(
+            scans.verdict(&executed, &rebuilt, &DeferralIndex::default()),
+            Err(vec![(
+                "upload",
+                "file.txt".to_owned(),
+                "this run wrote it and the NAS still differs"
+            )])
+        );
     }
 
     fn deletions(relatives: &[&str]) -> Vec<DeleteAction> {
@@ -6733,29 +7010,33 @@ mod tests {
         let executed = rename_plan();
         let mut rebuilt = rename_plan();
         rebuilt.post_deletes.clear();
-        let started_at = std::time::SystemTime::now();
-        assert!(matches!(
-            ensure_reconciled(
-                std::path::Path::new("."),
-                &executed,
+        let mut photos = local("photos");
+        photos.kind = EntryKind::Directory;
+        let scans = Scans::of_tree(&[photos]);
+        assert_eq!(
+            scans.verdict(&executed, &rebuilt, &DeferralIndex::default()),
+            Err(vec![(
+                "rename",
+                "photos".to_owned(),
+                "this run renamed it and the NAS still has the old spelling"
+            )])
+        );
+        // One the run did not plan, on a tree that did not change, is pending too.
+        assert_eq!(
+            scans.verdict(
+                &empty_plan_like(&rebuilt),
                 &rebuilt,
-                started_at,
                 &DeferralIndex::default()
             ),
-            Err(Error::ReconciliationPending { operations: 1 })
-        ));
+            Err(vec![(
+                "rename",
+                "photos".to_owned(),
+                "in the first scan, unchanged since, and the case-only rename is still pending"
+            )])
+        );
         let mut named = DeferralIndex::default();
         named.insert("photos", DeferReason::CaseRenamePending);
-        assert!(
-            ensure_reconciled(
-                std::path::Path::new("."),
-                &executed,
-                &rebuilt,
-                started_at,
-                &named
-            )
-            .is_ok()
-        );
+        assert!(scans.verdict(&executed, &rebuilt, &named).is_ok());
     }
 
     /// Deferrals the plan names among its skips (a folder the walk could not read, a rename
@@ -7330,5 +7611,508 @@ mod tests {
         let mut two = scoped_remote(&["a", "b"]);
         mark(&mut two, 2);
         assert!(check_link_boundaries(&two, &Default::default()).is_ok());
+    }
+
+    // ---------------------------------------------------------------- reconciliation verdict
+
+    /// The two scans reconciliation compares: the run's first walk and listing, and the
+    /// reconciliation pass's listing.
+    struct Scans {
+        root: RemoteRoot,
+        local: LocalInventory,
+        remote: RemoteInventory,
+        rebuilt_remote: RemoteInventory,
+        first_incomplete: Vec<String>,
+    }
+
+    impl Scans {
+        /// A first walk holding `entries`, and two empty NAS listings.
+        fn of_tree(entries: &[LocalEntry]) -> Self {
+            let empty = || RemoteInventory {
+                root_exists: true,
+                entries: BTreeMap::new(),
+            };
+            Self {
+                root: RemoteRoot::parse("/share/root").unwrap(),
+                local: LocalInventory {
+                    root: absent_source_root(),
+                    entries: entries
+                        .iter()
+                        .map(|entry| (entry.relative.clone(), entry.clone()))
+                        .collect(),
+                    skipped: Vec::new(),
+                },
+                remote: empty(),
+                rebuilt_remote: empty(),
+                first_incomplete: Vec::new(),
+            }
+        }
+
+        /// The verdict, with a failure reduced to the operations it names.
+        #[allow(clippy::type_complexity)]
+        fn verdict(
+            &self,
+            executed: &SyncPlan,
+            rebuilt: &SyncPlan,
+            deferred: &DeferralIndex,
+        ) -> std::result::Result<Reconciliation, Vec<(&'static str, String, &'static str)>>
+        {
+            ensure_reconciled(
+                executed,
+                rebuilt,
+                ReconcileObservations {
+                    root: &self.root,
+                    first_local: &self.local,
+                    first_remote: &self.remote,
+                    first_incomplete: &self.first_incomplete,
+                    rebuilt_remote: &self.rebuilt_remote,
+                    rebuilt_incomplete: &[],
+                },
+                deferred,
+            )
+            .map_err(|error| match error {
+                Error::ReconciliationPending { operations, named } => {
+                    assert_eq!(operations, named.len(), "every pending operation is named");
+                    named
+                        .into_iter()
+                        .map(|operation| (operation.action, operation.relative, operation.cause))
+                        .collect()
+                }
+                other => panic!("not a reconciliation verdict: {other}"),
+            })
+        }
+    }
+
+    fn remote_file(relative: &str, size: u64, mtime_seconds: i64) -> crate::api::RemoteEntry {
+        crate::api::RemoteEntry {
+            relative: relative.to_owned(),
+            remote_path: format!("/share/root/{relative}"),
+            kind: EntryKind::File,
+            size,
+            mtime_seconds,
+            ctime_seconds: None,
+            crtime_seconds: None,
+            digest_nas_time: None,
+            mount_point_type: None,
+            content_md5: None,
+        }
+    }
+
+    /// `plan` with every action removed, for a run that planned nothing.
+    fn empty_plan_like(plan: &SyncPlan) -> SyncPlan {
+        let mut empty = plan.clone();
+        empty.pre_deletes.clear();
+        empty.creates.clear();
+        empty.copies.clear();
+        empty.uploads.clear();
+        empty.post_deletes.clear();
+        empty.renames.clear();
+        empty
+    }
+
+    fn upload_plan(entries: &[LocalEntry]) -> SyncPlan {
+        let mut plan = empty_plan_like(&populated_plan());
+        plan.uploads = entries
+            .iter()
+            .map(|entry| UploadAction {
+                local: entry.clone(),
+                remote_path: format!("/share/root/{}", entry.relative),
+                reason: ChangeReason::MissingRemote,
+                expected_remote: None,
+            })
+            .collect();
+        plan
+    }
+
+    fn only_change(verdict: &Reconciliation) -> &DeferredPath {
+        assert_eq!(verdict.deferred.len(), 1, "{verdict:?}");
+        assert_eq!(verdict.changed_during_run, 1);
+        &verdict.deferred[0]
+    }
+
+    /// R2: a file moved or copied into the source while the run worked keeps its old modification
+    /// time. The first walk did not hold it, so it provably changed after the run planned: a
+    /// transient `source-changed` deferral by name, never a failure.
+    #[test]
+    fn reconciliation_names_a_file_absent_from_the_first_scan_as_changed_during_the_run() {
+        let mut moved = local("inbox/moved.pdf");
+        moved.mtime_ms = 1_500_000_000_000;
+        let scans = Scans::of_tree(&[]);
+        let verdict = scans
+            .verdict(
+                &empty_plan_like(&populated_plan()),
+                &upload_plan(&[moved]),
+                &DeferralIndex::default(),
+            )
+            .unwrap();
+        let change = only_change(&verdict);
+        assert_eq!(change.relative, "inbox/moved.pdf");
+        assert_eq!(change.reason, DeferReason::SourceChanged);
+        assert!(
+            !change.reason.is_lasting(),
+            "it clears by itself: transient"
+        );
+        assert!(change.detail.contains("not in the run's first scan"));
+    }
+
+    /// R2: a file whose local facts moved since the first walk changed under the run, whatever its
+    /// modification time; one whose facts held is the run's own failure, even with a modification
+    /// time after the run began (a clock ahead of this host's used to excuse it).
+    #[test]
+    fn reconciliation_excuses_local_changes_by_the_first_scan_not_by_the_clock() {
+        let before = local("report.docx");
+        let mut after = before.clone();
+        after.size = 2;
+        let scans = Scans::of_tree(std::slice::from_ref(&before));
+        let executed = empty_plan_like(&populated_plan());
+        let verdict = scans
+            .verdict(&executed, &upload_plan(&[after]), &DeferralIndex::default())
+            .unwrap();
+        assert_eq!(only_change(&verdict).reason, DeferReason::SourceChanged);
+        assert!(only_change(&verdict).detail.contains("changed since"));
+
+        let mut identity = before.clone();
+        identity.identity = crate::local::FileIdentity {
+            device: 1,
+            inode: 2,
+        };
+        let mut replaced = identity.clone();
+        replaced.identity.inode = 3;
+        let scans = Scans::of_tree(&[identity]);
+        assert!(
+            scans
+                .verdict(
+                    &executed,
+                    &upload_plan(&[replaced]),
+                    &DeferralIndex::default()
+                )
+                .is_ok(),
+            "a file replaced under the same name is a change"
+        );
+
+        let mut future = before.clone();
+        future.mtime_ms = i64::MAX / 2;
+        let scans = Scans::of_tree(std::slice::from_ref(&future));
+        assert_eq!(
+            scans.verdict(
+                &executed,
+                &upload_plan(&[future]),
+                &DeferralIndex::default()
+            ),
+            Err(vec![(
+                "upload",
+                "report.docx".to_owned(),
+                "in the first scan, unchanged since, and the NAS still differs"
+            )])
+        );
+    }
+
+    /// R2: a path in the first scan, unchanged locally and on the NAS, whose destination still
+    /// differs is a failure that names it, whether or not this run wrote it.
+    #[test]
+    fn reconciliation_fails_by_name_on_a_first_scan_path_that_still_differs() {
+        let entry = local("ledger.xlsx");
+        let scans = Scans::of_tree(std::slice::from_ref(&entry));
+        let rebuilt = upload_plan(std::slice::from_ref(&entry));
+        assert_eq!(
+            scans.verdict(
+                &empty_plan_like(&rebuilt),
+                &rebuilt,
+                &DeferralIndex::default()
+            ),
+            Err(vec![(
+                "upload",
+                "ledger.xlsx".to_owned(),
+                "in the first scan, unchanged since, and the NAS still differs"
+            )])
+        );
+        assert_eq!(
+            scans.verdict(&rebuilt, &rebuilt, &DeferralIndex::default()),
+            Err(vec![(
+                "upload",
+                "ledger.xlsx".to_owned(),
+                "this run wrote it and the NAS still differs"
+            )])
+        );
+    }
+
+    /// R2: a NAS entry another hand changed since the first listing explains a rebuilt upload the
+    /// run did not write. One the run wrote, or one beneath a folder the run deleted, does not: the
+    /// change there is the run's own.
+    #[test]
+    fn reconciliation_excuses_a_nas_change_only_where_the_run_did_not_touch_it() {
+        let entry = local("shared/plan.txt");
+        let mut scans = Scans::of_tree(std::slice::from_ref(&entry));
+        scans.remote.entries.insert(
+            "shared/plan.txt".to_owned(),
+            remote_file("shared/plan.txt", 1, 100),
+        );
+        scans.rebuilt_remote.entries.insert(
+            "shared/plan.txt".to_owned(),
+            remote_file("shared/plan.txt", 9, 200),
+        );
+        let rebuilt = upload_plan(std::slice::from_ref(&entry));
+        let verdict = scans
+            .verdict(
+                &empty_plan_like(&rebuilt),
+                &rebuilt,
+                &DeferralIndex::default(),
+            )
+            .unwrap();
+        assert_eq!(only_change(&verdict).reason, DeferReason::RemoteChanged);
+        assert!(!DeferReason::RemoteChanged.is_lasting());
+
+        let mut deleted_above = empty_plan_like(&rebuilt);
+        deleted_above.pre_deletes = deletions(&["shared"]);
+        assert_eq!(
+            scans.verdict(&deleted_above, &rebuilt, &DeferralIndex::default()),
+            Err(vec![(
+                "upload",
+                "shared/plan.txt".to_owned(),
+                "in the first scan, unchanged since, and the NAS still differs"
+            )])
+        );
+    }
+
+    /// R2: a deletion this run made that did not take is a failure by name, even where the tree
+    /// changed around it.
+    #[test]
+    fn reconciliation_fails_by_name_on_a_delete_that_did_not_take() {
+        let plan = deletion_only_plan(&["old/archive.zip"]);
+        let mut scans = Scans::of_tree(&[]);
+        scans.remote.entries.insert(
+            "old/archive.zip".to_owned(),
+            remote_file("old/archive.zip", 1, 1),
+        );
+        assert_eq!(
+            scans.verdict(&plan, &plan, &DeferralIndex::default()),
+            Err(vec![(
+                "delete",
+                "old/archive.zip".to_owned(),
+                "this run deleted it and the NAS still holds it"
+            )])
+        );
+        // The same, for a type conflict's deletion.
+        let mut conflict = empty_plan_like(&plan);
+        conflict.pre_deletes = deletions(&["mixed"]);
+        assert_eq!(
+            scans.verdict(&conflict, &conflict, &DeferralIndex::default()),
+            Err(vec![(
+                "type-conflict-delete",
+                "mixed".to_owned(),
+                "this run deleted it and the NAS still holds it"
+            )])
+        );
+    }
+
+    /// R2: a remote-only entry the run did not delete is explained when the local entry was in
+    /// the first walk (deleted locally while the run worked) or the NAS entry was not in the first
+    /// listing (added on the NAS meanwhile), and only where both listings were whole there.
+    #[test]
+    fn reconciliation_explains_a_remaining_nas_entry_only_by_the_first_scan() {
+        let rebuilt = deletion_only_plan(&["notes.txt"]);
+        let executed = empty_plan_like(&rebuilt);
+
+        let scans = Scans::of_tree(&[local("notes.txt")]);
+        let verdict = scans
+            .verdict(&executed, &rebuilt, &DeferralIndex::default())
+            .unwrap();
+        assert_eq!(only_change(&verdict).reason, DeferReason::SourceVanished);
+
+        let mut scans = Scans::of_tree(&[]);
+        scans
+            .rebuilt_remote
+            .entries
+            .insert("notes.txt".to_owned(), remote_file("notes.txt", 1, 1));
+        let verdict = scans
+            .verdict(&executed, &rebuilt, &DeferralIndex::default())
+            .unwrap();
+        assert_eq!(only_change(&verdict).reason, DeferReason::RemoteChanged);
+
+        // The first listing of the root came back short: its absence there proves nothing.
+        scans.first_incomplete = vec![String::new()];
+        assert_eq!(
+            scans.verdict(&executed, &rebuilt, &DeferralIndex::default()),
+            Err(vec![(
+                "delete",
+                "notes.txt".to_owned(),
+                "in the first scan, absent locally, and not deleted from the NAS by this run"
+            )])
+        );
+
+        // In the first listing, absent from the first walk, and not deleted: the run's own.
+        let mut scans = Scans::of_tree(&[]);
+        scans
+            .remote
+            .entries
+            .insert("notes.txt".to_owned(), remote_file("notes.txt", 1, 1));
+        scans
+            .rebuilt_remote
+            .entries
+            .insert("notes.txt".to_owned(), remote_file("notes.txt", 1, 1));
+        assert!(
+            scans
+                .verdict(&executed, &rebuilt, &DeferralIndex::default())
+                .is_err()
+        );
+    }
+
+    /// R2: a folder still missing on the NAS is explained by a folder moved in during the run, or
+    /// by the NAS losing it meanwhile; one the run created, or one in both scans and missing in
+    /// both, is a failure by name, and so is a missing destination root.
+    #[test]
+    fn reconciliation_explains_a_missing_folder_only_by_the_first_scan() {
+        let create = |relative: &str| CreateAction {
+            relative: relative.to_owned(),
+            remote_path: format!("/share/root/{relative}"),
+            reason: ChangeReason::MissingRemote,
+        };
+        let mut rebuilt = empty_plan_like(&populated_plan());
+        rebuilt.creates = vec![create("projects")];
+        let executed = empty_plan_like(&rebuilt);
+
+        let verdict = Scans::of_tree(&[])
+            .verdict(&executed, &rebuilt, &DeferralIndex::default())
+            .unwrap();
+        assert_eq!(only_change(&verdict).reason, DeferReason::SourceChanged);
+
+        let mut folder = local("projects");
+        folder.kind = EntryKind::Directory;
+        let mut scans = Scans::of_tree(std::slice::from_ref(&folder));
+        assert_eq!(
+            scans.verdict(&rebuilt, &rebuilt, &DeferralIndex::default()),
+            Err(vec![(
+                "create",
+                "projects".to_owned(),
+                "this run created it and the NAS still lacks it"
+            )])
+        );
+        assert_eq!(
+            scans.verdict(&executed, &rebuilt, &DeferralIndex::default()),
+            Err(vec![(
+                "create",
+                "projects".to_owned(),
+                "in the first scan, unchanged since, and the NAS still lacks it"
+            )])
+        );
+        let mut listed = remote_file("projects", 0, 1);
+        listed.kind = EntryKind::Directory;
+        scans.remote.entries.insert("projects".to_owned(), listed);
+        let verdict = scans
+            .verdict(&executed, &rebuilt, &DeferralIndex::default())
+            .unwrap();
+        assert_eq!(only_change(&verdict).reason, DeferReason::RemoteChanged);
+
+        rebuilt.creates = vec![create("")];
+        assert_eq!(
+            scans.verdict(&executed, &rebuilt, &DeferralIndex::default()),
+            Err(vec![(
+                "create",
+                String::new(),
+                "the destination root is missing"
+            )])
+        );
+    }
+
+    /// R2: a path the first walk held but withheld or skipped by name is not absent from it.
+    #[test]
+    fn reconciliation_does_not_read_a_withheld_path_as_absent_from_the_first_scan() {
+        let mut scans = Scans::of_tree(&[]);
+        scans.local.skipped.push(crate::local::SkippedEntry {
+            relative: "photos".to_owned(),
+            reason: crate::local::SkipReason::RemoteCaseCollision {
+                other: "Photos".to_owned(),
+            },
+        });
+        let rebuilt = upload_plan(&[local("photos/a.jpg")]);
+        assert!(
+            scans
+                .verdict(
+                    &empty_plan_like(&rebuilt),
+                    &rebuilt,
+                    &DeferralIndex::default()
+                )
+                .is_err()
+        );
+    }
+
+    /// R1: only unexcused operations are counted, the first five are named, the rest are counted
+    /// as "more", and a name cannot forge a field or a line of the record that carries it.
+    #[test]
+    fn a_pending_reconciliation_counts_and_names_only_what_nothing_excused() {
+        let names = ["a", "b", "c", "d", "e", "f", "g|h\nfake=1"];
+        let entries = names.iter().map(|name| local(name)).collect::<Vec<_>>();
+        let mut rebuilt = upload_plan(&entries);
+        // Excused by name, and moved in: neither is counted.
+        let mut moved = local("moved-in.bin");
+        moved.mtime_ms = 7;
+        rebuilt.uploads.push(UploadAction {
+            local: moved,
+            remote_path: "/share/root/moved-in.bin".to_owned(),
+            reason: ChangeReason::MissingRemote,
+            expected_remote: None,
+        });
+        let mut deferred = DeferralIndex::default();
+        deferred.insert("a", DeferReason::SourceUnreadable);
+        let scans = Scans::of_tree(&entries);
+
+        let error = ensure_reconciled(
+            &empty_plan_like(&rebuilt),
+            &rebuilt,
+            ReconcileObservations {
+                root: &scans.root,
+                first_local: &scans.local,
+                first_remote: &scans.remote,
+                first_incomplete: &[],
+                rebuilt_remote: &scans.rebuilt_remote,
+                rebuilt_incomplete: &[],
+            },
+            &deferred,
+        )
+        .unwrap_err();
+        let Error::ReconciliationPending { operations, named } = &error else {
+            panic!("{error}");
+        };
+        assert_eq!(
+            *operations, 6,
+            "b..g are unexcused; a is deferred, moved-in.bin changed"
+        );
+        assert_eq!(named.len(), crate::error::RECONCILIATION_PENDING_NAMED);
+        assert_eq!(named[0].relative, "b");
+        let text = error.to_string();
+        assert!(
+            text.starts_with(
+                "final reconciliation did not converge on 6 in-scope path(s): upload b ("
+            ),
+            "{text}"
+        );
+        assert!(text.ends_with(", and 1 more"), "{text}");
+        assert!(!text.contains('\n') && !text.contains('|'), "{text}");
+
+        let only_forged = upload_plan(&[local("g|h\nfake=1")]);
+        let text = Scans::of_tree(&[local("g|h\nfake=1")])
+            .verdict(
+                &empty_plan_like(&only_forged),
+                &only_forged,
+                &DeferralIndex::default(),
+            )
+            .unwrap_err();
+        assert_eq!(text[0].1, "g|h\nfake=1", "the record keeps the real name");
+        let error = Error::ReconciliationPending {
+            operations: 1,
+            named: vec![crate::error::PendingOperation {
+                action: "upload",
+                relative: "g|h\nfake=1".to_owned(),
+                cause: "x",
+            }],
+        };
+        assert!(
+            error.to_string().contains("upload g%7Ch%0Afake%3D1 (x)"),
+            "{error}"
+        );
+        assert_eq!(
+            crate::observability::failure_path(&error, None).as_deref(),
+            Some("g|h\nfake=1")
+        );
     }
 }

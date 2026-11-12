@@ -247,10 +247,18 @@ pub enum Error {
     #[error("{operation} did not finish within the configured request timeout")]
     OperationTimedOut { operation: &'static str },
 
+    /// The rebuilt plan still held work no change during the run explains. Only those operations
+    /// are counted, and the first [`RECONCILIATION_PENDING_NAMED`] are named with their action and
+    /// cause, so the result record, the log and the run's failure line say which path and why.
     #[error(
-        "final reconciliation found {operations} pending in-scope operations; inspect a fresh plan before rerunning"
+        "final reconciliation did not converge on {operations} in-scope path(s): {}{}",
+        pending_list(named),
+        and_more(operations.saturating_sub(named.len()))
     )]
-    ReconciliationPending { operations: usize },
+    ReconciliationPending {
+        operations: usize,
+        named: Vec<PendingOperation>,
+    },
 
     #[error("operation cancelled")]
     Cancelled,
@@ -359,6 +367,42 @@ fn join_refusal_codes(codes: &[(String, usize)]) -> String {
         .map(|(code, count)| format!("{code} x{count}"))
         .collect::<Vec<_>>()
         .join(", ")
+}
+
+/// How many unconverged operations a [`Error::ReconciliationPending`] names; the rest are counted.
+pub const RECONCILIATION_PENDING_NAMED: usize = 5;
+
+/// One operation the rebuilt plan still held that nothing excused: what it was, where, and why it
+/// counts as not converged.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PendingOperation {
+    /// `upload`, `copy`, `create`, `delete`, `type-conflict-delete` or `rename`.
+    pub action: &'static str,
+    /// Root-relative, `/`-separated.
+    pub relative: String,
+    pub cause: &'static str,
+}
+
+/// The named operations, each path percent-encoded and bounded so a name cannot forge a second
+/// line or field of the record that carries this text.
+fn pending_list(named: &[PendingOperation]) -> String {
+    named
+        .iter()
+        .map(|operation| {
+            // The source root itself is `.`, as every other record names it.
+            let relative = match operation.relative.as_str() {
+                "" => ".",
+                relative => relative,
+            };
+            format!(
+                "{} {} ({})",
+                operation.action,
+                crate::observability::InlineAscii::<120>::percent_encoded(relative).as_str(),
+                operation.cause
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("; ")
 }
 
 fn and_more(more: usize) -> String {
