@@ -3930,7 +3930,6 @@ safe_notify() {
     notify_cause_code=notifier_missing
     if [ -x /usr/syno/bin/synodsmnotify ] && [ ! -L /usr/syno/bin/synodsmnotify ]; then
         notify_error="the DSM notifier refused the notification"
-        notify_cause_code=notifier_not_called
         # DSM receives only reviewed application and I18N identifiers. Dynamic
         # profile, exit, log, and secret material never enters notifier argv.
         case $notify_key in
@@ -3939,23 +3938,26 @@ safe_notify() {
                     @administrators \
                     synology-drive-sync:notifications:sync_succeeded_title \
                     synology-drive-sync:notifications:sync_succeeded_message \
-                    >/dev/null 2>&1; then return 0; else notify_status=$?; notify_cause_code=notifier_exit_$notify_status; fi
+                    >/dev/null 2>&1; then return 0; else notify_status=$?; fi
                 ;;
             sync_failed)
                 if /usr/syno/bin/synodsmnotify -c SYNO.SDS.App.SynologyDriveSync.Instance \
                     @administrators \
                     synology-drive-sync:notifications:sync_failed_title \
                     synology-drive-sync:notifications:sync_failed_message \
-                    >/dev/null 2>&1; then return 0; else notify_status=$?; notify_cause_code=notifier_exit_$notify_status; fi
+                    >/dev/null 2>&1; then return 0; else notify_status=$?; fi
                 ;;
             doctor_failed)
                 if /usr/syno/bin/synodsmnotify -c SYNO.SDS.App.SynologyDriveSync.Instance \
                     @administrators \
                     synology-drive-sync:notifications:doctor_failed_title \
                     synology-drive-sync:notifications:doctor_failed_message \
-                    >/dev/null 2>&1; then return 0; else notify_status=$?; notify_cause_code=notifier_exit_$notify_status; fi
+                    >/dev/null 2>&1; then return 0; else notify_status=$?; fi
                 ;;
         esac
+        # Reached only by a call that failed (a delivered one returned above, and
+        # the key was validated against these three): its status is the cause.
+        notify_cause_code=notifier_exit_$notify_status
     fi
     # The Activity text is fixed (the callers log the status). A record that
     # cannot be written says so on stderr, with the status and which of the two
