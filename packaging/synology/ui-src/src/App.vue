@@ -2985,6 +2985,24 @@ function doctorSourceSkippedDetail(rawOutput) {
   return total ? `${total} ${total === 1 ? "entry" : "entries"} a sync will skip and not sync until fixed${lines.length ? `: ${lines.join("; ")}${total > lines.length ? "; ..." : ""}` : ""}.` : "";
 }
 
+// Why Doctor produced no report, in the words every row that says so repeats:
+// the failure's code and exit code when the package named them, then the first
+// line of output that is not a JSON record -- a refusal such as "doctor
+// --write-test is refused while PID ...", or the core's own `error:` line.
+// Bounded, and never empty: a row that says "not run" also says why.
+function doctorNoReportCause(result, rawOutput) {
+  const model = result && typeof result === "object" && !Array.isArray(result) ? result : {};
+  const code = typeof model.code === "string" && /^[a-z0-9_]{1,64}$/.test(model.code) ? model.code : "";
+  const exitCode = Number.isInteger(model.exit_code) && model.exit_code >= 0 && model.exit_code <= 255
+    ? model.exit_code
+    : null;
+  const named = [code ? `code ${code}` : "", exitCode === null ? "" : `exit code ${exitCode}`].filter(Boolean).join(", ");
+  const firstLine = String(rawOutput || "").split("\n").map((line) => line.trim()).find((line) => line && !line.startsWith("{")) || "";
+  const line = firstLine ? doctorText(firstLine, "", 240).slice(0, 240).replace(/[.;:,\s]+$/, "") : "";
+  if (named && line) return `${named}: ${line}`;
+  return named || line || "the package returned no output";
+}
+
 function doctorReportFromResult(result, successful, requestedLevel, writeTest, startedEpoch = 0) {
   const level = normalizedDoctorLevel(requestedLevel);
   const outputEnvelope = doctorOutputEnvelope(result);
@@ -2998,12 +3016,23 @@ function doctorReportFromResult(result, successful, requestedLevel, writeTest, s
       if (!returnedIds.has(expected.id)) sections.push(expected);
     }
   } else if (!document) {
-    sections = expectedDoctorSections(level, writeTest, "skipped");
+    // No report arrived, so no area was evaluated -- and each row says why
+    // rather than blaming "the installed package", which did run.
+    const cause = doctorNoReportCause(result, rawOutput);
+    sections = expectedDoctorSections(level, writeTest, "skipped").map((section) => ({
+      ...section,
+      detail: `Not run: Doctor produced no report. Cause: ${cause}.`
+    }));
+    const unpublished = /^code (?:unavailable|response_too_large)\b/.test(cause)
+      ? " The package could not publish Doctor's result; the check that refused it is recorded in api.log."
+      : "";
     sections.push({
       id: "terminal_evidence",
-      label: "Legacy terminal evidence",
+      label: successful ? "Legacy terminal evidence" : "Why Doctor produced no report",
       state: successful ? "ok" : "failed",
-      detail: doctorText(rawOutput, successful ? "Doctor completed." : "Doctor failed."),
+      detail: successful
+        ? doctorText(rawOutput, "Doctor completed.")
+        : doctorText(`Cause: ${cause}.${unpublished} ${rawOutput || ""}`, `Cause: ${cause}.`),
       step: null,
       duration_ms: null,
       timing_scope: "operation",
@@ -7311,7 +7340,12 @@ export default {
         recordIsolatedIncident(this, "operations", operation, error, report, { subject: boundedText(payload && payload.scope, operation) });
         if (kind === "doctor") {
           this.doctorReport = doctorReportFromResult(
-            { output: error.resultOutput || report.message, message: report.message },
+            {
+              output: error.resultOutput || report.message,
+              message: report.message,
+              code: error && typeof error.code === "string" ? error.code : "",
+              exit_code: error && Number.isInteger(error.exitCode) ? error.exitCode : null
+            },
             false,
             doctorLevel,
             payload && payload.write_test === true,

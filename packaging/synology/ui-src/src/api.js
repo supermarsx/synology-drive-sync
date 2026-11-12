@@ -1288,6 +1288,12 @@ async function pollJobResult(
         status.result.output,
         failure.message
       );
+      // An action's own exit code (a refused or failed Doctor carries one), so
+      // the page can say how the job ended, not only that it did.
+      if (failure.exitCode === undefined) {
+        const exitCode = status.result.exit_code;
+        failure.exitCode = Number.isInteger(exitCode) && exitCode >= 0 && exitCode <= 255 ? exitCode : null;
+      }
       failure.jobId = jobId;
       failure.requestId = validClientRequestId(requestId);
       failure.trustedJobId = true;
