@@ -65,7 +65,9 @@
                   "pair-index-writeback-unbounded",
                   "pair-index-nas-clock-skewed",
                   "pair-index-cleanup-failed",
-                  "pair-index-plan-clock-unbounded"
+                  "pair-index-plan-clock-unbounded",
+                  "pair-index-failed-run",
+                  "pair-index-unsettled-unusable"
                 ]
               },
               "severity": { "enum": ["info", "warning"] },
@@ -855,7 +857,7 @@
           "$ref": "#/$defs/nonNegativeInteger"
         },
         "changed_during_run": {
-          "description": "Entries the post-run reconciliation pass still found, all of them local files modified after the run began. The destination matches the source as it was when the run started, which is the only instant a run can be asked about.",
+          "description": "Entries the post-run reconciliation pass still found that the run's first scan proves changed while the run worked (a path the first walk did not hold, local facts that moved, a local deletion, or a NAS entry another hand changed). Each is also in `deferred`, by name, as a transient deferral, so the run is partial.",
           "$ref": "#/$defs/nonNegativeInteger"
         },
         "failed": {
@@ -863,7 +865,7 @@
           "type": "boolean"
         },
         "outcome": {
-          "description": "The run's verdict. `complete`: everything converged. `partial`: everything converged except the transient paths in `deferred` (every reason but `unrepresentable-name`, `unsupported-local-entry`, `listing-incomplete`, `remote-unreadable`, `local-permission-denied`, `delete-not-permitted`, `remote-refused`, `remote-skipped`, `unsupported-entry`, `case-rename-pending` and `tree-too-large-for-memory`), which the next run picks up; the process exits 3. Lasting skips and lasting deferrals are reported and logged but leave the outcome `complete` and the exit code 0. `failed`: the run stopped (see `failed`).",
+          "description": "The run's verdict. `complete`: everything converged. `partial`: everything converged except the transient paths in `deferred` (every reason but `unrepresentable-name`, `unsupported-local-entry`, `listing-incomplete`, `remote-unreadable`, `local-permission-denied`, `delete-not-permitted`, `remote-refused`, `remote-skipped`, `unsupported-entry`, `case-rename-pending`, `tree-too-large-for-memory`, `file-keeps-changing`, `source-stays-unreadable`, `remote-digest-keeps-failing` and `delete-keeps-failing`), which the next run picks up; the process exits 3. Lasting skips and lasting deferrals are reported and logged but leave the outcome `complete` and the exit code 0. `failed`: the run stopped (see `failed`).",
           "enum": ["complete", "partial", "failed"]
         },
         "deferred": {
@@ -1012,6 +1014,10 @@
           "description": "NAS folders this run listed, or passed through on the way to its scope, for which the NAS reported no real path, so a NAS link among their entries could not be told from a folder and is synced and deleted through like one. 0 means the link guard ran everywhere it was needed. A lasting, user-fixable warning: it never changes the outcome or the exit code.",
           "$ref": "#/$defs/nonNegativeInteger"
         },
+        "pair_index": {
+          "description": "What the verified-pair index did, when the job asked for one (`--pair-index`). Present on a run that found nothing to do, which is the warm run the index exists for.",
+          "$ref": "#/$defs/pairIndex"
+        },
         "elapsed_ms": { "$ref": "#/$defs/nonNegativeInteger" }
       }
     },
@@ -1025,7 +1031,7 @@
           "type": "string"
         },
         "reason": {
-          "description": "`source-changed`: the local file changed while it was read or sent. `source-vanished`: deleted locally during the run. `source-unreadable`: locked or briefly unreadable (transient). `unsupported-local-entry`: not a regular file or directory the sync carries. `remote-digest-unavailable`: the NAS could not checksum it. `remote-unreadable`: the NAS refuses this one file to the account (lasting until its permissions change). `remote-changed`: the NAS entry changed after planning and was left as found. `unrepresentable-name`: a NAS name this host's filesystem cannot hold; never deleted on that account. `listing-incomplete`: its NAS folder listed fewer entries than it counted, so no deletion was made there. `server-copy-failed`: the NAS-side copy finished with an error. `delete-failed`: the NAS refused the deletion. `remote-refused`: the NAS refuses this name or this account's access to it (lasting until it is renamed or its permissions change; three or more refusals with one cause that are more than half the attempts fail the run instead). `local-permission-denied`: this account may not read it (lasting until its permissions change). `case-rename-pending`: a case-only rename on the NAS was not made or did not finish, and the content keeps syncing under the NAS spelling (lasting until the NAS spelling is changed or the blocking entry removed). `remote-skipped`: a NAS name or link this tool will not follow; never deleted, overwritten or descended (lasting). `unsupported-entry`: a local name, path or entry kind Synology Drive cannot hold (a refused name, a path too long once the destination is prepended, a non-UTF-8 name, a FIFO, socket or device, a modification time before 1970); lasting until it is renamed or excluded. `delete-not-permitted`: DSM refused to delete it for permission (lasting until the folder's rights change). `tree-too-large-for-memory`: recorded against `.`, the whole tree needs more memory than the run may use, so nothing was listed, compared or written; the detail names the entry counts, the estimate and the available memory (lasting until the profile is split).",
+          "description": "`source-changed`: the local file changed while it was read or sent. `source-vanished`: deleted locally during the run. `source-unreadable`: locked or briefly unreadable (transient). `unsupported-local-entry`: not a regular file or directory the sync carries. `remote-digest-unavailable`: the NAS could not checksum it. `remote-unreadable`: the NAS refuses this one file to the account (lasting until its permissions change). `remote-changed`: the NAS entry changed after planning and was left as found. `unrepresentable-name`: a NAS name this host's filesystem cannot hold; never deleted on that account. `listing-incomplete`: its NAS folder listed fewer entries than it counted, so no deletion was made there. `server-copy-failed`: the NAS-side copy finished with an error. `delete-failed`: the NAS refused the deletion. `remote-refused`: the NAS refuses this name or this account's access to it (lasting until it is renamed or its permissions change; three or more refusals with one cause that are more than half the attempts fail the run instead). `local-permission-denied`: this account may not read it (lasting until its permissions change). `case-rename-pending`: a case-only rename on the NAS was not made or did not finish, and the content keeps syncing under the NAS spelling (lasting until the NAS spelling is changed or the blocking entry removed). `remote-skipped`: a NAS name or link this tool will not follow; never deleted, overwritten or descended (lasting). `unsupported-entry`: a local name, path or entry kind Synology Drive cannot hold (a refused name, a path too long once the destination is prepended, a non-UTF-8 name, a FIFO, socket or device, a modification time before 1970); lasting until it is renamed or excluded. `delete-not-permitted`: DSM refused to delete it for permission (lasting until the folder's rights change). `tree-too-large-for-memory`: recorded against `.`, the whole tree needs more memory than the run may use, so nothing was listed, compared or written; the detail names the entry counts, the estimate and the available memory (lasting until the profile is split). `file-keeps-changing`: the path changed while each of the last three runs worked (an Office lock file, an open mailbox or database, a log); the detail starts `file_keeps_changing path=<path> runs=<n>` and names the last cause. Lasting, so the run is not partial; it is tried on every run and the name clears the first run it syncs. Only with `--pair-index`, whose directory keeps the count. `source-stays-unreadable`, `remote-digest-keeps-failing`, `delete-keeps-failing`: the same for `source-unreadable`, `remote-digest-unavailable` and `delete-failed` in three consecutive runs; the detail starts `keeps_failing path=<path> runs=<n> cause=<reason>`.",
           "enum": [
             "source-changed",
             "source-vanished",
@@ -1044,7 +1050,11 @@
             "remote-skipped",
             "unsupported-entry",
             "delete-not-permitted",
-            "tree-too-large-for-memory"
+            "tree-too-large-for-memory",
+            "file-keeps-changing",
+            "source-stays-unreadable",
+            "remote-digest-keeps-failing",
+            "delete-keeps-failing"
           ]
         },
         "detail": {

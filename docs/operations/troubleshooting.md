@@ -114,7 +114,8 @@ comparison above, which is the one mechanism that can confirm it outright.
   and names that collide by case or Unicode normalisation are **skipped and reported** (`plan.skipped`,
   `SKIPPED` lines, `entry.skipped` warnings), never uploaded and never deleted from the NAS; the run
   exits `0` with a warning. OS metadata files (`desktop.ini`, `Thumbs.db`, `ehthumbs.db`, `.DS_Store`,
-  `Icon\r`, `~$*`) are excluded by default. Deduplicated and hydrated cloud files are ordinary data
+  `Icon\r`) and office lock and temporary files (`~$*`, `~*.tmp`, `.~lock.*#`, `*.laccdb`, `*.ldb`) are
+  excluded by default. Deduplicated and hydrated cloud files are ordinary data
   and are synced.
 - A file that changes or is locked while it is hashed or sent is **deferred**: it is not uploaded,
   nothing is deleted on its account, and the run exits `3` so a scheduler retries it. The reasons

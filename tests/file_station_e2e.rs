@@ -4561,7 +4561,8 @@ fn a_file_that_changes_while_it_is_hashed_is_deferred_and_carried_next_run() {
 }
 
 /// N-4: a file the run uploaded and the user then deleted locally is a change made while the run
-/// worked, not a reconciliation failure.
+/// worked, not a reconciliation failure. It was in the run's first scan, so it is named as a
+/// transient `source-vanished` deferral: the run is partial and the next run mirrors the deletion.
 #[test]
 fn a_file_deleted_locally_after_its_upload_does_not_fail_a_mirror_run() {
     let fixture = TestDir::new("deferral-vanished");
@@ -4589,11 +4590,20 @@ fn a_file_deleted_locally_after_its_upload_does_not_fail_a_mirror_run() {
         password_text,
         &["--compare", "metadata", "--delete"],
     ));
-    assert_success(&sync);
+    assert_eq!(
+        sync.status.code(),
+        Some(3),
+        "stderr: {}",
+        String::from_utf8_lossy(&sync.stderr)
+    );
     let document = stdout_json(&sync);
     assert_eq!(document["result"]["uploaded"], 2);
     assert_eq!(document["result"]["changed_during_run"], 1);
-    assert_eq!(document["result"]["outcome"], "complete");
+    assert_eq!(document["result"]["outcome"], "partial");
+    assert_eq!(document["result"]["failed"], false);
+    let deferred = only_deferred(&document);
+    assert_eq!(deferred["path"], "build.tmp");
+    assert_eq!(deferred["reason"], "source-vanished");
 }
 
 /// The mock pages `List.list` as DSM does, and a directory larger than one page is read whole: a

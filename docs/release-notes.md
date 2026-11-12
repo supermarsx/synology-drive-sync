@@ -293,6 +293,62 @@ lists its own commits.
   Synology package build (<target>)`, and a package API that reports neither reads `Not reported by
   package API`. See [Compatibility](dsm/compatibility.md#four-release-spks).
 
+### Reconciliation, the index on a failed run, and Doctor (fix8-core)
+
+- **A file moved into the source while a run works no longer fails the run.** A move or a copy keeps
+  the file's old modification time, so reconciliation could not tell it from a file the run had
+  failed to upload, and the run failed with `final reconciliation found 1 pending in-scope
+  operations`, retried, and alerted. Reconciliation now judges what is left against the run's first
+  scan: a path the first walk did not hold, one whose local facts moved, one deleted locally, and a
+  NAS entry another hand changed are named as transient deferrals (`source-changed`,
+  `source-vanished`, `remote-changed`). The run is partial (exit `3`), raises no alert, and the next
+  run carries them. A modification time after the run began no longer excuses anything by itself.
+  See [Comparison, exclusions, and deletion](configuration/safety.md).
+- **A reconciliation failure names its paths.** It used to give only a count, which also included
+  entries it had excused, and advised inspecting a fresh plan that no longer showed them. The
+  message now counts only the unconverged operations and names the first five with action, path and
+  cause, for example `final reconciliation did not converge on 1 in-scope path(s): upload
+  docs/a.pdf (in the first scan, unchanged since, and the NAS still differs)`. The first path is the
+  result record's `error.path` and the `run.failed` event's `path`, and each named path is logged as
+  an `entry.skipped` warning with reason `reconciliation_pending`. Exit `1` is kept for a deletion
+  the run made that did not take, a write the NAS still disagrees with, a path in the first scan
+  that still differs, an unresolved type conflict or rename, and a missing destination root.
+- **A failed run keeps the index evidence it proved.** Before, any failure abandoned the run's index
+  session, so the retry after a reconciliation failure started cold. A failed run now stores every
+  proof except those for paths it planned to change on the NAS and paths reconciliation found
+  unconverged. Those are dropped, their old records are removed, and the count is named in the new
+  information issue `pair-index-failed-run`.
+- **A run with nothing to do reports what the index did.** The result record of a no-change run now
+  carries `pair_index`, so the daemon's profile state (`index_state`, `index_hits`, ...) shows the
+  warm run the index exists for. Before, it showed nothing for that run.
+- **A file that is always being written no longer makes every run partial.** A log, an open mailbox
+  or database, or an Office lock file changes while every run works, so every run deferred it and
+  exited `3`, and a realtime routine re-ran for it forever. With `--pair-index` (the package always
+  passes it), a path deferred for a change during the run in three consecutive runs is named
+  `file-keeps-changing` (`file_keeps_changing path=<path> runs=<n>` and the last cause): lasting, so
+  the run exits `0`, still tried on every run, and cleared the first run it syncs. The count lives in
+  `<profile>.redb.unsettled` beside the index; a record that cannot be used is
+  `pair-index-unsettled-unusable`, and its paths stay transient.
+- **No other transient cause can make every run partial forever either.** A file locked for good
+  (`source-unreadable`), a checksum the NAS keeps failing (`remote-digest-unavailable`) and a deletion
+  DSM keeps refusing for a reason other than permission (`delete-failed`) become, after three
+  consecutive runs of the same cause, the lasting `source-stays-unreadable`,
+  `remote-digest-keeps-failing` and `delete-keeps-failing` (`keeps_failing path=<path> runs=<n>
+  cause=<reason>`). The run exits `0`, the path is tried every run, and the name clears when it
+  succeeds.
+- **Office lock and temporary files are excluded by default.** LibreOffice's `.~lock.*#`, Office's
+  `~*.tmp` save files, and Access's `*.laccdb` and `*.ldb` join Office's `~$*` among the built-in
+  excludes. They exist only while a document is open and change while it is. A copy already on the
+  NAS is left there, and a mirror run does not delete it. A rule such as `!*.ldb` re-includes one.
+- **Doctor keeps its report when its log cannot be written.** A log that could not be opened, or a failed log write (a full volume) at the start, before
+  discovery, before authentication, at the end, or at shutdown, used to replace the whole report with
+  one line on standard error, which the package's UI showed as every step skipped. The sections
+  already evaluated keep their verdicts. Every other section says `not run: the diagnostic log failed
+  (<cause>)`. The run still fails, by name.
+- **Doctor explains every section a failure stopped.** A section listed before the failed one but
+  run after it (for example the session checks after a failed File Station capability check) now
+  says `not run because <section> failed`, not `not reached`.
+
 ## Read this before upgrading
 
 - **Rust 1.90 or newer is needed to build from source** (was 1.88). The verified-pair index uses redb

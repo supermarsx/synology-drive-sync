@@ -38,7 +38,8 @@ Without `--hash`, the scanner validates names, types, metadata, case portability
 boundaries, and readability needed to enumerate the tree. Links, reparse points that redirect,
 SYSTEM and TEMPORARY entries, dehydrated cloud placeholders and case or Unicode-normalisation
 collisions are skipped rather than failing the scan, and OS metadata files (`desktop.ini`,
-`Thumbs.db`, `ehthumbs.db`, `.DS_Store`, `Icon\r`, `~$*`) are excluded by default; `sync`, `plan` and
+`Thumbs.db`, `ehthumbs.db`, `.DS_Store`, `Icon\r`) and lock and temporary files (`~$*`, `.~lock.*#`,
+`~*.tmp`, `*.laccdb`, `*.ldb`) are excluded by default; `sync`, `plan` and
 `doctor source` name every skipped path (see [local and SMB sources](local-and-smb-sources.md)). The
 `doctor source` JSON carries `source.skipped: [{path, reason, detail}]` using the `plan.skipped` tags;
 human output says "Source is readable, with entries a sync will skip" and lists `SKIPPED <path>:

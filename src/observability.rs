@@ -568,6 +568,14 @@ pub fn failure_path(error: &crate::error::Error, source: Option<&Path>) -> Optio
         | Error::ServerCopyFailed {
             destination: path, ..
         } => Some(path.clone()),
+        // The first operation reconciliation could not excuse; the message names the others.
+        Error::ReconciliationPending { named, .. } => named.first().map(|operation| {
+            if operation.relative.is_empty() {
+                ".".to_owned()
+            } else {
+                operation.relative.clone()
+            }
+        }),
         Error::InvalidUrl(_)
         | Error::Configuration(_)
         | Error::HttpsRequired
@@ -588,7 +596,6 @@ pub fn failure_path(error: &crate::error::Error, source: Option<&Path>) -> Optio
         | Error::RemoteDigestsFailing { .. }
         | Error::ServerCopyNotStarted
         | Error::OperationTimedOut { .. }
-        | Error::ReconciliationPending { .. }
         | Error::Cancelled
         | Error::Vault { .. }
         | Error::RemoteRefusalsShareWide { .. }
@@ -3272,7 +3279,10 @@ mod tests {
             EventReason::DeleteLimit
         );
         assert_eq!(
-            EventReason::of(&Error::ReconciliationPending { operations: 2 }),
+            EventReason::of(&Error::ReconciliationPending {
+                operations: 2,
+                named: Vec::new()
+            }),
             EventReason::ReconciliationPending
         );
         assert_eq!(EventReason::of(&Error::Cancelled), EventReason::Cancelled);
