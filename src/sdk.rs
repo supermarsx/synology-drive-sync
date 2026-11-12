@@ -844,6 +844,12 @@ pub enum DeferredReason {
     /// it settles. The SDK keeps no record across runs, so it never reports this itself; the
     /// variant mirrors the engine's.
     FileKeepsChanging,
+    /// The file could not be read in several consecutive runs; lasting. Engine-only, as above.
+    SourceStaysUnreadable,
+    /// The NAS could not checksum it in several consecutive runs; lasting. Engine-only.
+    RemoteDigestKeepsFailing,
+    /// The NAS refused its deletion in several consecutive runs; lasting. Engine-only.
+    DeleteKeepsFailing,
 }
 
 impl DeferredReason {
@@ -876,6 +882,9 @@ impl DeferredReason {
             Self::DeleteNotPermitted => sync::DeferReason::DeleteNotPermitted,
             Self::TreeTooLargeForMemory => sync::DeferReason::TreeTooLargeForMemory,
             Self::FileKeepsChanging => sync::DeferReason::FileKeepsChanging,
+            Self::SourceStaysUnreadable => sync::DeferReason::SourceStaysUnreadable,
+            Self::RemoteDigestKeepsFailing => sync::DeferReason::RemoteDigestKeepsFailing,
+            Self::DeleteKeepsFailing => sync::DeferReason::DeleteKeepsFailing,
         }
     }
 }
@@ -902,6 +911,9 @@ impl From<sync::DeferReason> for DeferredReason {
             sync::DeferReason::DeleteNotPermitted => Self::DeleteNotPermitted,
             sync::DeferReason::TreeTooLargeForMemory => Self::TreeTooLargeForMemory,
             sync::DeferReason::FileKeepsChanging => Self::FileKeepsChanging,
+            sync::DeferReason::SourceStaysUnreadable => Self::SourceStaysUnreadable,
+            sync::DeferReason::RemoteDigestKeepsFailing => Self::RemoteDigestKeepsFailing,
+            sync::DeferReason::DeleteKeepsFailing => Self::DeleteKeepsFailing,
         }
     }
 }

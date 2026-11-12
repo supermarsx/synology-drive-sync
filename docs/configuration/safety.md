@@ -191,7 +191,10 @@ that did not take, a write this run made that the NAS still disagrees with, a pa
 unchanged since, whose NAS copy still differs, a type conflict or case-only rename left unresolved,
 and a missing destination root. With `--pair-index`, a path deferred this way in three consecutive runs
 (a file always being written) is named `file-keeps-changing` instead: lasting, so the run is not partial,
-still tried on every run, and cleared the first run it syncs. The failure names the first five operations with their action, path
+still tried on every run, and cleared the first run it syncs. The same holds, under their own names,
+for a file that stays unreadable (`source-stays-unreadable`), a checksum the NAS keeps failing
+(`remote-digest-keeps-failing`) and a deletion DSM keeps refusing for a reason other than permission
+(`delete-keeps-failing`). The failure names the first five operations with their action, path
 and cause (`upload docs/a.pdf (in the first scan, unchanged since, and the NAS still differs)`),
 counts only those that nothing excused, and puts the first path in the result record's `error.path`;
 each named path is also logged as an `entry.skipped` warning with reason `reconciliation_pending`.

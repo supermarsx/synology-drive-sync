@@ -1,13 +1,17 @@
-//! Paths that keep changing while runs work, counted across runs (fix8 R6).
+//! Paths that keep hitting the same transient cause, counted across runs (fix8 R6, R7).
 //!
 //! A file that is always being written (an Office lock file, an open mailbox or database, a log)
 //! changes under every run, so every run defers it as a transient change and ends partial. Exit 3
 //! keeps a realtime routine's change pending, so the routine re-ran for it forever, and the
-//! partial-run breaker only slowed that down. This record, beside the profile's index, counts the
-//! consecutive runs that deferred each path for a change during the run. At
-//! [`KEEPS_CHANGING_RUNS`] the deferral becomes the lasting `file-keeps-changing`: still named,
-//! still tried on every run, but no longer a reason to run again. The count, and so the name,
-//! clears the first run the path is not deferred for a change.
+//! partial-run breaker only slowed that down. The same holds for a file locked for good
+//! (`source-unreadable`), one the NAS cannot checksum (`remote-digest-unavailable`) and a deletion
+//! DSM keeps refusing for a reason other than permission (`delete-failed`). This record, beside
+//! the profile's index, counts the consecutive runs that deferred each path for one such cause
+//! ([`DeferReason::streak`]). At [`KEEPS_CHANGING_RUNS`] of the same cause the deferral becomes
+//! that cause's lasting reason (`file-keeps-changing`, `source-stays-unreadable`,
+//! `remote-digest-keeps-failing`, `delete-keeps-failing`): still named, still tried on every run,
+//! but no longer a reason to run again. The count, and so the name, clears the first run the path
+//! is not deferred for that cause.
 //!
 //! The record is independent of the index's database, so it works when the index itself cannot
 //! be used. One that cannot be read or written is named (`pair-index-unsettled-unusable`), and its
@@ -24,8 +28,7 @@ use super::IndexIssue;
 use crate::plan::Scope;
 use crate::sync::{DeferReason, DeferredPath};
 
-/// Consecutive runs that defer a path for a change during the run before it is named
-/// `file-keeps-changing`.
+/// Consecutive runs that defer a path for the same cause before it is named as lasting.
 pub const KEEPS_CHANGING_RUNS: u32 = 3;
 
 /// Paths the record keeps at most. Beyond it a path is not counted, so it stays a transient
@@ -48,7 +51,8 @@ pub struct UnsettledRecord {
     path: PathBuf,
     source: String,
     remote: String,
-    runs: BTreeMap<String, u32>,
+    /// Path to the streak it is in (see [`DeferReason::streak`]) and how many runs long.
+    runs: BTreeMap<String, (String, u32)>,
 }
 
 impl UnsettledRecord {
@@ -72,7 +76,7 @@ impl UnsettledRecord {
                 );
             }
         };
-        let parsed: Option<BTreeMap<String, u32>> = serde_json::from_str::<Value>(&text)
+        let parsed: Option<BTreeMap<String, (String, u32)>> = serde_json::from_str::<Value>(&text)
             .ok()
             .filter(|value| value["schema"] == SCHEMA)
             .and_then(|value| {
@@ -82,12 +86,13 @@ impl UnsettledRecord {
                 }
                 value["runs"].as_object().and_then(|runs| {
                     runs.iter()
-                        .map(|(relative, count)| {
-                            count
+                        .map(|(relative, streak)| {
+                            let cause = streak["cause"].as_str()?;
+                            streak["runs"]
                                 .as_u64()
                                 .and_then(|count| u32::try_from(count).ok())
                                 .filter(|count| *count > 0)
-                                .map(|count| (relative.clone(), count))
+                                .map(|count| (relative.clone(), (cause.to_owned(), count)))
                         })
                         .collect()
                 })
@@ -107,47 +112,58 @@ impl UnsettledRecord {
         }
     }
 
-    /// Count this run's deferrals and name the paths that keep changing.
+    /// Count this run's deferrals and name the paths that keep hitting the same cause.
     ///
-    /// Every `deferred` change during the run (`source-changed`, `source-vanished`,
-    /// `remote-changed`) adds one to its path's count; at [`KEEPS_CHANGING_RUNS`] the record
-    /// becomes `file-keeps-changing`, with the count and the last cause in its detail. A path in
-    /// the run's scope that this run did not defer for a change has settled, and its count is
+    /// Every `deferred` record whose reason has a streak ([`DeferReason::streak`]) extends its
+    /// path's streak when the previous run's was the same cause, and starts one otherwise; at
+    /// [`KEEPS_CHANGING_RUNS`] the record becomes the streak's lasting reason, with the count and
+    /// the last cause in its detail (`file_keeps_changing path=<p> runs=<n>; last cause ...` for a
+    /// change, `keeps_failing path=<p> runs=<n> cause=<reason>; ...` otherwise). A path in the
+    /// run's scope that this run did not defer for such a cause has settled, and its streak is
     /// dropped; one outside the scope keeps it. Returns how many were named.
     pub fn count(&mut self, deferred: &mut [DeferredPath], scope: &Scope) -> usize {
-        let mut runs: BTreeMap<String, u32> = self
+        let mut runs: BTreeMap<String, (String, u32)> = self
             .runs
             .iter()
             .filter(|(relative, _)| !in_scope(relative, scope))
-            .map(|(relative, count)| (relative.clone(), *count))
+            .map(|(relative, streak)| (relative.clone(), streak.clone()))
             .collect();
         let mut named = 0;
         for record in deferred.iter_mut() {
-            let changing = record.reason.is_change_during_run()
-                || record.reason == DeferReason::FileKeepsChanging;
-            if !changing || runs.contains_key(&record.relative) {
+            let Some((cause, lasting)) = record.reason.streak() else {
+                continue;
+            };
+            if runs.contains_key(&record.relative) {
                 continue;
             }
             if runs.len() >= UNSETTLED_LIMIT {
                 // Not counted: it stays transient, and the run is retried.
                 continue;
             }
-            let count = self
-                .runs
-                .get(&record.relative)
-                .copied()
-                .unwrap_or(0)
-                .saturating_add(1);
-            runs.insert(record.relative.clone(), count);
-            if count >= KEEPS_CHANGING_RUNS && record.reason != DeferReason::FileKeepsChanging {
-                record.detail = format!(
-                    "file_keeps_changing path={} runs={count}; last cause {}: {}",
-                    crate::observability::InlineAscii::<160>::percent_encoded(&record.relative)
-                        .as_str(),
-                    record.reason,
-                    record.detail
-                );
-                record.reason = DeferReason::FileKeepsChanging;
+            let count = match self.runs.get(&record.relative) {
+                Some((previous, count)) if previous == cause => count.saturating_add(1),
+                _ => 1,
+            };
+            runs.insert(record.relative.clone(), (cause.to_owned(), count));
+            if count >= KEEPS_CHANGING_RUNS {
+                let path =
+                    crate::observability::InlineAscii::<160>::percent_encoded(&record.relative);
+                record.detail = if lasting == DeferReason::FileKeepsChanging {
+                    format!(
+                        "file_keeps_changing path={} runs={count}; last cause {}: {}",
+                        path.as_str(),
+                        record.reason,
+                        record.detail
+                    )
+                } else {
+                    format!(
+                        "keeps_failing path={} runs={count} cause={}; {}",
+                        path.as_str(),
+                        record.reason,
+                        record.detail
+                    )
+                };
+                record.reason = lasting;
                 named += 1;
             }
         }
@@ -176,11 +192,18 @@ impl UnsettledRecord {
                 )),
             };
         }
+        let runs: serde_json::Map<String, Value> = self
+            .runs
+            .iter()
+            .map(|(relative, (cause, count))| {
+                (relative.clone(), json!({"cause": cause, "runs": count}))
+            })
+            .collect();
         let text = json!({
             "schema": SCHEMA,
             "source": self.source,
             "remote": self.remote,
-            "runs": self.runs,
+            "runs": runs,
         })
         .to_string();
         let mut temporary = self.path.as_os_str().to_owned();
@@ -232,8 +255,8 @@ fn record_issue(path: &Path, cause: &str) -> IndexIssue {
         ISSUE,
         path.display().to_string(),
         format!(
-            "the record of paths that keep changing {cause}; they are deferred as ordinary \
-             changes during the run (partial runs) until it can be used"
+            "the record of paths that keep hitting the same cause {cause}; they stay ordinary \
+             transient deferrals (partial runs) until it can be used"
         ),
     )
 }
@@ -305,24 +328,87 @@ mod tests {
         let _ = fs::remove_dir_all(&directory);
     }
 
-    /// Only a change during the run counts; a scoped run keeps the counts outside its scope; a
-    /// record for another source starts from empty; a damaged one is named.
+    /// R7: a file locked for good, a checksum the NAS keeps failing and a deletion it keeps
+    /// refusing each become lasting after three runs of the same cause, name the cause, and clear
+    /// when the path succeeds. A change of cause starts the count again.
+    #[test]
+    fn every_looping_cause_is_named_lasting_after_three_runs_of_it() {
+        let directory = directory("classes");
+        let path = record_path(&directory.join("p.redb"));
+        let failing = |relative: &str, reason| DeferredPath {
+            relative: relative.to_owned(),
+            reason,
+            detail: "DSM error 900".to_owned(),
+        };
+        let classes = [
+            (
+                DeferReason::SourceUnreadable,
+                DeferReason::SourceStaysUnreadable,
+            ),
+            (
+                DeferReason::RemoteDigestUnavailable,
+                DeferReason::RemoteDigestKeepsFailing,
+            ),
+            (DeferReason::DeleteFailed, DeferReason::DeleteKeepsFailing),
+        ];
+        for round in 1..=3 {
+            let mut deferred: Vec<_> = classes
+                .iter()
+                .map(|(reason, _)| failing(reason.as_str(), *reason))
+                .collect();
+            let named = run(&path, &mut deferred);
+            for (record, (reason, lasting)) in deferred.iter().zip(classes) {
+                if round < 3 {
+                    assert_eq!(record.reason, reason, "run {round}");
+                    assert!(!record.reason.is_lasting());
+                } else {
+                    assert_eq!(named, 3);
+                    assert_eq!(record.reason, lasting);
+                    assert!(lasting.is_lasting());
+                    assert_eq!(
+                        record.detail,
+                        format!("keeps_failing path={reason} runs=3 cause={reason}; DSM error 900")
+                    );
+                }
+            }
+        }
+        // The unreadable file is read at last, the digest fails for another reason (a change),
+        // and the deletion still fails: only the last stays named.
+        let mut deferred = vec![
+            changed("remote-digest-unavailable"),
+            failing("delete-failed", DeferReason::DeleteFailed),
+        ];
+        assert_eq!(run(&path, &mut deferred), 1);
+        assert_eq!(
+            deferred[0].reason,
+            DeferReason::SourceChanged,
+            "a new cause counts from one"
+        );
+        assert_eq!(deferred[1].reason, DeferReason::DeleteKeepsFailing);
+        assert!(deferred[1].detail.contains("runs=4"));
+        let mut deferred = vec![failing("source-unreadable", DeferReason::SourceUnreadable)];
+        assert_eq!(
+            run(&path, &mut deferred),
+            0,
+            "its streak was cleared when it was read"
+        );
+        let _ = fs::remove_dir_all(&directory);
+    }
+
+    /// Only a looping cause counts; a scoped run keeps the counts outside its scope; a record for
+    /// another source starts from empty; a damaged one is named.
     #[test]
     fn the_record_counts_only_changes_and_names_what_it_cannot_read() {
         let directory = directory("rules");
         let path = record_path(&directory.join("p.redb"));
-        let unreadable = DeferredPath {
-            reason: DeferReason::SourceUnreadable,
-            ..changed("locked.db")
+        let lasting = DeferredPath {
+            reason: DeferReason::RemoteRefused,
+            ..changed("refused.db")
         };
         for _ in 0..3 {
-            let mut deferred = vec![
-                unreadable.clone(),
-                changed("a/log.txt"),
-                changed("b/log.txt"),
-            ];
+            let mut deferred = vec![lasting.clone(), changed("a/log.txt"), changed("b/log.txt")];
             run(&path, &mut deferred);
-            assert_eq!(deferred[0].reason, DeferReason::SourceUnreadable);
+            assert_eq!(deferred[0].reason, DeferReason::RemoteRefused);
         }
         let (mut record, _) = UnsettledRecord::load(&path, "/src", "/share/dst");
         assert_eq!(record.len(), 2);

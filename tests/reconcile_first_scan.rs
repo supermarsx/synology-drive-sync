@@ -95,7 +95,11 @@ impl Fixture {
     }
 
     fn sync(&self) -> Output {
-        run(&[
+        self.sync_with(&[])
+    }
+
+    fn sync_with(&self, extra: &[&str]) -> Output {
+        let mut arguments = vec![
             "--quiet",
             "--output",
             "json",
@@ -118,7 +122,9 @@ impl Fixture {
             "1",
             "--pair-index",
             self.index.to_str().unwrap(),
-        ])
+        ];
+        arguments.extend_from_slice(extra);
+        run(&arguments)
     }
 
     fn result_record(&self) -> Value {
@@ -372,4 +378,98 @@ fn a_file_rewritten_during_every_run_is_named_lasting_on_the_third_run() {
         .filter(|entry| entry.file_name().to_string_lossy().ends_with(".unsettled"))
         .count();
     assert_eq!(leftovers, 0, "a record that counts nothing is removed");
+}
+
+/// Run `fixture` four times, `fault` arming one failure of `path` before each of the first three:
+/// a transient `transient` twice, the lasting `lasting` on the third (exit 0, the cause named),
+/// and nothing named once the path succeeds.
+fn loops_until_named(
+    fixture: &Fixture,
+    extra: &[&str],
+    path: &str,
+    fault: impl Fn(&MockFileStation),
+    transient: &str,
+    lasting: &str,
+) {
+    for round in 1..=4_u32 {
+        if round <= 3 {
+            fault(&fixture.server);
+        }
+        let output = fixture.sync_with(extra);
+        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+        // The result record, which is what the package's daemon reads.
+        let document = fixture.result_record();
+        let named = document["result"]["deferred"]
+            .as_array()
+            .expect("named deferrals")
+            .iter()
+            .find(|record| record["path"] == path)
+            .cloned();
+        match round {
+            1 | 2 => {
+                assert_eq!(output.status.code(), Some(3), "run {round}: {stderr}");
+                let named = named.unwrap_or_else(|| panic!("run {round}: {document}"));
+                assert_eq!(named["reason"], transient, "run {round}");
+            }
+            3 => {
+                assert_eq!(output.status.code(), Some(0), "run 3: {stderr}");
+                assert_eq!(document["result"]["outcome"], "complete");
+                let named = named.unwrap_or_else(|| panic!("run 3: {document}"));
+                assert_eq!(named["reason"], lasting);
+                assert!(
+                    named["detail"]
+                        .as_str()
+                        .is_some_and(|detail| detail.starts_with(&format!(
+                            "keeps_failing path={path} runs=3 cause={transient}; "
+                        ))),
+                    "{named}"
+                );
+            }
+            _ => {
+                assert_eq!(output.status.code(), Some(0), "run 4: {stderr}");
+                assert!(named.is_none(), "cleared once it succeeds: {document}");
+            }
+        }
+    }
+}
+
+/// R7: a deletion DSM keeps refusing for a reason other than permission (code 900) is
+/// `delete-failed` twice, then the lasting `delete-keeps-failing`; it clears when it takes.
+#[test]
+fn a_deletion_that_keeps_failing_is_named_lasting_on_the_third_run() {
+    let fixture = Fixture::new("first-scan-delete-loop", &["steady.txt"]);
+    fixture.server.add_file(
+        &format!("{ROOT}/gone.txt"),
+        b"only on the NAS",
+        1_700_000_000,
+    );
+    loops_until_named(
+        &fixture,
+        &["--delete"],
+        "gone.txt",
+        |server| server.fail_next_api_operation("SYNO.FileStation.Delete.delete", 900),
+        "delete-failed",
+        "delete-keeps-failing",
+    );
+    assert_eq!(
+        fixture.server.file_contents(&format!("{ROOT}/gone.txt")),
+        None
+    );
+}
+
+/// R7: a file the NAS keeps failing to checksum is `remote-digest-unavailable` twice, then the
+/// lasting `remote-digest-keeps-failing`; it clears when it can be compared.
+#[test]
+fn a_checksum_that_keeps_failing_is_named_lasting_on_the_third_run() {
+    let fixture = Fixture::new("first-scan-digest-loop", &["steady.txt"]);
+    // Only the one pair is compared, so each armed failure is its own.
+    fs::remove_file(fixture.source.join("new.txt")).expect("remove the upload");
+    loops_until_named(
+        &fixture,
+        &[],
+        "steady.txt",
+        |server| server.fail_next_api_operation("SYNO.FileStation.MD5.start", 599),
+        "remote-digest-unavailable",
+        "remote-digest-keeps-failing",
+    );
 }

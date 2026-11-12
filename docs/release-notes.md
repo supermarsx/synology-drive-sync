@@ -329,6 +329,13 @@ lists its own commits.
   the run exits `0`, still tried on every run, and cleared the first run it syncs. The count lives in
   `<profile>.redb.unsettled` beside the index; a record that cannot be used is
   `pair-index-unsettled-unusable`, and its paths stay transient.
+- **No other transient cause can make every run partial forever either.** A file locked for good
+  (`source-unreadable`), a checksum the NAS keeps failing (`remote-digest-unavailable`) and a deletion
+  DSM keeps refusing for a reason other than permission (`delete-failed`) become, after three
+  consecutive runs of the same cause, the lasting `source-stays-unreadable`,
+  `remote-digest-keeps-failing` and `delete-keeps-failing` (`keeps_failing path=<path> runs=<n>
+  cause=<reason>`). The run exits `0`, the path is tried every run, and the name clears when it
+  succeeds.
 - **Doctor keeps its report when its log cannot be written.** A log that could not be opened, or a failed log write (a full volume) at the start, before
   discovery, before authentication, at the end, or at shutdown, used to replace the whole report with
   one line on standard error, which the package's UI showed as every step skipped. The sections

@@ -725,6 +725,15 @@ pub enum DeferReason {
     /// and a realtime routine stops re-running for it; it is still tried on every run, named until
     /// it settles, and the name clears the first run it syncs.
     FileKeepsChanging,
+    /// `source-unreadable` for the same path in consecutive runs: a file locked for good, or one
+    /// whose reads keep failing. Lasting, tried on every run, cleared the first run it is read.
+    SourceStaysUnreadable,
+    /// `remote-digest-unavailable` for the same path in consecutive runs: the NAS keeps failing to
+    /// checksum it. Lasting, tried on every run, cleared the first run it is compared.
+    RemoteDigestKeepsFailing,
+    /// `delete-failed` (a DSM code other than permission) for the same path in consecutive runs.
+    /// Lasting, tried on every run, cleared the first run the deletion takes.
+    DeleteKeepsFailing,
 }
 
 impl DeferReason {
@@ -749,6 +758,9 @@ impl DeferReason {
             Self::DeleteNotPermitted => "delete-not-permitted",
             Self::TreeTooLargeForMemory => "tree-too-large-for-memory",
             Self::FileKeepsChanging => "file-keeps-changing",
+            Self::SourceStaysUnreadable => "source-stays-unreadable",
+            Self::RemoteDigestKeepsFailing => "remote-digest-keeps-failing",
+            Self::DeleteKeepsFailing => "delete-keeps-failing",
         }
     }
 
@@ -802,6 +814,15 @@ impl DeferReason {
             Self::FileKeepsChanging => {
                 "changed while each of the last runs worked, so none could carry it; tried again every run and named until it settles"
             }
+            Self::SourceStaysUnreadable => {
+                "could not be read in each of the last runs (locked or failing); tried again every run and named until it is read"
+            }
+            Self::RemoteDigestKeepsFailing => {
+                "the NAS could not checksum it in each of the last runs; compared again every run and named until it can be"
+            }
+            Self::DeleteKeepsFailing => {
+                "the NAS refused its deletion in each of the last runs; tried again every run and named until it takes"
+            }
         }
     }
 
@@ -826,7 +847,27 @@ impl DeferReason {
                 | Self::CaseRenamePending
                 | Self::TreeTooLargeForMemory
                 | Self::FileKeepsChanging
+                | Self::SourceStaysUnreadable
+                | Self::RemoteDigestKeepsFailing
+                | Self::DeleteKeepsFailing
         )
+    }
+
+    /// The streak a transient deferral that can recur on every run belongs to, and the lasting
+    /// reason it becomes after [`crate::pair_index::unsettled::KEEPS_CHANGING_RUNS`] consecutive
+    /// runs of it: `None` for a deferral that cannot loop, or is already lasting.
+    pub fn streak(self) -> Option<(&'static str, Self)> {
+        match self {
+            Self::SourceChanged | Self::SourceVanished | Self::RemoteChanged => {
+                Some(("changing", Self::FileKeepsChanging))
+            }
+            Self::SourceUnreadable => Some(("source-unreadable", Self::SourceStaysUnreadable)),
+            Self::RemoteDigestUnavailable => {
+                Some(("remote-digest-unavailable", Self::RemoteDigestKeepsFailing))
+            }
+            Self::DeleteFailed => Some(("delete-failed", Self::DeleteKeepsFailing)),
+            _ => None,
+        }
     }
 
     /// Whether this deferral means the path changed while the run worked, the condition that can
@@ -839,7 +880,7 @@ impl DeferReason {
     }
 
     /// Every reason, so readers can be checked against the whole vocabulary.
-    pub const ALL: [Self; 19] = [
+    pub const ALL: [Self; 22] = [
         Self::SourceChanged,
         Self::SourceVanished,
         Self::SourceUnreadable,
@@ -859,6 +900,9 @@ impl DeferReason {
         Self::DeleteNotPermitted,
         Self::TreeTooLargeForMemory,
         Self::FileKeepsChanging,
+        Self::SourceStaysUnreadable,
+        Self::RemoteDigestKeepsFailing,
+        Self::DeleteKeepsFailing,
     ];
 
     /// The reason a failure reading one local file defers it, or `None` when the failure is not

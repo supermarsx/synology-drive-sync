@@ -3572,15 +3572,17 @@ fn defer_event_reason(reason: sync::DeferReason) -> EventReason {
         sync::DeferReason::SourceChanged
         | sync::DeferReason::SourceVanished
         | sync::DeferReason::FileKeepsChanging => EventReason::ChangedDuringRun,
-        sync::DeferReason::SourceUnreadable | sync::DeferReason::LocalPermissionDenied => {
-            EventReason::LocalIo
-        }
+        sync::DeferReason::SourceUnreadable
+        | sync::DeferReason::SourceStaysUnreadable
+        | sync::DeferReason::LocalPermissionDenied => EventReason::LocalIo,
         sync::DeferReason::UnsupportedLocalEntry
         | sync::DeferReason::UnrepresentableName
         | sync::DeferReason::UnsupportedEntry => EventReason::LocalEntryUnsupported,
         sync::DeferReason::RemoteDigestUnavailable
+        | sync::DeferReason::RemoteDigestKeepsFailing
         | sync::DeferReason::RemoteUnreadable
         | sync::DeferReason::DeleteFailed
+        | sync::DeferReason::DeleteKeepsFailing
         | sync::DeferReason::CaseRenamePending => EventReason::DsmApiError,
         // DSM refused this one path, or the walk will not address it.
         sync::DeferReason::RemoteRefused
@@ -4060,9 +4062,10 @@ fn build_reconciliation_plan(
     })
 }
 
-/// R6: count, across runs, the paths each run deferred for a change while it worked, and name a
-/// path that keeps changing (`file-keeps-changing`, lasting) instead of making every run partial
-/// for it. Without the index directory there is nowhere to count, and every such deferral stays
+/// R6/R7: count, across runs, the paths each run deferred for a cause that can recur on every run
+/// (a change during the run, an unreadable file, a checksum the NAS cannot make, a deletion it
+/// refuses), and name a path that keeps hitting the same one as a lasting warning instead of
+/// making every run partial for it. Without the index directory there is nowhere to count, and every such deferral stays
 /// transient, as it always was. What the record could not do is returned, to be named in the
 /// index's issues.
 fn count_keeps_changing(
@@ -4087,7 +4090,8 @@ fn count_keeps_changing(
     };
     if named > 0 && !settings.output.quiet {
         eprintln!(
-            "warning: {named} path(s) changed while each of the last {} runs worked; they are              named file-keeps-changing and tried again every run",
+            "warning: {named} path(s) were deferred for the same cause in each of the last {} \
+             runs; they are named as lasting warnings and tried again every run",
             pair_index::unsettled::KEEPS_CHANGING_RUNS
         );
     }
