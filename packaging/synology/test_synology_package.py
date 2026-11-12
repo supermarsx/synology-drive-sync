@@ -658,6 +658,39 @@ class BuilderTests(unittest.TestCase):
         self.assertEqual(len(shell_caps), 1, "the shell's Doctor cap moved; re-pin it here")
         self.assertLessEqual(int(shell_caps[0]), int(rust_cap.group(1).replace("_", "")))
 
+    def test_rejected_mutation_reasons_are_one_vocabulary_in_bridge_and_shell(self) -> None:
+        """The reason a rejected mutation's Activity row names is one list on both sides.
+
+        The bridge sends it, `sdsync-dsm api audit-rejected` admits it, and the bridge's verifier
+        proves the row that carries it. A reason only one side knows would be recorded as
+        `unclassified` at best, so the two lists must be the same set.
+        """
+        bridge = (REPOSITORY / "src/dsm_api.rs").read_text(encoding="utf-8")
+        manager = (HERE / "package/bin/sdsync-dsm").read_text(encoding="utf-8")
+        declared = re.search(
+            r"^const REJECTED_POST_REASONS: \[&str; ([0-9]+)\] = \[\n(.*?)\n\];$",
+            bridge,
+            re.MULTILINE | re.DOTALL,
+        )
+        self.assertIsNotNone(declared, "REJECTED_POST_REASONS is not a literal array")
+        rust = re.findall(r'^    "([a-z_]+)",$', declared.group(2), re.MULTILINE)
+        self.assertEqual(len(rust), int(declared.group(1)))
+        start = manager.index("        audit-rejected)\n")
+        case = re.search(
+            r"case \$\{SDSYNC_DSM_AUDIT_REASON:-\} in\n(.*?)\) ;;\n",
+            manager[start:],
+            re.DOTALL,
+        )
+        self.assertIsNotNone(case, "audit-rejected no longer validates its reason")
+        shell = [
+            name.strip()
+            for name in case.group(1).replace("\\\n", "").split("|")
+        ]
+        self.assertEqual(sorted(shell), sorted(rust))
+        self.assertEqual(len(shell), len(set(shell)))
+        self.assertIn("unclassified", shell)
+        self.assertIn("*) SDSYNC_DSM_AUDIT_REASON=unclassified ;;", manager[start:])
+
     def test_integrated_profile_help_tracks_mutable_output_contract(self) -> None:
         profile_help = (
             REPOSITORY / "packaging/synology/package/ui/help/enu/profiles.html"

@@ -9070,9 +9070,101 @@ fn record_controller_wake_failure() {
     );
 }
 
+/// The reasons a rejected mutation's audit record may name.
+///
+/// A closed list, and the same list `sdsync-dsm api audit-rejected` accepts (the packaging suite
+/// compares the two), because the reason travels through the shell into an Activity row and the
+/// durable-record verifier: a code one side knows and the other does not would turn the record of
+/// a refusal into a refusal to record it. A code outside the list is `unclassified` here, and its
+/// exact spelling is still in the api.log record the same rejection writes.
+const REJECTED_POST_REASONS: [&str; 20] = [
+    "invalid_request",
+    "unauthorized",
+    "forbidden",
+    "csrf_rejected",
+    "ui_build_stale",
+    "method_not_allowed",
+    "unsupported_media_type",
+    "payload_too_large",
+    "conflict",
+    "internal_error",
+    "unavailable",
+    "service_request_unavailable",
+    "control_lock_busy",
+    "runtime_closed",
+    "runtime_upgrading",
+    "runtime_uninstalling",
+    "runtime_marker_unsafe",
+    "clock_unavailable",
+    "job_unreadable",
+    "unclassified",
+];
+
+/// The reason an audited rejection names: the code its error envelope and api.log record carry,
+/// when that code is in [`REJECTED_POST_REASONS`].
+fn rejected_post_reason(error: BridgeError) -> &'static str {
+    let code = resolved_error_code(error, Some(CgiFailureStage::ServiceRequest), None);
+    REJECTED_POST_REASONS
+        .into_iter()
+        .find(|reason| *reason == code)
+        .unwrap_or("unclassified")
+}
+
+/// The client request ID a refused POST body names, when it names a well-formed one.
+///
+/// Read without the rest of the request's contract, because the refusal may be that contract
+/// failing; only the ID's own grammar is required. It goes into the Activity row's trailing tag
+/// and nowhere else -- never into the audit record, whose verifier requires a rejected record to
+/// carry none -- so that the dashboard's advice to match a request ID in Activity can be followed.
+fn rejected_post_request_id(body: Option<&[u8]>) -> Option<String> {
+    #[derive(Deserialize)]
+    struct NamedRequest<'a> {
+        #[serde(borrow, default)]
+        request_id: Option<&'a str>,
+    }
+    let named: NamedRequest<'_> = serde_json::from_slice(body?).ok()?;
+    named
+        .request_id
+        .filter(|value| valid_client_request_id(value))
+        .map(str::to_owned)
+}
+
+/// The text a rejected mutation's Activity row carries after `Module rejected-post failed [<tx>]`:
+/// ` reason=<code>`, then ` request_id=<id>` when the refused body named one. The request tag is
+/// last because Activity readers take a message's trailing ` request_id=` as its correlation ID.
+/// `None` without a reason; a reason outside [`REJECTED_POST_REASONS`] or a malformed ID is refused.
+fn rejected_post_activity_tag(
+    reason: Option<&str>,
+    request_id: Option<&str>,
+) -> BridgeResult<Option<String>> {
+    let Some(reason) = reason else {
+        return if request_id.is_some() {
+            Err(BridgeError::bad_request())
+        } else {
+            Ok(None)
+        };
+    };
+    if !REJECTED_POST_REASONS.contains(&reason)
+        || request_id.is_some_and(|value| !valid_client_request_id(value))
+    {
+        return Err(BridgeError::bad_request());
+    }
+    let mut tag = format!(" reason={reason}");
+    if let Some(request_id) = request_id {
+        tag.push_str(" request_id=");
+        tag.push_str(request_id);
+    }
+    Ok(Some(tag))
+}
+
 #[cfg(target_os = "linux")]
-fn record_rejected_post(audit_actor: &str, audit_actor_uid: u32) -> BridgeResult<()> {
-    record_rejected_operation(audit_actor, audit_actor_uid, "bridge")
+fn record_rejected_post(
+    audit_actor: &str,
+    audit_actor_uid: u32,
+    reason: &'static str,
+    request_id: Option<&str>,
+) -> BridgeResult<()> {
+    record_rejected_operation(audit_actor, audit_actor_uid, "bridge", reason, request_id)
 }
 
 #[cfg(target_os = "linux")]
@@ -9080,6 +9172,8 @@ fn record_rejected_operation(
     audit_actor: &str,
     audit_actor_uid: u32,
     origin: &str,
+    reason: &'static str,
+    request_id: Option<&str>,
 ) -> BridgeResult<()> {
     if !valid_authenticated_username(audit_actor) || audit_actor_uid == 0 {
         return Err(BridgeError::new(ErrorKind::Forbidden));
@@ -9087,10 +9181,19 @@ fn record_rejected_operation(
     if !matches!(origin, "bridge" | "controller") {
         return Err(BridgeError::new(ErrorKind::Forbidden));
     }
+    if !REJECTED_POST_REASONS.contains(&reason)
+        || request_id.is_some_and(|value| !valid_client_request_id(value))
+    {
+        return Err(BridgeError::internal());
+    }
     let mut command = manager_command(&["api".into(), "audit-rejected".into()], false)?;
     command.env("SDSYNC_DSM_AUDIT_ACTOR", audit_actor);
     command.env("SDSYNC_DSM_AUDIT_ACTOR_UID", audit_actor_uid.to_string());
     command.env("SDSYNC_DSM_AUDIT_ORIGIN", origin);
+    command.env("SDSYNC_DSM_AUDIT_REASON", reason);
+    if let Some(request_id) = request_id {
+        command.env("SDSYNC_DSM_REJECTED_REQUEST_ID", request_id);
+    }
     let output = capture_bounded_command(
         &mut command,
         MAX_MANAGER_OUTPUT_BYTES,
@@ -9534,7 +9637,9 @@ mod linux_files {
             return Ok(false);
         }
         if now == 0
-            || !matches!(status, 400 | 401 | 403 | 405 | 413 | 415 | 500 | 503)
+            // 409 is a refused mutation (a conflicting request ID, a full queue, a stale page):
+            // without it those refusals named their reason in Activity and nowhere else.
+            || !matches!(status, 400 | 401 | 403 | 405 | 409 | 413 | 415 | 500 | 503)
             || !matches!(
                 stage,
                 "request"
@@ -9912,25 +10017,51 @@ mod linux_files {
         }
     }
 
+    /// `rejection_tag` is what a rejected mutation's Activity row carries after its fixed text
+    /// (` reason=<code>` and, when the refused body named one, ` request_id=<id>`); see
+    /// [`rejected_post_activity_tag`].
     pub(super) fn durably_verify_audit_event(
         expected: &AuditOutboxRecord,
         expected_state: &str,
         package_uid: u32,
+        rejection_tag: Option<&str>,
     ) -> BridgeResult<()> {
-        durably_verify_audit_event_at(
+        durably_verify_tagged_audit_event_at(
             expected,
             expected_state,
             package_uid,
+            rejection_tag,
             Path::new(LOG_ROOT),
             Path::new(AUDIT_LOG_PATH),
             Path::new(ACTIVITY_LOG_PATH),
         )
     }
 
+    #[cfg(test)]
     pub(super) fn durably_verify_audit_event_at(
         expected: &AuditOutboxRecord,
         expected_state: &str,
         package_uid: u32,
+        log_root: &Path,
+        audit_log: &Path,
+        activity_log: &Path,
+    ) -> BridgeResult<()> {
+        durably_verify_tagged_audit_event_at(
+            expected,
+            expected_state,
+            package_uid,
+            None,
+            log_root,
+            audit_log,
+            activity_log,
+        )
+    }
+
+    pub(super) fn durably_verify_tagged_audit_event_at(
+        expected: &AuditOutboxRecord,
+        expected_state: &str,
+        package_uid: u32,
+        rejection_tag: Option<&str>,
         log_root: &Path,
         audit_log: &Path,
         activity_log: &Path,
@@ -9994,6 +10125,12 @@ mod linux_files {
             expected_message.push_str(" request_id=");
             expected_message.push_str(client_request_id);
         }
+        // A rejected mutation's row names its reason. The untagged text is accepted beside it so
+        // that a manager whose writer predates the tag still has its refusals proven rather than
+        // failed; the tag can only ever be the exact one this rejection carries.
+        let tagged_message = rejection_tag
+            .filter(|_| expected.operation == "rejected-post")
+            .map(|tag| format!("{expected_message}{tag}"));
         let mut activity_found = false;
         for path in rotating_log_paths(activity_log, 3) {
             let Some((file, bytes)) =
@@ -10042,7 +10179,8 @@ mod linux_files {
                                 || fields[4] != "audit"
                                 || actor_uid != expected.actor_uid
                                 || fields[7] != expected.actor
-                                || fields[8] != expected_message
+                                || (fields[8] != expected_message
+                                    && tagged_message.as_deref() != Some(fields[8]))
                             {
                                 return Err(BridgeError::unsafe_runtime());
                             }
@@ -14396,6 +14534,15 @@ fn run_audit_transaction_cli(arguments: &[OsString]) -> BridgeResult<bool> {
                 .ok_or_else(BridgeError::bad_request)
         })
         .transpose()?;
+    let environment_text = |name: &str| {
+        std::env::var_os(name)
+            .map(|value| value.into_string().map_err(|_| BridgeError::bad_request()))
+            .transpose()
+    };
+    let rejection_tag = rejected_post_activity_tag(
+        environment_text("SDSYNC_DSM_AUDIT_REASON")?.as_deref(),
+        environment_text("SDSYNC_DSM_REJECTED_REQUEST_ID")?.as_deref(),
+    )?;
     let text = |index: usize| -> BridgeResult<String> {
         arguments
             .get(index)
@@ -14519,7 +14666,12 @@ fn run_audit_transaction_cli(arguments: &[OsString]) -> BridgeResult<bool> {
                 phase: AuditOutboxPhase::Prepared,
             };
             linux_runtime::clear_environment()?;
-            linux_files::durably_verify_audit_event(&record, &state, package_uid)?;
+            linux_files::durably_verify_audit_event(
+                &record,
+                &state,
+                package_uid,
+                rejection_tag.as_deref(),
+            )?;
             Ok(false)
         }
         Some("validate") if arguments.len() == 7 => {
@@ -15478,6 +15630,11 @@ fn handle_relay_request_under_policy(
     // policy this request already paid to read.
     let policy = &*loaded_policy.insert(policy);
     let is_post = matches!(request, ValidatedHttpRequest::Post { .. });
+    let rejected_request_id = if is_post {
+        rejected_post_request_id(body)
+    } else {
+        None
+    };
     let result = if policy.require_https && !is_https_request(authentication.https.as_deref()) {
         Err(BridgeError::new(ErrorKind::Forbidden))
     } else {
@@ -15492,8 +15649,13 @@ fn handle_relay_request_under_policy(
         )
     };
     if is_post
-        && result.is_err()
-        && let Err(error) = record_rejected_post(&session.username, session.uid)
+        && let Err(rejection) = &result
+        && let Err(error) = record_rejected_post(
+            &session.username,
+            session.uid,
+            rejected_post_reason(*rejection),
+            rejected_request_id.as_deref(),
+        )
     {
         // The rejection itself is still answered below; what failed is its mandatory audit
         // record, and that loss is named in api.log rather than dropped.
@@ -20207,7 +20369,13 @@ fn run_consumer(request: &Path, response: &Path) -> BridgeResult<()> {
                     // No untrusted field is attributable until the strict job
                     // document parses. Preserve a durable, bounded controller
                     // rejection record before the controller quarantines it.
-                    record_rejected_operation("package-controller", package_uid, "controller")?;
+                    record_rejected_operation(
+                        "package-controller",
+                        package_uid,
+                        "controller",
+                        "job_unreadable",
+                        None,
+                    )?;
                     return Err(error);
                 }
             };
@@ -32712,6 +32880,147 @@ mod tests {
             .unwrap_err()
             .kind,
             ErrorKind::UnsafeRuntime
+        );
+    }
+
+    /// A rejected mutation's Activity row names its reason and, when the refused body named one,
+    /// its client request ID. The verifier proves exactly that row, or the untagged row a writer
+    /// that predates the tag leaves, and never a row naming a different reason.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn durable_audit_verification_proves_a_tagged_rejection_row() {
+        let fixture = TestControlFixture::new("durable-audit-rejection");
+        let package_uid = TestControlFixture::package_uid();
+        let log_root = fixture.root.join("logs");
+        fs::create_dir(&log_root).unwrap();
+        fs::set_permissions(&log_root, fs::Permissions::from_mode(0o700)).unwrap();
+        let audit_log = log_root.join("audit.log");
+        let activity_log = log_root.join("activity.log");
+        let (owner_pid, owner_start, owner_boot) = linux_files::current_process_identity().unwrap();
+        let transaction = format!("bridge-{JOB_ID}");
+        let record = AuditOutboxRecord {
+            schema: "sdsync.dsm-audit-outbox.v1".to_owned(),
+            transaction: transaction.clone(),
+            operation: "rejected-post".to_owned(),
+            profile: "all".to_owned(),
+            actor: "admin".to_owned(),
+            actor_uid: package_uid.max(1),
+            origin: "bridge".to_owned(),
+            client_request_id: None,
+            job_id: None,
+            owner_pid,
+            owner_start,
+            owner_boot,
+            phase: AuditOutboxPhase::Failed,
+        };
+        let audit = serde_json::to_string(&json!({
+            "epoch": 10_000, "level": "error", "configured_level": "info", "subject_level": "info",
+            "mandatory": true, "category": "audit", "subject_category": "bridge",
+            "operation": "rejected-post", "state": "failed", "transaction": transaction,
+            "origin": "bridge", "actor": "admin", "actor_uid": record.actor_uid, "profile": "all",
+        }))
+        .unwrap();
+        fixture.write_private(&audit_log, format!("{audit}\n").as_bytes());
+        let tag = rejected_post_activity_tag(Some("csrf_rejected"), Some(REQUEST_ID))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            tag,
+            format!(" reason=csrf_rejected request_id={REQUEST_ID}")
+        );
+        let row = |message: &str| {
+            format!(
+                "10000|audit.failed|all|failed|audit|error|{}|admin|{message}\n",
+                record.actor_uid
+            )
+        };
+        let verify = |rejection_tag: Option<&str>| {
+            linux_files::durably_verify_tagged_audit_event_at(
+                &record,
+                "failed",
+                package_uid,
+                rejection_tag,
+                &log_root,
+                &audit_log,
+                &activity_log,
+            )
+        };
+        let base = format!("Module rejected-post failed [{transaction}]");
+        fixture.write_private(&activity_log, row(&format!("{base}{tag}")).as_bytes());
+        verify(Some(&tag)).unwrap();
+        // The tag is only ever the exact one this rejection carries.
+        assert_eq!(verify(None).unwrap_err().kind, ErrorKind::UnsafeRuntime);
+        let other = rejected_post_activity_tag(Some("forbidden"), None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            verify(Some(&other)).unwrap_err().kind,
+            ErrorKind::UnsafeRuntime
+        );
+        // A writer that predates the tag still has its refusals proven.
+        fs::remove_file(&activity_log).unwrap();
+        fixture.write_private(&activity_log, row(&base).as_bytes());
+        verify(Some(&tag)).unwrap();
+        verify(None).unwrap();
+    }
+
+    #[test]
+    fn a_rejected_mutation_names_a_bounded_reason_and_a_well_formed_request_id() {
+        assert_eq!(
+            rejected_post_reason(BridgeError::new(ErrorKind::CsrfRejected)),
+            "csrf_rejected"
+        );
+        assert_eq!(
+            rejected_post_reason(BridgeError::new(ErrorKind::Forbidden)),
+            "forbidden"
+        );
+        assert_eq!(
+            rejected_post_reason(BridgeError::new(ErrorKind::Unavailable)),
+            "service_request_unavailable"
+        );
+        assert_eq!(
+            rejected_post_reason(BridgeError::unavailable_because("control_lock_busy")),
+            "control_lock_busy"
+        );
+        assert_eq!(
+            rejected_post_reason(BridgeError::unavailable_because("manager_timeout")),
+            "unclassified",
+            "a code outside the list is named unclassified, never dropped"
+        );
+        for reason in REJECTED_POST_REASONS {
+            assert!(
+                !reason.is_empty()
+                    && reason.len() <= 64
+                    && reason
+                        .bytes()
+                        .all(|byte| byte.is_ascii_lowercase() || byte == b'_'),
+                "{reason}"
+            );
+        }
+
+        let body = format!(r#"{{"schema":"old","request_id":"{REQUEST_ID}","operation":"gone"}}"#);
+        assert_eq!(
+            rejected_post_request_id(Some(body.as_bytes())).as_deref(),
+            Some(REQUEST_ID),
+            "the ID is read even when the rest of the request is what failed"
+        );
+        for refused in [
+            &br#"{"request_id":"short"}"#[..],
+            br#"{"request_id":7}"#,
+            b"not json",
+            br#"{"operation":"configure-profile"}"#,
+        ] {
+            assert_eq!(rejected_post_request_id(Some(refused)), None);
+        }
+        assert_eq!(rejected_post_request_id(None), None);
+
+        assert_eq!(rejected_post_activity_tag(None, None), Ok(None));
+        assert!(rejected_post_activity_tag(None, Some(REQUEST_ID)).is_err());
+        assert!(rejected_post_activity_tag(Some("made_up"), None).is_err());
+        assert!(rejected_post_activity_tag(Some("forbidden"), Some("short")).is_err());
+        assert_eq!(
+            rejected_post_activity_tag(Some("forbidden"), None),
+            Ok(Some(" reason=forbidden".to_owned()))
         );
     }
 

@@ -250,6 +250,31 @@ class DsmUiContractTests(unittest.TestCase):
         ):
             self.assertIn(marker, bundle)
 
+    def test_every_rejected_mutation_reason_has_words(self) -> None:
+        # The bridge names why it refused a mutation (REJECTED_POST_REASONS) in
+        # the Activity row and the error envelope; the AppWindow renders each
+        # reason from POST_REJECTION_COPY. A reason without a row would reach
+        # the operator as a bare code, and a row nothing produces is copy for a
+        # refusal that does not exist.
+        repository = HERE.parents[1]
+        backend = (repository / "src/dsm_api.rs").read_text(encoding="utf-8")
+        app = (UI_SOURCE / "src/App.vue").read_text(encoding="utf-8")
+        declared = re.search(
+            r"^const REJECTED_POST_REASONS: \[&str; [0-9]+\] = \[\n(.*?)\n\];$", backend, re.M | re.S
+        )
+        self.assertIsNotNone(declared)
+        reasons = set(re.findall(r'^    "([a-z_]+)",$', declared.group(1), re.M))
+        start = app.index("const POST_REJECTION_COPY = Object.freeze({")
+        end = app.index("\n});\n", start)
+        rows = set(re.findall(r"^  ([a-z_]+): Object\.freeze\(\{", app[start:end], re.M))
+        self.assertEqual(rows, reasons)
+        # Every 4xx code the bridge can answer a POST with has a toast of its own.
+        for code in ("invalid_request", "forbidden", "conflict", "payload_too_large", "ui_build_stale"):
+            row = re.search(rf"^  {code}: Object\.freeze\(\{{\n(.*?)\n  \}}\)", app[start:end], re.M | re.S)
+            self.assertIsNotNone(row, code)
+            self.assertIn("title:", row.group(1), code)
+            self.assertIn("message:", row.group(1), code)
+
     def test_progress_catalogue_and_failure_codes_agree_across_layers(self) -> None:
         # Two more lists that nothing else relates, both fail-closed on the
         # rendering side. The bridge resolves a phase id against src/lib.rs and

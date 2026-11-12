@@ -833,7 +833,7 @@ already stored, so a save from the dashboard's alert form does not switch system
 | `authentication_failed` | warn | authentication | A dashboard authentication attempt was rejected |
 | `security_failed` | err | security | A request failed a CGI or runtime identity check |
 | `bridge_failed` | warn | bridge | A dashboard request could not be served |
-| `bridge_rejected` | warn | bridge | An unauthorized dashboard mutation was refused |
+| `bridge_rejected` | warn | bridge | An authenticated dashboard mutation was refused before it was queued; its Activity row names the reason |
 | `service_started` | info | lifecycle | The package service started |
 | `service_stopped` | info | lifecycle | The package service stopped |
 | `service_restarted` | info | lifecycle | The package service restarted |

@@ -464,6 +464,29 @@ Use `status`, `paths`, the bounded logs above, and a Package Center Stop followe
 CGI/socket, add any identity-changing permission or capability, expose the socket, or hand-create
 the CSRF key.
 
+## A dashboard change was refused (`rejected-post`)
+
+A change the package refused after DSM authentication, before anything was queued, is recorded as
+`audit.failed` and `module.failed` with the text `Module rejected-post failed [<transaction>]
+reason=<code>`, followed by `request_id=<id>` when the refused request named a well-formed client
+request ID. That ID is the one the dashboard's toast shows, so the two can be matched. Activity
+also shows the reason in words, and the toast is worded by the same code. Nothing was changed.
+
+| `reason=` | Meaning | What to do |
+| --- | --- | --- |
+| `csrf_rejected` | The mutation token was expired or belonged to another session | Select **Retry** and submit again |
+| `ui_build_stale` | The page was loaded from an older package version | Reload the app (close and reopen it, or refresh the browser tab) |
+| `forbidden` | The security policy does not allow this change | Review **Settings > Security** |
+| `invalid_request` | The request was malformed or does not match the installed package | Reload the app; if it repeats, collect `api.log` |
+| `conflict` | Another change with the same request ID, or a full queue | Wait for queued work to finish |
+| `payload_too_large` | The request was larger than the package accepts | Shorten the change |
+| `control_lock_busy`, `runtime_*`, `service_request_unavailable`, `unavailable`, `clock_unavailable` | The package could not accept work at that moment | See [Dashboard status is stale](#dashboard-status-is-stale-or-a-read-reports-a-named-in-service-failure) |
+| `internal_error` | The package failed internally before queueing it | Collect `api.log` |
+| `job_unreadable` | A queued request could not be read by the controller (`origin` controller) | Collect `controller.log` and `api.log` |
+| `unclassified` | A cause outside this list | The `cgi_failure` record in `api.log` at the same time names the exact code |
+
+Rows written before this release carry no `reason=`.
+
 ## A queued action remains pending or becomes outcome-unknown
 
 Each mutation uses one serialized body and client request ID. When POST delivery or acknowledgement

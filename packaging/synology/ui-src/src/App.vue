@@ -501,7 +501,7 @@
                       <div class="sdsync-filter-row"><span class="sdsync-filter-label">Category</span><div class="sdsync-filter-control"><v-single-select class="sdsync-select-control" v-model="activityCategory" :options="activityLensCategoryOptions" width="100%" :custom-dropdown-cls="'sdsync-select-dropdown ' + themeClass" aria-label="Activity category" aria-describedby="sdsync-help-activity-category"><template #dropdown-icon><action-icon name="chevron-down" /></template></v-single-select><control-help help-key="activity-category" /></div></div>
                       <div class="sdsync-filter-row"><span class="sdsync-filter-label">Level</span><div class="sdsync-filter-control"><v-single-select class="sdsync-select-control" v-model="activityLevel" :options="activityLevelOptions" width="100%" :custom-dropdown-cls="'sdsync-select-dropdown ' + themeClass" aria-label="Activity level" aria-describedby="sdsync-help-activity-level"><template #dropdown-icon><action-icon name="chevron-down" /></template></v-single-select><control-help help-key="activity-level" /></div></div>
                     </div>
-                    <ol class="sdsync-activity-feed"><li v-if="!reversedActivity.length" class="sdsync-empty">{{ activityEmptyText }}</li><li v-for="event in shownActivity" :key="event.rowKey"><time>{{ formatDate(event.epoch) }}{{ nasTimeSuffix(event.epoch) }}</time><div class="sdsync-activity-detail"><strong>{{ event.code }}</strong><p v-if="event.message && !event.doctor_inventory">{{ event.message }}</p><div v-if="event.doctor_inventory" class="sdsync-inventory-evidence"><div class="sdsync-inventory-evidence-summary"><strong>{{ doctorInventoryScopeLabel(event.doctor_inventory.inventory.scope) }}</strong><span>{{ event.doctor_inventory.inventory.total }} total · {{ event.doctor_inventory.inventory.entries.length }} shown<span v-if="event.doctor_inventory.inventory.truncated"> · truncated</span></span></div><p v-if="!event.doctor_inventory.inventory.entries.length">No logical entries were visible.</p><div v-for="(entry, index) in event.doctor_inventory.inventory.entries" :key="entry.path + ':' + index" class="sdsync-inventory-evidence-entry"><span>{{ entry.kind }}</span><code>{{ entry.path }}</code><small>{{ entry.name }}</small></div></div><code v-if="event.client_request_id">Client request ID: {{ event.client_request_id }}</code></div><small><bdi>{{ shownName(event.profile) }}</bdi> · {{ event.state }} · {{ event.category }} / {{ event.level }}</small><v-button class="sdsync-evidence-copy" type="border" display="icon-text" :aria-label="'Copy activity event ' + event.code" tooltip="Copy this event as bounded, sanitized troubleshooting text" @click="copyActivityEvent(event)"><template #icon><action-icon name="copy" /></template>Copy</v-button></li><li v-if="activityHiddenCount" class="sdsync-empty sdsync-activity-more"><span>{{ activityMoreLabel }}</span> <v-button type="border" display="icon-text" tooltip="Draw the next 200 older events" @click="showMoreActivity">Show older</v-button></li></ol>
+                    <ol class="sdsync-activity-feed"><li v-if="!reversedActivity.length" class="sdsync-empty">{{ activityEmptyText }}</li><li v-for="event in shownActivity" :key="event.rowKey"><time>{{ formatDate(event.epoch) }}{{ nasTimeSuffix(event.epoch) }}</time><div class="sdsync-activity-detail"><strong>{{ event.code }}</strong><p v-if="event.message && !event.doctor_inventory">{{ event.message }}</p><p v-if="event.rejection_reason">{{ rejectionReasonText(event.rejection_reason) }}</p><div v-if="event.doctor_inventory" class="sdsync-inventory-evidence"><div class="sdsync-inventory-evidence-summary"><strong>{{ doctorInventoryScopeLabel(event.doctor_inventory.inventory.scope) }}</strong><span>{{ event.doctor_inventory.inventory.total }} total · {{ event.doctor_inventory.inventory.entries.length }} shown<span v-if="event.doctor_inventory.inventory.truncated"> · truncated</span></span></div><p v-if="!event.doctor_inventory.inventory.entries.length">No logical entries were visible.</p><div v-for="(entry, index) in event.doctor_inventory.inventory.entries" :key="entry.path + ':' + index" class="sdsync-inventory-evidence-entry"><span>{{ entry.kind }}</span><code>{{ entry.path }}</code><small>{{ entry.name }}</small></div></div><code v-if="event.client_request_id">Client request ID: {{ event.client_request_id }}</code></div><small><bdi>{{ shownName(event.profile) }}</bdi> · {{ event.state }} · {{ event.category }} / {{ event.level }}</small><v-button class="sdsync-evidence-copy" type="border" display="icon-text" :aria-label="'Copy activity event ' + event.code" tooltip="Copy this event as bounded, sanitized troubleshooting text" @click="copyActivityEvent(event)"><template #icon><action-icon name="copy" /></template>Copy</v-button></li><li v-if="activityHiddenCount" class="sdsync-empty sdsync-activity-more"><span>{{ activityMoreLabel }}</span> <v-button type="border" display="icon-text" tooltip="Draw the next 200 older events" @click="showMoreActivity">Show older</v-button></li></ol>
                   </article>
                 </div>
               </transition>
@@ -905,6 +905,80 @@ const BRIDGE_FAILURE_COPY = Object.freeze({
     cause: "the NAS clock is not set correctly",
     retry: "stop"
   })
+});
+// What a mutation the bridge refused before queueing it means, keyed by the code
+// of its error envelope. That is also the code its Activity row names as
+// `reason=` (REJECTED_POST_REASONS in dsm_api.rs; test_synology_ui.py compares
+// the two lists), so every reason the package can record has words here.
+//   `title`/`message` are the toast for a refusal answered with a 4xx. A 503
+//     keeps BRIDGE_FAILURE_COPY and its retry ladder, so those rows carry no toast.
+//   `activity` finishes the Activity row's sentence "Dashboard change refused: ...".
+//   `reload` marks the refusal only a reload clears; it also takes the header.
+// The bridge's own envelope message for all of these is the constant "Request
+// could not be completed.", which is why the toast used to be unable to tell a
+// policy refusal from a malformed request from a full queue.
+const POST_REJECTION_COPY = Object.freeze({
+  invalid_request: Object.freeze({
+    title: "Request not accepted",
+    message: "The installed package does not accept the request this page sent, so nothing was changed. Reload the app, then submit again.",
+    activity: "the request was malformed or does not match the installed package"
+  }),
+  unauthorized: Object.freeze({
+    title: "DSM sign-in required",
+    message: "DSM no longer recognises this session, so nothing was changed. Sign in to DSM again, then submit again.",
+    activity: "the DSM session was not authenticated"
+  }),
+  forbidden: Object.freeze({
+    title: "Refused by the security policy",
+    message: "The package security policy does not allow this change, so nothing was changed. Review Settings > Security, then submit again.",
+    activity: "the security policy does not allow this change"
+  }),
+  csrf_rejected: Object.freeze({
+    title: "Mutation token rejected",
+    message: "The request carried an expired mutation token or one from another session, so nothing was changed. Select Retry, then submit again.",
+    activity: "its mutation token was expired or belonged to another session"
+  }),
+  ui_build_stale: Object.freeze({
+    title: "This page is out of date",
+    message: "This page was loaded from an older version of the package, so nothing was changed. Reload the app (close and reopen it, or refresh the browser tab), then submit again.",
+    activity: "the page that sent it was loaded from an older package version",
+    reload: true
+  }),
+  method_not_allowed: Object.freeze({
+    title: "Request not accepted",
+    message: "The package does not accept this kind of request, so nothing was changed. Reload the app, then submit again.",
+    activity: "it used a request method the package does not accept"
+  }),
+  unsupported_media_type: Object.freeze({
+    title: "Request not accepted",
+    message: "The package accepts only JSON requests, so nothing was changed. Reload the app, then submit again.",
+    activity: "it was not a JSON request"
+  }),
+  payload_too_large: Object.freeze({
+    title: "Request too large",
+    message: "This change is larger than the package accepts, so nothing was changed. Shorten it, then submit again.",
+    activity: "it was larger than the package accepts"
+  }),
+  conflict: Object.freeze({
+    title: "Request conflicts with queued work",
+    message: "Another change with the same request ID, or a full queue, refused this one, so nothing was changed. Wait for queued work to finish, then submit again.",
+    activity: "it conflicted with queued work, or the queue was full"
+  }),
+  internal_error: Object.freeze({
+    title: "Package failed before queueing",
+    message: "The package failed internally before queueing this change, so nothing was changed. Inspect the package API log.",
+    activity: "the package failed internally before queueing it"
+  }),
+  unavailable: Object.freeze({ activity: "the package service was unavailable" }),
+  service_request_unavailable: Object.freeze({ activity: "the package service was unavailable" }),
+  control_lock_busy: Object.freeze({ activity: "the package was busy recording another change" }),
+  runtime_closed: Object.freeze({ activity: "the package was stopping or upgrading" }),
+  runtime_upgrading: Object.freeze({ activity: "the package was upgrading" }),
+  runtime_uninstalling: Object.freeze({ activity: "the package was being removed" }),
+  runtime_marker_unsafe: Object.freeze({ activity: "the package could not confirm it was running normally" }),
+  clock_unavailable: Object.freeze({ activity: "the NAS clock was not set correctly" }),
+  job_unreadable: Object.freeze({ activity: "the queued request could not be read" }),
+  unclassified: Object.freeze({ activity: "for a reason this page has no words for; the package API log names it" })
 });
 // Which bounded package logs the dashboard may empty. The audit log is absent
 // on purpose and the bridge refuses it independently: it is the record of who
@@ -1465,6 +1539,7 @@ function probeableIncidents(component) {
 // reaped, and those two differ in exactly the way that matters before a retry.
 const PROBE_VERDICT_COPY = Object.freeze({
   settled: "DSM holds a completed record for this exact request.",
+  rejected: "DSM refused this exact request before queueing it, so it was not performed. Activity names the reason.",
   accepted: "DSM accepted this request and its job is still running.",
   unknown: "The package recorded this request's own outcome as unknown.",
   absent: "Neither the package queue nor Activity holds any record of this request ID. That does not confirm it never ran: a completed job's record is eventually reaped, so this stays locked.",
@@ -3328,6 +3403,10 @@ function normalizedActivityEvent(event) {
   const code = field(event.code, "unknown.event");
   const level = field(event.level, "info");
   const legacyCancel = code === "run.failed" && level === "info" && /\bcancel(?:led|ed)\b/i.test(rawMessage);
+  // A refused dashboard mutation names why (`reason=`, the bridge's error code)
+  // after its fixed text, and the request ID last when the refused body named
+  // one. Only that exact shape is read; the row renders the reason in words.
+  const rejection = /^Module rejected-post failed \[[A-Za-z0-9_-]{1,96}\] reason=([a-z_]{1,64})(?: request_id=[0-9a-f]{32})?$/.exec(rawMessage);
   return {
     epoch: numberOr(event.epoch, 0),
     code: legacyCancel ? "run.cancelled" : code,
@@ -3337,7 +3416,8 @@ function normalizedActivityEvent(event) {
     level,
     message,
     client_request_id: validatedClientRequestId(event.client_request_id),
-    doctor_inventory: doctorInventory
+    doctor_inventory: doctorInventory,
+    ...(rejection ? { rejection_reason: rejection[1] } : {})
   };
 }
 
@@ -5553,6 +5633,10 @@ export default {
         true
       );
     },
+    rejectionReasonText(code) {
+      const copy = POST_REJECTION_COPY[code];
+      return `Dashboard change refused: ${copy ? copy.activity : `reason ${code}`}.`;
+    },
     reportMutationError(error, failedTitle, unknownTitle, fallback, options = undefined) {
       const formatting = options && typeof options === "object" ? options : {};
       const unknown = Boolean(error && error.outcomeUnknown === true);
@@ -5637,6 +5721,25 @@ export default {
         const message = withCorrelation(`${observed} ${this.bridgeIssue.message}`, this.bridgeIssue.message);
         this.toast(failedTitle, message, true);
         return { unknown: false, csrfRejected: true, message, requestId, jobId };
+      }
+      // Refused before it was queued, for a reason this window has words for.
+      // The envelope's own message is one constant for every refusal, so the
+      // code is the only thing that says which. Activity records the same
+      // refusal as `rejected-post` with `reason=<code>` and, when the request
+      // ID is shown here, the same ID -- so the two can be matched.
+      const rejectionCode = String((error && error.code) || "").toLowerCase();
+      const rejection = !unknown && !inspection && error && error.preAcceptance === true
+        && error.trustedRejection === true && Number(error.status) >= 400 && Number(error.status) < 500
+        ? POST_REJECTION_COPY[rejectionCode]
+        : undefined;
+      if (rejection && rejection.message) {
+        if (rejection.reload) {
+          this.bridgeIssue = { title: rejection.title, message: rejection.message };
+          this.connectionLabel = rejection.title;
+        }
+        const message = withCorrelation(`${rejection.title}. ${rejection.message}`, rejection.message);
+        this.toast(failedTitle, message, true);
+        return { unknown: false, inspection: false, rejected: true, code: rejectionCode, message, requestId, jobId };
       }
       const message = inspection
         ? withCorrelation(
@@ -5997,7 +6100,7 @@ export default {
             progress: (observed && observed.progress) || null,
             message: PROBE_VERDICT_COPY[verdict]
           };
-          if (verdict === "settled" && SELF_RELEASING_INCIDENT_SCOPES.includes(scope)) released.push(scope);
+          if ((verdict === "settled" || verdict === "rejected") && SELF_RELEASING_INCIDENT_SCOPES.includes(scope)) released.push(scope);
         }
       } finally {
         if (!this.disposed) this.incidentProbe = { ...this.incidentProbe, active: false };

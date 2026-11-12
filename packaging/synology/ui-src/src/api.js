@@ -1708,8 +1708,13 @@ const AUDIT_REQUEST_VERDICTS = Object.freeze({
   "audit.requested": "accepted"
 });
 // Precedence when several records name the same request: a terminal state
-// outranks the package's own unknown, which outranks a bare acceptance.
-const AUDIT_VERDICT_RANK = Object.freeze({ settled: 3, unknown: 2, accepted: 1 });
+// outranks the package's own unknown, which outranks a bare acceptance, which
+// outranks a refusal. A refusal is `audit.failed` like a settled failure, but
+// it proves only that one attempt was refused before anything was queued: a
+// replay of the same request may still have been accepted, so any other record
+// of the request outranks it.
+const AUDIT_VERDICT_RANK = Object.freeze({ settled: 3, unknown: 2, accepted: 1, rejected: 0 });
+const REJECTED_REQUEST_MESSAGE_PREFIX = "Module rejected-post failed ";
 const ACTIVITY_PROBE_LINES = 200;
 
 function auditVerdictForRequest(model, requestId) {
@@ -1718,8 +1723,12 @@ function auditVerdictForRequest(model, requestId) {
   for (const event of events) {
     if (!event || typeof event !== "object" || Array.isArray(event)) continue;
     if (validClientRequestId(event.client_request_id) !== requestId) continue;
-    const verdict = AUDIT_REQUEST_VERDICTS[event.code];
-    if (!verdict) continue;
+    if (!AUDIT_REQUEST_VERDICTS[event.code]) continue;
+    const verdict = event.code === "audit.failed"
+      && typeof event.message === "string"
+      && event.message.startsWith(REJECTED_REQUEST_MESSAGE_PREFIX)
+      ? "rejected"
+      : AUDIT_REQUEST_VERDICTS[event.code];
     const epoch = Number(event.epoch);
     const record = {
       verdict,

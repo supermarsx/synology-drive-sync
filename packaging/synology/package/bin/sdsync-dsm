@@ -473,7 +473,8 @@ begin_admitted() {
     # fresh, fixed service attribution so caller-controlled bridge variables
     # cannot suppress or forge its mandatory records.
     unset SDSYNC_DSM_AUDIT_TRANSACTION SDSYNC_DSM_AUDIT_ACTOR \
-        SDSYNC_DSM_AUDIT_ACTOR_UID SDSYNC_DSM_AUDIT_ORIGIN SDSYNC_DSM_CLIENT_REQUEST_ID
+        SDSYNC_DSM_AUDIT_ACTOR_UID SDSYNC_DSM_AUDIT_ORIGIN SDSYNC_DSM_CLIENT_REQUEST_ID \
+        SDSYNC_DSM_AUDIT_REASON SDSYNC_DSM_REJECTED_REQUEST_ID
     SDSYNC_DSM_AUDIT_ACTOR=package-manager
     SDSYNC_DSM_AUDIT_ACTOR_UID=$path_owner
     SDSYNC_DSM_AUDIT_ORIGIN=manager
@@ -5197,7 +5198,8 @@ api_command() {
             unset SDSYNC_DSM_AUDIT_ACTOR SDSYNC_DSM_AUDIT_ACTOR_UID SDSYNC_DSM_AUDIT_ORIGIN \
                 SDSYNC_DSM_AUDIT_TRANSACTION SDSYNC_DSM_AUDIT_PROFILE \
                 SDSYNC_DSM_AUDIT_REQUESTED SDSYNC_DSM_TERMINAL_AUDIT_OWNER \
-                SDSYNC_DSM_POLICY_JOB_PATH SDSYNC_DSM_AUDIT_WRAPPED SDSYNC_DSM_CLIENT_REQUEST_ID
+                SDSYNC_DSM_POLICY_JOB_PATH SDSYNC_DSM_AUDIT_WRAPPED SDSYNC_DSM_CLIENT_REQUEST_ID \
+                SDSYNC_DSM_AUDIT_REASON SDSYNC_DSM_REJECTED_REQUEST_ID
             SDSYNC_DSM_AUDIT_ACTOR=package-manager
             SDSYNC_DSM_AUDIT_ACTOR_UID=$path_owner
             SDSYNC_DSM_AUDIT_ORIGIN=manager
@@ -5215,6 +5217,27 @@ api_command() {
         cgi-failure) api_cgi_failure "$@" ;;
         audit-rejected)
             [ "$#" -eq 0 ] || api_error invalid_request "audit-rejected accepts no arguments" 64
+            # The bridge names why it refused the mutation, and the client
+            # request ID when the refused body carried a well-formed one. Both
+            # reach only the Activity row (append_audit_event) and the verifier
+            # that proves it; the audit.log record keeps its fixed shape. The
+            # list is REJECTED_POST_REASONS in dsm_api.rs, compared by the
+            # packaging suite: a reason outside it is recorded as unclassified
+            # rather than leaving the refusal unaudited.
+            case ${SDSYNC_DSM_AUDIT_REASON:-} in
+                invalid_request|unauthorized|forbidden|csrf_rejected|ui_build_stale|\
+                method_not_allowed|unsupported_media_type|payload_too_large|conflict|\
+                internal_error|unavailable|service_request_unavailable|control_lock_busy|\
+                runtime_closed|runtime_upgrading|runtime_uninstalling|runtime_marker_unsafe|\
+                clock_unavailable|job_unreadable|unclassified) ;;
+                *) SDSYNC_DSM_AUDIT_REASON=unclassified ;;
+            esac
+            case ${SDSYNC_DSM_REJECTED_REQUEST_ID:-} in
+                ''|*[!0-9a-f]*) unset SDSYNC_DSM_REJECTED_REQUEST_ID ;;
+                *) [ "${#SDSYNC_DSM_REJECTED_REQUEST_ID}" -eq 32 ] || unset SDSYNC_DSM_REJECTED_REQUEST_ID ;;
+            esac
+            export SDSYNC_DSM_AUDIT_REASON
+            [ -z "${SDSYNC_DSM_REJECTED_REQUEST_ID:-}" ] || export SDSYNC_DSM_REJECTED_REQUEST_ID
             append_audit_event rejected-post failed all >/dev/null 2>&1 || api_error audit_unavailable "mandatory audit record could not be written" 73
             dsm_log_event bridge_rejected
             api_result "Rejected dashboard mutation audited"
