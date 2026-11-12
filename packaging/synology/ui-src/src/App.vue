@@ -1949,7 +1949,12 @@ function settingsFromStoredValue(storedValue) {
     if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return fallback;
     return {
       theme: ["dark", "light", "system"].includes(parsed.theme) ? parsed.theme : fallback.theme,
-      status_refresh: [0, 1000, 3000, 5000, 10000, 30000].includes(Number(parsed.status_refresh)) ? Number(parsed.status_refresh) : fallback.status_refresh,
+      // A stored 1000 is the "Every second" option this window no longer offers
+      // (the validator never accepted it, yet it polled at 1 s and blocked every
+      // other Interface save); it becomes the default 5 seconds.
+      status_refresh: Number(parsed.status_refresh) === 1000
+        ? 5000
+        : ([0, 3000, 5000, 10000, 30000].includes(Number(parsed.status_refresh)) ? Number(parsed.status_refresh) : fallback.status_refresh),
       log_refresh: [0, 5000, 10000, 30000].includes(Number(parsed.log_refresh)) ? Number(parsed.log_refresh) : fallback.log_refresh,
       desktop_notifications: parsed.desktop_notifications === true,
       audible: parsed.audible === true
@@ -1965,6 +1970,16 @@ function loadSettings() {
   } catch (_error) {
     return defaults();
   }
+}
+
+// The settings as the Interface form binds them: the two refresh cadences as
+// the strings their selects offer. Stored and sent as numbers.
+function selectableSettings(settings) {
+  const shown = Object.assign({}, settings);
+  for (const key of ["status_refresh", "log_refresh"]) {
+    if (shown[key] !== undefined && shown[key] !== null) shown[key] = String(Number(shown[key]) || 0);
+  }
+  return shown;
 }
 
 function utf8ByteLength(value) {
@@ -4278,7 +4293,7 @@ export default {
   mixins: [patchGuard],
   components: { ActionIcon, ControlHelp, SecurityPanel },
   data() {
-    const settings = loadSettings();
+    const settings = selectableSettings(loadSettings());
     return {
       routes: [
         { id: "overview", title: "Overview", icon: "overview" }, { id: "profiles", title: "Profiles", icon: "profiles" },
@@ -5205,8 +5220,11 @@ export default {
     activityLevelOptions() { return options([["all", "All levels"], ...["trace", "debug", "info", "warn", "error"].map((level) => [level, level])]); },
     logLineOptions() { return options([[100, "100 lines"], [200, "200 lines"], [500, "500 lines"], [1000, "1000 lines"]]); },
     themeOptions() { return options([["dark", "Hellfire dark"], ["system", "Follow system"], ["light", "Ash light"]]); },
-    statusRefreshOptions() { return options([[0, "Manual only"], [1000, "Every second"], [3000, "Every 3 seconds"], [5000, "Every 5 seconds"], [10000, "Every 10 seconds"], [30000, "Every 30 seconds"]]); },
-    logRefreshOptions() { return options([[0, "Manual only"], [5000, "Every 5 seconds"], [10000, "Every 10 seconds"], [30000, "Every 30 seconds"]]); }
+    // String values: a select whose value is the number 0 may read as "nothing
+    // selected" to the DSM control, so these carry strings and every reader
+    // converts with Number() (scheduleSnapshot, scheduleLogs, the payload).
+    statusRefreshOptions() { return options([["0", "Manual only"], ["3000", "Every 3 seconds"], ["5000", "Every 5 seconds"], ["10000", "Every 10 seconds"], ["30000", "Every 30 seconds"]]); },
+    logRefreshOptions() { return options([["0", "Manual only"], ["5000", "Every 5 seconds"], ["10000", "Every 10 seconds"], ["30000", "Every 30 seconds"]]); }
   },
   watch: {
     // See ACTIVITY_SEARCH_DEBOUNCE_MS and normalizedActivityEvents above: the
@@ -8311,7 +8329,7 @@ export default {
       }
     },
     applySettingsState(settings) {
-      this.settings = Object.assign({}, settings);
+      this.settings = selectableSettings(settings);
       this.notificationForm = Object.assign({}, this.notificationForm, {
         desktop_notifications: settings.desktop_notifications === true,
         audible: settings.audible === true
