@@ -172,8 +172,11 @@ mod tests {
         // A later caller waits on the same helper (no second thread) and recovers once it is
         // released.
         release.send(()).expect("the helper is still waiting");
-        gate.wait(|| Err("a second helper must not start".to_owned()), Duration::from_secs(5))
-            .expect("ready after the pool filled");
+        gate.wait(
+            || Err("a second helper must not start".to_owned()),
+            Duration::from_secs(5),
+        )
+        .expect("ready after the pool filled");
     }
 
     #[test]
