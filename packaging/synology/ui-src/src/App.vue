@@ -4152,9 +4152,16 @@ function applyStep(vm, label, step) {
     return true;
   } catch (error) {
     const message = plainText(error && error.message ? error.message : String(error), 160);
-    if (typeof console !== "undefined" && console.error) console.error(`[sdsync] ${label}: ${message}`, error);
+    const kind = plainText(error && error.name ? error.name : "Error", 40);
+    if (typeof console !== "undefined" && console.error) {
+      console.error(`[sdsync] ${label}: ${kind}: ${message}`, error, error && error.stack);
+    }
     vm.applyError = `${label}: ${message}`;
-    vm.toast("Dashboard error", `The package answered, but this window failed while applying ${label}: ${message}`, true);
+    vm.toast(
+      `Dashboard error in ${label}`,
+      `The package answered, but this window failed while applying ${label} (${kind}: ${message}). The rest of the page is current. Reload the app if it repeats; the browser console has the details under [sdsync].`,
+      true
+    );
     return false;
   }
 }
