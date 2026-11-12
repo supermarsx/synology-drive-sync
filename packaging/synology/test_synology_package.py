@@ -18147,6 +18147,61 @@ fi
             "the processing request outlived its terminal result",
         )
 
+    def test_a_rejected_mutation_row_names_its_reason_and_request(self) -> None:
+        # C8 (B2). The refused-POST Activity row carried no reason, so the toast's
+        # "match the request ID" advice had nothing to match. The reason and the
+        # request ID ride on the row only; audit.log keeps its fixed shape.
+        emitter = self.root / "emit-reasoned-rejection.sh"
+        emitter.write_text(
+            "#!/bin/sh\n"
+            "set -eu\n"
+            f". {shlex.quote(str(self.real_target / 'libexec/sdsync-common'))}\n"
+            "SDSYNC_DSM_AUDIT_ACTOR=admin\n"
+            f"SDSYNC_DSM_AUDIT_ACTOR_UID={self.drop_uid}\n"
+            "SDSYNC_DSM_AUDIT_ORIGIN=bridge\n"
+            "SDSYNC_DSM_AUDIT_TRANSACTION=$1\n"
+            "SDSYNC_DSM_AUDIT_REASON=$2\n"
+            "unset SDSYNC_DSM_CLIENT_REQUEST_ID\n"
+            'if [ -n "${3:-}" ]; then SDSYNC_DSM_REJECTED_REQUEST_ID=$3; export SDSYNC_DSM_REJECTED_REQUEST_ID; fi\n'
+            "export SDSYNC_DSM_AUDIT_ACTOR SDSYNC_DSM_AUDIT_ACTOR_UID \\\n"
+            "    SDSYNC_DSM_AUDIT_ORIGIN SDSYNC_DSM_AUDIT_TRANSACTION SDSYNC_DSM_AUDIT_REASON\n"
+            "append_audit_event rejected-post failed all\n",
+            encoding="utf-8",
+        )
+        emitter.chmod(0o755)
+        activity_log = self.real_var / "log/activity.log"
+        audit_log = self.real_var / "log/audit.log"
+        request_id = "ab" * 16
+        transaction = "reasoned-" + ("a" * 40)
+        refused = self.shell(emitter, transaction, "forbidden", request_id)
+        self.assertEqual(refused.returncode, 0, refused.stderr)
+        expected = f"Module rejected-post failed [{transaction}] reason=forbidden request_id={request_id}"
+        rows = [
+            line.split("|") for line in activity_log.read_text(encoding="utf-8").splitlines()
+            if transaction in line
+        ]
+        self.assertEqual(sorted(row[1] for row in rows), ["audit.failed", "module.failed"], rows)
+        self.assertTrue(all(row[-1] == expected for row in rows), rows)
+        record = [
+            json.loads(line) for line in audit_log.read_text(encoding="utf-8").splitlines()
+            if transaction in line
+        ]
+        self.assertEqual(len(record), 1, record)
+        self.assertNotIn("client_request_id", record[0])
+        # Without a request ID in the refused body the row ends at the reason.
+        bare = "reasoned-" + ("b" * 40)
+        self.assertEqual(self.shell(emitter, bare, "csrf_rejected").returncode, 0)
+        self.assertIn(
+            f"Module rejected-post failed [{bare}] reason=csrf_rejected",
+            activity_log.read_text(encoding="utf-8"),
+        )
+        # An unvalidated reason or request ID writes nothing.
+        before = activity_log.read_bytes()
+        for reason, tag in (("Bad-Reason", ""), ("forbidden", "XYZ"), ("forbidden", "ab" * 15)):
+            result = self.shell(emitter, "reasoned-" + ("c" * 40), reason, tag)
+            self.assertEqual(result.returncode, 64, (reason, tag, result.stderr))
+        self.assertEqual(activity_log.read_bytes(), before)
+
     def test_a_dashboard_job_that_blocks_the_loop_is_named_once_and_its_end_said(self) -> None:
         # C4. check_stalled_run returned at once unless the active child was a
         # runner, so a status walk, Doctor or resync that never ended held the
@@ -18166,7 +18221,14 @@ fi
             extra_environment={"SDSYNC_DSM_CONSUMER_STALL_SECONDS": "2"}, timeout=30,
         )
         self.assertEqual(started.returncode, 0, started.stdout + started.stderr)
-        self.addCleanup(lambda: release.write_text("go\n", encoding="utf-8"))
+        # tearDown removes the tree before cleanups run: the release is best effort.
+        def release_the_job() -> None:
+            try:
+                release.write_text("go\n", encoding="utf-8")
+            except OSError:
+                pass
+
+        self.addCleanup(release_the_job)
         self.addCleanup(lambda: self.shell(self.lifecycle, "stop", timeout=30))
         self.wait_for_path(ready, "the job never started", timeout=15)
         blocked = self.wait_for_controller_event("controller_blocked_by_stalled_consumer", timeout=60)
