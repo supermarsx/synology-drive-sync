@@ -201,6 +201,7 @@ pub const ISSUE_CODES: &[&str] = &[
     "pair-index-nas-clock-skewed",
     "pair-index-cleanup-failed",
     "pair-index-plan-clock-unbounded",
+    "pair-index-unkeepable",
 ];
 
 impl IndexIssue {

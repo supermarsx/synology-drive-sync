@@ -925,3 +925,202 @@ fn a_compacted_pair_costs_no_more_than_the_compaction_budget_assumes() {
         );
     }
 }
+
+/// What the armv7 miscompile left on disk (`tests/pair_index_codegen.rs`): the magic number and
+/// the god byte, and the rest of the header zero.
+fn zero_the_header_body(dir: &Dir) {
+    use std::os::unix::fs::FileExt as _;
+    let file = fs::OpenOptions::new()
+        .write(true)
+        .open(database(dir))
+        .unwrap();
+    file.write_all_at(&[0; 310], 10).unwrap();
+}
+
+/// The directory's entries and their modification times.
+fn listing(dir: &Dir) -> BTreeMap<String, std::time::SystemTime> {
+    fs::read_dir(&dir.0)
+        .unwrap()
+        .flatten()
+        .map(|entry| {
+            (
+                entry.file_name().to_string_lossy().into_owned(),
+                entry.metadata().unwrap().modified().unwrap(),
+            )
+        })
+        .collect()
+}
+
+fn copies(dir: &Dir) -> usize {
+    listing(dir)
+        .keys()
+        .filter(|name| name.contains(".redb.corrupt-"))
+        .count()
+}
+
+fn sixty_pairs() -> IndexCommit {
+    IndexCommit {
+        clear: false,
+        remove: Vec::new(),
+        upsert: (0..60)
+            .map(|index| {
+                (
+                    key(index),
+                    StoredPair {
+                        record: record(index, 1),
+                        remote_spelling: None,
+                    },
+                )
+            })
+            .collect(),
+        meta: Some(meta()),
+    }
+}
+
+/// A system that cannot keep the index, as the DS416 on 26.62 could not: every file is found
+/// damaged, with the same cause, the next time it is opened. The third such open in a row sets
+/// the file aside like the others but builds no new one, and names a lasting condition. Later
+/// runs name the same condition and touch nothing, so one quarantined copy is all that stays,
+/// and the runs go on without the index.
+#[test]
+fn an_index_this_system_cannot_keep_is_turned_off_by_name_not_rebuilt_every_run() {
+    let dir = Dir::new("unkeepable");
+    write(&dir, 50, 1);
+    zero_the_header_body(&dir);
+
+    // Run 1: the open finds the file damaged (one) and builds a new one; the commit's reopen
+    // finds that one damaged too (two) and commits into a third.
+    let opened = RedbPairIndex::open(paths(&dir), 8);
+    let codes: Vec<&str> = opened.issues.iter().map(|issue| issue.code).collect();
+    assert_eq!(codes, vec!["pair-index-corrupt"]);
+    assert!(
+        opened.issues[0].cause.contains("page size 0"),
+        "{:?}",
+        opened.issues
+    );
+    let mut backend = opened
+        .backend
+        .expect("rebuilt after the first damaged open");
+    assert_eq!(backend.meta().unwrap(), None);
+    backend.finish_reads();
+    zero_the_header_body(&dir);
+    backend
+        .commit(sixty_pairs())
+        .expect("the second damaged open still rebuilds");
+    let codes: Vec<&str> = backend
+        .take_notes()
+        .iter()
+        .map(|issue| issue.code)
+        .collect();
+    assert_eq!(codes, vec!["pair-index-corrupt"]);
+    drop(backend);
+    assert_eq!(copies(&dir), 1, "one quarantined copy, as designed");
+    assert!(paths(&dir).rebuilds.is_file(), "the count is kept");
+
+    // Run 2: the third damaged open in a row.
+    zero_the_header_body(&dir);
+    let opened = RedbPairIndex::open(paths(&dir), 8);
+    let codes: Vec<&str> = opened.issues.iter().map(|issue| issue.code).collect();
+    assert_eq!(codes, vec!["pair-index-corrupt", "pair-index-unkeepable"]);
+    assert!(
+        opened.backend.is_none(),
+        "the run goes on without the index"
+    );
+    let unkeepable = &opened.issues[1];
+    assert_eq!(unkeepable.severity.as_str(), "warning");
+    assert!(
+        unkeepable.cause.contains("3 times in a row")
+            && unkeepable.cause.contains("page size 0")
+            && unkeepable.cause.contains("photos.redb.rebuilds"),
+        "{unkeepable:?}"
+    );
+    assert!(
+        opened.issues[0].cause.contains("no new index is built"),
+        "{:?}",
+        opened.issues[0]
+    );
+    assert!(!database(&dir).exists(), "no new file is built");
+    assert_eq!(copies(&dir), 1, "still one quarantined copy");
+
+    // Run 3 and on: the same lasting condition, and nothing in the directory changes.
+    let before = listing(&dir);
+    for _ in 0..3 {
+        let opened = RedbPairIndex::open(paths(&dir), 8);
+        let codes: Vec<&str> = opened.issues.iter().map(|issue| issue.code).collect();
+        assert_eq!(codes, vec!["pair-index-unkeepable"]);
+        assert!(opened.backend.is_none());
+    }
+    assert_eq!(listing(&dir), before, "a standing verdict touches nothing");
+}
+
+/// One damaged file is not a pattern: the open that finds the rebuilt file sound clears the
+/// count, so damage months apart never adds up to the lasting condition.
+#[test]
+fn a_sound_reopen_clears_the_count_of_damaged_opens() {
+    let dir = Dir::new("count-cleared");
+    write(&dir, 50, 1);
+    zero_the_header_body(&dir);
+    let opened = RedbPairIndex::open(paths(&dir), 8);
+    assert_eq!(opened.issues.len(), 1, "{:?}", opened.issues);
+    let mut backend = opened.backend.expect("rebuilt");
+    backend.finish_reads();
+    assert!(
+        paths(&dir).rebuilds.is_file(),
+        "one damaged open is counted"
+    );
+    // The commit's reopen finds the new file as this process left it: sound.
+    backend.commit(sixty_pairs()).unwrap();
+    assert_eq!(backend.take_notes(), Vec::new());
+    drop(backend);
+    assert!(!paths(&dir).rebuilds.exists(), "a sound reopen clears it");
+
+    for _ in 0..2 {
+        zero_the_header_body(&dir);
+        let opened = RedbPairIndex::open(paths(&dir), 8);
+        let codes: Vec<&str> = opened.issues.iter().map(|issue| issue.code).collect();
+        assert_eq!(
+            codes,
+            vec!["pair-index-corrupt"],
+            "each damage is healed alone"
+        );
+        let mut backend = opened.backend.expect("rebuilt");
+        backend.commit(sixty_pairs()).unwrap();
+        drop(backend);
+        let opened = RedbPairIndex::open(paths(&dir), 8);
+        assert_eq!(opened.issues, Vec::new());
+    }
+}
+
+/// A verdict another build reached, or one older than the retry period, is tried again from a
+/// count of zero; a record that is not one this package writes is named and starts over.
+#[test]
+fn a_lapsed_or_unreadable_verdict_is_tried_again() {
+    let dir = Dir::new("verdict-lapsed");
+    write(&dir, 10, 1);
+    let rebuilds = paths(&dir).rebuilds;
+    fs::write(
+        &rebuilds,
+        "sdsync.pair-index-rebuilds.v1\nwriter=0.0.1+elsewhere/redb-4.4.0\ncount=9\nsince=1\n\
+         last=1\ncause=DB corrupted: Database page size 0 does not match expected 4096\n",
+    )
+    .unwrap();
+    fs::set_permissions(&rebuilds, fs::Permissions::from_mode(0o600)).unwrap();
+    let opened = RedbPairIndex::open(paths(&dir), 8);
+    assert_eq!(opened.issues, Vec::new());
+    assert!(opened.backend.is_some(), "tried again");
+    assert!(!rebuilds.exists(), "the lapsed verdict is cleared");
+    drop(opened);
+
+    fs::write(&rebuilds, "not a record\n").unwrap();
+    fs::set_permissions(&rebuilds, fs::Permissions::from_mode(0o600)).unwrap();
+    let opened = RedbPairIndex::open(paths(&dir), 8);
+    let codes: Vec<&str> = opened.issues.iter().map(|issue| issue.code).collect();
+    assert_eq!(codes, vec!["pair-index-cleanup-failed"]);
+    assert!(
+        opened.issues[0].cause.contains("starts over")
+            && opened.issues[0].path.ends_with("photos.redb.rebuilds"),
+        "{:?}",
+        opened.issues
+    );
+    assert!(opened.backend.is_some());
+}
