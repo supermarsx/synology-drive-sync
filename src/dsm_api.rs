@@ -8062,26 +8062,56 @@ fn parse_manager_result(bytes: &[u8], exact_secret: Option<&[u8]>) -> BridgeResu
     parse_manager_result_for_operation(bytes, exact_secret, None)
 }
 
+/// The most text a manager's action result may carry in `output`.
+///
+/// Doctor is the action that needs it: the shell keeps up to 327,680 bytes of its NDJSON
+/// (`api_capture` in `sdsync-dsm`, truncation marker included) so that a multi-profile run keeps
+/// every record whole. This cap used to be the 65,536 bytes every other text field gets, so a
+/// Doctor over all profiles that the shell had carefully bounded was refused here and reached the
+/// dashboard as "could not be started" with no report at all. The two caps are pinned together by
+/// the packaging suite (the shell's must never exceed this one). Every other action's output is
+/// bounded at 65,536 bytes by the shell, so this widens nothing they can send.
+const MAX_ACTION_OUTPUT_BYTES: usize = 327_680;
+
+// Why a manager's result was refused. Each validation names itself, so the api.log record a
+// consume failure leaves says which check failed rather than only that one did; the kind, and
+// with it every caller's branch, is unchanged.
+/// Empty, larger than the manager output ceiling, or not JSON.
+const RESULT_UNREADABLE: BridgeError = BridgeError::unavailable_because("result_unreadable");
+/// A key or value that must never leave the package.
+const RESULT_SENSITIVE: BridgeError = BridgeError::unavailable_because("result_sensitive_value");
+/// Not a `sdsync.dsm-result.v1` document of a known shape.
+const RESULT_SHAPE_INVALID: BridgeError = BridgeError::unavailable_because("result_shape_invalid");
+/// A failure code outside the published vocabulary.
+const RESULT_CODE_UNKNOWN: BridgeError = BridgeError::unavailable_because("result_code_unknown");
+/// An action result whose status, scope, output or exit code is malformed.
+const RESULT_ACTION_INVALID: BridgeError =
+    BridgeError::unavailable_because("result_action_invalid");
+/// An action result whose `output` exceeds [`MAX_ACTION_OUTPUT_BYTES`]. Its own kind, so the
+/// terminal result says the output was too large instead of that the operation never started.
+const RESULT_OUTPUT_TOO_LARGE: BridgeError =
+    BridgeError::coded(ErrorKind::PayloadTooLarge, "result_output_too_large");
+/// The result's `ok` disagrees with the manager's exit status.
+const RESULT_EXIT_MISMATCH: BridgeError = BridgeError::unavailable_because("result_exit_mismatch");
+
 fn parse_manager_result_for_operation(
     bytes: &[u8],
     exact_secret: Option<&[u8]>,
     operation: Option<&str>,
 ) -> BridgeResult<Value> {
     if bytes.is_empty() || bytes.len() > MAX_MANAGER_OUTPUT_BYTES {
-        return Err(BridgeError::new(ErrorKind::Unavailable));
+        return Err(RESULT_UNREADABLE);
     }
-    let value: Value =
-        serde_json::from_slice(bytes).map_err(|_| BridgeError::new(ErrorKind::Unavailable))?;
+    let value: Value = serde_json::from_slice(bytes).map_err(|_| RESULT_UNREADABLE)?;
     if json_contains_sensitive_value(&value, exact_secret) {
-        return Err(BridgeError::new(ErrorKind::Unavailable));
+        return Err(RESULT_SENSITIVE);
     }
     if matches!(operation, Some("test-profile-auth" | "browse-remote")) {
-        validate_connection_manager_result(&value, operation.unwrap())?;
+        validate_connection_manager_result(&value, operation.unwrap())
+            .map_err(|_| RESULT_SHAPE_INVALID)?;
         return Ok(value);
     }
-    let root = value
-        .as_object()
-        .ok_or_else(|| BridgeError::new(ErrorKind::Unavailable))?;
+    let root = value.as_object().ok_or(RESULT_SHAPE_INVALID)?;
     const ALLOWED_FIELDS: &[&str] = &[
         "schema",
         "ok",
@@ -8103,23 +8133,23 @@ fn parse_manager_result_for_operation(
         .any(|key| !ALLOWED_FIELDS.contains(&key.as_str()))
         || root.get("schema").and_then(Value::as_str) != Some("sdsync.dsm-result.v1")
     {
-        return Err(BridgeError::new(ErrorKind::Unavailable));
+        return Err(RESULT_SHAPE_INVALID);
     }
-    validate_result_warnings(root)?;
+    validate_result_warnings(root).map_err(|_| RESULT_SHAPE_INVALID)?;
     let ok = root
         .get("ok")
         .and_then(Value::as_bool)
-        .ok_or_else(|| BridgeError::new(ErrorKind::Unavailable))?;
+        .ok_or(RESULT_SHAPE_INVALID)?;
     let message = root
         .get("message")
         .and_then(Value::as_str)
-        .ok_or_else(|| BridgeError::new(ErrorKind::Unavailable))?;
-    validate_result_text(message, 65_536)?;
+        .ok_or(RESULT_SHAPE_INVALID)?;
+    validate_result_text(message, 65_536).map_err(|_| RESULT_SHAPE_INVALID)?;
 
     let code = root.get("code");
     if ok {
         if code.is_some() {
-            return Err(BridgeError::new(ErrorKind::Unavailable));
+            return Err(RESULT_SHAPE_INVALID);
         }
     } else {
         let code = code
@@ -8141,8 +8171,8 @@ fn parse_manager_result_for_operation(
                         | "operation_failed"
                 ) || is_package_failure_code(code)
             })
-            .ok_or_else(|| BridgeError::new(ErrorKind::Unavailable))?;
-        validate_result_text(code, 32)?;
+            .ok_or(RESULT_CODE_UNKNOWN)?;
+        validate_result_text(code, 32).map_err(|_| RESULT_CODE_UNKNOWN)?;
     }
 
     let has_action_fields = ["status", "scope", "output"]
@@ -8153,33 +8183,36 @@ fn parse_manager_result_for_operation(
             .iter()
             .all(|field| root.contains_key(*field))
         {
-            return Err(BridgeError::new(ErrorKind::Unavailable));
+            return Err(RESULT_ACTION_INVALID);
         }
         let status = root
             .get("status")
             .and_then(Value::as_str)
-            .ok_or_else(|| BridgeError::new(ErrorKind::Unavailable))?;
+            .ok_or(RESULT_ACTION_INVALID)?;
         if !matches!((ok, status), (true, "succeeded") | (false, "failed")) {
-            return Err(BridgeError::new(ErrorKind::Unavailable));
+            return Err(RESULT_ACTION_INVALID);
         }
         let scope = root
             .get("scope")
             .and_then(Value::as_str)
-            .ok_or_else(|| BridgeError::new(ErrorKind::Unavailable))?;
+            .ok_or(RESULT_ACTION_INVALID)?;
         if scope != "all" && validate_existing_name(scope).is_err() {
-            return Err(BridgeError::new(ErrorKind::Unavailable));
+            return Err(RESULT_ACTION_INVALID);
         }
         let output = root
             .get("output")
             .and_then(Value::as_str)
-            .ok_or_else(|| BridgeError::new(ErrorKind::Unavailable))?;
-        validate_result_text(output, 65_536)?;
+            .ok_or(RESULT_ACTION_INVALID)?;
+        if output.len() > MAX_ACTION_OUTPUT_BYTES {
+            return Err(RESULT_OUTPUT_TOO_LARGE);
+        }
+        validate_result_text(output, MAX_ACTION_OUTPUT_BYTES).map_err(|_| RESULT_ACTION_INVALID)?;
     }
 
     if let Some(exit_code) = root.get("exit_code")
         && exit_code.as_u64().is_none_or(|code| code > 255)
     {
-        return Err(BridgeError::new(ErrorKind::Unavailable));
+        return Err(RESULT_ACTION_INVALID);
     }
 
     let presence_fields = ["has_password", "has_totp", "has_remote_log_token"];
@@ -8194,7 +8227,7 @@ fn parse_manager_result_for_operation(
                 .iter()
                 .any(|field| root.get(*field).and_then(Value::as_bool).is_none()))
     {
-        return Err(BridgeError::new(ErrorKind::Unavailable));
+        return Err(RESULT_SHAPE_INVALID);
     }
     Ok(value)
 }
@@ -8580,8 +8613,11 @@ fn parse_queued_response(
     }
     let session_binding =
         hex_decode_exact::<32>(response.session_binding).ok_or(STORED_RESULT_INVALID)?;
+    // A stored record keeps the plain kind it always had: which check refused it is the
+    // consumer's diagnosis (api.log, at write time), not something a poll can act on.
     let result =
-        parse_manager_result_for_operation(response.result.get().as_bytes(), None, operation)?;
+        parse_manager_result_for_operation(response.result.get().as_bytes(), None, operation)
+            .map_err(|_| BridgeError::new(ErrorKind::Unavailable))?;
     let expected_terminal = if result.get("ok").and_then(Value::as_bool) == Some(true) {
         "succeeded"
     } else {
@@ -8872,6 +8908,26 @@ fn consume_failure_result_value(kind: ErrorKind) -> Value {
     })
 }
 
+/// As [`consume_failure_result_value`], for the error itself.
+///
+/// The code stays the kind's: it is the vocabulary every validator and the dashboard already
+/// know. Only the sentence changes, and only where the kind's own sentence would be false. A
+/// result the manager produced and this bridge refused is `Unavailable`, whose sentence says the
+/// operation could not be started -- but it ran, so saying so sent operators looking for a
+/// scheduling problem. The named check travels in the sentence and, in full, in api.log
+/// ([`record_consume_failure`]).
+fn consume_failure_result_for_error(error: BridgeError) -> Value {
+    let mut value = consume_failure_result_value(error.kind);
+    if error.kind == ErrorKind::Unavailable
+        && let Some(cause) = error.code.filter(|code| code.starts_with("result_"))
+    {
+        value["message"] = json!(format!(
+            "The operation ran, but the package refused its result ({cause}). The cause is recorded in api.log."
+        ));
+    }
+    value
+}
+
 struct TerminalizedConsumeResult {
     value: Value,
     #[cfg_attr(not(test), allow(dead_code))]
@@ -8897,7 +8953,7 @@ where
         }
         // The kind was previously discarded here, which is what made every consume failure look
         // identical to an operator. It is the only thing this path knows about the cause.
-        Err(error) => (consume_failure_result_value(error.kind), "failed"),
+        Err(error) => (consume_failure_result_for_error(error), "failed"),
     };
     let audit_pending = record_terminal(state).unwrap_or(true);
     TerminalizedConsumeResult {
@@ -14068,7 +14124,15 @@ pub(crate) fn main_entry() -> ExitCode {
         let response = PathBuf::from(&arguments[2]);
         match run_consumer(&request, &response) {
             Ok(()) => ExitCode::SUCCESS,
-            Err(_) => ExitCode::FAILURE,
+            // No response was written, so the controller publishes `consumer_wrote_no_result`;
+            // this line, kept in controller.log, is what says why.
+            Err(error) => {
+                eprintln!(
+                    "sdsync-dsm-api: consume wrote no result: {}",
+                    resolved_error_code(error, None, None)
+                );
+                ExitCode::FAILURE
+            }
         }
     } else if arguments.len() == 3 && arguments[0] == "--reject-job" {
         let request = PathBuf::from(&arguments[1]);
@@ -20178,6 +20242,15 @@ fn run_consumer(request: &Path, response: &Path) -> BridgeResult<()> {
                     termination_requested,
                 )
             })();
+            if let Err(error) = &execution_result {
+                record_consume_failure(
+                    Path::new(LOG_ROOT),
+                    package_uid,
+                    job.mutation.operation_id(),
+                    &job.request_id,
+                    *error,
+                );
+            }
             let result = terminalize_consume_result(execution_result, |state| {
                 let phase = if state == "succeeded" {
                     AuditOutboxPhase::Succeeded
@@ -21099,10 +21172,10 @@ fn consume_job_inner(
     )?;
     normalize_result_warnings(&mut result);
     if matches!(&job.mutation, Mutation::SetSecret(_)) {
-        validate_set_secret_manager_result(&result)?;
+        validate_set_secret_manager_result(&result).map_err(|_| RESULT_SHAPE_INVALID)?;
     }
     if result.get("ok").and_then(Value::as_bool) != Some(output.status_success) {
-        return Err(BridgeError::new(ErrorKind::Unavailable));
+        return Err(RESULT_EXIT_MISMATCH);
     }
     for event in record_queued_mutation_side_channels(
         log_root,
@@ -21123,6 +21196,62 @@ fn consume_job_inner(
         );
     }
     Ok(result)
+}
+
+/// Name a failed consume in api.log: the result code the terminal result carries, and the
+/// narrower cause the error names -- which check refused the manager's result, which runtime
+/// state could not be verified. The terminal result keeps only the first, because its code is a
+/// closed vocabulary; this record is where the second goes, so the distinction an operator needs
+/// is no longer discarded where a consume ends.
+///
+/// When the record cannot be written, or the policy silences bridge warnings, the same line goes
+/// to the consumer's stderr, which the controller keeps in controller.log.
+#[cfg(target_os = "linux")]
+fn record_consume_failure(
+    log_root: &Path,
+    package_uid: u32,
+    operation: &str,
+    job_id: &str,
+    error: BridgeError,
+) {
+    let written = linux_files::load_security_policy(package_uid).and_then(|policy| {
+        record_consume_failure_at(log_root, package_uid, &policy, operation, job_id, error)
+    });
+    if written != Ok(true) {
+        eprintln!(
+            "sdsync-dsm-api: queued job {job_id} ({operation}) failed: {} ({})",
+            consume_failure_code(error.kind).0,
+            resolved_error_code(error, None, None)
+        );
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn record_consume_failure_at(
+    log_root: &Path,
+    package_uid: u32,
+    policy: &SecurityPolicyArgs,
+    operation: &str,
+    job_id: &str,
+    error: BridgeError,
+) -> BridgeResult<bool> {
+    let mut members = serde_json::Map::new();
+    members.insert("code".to_owned(), json!(consume_failure_code(error.kind).0));
+    members.insert(
+        "cause".to_owned(),
+        json!(resolved_error_code(error, None, None)),
+    );
+    members.insert("operation".to_owned(), json!(operation));
+    members.insert("job_id".to_owned(), json!(job_id));
+    linux_files::record_bridge_warning_at(
+        log_root,
+        &log_root.join("api.log"),
+        package_uid,
+        current_epoch()?,
+        policy,
+        "consume_failed",
+        &members,
+    )
 }
 
 /// The wall clock, refused rather than clamped when it reads before the epoch.
@@ -29212,6 +29341,117 @@ mod tests {
             &missing, uid, &policy, "routine", job_id, &result, b"", 0, None,
         );
         assert_eq!(failures, vec!["mutation_warning"]);
+    }
+
+    /// A Doctor result the shell bounded is published whole, and one over the bridge's cap is
+    /// refused as too large -- never as "could not be started" -- with the check that refused it
+    /// named in api.log.
+    #[test]
+    fn doctor_output_up_to_the_shell_cap_is_published_and_over_it_is_named() {
+        let doctor_result = |output: String| {
+            serde_json::to_vec(&json!({
+                "schema": "sdsync.dsm-result.v1", "ok": true, "message": "Doctor completed",
+                "status": "succeeded", "scope": "all", "output": output, "exit_code": 0,
+            }))
+            .unwrap()
+        };
+        // About five profiles of standard Doctor NDJSON: over the old 64 KiB field cap.
+        let record = r#"{"schema":"sdsync.doctor.v1","sections":[{"id":"network_reachability","status":"pass"}]}"#;
+        let multi_profile = format!("{record}\n").repeat(100_000 / (record.len() + 1));
+        assert!(multi_profile.len() > 65_536 && multi_profile.len() <= MAX_ACTION_OUTPUT_BYTES);
+        let parsed = parse_manager_result(&doctor_result(multi_profile.clone()), None).unwrap();
+        assert_eq!(parsed["output"], json!(multi_profile));
+        for operation in [None, Some("action")] {
+            assert!(
+                parse_manager_result_for_operation(
+                    &doctor_result("x".repeat(MAX_ACTION_OUTPUT_BYTES)),
+                    None,
+                    operation
+                )
+                .is_ok(),
+                "exactly the shell's cap must be accepted"
+            );
+        }
+
+        let refused = parse_manager_result(
+            &doctor_result("x".repeat(MAX_ACTION_OUTPUT_BYTES + 1)),
+            None,
+        )
+        .unwrap_err();
+        assert_eq!(refused, RESULT_OUTPUT_TOO_LARGE);
+        assert_eq!(refused.kind, ErrorKind::PayloadTooLarge);
+        let terminal = terminalize_consume_result(Err(refused), |_| Ok(false));
+        assert_eq!(terminal.value["code"], "response_too_large");
+        assert_eq!(
+            terminal.value["message"],
+            "The operation produced more output than the package will carry."
+        );
+
+        // Any other refusal says the operation ran and names the check, in a result every
+        // validator still accepts.
+        let shapeless =
+            parse_manager_result(br#"{"schema":"sdsync.dsm-result.v1"}"#, None).unwrap_err();
+        assert_eq!(shapeless, RESULT_SHAPE_INVALID);
+        let terminal = terminalize_consume_result(Err(shapeless), |_| Ok(false));
+        assert_eq!(terminal.value["code"], "unavailable");
+        let message = terminal.value["message"].as_str().unwrap();
+        assert!(
+            message.contains("ran") && message.contains("result_shape_invalid"),
+            "{message}"
+        );
+        assert!(
+            parse_manager_result_for_operation(
+                &serde_json::to_vec(&terminal.value).unwrap(),
+                None,
+                Some("action")
+            )
+            .is_ok()
+        );
+        assert_eq!(
+            parse_manager_result(b"not json", None).unwrap_err(),
+            RESULT_UNREADABLE
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_consume_failure_names_its_cause_in_api_log() {
+        let fixture = TestPackageFixture::new("consume-failure-cause");
+        let uid = TestPackageFixture::package_uid();
+        let policy = SecurityPolicyArgs::default();
+        let job_id = "0123456789abcdef0123456789abcdef";
+        assert_eq!(
+            record_consume_failure_at(
+                &fixture.log_root,
+                uid,
+                &policy,
+                "action",
+                job_id,
+                RESULT_OUTPUT_TOO_LARGE
+            ),
+            Ok(true)
+        );
+        let text = fs::read_to_string(fixture.log_root.join("api.log")).unwrap();
+        let record: Value = serde_json::from_str(text.trim_end()).unwrap();
+        assert_eq!(record["event"], "consume_failed");
+        assert_eq!(record["level"], "warn");
+        assert_eq!(record["category"], "bridge");
+        assert_eq!(record["code"], "response_too_large");
+        assert_eq!(record["cause"], "result_output_too_large");
+        assert_eq!(record["operation"], "action");
+        assert_eq!(record["job_id"], job_id);
+        // A log root that cannot be written is an error the caller reports, not a silence.
+        assert!(
+            record_consume_failure_at(
+                &fixture.log_root.join("missing-root"),
+                uid,
+                &policy,
+                "action",
+                job_id,
+                RESULT_SHAPE_INVALID
+            )
+            .is_err()
+        );
     }
 
     #[cfg(target_os = "linux")]

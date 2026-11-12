@@ -561,12 +561,23 @@ begin_admitted() {
         *) echo "operation is disabled by the current security policy" >&2; exit 77 ;;
     esac
     case ${command_name:-} in plan|run) return 0 ;; esac
+    # A Doctor that only reads changes nothing a run depends on, whichever
+    # engine holds run.lock: the same verdict daemon_run_admission gives it.
+    # Refusing it here sent Doctor's own refusal, worded for a profile change,
+    # to the dashboard as a page of steps that never ran.
+    if [ "${command_name:-}" = doctor ]; then
+        case " $* " in *" --write-test "*) ;; *) return 0 ;; esac
+    fi
     opposing_run_status=0
     private_process_lock_is_live "$run_lock" || opposing_run_status=$?
     if [ "$opposing_run_status" -eq 0 ]; then
             active_run=$lock_owner_pid
             if ! read_daemon_run_scope "$lock_owner_pid" "$lock_owner_start" "$lock_owner_boot"; then
-                echo "cannot change profiles, credentials, or schedule while PID $active_run is planning/syncing" >&2
+                if [ "${command_name:-}" = doctor ]; then
+                    echo "doctor --write-test is refused while PID $active_run is planning/syncing: it writes into the destination the run is syncing" >&2
+                else
+                    echo "cannot change profiles, credentials, or schedule while PID $active_run is planning/syncing" >&2
+                fi
                 exit 75
             fi
             daemon_run_admission "$@"
@@ -2919,6 +2930,8 @@ api_capture() {
     if [ "${2:-}" = doctor ]; then
         # The compiled bridge and browser both enforce a one-MiB response ceiling. Reserve ample
         # JSON-escaping headroom while retaining complete NDJSON records for multi-profile Doctor.
+        # The bridge publishes an action output of at most MAX_ACTION_OUTPUT_BYTES (dsm_api.rs);
+        # this cap must never exceed it, or a bounded report becomes a refused result.
         api_redact_limit=327680
         api_redact_marker='{"schema":"sdsync.dsm-output-truncated.v1","truncated":true}'
     fi

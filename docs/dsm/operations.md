@@ -398,9 +398,11 @@ the whole-package refusal above applies, preceded — when the file exists — b
 `run.scope ignored: <cause> (<path>)` line.
 
 **Doctor** and a **resync plan** (no `--confirm`) only read, and take no management lock, so a save
-does not wait for them and they do not make a run refuse. Beside a shell-engine run they are still
-refused as before. A **Doctor write test** writes into the destination and keeps the management lock
-for its whole duration. An interactive `set-password` or `set-totp` reads the secret before it takes
+does not wait for them and they do not make a run refuse. A read-only Doctor is never refused beside
+a run of either engine; a resync plan beside a shell-engine run still is. A **Doctor write test**
+writes into the destination and keeps the management lock for its whole duration; beside a run whose
+scope cannot be attributed it is refused with exit `75` (`doctor --write-test is refused while PID …
+is planning/syncing: it writes into the destination the run is syncing`). An interactive `set-password` or `set-totp` reads the secret before it takes
 the lock, so a person typing no longer makes runs refuse.
 
 ### Verified-pair index status

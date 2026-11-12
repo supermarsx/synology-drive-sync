@@ -638,6 +638,26 @@ class BuilderTests(unittest.TestCase):
         self.assertIn('"target": BUILD.target,', bridge)
         self.assertIn('"arch": BUILD.package_arch(),', bridge)
 
+    def test_shell_doctor_output_cap_never_exceeds_the_bridge_cap(self) -> None:
+        """The shell bounds Doctor's NDJSON so the bridge can publish it whole.
+
+        A shell cap above the bridge's turns a report the shell carefully bounded into a result
+        the bridge refuses, and the dashboard shows every Doctor step as not run. That is how a
+        multi-profile Doctor reached users as "could not be started": the shell allowed 327,680
+        bytes and the bridge accepted 65,536.
+        """
+        bridge = (REPOSITORY / "src/dsm_api.rs").read_text(encoding="utf-8")
+        manager = (HERE / "package/bin/sdsync-dsm").read_text(encoding="utf-8")
+        rust_cap = re.search(r"^const MAX_ACTION_OUTPUT_BYTES: usize = ([0-9_]+);$", bridge, re.MULTILINE)
+        self.assertIsNotNone(rust_cap, "the bridge's action output cap is not a literal constant")
+        self.assertIn("validate_result_text(output, MAX_ACTION_OUTPUT_BYTES)", bridge)
+        shell_caps = re.findall(
+            r'if \[ "\$\{2:-\}" = doctor \]; then\n(?:[ \t]*#[^\n]*\n)*[ \t]*api_redact_limit=([0-9]+)\n',
+            manager,
+        )
+        self.assertEqual(len(shell_caps), 1, "the shell's Doctor cap moved; re-pin it here")
+        self.assertLessEqual(int(shell_caps[0]), int(rust_cap.group(1).replace("_", "")))
+
     def test_integrated_profile_help_tracks_mutable_output_contract(self) -> None:
         profile_help = (
             REPOSITORY / "packaging/synology/package/ui/help/enu/profiles.html"
@@ -13361,21 +13381,28 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
             for label, plant, cause in cases:
                 scope.unlink(missing_ok=True)
                 plant()
-                for arguments in (
-                    ("configure-profile", "--name", "other", "--source", str(self.source_two),
-                     "--url", "https://files.example.test/proxy/", "--username", "other-bot",
-                     "--remote", "/home/Drive/Moved"),
-                    ("doctor", "other", "--level", "quick"),
+                for arguments, refusal in (
+                    (("configure-profile", "--name", "other", "--source", str(self.source_two),
+                      "--url", "https://files.example.test/proxy/", "--username", "other-bot",
+                      "--remote", "/home/Drive/Moved"),
+                     f"cannot change profiles, credentials, or schedule while PID {pid} is planning/syncing"),
+                    (("doctor", "other", "--write-test"),
+                     f"doctor --write-test is refused while PID {pid} is planning/syncing: "
+                     "it writes into the destination the run is syncing"),
                 ):
                     refused = self.shell(self.manager, *arguments)
                     self.assertEqual(refused.returncode, 75, f"{label}: {refused.stderr}")
                     lines = refused.stderr.strip().splitlines()
-                    self.assertIn("planning/syncing", lines[-1], label)
-                    self.assertIn(f"while PID {pid} ", lines[-1], label)
+                    self.assertEqual(lines[-1], refusal, label)
                     ignored = [line for line in lines if line.startswith("run.scope ignored:")]
                     self.assertEqual(len(ignored), 1, f"{label}: {refused.stderr}")
                     self.assertIn(str(self.fhs / "var/run/run.scope"), ignored[0], label)
                     self.assertIn(cause, ignored[0], label)
+                # A Doctor that only reads is never refused beside a run, whether or not the run
+                # can be attributed: it changes nothing the run depends on.
+                doctor = self.shell(self.manager, "doctor", "other", "--level", "quick")
+                self.assertEqual(doctor.returncode, 0, f"{label}: {doctor.stdout}{doctor.stderr}")
+                self.assertNotIn("planning/syncing", doctor.stderr, label)
             # No scope at all is the shell runner's run: the old refusal, and
             # nothing to report about a file that is not there.
             scope.unlink()
@@ -13385,6 +13412,9 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
                 refused.stderr.strip(),
                 f"cannot change profiles, credentials, or schedule while PID {pid} is planning/syncing",
             )
+            doctor = self.shell(self.manager, "doctor", "other", "--level", "quick")
+            self.assertEqual(doctor.returncode, 0, doctor.stdout + doctor.stderr)
+            self.assertNotIn("planning/syncing", doctor.stderr, "a read-only Doctor beside a shell-runner run")
         finally:
             release()
 
