@@ -318,6 +318,14 @@ lists its own commits.
   proof except those for paths it planned to change on the NAS and paths reconciliation found
   unconverged. Those are dropped, their old records are removed, and the count is named in the new
   information issue `pair-index-failed-run`.
+- **Doctor keeps its report when its log cannot be written.** A log that could not be opened, or a failed log write (a full volume) at the start, before
+  discovery, before authentication, at the end, or at shutdown, used to replace the whole report with
+  one line on standard error, which the package's UI showed as every step skipped. The sections
+  already evaluated keep their verdicts. Every other section says `not run: the diagnostic log failed
+  (<cause>)`. The run still fails, by name.
+- **Doctor explains every section a failure stopped.** A section listed before the failed one but
+  run after it (for example the session checks after a failed File Station capability check) now
+  says `not run because <section> failed`, not `not reached`.
 
 ## Read this before upgrading
 

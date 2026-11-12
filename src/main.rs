@@ -4134,7 +4134,20 @@ fn run_doctor_job(
     perform_write_probe: bool,
 ) -> Result<TimedDoctorResult> {
     warn_for_insecure_network(&settings.network, &settings.output);
-    let logger = build_logger(&settings.output)?;
+    // A log that cannot be opened, or whose first record cannot be written (a full volume), is
+    // the report's to name: every section says it was not run and why, and the run fails by name.
+    let logger = match build_logger(&settings.output) {
+        Ok(logger) => logger,
+        Err(error) => {
+            let mut result =
+                DoctorResult::new(settings, perform_write_probe, DoctorCallLog::default());
+            result.stop_at_log_failure(&error);
+            return Ok(TimedDoctorResult {
+                result,
+                elapsed: Duration::ZERO,
+            });
+        }
+    };
     let start_log = log_event(
         logger.as_ref(),
         LogEvent::new(EventLogLevel::Info, EventCode::RunStarted),
@@ -4143,7 +4156,14 @@ fn run_doctor_job(
 
     let mut operation = match start_log {
         Ok(()) => doctor_checks(settings, logger.clone(), cancellation, perform_write_probe),
-        Err(error) => Err(error),
+        // Nothing was evaluated, and the report says so section by section, with the cause,
+        // rather than replacing itself with one line on standard error.
+        Err(error) => {
+            let mut result =
+                DoctorResult::new(settings, perform_write_probe, DoctorCallLog::default());
+            result.stop_at_log_failure(&error);
+            Ok(result)
+        }
     };
     let final_log = match &operation {
         Ok(result) if !result.failed() => log_event(
@@ -4167,18 +4187,17 @@ fn run_doctor_job(
             log_event(logger.as_ref(), event)
         }
     };
-    if let Err(error) = final_log {
-        match &mut operation {
-            Ok(result) if result.write_probe_performed => {
-                append_doctor_failure_context(
-                    result,
-                    "writing the final diagnostic log also failed",
-                    &error.to_string(),
-                );
-            }
-            Ok(_) => operation = Err(error),
-            Err(_) => {}
-        }
+    // The result is kept whatever the log did: a failed log write is appended to it, so the
+    // sections a run evaluated still reach the operator and the run still fails by name.
+    if let Err(error) = final_log
+        && let Ok(result) = &mut operation
+    {
+        let context = if result.write_probe_performed {
+            "writing the final diagnostic log also failed"
+        } else {
+            "writing the final diagnostic log failed"
+        };
+        append_doctor_failure_context(result, context, &error.to_string());
     }
     let result = finish_doctor_logger(logger.as_ref(), operation, settings.output.quiet)?;
     Ok(TimedDoctorResult {
@@ -4608,17 +4627,42 @@ impl DoctorResult {
             return;
         };
         let failed_label = self.sections[failed_index].label;
-        for section in self.sections.iter_mut().skip(failed_index + 1) {
+        let failed_step = self.sections[failed_index].step;
+        for (index, section) in self.sections.iter_mut().enumerate() {
             // A derived section is recorded after the run ends and still has something to say
             // about a run that failed early, so it is never written off as unreached.
             if DOCTOR_DERIVED_SECTION_IDS.contains(&section.id) {
                 continue;
             }
-            if section.status == DoctorSectionStatus::Skip && section.detail == "not reached" {
+            // Shown after the failed section, or run after it: display order is not execution
+            // order, and a section listed earlier that would have run later (session channel
+            // ablation after a failed File Station capability check) used to keep a bare
+            // "not reached".
+            if (index > failed_index || section.step > failed_step)
+                && section.status == DoctorSectionStatus::Skip
+                && section.detail == "not reached"
+            {
                 section.detail =
                     bounded_doctor_detail(&format!("not run because {failed_label} failed"));
             }
         }
+    }
+
+    /// Stop the diagnostic at a log write that failed, keeping every section recorded so far.
+    ///
+    /// Each section not yet evaluated says why, and the failure is appended to the result, so the
+    /// report still reaches the operator and the run still fails by name. A `?` here used to
+    /// replace the whole report with one line on standard error, which the package's UI showed as
+    /// every step skipped with no cause.
+    fn stop_at_log_failure(&mut self, error: &Error) {
+        let cause = safe_doctor_error(error);
+        for section in &mut self.sections {
+            if section.status == DoctorSectionStatus::Skip && section.detail == "not reached" {
+                section.detail =
+                    bounded_doctor_detail(&format!("not run: the diagnostic log failed ({cause})"));
+            }
+        }
+        append_doctor_failure_context(self, "writing the diagnostic log failed", &cause);
     }
 
     fn failed(&self) -> bool {
@@ -6376,10 +6420,13 @@ fn doctor_run(
         result.fail_section("routing_tls", &error, Duration::ZERO);
         return Ok(result);
     }
-    log_event(
+    if let Err(error) = log_event(
         logger.as_ref(),
         LogEvent::new(EventLogLevel::Info, EventCode::ApiDiscoveryStarted),
-    )?;
+    ) {
+        result.stop_at_log_failure(&error);
+        return Ok(result);
+    }
     let connection_started = Instant::now();
     // The doctor's observer both logs each round trip and retains the completed ones, so every
     // section can report the requests it is responsible for.
@@ -6550,10 +6597,13 @@ fn doctor_run(
         result.fail_section("dsm_session_auth", &error, Duration::ZERO);
         return Ok(result);
     }
-    log_event(
+    if let Err(error) = log_event(
         logger.as_ref(),
         LogEvent::new(EventLogLevel::Info, EventCode::ApiDiscoveryCompleted),
-    )?;
+    ) {
+        result.stop_at_log_failure(&error);
+        return Ok(result);
+    }
     if settings.level == cli::DoctorLevel::Quick {
         return Ok(result);
     }
@@ -6565,10 +6615,14 @@ fn doctor_run(
         result.fail_section("dsm_session_auth", &error, Duration::ZERO);
         return Ok(result);
     };
-    log_event(
+    // No session exists yet, so stopping here leaves nothing to log out.
+    if let Err(error) = log_event(
         logger.as_ref(),
         LogEvent::new(EventLogLevel::Info, EventCode::AuthenticationStarted),
-    )?;
+    ) {
+        result.stop_at_log_failure(&error);
+        return Ok(result);
+    }
     let authentication_started = Instant::now();
     // The ablation's tokenless variant needs a second login, so it needs the password after this
     // closure has returned. The buffer is `Zeroizing` and is dropped as soon as the ablation
@@ -7941,15 +7995,15 @@ fn finish_doctor_logger(
             Err(error)
         }
         (Err(error), _) => Err(error),
-        (Ok(mut result), Err(error)) if result.write_probe_performed => {
-            append_doctor_failure_context(
-                &mut result,
-                "observability shutdown also failed",
-                &error.to_string(),
-            );
+        (Ok(mut result), Err(error)) => {
+            let context = if result.write_probe_performed {
+                "observability shutdown also failed"
+            } else {
+                "observability shutdown failed"
+            };
+            append_doctor_failure_context(&mut result, context, &error.to_string());
             Ok(result)
         }
-        (Ok(_), Err(error)) => Err(error),
         (Ok(result), Ok(Some(report))) => {
             if !quiet && (report.remote_events_dropped > 0 || report.remote_delivery_failures > 0) {
                 eprintln!(
@@ -14841,6 +14895,123 @@ mod tests {
                 .filter(|section| section.id != "session_channel_ablation")
                 .all(|section| !section.detail.contains("not run because")),
             "a failed diagnostic must not disown the sections that follow it"
+        );
+    }
+
+    /// R4: a section listed before the failed one that would have run after it says why it did
+    /// not run, instead of a bare "not reached". One that would have run before it keeps its own
+    /// verdict.
+    #[test]
+    fn a_failed_section_explains_earlier_listed_sections_that_run_after_it() {
+        let mut result = DoctorResult::new(
+            &resolved_doctor(
+                "https://files.example.test",
+                Some("doctor-user"),
+                Some("/share/acceptance"),
+            ),
+            false,
+            DoctorCallLog::default(),
+        );
+        result.set_section(
+            "routing_tls",
+            DoctorSectionStatus::Pass,
+            "HTTPS route responded",
+            Duration::ZERO,
+            "shared_connection",
+        );
+        result.fail_section(
+            "file_station_capabilities",
+            &Error::MissingApi("SYNO.FileStation.MD5".to_owned()),
+            Duration::ZERO,
+        );
+        let detail = |id: &str| {
+            result
+                .sections
+                .iter()
+                .find(|section| section.id == id)
+                .map(|section| section.detail.clone())
+                .unwrap()
+        };
+        // Listed before File Station capabilities (step 5), run after it (step 6 and 7).
+        assert_eq!(
+            detail("dsm_session_auth"),
+            "not run because File Station capabilities failed"
+        );
+        assert_eq!(
+            detail("session_channel_ablation"),
+            "not run because File Station capabilities failed"
+        );
+        // Listed after it, as before.
+        assert_eq!(
+            detail("destination_inventory"),
+            "not run because File Station capabilities failed"
+        );
+        // Recorded already, and run before it: untouched.
+        assert_eq!(detail("routing_tls"), "HTTPS route responded");
+        assert!(
+            !result
+                .sections
+                .iter()
+                .filter(|section| !DOCTOR_DERIVED_SECTION_IDS.contains(&section.id))
+                .any(|section| section.detail == "not reached" && section.step > 5),
+            "no section that runs after the failure is left unexplained"
+        );
+    }
+
+    /// R4: a log write that fails stops the diagnostic, but the report survives it: every section
+    /// already evaluated keeps its verdict, every other one names the cause, and the run fails by
+    /// name with the structured document intact.
+    #[test]
+    fn a_doctor_whose_log_cannot_be_written_keeps_its_report() {
+        let mut result = DoctorResult::new(
+            &resolved_doctor(
+                "https://files.example.test",
+                Some("doctor-user"),
+                Some("/share/acceptance"),
+            ),
+            false,
+            DoctorCallLog::default(),
+        );
+        result.set_section(
+            "routing_tls",
+            DoctorSectionStatus::Pass,
+            "HTTPS route responded",
+            Duration::ZERO,
+            "shared_connection",
+        );
+        result.stop_at_log_failure(&Error::Message("No space left on device".to_owned()));
+
+        assert!(result.failed());
+        assert_eq!(doctor_overall_status(&result), "fail");
+        let error = doctor_result_error(&result).expect("the failure is named");
+        assert!(
+            error.starts_with("writing the diagnostic log failed: "),
+            "{error}"
+        );
+        let value = doctor_value(&result, Duration::ZERO);
+        let sections = value["sections"].as_array().unwrap();
+        let routing = sections
+            .iter()
+            .find(|section| section["id"] == "routing_tls")
+            .unwrap();
+        assert_eq!(routing["status"], "pass");
+        for section in sections
+            .iter()
+            .filter(|section| section["id"] != "routing_tls")
+        {
+            let detail = section["detail"].as_str().unwrap();
+            assert_ne!(detail, "not reached", "{section}");
+        }
+        let auth = sections
+            .iter()
+            .find(|section| section["id"] == "dsm_session_auth")
+            .unwrap();
+        assert!(
+            auth["detail"]
+                .as_str()
+                .unwrap()
+                .starts_with("not run: the diagnostic log failed ("),
+            "{auth}"
         );
     }
 }
