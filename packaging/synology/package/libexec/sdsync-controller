@@ -94,6 +94,27 @@ retire_pending_controller_reload() {
     return 0
 }
 
+# Mark a native event pending again after the run that consumed it was refused
+# at admission. One newline appended: the marker's size and mtime are all the
+# controller reads, and a write at the end cannot disturb the watcher's own.
+# Returns 1, named, when it cannot; the caller then makes the poll due at once.
+remark_realtime_event() {
+    remark_path=$1
+    if [ -L "$remark_path" ] || [ ! -f "$remark_path" ] || [ ! -w "$remark_path" ]; then
+        controller_log_event warn routine_event_remark_failed \
+            "profile=$routine_profile path=$remark_path cause=the event marker is missing, is not a regular file or is not writable; the poll is made due instead"
+        return 1
+    fi
+    if ! printf '\n' >> "$remark_path"; then
+        controller_log_event warn routine_event_remark_failed \
+            "profile=$routine_profile path=$remark_path cause=the event marker could not be written; the poll is made due instead"
+        return 1
+    fi
+    controller_log_event info routine_event_remarked \
+        "profile=$routine_profile path=$remark_path cause=the run was refused at admission; the change is pending again"
+    return 0
+}
+
 # A realtime routine whose retry ladder ran out waits this long before its
 # still-pending change is tried again, so an outage costs one attempt per
 # quarter hour rather than one per poll.
@@ -745,6 +766,8 @@ process_control_queue() {
         launched_control_admission_path=$admitted_child_admission_path
         if [ "$interactive_only" != true ]; then
             active_control_classification=$queued_classification
+            active_consumer_started=
+            ! read_uptime_seconds || active_consumer_started=$uptime_seconds
         fi
         # TERM can be delivered after the asynchronous launch but before either
         # assignment above. Recheck the latched shutdown state so that window
@@ -2026,6 +2049,31 @@ poll_job_purpose=
 poll_job_result=
 poll_job_output=
 poll_job_errors=
+# Whole seconds of uptime when the walk was started (uptime, not the clock: a
+# clock that steps must neither expire a walk nor extend it).
+poll_job_started_uptime=
+# The profiles whose last walk was killed for outliving its budget. A routine
+# is in the episode until one of its walks is collected, and the observation
+# pass names it once.
+poll_expired_profiles=,
+# `pid:start` of the children of a killed walk, a `find` blocked in the kernel
+# among them: SIGKILL does not end a process stuck on a dead mount. They are
+# counted, and a poll is not started while several are still alive.
+poll_orphans=
+# The longest a poll walk may take (seconds) before it is killed, logged and its
+# slot freed. A walk with no bound held the single slot for good, and every
+# realtime routine's backstop with it. SDSYNC_DSM_POLL_WALK_BUDGET overrides it
+# (1-86400).
+poll_walk_budget=900
+case ${SDSYNC_DSM_POLL_WALK_BUDGET:-} in
+    ''|*[!0-9]*) ;;
+    *)
+        if [ "${#SDSYNC_DSM_POLL_WALK_BUDGET}" -le 5 ] && [ "$SDSYNC_DSM_POLL_WALK_BUDGET" -ge 1 ] \
+            && [ "$SDSYNC_DSM_POLL_WALK_BUDGET" -le 86400 ]; then
+            poll_walk_budget=$SDSYNC_DSM_POLL_WALK_BUDGET
+        fi
+        ;;
+esac
 
 # A background job is signalled only while its PID still names it: the start
 # tick and parent read when it was spawned. dash keeps an exited child a zombie
@@ -2062,6 +2110,15 @@ start_poll_job() {
     start_poll_source=$2
     start_poll_purpose=$3
     [ -z "$poll_job_pid" ] || return 75
+    # Children of earlier killed walks that are still alive are the kernel's to
+    # finish. A few are tolerated; past that a new walk would only add another,
+    # so none starts, and the poll reports itself unavailable until they end.
+    poll_orphans_prune
+    if [ "$poll_orphans_alive" -ge 3 ]; then
+        watch_note_once "$start_poll_profile:poll_orphans" warn poll_walk_orphans \
+            "profile=$start_poll_profile alive=$poll_orphans_alive cause=earlier poll walks were killed but their find processes have not ended; no new walk starts until they do"
+        return 77
+    fi
     poll_job_result=$runtime_root/poll-$start_poll_profile.result
     poll_job_output=$runtime_root/poll-$start_poll_profile.output
     # The walk's stderr names the stage and the tool that failed; it used to go
@@ -2086,6 +2143,65 @@ start_poll_job() {
     poll_job_start=$own_job_start_value
     poll_job_profile=$start_poll_profile
     poll_job_purpose=$start_poll_purpose
+    poll_job_started_uptime=
+    ! read_uptime_seconds || poll_job_started_uptime=$uptime_seconds
+}
+
+# Sets poll_orphans_alive and forgets the orphans that have ended.
+poll_orphans_prune() {
+    poll_orphans_alive=0
+    poll_orphans_kept=
+    for poll_orphan in $poll_orphans; do
+        poll_orphan_pid=${poll_orphan%%:*}
+        poll_orphan_start=${poll_orphan#*:}
+        read_process_stat_fields "$poll_orphan_pid" || continue
+        case $process_stat_state in Z|X|x) continue ;; esac
+        [ "$process_stat_start" = "$poll_orphan_start" ] || continue
+        poll_orphans_alive=$((poll_orphans_alive + 1))
+        poll_orphans_kept="$poll_orphans_kept $poll_orphan"
+    done
+    poll_orphans=$poll_orphans_kept
+}
+
+# A walk that has outlived poll_walk_budget is killed, its slot freed and the
+# episode named (the observation pass writes the one Activity row). Builtin
+# reads only until it fires, so a healthy walk costs nothing here.
+expire_stuck_poll_job() {
+    [ -n "$poll_job_pid" ] && [ -n "$poll_job_started_uptime" ] || return 0
+    [ ! -f "$poll_job_result" ] || return 0
+    read_uptime_seconds || return 0
+    expire_age=$((uptime_seconds - poll_job_started_uptime))
+    [ "$expire_age" -ge "$poll_walk_budget" ] || return 0
+    expire_profile=$poll_job_profile
+    expire_pid=$poll_job_pid
+    # The walk's own children first (its find): ending the subshell first would
+    # reparent them out of this scan's reach.
+    expire_children=
+    for expire_stat in /proc/[0-9]*/stat; do
+        expire_child=${expire_stat#/proc/}
+        expire_child=${expire_child%/stat}
+        [ "$expire_child" != "$expire_pid" ] || continue
+        read_process_stat_fields "$expire_child" || continue
+        [ "$process_stat_ppid" = "$expire_pid" ] || continue
+        expire_children="$expire_children $expire_child:$process_stat_start"
+    done
+    expire_killed=0
+    for expire_entry in $expire_children; do
+        kill -KILL "${expire_entry%%:*}" 2>/dev/null || :
+        poll_orphans="$poll_orphans $expire_entry"
+        expire_killed=$((expire_killed + 1))
+    done
+    if own_job_is_running "$poll_job_pid" "$poll_job_start" "$$"; then
+        kill -KILL "$poll_job_pid" 2>/dev/null || :
+    fi
+    reap_own_job "$poll_job_pid" "$poll_job_start"
+    clear_poll_job
+    case $poll_expired_profiles in
+        *",$expire_profile,"*) ;;
+        *) poll_expired_profiles=$poll_expired_profiles$expire_profile, ;;
+    esac
+    controller_log_event warn poll_walk_timeout \
+        "profile=$expire_profile seconds=$expire_age budget=$poll_walk_budget killed_children=$expire_killed cause=the poll walk of the source did not finish within its budget; it was killed and the poll slot is free"
 }
 
 clear_poll_job() {
@@ -2095,6 +2211,7 @@ clear_poll_job() {
     poll_job_start=
     poll_job_profile=
     poll_job_purpose=
+    poll_job_started_uptime=
 }
 
 # 0 with collected_poll_status/collected_poll_output/collected_poll_purpose set
@@ -2125,6 +2242,11 @@ collect_poll_job() {
         # could not write. That is a stage failure, reported like one.
         controller_log_event warn poll_job_lost "profile=$poll_job_profile"
     fi
+    case $poll_expired_profiles in
+        *",$poll_job_profile,"*)
+            poll_expired_profiles=${poll_expired_profiles%%",$poll_job_profile,"*},${poll_expired_profiles#*",$poll_job_profile,"}
+            ;;
+    esac
     clear_poll_job
     return 0
 }
@@ -2194,7 +2316,11 @@ write_routine_state() {
             "${routine_defer_reason_value:-none}" "${routine_last_exit_value:--1}" \
             "${routine_last_reason_value:-none}" &&
         printf 'partial_streak=%s\nescalated_epoch=%s\n' \
-            "${routine_partial_streak_value:-0}" "${routine_escalated_value:-0}"
+            "${routine_partial_streak_value:-0}" "${routine_escalated_value:-0}" &&
+        printf 'last_trigger_epoch=%s\nlast_run_epoch=%s\nwatching_via=%s\n' \
+            "${routine_last_trigger_value:-0}" "${routine_last_run_value:-0}" "${routine_watching_via_value:-none}" &&
+        printf 'observe_state=%s\nobserve_cause=%s\nobserve_since_epoch=%s\n' \
+            "${routine_observe_value:-ok}" "${routine_observe_cause_value:-none}" "${routine_observe_since_value:-0}"
     } > "$routine_state_temp" || { rm -f "$routine_state_temp"; return 69; }
     finish_private_file "$routine_state_temp" || { rm -f "$routine_state_temp"; return 69; }
     mv -f "$routine_state_temp" "$routine_state_dir/$routine_state_profile.state" \
@@ -2319,6 +2445,12 @@ hold_routine_outcome() {
     held_last_reason_value=$routine_last_reason_value
     held_partial_streak_value=$routine_partial_streak_value
     held_escalated_value=$routine_escalated_value
+    held_last_trigger_value=$routine_last_trigger_value
+    held_last_run_value=$routine_last_run_value
+    held_watching_via_value=$routine_watching_via_value
+    held_observe_value=$routine_observe_value
+    held_observe_cause_value=$routine_observe_cause_value
+    held_observe_since_value=$routine_observe_since_value
 }
 flush_routine_outcome() {
     [ -n "$routine_outcome_held" ] || return 0
@@ -2341,6 +2473,12 @@ flush_routine_outcome() {
     routine_last_reason_value=$held_last_reason_value
     routine_partial_streak_value=$held_partial_streak_value
     routine_escalated_value=$held_escalated_value
+    routine_last_trigger_value=$held_last_trigger_value
+    routine_last_run_value=$held_last_run_value
+    routine_watching_via_value=$held_watching_via_value
+    routine_observe_value=$held_observe_value
+    routine_observe_cause_value=$held_observe_cause_value
+    routine_observe_since_value=$held_observe_since_value
     save_routine_state "$routine_outcome_held"
     [ "$routine_state_saved" = true ] || return 1
     routine_outcome_held=
@@ -3142,8 +3280,56 @@ arm_connection_queue_from_backlog() {
 # not be stoppable, and an operator can still cancel it or stop the package.
 stalled_run_wakes=0
 stalled_run_reported=
+# Set while a stall is reported and its end not yet said: Activity gets one row
+# for each.
+stalled_block_open=
+# How long (seconds) a dashboard job in the primary slot may run before the
+# controller says scheduling is waiting on it. SDSYNC_DSM_CONSUMER_STALL_SECONDS
+# overrides it (1-86400).
+consumer_stall_seconds=1800
+case ${SDSYNC_DSM_CONSUMER_STALL_SECONDS:-} in
+    ''|*[!0-9]*) ;;
+    *)
+        if [ "${#SDSYNC_DSM_CONSUMER_STALL_SECONDS}" -le 5 ] && [ "$SDSYNC_DSM_CONSUMER_STALL_SECONDS" -ge 1 ] \
+            && [ "$SDSYNC_DSM_CONSUMER_STALL_SECONDS" -le 86400 ]; then
+            consumer_stall_seconds=$SDSYNC_DSM_CONSUMER_STALL_SECONDS
+        fi
+        ;;
+esac
+active_consumer_started=
+stalled_consumer_reported=
+check_stalled_consumer() {
+    stalled_run_wakes=$((stalled_run_wakes + 1))
+    [ "$stalled_run_wakes" -ge 15 ] || return 0
+    stalled_run_wakes=0
+    [ -n "$active_consumer_started" ] || return 0
+    read_uptime_seconds || return 0
+    stalled_consumer_age=$((uptime_seconds - active_consumer_started))
+    [ "$stalled_consumer_age" -gt "$consumer_stall_seconds" ] || return 0
+    [ "$stalled_consumer_reported" != "$active_consumer_started" ] || return 0
+    stalled_consumer_reported=$active_consumer_started
+    stalled_queued=0
+    for stalled_request in "$control_requests"/*.json; do
+        [ -e "$stalled_request" ] || [ -L "$stalled_request" ] || continue
+        stalled_queued=$((stalled_queued + 1))
+    done
+    controller_log_event error controller_blocked_by_stalled_consumer \
+        "class=$active_control_classification running_seconds=$stalled_consumer_age queued_jobs=$stalled_queued waiting=routines,polls,schedule" \
+        scheduler
+    stalled_block_open=$active_consumer_started
+    controller_activity routine.unobserved all unavailable \
+        "Scheduling is blocked: a dashboard job has been running for ${stalled_consumer_age}s; routines, polls and the schedule wait until it ends (cause=controller_blocked)" \
+        routines warn
+}
+
 check_stalled_run() {
-    [ "$active_control_classification" = runner ] || return 0
+    case $active_control_classification in
+        runner) ;;
+        '') return 0 ;;
+        # A dashboard job in the primary slot blocks the loop just as a run
+        # does, and has no heartbeat: it is judged by how long it has run.
+        *) check_stalled_consumer; return 0 ;;
+    esac
     # The runner-wait guard wakes this loop every second; read run.state on
     # every fifteenth wake, not every one.
     stalled_run_wakes=$((stalled_run_wakes + 1))
@@ -3182,6 +3368,10 @@ check_stalled_run() {
     controller_log_event error controller_blocked_by_stalled_run \
         "scope=$stalled_scope started=$stalled_started progress_epoch=$stalled_heartbeat queued_jobs=$stalled_queued waiting=routines,polls,schedule" \
         scheduler
+    stalled_block_open=$stalled_started
+    controller_activity routine.unobserved all unavailable \
+        "Scheduling is blocked: a run has shown no progress for $((stalled_now - stalled_heartbeat))s; routines, polls and the schedule wait until it ends (cause=controller_blocked)" \
+        routines warn
     dsm_log_event sync_failed "$stalled_now" \
         || controller_log_event error alert_unavailable "scope=$stalled_scope channel=system_log reason=stalled" scheduler
     stalled_alert_enabled=$(setting "$alert_policy_file" enabled true) || stalled_alert_enabled=true
@@ -3301,6 +3491,12 @@ wait_for_runner() {
     active_pid_start=
     active_pid_boot=
     active_control_classification=
+    active_consumer_started=
+    if [ -n "$stalled_block_open" ]; then
+        stalled_block_open=
+        controller_activity routine.observed all changed \
+            "Scheduling resumed: the job that blocked it has ended" routines info
+    fi
 }
 
 wait_for_control_consumer() {
@@ -3438,6 +3634,12 @@ load_routine_state_runtime() {
     routine_last_reason_value=none
     routine_partial_streak_value=0
     routine_escalated_value=0
+    routine_last_trigger_value=0
+    routine_last_run_value=0
+    routine_watching_via_value=none
+    routine_observe_value=ok
+    routine_observe_cause_value=none
+    routine_observe_since_value=0
     [ -f "$1" ] && [ ! -L "$1" ] && [ -r "$1" ] || return 0
     routine_state_seen=,
     routine_state_lines=0
@@ -3469,6 +3671,12 @@ load_routine_state_runtime() {
             last_reason) routine_last_reason_value=$routine_state_field ;;
             partial_streak) routine_partial_streak_value=$routine_state_field ;;
             escalated_epoch) routine_escalated_value=$routine_state_field ;;
+            last_trigger_epoch) routine_last_trigger_value=$routine_state_field ;;
+            last_run_epoch) routine_last_run_value=$routine_state_field ;;
+            watching_via) routine_watching_via_value=$routine_state_field ;;
+            observe_state) routine_observe_value=$routine_state_field ;;
+            observe_cause) routine_observe_cause_value=$routine_state_field ;;
+            observe_since_epoch) routine_observe_since_value=$routine_state_field ;;
             *) continue ;;
         esac
         routine_state_seen=$routine_state_seen$routine_state_key,
@@ -3485,6 +3693,14 @@ load_routine_state_runtime() {
     case $routine_partial_streak_value in ''|*[!0-9]*) routine_partial_streak_value=0 ;; esac
     [ "${#routine_partial_streak_value}" -le 4 ] || routine_partial_streak_value=9999
     case $routine_escalated_value in ''|*[!0-9]*) routine_escalated_value=0 ;; esac
+    # The liveness fields are additive too, and repaired the same way: a record
+    # from before them reads as observed, with nothing yet seen.
+    case $routine_last_trigger_value in ''|*[!0-9]*) routine_last_trigger_value=0 ;; esac
+    case $routine_last_run_value in ''|*[!0-9]*) routine_last_run_value=0 ;; esac
+    case $routine_watching_via_value in native|poll|schedule|none) ;; *) routine_watching_via_value=none ;; esac
+    case $routine_observe_value in ok|degraded|blind|disabled) ;; *) routine_observe_value=ok ;; esac
+    case $routine_observe_cause_value in ''|*[!a-z0-9_]*) routine_observe_cause_value=none ;; esac
+    case $routine_observe_since_value in ''|*[!0-9]*) routine_observe_since_value=0 ;; esac
 }
 
 load_routine_profile_runtime() {
@@ -3554,6 +3770,7 @@ process_routines() {
     routine_now=$1
     poll_due_seen=
     flush_routine_outcome || return 0
+    expire_stuck_poll_job
     # A walk whose routine was removed, disabled or moved off realtime has no
     # collector left; without this it would hold the single walk slot forever.
     if [ -n "$poll_job_pid" ]; then
@@ -3888,6 +4105,7 @@ process_routines() {
                             if [ "$routine_event_first_seen_value" -eq 0 ] \
                                 || [ "$routine_event_first_seen_value" -gt "$routine_now" ]; then
                                 routine_event_first_seen_value=$routine_now
+                                routine_last_trigger_value=$routine_now
                                 # The ceiling is measured from this epoch, so the
                                 # epoch has to outlive the turn that set it. A
                                 # turn that leaves the event pending and not yet
@@ -4112,6 +4330,7 @@ process_routines() {
                             if [ "$routine_pending_since_value" -eq 0 ] \
                                 || [ "$routine_pending_since_value" -gt "$routine_now" ]; then
                                 routine_pending_since_value=$routine_now
+                                routine_last_trigger_value=$routine_now
                             fi
                             # A source that differs on every poll would replace
                             # the pending reading forever and never dispatch at
@@ -4236,6 +4455,8 @@ process_routines() {
         fi
         routine_state_value=running
         routine_last_attempt_value=$routine_now
+        # A dispatch is a trigger: the change, or the cadence, that made it due.
+        routine_last_trigger_value=$routine_now
         save_routine_state "$routine_profile"
         if [ "$routine_state_saved" != true ]; then
             # The record of this run cannot be written (save_routine_state said
@@ -4288,6 +4509,8 @@ process_routines() {
         esac
         routine_last_exit_value=$scheduled_exit
         routine_defer_reason_value=none
+        # A refusal never ran; every other end is the last run, whatever it was.
+        [ "$scheduled_exit" -eq 75 ] || routine_last_run_value=$routine_finished
         if [ "$scheduled_exit" -eq 0 ]; then
             routine_state_value=succeeded
             routine_last_reason_value=ok
@@ -4365,6 +4588,14 @@ process_routines() {
             routine_defer_reason_value=busy
             if [ "${admission_refused:-false}" = true ]; then routine_last_reason_value=admission_refused; else routine_last_reason_value=busy; fi
             routine_next_value=$((routine_finished + 30))
+            # The native event this dispatch consumed was the only record of the
+            # change, and the refused run never synced it. Leaving the retry to
+            # the poll lost it whenever the poll was behind or stalled, so the
+            # event is marked again: the next turn finds it pending and, once
+            # quiet for the debounce, due.
+            if [ "$routine_native_event_due" = true ]; then
+                remark_realtime_event "$watcher_event_path" || routine_last_poll_value=0
+            fi
         elif [ "$routine_cancelled" = true ]; then
             # A cancelled run consumed no attempt, so retry_attempt is left
             # exactly where it was: a retry that was already owed is still owed,
@@ -4465,6 +4696,177 @@ process_routines() {
             "profile=$routine_profile action=$routine_action exit=$scheduled_exit next=$routine_next_value backend=$routine_backend_value reason=$routine_last_reason_value" scheduler
         # One routine per turn keeps control-plane latency and shutdown bounded.
         break
+    done
+}
+
+# What observes a routine, and whether anything fully does: sets observe_via
+# (native, poll, schedule, none), observe_state (ok, degraded, blind,
+# disabled), observe_cause (a token, none while observed) and observe_row
+# (false for a cause whose own Activity row is written where it arises). Reads
+# the routine's loaded configuration and state, so it costs no process.
+#
+# Blind is nothing at all looking. A realtime routine whose native watch is
+# down but whose poll runs is degraded; one whose poll cannot read its tree or
+# was killed for taking too long has no observer left.
+observe_classify() {
+    observe_via=none
+    observe_state=ok
+    observe_cause=none
+    observe_row=true
+    if [ "$routine_enabled" != true ]; then
+        observe_state=disabled
+        observe_cause=disabled
+        return 0
+    fi
+    if [ "$routine_state_value" = deferred ] && [ "$routine_defer_reason_value" = delete_bound ]; then
+        observe_state=blind
+        observe_cause=delete_bound
+        observe_row=false
+        return 0
+    fi
+    case $routine_mode in
+        interval|daily) observe_via=schedule; return 0 ;;
+    esac
+    # Not evaluated yet: the first turn has not reported a backend.
+    case $routine_state_value:$routine_backend_value:$routine_last_poll_value in
+        never:none:0) return 0 ;;
+    esac
+    observe_poll_expired=false
+    case $poll_expired_profiles in *",$routine_profile,"*) observe_poll_expired=true ;; esac
+    case $routine_backend_reason_value in
+        source_missing|source_symlink)
+            observe_state=blind
+            observe_cause=$routine_backend_reason_value
+            observe_row=false
+            return 0
+            ;;
+    esac
+    case $routine_backend_value in
+        inotify)
+            observe_via=native
+            if [ "$observe_poll_expired" = true ]; then
+                observe_state=degraded
+                observe_cause=poll_walk_timeout
+            elif [ "$routine_backend_reason_value" != ok ]; then
+                observe_state=degraded
+                observe_cause=$routine_backend_reason_value
+            fi
+            ;;
+        *)
+            # polling, or none after the watcher ladder gave up: the poll is the
+            # observer, and the routine is blind when it cannot be.
+            observe_via=poll
+            if [ "$observe_poll_expired" = true ]; then
+                observe_via=none
+                observe_state=blind
+                observe_cause=poll_walk_timeout
+            else
+                case $routine_backend_reason_value in
+                    ok) ;;
+                    poll_unreadable|poll_unavailable)
+                        observe_via=none
+                        observe_state=blind
+                        observe_cause=$routine_backend_reason_value
+                        ;;
+                    *)
+                        observe_state=degraded
+                        observe_cause=$routine_backend_reason_value
+                        ;;
+                esac
+            fi
+            ;;
+    esac
+}
+
+# Sets observe_text for the row of a routine nothing fully observes.
+observe_message() {
+    case $observe_cause in
+        disabled)
+            observe_text="Routine is disabled: nothing is watching or scheduling it"
+            return 0
+            ;;
+        poll_walk_timeout) observe_what="the poll walk of its source did not finish within its budget and was killed" ;;
+        poll_unreadable) observe_what="the poll cannot read part of the source tree" ;;
+        poll_unavailable) observe_what="the poll cannot run" ;;
+        watch_setup_failed) observe_what="the realtime watch failed to start" ;;
+        watch_unavailable) observe_what="native watching is unavailable on this system" ;;
+        watch_limit) observe_what="the native watch limit was reached" ;;
+        watch_stopped) observe_what="the native watch stopped" ;;
+        *) observe_what="its source is not being watched" ;;
+    esac
+    if [ "$observe_state" = degraded ]; then
+        observe_text="Routine is only partly observed (watching via $observe_via): $observe_what; Logs name the cause"
+    else
+        observe_text="Routine is not observed: $observe_what; changes are not noticed until it clears; Logs name the cause"
+    fi
+}
+
+# One Activity row per episode, kept in the routine's own state record
+# (observe_state, observe_cause, observe_since_epoch) so it survives a restart:
+# a routine still blind for the same cause is not announced again. Runs after
+# process_routines on a full turn, over every routine -- a disabled one too,
+# which process_routines passes over without a word.
+observe_routines() {
+    observe_now=$1
+    for routine_config in "$routines_dir"/*.conf; do
+        [ -e "$routine_config" ] || continue
+        [ ! -L "$routine_config" ] && [ -f "$routine_config" ] && [ -r "$routine_config" ] || continue
+        routine_profile=${routine_config##*/}
+        routine_profile=${routine_profile%.conf}
+        case $routine_profile in ''|*[!A-Za-z0-9_-]*) continue ;; esac
+        profile_exists "$routine_profile" || continue
+        load_routine_config_runtime "$routine_config"
+        case $routine_enabled in true|false) ;; *) continue ;; esac
+        case $routine_mode in interval|daily|realtime) ;; *) continue ;; esac
+        routine_state_path=$routine_state_dir/$routine_profile.state
+        [ ! -L "$routine_state_path" ] || continue
+        load_routine_state_runtime "$routine_state_path"
+        case $routine_state_value in never|scheduled|running|succeeded|failed|deferred) ;; *) continue ;; esac
+        case $routine_next_value:$routine_last_success_value:$routine_last_attempt_value:$routine_retry_value:$routine_last_poll_value in *[!0-9:]*) continue ;; esac
+        case $routine_pending_since_value:$routine_event_first_seen_value:$routine_poll_retries_value in *[!0-9:]*) continue ;; esac
+        case $routine_backend_reason_value in
+            ok|source_missing|source_symlink|watch_unavailable|watch_setup_failed|watch_limit|\
+            watch_stopped|poll_unreadable|poll_unavailable) ;;
+            *) routine_backend_reason_value=ok ;;
+        esac
+        observe_classify
+        observe_previous_state=$routine_observe_value
+        observe_previous_cause=$routine_observe_cause_value
+        observe_changed=false
+        if [ "$observe_previous_state:$observe_previous_cause" != "$observe_state:$observe_cause" ]; then
+            observe_changed=true
+            routine_observe_value=$observe_state
+            routine_observe_cause_value=$observe_cause
+            if [ "$observe_state" = ok ]; then routine_observe_since_value=0; else routine_observe_since_value=$observe_now; fi
+        fi
+        if [ "$observe_changed" != true ] && [ "$routine_watching_via_value" = "$observe_via" ]; then
+            continue
+        fi
+        routine_watching_via_value=$observe_via
+        save_routine_state "$routine_profile"
+        [ "$observe_changed" = true ] || continue
+        # The episode is the record on disk: a write that failed (named by
+        # save_routine_state, once per episode) is announced when it lands, not
+        # on every turn it fails.
+        [ "$routine_state_saved" = true ] || continue
+        if [ "$observe_state" = ok ]; then
+            controller_log_event info routine_observed \
+                "profile=$routine_profile watching_via=$observe_via previous=$observe_previous_state cause=$observe_previous_cause" scheduler
+            if [ "$observe_previous_state" = disabled ]; then
+                observe_text="Routine is enabled again"
+            else
+                observe_text="Routine is observed again (watching via $observe_via)"
+            fi
+            controller_activity routine.observed "$routine_profile" changed "$observe_text" routines info
+            continue
+        fi
+        observe_level=warn
+        [ "$observe_state" != disabled ] || observe_level=info
+        controller_log_event "$observe_level" routine_unobserved \
+            "profile=$routine_profile state=$observe_state cause=$observe_cause watching_via=$observe_via" scheduler
+        [ "$observe_row" = true ] || continue
+        observe_message
+        controller_activity routine.unobserved "$routine_profile" unavailable "$observe_text" routines "$observe_level"
     done
 }
 
@@ -4997,6 +5399,8 @@ while [ "$shutdown" = false ]; do
     controller_now
     process_routines "$now"
     poll_due_list=$poll_due_seen
+    [ "$shutdown" = false ] || break
+    observe_routines "$now"
 
     [ "$shutdown" = false ] || break
 
