@@ -18221,15 +18221,6 @@ fi
             extra_environment={"SDSYNC_DSM_CONSUMER_STALL_SECONDS": "2"}, timeout=30,
         )
         self.assertEqual(started.returncode, 0, started.stdout + started.stderr)
-        # tearDown removes the tree before cleanups run: the release is best effort.
-        def release_the_job() -> None:
-            try:
-                release.write_text("go\n", encoding="utf-8")
-            except OSError:
-                pass
-
-        self.addCleanup(release_the_job)
-        self.addCleanup(lambda: self.shell(self.lifecycle, "stop", timeout=30))
         self.wait_for_path(ready, "the job never started", timeout=15)
         blocked = self.wait_for_controller_event("controller_blocked_by_stalled_consumer", timeout=60)
         self.assertEqual(len(blocked), 1, blocked)
@@ -18252,6 +18243,10 @@ fi
             "the end of the stall was not said\n" + bounded_file_tail(self.real_var / "log/controller.log"),
             timeout=30,
         )
+        # Stopped here, not in a cleanup: tearDown removes the tree first, and a
+        # controller still holding the job would outlive the test.
+        stopped = self.shell(self.lifecycle, "stop", timeout=60)
+        self.assertEqual(stopped.returncode, 0, stopped.stdout + stopped.stderr)
 
     def test_controller_publishes_consumer_wrote_no_result_for_a_silent_clean_exit(self) -> None:
         # Contract row 2: exit 0 with nothing written. Same class gate as row 1;
