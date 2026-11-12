@@ -55,6 +55,9 @@ const SUFFIX_DATABASE: &str = ".redb";
 const SUFFIX_CORRUPT: &str = ".redb.corrupt-";
 const SUFFIX_PANICKED: &str = ".redb.panicked";
 const SUFFIX_REBUILDS: &str = ".redb.rebuilds";
+/// The record of paths that keep failing (`pair_index::unsettled`), and its atomic-write temp.
+const SUFFIX_UNSETTLED: &str = ".redb.unsettled";
+const SUFFIX_UNSETTLED_TMP: &str = ".redb.unsettled.tmp";
 /// The bytes of the file a [`Fingerprint`] keeps: redb's header (magic, flags, both commit
 /// slots with their transaction ids and checksums) is the first 320.
 const HEADER_BYTES: u64 = 512;
@@ -298,6 +301,12 @@ fn is_index_owned(name: &std::ffi::OsStr) -> bool {
         return stem_is_owned(stem);
     }
     if let Some(stem) = name.strip_suffix(SUFFIX_REBUILDS) {
+        return stem_is_owned(stem);
+    }
+    if let Some(stem) = name
+        .strip_suffix(SUFFIX_UNSETTLED)
+        .or_else(|| name.strip_suffix(SUFFIX_UNSETTLED_TMP))
+    {
         return stem_is_owned(stem);
     }
     name.strip_suffix(SUFFIX_DATABASE)
@@ -1823,6 +1832,8 @@ mod tests {
             "photos.redb.corrupt-1800000000",
             "photos.redb.panicked",
             "photos.redb.rebuilds",
+            "photos.redb.unsettled",
+            "photos.redb.unsettled.tmp",
             MARKER,
         ] {
             assert!(is_index_owned(std::ffi::OsStr::new(owned)), "{owned}");
@@ -1834,6 +1845,8 @@ mod tests {
             "photos.redb.corrupt-",
             "photos.redb.meta",
             ".x.redb.panicked",
+            ".x.redb.unsettled",
+            "../x.redb.unsettled.tmp",
         ] {
             assert!(!is_index_owned(std::ffi::OsStr::new(foreign)), "{foreign}");
         }
