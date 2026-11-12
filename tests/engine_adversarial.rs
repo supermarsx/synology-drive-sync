@@ -557,25 +557,23 @@ fn a_refused_local_name_is_skipped_and_the_rest_uploads() {
     for index in 0..5 {
         fixture.write(&format!("f{index:02}.txt"), b"payload");
     }
-    fixture.write("~WRL0001.tmp", b"word autosave");
+    // `~WRL0001.tmp` was the example until Office temp files became a default exclude (fix8 R7b);
+    // any other leading `~` is still a name Synology Drive refuses.
+    fixture.write("~notes.txt", b"draft");
     fixture.server.add_directory("/team/e3");
     // An earlier version uploaded it; the skip must shield it from mirror deletion.
     fixture
         .server
-        .add_file("/team/e3/~WRL0001.tmp", b"old autosave", 1_700_000_000);
+        .add_file("/team/e3/~notes.txt", b"old draft", 1_700_000_000);
 
     let output = fixture.sync("/team/e3", &["--delete"]);
     assert_eq!(output.status.code(), Some(0), "{}", describe(&output));
     let document = json(&output);
     assert_eq!(document["result"]["outcome"], "complete");
-    assert!(has(
-        &deferred(&document),
-        "~WRL0001.tmp",
-        "unsupported-entry"
-    ));
+    assert!(has(&deferred(&document), "~notes.txt", "unsupported-entry"));
     assert_eq!(fixture.count(UPLOAD), 5);
     assert_eq!(fixture.count(DELETE), 0, "a skipped path is never deleted");
-    assert!(fixture.text("/team/e3/~WRL0001.tmp").is_some());
+    assert!(fixture.text("/team/e3/~notes.txt").is_some());
 }
 
 #[test]
