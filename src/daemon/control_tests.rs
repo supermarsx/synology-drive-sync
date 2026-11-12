@@ -230,6 +230,8 @@ impl Harness {
         settings.timings.kill_wait = Duration::from_millis(200);
         settings.wake_cap = Duration::from_millis(100);
         settings.publish_run_lock = false;
+        // Rows are asserted as soon as they are due; one test sets a grace.
+        settings.observe_grace = Duration::ZERO;
         tune(&mut settings);
         let wall_reader = Arc::clone(&wall);
         let parts = Parts {
@@ -2634,4 +2636,45 @@ fn the_state_record_carries_the_last_trigger_and_the_last_run() {
     assert!(!state.contains("last_trigger_epoch=0\n"), "{state}");
     assert!(!state.contains("last_run_epoch=0\n"), "{state}");
     assert!(state.contains("watching_via=native\n"), "{state}");
+}
+
+/// A reading that clears inside the grace (a watcher still starting reads blind
+/// for a moment) is never announced; one that holds past it is, once.
+#[test]
+fn a_reading_that_clears_inside_the_grace_is_never_announced() {
+    let h = Harness::tuned(
+        "observe-grace",
+        |home, _| {
+            profile(home, "docs");
+            routine(
+                home,
+                "docs",
+                "enabled=true\nmode=realtime\ndebounce_seconds=1\nretry_backoff_seconds=10\n",
+            );
+        },
+        |settings| settings.observe_grace = Duration::from_millis(1500),
+    );
+    h.wait_for("arm", PATIENT, |h| armed_generation(h, "docs").is_some());
+    report_backend(
+        &h,
+        Backend::None,
+        BackendReason::WatchSetupFailed,
+        "starting",
+    );
+    let _ = h.ask(Request::Wake);
+    thread::sleep(Duration::from_millis(300));
+    report_backend(&h, Backend::Inotify, BackendReason::Ok, "armed");
+    thread::sleep(Duration::from_millis(2200));
+    let _ = h.ask(Request::Wake);
+    thread::sleep(Duration::from_millis(300));
+    assert!(observation_rows(&h, "routine.unobserved", "docs").is_empty());
+    assert!(observation_rows(&h, "routine.observed", "docs").is_empty());
+    // Held past the grace it is one row.
+    report_backend(&h, Backend::None, BackendReason::WatchSetupFailed, "stuck");
+    h.wait_for("the row", PATIENT, |h| {
+        let _ = h.ask(Request::Wake);
+        observation_rows(h, "routine.unobserved", "docs").len() == 1
+    });
+    thread::sleep(Duration::from_millis(400));
+    assert_eq!(observation_rows(&h, "routine.unobserved", "docs").len(), 1);
 }

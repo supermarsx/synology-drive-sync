@@ -219,6 +219,10 @@ pub(crate) struct Settings {
     pub(crate) publish_run_lock: bool,
     /// How often an armed realtime routine syncs its whole tree anyway.
     pub(crate) full_reconcile_every: Duration,
+    /// How long a degraded or blind reading must hold before it is announced
+    /// (a watcher still starting reads blind for a moment). A disabled routine
+    /// and a recovery are never held back.
+    pub(crate) observe_grace: Duration,
     /// The child's base environment (already allowlisted).
     pub(crate) child_env: Vec<(std::ffi::OsString, std::ffi::OsString)>,
 }
@@ -233,6 +237,7 @@ impl Default for Settings {
             pair_index_dir: None,
             publish_run_lock: cfg!(target_os = "linux"),
             full_reconcile_every: Duration::from_secs(24 * 3600),
+            observe_grace: Duration::from_secs(30),
             child_env: allowlisted_env(std::env::vars_os()),
         }
     }
@@ -304,6 +309,9 @@ struct Entry {
     trigger_seen: Option<u64>,
     /// When the routine was armed: a backend that never reports is blind.
     armed_at: Option<Instant>,
+    /// The reading that differs from the announced one, and since when: it is
+    /// announced once it has held for `Settings::observe_grace`.
+    observe_pending: Option<(Observe, String, Instant)>,
 }
 
 /// Why a profile's automatic runs are held (daemon/lasting.rs).
@@ -1285,6 +1293,7 @@ impl Control {
                 floor_failing: false,
                 trigger_seen: None,
                 armed_at: None,
+                observe_pending: None,
             });
             entry.state = state;
             let realtime =
@@ -2113,7 +2122,22 @@ impl Control {
                 continue;
             };
             let mut next = state.clone();
-            let announce = (next.observe, next.observe_cause.as_str()) != (observe, cause.as_str());
+            let differs = (next.observe, next.observe_cause.as_str()) != (observe, cause.as_str());
+            // A reading that is not yet a settled one waits out the grace: a
+            // watcher still starting, a poll between two walks. A disabled
+            // routine and a recovery are said at once.
+            let mut pending = entry.observe_pending.clone();
+            let mut announce = differs;
+            if !differs || matches!(observe, Observe::Ok | Observe::Disabled) {
+                pending = None;
+            } else {
+                let since = match &pending {
+                    Some((o, c, at)) if *o == observe && *c == cause => *at,
+                    _ => Instant::now(),
+                };
+                pending = Some((observe, cause.clone(), since));
+                announce = since.elapsed() >= self.settings.observe_grace;
+            }
             next.watching_via = via;
             if announce {
                 next.observe = observe;
@@ -2130,8 +2154,11 @@ impl Control {
             }
             let changed = next != *state;
             let previous = (state.observe, state.observe_cause.clone());
-            if trigger_moved && let Some(entry) = self.routines.get_mut(&name) {
-                entry.trigger_seen = None;
+            if let Some(entry) = self.routines.get_mut(&name) {
+                entry.observe_pending = pending;
+                if trigger_moved {
+                    entry.trigger_seen = None;
+                }
             }
             if !changed {
                 continue;

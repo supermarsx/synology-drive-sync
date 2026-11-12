@@ -8545,6 +8545,7 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
         environment = self.fast_clock_environment(step=31)
         environment["PATH"] = f"{shim_bin}:{environment['PATH']}"
         environment["SDSYNC_DSM_POLL_WALK_BUDGET"] = "3"
+        environment["SDSYNC_DSM_OBSERVE_GRACE"] = "0"
         started = self.shell(self.lifecycle, "start", extra_environment=environment, timeout=30)
         self.assertEqual(started.returncode, 0, started.stdout + started.stderr)
         self._wait_for(held.exists, "no poll walk reached its scratch directory", timeout=30)
@@ -8666,9 +8667,9 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
                 "--poll-seconds", "5", "--allow-delete", "false", "--max-total-delete", "100",
             )
             self.assertEqual(routine.returncode, 0, routine.stderr)
-            started = self.shell(
-                self.lifecycle, "start", extra_environment=self.fast_clock_environment(step=31), timeout=30
-            )
+            environment = self.fast_clock_environment(step=31)
+            environment["SDSYNC_DSM_OBSERVE_GRACE"] = "0"
+            started = self.shell(self.lifecycle, "start", extra_environment=environment, timeout=30)
             self.assertEqual(started.returncode, 0, started.stderr)
             self._wait_for(
                 lambda: self._unobserved_rows("watch", "cannot read part of the source tree"),

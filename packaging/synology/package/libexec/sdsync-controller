@@ -4801,6 +4801,47 @@ observe_message() {
     fi
 }
 
+# How long (seconds) a non-ok reading must hold before it is announced.
+# SDSYNC_DSM_OBSERVE_GRACE overrides it (0-3600); a disabled routine is never
+# held back.
+observe_grace=30
+case ${SDSYNC_DSM_OBSERVE_GRACE:-} in
+    ''|*[!0-9]*) ;;
+    *)
+        if [ "${#SDSYNC_DSM_OBSERVE_GRACE}" -le 4 ] && [ "$SDSYNC_DSM_OBSERVE_GRACE" -le 3600 ]; then
+            observe_grace=$SDSYNC_DSM_OBSERVE_GRACE
+        fi
+        ;;
+esac
+# profile/state:cause@uptime entries, space separated: the readings waiting out
+# their grace. Profile names hold none of / : @ or a space.
+observe_pending=
+observe_pending_get() {
+    observe_pending_key=
+    observe_pending_start=0
+    for observe_pending_entry in $observe_pending; do
+        case $observe_pending_entry in
+            "$1"/*)
+                observe_pending_rest=${observe_pending_entry#"$1"/}
+                observe_pending_key=${observe_pending_rest%@*}
+                observe_pending_start=${observe_pending_rest##*@}
+                return 0
+                ;;
+        esac
+    done
+}
+observe_pending_clear() {
+    observe_pending_kept=
+    for observe_pending_entry in $observe_pending; do
+        case $observe_pending_entry in "$1"/*) ;; *) observe_pending_kept="$observe_pending_kept $observe_pending_entry" ;; esac
+    done
+    observe_pending=$observe_pending_kept
+}
+observe_pending_set() {
+    observe_pending_clear "$1"
+    observe_pending="$observe_pending $1/$2@$3"
+}
+
 # One Activity row per episode, kept in the routine's own state record
 # (observe_state, observe_cause, observe_since_epoch) so it survives a restart:
 # a routine still blind for the same cause is not announced again. Runs after
@@ -4835,9 +4876,32 @@ observe_routines() {
         observe_changed=false
         if [ "$observe_previous_state:$observe_previous_cause" != "$observe_state:$observe_cause" ]; then
             observe_changed=true
-            routine_observe_value=$observe_state
-            routine_observe_cause_value=$observe_cause
-            if [ "$observe_state" = ok ]; then routine_observe_since_value=0; else routine_observe_since_value=$observe_now; fi
+            case $observe_state in
+                ok|disabled) observe_pending_clear "$routine_profile" ;;
+                *)
+                    # A watcher that is still starting, or a poll that is between
+                    # two walks, reads blind for a moment and then is not. A
+                    # reading is announced once it has held for observe_grace
+                    # seconds; a recovery inside the grace is never said.
+                    observe_pending_get "$routine_profile"
+                    observe_pending_now=0
+                    ! read_uptime_seconds || observe_pending_now=$uptime_seconds
+                    if [ "$observe_pending_key" != "$observe_state:$observe_cause" ]; then
+                        observe_pending_set "$routine_profile" "$observe_state:$observe_cause" "$observe_pending_now"
+                        observe_pending_start=$observe_pending_now
+                    fi
+                    if [ $((observe_pending_now - observe_pending_start)) -lt "$observe_grace" ]; then
+                        observe_changed=false
+                    fi
+                    ;;
+            esac
+            if [ "$observe_changed" = true ]; then
+                routine_observe_value=$observe_state
+                routine_observe_cause_value=$observe_cause
+                if [ "$observe_state" = ok ]; then routine_observe_since_value=0; else routine_observe_since_value=$observe_now; fi
+            fi
+        else
+            observe_pending_clear "$routine_profile"
         fi
         if [ "$observe_changed" != true ] && [ "$routine_watching_via_value" = "$observe_via" ]; then
             continue
