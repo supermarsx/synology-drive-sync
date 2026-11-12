@@ -18,10 +18,10 @@
 
   <h2>Refresh cadence</h2>
   <dl>
-    <dt>Status refresh</dt><dd>Controls periodic authenticated snapshot requests while DSM is visible.</dd>
+    <dt>Status refresh</dt><dd>Controls periodic authenticated snapshot requests while DSM is visible: manual only, or every 3, 5, 10 or 30 seconds. A cadence of one second saved by an earlier release is read as 5 seconds.</dd>
     <dt>Log refresh</dt><dd>Controls periodic Activity log requests while that page is visible and not paused.</dd>
   </dl>
-  <p>Faster refresh improves freshness but increases browser and NAS request frequency. Hiding the DSM document or destroying the AppWindow stops scheduled refreshes and aborts active browser requests.</p>
+  <p>Faster refresh improves freshness but increases browser and NAS request frequency. Hiding the DSM document stops scheduled refreshes; requests already sent finish. Destroying the AppWindow stops scheduled refreshes and aborts active browser requests.</p>
 
   <h2>Storage and privacy</h2>
   <p>Theme, refresh cadence, and optional open-session notification preferences use browser local storage. The AppWindow writes the candidate browser preference first and submits the fixed package audit event only after that write succeeds. If browser storage rejects the write, no audit event is submitted. A trustworthy pre-acceptance audit rejection restores the exact prior browser value and applied settings. Once DSM may have accepted the audit event, the saved candidate is retained and the AppWindow shows its validated client request and queued job correlation instead of risking a misleading rollback. Profile configuration and protected secrets remain in DSM package-private storage. Secret editor values are never written to browser storage.</p>

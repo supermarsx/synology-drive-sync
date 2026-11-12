@@ -251,6 +251,42 @@ test("a terminal Activity record outranks the bare acceptance recorded beside it
   }
 });
 
+test("a refused request is answered as rejected, and any other record of it outranks the refusal", async () => {
+  const rejectedRow = activityEvent({
+    code: "audit.failed",
+    profile: "all",
+    state: "failed",
+    category: "audit",
+    level: "error",
+    epoch: 1757000003,
+    message: `Module rejected-post failed [bridge-${"a".repeat(64)}] reason=csrf_rejected request_id=${REQUEST_ID}`
+  });
+  const unresolved = () => Promise.resolve(jsonResponse({
+    schema: "sdsync.dsm-request-status.v1",
+    request_id: REQUEST_ID,
+    state: "unresolved"
+  }, 202));
+  for (const [events, verdict, code] of [
+    [[rejectedRow], "rejected", "audit.failed"],
+    // A replay of the same request was accepted after the first attempt was refused.
+    [[rejectedRow, activityEvent({ epoch: 1757000001 })], "accepted", "audit.requested"],
+    [[rejectedRow, activityEvent({ code: "audit.succeeded", state: "succeeded", epoch: 1757000009 })], "settled", "audit.succeeded"]
+  ]) {
+    const restore = installBrowser(routed({
+      "request-status": unresolved,
+      activity: () => Promise.resolve(jsonResponse({ events }))
+    }));
+    try {
+      const api = await loadApi();
+      const observed = await api.probeRequestOutcome({}, REQUEST_ID, OPERATION);
+      assert.equal(observed.verdict, verdict);
+      assert.equal(observed.code, code);
+    } finally {
+      restore();
+    }
+  }
+});
+
 test("no trace in either source is reported as absent, and an unreadable source is not", async () => {
   const unresolved = () => Promise.resolve(jsonResponse({
     schema: "sdsync.dsm-request-status.v1",

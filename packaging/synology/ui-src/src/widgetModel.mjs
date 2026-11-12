@@ -515,6 +515,12 @@ const WIDGET_BRIDGE_FAILURES = Object.freeze({
   }),
   clock_unavailable: Object.freeze({
     level: "fail", title: "NAS clock is not set", detail: "Set the NAS system time."
+  }),
+  client_timeout: Object.freeze({
+    level: "warn", title: "Package is slow to answer", detail: "No answer within 10 seconds; retrying."
+  }),
+  cgi_deadline_exceeded: Object.freeze({
+    level: "warn", title: "Package request timed out", detail: "Recorded in the package API log; retrying."
   })
 });
 

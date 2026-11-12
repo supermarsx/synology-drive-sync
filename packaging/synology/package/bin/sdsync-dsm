@@ -473,7 +473,8 @@ begin_admitted() {
     # fresh, fixed service attribution so caller-controlled bridge variables
     # cannot suppress or forge its mandatory records.
     unset SDSYNC_DSM_AUDIT_TRANSACTION SDSYNC_DSM_AUDIT_ACTOR \
-        SDSYNC_DSM_AUDIT_ACTOR_UID SDSYNC_DSM_AUDIT_ORIGIN SDSYNC_DSM_CLIENT_REQUEST_ID
+        SDSYNC_DSM_AUDIT_ACTOR_UID SDSYNC_DSM_AUDIT_ORIGIN SDSYNC_DSM_CLIENT_REQUEST_ID \
+        SDSYNC_DSM_AUDIT_REASON SDSYNC_DSM_REJECTED_REQUEST_ID
     SDSYNC_DSM_AUDIT_ACTOR=package-manager
     SDSYNC_DSM_AUDIT_ACTOR_UID=$path_owner
     SDSYNC_DSM_AUDIT_ORIGIN=manager
@@ -561,12 +562,23 @@ begin_admitted() {
         *) echo "operation is disabled by the current security policy" >&2; exit 77 ;;
     esac
     case ${command_name:-} in plan|run) return 0 ;; esac
+    # A Doctor that only reads changes nothing a run depends on, whichever
+    # engine holds run.lock: the same verdict daemon_run_admission gives it.
+    # Refusing it here sent Doctor's own refusal, worded for a profile change,
+    # to the dashboard as a page of steps that never ran.
+    if [ "${command_name:-}" = doctor ]; then
+        case " $* " in *" --write-test "*) ;; *) return 0 ;; esac
+    fi
     opposing_run_status=0
     private_process_lock_is_live "$run_lock" || opposing_run_status=$?
     if [ "$opposing_run_status" -eq 0 ]; then
             active_run=$lock_owner_pid
             if ! read_daemon_run_scope "$lock_owner_pid" "$lock_owner_start" "$lock_owner_boot"; then
-                echo "cannot change profiles, credentials, or schedule while PID $active_run is planning/syncing" >&2
+                if [ "${command_name:-}" = doctor ]; then
+                    echo "doctor --write-test is refused while PID $active_run is planning/syncing: it writes into the destination the run is syncing" >&2
+                else
+                    echo "cannot change profiles, credentials, or schedule while PID $active_run is planning/syncing" >&2
+                fi
                 exit 75
             fi
             daemon_run_admission "$@"
@@ -1427,8 +1439,9 @@ pair_index_stem() {
 
 # State the profile's own runs left beside its configuration: the alert counter
 # (never removed before, so a profile recreated under the name inherited its
-# failure streak), the verified-pair index, its quarantined copies and its panic
-# record (by the stem above), and the daemon's lasting condition. The
+# failure streak), the verified-pair index, its quarantined copies, its panic
+# record, its count of damaged opens and its record of files that keep changing
+# (by the stem above), and the daemon's lasting condition. The
 # configuration is already gone by now, so one that cannot be removed does not
 # undo the removal: it is named with its path and cause as a warning, which
 # `api` returns as the result's warning.
@@ -1438,7 +1451,10 @@ remove_profile_leftovers() {
     if pair_index_stem "$leftover_profile"; then
         set -- "$@" "$cache_root/pairs/$pair_index_stem_value.redb" \
             "$cache_root/pairs/$pair_index_stem_value.redb.corrupt-"* \
-            "$cache_root/pairs/$pair_index_stem_value.redb.panicked"
+            "$cache_root/pairs/$pair_index_stem_value.redb.panicked" \
+            "$cache_root/pairs/$pair_index_stem_value.redb.rebuilds" \
+            "$cache_root/pairs/$pair_index_stem_value.redb.unsettled" \
+            "$cache_root/pairs/$pair_index_stem_value.redb.unsettled.tmp"
     else
         echo "warning: the pair index files of profile $leftover_profile in $cache_root/pairs were not removed: $pair_index_stem_cause" >&2
     fi
@@ -2919,6 +2935,8 @@ api_capture() {
     if [ "${2:-}" = doctor ]; then
         # The compiled bridge and browser both enforce a one-MiB response ceiling. Reserve ample
         # JSON-escaping headroom while retaining complete NDJSON records for multi-profile Doctor.
+        # The bridge publishes an action output of at most MAX_ACTION_OUTPUT_BYTES (dsm_api.rs);
+        # this cap must never exceed it, or a bounded report becomes a refused result.
         api_redact_limit=327680
         api_redact_marker='{"schema":"sdsync.dsm-output-truncated.v1","truncated":true}'
     fi
@@ -2995,6 +3013,22 @@ manager_best_effort() {
     return 0
 }
 
+# Refuse a package state file, naming it and the check it failed, as the
+# compiled rung's `config_file_unsafe` record does: the path under the package
+# root (bytes outside [A-Za-z0-9._/-] as _, at most 160 bytes) and one of
+# type, read. Never returns.
+api_unsafe_state_file() {
+    unsafe_state_path=$1
+    if [ -L "$unsafe_state_path" ] || [ ! -f "$unsafe_state_path" ]; then
+        unsafe_state_check=type
+    else
+        unsafe_state_check=read
+    fi
+    unsafe_state_shown=${unsafe_state_path#/var/packages/synology-drive-sync/}
+    unsafe_state_shown=$(printf '%s' "$unsafe_state_shown" | LC_ALL=C tr -c 'A-Za-z0-9._/-' '_' | tail -c 160)
+    api_error unsafe_state "unsafe package state file $unsafe_state_shown ($unsafe_state_check)" 73
+}
+
 api_load_kv() {
     kv_file=$1
     kv_key=$2
@@ -3002,7 +3036,7 @@ api_load_kv() {
     kv_value=$kv_default
     [ -e "$kv_file" ] || return 0
     if [ -L "$kv_file" ] || [ ! -f "$kv_file" ] || [ ! -r "$kv_file" ]; then
-        api_error unsafe_state "unsafe package state file" 73
+        api_unsafe_state_file "$kv_file"
     fi
     kv_count=$(grep -c "^${kv_key}=" "$kv_file" 2>/dev/null || true)
     [ "$kv_count" = 1 ] || api_error corrupt_state "package state is missing or duplicates $kv_key" 73
@@ -3018,7 +3052,7 @@ api_load_kv_optional() {
     kv_default=$3
     kv_value=$kv_default
     [ -e "$kv_file" ] || return 0
-    if [ -L "$kv_file" ] || [ ! -f "$kv_file" ] || [ ! -r "$kv_file" ]; then api_error unsafe_state "unsafe package state file" 73; fi
+    if [ -L "$kv_file" ] || [ ! -f "$kv_file" ] || [ ! -r "$kv_file" ]; then api_unsafe_state_file "$kv_file"; fi
     kv_count=$(grep -c "^${kv_key}=" "$kv_file" 2>/dev/null || true)
     case $kv_count in 0) return 0 ;; 1) ;; *) api_error corrupt_state "package state duplicates $kv_key" 73 ;; esac
     kv_value=$(sed -n "s/^${kv_key}=//p" "$kv_file")
@@ -4324,6 +4358,46 @@ api_routine_json() {
         *) api_error corrupt_state "invalid routine backend reason" 73 ;; \
     esac
     case $routine_next:$routine_last_success:$routine_last_poll in *[!0-9:]*) api_error corrupt_state "invalid routine epoch" 73 ;; esac
+    # What observes the routine (both engines append these after
+    # escalated_epoch), optional on read with the same defaults and the same
+    # validation as the compiled rung. One awk pass for all six, not two forks
+    # per key: this runs once per routine on every snapshot.
+    routine_last_trigger=0 routine_last_run=0 routine_watching_via=none
+    routine_observe_state=ok routine_observe_cause=none routine_observe_since=0
+    if [ -e "$routine_state_file" ]; then
+        routine_observation=$(LC_ALL=C awk '
+            BEGIN { split("last_trigger_epoch last_run_epoch watching_via observe_state observe_cause observe_since_epoch", keys, " ") }
+            {
+                for (i = 1; i <= 6; i++) {
+                    prefix = keys[i] "="
+                    if (substr($0, 1, length(prefix)) == prefix) { seen[i]++; value[i] = substr($0, length(prefix) + 1) }
+                }
+            }
+            END {
+                for (i = 1; i <= 6; i++) if (seen[i] > 1) exit 3
+                for (i = 1; i <= 6; i++) if (seen[i]) printf "%s=%s\n", keys[i], value[i]
+            }
+        ' "$routine_state_file") || api_error corrupt_state "package state duplicates a routine observation field" 73
+        while IFS= read -r routine_observation_line; do
+            case $routine_observation_line in
+                last_trigger_epoch=*) routine_last_trigger=${routine_observation_line#*=} ;;
+                last_run_epoch=*) routine_last_run=${routine_observation_line#*=} ;;
+                watching_via=*) routine_watching_via=${routine_observation_line#*=} ;;
+                observe_state=*) routine_observe_state=${routine_observation_line#*=} ;;
+                observe_cause=*) routine_observe_cause=${routine_observation_line#*=} ;;
+                observe_since_epoch=*) routine_observe_since=${routine_observation_line#*=} ;;
+            esac
+        done <<ROUTINE_OBSERVATION
+$routine_observation
+ROUTINE_OBSERVATION
+    fi
+    case $routine_watching_via in native|poll|schedule|none) ;; *) api_error corrupt_state "invalid routine watching_via" 73 ;; esac
+    case $routine_observe_state in ok|degraded|blind|disabled) ;; *) api_error corrupt_state "invalid routine observe_state" 73 ;; esac
+    case $routine_observe_cause in ''|*[!a-z0-9_]*) api_error corrupt_state "invalid routine observe_cause" 73 ;; esac
+    [ "${#routine_observe_cause}" -le 64 ] || api_error corrupt_state "invalid routine observe_cause" 73
+    case $routine_last_trigger:$routine_last_run:$routine_observe_since in
+        :*|*::*|*:|*[!0-9:]*) api_error corrupt_state "invalid routine observation epoch" 73 ;;
+    esac
     printf '{"profile":%s,"enabled":%s,"action":%s,"mode":%s,' \
         "$(json_quote "$routine_name")" "$routine_enabled" "$(json_quote "$routine_action")" "$(json_quote "$routine_mode")"
     case $routine_mode in
@@ -4337,9 +4411,12 @@ api_routine_json() {
     printf '"retry_count":%s,"retry_backoff_seconds":%s,"retry_exponential":%s,"allow_delete":%s,"max_total_delete":%s,"depends_on":' \
         "$routine_retries" "$routine_backoff" "$routine_retry_exponential" "$routine_delete" "$routine_max_total"
     api_dependencies_json "$routine_dependencies"
-    printf ',"backend":%s,"backend_reason":%s,"state":%s,"next_run_epoch":%s,"last_success_epoch":%s,"last_poll_epoch":%s}' \
+    printf ',"backend":%s,"backend_reason":%s,"state":%s,"next_run_epoch":%s,"last_success_epoch":%s,"last_poll_epoch":%s' \
         "$(json_quote "$routine_backend")" "$(json_quote "$routine_backend_reason")" "$(json_quote "$routine_state")" \
         "$routine_next" "$routine_last_success" "$routine_last_poll"
+    printf ',"last_trigger_epoch":%s,"last_run_epoch":%s,"watching_via":"%s","observe_state":"%s","observe_cause":"%s","observe_since_epoch":%s}' \
+        "$routine_last_trigger" "$routine_last_run" "$routine_watching_via" "$routine_observe_state" \
+        "$routine_observe_cause" "$routine_observe_since"
 }
 
 # 0 when daemon.ready names a daemon that is still that process (the in-process
@@ -5038,9 +5115,23 @@ api_cgi_failure() {
     cgi_failure_code=$4
     cgi_failure_status=$6
     case "$cgi_failure_stage:$cgi_failure_code:$cgi_failure_status" in
-        request:invalid_request:400|request:method_not_allowed:405|request:payload_too_large:413|request:unsupported_media_type:415)
+        request:invalid_request:400|request:method_not_allowed:405|request:payload_too_large:413|request:unsupported_media_type:415|request:request_body_timeout:400)
             cgi_failure_event=bridge.failed
             cgi_failure_category=bridge
+            ;;
+        # The CGI's watchdog answered a request that ran out of time in this
+        # stage, or the response could not be written to a reader that stopped.
+        request:cgi_deadline_exceeded:503|bridge_connect:cgi_deadline_exceeded:503|bridge_io:cgi_deadline_exceeded:503|bridge_protocol:cgi_deadline_exceeded:503)
+            cgi_failure_event=bridge.failed
+            cgi_failure_category=bridge
+            ;;
+        cgi_identity:cgi_deadline_exceeded:503|cgi_runtime:cgi_deadline_exceeded:503|cgi_runtime:response_write_timeout:503)
+            cgi_failure_event=security.failed
+            cgi_failure_category=security
+            ;;
+        dsm_authentication:cgi_deadline_exceeded:503)
+            cgi_failure_event=authentication.failed
+            cgi_failure_category=authentication
             ;;
         cgi_identity:cgi_identity_unsafe:503|cgi_runtime:cgi_runtime_unsafe:503|cgi_runtime:cgi_runtime_unavailable:503)
             cgi_failure_event=security.failed
@@ -5184,7 +5275,8 @@ api_command() {
             unset SDSYNC_DSM_AUDIT_ACTOR SDSYNC_DSM_AUDIT_ACTOR_UID SDSYNC_DSM_AUDIT_ORIGIN \
                 SDSYNC_DSM_AUDIT_TRANSACTION SDSYNC_DSM_AUDIT_PROFILE \
                 SDSYNC_DSM_AUDIT_REQUESTED SDSYNC_DSM_TERMINAL_AUDIT_OWNER \
-                SDSYNC_DSM_POLICY_JOB_PATH SDSYNC_DSM_AUDIT_WRAPPED SDSYNC_DSM_CLIENT_REQUEST_ID
+                SDSYNC_DSM_POLICY_JOB_PATH SDSYNC_DSM_AUDIT_WRAPPED SDSYNC_DSM_CLIENT_REQUEST_ID \
+                SDSYNC_DSM_AUDIT_REASON SDSYNC_DSM_REJECTED_REQUEST_ID
             SDSYNC_DSM_AUDIT_ACTOR=package-manager
             SDSYNC_DSM_AUDIT_ACTOR_UID=$path_owner
             SDSYNC_DSM_AUDIT_ORIGIN=manager
@@ -5202,6 +5294,27 @@ api_command() {
         cgi-failure) api_cgi_failure "$@" ;;
         audit-rejected)
             [ "$#" -eq 0 ] || api_error invalid_request "audit-rejected accepts no arguments" 64
+            # The bridge names why it refused the mutation, and the client
+            # request ID when the refused body carried a well-formed one. Both
+            # reach only the Activity row (append_audit_event) and the verifier
+            # that proves it; the audit.log record keeps its fixed shape. The
+            # list is REJECTED_POST_REASONS in dsm_api.rs, compared by the
+            # packaging suite: a reason outside it is recorded as unclassified
+            # rather than leaving the refusal unaudited.
+            case ${SDSYNC_DSM_AUDIT_REASON:-} in
+                invalid_request|unauthorized|forbidden|csrf_rejected|ui_build_stale|\
+                method_not_allowed|unsupported_media_type|payload_too_large|conflict|\
+                internal_error|unavailable|service_request_unavailable|control_lock_busy|\
+                runtime_closed|runtime_upgrading|runtime_uninstalling|runtime_marker_unsafe|\
+                clock_unavailable|job_unreadable|unclassified) ;;
+                *) SDSYNC_DSM_AUDIT_REASON=unclassified ;;
+            esac
+            case ${SDSYNC_DSM_REJECTED_REQUEST_ID:-} in
+                ''|*[!0-9a-f]*) unset SDSYNC_DSM_REJECTED_REQUEST_ID ;;
+                *) [ "${#SDSYNC_DSM_REJECTED_REQUEST_ID}" -eq 32 ] || unset SDSYNC_DSM_REJECTED_REQUEST_ID ;;
+            esac
+            export SDSYNC_DSM_AUDIT_REASON
+            [ -z "${SDSYNC_DSM_REJECTED_REQUEST_ID:-}" ] || export SDSYNC_DSM_REJECTED_REQUEST_ID
             append_audit_event rejected-post failed all >/dev/null 2>&1 || api_error audit_unavailable "mandatory audit record could not be written" 73
             dsm_log_event bridge_rejected
             api_result "Rejected dashboard mutation audited"

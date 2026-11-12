@@ -555,6 +555,72 @@ test("legacy output is preserved but unreported areas are skipped, never assumed
   assert.match(report.sections.at(-1).detail, /rejected authentication/);
 });
 
+test("a Doctor that produced no report says on every step why, never blaming the package for running", async () => {
+  const doctor = await loadDoctorHelpers();
+  const expected = doctor.expectedDoctorSections("standard", false).length;
+  // A result the bridge refused to publish: a code, no exit code, the bridge's sentence.
+  const refused = doctor.doctorReportFromResult(
+    {
+      output: "The operation produced more output than the package will carry.",
+      message: "Doctor failed",
+      code: "response_too_large",
+      exit_code: null
+    },
+    false,
+    "standard",
+    false,
+    1788200000
+  );
+  const skipped = refused.sections.filter((section) => section.state === "skipped");
+  assert.equal(skipped.length, expected);
+  for (const section of skipped) {
+    assert.equal(
+      section.detail,
+      "Not run: Doctor produced no report. Cause: code response_too_large: The operation produced more output than the package will carry."
+    );
+    assert.doesNotMatch(section.detail, /installed package returned no structured evidence/);
+  }
+  const why = refused.sections.at(-1);
+  assert.equal(why.id, "terminal_evidence");
+  assert.equal(why.label, "Why Doctor produced no report");
+  assert.equal(why.state, "failed");
+  assert.match(why.detail, /^Cause: code response_too_large: /);
+  assert.match(why.detail, /recorded in api\.log/);
+  assert.doesNotMatch(why.detail, /^Doctor failed\.?$/);
+
+  // The shell refused before the core ran: plain text and an exit code.
+  const shell = doctor.doctorReportFromResult(
+    {
+      output: "doctor --write-test is refused while PID 41 is planning/syncing: it writes into the destination the run is syncing\n",
+      code: "operation_failed",
+      exit_code: 75
+    },
+    false,
+    "standard",
+    true,
+    1788200000
+  );
+  assert.match(
+    shell.sections.find((section) => section.state === "skipped").detail,
+    /^Not run: Doctor produced no report\. Cause: code operation_failed, exit code 75: doctor --write-test is refused while PID 41/
+  );
+  assert.doesNotMatch(shell.sections.at(-1).detail, /api\.log/, "only an unpublished result points at api.log");
+
+  // Nothing at all to go on is still a stated cause.
+  const silent = doctor.doctorReportFromResult({ output: "", message: "" }, false, "quick", false, 1788200000);
+  assert.match(silent.sections[0].detail, /Cause: the package returned no output\.$/);
+
+  // A successful legacy result keeps its label and is not called a failure.
+  const legacy = doctor.doctorReportFromResult({ output: "legacy text" }, true, "quick", false, 1788200000);
+  assert.equal(legacy.sections.at(-1).label, "Legacy terminal evidence");
+  assert.equal(legacy.sections.at(-1).state, "ok");
+});
+
+test("a failed queued action carries its exit code to the page", () => {
+  assert.match(apiSource, /failure\.exitCode = Number\.isInteger\(exitCode\) && exitCode >= 0 && exitCode <= 255 \? exitCode : null;/);
+  assert.match(source, /exit_code: error && Number\.isInteger\(error\.exitCode\) \? error\.exitCode : null/);
+});
+
 test("Doctor surface renders section states, progress, timings, copy, and bounded inventory", () => {
   for (const marker of [
     'label="Test level"',

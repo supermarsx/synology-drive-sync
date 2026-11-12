@@ -183,9 +183,17 @@ whether the window keeps asking:
   repaired. Polling through a fault that waiting cannot fix only buries the operator's own repair
   under identical failures.
 
-The Activity feed draws the newest 200 events that match its filter and says "N older events not shown"
+The Activity feed draws the newest 200 rows that match its filter and says "N older events not shown"
 with a **Show older** button that draws 200 more (the heading still counts the whole filtered list,
 and **Copy visible** copies every match), so a thousand-event feed does not stall the page.
+
+By default the feed folds the rows of one run into one row with its outcome and duration (`Run of
+nightly succeeded in 25 s · 5 events`): the run's audit records (`audit.*`/`module.*` rows of one
+`[<transaction>]`) and its `run.started` with the next terminal `run.*` row of the same profile. An
+audited change folds by its transaction the same way. **Show its events** opens a fold, **Show every
+event** draws every row as recorded, and **Group by run** folds them again. A `warn` or `error` row is
+never folded away: it is drawn under its run's row while the fold is closed. A run or change without a
+terminal row yet is not folded. Searching, the filters and copying act on the recorded events.
 
 The Activity and Logs feeds settle independently of each other and retain their rows the same way,
 so the feed state beside them dates what is left on screen: `activity feed unavailable, retained
@@ -297,8 +305,10 @@ controller could not be told to reload, so the previous schedule or policy is st
 as saved with a persistent red *Saved, but it is not fully in effect* notice that names each warning
 and can be dismissed; it is never reported as plain success. Configuration is applied first, followed by
 each requested secret operation in order. A lost POST acknowledgement is recovered by replaying the exact serialized
-request, request ID, authentication snapshot, and CSRF token up to two times; the package returns the
-same job instead of creating a duplicate. Configuration and secret stages also have bounded result
+request, request ID and authentication snapshot up to two times; the package returns the same job
+instead of creating a duplicate. A replay carries a fresh CSRF token when the earlier one has gone
+stale or was answered with a 403 the page could not read, and is not sent at all if no fresh token
+can be had. Configuration and secret stages also have bounded result
 observation so the editor cannot stay busy indefinitely.
 
 If a later stage fails or remains outcome-unknown after recovery, the page reports the profile as
@@ -486,9 +496,10 @@ Configuration/secret/routine/policy calls and Doctor poll that response before r
 result. Plan and Run remain asynchronous. Therefore:
 
 1. Before declaring a POST outcome unknown, the AppWindow makes at most two automatic replays of the
-   exact original request body, client request ID, DSM authentication snapshot, and CSRF token. An
-   accepted replay returns the original job ID. No retry creates a new request identity or changes the
-   payload.
+   exact original request body, client request ID and DSM authentication snapshot. An accepted replay
+   returns the original job ID. No retry creates a new request identity or changes the payload. A
+   replay never repeats a CSRF token the package may already have refused (a 403 whose body could not
+   be read) or one that has gone stale; it fetches a fresh one first, or is not sent.
 2. A configuration success toast proves a sanitized terminal manager result, but the refreshed
    snapshot remains the authoritative displayed state.
 3. Profile saves, profile-connection probes, and autosave calls use explicit overall observation

@@ -92,7 +92,9 @@ const ISSUES = {
   "pair-index-nas-clock-skewed": /clock .*more than 20 seconds/i,
   // S3-21: also named for a crash record, a listing and an unreadable age, not only a copy that stays.
   "pair-index-cleanup-failed": /could not be cleaned up/i,
-  "pair-index-remote-ctime-static": /change time/i
+  "pair-index-remote-ctime-static": /change time/i,
+  "pair-index-unsettled-unusable": /keep changing could not be used/i,
+  "pair-index-unkeepable": /cannot keep it; it is no longer rebuilt and every file is checked live/
 };
 
 for (const [issue, words] of Object.entries(ISSUES)) {
@@ -102,13 +104,15 @@ for (const [issue, words] of Object.entries(ISSUES)) {
     assert.equal(found[0].level, "warn");
     assert.match(found[0].title, /photos/);
     assert.match(found[0].detail, words);
-    assert.match(found[0].detail, /photos\.redb: it broke/);
+    // The raw detail is evidence behind a disclosure, not the sentence itself.
+    assert.doesNotMatch(found[0].detail, /it broke/);
+    assert.equal(found[0].raw, "/var/state/cache/pairs/photos.redb: it broke");
     assert.doesNotMatch(found[0].detail, /unknown/);
   });
 }
 
 test("info-level index codes never produce an item", () => {
-  for (const issue of ["pair-index-retired", "pair-index-not-applicable", "pair-index-unsupported-platform", "pair-index-plan-clock-unbounded", "pair-index-compaction-failed", "pair-index-link-guard-unchecked"]) {
+  for (const issue of ["pair-index-retired", "pair-index-not-applicable", "pair-index-unsupported-platform", "pair-index-plan-clock-unbounded", "pair-index-compaction-failed", "pair-index-link-guard-unchecked", "pair-index-failed-run", "pair-index-compacted", "pair-index-remote-ctime-unavailable"]) {
     assert.deepEqual(indexItems(withIndex({ issue })), [], issue);
   }
 });
@@ -357,4 +361,18 @@ test("the notice is headed by what it means, and the generic heading is kept for
   assert.equal(clean.mutationWarning, null);
   assert.deepEqual(clean.toasts, [], "a clean save raises no warning toast");
   assert.match(appSource, /<strong>\{\{ mutationWarningTitle \}\}<\/strong>/);
+});
+
+test("the damaged-index item says what it means for the sync and what to do, with the redb text kept back", () => {
+  const found = indexItems(withIndex({ issue: "pair-index-corrupt", issue_detail: "...cache/pairs/office.redb: DB corrupted: Database page size 0 does not match expected 4096; set aside as /var" }));
+  assert.equal(found.length, 1);
+  assert.match(found[0].detail, /still compared in full/);
+  assert.match(found[0].detail, /Storage Manager/);
+  assert.doesNotMatch(found[0].detail, /page size/);
+  assert.match(found[0].raw, /Database page size 0 does not match expected 4096/);
+});
+
+test("a failed run that kept its index evidence is a note on the index line, not an item", () => {
+  const line = indexLine(normalizeOutcomes(withIndex({ state: "warm", issue: "pair-index-failed-run" })).profiles[0].index);
+  assert.match(line, /the last run failed; the checksums it proved were kept/);
 });

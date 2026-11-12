@@ -393,6 +393,52 @@ observing a routine wrote controller.log at most, so the Activity page read as h
 - **`module.succeeded` is `debug`.** It repeated `audit.succeeded` for every run; `module.failed` and the
   `audit.*` rows are unchanged.
 
+### Dashboard bridge fixes from the NAS field report
+
+- **Doctor over many profiles reports again.** The package keeps up to 320 KiB of Doctor output, but
+  the bridge refused any result output over 64 KiB, so a Doctor over three or four profiles showed
+  every step as skipped and "The operation could not be started". The bridge now accepts what the
+  package carries; past that the result is `response_too_large`, never "could not be started". A
+  result the bridge refuses names the check (`result_shape_invalid`, `result_output_too_large`, ...)
+  in its message and in a `consume_failed` record in `api.log`.
+- **A read-only Doctor runs beside a sync.** It was refused while a shell-runner run held the run
+  lock, with a message about changing profiles. Only `doctor --write-test` is still refused there,
+  in its own words.
+- **A Doctor with no report says why on every step**: `Not run: Doctor produced no report. Cause:
+  <code, exit code>: <first line>`, closed by a **Why Doctor produced no report** row.
+- **A refused dashboard change names its reason.** Its Activity row ends `reason=<code>` and, when the
+  request named one, `request_id=<id>` (the ID the error message shows), and reads the reason in
+  words; the error message is worded by the reason instead of "Request could not be completed". See
+  [A dashboard change was refused](dsm/troubleshooting.md#a-dashboard-change-was-refused-rejected-post).
+  Conflicting or queue-full refusals (409) are now also in `api.log`.
+- **An open page renews its mutation token before it expires**, and when its tab becomes visible
+  again, so the first change after five idle minutes is no longer refused. A replay after a refusal
+  the page could not read carries a fresh token instead of repeating the refused one.
+- **A page left open across an upgrade is told to reload.** Every request carries `X-SDSYNC-Build`;
+  a change from another build is refused as `ui_build_stale` with that advice. Pages loaded before
+  this release send no build and are refused the same way: reload them once after upgrading.
+- **Activity folds each run into one row** with its outcome and duration; warnings and errors are
+  always drawn, each fold opens, and **Show every event** draws every row as recorded.
+- **Routines say what observes them**: idle and watching via native events, polling or the schedule,
+  partly observed, or blind since a time with the cause. Blind and partly observed routines are amber
+  Overview items.
+- **A dashboard request can no longer hang the NAS's web server for most of an hour.** On DSM 7 each
+  request's CGI built its own TLS client for DSM's session check, and on a 3.10 kernel with a drained
+  entropy pool that client waited forever for randomness. The session check now runs in the package's
+  long-lived service with one client, and every CGI request is answered within 12 seconds (40 for a
+  change), at worst with a named `cgi_deadline_exceeded` that is recorded in `api.log`. See
+  [A dashboard request timed out](dsm/troubleshooting.md#a-dashboard-request-timed-out-cgi_deadline_exceeded).
+- **`config_file_unsafe` names the file and the check** (owner, mode, links, ...) on the page and in
+  `api.log`, a read that raced a writer is looked at again, and the page stops refreshing only after
+  three in a row.
+- **A slow read says the NAS is slow** ("did not answer within 10 seconds") instead of "confirm the
+  package is running", and no longer locks edits.
+- **The "Every second" status refresh is gone**; a saved one becomes 5 seconds.
+- **A damaged checksum index reads in plain words** (files were still compared in full; nothing to do),
+  with the library's message under **Technical detail**; a long detail keeps its file name. An index
+  this system cannot keep (`pair-index-unkeepable`) says so and when it is tried again.
+- **A file that keeps failing or changing names the file** and how many runs in a row.
+
 ## Read this before upgrading
 
 - **Rust 1.90 or newer is needed to build from source** (was 1.88). The verified-pair index uses redb

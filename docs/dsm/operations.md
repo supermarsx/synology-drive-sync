@@ -398,9 +398,11 @@ the whole-package refusal above applies, preceded — when the file exists — b
 `run.scope ignored: <cause> (<path>)` line.
 
 **Doctor** and a **resync plan** (no `--confirm`) only read, and take no management lock, so a save
-does not wait for them and they do not make a run refuse. Beside a shell-engine run they are still
-refused as before. A **Doctor write test** writes into the destination and keeps the management lock
-for its whole duration. An interactive `set-password` or `set-totp` reads the secret before it takes
+does not wait for them and they do not make a run refuse. A read-only Doctor is never refused beside
+a run of either engine; a resync plan beside a shell-engine run still is. A **Doctor write test**
+writes into the destination and keeps the management lock for its whole duration; beside a run whose
+scope cannot be attributed it is refused with exit `75` (`doctor --write-test is refused while PID …
+is planning/syncing: it writes into the destination the run is syncing`). An interactive `set-password` or `set-totp` reads the secret before it takes
 the lock, so a person typing no longer makes runs refuse.
 
 ### Verified-pair index status
@@ -661,7 +663,10 @@ service's own view of the package.
 
 Two codes belong to reads the service answers itself, without running the manager.
 `config_file_unsafe` means a package file failed the ownership, mode, link-count or size contract,
-and names a file to repair rather than a service to restart. `package_state_corrupt` means a
+and names a file to repair rather than a service to restart: the envelope carries `file` (its path
+under the package root, at most 160 bytes, the tail kept) and `check`, and the same pair is an
+`unsafe_file` record in `api.log`. A rename replacement, a read that came back a different length,
+and a file removed between listing and reading are looked at again before they count. `package_state_corrupt` means a
 package file was readable and holds a record the service cannot parse. Neither is ever a reason to
 retry the read through the manager instead: the manager checks less, so falling back would serve
 exactly the file the service had just refused.
@@ -835,7 +840,7 @@ already stored, so a save from the dashboard's alert form does not switch system
 | `authentication_failed` | warn | authentication | A dashboard authentication attempt was rejected |
 | `security_failed` | err | security | A request failed a CGI or runtime identity check |
 | `bridge_failed` | warn | bridge | A dashboard request could not be served |
-| `bridge_rejected` | warn | bridge | An unauthorized dashboard mutation was refused |
+| `bridge_rejected` | warn | bridge | An authenticated dashboard mutation was refused before it was queued; its Activity row names the reason |
 | `service_started` | info | lifecycle | The package service started |
 | `service_stopped` | info | lifecycle | The package service stopped |
 | `service_restarted` | info | lifecycle | The package service restarted |

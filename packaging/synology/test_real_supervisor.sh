@@ -20,6 +20,10 @@ authenticate_target=/usr/syno/synoman/webman/authenticate.cgi
 authenticate_helper_parent=$(dirname -- "$authenticate_helper")
 fixture_cookie=id=sdsync-fixture-session
 fixture_synology_token=sdsync-fixture%2B%2F%3D
+# The AppWindow build every request carries (DASHBOARD_BUILD in dsm_api.rs and
+# api.js; the packaging suite pins this copy to them). A mutation without it is
+# refused as ui_build_stale.
+dashboard_build=1
 package_auth_marker=/tmp/sdsync-auth.$package_uid
 user_service_marker=/tmp/sdsync-user-service.$package_uid
 user_service_port=18080
@@ -336,6 +340,7 @@ run_package_cgi_post() {
         CONTENT_TYPE=application/json \
         HTTP_TRANSFER_ENCODING= \
         HTTP_X_SDSYNC_CSRF='$request_csrf' \
+        HTTP_X_SDSYNC_BUILD=$dashboard_build \
         HTTP_COOKIE=$fixture_cookie \
         HTTP_X_SYNO_TOKEN=$fixture_synology_token \
         HTTP_X_SDSYNC_REQUEST=1 \

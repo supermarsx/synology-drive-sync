@@ -420,7 +420,9 @@ says so, and **Retry** re-arms it once the package is repaired.
 | `manager_exit_status` | The manager exited non-zero | Inspect `api.log`. Retried on a bounded ramp |
 | `manager_output_invalid` | Manager output was not JSON, not an object, or missing a required key | Inspect `api.log`. Retried on a bounded ramp |
 | `manager_output_schema` | The document's schema string is not the one this bundle expects | Repair or reinstall one complete release. Retried on a bounded ramp |
-| `config_file_unsafe` | A configuration or state file failed the ownership and mode contract | Repair the package rather than editing the file. **Not retried** |
+| `config_file_unsafe` | A configuration or state file failed its contract. The envelope and an `unsafe_file` record in `api.log` name the file (under the package root) and the check: `owner`, `mode` (not `0600`), `links` (a second hard link), `type` (a link or not a regular file), `size`, `length` (it changed length while read), `read`, `open` or `list` | Repair the package rather than editing the file. A read that changed length or failed is looked at again three times, 50 ms apart, before it counts; the page checks again twice and stops refreshing only after three in a row |
+| `client_timeout` | This window got no answer within 10 seconds (the NAS is busy, or a request is stuck) | Nothing; the page retries with backoff, and the first two in a row keep edits available |
+| `cgi_deadline_exceeded` | The package's CGI answered for a request at its deadline (see [A dashboard request timed out](#a-dashboard-request-timed-out-cgi_deadline_exceeded)) | Retried with backoff; the stage is in `api.log` |
 | `package_state_corrupt` | A stored package record could not be parsed; the Activity feed is where this surfaces today | Inspect Logs and Activity for the affected file. A restart does not repair it; the record clears when the file rotates or is cleared. **Not retried** |
 | `clock_unavailable` | The system clock reads before the epoch | Correct the NAS system time. **Not retried** |
 
@@ -463,6 +465,42 @@ state, or an unsafe package path.
 Use `status`, `paths`, the bounded logs above, and a Package Center Stop followed by Run. Do not chmod or chown the
 CGI/socket, add any identity-changing permission or capability, expose the socket, or hand-create
 the CSRF key.
+
+## A dashboard request timed out (`cgi_deadline_exceeded`)
+
+The package's CGI answers every request within 12 seconds for a read and 40 seconds for a change. A
+request still running then is answered with HTTP 503 `cgi_deadline_exceeded` and the stage it was in
+(`dsm_authentication`, `request`, `bridge_connect`, `bridge_io`, ...), and recorded in `api.log` and
+Activity. A `request_body_timeout` means a change's body stopped arriving; `response_write_timeout`
+means the web server stopped reading the answer. Before this release such a CGI could stay alive for
+most of an hour on a DSM 7 NAS with a drained entropy pool, because each one built a TLS client of
+its own; the service now makes that query with one client for its life.
+
+If they repeat: `cat /proc/sys/kernel/random/entropy_avail` (below 64 on a 3.x kernel means the pool
+is drained), the stage named in the record, and the `api.log` and `controller.log` lines at that time.
+
+## A dashboard change was refused (`rejected-post`)
+
+A change the package refused after DSM authentication, before anything was queued, is recorded as
+`audit.failed` and `module.failed` with the text `Module rejected-post failed [<transaction>]
+reason=<code>`, followed by `request_id=<id>` when the refused request named a well-formed client
+request ID. That ID is the one the dashboard's toast shows, so the two can be matched. Activity
+also shows the reason in words, and the toast is worded by the same code. Nothing was changed.
+
+| `reason=` | Meaning | What to do |
+| --- | --- | --- |
+| `csrf_rejected` | The mutation token was expired or belonged to another session | Select **Retry** and submit again. The page now replaces its token before it expires and when it becomes visible again, so this should follow only a session change |
+| `ui_build_stale` | The page was loaded from an older package version | Reload the app (close and reopen it, or refresh the browser tab) |
+| `forbidden` | The security policy does not allow this change | Review **Settings > Security** |
+| `invalid_request` | The request was malformed or does not match the installed package | Reload the app; if it repeats, collect `api.log` |
+| `conflict` | Another change with the same request ID, or a full queue | Wait for queued work to finish |
+| `payload_too_large` | The request was larger than the package accepts | Shorten the change |
+| `control_lock_busy`, `runtime_*`, `service_request_unavailable`, `unavailable`, `clock_unavailable` | The package could not accept work at that moment | See [Dashboard status is stale](#dashboard-status-is-stale-or-a-read-reports-a-named-in-service-failure) |
+| `internal_error` | The package failed internally before queueing it | Collect `api.log` |
+| `job_unreadable` | A queued request could not be read by the controller (`origin` controller) | Collect `controller.log` and `api.log` |
+| `unclassified` | A cause outside this list | The `cgi_failure` record in `api.log` at the same time names the exact code |
+
+Rows written before this release carry no `reason=`.
 
 ## A queued action remains pending or becomes outcome-unknown
 

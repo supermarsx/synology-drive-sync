@@ -105,6 +105,28 @@ const FAILED_CONTROLLER_CHILD_PATH: &str =
     "/var/packages/synology-drive-sync/var/run/failed-start.controller";
 const ADMINISTRATORS_GROUP: &str = "administrators";
 const RELAY_SCHEMA: &str = "sdsync.dsm-relay.v1";
+/// The dashboard build this bridge accepts mutations from, sent by every request of the AppWindow
+/// as `X-SDSYNC-Build` (`DASHBOARD_BUILD` in api.js; the UI suite compares the two).
+///
+/// A page stays open across a package upgrade, and the bundle in its memory is the old one: it
+/// can post an argument shape the new bridge refuses, which used to reach the operator as the
+/// constant "Request could not be completed." with nothing saying the page itself was stale. A
+/// mutation from any other build, or from a page that sends none (every build before this one), is
+/// refused as `ui_build_stale` before its token is even read, and the page says to reload.
+///
+/// Bump it with any change to the request contract: an operation, an argument, the request
+/// schema. The UI suite pins a digest of api.js's argument table to remind whoever changes it.
+const DASHBOARD_BUILD: &str = "1";
+/// A mutation from a page whose build is not [`DASHBOARD_BUILD`].
+const UI_BUILD_STALE: BridgeError = BridgeError::coded(ErrorKind::Conflict, "ui_build_stale");
+
+fn require_dashboard_build(build: Option<&str>) -> BridgeResult<()> {
+    if build == Some(DASHBOARD_BUILD) {
+        Ok(())
+    } else {
+        Err(UI_BUILD_STALE)
+    }
+}
 const CGI_ORIGIN_VARIABLES: &[&str] = &[
     "REQUEST_METHOD",
     "GATEWAY_INTERFACE",
@@ -115,6 +137,7 @@ const CGI_ORIGIN_VARIABLES: &[&str] = &[
     "HTTP_X_SDSYNC_REQUEST",
     "HTTP_X_SYNO_TOKEN",
     "HTTP_X_SDSYNC_CSRF",
+    "HTTP_X_SDSYNC_BUILD",
     "HTTP_TRANSFER_ENCODING",
     "HTTP_HOST",
     "REMOTE_ADDR",
@@ -173,6 +196,7 @@ const MAX_QUERY_BYTES: usize = 4 * 1024;
 const MAX_COOKIE_BYTES: usize = 16 * 1024;
 const MAX_TOKEN_BYTES: usize = 1024;
 const MAX_CSRF_BYTES: usize = 256;
+const MAX_BUILD_HEADER_BYTES: usize = 64;
 const MAX_POST_BODY_BYTES: usize = 64 * 1024;
 const MAX_JOB_BYTES: usize = 64 * 1024;
 const MAX_AUDIT_OUTBOX_BYTES: usize = 4 * 1024;
@@ -220,6 +244,23 @@ const CGI_SERVICE_CONNECT_WINDOW: Duration = Duration::from_secs(2);
 const CGI_SERVICE_RETRY_INTERVAL: Duration = Duration::from_millis(50);
 #[cfg(target_os = "linux")]
 const AUTH_HELPER_TIMEOUT: Duration = Duration::from_secs(5);
+/// How long the CGI waits for each part of a POST body. A body shorter than its Content-Length on
+/// a pipe that stays open used to hold the CGI forever.
+#[cfg(target_os = "linux")]
+const REQUEST_BODY_READ_TIMEOUT: Duration = Duration::from_secs(5);
+/// A POST body that stopped arriving.
+const REQUEST_BODY_TIMEOUT: BridgeError =
+    BridgeError::coded(ErrorKind::BadRequest, "request_body_timeout");
+/// The whole of one CGI request, after which the watchdog answers for it (`cgi_watchdog`). Reads
+/// get 12 s, two more than the dashboard waits for one, so the browser can still see the named
+/// answer; a POST gets 40 s, past the relay's 30 s and short of the dashboard's 45 s.
+#[cfg(target_os = "linux")]
+const CGI_READ_DEADLINE: Duration = Duration::from_secs(12);
+#[cfg(target_os = "linux")]
+const CGI_POST_DEADLINE: Duration = Duration::from_secs(40);
+/// How long writing the response may take before the CGI gives up on a reader that stopped.
+#[cfg(target_os = "linux")]
+const CGI_RESPONSE_WRITE_TIMEOUT: Duration = Duration::from_secs(2);
 #[cfg(target_os = "linux")]
 const READ_MANAGER_TIMEOUT: Duration = Duration::from_secs(20);
 #[cfg(target_os = "linux")]
@@ -1072,6 +1113,103 @@ impl CgiFailure {
     }
 }
 
+/// Which package file a request judged unsafe, and the check it failed.
+///
+/// `config_file_unsafe` used to collapse every cause -- a wrong owner, a wrong mode, a second hard
+/// link, a file that changed length while it was read, a read error -- into one code with no path,
+/// so four of them in a NAS's api.log could not be told apart or traced to a file. The reader that
+/// refuses a file names it here; the envelope and the api.log record for the request carry it. One
+/// per thread, because the service answers each request on one worker thread, and cleared when the
+/// thread takes the next request.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct UnsafeFile {
+    /// The path, relative to the package's roots where it is under one, bounded and with every
+    /// byte outside `[A-Za-z0-9._/-]` written as `_`.
+    file: String,
+    /// `open`, `type`, `owner`, `mode`, `links`, `size`, `length`, `read` or `list`.
+    check: &'static str,
+}
+
+thread_local! {
+    static UNSAFE_FILE: std::cell::RefCell<Option<UnsafeFile>> = const { std::cell::RefCell::new(None) };
+}
+
+const UNSAFE_FILE_CHECKS: [&str; 9] = [
+    "open", "type", "owner", "mode", "links", "size", "length", "read", "list",
+];
+const MAX_UNSAFE_FILE_BYTES: usize = 160;
+
+/// The bounded, shown form of a package path: its roots stripped, unsafe bytes replaced, and the
+/// tail kept when it is too long, because the file's own name is the part that identifies it.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn shown_package_path(path: &Path) -> String {
+    let text = path.to_string_lossy();
+    let mut relative: String = text.to_string();
+    if let Some(rest) = text.strip_prefix("/var/packages/synology-drive-sync/") {
+        relative = rest.to_owned();
+    } else if let Some(volume) = text.strip_prefix("/volume")
+        && let Some((digits, rest)) = volume.split_once('/')
+        && !digits.is_empty()
+        && digits.bytes().all(|byte| byte.is_ascii_digit())
+        && let Some((area, rest)) = rest.split_once("/synology-drive-sync/")
+        && matches!(area, "@apphome" | "@appdata" | "@appstore")
+    {
+        // DSM's physical package roots, behind the `home`, `var` and `target` symlinks.
+        relative = format!("{}/{rest}", &area[1..]);
+    }
+    let cleaned: String = relative
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '/' | '-') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>()
+        .replace("..", "__");
+    if cleaned.len() <= MAX_UNSAFE_FILE_BYTES {
+        cleaned
+    } else {
+        format!(
+            "...{}",
+            &cleaned[cleaned.len() - (MAX_UNSAFE_FILE_BYTES - 3)..]
+        )
+    }
+}
+
+/// Name the file this thread's request refused, and the check it failed. The first refusal wins:
+/// it is the one the request failed on.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn note_unsafe_file(path: &Path, check: &'static str) {
+    debug_assert!(UNSAFE_FILE_CHECKS.contains(&check));
+    UNSAFE_FILE.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        if slot.is_none() {
+            *slot = Some(UnsafeFile {
+                file: shown_package_path(path),
+                check,
+            });
+        }
+    });
+}
+
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn take_unsafe_file() -> Option<UnsafeFile> {
+    UNSAFE_FILE.with(|slot| slot.borrow_mut().take())
+}
+
+fn peek_unsafe_file() -> Option<UnsafeFile> {
+    UNSAFE_FILE.with(|slot| slot.borrow().clone())
+}
+
+/// A file a reader refused: `config_file_unsafe`, with the file and the check noted.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn unsafe_file(path: &Path, check: &'static str) -> BridgeError {
+    note_unsafe_file(path, check);
+    BridgeError::unsafe_because("config_file_unsafe")
+}
+
 /// A runtime marker under `var/run` is unreadable, mis-owned, or holds a value
 /// this service does not recognise. The service refuses to act on a lifecycle
 /// state it cannot verify, and says so rather than reporting a generic outage.
@@ -1158,6 +1296,7 @@ struct CgiEnvironment {
     request_marker: Option<String>,
     synology_token_header: Option<Zeroizing<String>>,
     csrf_header: Option<Zeroizing<String>>,
+    build_header: Option<String>,
     remote_address: Option<String>,
     server_address: Option<String>,
     server_name: Option<String>,
@@ -1253,6 +1392,7 @@ enum ValidatedHttpRequest {
     Post {
         content_length: usize,
         csrf_token: Zeroizing<String>,
+        build: Option<String>,
         authentication: AuthenticationInputs,
     },
 }
@@ -1279,6 +1419,10 @@ struct RelayRequestRef<'a> {
     request_marker: Option<&'a str>,
     synology_token_header: Option<&'a str>,
     csrf_header: Option<&'a str>,
+    // Absent from the document when the page sent none, so a relay between a CGI and a service of
+    // one release reads exactly as it did before the header existed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    build_header: Option<&'a str>,
     remote_address: Option<&'a str>,
     server_address: Option<&'a str>,
     server_name: Option<&'a str>,
@@ -1288,6 +1432,10 @@ struct RelayRequestRef<'a> {
     authenticated_username: &'a str,
     authenticated_uid: u32,
     session_binding: &'a str,
+    // Present (and true) only when the CGI could not run DSM's authenticate.cgi and leaves the
+    // session to the service's loopback query; see `encode_loopback_relay_request`.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    loopback_authentication: bool,
     body: Option<&'a str>,
 }
 
@@ -1303,6 +1451,8 @@ struct RelayRequest {
     request_marker: Option<String>,
     synology_token_header: Option<String>,
     csrf_header: Option<String>,
+    #[serde(default)]
+    build_header: Option<String>,
     remote_address: Option<String>,
     server_address: Option<String>,
     server_name: Option<String>,
@@ -1312,6 +1462,8 @@ struct RelayRequest {
     authenticated_username: String,
     authenticated_uid: u32,
     session_binding: String,
+    #[serde(default)]
+    loopback_authentication: bool,
     body: Option<String>,
 }
 
@@ -1332,6 +1484,7 @@ impl RelayRequest {
                 .csrf_header
                 .as_ref()
                 .map(|value| Zeroizing::new(value.clone())),
+            build_header: self.build_header.clone(),
             remote_address: self.remote_address.clone(),
             server_address: self.server_address.clone(),
             server_name: self.server_name.clone(),
@@ -1357,16 +1510,25 @@ impl RelayRequest {
             MAX_TOKEN_BYTES,
         )?;
         validate_optional_environment_value(self.csrf_header.as_deref(), MAX_CSRF_BYTES)?;
+        validate_optional_environment_value(self.build_header.as_deref(), MAX_BUILD_HEADER_BYTES)?;
         validate_optional_environment_value(self.remote_address.as_deref(), 128)?;
         validate_optional_environment_value(self.server_address.as_deref(), 128)?;
         validate_optional_environment_value(self.server_name.as_deref(), 255)?;
         validate_optional_environment_value(self.server_port.as_deref(), 8)?;
         validate_optional_environment_value(self.https.as_deref(), 16)?;
         validate_optional_environment_value(self.transfer_encoding.as_deref(), 64)?;
-        if !valid_authenticated_username(&self.authenticated_username)
-            || self.authenticated_uid == 0
-            || hex_decode_exact::<32>(&self.session_binding).is_none()
-        {
+        // A loopback request carries no identity at all: the service establishes it. Anything
+        // half-filled is malformed rather than trusted in part.
+        let identity_valid = if self.loopback_authentication {
+            self.authenticated_username.is_empty()
+                && self.authenticated_uid == 0
+                && self.session_binding.is_empty()
+        } else {
+            valid_authenticated_username(&self.authenticated_username)
+                && self.authenticated_uid != 0
+                && hex_decode_exact::<32>(&self.session_binding).is_some()
+        };
+        if !identity_valid {
             return Err(BridgeError::bad_request());
         }
         if self
@@ -1391,6 +1553,7 @@ impl Drop for RelayRequest {
         self.request_marker.zeroize();
         self.synology_token_header.zeroize();
         self.csrf_header.zeroize();
+        self.build_header.zeroize();
         self.remote_address.zeroize();
         self.server_address.zeroize();
         self.server_name.zeroize();
@@ -1424,10 +1587,38 @@ fn encode_relay_request(
     body: Option<&[u8]>,
     session: &AuthenticatedSession,
 ) -> BridgeResult<Zeroizing<Vec<u8>>> {
+    encode_relay_request_for(environment, body, Some(session))
+}
+
+/// A relay whose DSM session the service authenticates through the loopback user service.
+///
+/// On DSM 7 the package cannot execute `authenticate.cgi`, and the CGI used to make that loopback
+/// query itself, building a TLS client per request. A TLS client needs randomness; on the 3.10
+/// kernels DSM 7 still ships there is no `getrandom(2)`, so the first draw in every process waits
+/// in `poll(/dev/random, -1)` until the kernel's entropy count rises, and the client's `Drop`
+/// joins the thread that is waiting. Every dashboard request was a new process paying that wait,
+/// and on a drained pool CGIs hung for the better part of an hour. The service is one long-lived
+/// process with one client, so the wait is paid once per service life, and the CGI path needs no
+/// randomness at all. The service still checks the peer's UID, resolves the user through NSS and
+/// computes the session binding, exactly as for a relay the CGI authenticated.
+fn encode_loopback_relay_request(
+    environment: &CgiEnvironment,
+    body: Option<&[u8]>,
+) -> BridgeResult<Zeroizing<Vec<u8>>> {
+    encode_relay_request_for(environment, body, None)
+}
+
+fn encode_relay_request_for(
+    environment: &CgiEnvironment,
+    body: Option<&[u8]>,
+    session: Option<&AuthenticatedSession>,
+) -> BridgeResult<Zeroizing<Vec<u8>>> {
     let body = body
         .map(|bytes| std::str::from_utf8(bytes).map_err(|_| BridgeError::bad_request()))
         .transpose()?;
-    let session_binding = hex_encode(&session.binding);
+    let session_binding = session
+        .map(|session| hex_encode(&session.binding))
+        .unwrap_or_default();
     let request = RelayRequestRef {
         schema: RELAY_SCHEMA,
         method: &environment.method,
@@ -1441,15 +1632,17 @@ fn encode_relay_request(
             .as_ref()
             .map(|value| value.as_str()),
         csrf_header: environment.csrf_header.as_ref().map(|value| value.as_str()),
+        build_header: environment.build_header.as_deref(),
         remote_address: environment.remote_address.as_deref(),
         server_address: environment.server_address.as_deref(),
         server_name: environment.server_name.as_deref(),
         server_port: environment.server_port.as_deref(),
         https: environment.https.as_deref(),
         transfer_encoding: environment.transfer_encoding.as_deref(),
-        authenticated_username: &session.username,
-        authenticated_uid: session.uid,
+        authenticated_username: session.map_or("", |session| session.username.as_str()),
+        authenticated_uid: session.map_or(0, |session| session.uid),
         session_binding: &session_binding,
+        loopback_authentication: session.is_none(),
         body,
     };
     let encoded = serde_json::to_vec(&request).map_err(|_| BridgeError::internal())?;
@@ -2391,6 +2584,7 @@ fn process_environment() -> BridgeResult<CgiEnvironment> {
         request_marker: optional("HTTP_X_SDSYNC_REQUEST", 8)?,
         synology_token_header: optional("HTTP_X_SYNO_TOKEN", MAX_TOKEN_BYTES)?.map(Zeroizing::new),
         csrf_header: optional("HTTP_X_SDSYNC_CSRF", MAX_CSRF_BYTES)?.map(Zeroizing::new),
+        build_header: optional("HTTP_X_SDSYNC_BUILD", MAX_BUILD_HEADER_BYTES)?,
         remote_address: optional("REMOTE_ADDR", 128)?,
         server_address: optional("SERVER_ADDR", 128)?,
         server_name: optional("SERVER_NAME", 255)?,
@@ -2495,6 +2689,10 @@ fn validate_http_request(mut environment: CgiEnvironment) -> BridgeResult<Valida
             Ok(ValidatedHttpRequest::Post {
                 content_length,
                 csrf_token,
+                build: environment
+                    .build_header
+                    .take()
+                    .filter(|value| !value.is_empty()),
                 authentication,
             })
         }
@@ -3003,9 +3201,13 @@ fn read_exact_body(
     }
     let mut body = Zeroizing::new(Vec::with_capacity(content_length));
     let mut limited = reader.take((content_length + 1) as u64);
-    limited
-        .read_to_end(&mut body)
-        .map_err(|_| BridgeError::bad_request())?;
+    limited.read_to_end(&mut body).map_err(|error| {
+        if error.kind() == io::ErrorKind::TimedOut {
+            REQUEST_BODY_TIMEOUT
+        } else {
+            BridgeError::bad_request()
+        }
+    })?;
     if body.len() != content_length {
         return Err(BridgeError::bad_request());
     }
@@ -4726,16 +4928,65 @@ mod linux_runtime {
         }
     }
 
-    pub(super) fn authenticate_and_authorize_cgi(
+    /// The CGI's stdin, read with a bound on every wait for more of the body.
+    pub(super) struct PolledStdin {
+        timeout: Duration,
+    }
+
+    impl PolledStdin {
+        pub(super) fn new(timeout: Duration) -> Self {
+            Self { timeout }
+        }
+    }
+
+    impl Read for PolledStdin {
+        fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+            let mut poll = libc::pollfd {
+                fd: libc::STDIN_FILENO,
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            let millis =
+                libc::c_int::try_from(self.timeout.as_millis()).unwrap_or(libc::c_int::MAX);
+            loop {
+                // SAFETY: one live pollfd for the duration of the call.
+                let ready = unsafe { libc::poll(&mut poll, 1, millis) };
+                if ready < 0 {
+                    let error = io::Error::last_os_error();
+                    if error.kind() == io::ErrorKind::Interrupted {
+                        continue;
+                    }
+                    return Err(error);
+                }
+                if ready == 0 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "request body stopped arriving",
+                    ));
+                }
+                break;
+            }
+            // SAFETY: `buffer` is a live, writable slice of its own length.
+            let read =
+                unsafe { libc::read(libc::STDIN_FILENO, buffer.as_mut_ptr().cast(), buffer.len()) };
+            if read < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(read as usize)
+        }
+    }
+
+    /// The CGI's half of authentication: run DSM's authenticate.cgi when this process may, or
+    /// `None` when it may not, leaving the session to the service's loopback query
+    /// ([`authenticate_relayed_via_dsm_user_service`]). The CGI never builds a TLS client.
+    pub(super) fn authenticate_or_defer_cgi(
         inputs: &AuthenticationInputs,
         timeout: Duration,
-    ) -> Result<AuthenticatedSession, CgiFailure> {
+    ) -> Result<Option<AuthenticatedSession>, CgiFailure> {
         let helper = match select_authentication_helper(probe_caller_execute, |path| {
             validate_dsm_authentication_helper(path)
         })? {
-            AuthenticationHelperSelection::Loopback => {
-                return authenticate_via_dsm_user_service(inputs, timeout);
-            }
+            AuthenticationHelperSelection::Loopback => return Ok(None),
             AuthenticationHelperSelection::Direct(helper) => helper,
         };
         let mut command = Command::new(&helper.path);
@@ -4771,13 +5022,15 @@ mod linux_runtime {
             &output.stdout,
             inputs.native_context.http_host.as_deref(),
         )?;
-        authorize_authenticated_username(username, inputs).map_err(|error| {
-            CgiFailure::coded(
-                CgiFailureStage::Authentication,
-                error,
-                "dsm_authentication_forbidden",
-            )
-        })
+        authorize_authenticated_username(username, inputs)
+            .map(Some)
+            .map_err(|error| {
+                CgiFailure::coded(
+                    CgiFailureStage::Authentication,
+                    error,
+                    "dsm_authentication_forbidden",
+                )
+            })
     }
 
     pub(super) fn authenticated_helper_username(
@@ -4801,7 +5054,8 @@ mod linux_runtime {
         })
     }
 
-    fn authenticate_via_dsm_user_service(
+    /// The service's half: authenticate a relayed DSM session through the loopback user service.
+    pub(super) fn authenticate_relayed_via_dsm_user_service(
         inputs: &AuthenticationInputs,
         timeout: Duration,
     ) -> Result<AuthenticatedSession, CgiFailure> {
@@ -4931,6 +5185,44 @@ mod linux_runtime {
         is_admin: bool,
     }
 
+    /// The one loopback client this process keeps.
+    ///
+    /// Built once and never dropped: a `reqwest::blocking::Client` owns a runtime thread, and its
+    /// `Drop` joins that thread, so a client per request made every request wait for whatever the
+    /// thread was waiting on -- on a 3.10 kernel, `poll(/dev/random)` for the first random draw.
+    /// Kept, the client's thread pays that wait once per process; each request is still bounded by
+    /// its own timeout, because nothing waits on a drop. No connection is kept idle: the reuse is
+    /// of the runtime, the TLS configuration and the RNG state, not of a socket DSM may close.
+    ///
+    /// Through the workspace choke point rather than building a reqwest client directly: under
+    /// `rustls-no-provider` a client built without an installed provider panics on reqwest's
+    /// internal runtime thread instead of returning an error.
+    fn loopback_client() -> BridgeResult<reqwest::blocking::Client> {
+        static CLIENT: Mutex<Option<reqwest::blocking::Client>> = Mutex::new(None);
+        let mut held = CLIENT
+            .lock()
+            .map_err(|_| BridgeError::unavailable_because("loopback_client_poisoned"))?;
+        if let Some(client) = held.as_ref() {
+            return Ok(client.clone());
+        }
+        let client = synology_drive_sync::blocking_client_builder()
+            .map_err(|_| BridgeError::new(ErrorKind::Unavailable))?
+            .no_proxy()
+            .redirect(Policy::none())
+            .http1_only()
+            .pool_max_idle_per_host(0)
+            .connect_timeout(AUTH_HELPER_TIMEOUT)
+            // DSM commonly uses a user-selected or self-signed certificate.
+            // The peer is still pinned to the IPv4 loopback literal the URL
+            // names; no hostname, proxy, redirect, or remote address is
+            // accepted. Over plain HTTP the setting has nothing to act on.
+            .danger_accept_invalid_certs(true)
+            .build()
+            .map_err(|_| BridgeError::new(ErrorKind::Unavailable))?;
+        *held = Some(client.clone());
+        Ok(client)
+    }
+
     pub(super) fn query_dsm_user_service(
         inputs: &AuthenticationInputs,
         timeout: Duration,
@@ -4955,30 +5247,13 @@ mod linux_runtime {
         let url = format!(
             "{scheme}://127.0.0.1:{port}{DSM_USER_SERVICE_PATH}?api={DSM_USER_SERVICE_API}&version=1&method=get_user_service"
         );
-        // Through the workspace choke point rather than building a reqwest
-        // client here: this is the DSM package's own API server, and under
-        // `rustls-no-provider` a client built without an installed provider
-        // panics on reqwest's internal runtime thread instead of returning an
-        // error. This path is why the choke point exists -- it reaches TLS
-        // without going through ApiClient at all.
-        let client = synology_drive_sync::blocking_client_builder()
-            .map_err(|_| BridgeError::new(ErrorKind::Unavailable))?
-            .no_proxy()
-            .redirect(Policy::none())
-            .http1_only()
-            .connect_timeout(timeout)
-            .timeout(timeout)
-            // DSM commonly uses a user-selected or self-signed certificate.
-            // The peer is still pinned to the IPv4 loopback literal above;
-            // no hostname, proxy, redirect, or remote address is accepted.
-            .danger_accept_invalid_certs(https)
-            .build()
-            .map_err(|_| BridgeError::new(ErrorKind::Unavailable))?;
+        let client = loopback_client()?;
         let mut cookie = HeaderValue::from_str(inputs.cookie.as_str())
             .map_err(|_| BridgeError::new(ErrorKind::Unauthorized))?;
         cookie.set_sensitive(true);
         let mut request = client
             .get(&url)
+            .timeout(timeout)
             .header(ACCEPT, "application/json")
             .header(COOKIE, cookie);
         if let Some(token) = &inputs.synology_token {
@@ -7134,7 +7409,32 @@ mod linux_process {
         }
         // Fall back to the direct child if the group disappeared or changed.
         let _ = child.kill();
-        let _ = child.wait();
+        // SIGKILL is not instant for a process in uninterruptible I/O, and an unbounded wait
+        // here held the request (and, on the CGI's Direct branch, the CGI) for as long as the
+        // kernel did. Reap within two seconds or abandon it, and say so.
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            match child.try_wait() {
+                Ok(Some(_)) => return,
+                Ok(None) if Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                Ok(None) => {
+                    eprintln!(
+                        "sdsync-dsm-api: manager_unkillable pid={} did not exit within 2 s of SIGKILL; abandoned",
+                        child.id()
+                    );
+                    return;
+                }
+                Err(error) => {
+                    eprintln!(
+                        "sdsync-dsm-api: manager_unkillable pid={} could not be reaped: {error}",
+                        child.id()
+                    );
+                    return;
+                }
+            }
+        }
     }
 
     fn terminate_queued_process_group(
@@ -8062,26 +8362,56 @@ fn parse_manager_result(bytes: &[u8], exact_secret: Option<&[u8]>) -> BridgeResu
     parse_manager_result_for_operation(bytes, exact_secret, None)
 }
 
+/// The most text a manager's action result may carry in `output`.
+///
+/// Doctor is the action that needs it: the shell keeps up to 327,680 bytes of its NDJSON
+/// (`api_capture` in `sdsync-dsm`, truncation marker included) so that a multi-profile run keeps
+/// every record whole. This cap used to be the 65,536 bytes every other text field gets, so a
+/// Doctor over all profiles that the shell had carefully bounded was refused here and reached the
+/// dashboard as "could not be started" with no report at all. The two caps are pinned together by
+/// the packaging suite (the shell's must never exceed this one). Every other action's output is
+/// bounded at 65,536 bytes by the shell, so this widens nothing they can send.
+const MAX_ACTION_OUTPUT_BYTES: usize = 327_680;
+
+// Why a manager's result was refused. Each validation names itself, so the api.log record a
+// consume failure leaves says which check failed rather than only that one did; the kind, and
+// with it every caller's branch, is unchanged.
+/// Empty, larger than the manager output ceiling, or not JSON.
+const RESULT_UNREADABLE: BridgeError = BridgeError::unavailable_because("result_unreadable");
+/// A key or value that must never leave the package.
+const RESULT_SENSITIVE: BridgeError = BridgeError::unavailable_because("result_sensitive_value");
+/// Not a `sdsync.dsm-result.v1` document of a known shape.
+const RESULT_SHAPE_INVALID: BridgeError = BridgeError::unavailable_because("result_shape_invalid");
+/// A failure code outside the published vocabulary.
+const RESULT_CODE_UNKNOWN: BridgeError = BridgeError::unavailable_because("result_code_unknown");
+/// An action result whose status, scope, output or exit code is malformed.
+const RESULT_ACTION_INVALID: BridgeError =
+    BridgeError::unavailable_because("result_action_invalid");
+/// An action result whose `output` exceeds [`MAX_ACTION_OUTPUT_BYTES`]. Its own kind, so the
+/// terminal result says the output was too large instead of that the operation never started.
+const RESULT_OUTPUT_TOO_LARGE: BridgeError =
+    BridgeError::coded(ErrorKind::PayloadTooLarge, "result_output_too_large");
+/// The result's `ok` disagrees with the manager's exit status.
+const RESULT_EXIT_MISMATCH: BridgeError = BridgeError::unavailable_because("result_exit_mismatch");
+
 fn parse_manager_result_for_operation(
     bytes: &[u8],
     exact_secret: Option<&[u8]>,
     operation: Option<&str>,
 ) -> BridgeResult<Value> {
     if bytes.is_empty() || bytes.len() > MAX_MANAGER_OUTPUT_BYTES {
-        return Err(BridgeError::new(ErrorKind::Unavailable));
+        return Err(RESULT_UNREADABLE);
     }
-    let value: Value =
-        serde_json::from_slice(bytes).map_err(|_| BridgeError::new(ErrorKind::Unavailable))?;
+    let value: Value = serde_json::from_slice(bytes).map_err(|_| RESULT_UNREADABLE)?;
     if json_contains_sensitive_value(&value, exact_secret) {
-        return Err(BridgeError::new(ErrorKind::Unavailable));
+        return Err(RESULT_SENSITIVE);
     }
     if matches!(operation, Some("test-profile-auth" | "browse-remote")) {
-        validate_connection_manager_result(&value, operation.unwrap())?;
+        validate_connection_manager_result(&value, operation.unwrap())
+            .map_err(|_| RESULT_SHAPE_INVALID)?;
         return Ok(value);
     }
-    let root = value
-        .as_object()
-        .ok_or_else(|| BridgeError::new(ErrorKind::Unavailable))?;
+    let root = value.as_object().ok_or(RESULT_SHAPE_INVALID)?;
     const ALLOWED_FIELDS: &[&str] = &[
         "schema",
         "ok",
@@ -8103,23 +8433,23 @@ fn parse_manager_result_for_operation(
         .any(|key| !ALLOWED_FIELDS.contains(&key.as_str()))
         || root.get("schema").and_then(Value::as_str) != Some("sdsync.dsm-result.v1")
     {
-        return Err(BridgeError::new(ErrorKind::Unavailable));
+        return Err(RESULT_SHAPE_INVALID);
     }
-    validate_result_warnings(root)?;
+    validate_result_warnings(root).map_err(|_| RESULT_SHAPE_INVALID)?;
     let ok = root
         .get("ok")
         .and_then(Value::as_bool)
-        .ok_or_else(|| BridgeError::new(ErrorKind::Unavailable))?;
+        .ok_or(RESULT_SHAPE_INVALID)?;
     let message = root
         .get("message")
         .and_then(Value::as_str)
-        .ok_or_else(|| BridgeError::new(ErrorKind::Unavailable))?;
-    validate_result_text(message, 65_536)?;
+        .ok_or(RESULT_SHAPE_INVALID)?;
+    validate_result_text(message, 65_536).map_err(|_| RESULT_SHAPE_INVALID)?;
 
     let code = root.get("code");
     if ok {
         if code.is_some() {
-            return Err(BridgeError::new(ErrorKind::Unavailable));
+            return Err(RESULT_SHAPE_INVALID);
         }
     } else {
         let code = code
@@ -8141,8 +8471,8 @@ fn parse_manager_result_for_operation(
                         | "operation_failed"
                 ) || is_package_failure_code(code)
             })
-            .ok_or_else(|| BridgeError::new(ErrorKind::Unavailable))?;
-        validate_result_text(code, 32)?;
+            .ok_or(RESULT_CODE_UNKNOWN)?;
+        validate_result_text(code, 32).map_err(|_| RESULT_CODE_UNKNOWN)?;
     }
 
     let has_action_fields = ["status", "scope", "output"]
@@ -8153,33 +8483,36 @@ fn parse_manager_result_for_operation(
             .iter()
             .all(|field| root.contains_key(*field))
         {
-            return Err(BridgeError::new(ErrorKind::Unavailable));
+            return Err(RESULT_ACTION_INVALID);
         }
         let status = root
             .get("status")
             .and_then(Value::as_str)
-            .ok_or_else(|| BridgeError::new(ErrorKind::Unavailable))?;
+            .ok_or(RESULT_ACTION_INVALID)?;
         if !matches!((ok, status), (true, "succeeded") | (false, "failed")) {
-            return Err(BridgeError::new(ErrorKind::Unavailable));
+            return Err(RESULT_ACTION_INVALID);
         }
         let scope = root
             .get("scope")
             .and_then(Value::as_str)
-            .ok_or_else(|| BridgeError::new(ErrorKind::Unavailable))?;
+            .ok_or(RESULT_ACTION_INVALID)?;
         if scope != "all" && validate_existing_name(scope).is_err() {
-            return Err(BridgeError::new(ErrorKind::Unavailable));
+            return Err(RESULT_ACTION_INVALID);
         }
         let output = root
             .get("output")
             .and_then(Value::as_str)
-            .ok_or_else(|| BridgeError::new(ErrorKind::Unavailable))?;
-        validate_result_text(output, 65_536)?;
+            .ok_or(RESULT_ACTION_INVALID)?;
+        if output.len() > MAX_ACTION_OUTPUT_BYTES {
+            return Err(RESULT_OUTPUT_TOO_LARGE);
+        }
+        validate_result_text(output, MAX_ACTION_OUTPUT_BYTES).map_err(|_| RESULT_ACTION_INVALID)?;
     }
 
     if let Some(exit_code) = root.get("exit_code")
         && exit_code.as_u64().is_none_or(|code| code > 255)
     {
-        return Err(BridgeError::new(ErrorKind::Unavailable));
+        return Err(RESULT_ACTION_INVALID);
     }
 
     let presence_fields = ["has_password", "has_totp", "has_remote_log_token"];
@@ -8194,7 +8527,7 @@ fn parse_manager_result_for_operation(
                 .iter()
                 .any(|field| root.get(*field).and_then(Value::as_bool).is_none()))
     {
-        return Err(BridgeError::new(ErrorKind::Unavailable));
+        return Err(RESULT_SHAPE_INVALID);
     }
     Ok(value)
 }
@@ -8580,8 +8913,11 @@ fn parse_queued_response(
     }
     let session_binding =
         hex_decode_exact::<32>(response.session_binding).ok_or(STORED_RESULT_INVALID)?;
+    // A stored record keeps the plain kind it always had: which check refused it is the
+    // consumer's diagnosis (api.log, at write time), not something a poll can act on.
     let result =
-        parse_manager_result_for_operation(response.result.get().as_bytes(), None, operation)?;
+        parse_manager_result_for_operation(response.result.get().as_bytes(), None, operation)
+            .map_err(|_| BridgeError::new(ErrorKind::Unavailable))?;
     let expected_terminal = if result.get("ok").and_then(Value::as_bool) == Some(true) {
         "succeeded"
     } else {
@@ -8872,6 +9208,26 @@ fn consume_failure_result_value(kind: ErrorKind) -> Value {
     })
 }
 
+/// As [`consume_failure_result_value`], for the error itself.
+///
+/// The code stays the kind's: it is the vocabulary every validator and the dashboard already
+/// know. Only the sentence changes, and only where the kind's own sentence would be false. A
+/// result the manager produced and this bridge refused is `Unavailable`, whose sentence says the
+/// operation could not be started -- but it ran, so saying so sent operators looking for a
+/// scheduling problem. The named check travels in the sentence and, in full, in api.log
+/// ([`record_consume_failure`]).
+fn consume_failure_result_for_error(error: BridgeError) -> Value {
+    let mut value = consume_failure_result_value(error.kind);
+    if error.kind == ErrorKind::Unavailable
+        && let Some(cause) = error.code.filter(|code| code.starts_with("result_"))
+    {
+        value["message"] = json!(format!(
+            "The operation ran, but the package refused its result ({cause}). The cause is recorded in api.log."
+        ));
+    }
+    value
+}
+
 struct TerminalizedConsumeResult {
     value: Value,
     #[cfg_attr(not(test), allow(dead_code))]
@@ -8897,7 +9253,7 @@ where
         }
         // The kind was previously discarded here, which is what made every consume failure look
         // identical to an operator. It is the only thing this path knows about the cause.
-        Err(error) => (consume_failure_result_value(error.kind), "failed"),
+        Err(error) => (consume_failure_result_for_error(error), "failed"),
     };
     let audit_pending = record_terminal(state).unwrap_or(true);
     TerminalizedConsumeResult {
@@ -9014,9 +9370,101 @@ fn record_controller_wake_failure() {
     );
 }
 
+/// The reasons a rejected mutation's audit record may name.
+///
+/// A closed list, and the same list `sdsync-dsm api audit-rejected` accepts (the packaging suite
+/// compares the two), because the reason travels through the shell into an Activity row and the
+/// durable-record verifier: a code one side knows and the other does not would turn the record of
+/// a refusal into a refusal to record it. A code outside the list is `unclassified` here, and its
+/// exact spelling is still in the api.log record the same rejection writes.
+const REJECTED_POST_REASONS: [&str; 20] = [
+    "invalid_request",
+    "unauthorized",
+    "forbidden",
+    "csrf_rejected",
+    "ui_build_stale",
+    "method_not_allowed",
+    "unsupported_media_type",
+    "payload_too_large",
+    "conflict",
+    "internal_error",
+    "unavailable",
+    "service_request_unavailable",
+    "control_lock_busy",
+    "runtime_closed",
+    "runtime_upgrading",
+    "runtime_uninstalling",
+    "runtime_marker_unsafe",
+    "clock_unavailable",
+    "job_unreadable",
+    "unclassified",
+];
+
+/// The reason an audited rejection names: the code its error envelope and api.log record carry,
+/// when that code is in [`REJECTED_POST_REASONS`].
+fn rejected_post_reason(error: BridgeError) -> &'static str {
+    let code = resolved_error_code(error, Some(CgiFailureStage::ServiceRequest), None);
+    REJECTED_POST_REASONS
+        .into_iter()
+        .find(|reason| *reason == code)
+        .unwrap_or("unclassified")
+}
+
+/// The client request ID a refused POST body names, when it names a well-formed one.
+///
+/// Read without the rest of the request's contract, because the refusal may be that contract
+/// failing; only the ID's own grammar is required. It goes into the Activity row's trailing tag
+/// and nowhere else -- never into the audit record, whose verifier requires a rejected record to
+/// carry none -- so that the dashboard's advice to match a request ID in Activity can be followed.
+fn rejected_post_request_id(body: Option<&[u8]>) -> Option<String> {
+    #[derive(Deserialize)]
+    struct NamedRequest<'a> {
+        #[serde(borrow, default)]
+        request_id: Option<&'a str>,
+    }
+    let named: NamedRequest<'_> = serde_json::from_slice(body?).ok()?;
+    named
+        .request_id
+        .filter(|value| valid_client_request_id(value))
+        .map(str::to_owned)
+}
+
+/// The text a rejected mutation's Activity row carries after `Module rejected-post failed [<tx>]`:
+/// ` reason=<code>`, then ` request_id=<id>` when the refused body named one. The request tag is
+/// last because Activity readers take a message's trailing ` request_id=` as its correlation ID.
+/// `None` without a reason; a reason outside [`REJECTED_POST_REASONS`] or a malformed ID is refused.
+fn rejected_post_activity_tag(
+    reason: Option<&str>,
+    request_id: Option<&str>,
+) -> BridgeResult<Option<String>> {
+    let Some(reason) = reason else {
+        return if request_id.is_some() {
+            Err(BridgeError::bad_request())
+        } else {
+            Ok(None)
+        };
+    };
+    if !REJECTED_POST_REASONS.contains(&reason)
+        || request_id.is_some_and(|value| !valid_client_request_id(value))
+    {
+        return Err(BridgeError::bad_request());
+    }
+    let mut tag = format!(" reason={reason}");
+    if let Some(request_id) = request_id {
+        tag.push_str(" request_id=");
+        tag.push_str(request_id);
+    }
+    Ok(Some(tag))
+}
+
 #[cfg(target_os = "linux")]
-fn record_rejected_post(audit_actor: &str, audit_actor_uid: u32) -> BridgeResult<()> {
-    record_rejected_operation(audit_actor, audit_actor_uid, "bridge")
+fn record_rejected_post(
+    audit_actor: &str,
+    audit_actor_uid: u32,
+    reason: &'static str,
+    request_id: Option<&str>,
+) -> BridgeResult<()> {
+    record_rejected_operation(audit_actor, audit_actor_uid, "bridge", reason, request_id)
 }
 
 #[cfg(target_os = "linux")]
@@ -9024,6 +9472,8 @@ fn record_rejected_operation(
     audit_actor: &str,
     audit_actor_uid: u32,
     origin: &str,
+    reason: &'static str,
+    request_id: Option<&str>,
 ) -> BridgeResult<()> {
     if !valid_authenticated_username(audit_actor) || audit_actor_uid == 0 {
         return Err(BridgeError::new(ErrorKind::Forbidden));
@@ -9031,10 +9481,19 @@ fn record_rejected_operation(
     if !matches!(origin, "bridge" | "controller") {
         return Err(BridgeError::new(ErrorKind::Forbidden));
     }
+    if !REJECTED_POST_REASONS.contains(&reason)
+        || request_id.is_some_and(|value| !valid_client_request_id(value))
+    {
+        return Err(BridgeError::internal());
+    }
     let mut command = manager_command(&["api".into(), "audit-rejected".into()], false)?;
     command.env("SDSYNC_DSM_AUDIT_ACTOR", audit_actor);
     command.env("SDSYNC_DSM_AUDIT_ACTOR_UID", audit_actor_uid.to_string());
     command.env("SDSYNC_DSM_AUDIT_ORIGIN", origin);
+    command.env("SDSYNC_DSM_AUDIT_REASON", reason);
+    if let Some(request_id) = request_id {
+        command.env("SDSYNC_DSM_REJECTED_REQUEST_ID", request_id);
+    }
     let output = capture_bounded_command(
         &mut command,
         MAX_MANAGER_OUTPUT_BYTES,
@@ -9478,7 +9937,9 @@ mod linux_files {
             return Ok(false);
         }
         if now == 0
-            || !matches!(status, 400 | 401 | 403 | 405 | 413 | 415 | 500 | 503)
+            // 409 is a refused mutation (a conflicting request ID, a full queue, a stale page):
+            // without it those refusals named their reason in Activity and nowhere else.
+            || !matches!(status, 400 | 401 | 403 | 405 | 409 | 413 | 415 | 500 | 503)
             || !matches!(
                 stage,
                 "request"
@@ -9856,25 +10317,51 @@ mod linux_files {
         }
     }
 
+    /// `rejection_tag` is what a rejected mutation's Activity row carries after its fixed text
+    /// (` reason=<code>` and, when the refused body named one, ` request_id=<id>`); see
+    /// [`rejected_post_activity_tag`].
     pub(super) fn durably_verify_audit_event(
         expected: &AuditOutboxRecord,
         expected_state: &str,
         package_uid: u32,
+        rejection_tag: Option<&str>,
     ) -> BridgeResult<()> {
-        durably_verify_audit_event_at(
+        durably_verify_tagged_audit_event_at(
             expected,
             expected_state,
             package_uid,
+            rejection_tag,
             Path::new(LOG_ROOT),
             Path::new(AUDIT_LOG_PATH),
             Path::new(ACTIVITY_LOG_PATH),
         )
     }
 
+    #[cfg(test)]
     pub(super) fn durably_verify_audit_event_at(
         expected: &AuditOutboxRecord,
         expected_state: &str,
         package_uid: u32,
+        log_root: &Path,
+        audit_log: &Path,
+        activity_log: &Path,
+    ) -> BridgeResult<()> {
+        durably_verify_tagged_audit_event_at(
+            expected,
+            expected_state,
+            package_uid,
+            None,
+            log_root,
+            audit_log,
+            activity_log,
+        )
+    }
+
+    pub(super) fn durably_verify_tagged_audit_event_at(
+        expected: &AuditOutboxRecord,
+        expected_state: &str,
+        package_uid: u32,
+        rejection_tag: Option<&str>,
         log_root: &Path,
         audit_log: &Path,
         activity_log: &Path,
@@ -9938,6 +10425,12 @@ mod linux_files {
             expected_message.push_str(" request_id=");
             expected_message.push_str(client_request_id);
         }
+        // A rejected mutation's row names its reason. The untagged text is accepted beside it so
+        // that a manager whose writer predates the tag still has its refusals proven rather than
+        // failed; the tag can only ever be the exact one this rejection carries.
+        let tagged_message = rejection_tag
+            .filter(|_| expected.operation == "rejected-post")
+            .map(|tag| format!("{expected_message}{tag}"));
         let mut activity_found = false;
         for path in rotating_log_paths(activity_log, 3) {
             let Some((file, bytes)) =
@@ -9986,7 +10479,8 @@ mod linux_files {
                                 || fields[4] != "audit"
                                 || actor_uid != expected.actor_uid
                                 || fields[7] != expected.actor
-                                || fields[8] != expected_message
+                                || (fields[8] != expected_message
+                                    && tagged_message.as_deref() != Some(fields[8]))
                             {
                                 return Err(BridgeError::unsafe_runtime());
                             }
@@ -10267,6 +10761,7 @@ mod linux_files {
             match open_private_log_file(&path, package_uid, MAX_ACTIVITY_LOG_BYTES, true) {
                 Ok(Some((_, bytes))) => history.push(bytes),
                 Ok(None) => {}
+                // The reader already named the file and the check.
                 Err(_) => return Err(BridgeError::unsafe_because("config_file_unsafe")),
             }
         }
@@ -10295,20 +10790,15 @@ mod linux_files {
         options.read(true).custom_flags(NOFOLLOW_CLOEXEC);
         let file = options
             .open(oldest)
-            .map_err(|_| BridgeError::unsafe_because("config_file_unsafe"))?;
-        let metadata = file
-            .metadata()
-            .map_err(|_| BridgeError::unsafe_because("config_file_unsafe"))?;
-        if !metadata.file_type().is_file()
-            || metadata.st_uid() != package_uid
-            || metadata.st_mode() & 0o7777 != 0o600
-        {
-            return Err(BridgeError::unsafe_because("config_file_unsafe"));
+            .map_err(|_| unsafe_file(oldest, "open"))?;
+        let metadata = file.metadata().map_err(|_| unsafe_file(oldest, "read"))?;
+        if let Some(check) = private_file_check(&metadata, package_uid, false) {
+            return Err(unsafe_file(oldest, check));
         }
         let mut head = Vec::with_capacity(32);
         file.take(32)
             .read_to_end(&mut head)
-            .map_err(|_| BridgeError::unsafe_because("config_file_unsafe"))?;
+            .map_err(|_| unsafe_file(oldest, "read"))?;
         let epoch = head
             .split(|byte| *byte == b'|')
             .next()
@@ -10345,12 +10835,8 @@ mod linux_files {
         let Ok(metadata) = fs::symlink_metadata(path) else {
             return Ok(false);
         };
-        if !metadata.file_type().is_file()
-            || metadata.st_uid() != package_uid
-            || metadata.st_mode() & 0o7777 != 0o600
-            || metadata.st_nlink() != 1
-        {
-            return Err(BridgeError::unsafe_because("config_file_unsafe"));
+        if let Some(check) = private_file_check(&metadata, package_uid, true) {
+            return Err(unsafe_file(path, check));
         }
         Ok(true)
     }
@@ -10365,22 +10851,25 @@ mod linux_files {
     ) -> BridgeResult<Option<(File, u64)>> {
         let mut options = OpenOptions::new();
         options.read(true).custom_flags(NOFOLLOW_CLOEXEC);
-        let file = match options.open(path) {
-            Ok(file) => file,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
-            Err(_) => return Err(BridgeError::unsafe_because("config_file_unsafe")),
-        };
-        let metadata = file
-            .metadata()
-            .map_err(|_| BridgeError::unsafe_because("config_file_unsafe"))?;
-        if !metadata.file_type().is_file()
-            || metadata.st_uid() != package_uid
-            || metadata.st_mode() & 0o7777 != 0o600
-            || metadata.st_nlink() != 1
-        {
-            return Err(BridgeError::unsafe_because("config_file_unsafe"));
+        // The same second look as a document read: a log rotated over (`mv .2 .3`) while it is
+        // opened reaches `fstat` with no links, which is not an unsafe file.
+        let mut look = 0;
+        loop {
+            let file = match options.open(path) {
+                Ok(file) => file,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+                Err(_) => return Err(unsafe_file(path, "open")),
+            };
+            let metadata = file.metadata().map_err(|_| unsafe_file(path, "read"))?;
+            look += 1;
+            if metadata.st_nlink() == 0 && look < REPLACED_DURING_READ_LOOKS {
+                continue;
+            }
+            if let Some(check) = private_file_check(&metadata, package_uid, true) {
+                return Err(unsafe_file(path, check));
+            }
+            return Ok(Some((file, metadata.len())));
         }
-        Ok(Some((file, metadata.len())))
     }
 
     /// The secret values the log reader redacts: the first line of every profile password,
@@ -10394,12 +10883,10 @@ mod linux_files {
         let mut needles = Vec::new();
         for suffix in [".password", ".totp", ".remote-log-token"] {
             for name in private_fragment_names(secrets_dir, suffix, package_uid)? {
-                let bytes = read_exact_single_link_private_file(
-                    &secrets_dir.join(&name),
-                    package_uid,
-                    MAX_SECRET_BYTES + 1,
-                )
-                .map_err(|_| BridgeError::unsafe_because("config_file_unsafe"))?;
+                let secret = secrets_dir.join(&name);
+                let bytes =
+                    read_exact_single_link_private_file(&secret, package_uid, MAX_SECRET_BYTES + 1)
+                        .map_err(|_| unsafe_file(&secret, "read"))?;
                 let line = bytes
                     .split(|byte| *byte == b'\n')
                     .next()
@@ -10427,11 +10914,11 @@ mod linux_files {
         let entries = match fs::read_dir(directory) {
             Ok(entries) => entries,
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
-            Err(_) => return Err(BridgeError::unsafe_because("config_file_unsafe")),
+            Err(_) => return Err(unsafe_file(directory, "list")),
         };
         let mut files = Vec::new();
         for entry in entries {
-            let entry = entry.map_err(|_| BridgeError::unsafe_because("config_file_unsafe"))?;
+            let entry = entry.map_err(|_| unsafe_file(directory, "list"))?;
             let Ok(name) = entry.file_name().into_string() else {
                 continue;
             };
@@ -10439,10 +10926,18 @@ mod linux_files {
             if name.starts_with('.') || !name.ends_with(suffix) || name.len() == suffix.len() {
                 continue;
             }
-            let metadata = fs::symlink_metadata(entry.path())
-                .map_err(|_| BridgeError::unsafe_because("config_file_unsafe"))?;
-            if !metadata.file_type().is_file() || metadata.st_uid() != package_uid {
-                return Err(BridgeError::unsafe_because("config_file_unsafe"));
+            let metadata = match fs::symlink_metadata(entry.path()) {
+                Ok(metadata) => metadata,
+                // Removed between the listing and the look: it is no longer there to be unsafe,
+                // exactly as the manager's glob would no longer match it.
+                Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                Err(_) => return Err(unsafe_file(&entry.path(), "read")),
+            };
+            if !metadata.file_type().is_file() {
+                return Err(unsafe_file(&entry.path(), "type"));
+            }
+            if metadata.st_uid() != package_uid {
+                return Err(unsafe_file(&entry.path(), "owner"));
             }
             files.push(name);
         }
@@ -10799,42 +11294,77 @@ mod linux_files {
         let mut options = OpenOptions::new();
         options.read(true).custom_flags(NOFOLLOW_CLOEXEC);
         let mut look = 0;
-        let (mut file, metadata) = loop {
-            let file = match options.open(path) {
+        // A read that came back shorter or longer than `fstat` said, or failed, is looked at
+        // again a few times before it is called unsafe: an in-place truncation (a log clear) or a
+        // writer mid-write produces it and clears in milliseconds. Ownership, mode, type, a second
+        // link or an oversized file are refused on the first look, as before.
+        let mut transient_looks = 0;
+        loop {
+            let mut file = match options.open(path) {
                 Ok(file) => file,
                 Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
-                Err(_) => return Err(BridgeError::unsafe_runtime()),
+                Err(_) => return Err(unsafe_file_runtime(path, "open")),
             };
             between_open_and_stat(look);
-            let metadata = file.metadata().map_err(|_| BridgeError::unsafe_runtime())?;
+            let metadata = file
+                .metadata()
+                .map_err(|_| unsafe_file_runtime(path, "read"))?;
             look += 1;
             if metadata.st_nlink() == 0 && look < REPLACED_DURING_READ_LOOKS {
                 continue;
             }
-            break (file, metadata);
-        };
-        if !metadata.file_type().is_file()
-            || metadata.st_uid() != package_uid
-            || metadata.st_mode() & 0o7777 != 0o600
-            || metadata.st_nlink() != 1
-            || metadata.len() > maximum as u64
-        {
-            return Err(BridgeError::unsafe_runtime());
+            if let Some(check) = private_file_check(&metadata, package_uid, true) {
+                return Err(unsafe_file_runtime(path, check));
+            }
+            if metadata.len() > maximum as u64 {
+                return Err(unsafe_file_runtime(path, "size"));
+            }
+            let mut bytes = Vec::with_capacity(metadata.len() as usize);
+            let limit = if append_only {
+                metadata.len()
+            } else {
+                (maximum + 1) as u64
+            };
+            let read = Read::by_ref(&mut file).take(limit).read_to_end(&mut bytes);
+            let check = match read {
+                Err(_) => "read",
+                Ok(_) if bytes.len() > maximum => return Err(unsafe_file_runtime(path, "size")),
+                Ok(_) if bytes.len() as u64 != metadata.len() => "length",
+                Ok(_) => return Ok(Some((file, bytes))),
+            };
+            transient_looks += 1;
+            if transient_looks >= TRANSIENT_READ_LOOKS {
+                return Err(unsafe_file_runtime(path, check));
+            }
+            std::thread::sleep(TRANSIENT_READ_PAUSE);
         }
-        let mut bytes = Vec::with_capacity(metadata.len() as usize);
-        let limit = if append_only {
-            metadata.len()
+    }
+
+    /// The check a package-private file's metadata fails, or `None`: a regular file, owned by the
+    /// package, mode `0600`, and (when `single_link`) exactly one link.
+    pub(super) fn private_file_check(
+        metadata: &fs::Metadata,
+        package_uid: u32,
+        single_link: bool,
+    ) -> Option<&'static str> {
+        if !metadata.file_type().is_file() {
+            Some("type")
+        } else if metadata.st_uid() != package_uid {
+            Some("owner")
+        } else if metadata.st_mode() & 0o7777 != 0o600 {
+            Some("mode")
+        } else if single_link && metadata.st_nlink() != 1 {
+            Some("links")
         } else {
-            (maximum + 1) as u64
-        };
-        Read::by_ref(&mut file)
-            .take(limit)
-            .read_to_end(&mut bytes)
-            .map_err(|_| BridgeError::unsafe_runtime())?;
-        if bytes.len() > maximum || bytes.len() as u64 != metadata.len() {
-            return Err(BridgeError::unsafe_runtime());
+            None
         }
-        Ok(Some((file, bytes)))
+    }
+
+    /// As `unsafe_file`, for the readers whose callers fold the error into their own code: the
+    /// kind stays `UnsafeRuntime` with no code of its own, as it always was.
+    fn unsafe_file_runtime(path: &Path, check: &'static str) -> BridgeError {
+        note_unsafe_file(path, check);
+        BridgeError::unsafe_runtime()
     }
 
     pub(super) fn load_security_policy(package_uid: u32) -> BridgeResult<SecurityPolicyArgs> {
@@ -13346,6 +13876,10 @@ mod linux_files {
     /// complete when the descriptor's link count reads zero. Eight is a bound, not an
     /// expectation, so a path that keeps being replaced cannot hold a reader forever.
     const REPLACED_DURING_READ_LOOKS: usize = 8;
+    /// How many times a document whose read did not match its `fstat` is looked at, and how long
+    /// apart, before it is called unsafe.
+    const TRANSIENT_READ_LOOKS: usize = 3;
+    const TRANSIENT_READ_PAUSE: Duration = Duration::from_millis(50);
 
     fn read_private_file_with_link_contract(
         path: &Path,
@@ -13588,6 +14122,11 @@ struct RenderedCgiError<'a> {
     code: &'a str,
     stage: Option<&'a str>,
     message: &'a str,
+    /// Only on `config_file_unsafe`: the file refused and the check it failed (`UnsafeFile`).
+    #[serde(default, borrow)]
+    file: Option<&'a str>,
+    #[serde(default, borrow)]
+    check: Option<&'a str>,
 }
 
 impl CgiResponse {
@@ -13641,14 +14180,21 @@ impl CgiResponse {
         } else {
             "Request could not be completed."
         };
-        let body = serde_json::to_vec(&json!({
+        let mut envelope = json!({
             "schema": "sdsync.dsm-error.v1",
             "ok": false,
             "status": status,
             "code": code,
             "stage": stage.map(CgiFailureStage::as_str),
             "message": message,
-        }))
+        });
+        if code == "config_file_unsafe"
+            && let Some(unsafe_file) = peek_unsafe_file()
+        {
+            envelope["file"] = json!(unsafe_file.file);
+            envelope["check"] = json!(unsafe_file.check);
+        }
+        let body = serde_json::to_vec(&envelope)
         .unwrap_or_else(|_| {
             format!(
                 r#"{{"schema":"sdsync.dsm-error.v1","ok":false,"status":{status},"code":"internal_error","stage":null,"message":"Request could not be completed."}}"#
@@ -13683,6 +14229,18 @@ impl CgiResponse {
                 .code
                 .bytes()
                 .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
+            && payload.file.is_none_or(|file| {
+                payload.code == "config_file_unsafe"
+                    && !file.is_empty()
+                    && file.len() <= MAX_UNSAFE_FILE_BYTES
+                    && file.bytes().all(|byte| {
+                        byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'/' | b'-')
+                    })
+            })
+            && payload.check.is_none_or(|check| {
+                payload.code == "config_file_unsafe" && UNSAFE_FILE_CHECKS.contains(&check)
+            })
+            && payload.file.is_some() == payload.check.is_some()
             && payload.stage.is_none_or(|stage| {
                 matches!(
                     stage,
@@ -13898,6 +14456,15 @@ pub(crate) fn main_entry() -> ExitCode {
     }
     if arguments.is_empty() {
         let is_get = std::env::var("REQUEST_METHOD").is_ok_and(|method| method == "GET");
+        #[cfg(target_os = "linux")]
+        cgi_watchdog::arm(
+            if is_get {
+                CGI_READ_DEADLINE
+            } else {
+                CGI_POST_DEADLINE
+            },
+            is_get,
+        );
         let response = match run_cgi() {
             Ok(response) => response,
             Err(failure) => {
@@ -13907,6 +14474,25 @@ pub(crate) fn main_entry() -> ExitCode {
             }
         }
         .for_cgi_transport(is_get);
+        #[cfg(target_os = "linux")]
+        {
+            // The watchdog may already be answering: then it writes, records and exits, and this
+            // thread must not interleave a second response.
+            if !cgi_watchdog::claim_response() {
+                cgi_watchdog::park();
+            }
+            let written =
+                cgi_watchdog::write_response_bounded(&response, CGI_RESPONSE_WRITE_TIMEOUT);
+            if !written {
+                record_pre_relay_cgi_failure(&CgiFailure::coded(
+                    CgiFailureStage::Runtime,
+                    BridgeError::unavailable_because("response_write_timeout"),
+                    "response_write_timeout",
+                ));
+            }
+            cgi_exit_code(written)
+        }
+        #[cfg(not(target_os = "linux"))]
         cgi_exit_code(write_cgi_response(&response).is_ok())
     } else if arguments.len() == 1 && arguments[0] == "--serve" {
         match run_server() {
@@ -14068,7 +14654,15 @@ pub(crate) fn main_entry() -> ExitCode {
         let response = PathBuf::from(&arguments[2]);
         match run_consumer(&request, &response) {
             Ok(()) => ExitCode::SUCCESS,
-            Err(_) => ExitCode::FAILURE,
+            // No response was written, so the controller publishes `consumer_wrote_no_result`;
+            // this line, kept in controller.log, is what says why.
+            Err(error) => {
+                eprintln!(
+                    "sdsync-dsm-api: consume wrote no result: {}",
+                    resolved_error_code(error, None, None)
+                );
+                ExitCode::FAILURE
+            }
         }
     } else if arguments.len() == 3 && arguments[0] == "--reject-job" {
         let request = PathBuf::from(&arguments[1]);
@@ -14332,6 +14926,15 @@ fn run_audit_transaction_cli(arguments: &[OsString]) -> BridgeResult<bool> {
                 .ok_or_else(BridgeError::bad_request)
         })
         .transpose()?;
+    let environment_text = |name: &str| {
+        std::env::var_os(name)
+            .map(|value| value.into_string().map_err(|_| BridgeError::bad_request()))
+            .transpose()
+    };
+    let rejection_tag = rejected_post_activity_tag(
+        environment_text("SDSYNC_DSM_AUDIT_REASON")?.as_deref(),
+        environment_text("SDSYNC_DSM_REJECTED_REQUEST_ID")?.as_deref(),
+    )?;
     let text = |index: usize| -> BridgeResult<String> {
         arguments
             .get(index)
@@ -14455,7 +15058,12 @@ fn run_audit_transaction_cli(arguments: &[OsString]) -> BridgeResult<bool> {
                 phase: AuditOutboxPhase::Prepared,
             };
             linux_runtime::clear_environment()?;
-            linux_files::durably_verify_audit_event(&record, &state, package_uid)?;
+            linux_files::durably_verify_audit_event(
+                &record,
+                &state,
+                package_uid,
+                rejection_tag.as_deref(),
+            )?;
             Ok(false)
         }
         Some("validate") if arguments.len() == 7 => {
@@ -14507,12 +15115,15 @@ fn run_cgi() -> Result<CgiResponse, CgiFailure> {
 
     #[cfg(target_os = "linux")]
     {
+        cgi_watchdog::enter(CgiFailureStage::Request);
         let environment = process_environment()
             .map_err(|error| CgiFailure::new(CgiFailureStage::Request, error))?;
+        cgi_watchdog::enter(CgiFailureStage::Identity);
         let identity = linux_runtime::identity_state()
             .map_err(|error| CgiFailure::new(CgiFailureStage::Identity, error))?;
         let package_uid = validate_cgi_identity(&identity)
             .map_err(|error| CgiFailure::new(CgiFailureStage::Identity, error))?;
+        cgi_watchdog::enter(CgiFailureStage::Request);
         let request = validate_http_request(environment.clone())
             .map_err(|error| CgiFailure::new(CgiFailureStage::Request, error))?;
         let authentication = match &request {
@@ -14521,23 +15132,31 @@ fn run_cgi() -> Result<CgiResponse, CgiFailure> {
         };
         // Synology documents authenticate.cgi being invoked from the custom
         // CGI, where DSM's native request environment is still authoritative.
+        // Where the package may not execute it (DSM 7), the service makes the
+        // loopback query instead (`encode_loopback_relay_request`).
+        cgi_watchdog::enter(CgiFailureStage::Authentication);
         let session =
-            linux_runtime::authenticate_and_authorize_cgi(authentication, AUTH_HELPER_TIMEOUT)?;
+            linux_runtime::authenticate_or_defer_cgi(authentication, AUTH_HELPER_TIMEOUT)?;
+        cgi_watchdog::enter(CgiFailureStage::Request);
         let body = match request {
             ValidatedHttpRequest::Get { .. } => None,
             ValidatedHttpRequest::Post { content_length, .. } => Some(
-                read_exact_body(&mut io::stdin().lock(), content_length)
-                    .map_err(|error| CgiFailure::new(CgiFailureStage::Request, error))?,
+                read_exact_body(
+                    &mut linux_runtime::PolledStdin::new(REQUEST_BODY_READ_TIMEOUT),
+                    content_length,
+                )
+                .map_err(|error| CgiFailure::new(CgiFailureStage::Request, error))?,
             ),
         };
-        let encoded = encode_relay_request(
-            &environment,
-            body.as_ref().map(|value| value.as_slice()),
-            &session,
-        )
+        let body = body.as_ref().map(|value| value.as_slice());
+        let encoded = match &session {
+            Some(session) => encode_relay_request(&environment, body, session),
+            None => encode_loopback_relay_request(&environment, body),
+        }
         .map_err(|error| CgiFailure::new(CgiFailureStage::Runtime, error))?;
         linux_runtime::clear_environment()
             .map_err(|error| CgiFailure::new(CgiFailureStage::Runtime, error))?;
+        cgi_watchdog::enter(CgiFailureStage::BridgeConnect);
         let mut stream = match linux_socket::connect_for_cgi(
             Path::new(API_SOCKET_PATH),
             package_uid,
@@ -14551,6 +15170,7 @@ fn run_cgi() -> Result<CgiResponse, CgiFailure> {
                 return Err(CgiFailure::new(CgiFailureStage::BridgeConnect, error));
             }
         };
+        cgi_watchdog::enter(CgiFailureStage::BridgeIo);
         write_frame(&mut stream, &encoded, MAX_RELAY_REQUEST_BYTES)
             .map_err(|error| CgiFailure::new(CgiFailureStage::BridgeIo, error))?;
         linux_socket::shutdown_write(&stream)
@@ -15311,6 +15931,14 @@ fn record_in_service_failure(
         return;
     };
     let (stage, code, status) = claim.triple;
+    // Which file a `config_file_unsafe` refused, in its own record: the coalesced failure record
+    // is keyed by stage, code and status only, so it could never say which of the package's files
+    // was refused or why.
+    if code == "config_file_unsafe"
+        && let Some(unsafe_file) = peek_unsafe_file()
+    {
+        record_unsafe_file(package_uid, policy, stage, &unsafe_file);
+    }
     let recorded = match policy {
         Some(policy) => linux_files::record_cgi_failure_under_policy(
             package_uid,
@@ -15331,10 +15959,64 @@ fn record_in_service_failure(
         ),
     };
     if recorded.is_ok_and(|recorded| recorded) {
+        // Authentication is decided here for a loopback relay, so its refusal gets the Activity
+        // row (`authentication.failed`) the CGI wrote when it decided it; the shell allowlists
+        // exactly these triples already.
+        if stage == CgiFailureStage::Authentication.as_str()
+            && let Err(error) = record_pre_relay_activity(stage, code, status)
+        {
+            eprintln!(
+                "sdsync-dsm-api: activity mirror of api.log failure {stage}/{code} not appended: {}",
+                resolved_error_code(error, None, None)
+            );
+        }
         return;
     }
     if let Ok(mut coalescer) = IN_SERVICE_FAILURES.lock() {
         coalescer.give_back(claim);
+    }
+}
+
+/// One `unsafe_file` record in api.log naming the refused file and the check; on stderr (the
+/// service's log) when api.log cannot take it.
+#[cfg(target_os = "linux")]
+fn record_unsafe_file(
+    package_uid: u32,
+    policy: Option<&SecurityPolicyArgs>,
+    stage: &str,
+    unsafe_file: &UnsafeFile,
+) {
+    let mut members = serde_json::Map::new();
+    members.insert("code".to_owned(), json!("config_file_unsafe"));
+    members.insert("stage".to_owned(), json!(stage));
+    members.insert("file".to_owned(), json!(unsafe_file.file));
+    members.insert("check".to_owned(), json!(unsafe_file.check));
+    let loaded;
+    let policy = match policy {
+        Some(policy) => Ok(policy),
+        None => {
+            loaded = linux_files::load_security_policy(package_uid);
+            loaded.as_ref().map_err(|error| *error)
+        }
+    };
+    let written = policy.and_then(|policy| {
+        current_epoch().and_then(|now| {
+            linux_files::record_bridge_warning_at(
+                Path::new(LOG_ROOT),
+                Path::new(API_LOG_PATH),
+                package_uid,
+                now,
+                policy,
+                "unsafe_file",
+                &members,
+            )
+        })
+    });
+    if written != Ok(true) {
+        eprintln!(
+            "sdsync-dsm-api: config_file_unsafe file={} check={} stage={stage}",
+            unsafe_file.file, unsafe_file.check
+        );
     }
 }
 
@@ -15372,6 +16054,8 @@ fn serve_connection(
 /// where the security policy that governs whether it may be written is loaded.
 #[cfg(target_os = "linux")]
 fn handle_relay_request(encoded: &[u8], package_uid: u32) -> Result<CgiResponse, CgiFailure> {
+    // A worker serves one request after another; what the last one refused is not this one's.
+    take_unsafe_file();
     let mut loaded_policy = None;
     let outcome = handle_relay_request_under_policy(encoded, package_uid, &mut loaded_policy);
     if let Err(failure) = &outcome {
@@ -15400,10 +16084,17 @@ fn handle_relay_request_under_policy(
     // independently resolves the relayed username through NSS, rechecks
     // administrator membership, requires the exact package UID at SO_PEERCRED
     // in serve_connection, and recomputes the cookie/token session binding.
-    let resolved_uid = linux_runtime::authorize_relayed_username(&relay.authenticated_username)
-        .map_err(|error| CgiFailure::new(CgiFailureStage::Authentication, error))?;
-    let session = validate_relay_authenticated_session(&relay, authentication, resolved_uid)
-        .map_err(|error| CgiFailure::new(CgiFailureStage::Authentication, error))?;
+    let session = if relay.loopback_authentication {
+        linux_runtime::authenticate_relayed_via_dsm_user_service(
+            authentication,
+            AUTH_HELPER_TIMEOUT,
+        )?
+    } else {
+        let resolved_uid = linux_runtime::authorize_relayed_username(&relay.authenticated_username)
+            .map_err(|error| CgiFailure::new(CgiFailureStage::Authentication, error))?;
+        validate_relay_authenticated_session(&relay, authentication, resolved_uid)
+            .map_err(|error| CgiFailure::new(CgiFailureStage::Authentication, error))?
+    };
     let control_paths = ControlPaths::for_request();
     linux_files::require_open_runtime_admission(&control_paths, package_uid)
         .map_err(|error| CgiFailure::new(CgiFailureStage::ServiceRequest, error))?;
@@ -15414,6 +16105,11 @@ fn handle_relay_request_under_policy(
     // policy this request already paid to read.
     let policy = &*loaded_policy.insert(policy);
     let is_post = matches!(request, ValidatedHttpRequest::Post { .. });
+    let rejected_request_id = if is_post {
+        rejected_post_request_id(body)
+    } else {
+        None
+    };
     let result = if policy.require_https && !is_https_request(authentication.https.as_deref()) {
         Err(BridgeError::new(ErrorKind::Forbidden))
     } else {
@@ -15428,8 +16124,13 @@ fn handle_relay_request_under_policy(
         )
     };
     if is_post
-        && result.is_err()
-        && let Err(error) = record_rejected_post(&session.username, session.uid)
+        && let Err(rejection) = &result
+        && let Err(error) = record_rejected_post(
+            &session.username,
+            session.uid,
+            rejected_post_reason(*rejection),
+            rejected_request_id.as_deref(),
+        )
     {
         // The rejection itself is still answered below; what failed is its mandatory audit
         // record, and that loss is named in api.log rather than dropped.
@@ -15503,7 +16204,12 @@ fn execute_authenticated_request(
                 execute_read_action(&PackagePaths::production(), &action, policy, package_uid)
             }
         },
-        ValidatedHttpRequest::Post { csrf_token, .. } => {
+        ValidatedHttpRequest::Post {
+            csrf_token, build, ..
+        } => {
+            // Before the token: a page from another build most likely holds a stale token too, and
+            // "reload this page" is the answer to both.
+            require_dashboard_build(build.as_deref())?;
             let key = linux_files::load_or_create_csrf_key(&control_paths, package_uid)?;
             verify_csrf_token(
                 &csrf_token,
@@ -17251,6 +17957,34 @@ fn render_routine(
     // as its own `matches!` rather than merged with it.
     let backend_reason = manager_kv_optional(state_document, "backend_reason", "ok")?;
     let last_poll = manager_kv(state_document, "last_poll_epoch", "0")?;
+    // What observes the routine, which both engines append after `escalated_epoch`: when a change
+    // (or a due cadence) was last seen, when a run last finished, the backend watching it, and
+    // whether anything is watching at all. Optional on read like `backend_reason`, so a record
+    // from before them reads as their defaults; `watching_via` and `observe_state` fail closed on
+    // an unknown value, and `observe_cause` is an open token held to its shape.
+    let last_trigger = manager_kv_optional(state_document, "last_trigger_epoch", "0")?;
+    let last_run = manager_kv_optional(state_document, "last_run_epoch", "0")?;
+    let watching_via = manager_kv_optional(state_document, "watching_via", "none")?;
+    let observe_state = manager_kv_optional(state_document, "observe_state", "ok")?;
+    let observe_cause = manager_kv_optional(state_document, "observe_cause", "none")?;
+    let observe_since = manager_kv_optional(state_document, "observe_since_epoch", "0")?;
+    if !matches!(
+        watching_via.as_slice(),
+        b"native" | b"poll" | b"schedule" | b"none"
+    ) || !matches!(
+        observe_state.as_slice(),
+        b"ok" | b"degraded" | b"blind" | b"disabled"
+    ) || observe_cause.is_empty()
+        || observe_cause.len() > 64
+        || !observe_cause
+            .iter()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || *byte == b'_')
+        || !digits(&last_trigger)
+        || !digits(&last_run)
+        || !digits(&observe_since)
+    {
+        return Err(PACKAGE_STATE_CORRUPT);
+    }
     if !matches!(
         state.as_slice(),
         b"never" | b"scheduled" | b"running" | b"succeeded" | b"failed" | b"deferred"
@@ -17337,6 +18071,18 @@ fn render_routine(
     push_raw_member(&mut routine, "last_success_epoch", &last_success);
     routine.push(b',');
     push_raw_member(&mut routine, "last_poll_epoch", &last_poll);
+    routine.push(b',');
+    push_raw_member(&mut routine, "last_trigger_epoch", &last_trigger);
+    routine.push(b',');
+    push_raw_member(&mut routine, "last_run_epoch", &last_run);
+    routine.push(b',');
+    push_quoted_member(&mut routine, "watching_via", &watching_via);
+    routine.push(b',');
+    push_quoted_member(&mut routine, "observe_state", &observe_state);
+    routine.push(b',');
+    push_quoted_member(&mut routine, "observe_cause", &observe_cause);
+    routine.push(b',');
+    push_raw_member(&mut routine, "observe_since_epoch", &observe_since);
     routine.push(b'}');
     Ok(routine)
 }
@@ -18541,16 +19287,13 @@ fn profile_index_value(record: &OutcomeRecord<'_>, errors: &mut OutcomeErrors) -
             None
         }
     });
+    // Shown, never dropped: a detail that is longer than the 160 bytes the dashboard carries, or
+    // holds a byte it does not print, used to make the whole record "malformed" and vanish, so the
+    // issue lost its evidence exactly when the path in it was long. Unprintable bytes read `?`,
+    // and a long detail keeps its tail, where the file name and the library's message are.
     let issue_detail = record
         .text("index_issue_detail", errors)
-        .and_then(|detail| {
-            if detail.len() <= 160 && detail.iter().all(|b| (b' '..=b'~').contains(b)) {
-                String::from_utf8(detail).ok()
-            } else {
-                errors.push(record.source, "malformed");
-                None
-            }
-        });
+        .map(|detail| shown_index_detail(&detail));
     json!({
         "state": String::from_utf8_lossy(&state),
         "entries": record.number("index_entries", errors),
@@ -18562,6 +19305,28 @@ fn profile_index_value(record: &OutcomeRecord<'_>, errors: &mut OutcomeErrors) -
         "issue": issue,
         "issue_detail": issue_detail,
     })
+}
+
+/// An index issue's detail as the dashboard carries it: printable ASCII, at most 160 bytes, the
+/// tail kept behind `...` when it is longer.
+#[cfg(target_os = "linux")]
+fn shown_index_detail(detail: &[u8]) -> String {
+    const LIMIT: usize = 160;
+    let printable: String = detail
+        .iter()
+        .map(|byte| {
+            if (b' '..=b'~').contains(byte) {
+                char::from(*byte)
+            } else {
+                '?'
+            }
+        })
+        .collect();
+    if printable.len() <= LIMIT {
+        printable
+    } else {
+        format!("...{}", &printable[printable.len() - (LIMIT - 3)..])
+    }
 }
 
 /// `detail=` in a profile record: the core's error line for that profile (S-18), written by the
@@ -20143,7 +20908,13 @@ fn run_consumer(request: &Path, response: &Path) -> BridgeResult<()> {
                     // No untrusted field is attributable until the strict job
                     // document parses. Preserve a durable, bounded controller
                     // rejection record before the controller quarantines it.
-                    record_rejected_operation("package-controller", package_uid, "controller")?;
+                    record_rejected_operation(
+                        "package-controller",
+                        package_uid,
+                        "controller",
+                        "job_unreadable",
+                        None,
+                    )?;
                     return Err(error);
                 }
             };
@@ -20178,6 +20949,15 @@ fn run_consumer(request: &Path, response: &Path) -> BridgeResult<()> {
                     termination_requested,
                 )
             })();
+            if let Err(error) = &execution_result {
+                record_consume_failure(
+                    Path::new(LOG_ROOT),
+                    package_uid,
+                    job.mutation.operation_id(),
+                    &job.request_id,
+                    *error,
+                );
+            }
             let result = terminalize_consume_result(execution_result, |state| {
                 let phase = if state == "succeeded" {
                     AuditOutboxPhase::Succeeded
@@ -21099,10 +21879,10 @@ fn consume_job_inner(
     )?;
     normalize_result_warnings(&mut result);
     if matches!(&job.mutation, Mutation::SetSecret(_)) {
-        validate_set_secret_manager_result(&result)?;
+        validate_set_secret_manager_result(&result).map_err(|_| RESULT_SHAPE_INVALID)?;
     }
     if result.get("ok").and_then(Value::as_bool) != Some(output.status_success) {
-        return Err(BridgeError::new(ErrorKind::Unavailable));
+        return Err(RESULT_EXIT_MISMATCH);
     }
     for event in record_queued_mutation_side_channels(
         log_root,
@@ -21125,6 +21905,62 @@ fn consume_job_inner(
     Ok(result)
 }
 
+/// Name a failed consume in api.log: the result code the terminal result carries, and the
+/// narrower cause the error names -- which check refused the manager's result, which runtime
+/// state could not be verified. The terminal result keeps only the first, because its code is a
+/// closed vocabulary; this record is where the second goes, so the distinction an operator needs
+/// is no longer discarded where a consume ends.
+///
+/// When the record cannot be written, or the policy silences bridge warnings, the same line goes
+/// to the consumer's stderr, which the controller keeps in controller.log.
+#[cfg(target_os = "linux")]
+fn record_consume_failure(
+    log_root: &Path,
+    package_uid: u32,
+    operation: &str,
+    job_id: &str,
+    error: BridgeError,
+) {
+    let written = linux_files::load_security_policy(package_uid).and_then(|policy| {
+        record_consume_failure_at(log_root, package_uid, &policy, operation, job_id, error)
+    });
+    if written != Ok(true) {
+        eprintln!(
+            "sdsync-dsm-api: queued job {job_id} ({operation}) failed: {} ({})",
+            consume_failure_code(error.kind).0,
+            resolved_error_code(error, None, None)
+        );
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn record_consume_failure_at(
+    log_root: &Path,
+    package_uid: u32,
+    policy: &SecurityPolicyArgs,
+    operation: &str,
+    job_id: &str,
+    error: BridgeError,
+) -> BridgeResult<bool> {
+    let mut members = serde_json::Map::new();
+    members.insert("code".to_owned(), json!(consume_failure_code(error.kind).0));
+    members.insert(
+        "cause".to_owned(),
+        json!(resolved_error_code(error, None, None)),
+    );
+    members.insert("operation".to_owned(), json!(operation));
+    members.insert("job_id".to_owned(), json!(job_id));
+    linux_files::record_bridge_warning_at(
+        log_root,
+        &log_root.join("api.log"),
+        package_uid,
+        current_epoch()?,
+        policy,
+        "consume_failed",
+        &members,
+    )
+}
+
 /// The wall clock, refused rather than clamped when it reads before the epoch.
 ///
 /// The kind stays `Unavailable` — every consumer that branches on a kind sees
@@ -21138,7 +21974,162 @@ fn current_epoch() -> BridgeResult<u64> {
         .map_err(|_| BridgeError::unavailable_because("clock_unavailable"))
 }
 
-fn write_cgi_response(response: &CgiResponse) -> io::Result<()> {
+/// The CGI's watchdog: nothing a request does may hold the process past its deadline.
+///
+/// The CGI is a child of DSM's web server, not of the package supervisor, so stopping the package
+/// signals nothing, and a CGI blocked on a kernel event left no record of any kind: failures were
+/// recorded only after `run_cgi` returned. The watchdog thread is armed before anything else.
+/// When the deadline passes it answers the request itself -- a 503 naming `cgi_deadline_exceeded`
+/// and the stage the request was in -- records it in api.log (and Activity), and ends the process
+/// with `_exit`, because the main thread may be the one that is blocked.
+#[cfg(target_os = "linux")]
+mod cgi_watchdog {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, AtomicU8};
+
+    static STAGE: AtomicU8 = AtomicU8::new(0);
+    static RESPONDING: AtomicBool = AtomicBool::new(false);
+
+    const STAGES: [CgiFailureStage; 8] = [
+        CgiFailureStage::Request,
+        CgiFailureStage::Identity,
+        CgiFailureStage::Authentication,
+        CgiFailureStage::Runtime,
+        CgiFailureStage::BridgeConnect,
+        CgiFailureStage::BridgeIo,
+        CgiFailureStage::BridgeProtocol,
+        CgiFailureStage::ServiceRequest,
+    ];
+
+    /// The stage the request is in, for the watchdog's answer.
+    pub(super) fn enter(stage: CgiFailureStage) {
+        if let Some(index) = STAGES.iter().position(|candidate| *candidate == stage) {
+            STAGE.store(index as u8, AtomicOrdering::Relaxed);
+        }
+    }
+
+    pub(super) fn stage() -> CgiFailureStage {
+        STAGES
+            .get(usize::from(STAGE.load(AtomicOrdering::Relaxed)))
+            .copied()
+            .unwrap_or(CgiFailureStage::Request)
+    }
+
+    /// The right to write this process's one response; the loser must not write.
+    pub(super) fn claim_response() -> bool {
+        RESPONDING
+            .compare_exchange(false, true, AtomicOrdering::AcqRel, AtomicOrdering::Acquire)
+            .is_ok()
+    }
+
+    /// Wait for the watchdog, which holds the response, to end the process.
+    pub(super) fn park() -> ! {
+        loop {
+            std::thread::sleep(Duration::from_secs(60));
+        }
+    }
+
+    /// The answer the watchdog writes for a request that ran out of time in `stage`.
+    pub(super) fn deadline_failure(stage: CgiFailureStage) -> CgiFailure {
+        CgiFailure::coded(
+            stage,
+            BridgeError::unavailable_because("cgi_deadline_exceeded"),
+            "cgi_deadline_exceeded",
+        )
+    }
+
+    /// Start the watchdog thread. If it cannot be started the request still runs, and says so
+    /// on stderr, which DSM's web server keeps.
+    pub(super) fn arm(deadline: Duration, is_get: bool) {
+        let started = std::thread::Builder::new()
+            .name("cgi-watchdog".to_owned())
+            .spawn(move || {
+                std::thread::sleep(deadline);
+                expire(is_get);
+            });
+        if started.is_err() {
+            eprintln!(
+                "sdsync-dsm-api: cgi watchdog could not be started; this request is unbounded"
+            );
+        }
+    }
+
+    fn expire(is_get: bool) -> ! {
+        let stage = stage();
+        if claim_response() {
+            let failure = deadline_failure(stage);
+            let response = CgiResponse::failure(failure).for_cgi_transport(is_get);
+            let written = write_response_bounded(&response, CGI_RESPONSE_WRITE_TIMEOUT);
+            record_pre_relay_cgi_failure(&failure);
+            eprintln!(
+                "sdsync-dsm-api: cgi_deadline_exceeded at stage {} (response {})",
+                stage.as_str(),
+                if written { "written" } else { "not written" }
+            );
+        } else {
+            // The main thread is writing its own answer, under its own bound. Give it that long.
+            std::thread::sleep(CGI_RESPONSE_WRITE_TIMEOUT + Duration::from_secs(1));
+            eprintln!("sdsync-dsm-api: cgi response write outlived its bound; process ended");
+        }
+        // SAFETY: _exit ends the process without running destructors or flushing stdio, which is
+        // the point: the thread that would run them may be the blocked one.
+        unsafe { libc::_exit(1) }
+    }
+
+    /// Write the whole response to stdout within `timeout`, never blocking past it.
+    ///
+    /// Each write is at most PIPE_BUF bytes after `poll` says the descriptor is writable, so a
+    /// write to a pipe can never block; a reader that stops reading costs `timeout`, not forever.
+    pub(super) fn write_response_bounded(response: &CgiResponse, timeout: Duration) -> bool {
+        let bytes = rendered_cgi_response(response);
+        write_all_bounded(libc::STDOUT_FILENO, &bytes, timeout)
+    }
+
+    pub(super) fn write_all_bounded(
+        descriptor: libc::c_int,
+        mut bytes: &[u8],
+        timeout: Duration,
+    ) -> bool {
+        let deadline = Instant::now() + timeout;
+        while !bytes.is_empty() {
+            let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+                return false;
+            };
+            let mut poll = libc::pollfd {
+                fd: descriptor,
+                events: libc::POLLOUT,
+                revents: 0,
+            };
+            let millis =
+                libc::c_int::try_from(remaining.as_millis().max(1)).unwrap_or(libc::c_int::MAX);
+            // SAFETY: one live pollfd for the duration of the call.
+            let ready = unsafe { libc::poll(&mut poll, 1, millis) };
+            if ready < 0 {
+                if io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
+                    continue;
+                }
+                return false;
+            }
+            if ready == 0 || poll.revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL) != 0 {
+                return false;
+            }
+            let chunk = bytes.len().min(libc::PIPE_BUF);
+            // SAFETY: `chunk` bytes of a live slice.
+            let written = unsafe { libc::write(descriptor, bytes.as_ptr().cast(), chunk) };
+            if written < 0 {
+                if io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
+                    continue;
+                }
+                return false;
+            }
+            bytes = &bytes[written as usize..];
+        }
+        true
+    }
+}
+
+/// The CGI response, headers and body, as the bytes written to stdout.
+fn rendered_cgi_response(response: &CgiResponse) -> Vec<u8> {
     let reason = match response.status {
         200 => "OK",
         202 => "Accepted",
@@ -21154,15 +22145,20 @@ fn write_cgi_response(response: &CgiResponse) -> io::Result<()> {
         503 => "Service Unavailable",
         _ => "Error",
     };
-    let mut stdout = io::stdout().lock();
-    write!(
-        stdout,
+    let mut bytes = format!(
         "Status: {} {}\r\nContent-Type: application/json; charset=utf-8\r\nCache-Control: no-store\r\nPragma: no-cache\r\nX-Content-Type-Options: nosniff\r\nContent-Security-Policy: default-src 'none'\r\nContent-Length: {}\r\n\r\n",
         response.status,
         reason,
         response.body.len()
-    )?;
-    stdout.write_all(&response.body)?;
+    )
+    .into_bytes();
+    bytes.extend_from_slice(&response.body);
+    bytes
+}
+
+fn write_cgi_response(response: &CgiResponse) -> io::Result<()> {
+    let mut stdout = io::stdout().lock();
+    stdout.write_all(&rendered_cgi_response(response))?;
     stdout.flush()
 }
 
@@ -22294,6 +23290,7 @@ mod tests {
             request_marker: Some("1".to_owned()),
             synology_token_header: None,
             csrf_header: None,
+            build_header: None,
             remote_address: Some("192.0.2.8".to_owned()),
             server_address: Some("192.0.2.2".to_owned()),
             server_name: Some("nas.example.invalid".to_owned()),
@@ -22356,6 +23353,7 @@ mod tests {
         environment.content_type = Some("application/json; charset=utf-8".to_owned());
         environment.synology_token_header = Some(Zeroizing::new("dsm-token".to_owned()));
         environment.csrf_header = Some(Zeroizing::new("csrf-token".to_owned()));
+        environment.build_header = Some(DASHBOARD_BUILD.to_owned());
         environment
     }
 
@@ -23734,6 +24732,250 @@ mod tests {
         assert_eq!(realtime["retry_backoff_seconds"], 300);
         assert_eq!(realtime["backend_reason"], "ok");
         assert_eq!(realtime["last_poll_epoch"], 0);
+    }
+
+    #[test]
+    fn an_unsafe_file_is_shown_by_its_package_path_bounded_from_the_tail() {
+        assert_eq!(
+            shown_package_path(Path::new(
+                "/var/packages/synology-drive-sync/var/state/routines/nightly.state"
+            )),
+            "var/state/routines/nightly.state"
+        );
+        assert_eq!(
+            shown_package_path(Path::new(
+                "/volume3/@apphome/synology-drive-sync/etc/profiles.d/office.toml"
+            )),
+            "apphome/etc/profiles.d/office.toml"
+        );
+        assert_eq!(
+            shown_package_path(Path::new("/var/packages/synology-drive-sync/var/a b\n../c")),
+            "var/a_b___/c"
+        );
+        let long = format!(
+            "/var/packages/synology-drive-sync/var/{}/end.state",
+            "d".repeat(400)
+        );
+        let shown = shown_package_path(Path::new(&long));
+        assert_eq!(shown.len(), MAX_UNSAFE_FILE_BYTES);
+        assert!(
+            shown.starts_with("...") && shown.ends_with("/end.state"),
+            "{shown}"
+        );
+    }
+
+    #[test]
+    fn a_config_file_unsafe_envelope_names_the_file_and_check_and_stays_trusted() {
+        take_unsafe_file();
+        note_unsafe_file(
+            Path::new("/var/packages/synology-drive-sync/var/state/controller.state"),
+            "mode",
+        );
+        // The first refusal is the one the request failed on.
+        note_unsafe_file(
+            Path::new("/var/packages/synology-drive-sync/var/other"),
+            "owner",
+        );
+        let response = CgiResponse::failure(CgiFailure::new(
+            CgiFailureStage::ServiceRequest,
+            BridgeError::unsafe_because("config_file_unsafe"),
+        ));
+        assert!(response.is_trusted_error_envelope());
+        let envelope: Value = serde_json::from_slice(&response.body).unwrap();
+        assert_eq!(envelope["code"], "config_file_unsafe");
+        assert_eq!(envelope["file"], "var/state/controller.state");
+        assert_eq!(envelope["check"], "mode");
+        // Any other code carries neither, and a file on another code is not trusted.
+        let other = CgiResponse::failure(CgiFailure::new(
+            CgiFailureStage::ServiceRequest,
+            BridgeError::unavailable_because("manager_busy"),
+        ));
+        let envelope: Value = serde_json::from_slice(&other.body).unwrap();
+        assert!(envelope.get("file").is_none());
+        let mut forged: Value = serde_json::from_slice(&other.body).unwrap();
+        forged["file"] = json!("var/x");
+        forged["check"] = json!("mode");
+        let forged = CgiResponse {
+            status: other.status,
+            body: serde_json::to_vec(&forged).unwrap(),
+        };
+        assert!(!forged.is_trusted_error_envelope());
+        take_unsafe_file();
+        assert!(peek_unsafe_file().is_none());
+    }
+
+    /// On a DSM-shaped layout (home and var are symlinks into the volume's app roots), a routine
+    /// state replaced by rename over and over while the snapshot reads it is never refused, and
+    /// a state file that really is unsafe is refused naming the file and the check.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_snapshot_names_an_unsafe_file_and_survives_a_writer_renaming_over_it() {
+        let fixture = TestShellPackageFixture::new("unsafe-file-named");
+        write_snapshot_inputs(&fixture);
+        let policy = SecurityPolicyArgs::default();
+        let state_file = fixture.routine_state_dir.join("alpha.state");
+        let state = "state=succeeded\nnext_run_epoch=1700003000\nlast_success_epoch=1700002900\n\
+                     backend=daily\nlast_poll_epoch=1700003100\n";
+        fixture.write_config(&state_file, state);
+        fixture.hand_over();
+
+        // A writer that replaces the file the way both engines do: a 0600 sibling, then rename.
+        let stop = std::sync::Arc::new(AtomicBool::new(false));
+        let writer = {
+            let stop = std::sync::Arc::clone(&stop);
+            let state_file = state_file.clone();
+            std::thread::spawn(move || {
+                let sibling = state_file.with_extension("state.tmp");
+                let mut count = 0_u64;
+                while !stop.load(AtomicOrdering::Relaxed) {
+                    let _ = fs::remove_file(&sibling);
+                    fs::write(&sibling, state).unwrap();
+                    fs::set_permissions(&sibling, fs::Permissions::from_mode(0o600)).unwrap();
+                    fs::rename(&sibling, &state_file).unwrap();
+                    count += 1;
+                }
+                count
+            })
+        };
+        for _ in 0..150 {
+            take_unsafe_file();
+            if let Err(error) = snapshot_document(&fixture.paths(), fixture.package_uid(), &policy)
+            {
+                stop.store(true, AtomicOrdering::Relaxed);
+                writer.join().unwrap();
+                panic!(
+                    "a rename-replaced state file was refused: {:?} {:?}",
+                    error.code,
+                    peek_unsafe_file()
+                );
+            }
+        }
+        stop.store(true, AtomicOrdering::Relaxed);
+        assert!(
+            writer.join().unwrap() > 0,
+            "the writer never replaced the file"
+        );
+
+        // A state file left at 0644 is refused on the first look, and named.
+        fs::set_permissions(&state_file, fs::Permissions::from_mode(0o644)).unwrap();
+        take_unsafe_file();
+        assert_eq!(
+            snapshot_document(&fixture.paths(), fixture.package_uid(), &policy)
+                .unwrap_err()
+                .code,
+            Some("config_file_unsafe")
+        );
+        let named = peek_unsafe_file().expect("the refused file is named");
+        assert_eq!(named.check, "mode");
+        assert!(
+            named.file.ends_with("routines/alpha.state"),
+            "{}",
+            named.file
+        );
+        // A second hard link is refused as links, not lumped in with the rest.
+        fs::set_permissions(&state_file, fs::Permissions::from_mode(0o600)).unwrap();
+        let link = fixture.routine_state_dir.join("alpha.state.link");
+        fs::hard_link(&state_file, &link).unwrap();
+        take_unsafe_file();
+        assert!(snapshot_document(&fixture.paths(), fixture.package_uid(), &policy).is_err());
+        assert_eq!(peek_unsafe_file().unwrap().check, "links");
+        fs::remove_file(&link).unwrap();
+        take_unsafe_file();
+    }
+
+    /// What observes a routine: six fields both engines append to its state file. Absent they read
+    /// as their defaults on both rungs, written they round-trip byte-identically on both rungs, and
+    /// an unknown `observe_state` or `watching_via`, a malformed cause or a non-numeric epoch fails
+    /// the whole snapshot closed on both, like an unknown `backend_reason`.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn routine_observation_fields_default_round_trip_and_fail_closed_on_both_rungs() {
+        let fixture = TestShellPackageFixture::new("routine-observation");
+        write_snapshot_inputs(&fixture);
+        let policy = SecurityPolicyArgs::default();
+        let state_file = fixture.routine_state_dir.join("alpha.state");
+        let base = "state=succeeded\nnext_run_epoch=1700003000\nlast_success_epoch=1700002900\n\
+                    backend=daily\nlast_poll_epoch=1700003100\n";
+
+        fixture.write_config(&state_file, base);
+        let document = assert_snapshot_parity(&fixture);
+        let daily = &document["routines"].as_array().unwrap()[1];
+        assert_eq!(daily["last_trigger_epoch"], 0);
+        assert_eq!(daily["last_run_epoch"], 0);
+        assert_eq!(daily["watching_via"], "none");
+        assert_eq!(daily["observe_state"], "ok");
+        assert_eq!(daily["observe_cause"], "none");
+        assert_eq!(daily["observe_since_epoch"], 0);
+        // A routine with no state file at all reads the same defaults.
+        assert_eq!(
+            document["routines"].as_array().unwrap()[0]["observe_state"],
+            "ok"
+        );
+
+        for (via, state, cause) in [
+            ("native", "ok", "none"),
+            ("poll", "degraded", "poll_floor_failed"),
+            ("schedule", "blind", "poll_walk_timeout"),
+            ("none", "disabled", "disabled"),
+        ] {
+            fixture.write_config(
+                &state_file,
+                &format!(
+                    "{base}last_trigger_epoch=1700003050\nlast_run_epoch=1700003060\n\
+                     watching_via={via}\nobserve_state={state}\nobserve_cause={cause}\n\
+                     observe_since_epoch=1700003070\n"
+                ),
+            );
+            let document = assert_snapshot_parity(&fixture);
+            let daily = &document["routines"].as_array().unwrap()[1];
+            assert_eq!(daily["last_trigger_epoch"], 1_700_003_050);
+            assert_eq!(daily["last_run_epoch"], 1_700_003_060);
+            assert_eq!(daily["watching_via"], via);
+            assert_eq!(daily["observe_state"], state);
+            assert_eq!(daily["observe_cause"], cause);
+            assert_eq!(daily["observe_since_epoch"], 1_700_003_070);
+        }
+
+        for refused in [
+            "observe_state=asleep\n",
+            "watching_via=carrier_pigeon\n",
+            "observe_cause=Not-A-Token\n",
+            "observe_cause=\n",
+            "last_run_epoch=soon\n",
+            "observe_since_epoch=1\nobserve_since_epoch=2\n",
+        ] {
+            fixture.write_config(&state_file, &format!("{base}{refused}"));
+            let shell = fixture.run_manager(&["api", "snapshot"]);
+            assert!(!shell.status.success(), "{refused}");
+            assert!(
+                String::from_utf8_lossy(&shell.stdout).contains("corrupt_state"),
+                "{refused}: {}",
+                String::from_utf8_lossy(&shell.stdout)
+            );
+            fixture.hand_over();
+            assert_eq!(
+                snapshot_document(&fixture.paths(), fixture.package_uid(), &policy)
+                    .unwrap_err()
+                    .code,
+                Some("package_state_corrupt"),
+                "{refused}"
+            );
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_long_index_issue_detail_keeps_its_tail_instead_of_being_dropped() {
+        let nas = b"/var/packages/synology-drive-sync/var/state/cache/pairs/checkoffice_nas.redb: DB corrupted: Database page size 0 does not match expected 4096; set aside as /var/packages/synology-drive-sync/var/state/cache/pairs/checkoffice_nas.redb.corrupt-1794446729";
+        let shown = shown_index_detail(nas);
+        assert_eq!(shown.len(), 160);
+        assert!(shown.starts_with("..."), "{shown}");
+        assert!(
+            shown.ends_with("checkoffice_nas.redb.corrupt-1794446729"),
+            "{shown}"
+        );
+        assert_eq!(shown_index_detail(b"short: fine"), "short: fine");
+        assert_eq!(shown_index_detail(b"tab\there\x07"), "tab?here?");
     }
 
     /// Fault-injection rows 24-26: `backend_reason` on the routine object.
@@ -29214,6 +30456,339 @@ mod tests {
         assert_eq!(failures, vec!["mutation_warning"]);
     }
 
+    /// A Doctor result the shell bounded is published whole, and one over the bridge's cap is
+    /// refused as too large -- never as "could not be started" -- with the check that refused it
+    /// named in api.log.
+    #[test]
+    fn doctor_output_up_to_the_shell_cap_is_published_and_over_it_is_named() {
+        let doctor_result = |output: String| {
+            serde_json::to_vec(&json!({
+                "schema": "sdsync.dsm-result.v1", "ok": true, "message": "Doctor completed",
+                "status": "succeeded", "scope": "all", "output": output, "exit_code": 0,
+            }))
+            .unwrap()
+        };
+        // About five profiles of standard Doctor NDJSON: over the old 64 KiB field cap.
+        let record = r#"{"schema":"sdsync.doctor.v1","sections":[{"id":"network_reachability","status":"pass"}]}"#;
+        let multi_profile = format!("{record}\n").repeat(100_000 / (record.len() + 1));
+        assert!(multi_profile.len() > 65_536 && multi_profile.len() <= MAX_ACTION_OUTPUT_BYTES);
+        let parsed = parse_manager_result(&doctor_result(multi_profile.clone()), None).unwrap();
+        assert_eq!(parsed["output"], json!(multi_profile));
+        for operation in [None, Some("action")] {
+            assert!(
+                parse_manager_result_for_operation(
+                    &doctor_result("x".repeat(MAX_ACTION_OUTPUT_BYTES)),
+                    None,
+                    operation
+                )
+                .is_ok(),
+                "exactly the shell's cap must be accepted"
+            );
+        }
+
+        let refused = parse_manager_result(
+            &doctor_result("x".repeat(MAX_ACTION_OUTPUT_BYTES + 1)),
+            None,
+        )
+        .unwrap_err();
+        assert_eq!(refused, RESULT_OUTPUT_TOO_LARGE);
+        assert_eq!(refused.kind, ErrorKind::PayloadTooLarge);
+        let terminal = terminalize_consume_result(Err(refused), |_| Ok(false));
+        assert_eq!(terminal.value["code"], "response_too_large");
+        assert_eq!(
+            terminal.value["message"],
+            "The operation produced more output than the package will carry."
+        );
+
+        // Any other refusal says the operation ran and names the check, in a result every
+        // validator still accepts.
+        let shapeless =
+            parse_manager_result(br#"{"schema":"sdsync.dsm-result.v1"}"#, None).unwrap_err();
+        assert_eq!(shapeless, RESULT_SHAPE_INVALID);
+        let terminal = terminalize_consume_result(Err(shapeless), |_| Ok(false));
+        assert_eq!(terminal.value["code"], "unavailable");
+        let message = terminal.value["message"].as_str().unwrap();
+        assert!(
+            message.contains("ran") && message.contains("result_shape_invalid"),
+            "{message}"
+        );
+        assert!(
+            parse_manager_result_for_operation(
+                &serde_json::to_vec(&terminal.value).unwrap(),
+                None,
+                Some("action")
+            )
+            .is_ok()
+        );
+        assert_eq!(
+            parse_manager_result(b"not json", None).unwrap_err(),
+            RESULT_UNREADABLE
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_consume_failure_names_its_cause_in_api_log() {
+        let fixture = TestPackageFixture::new("consume-failure-cause");
+        let uid = TestPackageFixture::package_uid();
+        let policy = SecurityPolicyArgs::default();
+        let job_id = "0123456789abcdef0123456789abcdef";
+        assert_eq!(
+            record_consume_failure_at(
+                &fixture.log_root,
+                uid,
+                &policy,
+                "action",
+                job_id,
+                RESULT_OUTPUT_TOO_LARGE
+            ),
+            Ok(true)
+        );
+        let text = fs::read_to_string(fixture.log_root.join("api.log")).unwrap();
+        let record: Value = serde_json::from_str(text.trim_end()).unwrap();
+        assert_eq!(record["event"], "consume_failed");
+        assert_eq!(record["level"], "warn");
+        assert_eq!(record["category"], "bridge");
+        assert_eq!(record["code"], "response_too_large");
+        assert_eq!(record["cause"], "result_output_too_large");
+        assert_eq!(record["operation"], "action");
+        assert_eq!(record["job_id"], job_id);
+        // A log root that cannot be written is an error the caller reports, not a silence.
+        assert!(
+            record_consume_failure_at(
+                &fixture.log_root.join("missing-root"),
+                uid,
+                &policy,
+                "action",
+                job_id,
+                RESULT_SHAPE_INVALID
+            )
+            .is_err()
+        );
+    }
+
+    /// A CGI blocked on a source that never becomes readable -- what `poll(/dev/random, -1)` is on
+    /// a 3.10 kernel with a drained pool -- is answered by its watchdog with a named 503 for the
+    /// stage it was in, and the process ends, instead of living for the better part of an hour.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_cgi_blocked_on_a_random_source_is_answered_by_its_watchdog() {
+        const CHILD_MODE: &str = "SDSYNC_TEST_CGI_WATCHDOG_CHILD";
+        if std::env::var_os(CHILD_MODE).is_some() {
+            cgi_watchdog::arm(Duration::from_millis(300), false);
+            cgi_watchdog::enter(CgiFailureStage::Authentication);
+            // A pipe whose write end is held open and never written: a stand-in for a random
+            // device that never reports enough entropy.
+            let mut ends = [0; 2];
+            // SAFETY: two live descriptors are returned into `ends`.
+            assert_eq!(unsafe { libc::pipe(ends.as_mut_ptr()) }, 0);
+            let mut poll = libc::pollfd {
+                fd: ends[0],
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            // SAFETY: one live pollfd; -1 waits forever, exactly as getrandom's readiness wait.
+            unsafe { libc::poll(&mut poll, 1, -1) };
+            unreachable!("the blocked source became readable");
+        }
+        let started = Instant::now();
+        let child = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "a_cgi_blocked_on_a_random_source_is_answered_by_its_watchdog",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(CHILD_MODE, "true")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let output = child.wait_with_output().unwrap();
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "the watchdog must end the process: {:?}",
+            started.elapsed()
+        );
+        assert_eq!(output.status.code(), Some(1));
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            stdout.contains("Status: 503 Service Unavailable\r\n"),
+            "{stdout}"
+        );
+        assert!(
+            stdout.contains(r#""code":"cgi_deadline_exceeded""#),
+            "{stdout}"
+        );
+        assert!(
+            stdout.contains(r#""stage":"dsm_authentication""#),
+            "{stdout}"
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("cgi_deadline_exceeded at stage dsm_authentication (response written)"),
+            "{stderr}"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_watchdog_answer_is_a_trusted_named_envelope_for_every_stage() {
+        for stage in [
+            CgiFailureStage::Request,
+            CgiFailureStage::Identity,
+            CgiFailureStage::Authentication,
+            CgiFailureStage::Runtime,
+            CgiFailureStage::BridgeConnect,
+            CgiFailureStage::BridgeIo,
+            CgiFailureStage::BridgeProtocol,
+        ] {
+            let response = CgiResponse::failure(cgi_watchdog::deadline_failure(stage));
+            assert_eq!(response.status, 503);
+            assert!(response.is_trusted_error_envelope(), "{stage:?}");
+            let envelope: Value = serde_json::from_slice(&response.body).unwrap();
+            assert_eq!(envelope["code"], "cgi_deadline_exceeded");
+            assert_eq!(envelope["stage"], stage.as_str());
+            // A read keeps its status inside the envelope, as every other GET failure does.
+            assert_eq!(
+                CgiResponse::failure(cgi_watchdog::deadline_failure(stage))
+                    .for_cgi_transport(true)
+                    .status,
+                200
+            );
+        }
+        // The watchdog and the main thread can never both write a response.
+        assert!(cgi_watchdog::claim_response());
+        assert!(!cgi_watchdog::claim_response());
+    }
+
+    /// A reader that stopped reading costs the bound, not forever.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_response_write_to_a_reader_that_stopped_is_bounded() {
+        let mut ends = [0; 2];
+        // SAFETY: two live descriptors are returned into `ends`.
+        assert_eq!(unsafe { libc::pipe(ends.as_mut_ptr()) }, 0);
+        let started = Instant::now();
+        let written = cgi_watchdog::write_all_bounded(
+            ends[1],
+            &vec![b'x'; 1024 * 1024],
+            Duration::from_millis(200),
+        );
+        assert!(!written);
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "{:?}",
+            started.elapsed()
+        );
+        // A reader that keeps up receives every byte.
+        let reader = std::thread::spawn(move || {
+            use std::os::fd::FromRawFd;
+            // SAFETY: the read end is owned by this thread from here on.
+            let mut file = unsafe { File::from_raw_fd(ends[0]) };
+            let mut sink = Vec::new();
+            file.read_to_end(&mut sink).unwrap();
+            sink.len()
+        });
+        // Drain what the first attempt left first, then write a known amount.
+        let payload = vec![b'y'; 300 * 1024];
+        assert!(cgi_watchdog::write_all_bounded(
+            ends[1],
+            &payload,
+            Duration::from_secs(5)
+        ));
+        // SAFETY: the write end is closed exactly once so the reader sees EOF.
+        unsafe { libc::close(ends[1]) };
+        assert!(reader.join().unwrap() >= payload.len());
+    }
+
+    #[test]
+    fn a_post_body_that_stops_arriving_is_named() {
+        struct Stalled;
+        impl Read for Stalled {
+            fn read(&mut self, _buffer: &mut [u8]) -> io::Result<usize> {
+                Err(io::Error::new(io::ErrorKind::TimedOut, "stalled"))
+            }
+        }
+        let error = read_exact_body(&mut Stalled, 10).unwrap_err();
+        assert_eq!(error, REQUEST_BODY_TIMEOUT);
+        let response = CgiResponse::failure(CgiFailure::new(CgiFailureStage::Request, error));
+        assert_eq!(response.status, 400);
+        let envelope: Value = serde_json::from_slice(&response.body).unwrap();
+        assert_eq!(envelope["code"], "request_body_timeout");
+        // Any other read failure is the malformed request it always was.
+        struct Broken;
+        impl Read for Broken {
+            fn read(&mut self, _buffer: &mut [u8]) -> io::Result<usize> {
+                Err(io::Error::other("broken"))
+            }
+        }
+        assert_eq!(
+            read_exact_body(&mut Broken, 10).unwrap_err(),
+            BridgeError::bad_request()
+        );
+    }
+
+    /// The CGI defers DSM 7's loopback authentication to the service and builds no TLS client;
+    /// the relay carries no identity for it to be trusted with, and a half-filled one is refused.
+    #[test]
+    fn a_loopback_relay_carries_no_identity_and_the_cgi_builds_no_tls_client() {
+        let body = request("remove-profile", json!({"name":"nightly"}));
+        let environment = post_environment(body.len());
+        let encoded = encode_loopback_relay_request(&environment, Some(&body)).unwrap();
+        let document: Value = serde_json::from_slice(&encoded).unwrap();
+        assert_eq!(document["loopback_authentication"], true);
+        assert_eq!(document["authenticated_username"], "");
+        assert_eq!(document["authenticated_uid"], 0);
+        assert_eq!(document["session_binding"], "");
+        let relay = decode_relay_request(&encoded).unwrap();
+        assert!(relay.loopback_authentication);
+        let (validated, relayed) = validate_relay_http_request(&relay).unwrap();
+        assert!(matches!(validated, ValidatedHttpRequest::Post { .. }));
+        assert_eq!(relayed, Some(body.as_slice()));
+
+        // An authenticated relay is the document it always was.
+        let authenticated =
+            encode_relay_request(&environment, Some(&body), &authenticated_session()).unwrap();
+        let document: Value = serde_json::from_slice(&authenticated).unwrap();
+        assert!(document.get("loopback_authentication").is_none());
+
+        let mut half = decode_relay_request(&encoded).unwrap();
+        half.authenticated_username = "admin".to_owned();
+        assert!(half.validate_fields().is_err());
+        let mut half = decode_relay_request(&encoded).unwrap();
+        half.authenticated_uid = 1000;
+        assert!(half.validate_fields().is_err());
+        let mut claimed = decode_relay_request(&authenticated).unwrap();
+        claimed.loopback_authentication = true;
+        assert!(claimed.validate_fields().is_err());
+
+        // Structural: the CGI path names no loopback query and no client builder.
+        let source = include_str!("dsm_api.rs");
+        let cgi = &source[source
+            .find("\nfn run_cgi() -> Result<CgiResponse, CgiFailure> {")
+            .unwrap()..];
+        let cgi = &cgi[..cgi.find("\n}\n").unwrap()];
+        for forbidden in [
+            "query_dsm_user_service",
+            "blocking_client_builder",
+            "reqwest",
+            "authenticate_relayed_via_dsm_user_service",
+        ] {
+            assert!(
+                !cgi.contains(forbidden),
+                "run_cgi must not reach {forbidden}"
+            );
+        }
+        assert!(cgi.contains("authenticate_or_defer_cgi"));
+        let defer = &source[source
+            .find("pub(super) fn authenticate_or_defer_cgi(")
+            .unwrap()..];
+        let defer = &defer[..defer.find("\n    }\n").unwrap()];
+        assert!(defer.contains("AuthenticationHelperSelection::Loopback => return Ok(None),"));
+        assert!(!defer.contains("query_dsm_user_service"));
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn queued_mutation_cancellation_is_group_safe_without_subreaper() {
@@ -31561,6 +33136,65 @@ mod tests {
         assert!(decode_relay_response(&invalid_status).is_err());
     }
 
+    /// The page's build reaches the service through the relay, a page that sends none relays the
+    /// document it always did, and only the build this bridge is accepts a mutation.
+    #[test]
+    fn a_mutation_from_another_dashboard_build_is_refused_as_stale() {
+        let body = request("remove-profile", json!({"name":"nightly"}));
+        let current = post_environment(body.len());
+        let encoded =
+            encode_relay_request(&current, Some(&body), &authenticated_session()).unwrap();
+        let relay = decode_relay_request(&encoded).unwrap();
+        let (validated, _) = validate_relay_http_request(&relay).unwrap();
+        let ValidatedHttpRequest::Post { build, .. } = validated else {
+            panic!("a POST must validate as a POST");
+        };
+        assert_eq!(build.as_deref(), Some(DASHBOARD_BUILD));
+        assert_eq!(require_dashboard_build(build.as_deref()), Ok(()));
+
+        let mut legacy = post_environment(body.len());
+        legacy.build_header = None;
+        let encoded = encode_relay_request(&legacy, Some(&body), &authenticated_session()).unwrap();
+        let document: Value = serde_json::from_slice(&encoded).unwrap();
+        assert!(
+            document.get("build_header").is_none(),
+            "a page without the header relays the document it always did"
+        );
+        let relay = decode_relay_request(&encoded).unwrap();
+        let (validated, _) = validate_relay_http_request(&relay).unwrap();
+        let ValidatedHttpRequest::Post { build, .. } = validated else {
+            panic!("a POST must validate as a POST");
+        };
+        assert_eq!(build, None);
+        for stale in [None, Some(""), Some("0"), Some("2"), Some(" 1")] {
+            let refused = require_dashboard_build(stale).unwrap_err();
+            assert_eq!(refused, UI_BUILD_STALE, "{stale:?}");
+            assert_eq!(refused.kind, ErrorKind::Conflict);
+            assert_eq!(rejected_post_reason(refused), "ui_build_stale");
+            let response =
+                CgiResponse::failure(CgiFailure::new(CgiFailureStage::ServiceRequest, refused));
+            assert_eq!(response.status, 409);
+            let envelope: Value = serde_json::from_slice(&response.body).unwrap();
+            assert_eq!(envelope["code"], "ui_build_stale");
+        }
+        // An empty header is absent, and an oversized one is a malformed request.
+        let mut empty = post_environment(body.len());
+        empty.build_header = Some(String::new());
+        let ValidatedHttpRequest::Post { build, .. } = validate_http_request(empty).unwrap() else {
+            panic!("a POST must validate as a POST");
+        };
+        assert_eq!(build, None);
+        let mut oversized = decode_relay_request(
+            &encode_relay_request(&current, Some(&body), &authenticated_session()).unwrap(),
+        )
+        .unwrap();
+        oversized.build_header = Some("1".repeat(MAX_BUILD_HEADER_BYTES + 1));
+        assert_eq!(
+            oversized.validate_fields().unwrap_err().kind,
+            ErrorKind::BadRequest
+        );
+    }
+
     #[test]
     fn relay_reconstructs_and_revalidates_raw_http_fields_and_secret_body() {
         let secret = "socket-secret-value";
@@ -32472,6 +34106,147 @@ mod tests {
             .unwrap_err()
             .kind,
             ErrorKind::UnsafeRuntime
+        );
+    }
+
+    /// A rejected mutation's Activity row names its reason and, when the refused body named one,
+    /// its client request ID. The verifier proves exactly that row, or the untagged row a writer
+    /// that predates the tag leaves, and never a row naming a different reason.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn durable_audit_verification_proves_a_tagged_rejection_row() {
+        let fixture = TestControlFixture::new("durable-audit-rejection");
+        let package_uid = TestControlFixture::package_uid();
+        let log_root = fixture.root.join("logs");
+        fs::create_dir(&log_root).unwrap();
+        fs::set_permissions(&log_root, fs::Permissions::from_mode(0o700)).unwrap();
+        let audit_log = log_root.join("audit.log");
+        let activity_log = log_root.join("activity.log");
+        let (owner_pid, owner_start, owner_boot) = linux_files::current_process_identity().unwrap();
+        let transaction = format!("bridge-{JOB_ID}");
+        let record = AuditOutboxRecord {
+            schema: "sdsync.dsm-audit-outbox.v1".to_owned(),
+            transaction: transaction.clone(),
+            operation: "rejected-post".to_owned(),
+            profile: "all".to_owned(),
+            actor: "admin".to_owned(),
+            actor_uid: package_uid.max(1),
+            origin: "bridge".to_owned(),
+            client_request_id: None,
+            job_id: None,
+            owner_pid,
+            owner_start,
+            owner_boot,
+            phase: AuditOutboxPhase::Failed,
+        };
+        let audit = serde_json::to_string(&json!({
+            "epoch": 10_000, "level": "error", "configured_level": "info", "subject_level": "info",
+            "mandatory": true, "category": "audit", "subject_category": "bridge",
+            "operation": "rejected-post", "state": "failed", "transaction": transaction,
+            "origin": "bridge", "actor": "admin", "actor_uid": record.actor_uid, "profile": "all",
+        }))
+        .unwrap();
+        fixture.write_private(&audit_log, format!("{audit}\n").as_bytes());
+        let tag = rejected_post_activity_tag(Some("csrf_rejected"), Some(REQUEST_ID))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            tag,
+            format!(" reason=csrf_rejected request_id={REQUEST_ID}")
+        );
+        let row = |message: &str| {
+            format!(
+                "10000|audit.failed|all|failed|audit|error|{}|admin|{message}\n",
+                record.actor_uid
+            )
+        };
+        let verify = |rejection_tag: Option<&str>| {
+            linux_files::durably_verify_tagged_audit_event_at(
+                &record,
+                "failed",
+                package_uid,
+                rejection_tag,
+                &log_root,
+                &audit_log,
+                &activity_log,
+            )
+        };
+        let base = format!("Module rejected-post failed [{transaction}]");
+        fixture.write_private(&activity_log, row(&format!("{base}{tag}")).as_bytes());
+        verify(Some(&tag)).unwrap();
+        // The tag is only ever the exact one this rejection carries.
+        assert_eq!(verify(None).unwrap_err().kind, ErrorKind::UnsafeRuntime);
+        let other = rejected_post_activity_tag(Some("forbidden"), None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            verify(Some(&other)).unwrap_err().kind,
+            ErrorKind::UnsafeRuntime
+        );
+        // A writer that predates the tag still has its refusals proven.
+        fs::remove_file(&activity_log).unwrap();
+        fixture.write_private(&activity_log, row(&base).as_bytes());
+        verify(Some(&tag)).unwrap();
+        verify(None).unwrap();
+    }
+
+    #[test]
+    fn a_rejected_mutation_names_a_bounded_reason_and_a_well_formed_request_id() {
+        assert_eq!(
+            rejected_post_reason(BridgeError::new(ErrorKind::CsrfRejected)),
+            "csrf_rejected"
+        );
+        assert_eq!(
+            rejected_post_reason(BridgeError::new(ErrorKind::Forbidden)),
+            "forbidden"
+        );
+        assert_eq!(
+            rejected_post_reason(BridgeError::new(ErrorKind::Unavailable)),
+            "service_request_unavailable"
+        );
+        assert_eq!(
+            rejected_post_reason(BridgeError::unavailable_because("control_lock_busy")),
+            "control_lock_busy"
+        );
+        assert_eq!(
+            rejected_post_reason(BridgeError::unavailable_because("manager_timeout")),
+            "unclassified",
+            "a code outside the list is named unclassified, never dropped"
+        );
+        for reason in REJECTED_POST_REASONS {
+            assert!(
+                !reason.is_empty()
+                    && reason.len() <= 64
+                    && reason
+                        .bytes()
+                        .all(|byte| byte.is_ascii_lowercase() || byte == b'_'),
+                "{reason}"
+            );
+        }
+
+        let body = format!(r#"{{"schema":"old","request_id":"{REQUEST_ID}","operation":"gone"}}"#);
+        assert_eq!(
+            rejected_post_request_id(Some(body.as_bytes())).as_deref(),
+            Some(REQUEST_ID),
+            "the ID is read even when the rest of the request is what failed"
+        );
+        for refused in [
+            &br#"{"request_id":"short"}"#[..],
+            br#"{"request_id":7}"#,
+            b"not json",
+            br#"{"operation":"configure-profile"}"#,
+        ] {
+            assert_eq!(rejected_post_request_id(Some(refused)), None);
+        }
+        assert_eq!(rejected_post_request_id(None), None);
+
+        assert_eq!(rejected_post_activity_tag(None, None), Ok(None));
+        assert!(rejected_post_activity_tag(None, Some(REQUEST_ID)).is_err());
+        assert!(rejected_post_activity_tag(Some("made_up"), None).is_err());
+        assert!(rejected_post_activity_tag(Some("forbidden"), Some("short")).is_err());
+        assert_eq!(
+            rejected_post_activity_tag(Some("forbidden"), None),
+            Ok(Some(" reason=forbidden".to_owned()))
         );
     }
 

@@ -142,7 +142,7 @@
               </div>
             </div>
 
-            <ul v-if="attentionItems.length" class="sdsync-attention" role="status" aria-label="Run outcomes needing attention"><li v-for="item in attentionItems" :key="item.id" :class="'is-' + item.level"><strong>{{ item.title }}</strong> <span>{{ item.detail }}</span></li></ul>
+            <ul v-if="attentionItems.length" class="sdsync-attention" role="status" aria-label="Run outcomes needing attention"><li v-for="item in attentionItems" :key="item.id" :class="'is-' + item.level"><strong>{{ item.title }}</strong> <span>{{ item.detail }}</span><details v-if="item.raw"><summary>Technical detail</summary><code>{{ item.raw }}</code></details></li></ul>
             <details v-if="runStderrView" class="sdsync-run-stderr"><summary>Core error output of the last run<span v-if="runStderrView.error"> (could not be read)</span></summary><p v-if="runStderrView.error" class="is-fail">{{ runStderrView.error }}</p><pre v-else>{{ runStderrView.text }}</pre></details>
             <div class="sdsync-metrics" aria-label="Package summary">
               <article><span>Profiles</span><strong>{{ snapshotRead ? profiles.length : 'Not read' }}</strong><small>{{ snapshotRead ? readyProfileCount + ' with protected password material' : 'Waiting for the package status' }}</small></article>
@@ -298,7 +298,7 @@
               <article v-if="!routineEditorOpen" key="routine-catalog" class="sdsync-panel sdsync-routine-catalog">
                 <div class="sdsync-panel-heading"><div><p class="sdsync-eyebrow">Configured routines</p><h3>Per-profile automation</h3></div><span class="sdsync-mini-badge">{{ routines.length }} total</span></div>
                 <p v-if="!routines.length" class="sdsync-empty">{{ routinesEmptyText }}</p>
-                <button v-for="routine in routines" :key="routine.profile" type="button" :class="['sdsync-routine-row', { 'is-selected': selectedRoutine && selectedRoutine.profile === routine.profile }]" :title="'Edit routine for ' + routine.profile" :disabled="operationBusy" @click="openRoutine(routine.profile)"><span><strong><action-icon name="edit" />&nbsp;<bdi>{{ shownName(routine.profile) }}</bdi></strong><small>{{ routine.mode || 'interval' }} · {{ routine.backend || 'fallback unreported' }} · {{ routine.state || (routine.enabled ? 'enabled' : 'disabled') }}{{ routine.backend_reason && routine.backend_reason !== 'ok' ? ' · ' + routine.backend_reason : '' }}</small></span><time>{{ routineNextRunLabel(routine) }}</time></button>
+                <button v-for="routine in routines" :key="routine.profile" type="button" :class="['sdsync-routine-row', { 'is-selected': selectedRoutine && selectedRoutine.profile === routine.profile }]" :title="'Edit routine for ' + routine.profile" :disabled="operationBusy" @click="openRoutine(routine.profile)"><span><strong><action-icon name="edit" />&nbsp;<bdi>{{ shownName(routine.profile) }}</bdi></strong><small>{{ routine.mode || 'interval' }} · {{ routine.backend || 'fallback unreported' }} · {{ routine.state || (routine.enabled ? 'enabled' : 'disabled') }}{{ routine.backend_reason && routine.backend_reason !== 'ok' ? ' · ' + routine.backend_reason : '' }}{{ routine.observe_state === 'blind' ? ' · blind' : (routine.observe_state === 'degraded' ? ' · partly observed' : '') }}</small></span><time>{{ routineNextRunLabel(routine) }}</time></button>
               </article>
               <v-form v-else key="routine-editor" v-model="routineForm" class="sdsync-panel sdsync-editor sdsync-horizontal-form sdsync-routine-editor" direction="horizontal" @submit="saveRoutine">
                     <div class="sdsync-panel-heading"><div><p class="sdsync-eyebrow">Routine editor</p><h3>{{ selectedRoutine ? 'Edit ' + selectedRoutine.profile : 'New profile routine' }}</h3></div><v-button type="border" display="icon-text" tooltip="Close the routine editor and discard unsaved values" @click="closeRoutine"><template #icon><action-icon name="close" /></template>Close</v-button></div>
@@ -316,6 +316,7 @@
                       <div v-if="routineForm.mode === 'realtime' && selectedRoutine" class="sdsync-form-item span-2">
                         <p class="sdsync-field-note">Realtime status: {{ selectedRoutine.backend || 'none' }} · {{ selectedRoutine.state || (selectedRoutine.enabled ? 'enabled' : 'disabled') }}{{ selectedRoutine.backend_reason && selectedRoutine.backend_reason !== 'ok' ? ' · ' + selectedRoutine.backend_reason : '' }} · last poll {{ formatDate(selectedRoutine.last_poll_epoch) }}</p>
                         <p v-if="selectedRoutine.backend_reason && selectedRoutine.backend_reason !== 'ok'" class="sdsync-field-note">{{ realtimeReasonGuidance(selectedRoutine.backend_reason) }}</p>
+                        <p class="sdsync-field-note">Observation: {{ routineObservation(selectedRoutine) }}</p>
                       </div>
                       <v-form-item class="sdsync-form-item sdsync-inline-form-item" label="Retry attempts" label-flex="0 0 150px" control-flex="1 1 auto"><template #label-after><control-help class="sdsync-form-label-help" help-key="routine-retries" /></template><v-input class="sdsync-input-control" v-model="routineForm.retry_count" number-only aria-describedby="sdsync-help-routine-retries" :disabled="!canChangeRoutines" /></v-form-item>
                       <v-form-item class="sdsync-form-item sdsync-inline-form-item" label="Retry backoff (seconds)" label-flex="0 0 150px" control-flex="1 1 auto"><template #label-after><control-help class="sdsync-form-label-help" help-key="routine-backoff" /></template><v-input class="sdsync-input-control" v-model="routineForm.retry_backoff_seconds" number-only min="10" max="300" aria-describedby="sdsync-help-routine-backoff" :disabled="!canChangeRoutines" /></v-form-item>
@@ -473,7 +474,7 @@
 
           <section v-else-if="route === 'activity'" class="sdsync-page" aria-labelledby="sdsync-page-title">
             <div class="sdsync-page-actions"><v-button suffix="grey" display="icon-text" tooltip="Pause or resume browser-side log refreshes" @click="toggleLogs"><template #icon><action-icon :name="logsPaused ? 'run' : 'pause'" /></template>{{ logsPaused ? 'Resume live updates' : 'Pause live updates' }}</v-button><v-button suffix="grey" display="icon-text" tooltip="Clear only this rendered view; package logs remain intact" @click="clearLogView"><template #icon><action-icon name="clear" /></template>Clear view</v-button></div>
-            <ul v-if="attentionItems.length" class="sdsync-attention" role="status" aria-label="Run outcomes needing attention"><li v-for="item in attentionItems" :key="item.id" :class="'is-' + item.level"><strong>{{ item.title }}</strong> <span>{{ item.detail }}</span></li></ul>
+            <ul v-if="attentionItems.length" class="sdsync-attention" role="status" aria-label="Run outcomes needing attention"><li v-for="item in attentionItems" :key="item.id" :class="'is-' + item.level"><strong>{{ item.title }}</strong> <span>{{ item.detail }}</span><details v-if="item.raw"><summary>Technical detail</summary><code>{{ item.raw }}</code></details></li></ul>
             <ul v-if="feedProblem" class="sdsync-attention sdsync-feed-problem" role="alert" aria-label="Activity feed problem"><li class="is-fail"><strong>Activity feed unavailable</strong> <span>{{ feedProblem }}</span></li></ul>
             <p class="sdsync-field-note">{{ activityHistoryNote }}</p>
             <div class="sdsync-subtabs" data-subtabs="activity" role="tablist" aria-label="Activity views" @keydown="moveSubtab('activityTab', activityTabs, $event)">
@@ -493,7 +494,7 @@
                   <article class="sdsync-panel">
                     <div class="sdsync-panel-heading">
                       <div><p class="sdsync-eyebrow">Structured activity</p><h3>Recent package events</h3></div>
-                      <div class="sdsync-evidence-heading-actions"><span class="sdsync-freshness">{{ reversedActivity.length }} of {{ activityLensTotal }} event{{ activityLensTotal === 1 ? '' : 's' }}</span><v-button type="border" display="icon-text" aria-label="Copy all visible activity events" tooltip="Copy the filtered activity events as bounded, sanitized troubleshooting text" :disabled="!reversedActivity.length" @click="copyVisibleActivity"><template #icon><action-icon name="copy" /></template>Copy visible</v-button></div>
+                      <div class="sdsync-evidence-heading-actions"><span class="sdsync-freshness">{{ reversedActivity.length }} of {{ activityLensTotal }} event{{ activityLensTotal === 1 ? '' : 's' }}</span><v-button type="border" display="icon-text" aria-label="Group activity by run or show every event" tooltip="Fold each run's rows into one row with its outcome, or draw every event; failures are always drawn" :disabled="!reversedActivity.length" @click="toggleActivityGrouping">{{ activityGroupingLabel() }}</v-button><v-button type="border" display="icon-text" aria-label="Copy all visible activity events" tooltip="Copy the filtered activity events as bounded, sanitized troubleshooting text" :disabled="!reversedActivity.length" @click="copyVisibleActivity"><template #icon><action-icon name="copy" /></template>Copy visible</v-button></div>
                     </div>
                     <p v-if="nasTimeNote" class="sdsync-field-note">{{ nasTimeNote }}</p>
                     <div class="sdsync-filter-list" aria-label="Activity filters">
@@ -501,7 +502,7 @@
                       <div class="sdsync-filter-row"><span class="sdsync-filter-label">Category</span><div class="sdsync-filter-control"><v-single-select class="sdsync-select-control" v-model="activityCategory" :options="activityLensCategoryOptions" width="100%" :custom-dropdown-cls="'sdsync-select-dropdown ' + themeClass" aria-label="Activity category" aria-describedby="sdsync-help-activity-category"><template #dropdown-icon><action-icon name="chevron-down" /></template></v-single-select><control-help help-key="activity-category" /></div></div>
                       <div class="sdsync-filter-row"><span class="sdsync-filter-label">Level</span><div class="sdsync-filter-control"><v-single-select class="sdsync-select-control" v-model="activityLevel" :options="activityLevelOptions" width="100%" :custom-dropdown-cls="'sdsync-select-dropdown ' + themeClass" aria-label="Activity level" aria-describedby="sdsync-help-activity-level"><template #dropdown-icon><action-icon name="chevron-down" /></template></v-single-select><control-help help-key="activity-level" /></div></div>
                     </div>
-                    <ol class="sdsync-activity-feed"><li v-if="!reversedActivity.length" class="sdsync-empty">{{ activityEmptyText }}</li><li v-for="event in shownActivity" :key="event.rowKey"><time>{{ formatDate(event.epoch) }}{{ nasTimeSuffix(event.epoch) }}</time><div class="sdsync-activity-detail"><strong>{{ event.code }}</strong><p v-if="event.message && !event.doctor_inventory">{{ event.message }}</p><div v-if="event.doctor_inventory" class="sdsync-inventory-evidence"><div class="sdsync-inventory-evidence-summary"><strong>{{ doctorInventoryScopeLabel(event.doctor_inventory.inventory.scope) }}</strong><span>{{ event.doctor_inventory.inventory.total }} total · {{ event.doctor_inventory.inventory.entries.length }} shown<span v-if="event.doctor_inventory.inventory.truncated"> · truncated</span></span></div><p v-if="!event.doctor_inventory.inventory.entries.length">No logical entries were visible.</p><div v-for="(entry, index) in event.doctor_inventory.inventory.entries" :key="entry.path + ':' + index" class="sdsync-inventory-evidence-entry"><span>{{ entry.kind }}</span><code>{{ entry.path }}</code><small>{{ entry.name }}</small></div></div><code v-if="event.client_request_id">Client request ID: {{ event.client_request_id }}</code></div><small><bdi>{{ shownName(event.profile) }}</bdi> · {{ event.state }} · {{ event.category }} / {{ event.level }}</small><v-button class="sdsync-evidence-copy" type="border" display="icon-text" :aria-label="'Copy activity event ' + event.code" tooltip="Copy this event as bounded, sanitized troubleshooting text" @click="copyActivityEvent(event)"><template #icon><action-icon name="copy" /></template>Copy</v-button></li><li v-if="activityHiddenCount" class="sdsync-empty sdsync-activity-more"><span>{{ activityMoreLabel }}</span> <v-button type="border" display="icon-text" tooltip="Draw the next 200 older events" @click="showMoreActivity">Show older</v-button></li></ol>
+                    <ol class="sdsync-activity-feed"><li v-if="!reversedActivity.length" class="sdsync-empty">{{ activityEmptyText }}</li><li v-for="event in shownActivity" :key="event.rowKey"><time>{{ formatDate(event.epoch) }}{{ nasTimeSuffix(event.epoch) }}</time><div class="sdsync-activity-detail"><strong>{{ event.code }}</strong><p v-if="event.message && !event.doctor_inventory">{{ event.message }}</p><p v-if="event.rejection_reason">{{ rejectionReasonText(event.rejection_reason) }}</p><div v-if="event.doctor_inventory" class="sdsync-inventory-evidence"><div class="sdsync-inventory-evidence-summary"><strong>{{ doctorInventoryScopeLabel(event.doctor_inventory.inventory.scope) }}</strong><span>{{ event.doctor_inventory.inventory.total }} total · {{ event.doctor_inventory.inventory.entries.length }} shown<span v-if="event.doctor_inventory.inventory.truncated"> · truncated</span></span></div><p v-if="!event.doctor_inventory.inventory.entries.length">No logical entries were visible.</p><div v-for="(entry, index) in event.doctor_inventory.inventory.entries" :key="entry.path + ':' + index" class="sdsync-inventory-evidence-entry"><span>{{ entry.kind }}</span><code>{{ entry.path }}</code><small>{{ entry.name }}</small></div></div><code v-if="event.client_request_id">Client request ID: {{ event.client_request_id }}</code><v-button v-if="event.fold" type="border" display="icon-text" :aria-label="activityFoldLabel(event.fold)" tooltip="Draw or hide the rows this run folds; failures are drawn either way" @click="toggleActivityFold(event.fold.key)">{{ activityFoldLabel(event.fold) }}</v-button></div><small><bdi>{{ shownName(event.profile) }}</bdi> · {{ event.state }} · {{ event.category }} / {{ event.level }}</small><v-button class="sdsync-evidence-copy" type="border" display="icon-text" :aria-label="'Copy activity event ' + event.code" tooltip="Copy this event as bounded, sanitized troubleshooting text" @click="copyActivityEvent(event)"><template #icon><action-icon name="copy" /></template>Copy</v-button></li><li v-if="activityHiddenCount" class="sdsync-empty sdsync-activity-more"><span>{{ activityMoreLabel }}</span> <v-button type="border" display="icon-text" tooltip="Draw the next 200 older events" @click="showMoreActivity">Show older</v-button></li></ol>
                   </article>
                 </div>
               </transition>
@@ -705,6 +706,7 @@ import {
   SYNC_STATUS_MAX_LIMIT,
   apiGet,
   apiPost,
+  csrfTokenStale,
   trustedRequestProgress,
   probeRequestOutcome,
   purgeReconciliationAuth,
@@ -883,11 +885,14 @@ const BRIDGE_FAILURE_COPY = Object.freeze({
     cause: "the UI and package versions differ",
     retry: "backoff"
   }),
+  // Stops only after three in a row: a one-off read that raced a writer is
+  // looked at again rather than freezing the window (`stopAfter`).
   config_file_unsafe: Object.freeze({
     title: "Package file permissions are unsafe",
     message: "A package file has unexpected ownership or permissions. Repair the package rather than changing the file yourself.",
     cause: "a package file has unexpected ownership or permissions",
-    retry: "stop"
+    retry: "stop",
+    stopAfter: 3
   }),
   // Kind Unavailable, but it does not clear on its own: a stored record stays
   // unparseable until the file rotates or is cleared, so polling through it
@@ -904,7 +909,121 @@ const BRIDGE_FAILURE_COPY = Object.freeze({
     message: "The NAS clock is not set correctly. Correct the system time, then retry.",
     cause: "the NAS clock is not set correctly",
     retry: "stop"
+  }),
+  // This window's own read limit, not the package's verdict: the NAS is busy,
+  // or a request is stuck. Not "confirm the package is running", which is what
+  // it used to read as, and changes stay available (KEEP_SESSION_FAILURES).
+  client_timeout: Object.freeze({
+    title: "Package is slow to answer",
+    message: "The package did not answer within 10 seconds: the NAS is busy, or a request is stuck. Retrying; your changes stay available.",
+    cause: "the package did not answer within 10 seconds",
+    retry: "backoff"
+  }),
+  // The package's own CGI gave up on a request at its deadline and recorded
+  // the stage it was in.
+  cgi_deadline_exceeded: Object.freeze({
+    title: "Package request timed out",
+    message: "The package's web handler gave up on a request at its deadline and recorded the stage in the package API log. Retrying; your changes stay available.",
+    cause: "a package request timed out",
+    retry: "backoff"
   })
+});
+// Read failures that say the NAS was slow, not that the session or package is
+// gone: the first two in a row keep the mutation token and the connected state,
+// so one slow read does not lock every edit until the next good poll.
+const KEEP_SESSION_FAILURES = Object.freeze(["client_timeout", "cgi_deadline_exceeded"]);
+// Why a package file was refused, by the check the package names (B7).
+const UNSAFE_FILE_CHECK_COPY = Object.freeze({
+  open: "it could not be opened",
+  type: "it is a link or not a regular file",
+  owner: "it is not owned by the package user",
+  mode: "its permissions are not 600",
+  links: "it has a second hard link",
+  size: "it is larger than the package ever writes",
+  length: "it kept changing length while it was read",
+  read: "it could not be read",
+  list: "its folder could not be listed"
+});
+
+// Whether a named failure has stood the poll down: `retry: "stop"`, and for a
+// row with `stopAfter`, only once that many have come in a row.
+function bridgeFailureStopped(named, streak) {
+  if (!named || named.retry !== "stop") return false;
+  return !(named.stopAfter > 0 && Number(streak) < named.stopAfter);
+}
+// What a mutation the bridge refused before queueing it means, keyed by the code
+// of its error envelope. That is also the code its Activity row names as
+// `reason=` (REJECTED_POST_REASONS in dsm_api.rs; test_synology_ui.py compares
+// the two lists), so every reason the package can record has words here.
+//   `title`/`message` are the toast for a refusal answered with a 4xx. A 503
+//     keeps BRIDGE_FAILURE_COPY and its retry ladder, so those rows carry no toast.
+//   `activity` finishes the Activity row's sentence "Dashboard change refused: ...".
+//   `reload` marks the refusal only a reload clears; it also takes the header.
+// The bridge's own envelope message for all of these is the constant "Request
+// could not be completed.", which is why the toast used to be unable to tell a
+// policy refusal from a malformed request from a full queue.
+const POST_REJECTION_COPY = Object.freeze({
+  invalid_request: Object.freeze({
+    title: "Request not accepted",
+    message: "The installed package does not accept the request this page sent, so nothing was changed. Reload the app, then submit again.",
+    activity: "the request was malformed or does not match the installed package"
+  }),
+  unauthorized: Object.freeze({
+    title: "DSM sign-in required",
+    message: "DSM no longer recognises this session, so nothing was changed. Sign in to DSM again, then submit again.",
+    activity: "the DSM session was not authenticated"
+  }),
+  forbidden: Object.freeze({
+    title: "Refused by the security policy",
+    message: "The package security policy does not allow this change, so nothing was changed. Review Settings > Security, then submit again.",
+    activity: "the security policy does not allow this change"
+  }),
+  csrf_rejected: Object.freeze({
+    title: "Mutation token rejected",
+    message: "The request carried an expired mutation token or one from another session, so nothing was changed. Select Retry, then submit again.",
+    activity: "its mutation token was expired or belonged to another session"
+  }),
+  ui_build_stale: Object.freeze({
+    title: "This page is out of date",
+    message: "This page was loaded from an older version of the package, so nothing was changed. Reload the app (close and reopen it, or refresh the browser tab), then submit again.",
+    activity: "the page that sent it was loaded from an older package version",
+    reload: true
+  }),
+  method_not_allowed: Object.freeze({
+    title: "Request not accepted",
+    message: "The package does not accept this kind of request, so nothing was changed. Reload the app, then submit again.",
+    activity: "it used a request method the package does not accept"
+  }),
+  unsupported_media_type: Object.freeze({
+    title: "Request not accepted",
+    message: "The package accepts only JSON requests, so nothing was changed. Reload the app, then submit again.",
+    activity: "it was not a JSON request"
+  }),
+  payload_too_large: Object.freeze({
+    title: "Request too large",
+    message: "This change is larger than the package accepts, so nothing was changed. Shorten it, then submit again.",
+    activity: "it was larger than the package accepts"
+  }),
+  conflict: Object.freeze({
+    title: "Request conflicts with queued work",
+    message: "Another change with the same request ID, or a full queue, refused this one, so nothing was changed. Wait for queued work to finish, then submit again.",
+    activity: "it conflicted with queued work, or the queue was full"
+  }),
+  internal_error: Object.freeze({
+    title: "Package failed before queueing",
+    message: "The package failed internally before queueing this change, so nothing was changed. Inspect the package API log.",
+    activity: "the package failed internally before queueing it"
+  }),
+  unavailable: Object.freeze({ activity: "the package service was unavailable" }),
+  service_request_unavailable: Object.freeze({ activity: "the package service was unavailable" }),
+  control_lock_busy: Object.freeze({ activity: "the package was busy recording another change" }),
+  runtime_closed: Object.freeze({ activity: "the package was stopping or upgrading" }),
+  runtime_upgrading: Object.freeze({ activity: "the package was upgrading" }),
+  runtime_uninstalling: Object.freeze({ activity: "the package was being removed" }),
+  runtime_marker_unsafe: Object.freeze({ activity: "the package could not confirm it was running normally" }),
+  clock_unavailable: Object.freeze({ activity: "the NAS clock was not set correctly" }),
+  job_unreadable: Object.freeze({ activity: "the queued request could not be read" }),
+  unclassified: Object.freeze({ activity: "for a reason this page has no words for; the package API log names it" })
 });
 // Which bounded package logs the dashboard may empty. The audit log is absent
 // on purpose and the bridge refuses it independently: it is the record of who
@@ -1465,6 +1584,7 @@ function probeableIncidents(component) {
 // reaped, and those two differ in exactly the way that matters before a retry.
 const PROBE_VERDICT_COPY = Object.freeze({
   settled: "DSM holds a completed record for this exact request.",
+  rejected: "DSM refused this exact request before queueing it, so it was not performed. Activity names the reason.",
   accepted: "DSM accepted this request and its job is still running.",
   unknown: "The package recorded this request's own outcome as unknown.",
   absent: "Neither the package queue nor Activity holds any record of this request ID. That does not confirm it never ran: a completed job's record is eventually reaped, so this stays locked.",
@@ -1829,7 +1949,12 @@ function settingsFromStoredValue(storedValue) {
     if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return fallback;
     return {
       theme: ["dark", "light", "system"].includes(parsed.theme) ? parsed.theme : fallback.theme,
-      status_refresh: [0, 1000, 3000, 5000, 10000, 30000].includes(Number(parsed.status_refresh)) ? Number(parsed.status_refresh) : fallback.status_refresh,
+      // A stored 1000 is the "Every second" option this window no longer offers
+      // (the validator never accepted it, yet it polled at 1 s and blocked every
+      // other Interface save); it becomes the default 5 seconds.
+      status_refresh: Number(parsed.status_refresh) === 1000
+        ? 5000
+        : ([0, 3000, 5000, 10000, 30000].includes(Number(parsed.status_refresh)) ? Number(parsed.status_refresh) : fallback.status_refresh),
       log_refresh: [0, 5000, 10000, 30000].includes(Number(parsed.log_refresh)) ? Number(parsed.log_refresh) : fallback.log_refresh,
       desktop_notifications: parsed.desktop_notifications === true,
       audible: parsed.audible === true
@@ -1845,6 +1970,16 @@ function loadSettings() {
   } catch (_error) {
     return defaults();
   }
+}
+
+// The settings as the Interface form binds them: the two refresh cadences as
+// the strings their selects offer. Stored and sent as numbers.
+function selectableSettings(settings) {
+  const shown = Object.assign({}, settings);
+  for (const key of ["status_refresh", "log_refresh"]) {
+    if (shown[key] !== undefined && shown[key] !== null) shown[key] = String(Number(shown[key]) || 0);
+  }
+  return shown;
 }
 
 function utf8ByteLength(value) {
@@ -1933,6 +2068,49 @@ const REALTIME_REASON_GUIDANCE = Object.freeze({
   poll_unreadable: "Part of the source could not be read during the last poll. Fix permissions on the unreadable subtree; the readable part is still observed.",
   poll_unavailable: "The last poll of the source failed outright. Confirm the source path is reachable and readable."
 });
+// What observes a routine, from the six fields both engines write to its
+// state (`watching_via`, `observe_state`, `observe_cause`,
+// `observe_since_epoch`, `last_trigger_epoch`, `last_run_epoch`; a package that
+// predates them reads as ok and watching via nothing). This is what tells
+// "no run for two days" apart: idle and watching, or blind since a time.
+const ROUTINE_OBSERVATION_COPY = Object.freeze({
+  via: Object.freeze({ native: "native events", poll: "polling", schedule: "the schedule", none: "nothing" }),
+  causes: Object.freeze({
+    poll_walk_timeout: "the poll walk of the source did not finish within its budget and was killed",
+    poll_floor_failed: "the backstop poll under the native watch cannot finish",
+    walk_cap: "too many tree walks are in flight",
+    lasting_block: "automatic runs are held after a failed run; Run now or a settings change lifts it",
+    watch_not_reporting: "the watcher started and never reported",
+    backend_none: "its source is not being watched",
+    controller_blocked: "a long run or dashboard job holds the shell controller, so scheduling is blocked",
+    disabled: "the routine is disabled"
+  }),
+  unknownCause: "its source is not being watched",
+  never: "none yet",
+  ok: (via, trigger, run) => `idle: watching via ${via}, last change seen ${trigger}, last run ${run}`,
+  degraded: (since, cause, via) => `partly observed since ${since}: ${cause} (watching via ${via})`,
+  blind: (since, cause) => `blind since ${since}: ${cause}; changes are not noticed until it clears`,
+  disabled: "disabled",
+  degradedTitle: (profile, cause) => `Routine ${profile} is only partly observed (${cause})`,
+  blindTitle: (profile, cause) => `Routine ${profile} is not observing changes (${cause})`
+});
+
+function routineObservationCause(routine) {
+  const cause = String((routine && routine.observe_cause) || "none");
+  return ROUTINE_OBSERVATION_COPY.causes[cause]
+    || REALTIME_REASON_GUIDANCE[cause]
+    || ROUTINE_OBSERVATION_COPY.unknownCause;
+}
+
+function routineObservationText(routine) {
+  const state = String((routine && routine.observe_state) || "ok");
+  const via = ROUTINE_OBSERVATION_COPY.via[String((routine && routine.watching_via) || "none")] || ROUTINE_OBSERVATION_COPY.via.none;
+  const when = (epoch) => (Number(epoch) > 0 ? formatDate(Number(epoch)) : ROUTINE_OBSERVATION_COPY.never);
+  if (state === "disabled") return ROUTINE_OBSERVATION_COPY.disabled;
+  if (state === "blind") return ROUTINE_OBSERVATION_COPY.blind(when(routine.observe_since_epoch), routineObservationCause(routine));
+  if (state === "degraded") return ROUTINE_OBSERVATION_COPY.degraded(when(routine.observe_since_epoch), routineObservationCause(routine), via);
+  return ROUTINE_OBSERVATION_COPY.ok(via, when(routine && routine.last_trigger_epoch), when(routine && routine.last_run_epoch));
+}
 
 const SECURITY_BOOLEAN_FIELDS = Object.freeze([
   "require_https", "allow_interface_changes", "allow_profile_changes", "allow_secret_changes",
@@ -2909,6 +3087,24 @@ function doctorSourceSkippedDetail(rawOutput) {
   return total ? `${total} ${total === 1 ? "entry" : "entries"} a sync will skip and not sync until fixed${lines.length ? `: ${lines.join("; ")}${total > lines.length ? "; ..." : ""}` : ""}.` : "";
 }
 
+// Why Doctor produced no report, in the words every row that says so repeats:
+// the failure's code and exit code when the package named them, then the first
+// line of output that is not a JSON record -- a refusal such as "doctor
+// --write-test is refused while PID ...", or the core's own `error:` line.
+// Bounded, and never empty: a row that says "not run" also says why.
+function doctorNoReportCause(result, rawOutput) {
+  const model = result && typeof result === "object" && !Array.isArray(result) ? result : {};
+  const code = typeof model.code === "string" && /^[a-z0-9_]{1,64}$/.test(model.code) ? model.code : "";
+  const exitCode = Number.isInteger(model.exit_code) && model.exit_code >= 0 && model.exit_code <= 255
+    ? model.exit_code
+    : null;
+  const named = [code ? `code ${code}` : "", exitCode === null ? "" : `exit code ${exitCode}`].filter(Boolean).join(", ");
+  const firstLine = String(rawOutput || "").split("\n").map((line) => line.trim()).find((line) => line && !line.startsWith("{")) || "";
+  const line = firstLine ? doctorText(firstLine, "", 240).slice(0, 240).replace(/[.;:,\s]+$/, "") : "";
+  if (named && line) return `${named}: ${line}`;
+  return named || line || "the package returned no output";
+}
+
 function doctorReportFromResult(result, successful, requestedLevel, writeTest, startedEpoch = 0) {
   const level = normalizedDoctorLevel(requestedLevel);
   const outputEnvelope = doctorOutputEnvelope(result);
@@ -2922,12 +3118,23 @@ function doctorReportFromResult(result, successful, requestedLevel, writeTest, s
       if (!returnedIds.has(expected.id)) sections.push(expected);
     }
   } else if (!document) {
-    sections = expectedDoctorSections(level, writeTest, "skipped");
+    // No report arrived, so no area was evaluated -- and each row says why
+    // rather than blaming "the installed package", which did run.
+    const cause = doctorNoReportCause(result, rawOutput);
+    sections = expectedDoctorSections(level, writeTest, "skipped").map((section) => ({
+      ...section,
+      detail: `Not run: Doctor produced no report. Cause: ${cause}.`
+    }));
+    const unpublished = /^code (?:unavailable|response_too_large)\b/.test(cause)
+      ? " The package could not publish Doctor's result; the check that refused it is recorded in api.log."
+      : "";
     sections.push({
       id: "terminal_evidence",
-      label: "Legacy terminal evidence",
+      label: successful ? "Legacy terminal evidence" : "Why Doctor produced no report",
       state: successful ? "ok" : "failed",
-      detail: doctorText(rawOutput, successful ? "Doctor completed." : "Doctor failed."),
+      detail: successful
+        ? doctorText(rawOutput, "Doctor completed.")
+        : doctorText(`Cause: ${cause}.${unpublished} ${rawOutput || ""}`, `Cause: ${cause}.`),
       step: null,
       duration_ms: null,
       timing_scope: "operation",
@@ -3328,6 +3535,10 @@ function normalizedActivityEvent(event) {
   const code = field(event.code, "unknown.event");
   const level = field(event.level, "info");
   const legacyCancel = code === "run.failed" && level === "info" && /\bcancel(?:led|ed)\b/i.test(rawMessage);
+  // A refused dashboard mutation names why (`reason=`, the bridge's error code)
+  // after its fixed text, and the request ID last when the refused body named
+  // one. Only that exact shape is read; the row renders the reason in words.
+  const rejection = /^Module rejected-post failed \[[A-Za-z0-9_-]{1,96}\] reason=([a-z_]{1,64})(?: request_id=[0-9a-f]{32})?$/.exec(rawMessage);
   return {
     epoch: numberOr(event.epoch, 0),
     code: legacyCancel ? "run.cancelled" : code,
@@ -3337,7 +3548,8 @@ function normalizedActivityEvent(event) {
     level,
     message,
     client_request_id: validatedClientRequestId(event.client_request_id),
-    doctor_inventory: doctorInventory
+    doctor_inventory: doctorInventory,
+    ...(rejection ? { rejection_reason: rejection[1] } : {})
   };
 }
 
@@ -3353,6 +3565,137 @@ function normalizedEvents(events) {
   const keys = uniqueRowKeys(normalized, activityContentKey);
   normalized.forEach((event, index) => { event.rowKey = keys[index]; });
   return normalized;
+}
+
+// Activity folding. A scheduled run writes five rows -- audit.requested,
+// run.started, run.succeeded, audit.succeeded, module.succeeded -- so 200 rows
+// held about forty runs and the three failures among them were buried. The
+// default view folds the rows of one audited transaction (`[<transaction>]` in
+// an audit.* or module.* message) and one run pair (run.started and the next
+// terminal run row of the same profile, which carry no transaction) into one
+// row per run that names its outcome. Nothing leaves the data: the rows stay in
+// the feed, copying copies all of them, each fold expands, and the whole view
+// can be switched back to every event. A row at warn or error is never folded
+// away: it is drawn under its fold's row even while the fold is closed. A
+// transaction or run with no terminal row yet is not folded, so a change still
+// in flight reads as its own rows.
+const ACTIVITY_TERMINAL_RUN_CODES = Object.freeze(["run.succeeded", "run.failed", "run.cancelled"]);
+const ACTIVITY_LEVEL_RANK = Object.freeze({ trace: 0, debug: 1, info: 2, warn: 3, error: 4 });
+const ACTIVITY_FOLD_COPY = Object.freeze({
+  outcome: Object.freeze({
+    succeeded: "succeeded",
+    failed: "failed",
+    cancelled: "cancelled",
+    outcome_unknown: "outcome unknown"
+  }),
+  run: (profile, outcome, duration, count) =>
+    `Run of ${profile === "all" ? "all profiles" : profile} ${outcome}${duration ? ` in ${duration}` : ""} · ${count} events`,
+  change: (operation, profile, outcome, count) =>
+    `${operation}${profile && profile !== "none" && profile !== "all" ? ` of ${profile}` : ""} ${outcome} · ${count} events`,
+  show: (count) => `Show its ${count} events`,
+  hide: "Hide its events",
+  showAll: "Show every event",
+  groupRuns: "Group by run"
+});
+
+function activityTransactionOf(event) {
+  if (!/^(?:audit|module)\./.test(event.code)) return null;
+  const match = /^Module ([a-z][a-z0-9-]{0,63}) (requested|succeeded|failed|outcome_unknown) \[([A-Za-z0-9_-]{1,96})\]/.exec(event.message);
+  return match ? { operation: match[1], state: match[2], transaction: match[3] } : null;
+}
+
+function activityDurationText(seconds) {
+  const value = Math.max(0, Math.round(Number(seconds) || 0));
+  if (value < 120) return `${value} s`;
+  if (value < 7200) return `${Math.round(value / 60)} min`;
+  return `${Math.round(value / 3600)} h`;
+}
+
+// `events` newest first, as the feed draws them; `expanded` names the open folds.
+function foldedActivityRows(events, expanded) {
+  const chronological = events.slice().reverse();
+  const groups = [];
+  const byTransaction = new Map();
+  const groupOf = new Map();
+  const join = (group, event) => { group.members.push(event); groupOf.set(event, group); };
+  for (const event of chronological) {
+    const transaction = activityTransactionOf(event);
+    if (!transaction) continue;
+    let group = byTransaction.get(transaction.transaction);
+    if (!group) {
+      group = { key: `tx:${transaction.transaction}`, operation: transaction.operation, profile: event.profile, members: [], outcome: "", run: null };
+      byTransaction.set(transaction.transaction, group);
+      groups.push(group);
+    }
+    if (transaction.state !== "requested") group.outcome = transaction.state;
+    join(group, event);
+  }
+  const openRuns = new Map();
+  for (const event of chronological) {
+    if (event.code === "run.started") {
+      openRuns.set(event.profile, event);
+      continue;
+    }
+    if (!ACTIVITY_TERMINAL_RUN_CODES.includes(event.code) || !openRuns.has(event.profile)) continue;
+    const started = openRuns.get(event.profile);
+    openRuns.delete(event.profile);
+    // The audited run this pair belongs to: a run or plan transaction of the
+    // same profile whose own rows bracket it.
+    let group = groups.find((candidate) => !candidate.run
+      && (candidate.operation === "run" || candidate.operation === "plan")
+      && candidate.profile === event.profile
+      && candidate.members[0].epoch <= started.epoch + 5
+      && candidate.members[candidate.members.length - 1].epoch + 5 >= event.epoch);
+    if (!group) {
+      group = { key: `run:${started.rowKey}`, operation: "run", profile: event.profile, members: [], outcome: "", run: null };
+      groups.push(group);
+    }
+    group.run = { started, finished: event };
+    join(group, started);
+    join(group, event);
+  }
+  const foldable = (group) => group.members.length >= 2 && Boolean(group.run || group.outcome);
+  const position = new Map(events.map((event, index) => [event, index]));
+  const rows = [];
+  const drawn = new Set();
+  for (const event of events) {
+    const group = groupOf.get(event);
+    if (!group || !foldable(group)) {
+      rows.push(event);
+      continue;
+    }
+    if (drawn.has(group)) continue;
+    drawn.add(group);
+    // In the feed's own order, so an opened fold reads exactly as the rows did.
+    const members = group.members.slice().sort((left, right) => position.get(left) - position.get(right));
+    const open = Boolean(expanded && expanded[group.key]);
+    const worst = members.reduce((level, member) => (
+      (ACTIVITY_LEVEL_RANK[member.level] || 0) > (ACTIVITY_LEVEL_RANK[level] || 0) ? member.level : level
+    ), "trace");
+    const state = group.run ? group.run.finished.state : group.outcome;
+    const outcome = ACTIVITY_FOLD_COPY.outcome[group.run ? group.run.finished.code.slice(4) : group.outcome] || state;
+    const message = group.run
+      ? ACTIVITY_FOLD_COPY.run(group.profile, outcome, activityDurationText(group.run.finished.epoch - group.run.started.epoch), members.length)
+      : ACTIVITY_FOLD_COPY.change(group.operation, group.profile, outcome, members.length);
+    const terminal = group.run ? group.run.finished : members.find((member) => member.code.startsWith("audit.")) || members[0];
+    rows.push({
+      rowKey: `fold:${group.key}`,
+      epoch: members[0].epoch,
+      code: terminal.code,
+      profile: group.profile,
+      state,
+      category: terminal.category,
+      level: worst,
+      message,
+      client_request_id: (members.find((member) => member.client_request_id) || {}).client_request_id || "",
+      doctor_inventory: null,
+      fold: { key: group.key, count: members.length, expanded: open }
+    });
+    for (const member of members) {
+      if (open || (ACTIVITY_LEVEL_RANK[member.level] || 0) >= ACTIVITY_LEVEL_RANK.warn) rows.push(member);
+    }
+  }
+  return rows;
 }
 
 function canonicalProfileConfiguration(value, snapshot = false) {
@@ -3515,13 +3858,13 @@ function snapshotStaleEscalationMs() {
   return WIDGET_BACKOFF_RAMP_MS[WIDGET_BACKOFF_RAMP_MS.length - 1];
 }
 
-function retainedDocumentFreshness(receivedAtMs, code, nowMs = Date.now()) {
+function retainedDocumentFreshness(receivedAtMs, code, nowMs = Date.now(), streak = Number.POSITIVE_INFINITY) {
   const received = Number(receivedAtMs);
   const named = BRIDGE_FAILURE_COPY[String(code || "").toLowerCase()];
   const because = named ? `: ${named.cause}` : "";
-  const stopped = named && named.retry === "stop"
+  const stopped = bridgeFailureStopped(named, streak)
     ? " Automatic refresh has stopped; select Retry once the package is repaired."
-    : "";
+    : (named && named.stopAfter > 0 ? ` Checking again (${Math.max(1, Number(streak) || 1)} of ${named.stopAfter}).` : "");
   if (!Number.isFinite(received) || received <= 0) {
     return `Stale · the package could not refresh it${because}.${stopped}`;
   }
@@ -3743,6 +4086,13 @@ function describeBridgeFailure(error, phase = "status") {
   // code a newer package emits that this release has never heard of.
   const named = BRIDGE_FAILURE_COPY[code];
   if (named && (status === 503 || status === 0)) {
+    const refused = code === "config_file_unsafe" && error && error.unsafeFile;
+    if (refused && UNSAFE_FILE_CHECK_COPY[refused.check]) {
+      return issue(
+        named.title,
+        `The package refused ${refused.file}: ${UNSAFE_FILE_CHECK_COPY[refused.check]}. Repair the package from Package Center (or reinstall the same release), which restores its files; do not change the file by hand. If this happened once, the next read checks again.`
+      );
+    }
     return issue(named.title, named.message);
   }
   if (status === 503) {
@@ -3802,9 +4152,16 @@ function applyStep(vm, label, step) {
     return true;
   } catch (error) {
     const message = plainText(error && error.message ? error.message : String(error), 160);
-    if (typeof console !== "undefined" && console.error) console.error(`[sdsync] ${label}: ${message}`, error);
+    const kind = plainText(error && error.name ? error.name : "Error", 40);
+    if (typeof console !== "undefined" && console.error) {
+      console.error(`[sdsync] ${label}: ${kind}: ${message}`, error, error && error.stack);
+    }
     vm.applyError = `${label}: ${message}`;
-    vm.toast("Dashboard error", `The package answered, but this window failed while applying ${label}: ${message}`, true);
+    vm.toast(
+      `Dashboard error in ${label}`,
+      `The package answered, but this window failed while applying ${label} (${kind}: ${message}). The rest of the page is current. Reload the app if it repeats; the browser console has the details under [sdsync].`,
+      true
+    );
     return false;
   }
 }
@@ -3867,7 +4224,7 @@ function logsPollDelay(vm, interval) {
 function tickClock(vm, nowMs = Date.now()) {
   vm.nowMs = nowMs;
   if (vm.staleFreshnessCode !== null && vm.staleFreshnessCode !== undefined && !vm.connected && vm.snapshot) {
-    vm.freshness = retainedDocumentFreshness(vm.snapshotReceivedAtMs, vm.staleFreshnessCode, nowMs);
+    vm.freshness = retainedDocumentFreshness(vm.snapshotReceivedAtMs, vm.staleFreshnessCode, nowMs, vm.snapshotFailureStreak);
   }
 }
 
@@ -3898,7 +4255,7 @@ function clockWatchdog(vm) {
 function probeSnapshotAfterAnswer(vm) {
   if (vm.disposed || vm.connected || !vm.snapshot || vm.snapshotLoading || vm.snapshotPromise) return;
   const named = BRIDGE_FAILURE_COPY[vm.snapshotFailureCode];
-  if (named && named.retry === "stop") return;
+  if (bridgeFailureStopped(named, vm.snapshotFailureStreak)) return;
   vm.snapshotFailureStreak = 0;
   vm.refreshSnapshot(false);
 }
@@ -3943,7 +4300,7 @@ export default {
   mixins: [patchGuard],
   components: { ActionIcon, ControlHelp, SecurityPanel },
   data() {
-    const settings = loadSettings();
+    const settings = selectableSettings(loadSettings());
     return {
       routes: [
         { id: "overview", title: "Overview", icon: "overview" }, { id: "profiles", title: "Profiles", icon: "profiles" },
@@ -4045,6 +4402,7 @@ export default {
       // activitySearch for immediate typing feedback.
       activitySearchDebounced: "", activitySearchDebounceTimer: 0,
       activityCategory: "all", activityLevel: "all", activityRenderLimit: ACTIVITY_RENDER_STEP,
+      activityGrouped: true, activityExpandedFolds: {},
       activityTabs: [
         { id: "events", label: "All events" },
         { id: "changes", label: "Changes" },
@@ -4119,7 +4477,8 @@ export default {
     realtimeRoutines() { return this.enabledRoutines.filter((routine) => routine.mode === "realtime"); },
     realtimeDetail() {
       if (!this.realtimeRoutines.length) return "No enabled realtime routine";
-      const notObserving = this.realtimeRoutines.filter((routine) => REALTIME_NOT_OBSERVING_REASONS.includes(String(routine.backend_reason || "ok"))).length;
+      const notObserving = this.realtimeRoutines.filter((routine) => REALTIME_NOT_OBSERVING_REASONS.includes(String(routine.backend_reason || "ok"))
+        || routine.observe_state === "blind").length;
       if (notObserving) return `${notObserving} not observing changes`;
       const fallbacks = this.realtimeRoutines.filter((routine) => String(routine.backend || "").includes("poll")).length;
       if (fallbacks) return `${fallbacks} using polling fallback`;
@@ -4568,7 +4927,7 @@ export default {
     // named by its reason and carrying the same guidance as the routine editor.
     realtimeAttentionItems() {
       const routines = Array.isArray(this.routines) ? this.routines : [];
-      return routines
+      const demoted = routines
         .filter((routine) => routine && routine.enabled === true && routine.mode === "realtime")
         .filter((routine) => REALTIME_WATCHER_DEMOTED_REASONS.includes(String(routine.backend_reason || "ok")))
         .map((routine) => ({
@@ -4577,6 +4936,22 @@ export default {
           title: `Realtime routine ${routine.profile} is not watched natively (${routine.backend_reason})`,
           detail: REALTIME_REASON_GUIDANCE[routine.backend_reason]
         }));
+      // A routine that is blind, or only partly observed, whatever its mode --
+      // unless the item above already names the same cause for it.
+      const observed = routines
+        .filter((routine) => routine && routine.enabled === true
+          && (routine.observe_state === "blind" || routine.observe_state === "degraded"))
+        .filter((routine) => !(demoted.some((item) => item.id === `realtime-${routine.profile}`)
+          && routine.observe_cause === routine.backend_reason))
+        .map((routine) => ({
+          id: `observe-${routine.profile}`,
+          level: "warn",
+          title: routine.observe_state === "blind"
+            ? ROUTINE_OBSERVATION_COPY.blindTitle(routine.profile, routine.observe_cause)
+            : ROUTINE_OBSERVATION_COPY.degradedTitle(routine.profile, routine.observe_cause),
+          detail: routineObservationText(routine)
+        }));
+      return demoted.concat(observed);
     },
     // One line visible on every page. The Overview's attention list exists only on
     // the Overview and Activity, and a failure toast is gone before anyone looks.
@@ -4783,8 +5158,16 @@ export default {
     },
     // Only the newest rows are drawn; the filtered total above still counts every event,
     // and the control under the list says how many are not drawn.
-    shownActivity() { return this.reversedActivity.slice(0, Math.max(ACTIVITY_RENDER_STEP, Number(this.activityRenderLimit) || 0)); },
-    activityHiddenCount() { return Math.max(0, this.reversedActivity.length - this.shownActivity.length); },
+    // The rows the feed draws: every matching event, or with grouping on (the
+    // AppWindow's default; a context built without the flag draws every event)
+    // one row per run with its failures beneath it. See foldedActivityRows.
+    displayedActivity() {
+      return this.activityGrouped === true
+        ? foldedActivityRows(this.reversedActivity, this.activityExpandedFolds)
+        : this.reversedActivity;
+    },
+    shownActivity() { return this.displayedActivity.slice(0, Math.max(ACTIVITY_RENDER_STEP, Number(this.activityRenderLimit) || 0)); },
+    activityHiddenCount() { return Math.max(0, this.displayedActivity.length - this.shownActivity.length); },
     activityMoreLabel() {
       const hidden = this.activityHiddenCount;
       return hidden ? `${hidden} older event${hidden === 1 ? "" : "s"} not shown.` : "";
@@ -4844,8 +5227,11 @@ export default {
     activityLevelOptions() { return options([["all", "All levels"], ...["trace", "debug", "info", "warn", "error"].map((level) => [level, level])]); },
     logLineOptions() { return options([[100, "100 lines"], [200, "200 lines"], [500, "500 lines"], [1000, "1000 lines"]]); },
     themeOptions() { return options([["dark", "Hellfire dark"], ["system", "Follow system"], ["light", "Ash light"]]); },
-    statusRefreshOptions() { return options([[0, "Manual only"], [1000, "Every second"], [3000, "Every 3 seconds"], [5000, "Every 5 seconds"], [10000, "Every 10 seconds"], [30000, "Every 30 seconds"]]); },
-    logRefreshOptions() { return options([[0, "Manual only"], [5000, "Every 5 seconds"], [10000, "Every 10 seconds"], [30000, "Every 30 seconds"]]); }
+    // String values: a select whose value is the number 0 may read as "nothing
+    // selected" to the DSM control, so these carry strings and every reader
+    // converts with Number() (scheduleSnapshot, scheduleLogs, the payload).
+    statusRefreshOptions() { return options([["0", "Manual only"], ["3000", "Every 3 seconds"], ["5000", "Every 5 seconds"], ["10000", "Every 10 seconds"], ["30000", "Every 30 seconds"]]); },
+    logRefreshOptions() { return options([["0", "Manual only"], ["5000", "Every 5 seconds"], ["10000", "Every 10 seconds"], ["30000", "Every 30 seconds"]]); }
   },
   watch: {
     // See ACTIVITY_SEARCH_DEBOUNCE_MS and normalizedActivityEvents above: the
@@ -4936,6 +5322,10 @@ export default {
         if (this.autosaveCoordinator) this.autosaveCoordinator.setGlobalBusy(this.operationBusy);
         tickClock(this);
         scheduleClock(this);
+        // A tab left in the background past the token's lifetime comes back
+        // holding a token the package would refuse. Dropping it here makes the
+        // snapshot refresh below fetch a fresh one first, before any click.
+        if (this.csrfToken && csrfTokenStale(this.auth, this.csrfToken)) this.csrfToken = "";
         this.refreshSnapshot(false);
         if (this.route === "activity") this.refreshLogs();
         this.scheduleIncidentProbe();
@@ -5553,6 +5943,10 @@ export default {
         true
       );
     },
+    rejectionReasonText(code) {
+      const copy = POST_REJECTION_COPY[code];
+      return `Dashboard change refused: ${copy ? copy.activity : `reason ${code}`}.`;
+    },
     reportMutationError(error, failedTitle, unknownTitle, fallback, options = undefined) {
       const formatting = options && typeof options === "object" ? options : {};
       const unknown = Boolean(error && error.outcomeUnknown === true);
@@ -5637,6 +6031,25 @@ export default {
         const message = withCorrelation(`${observed} ${this.bridgeIssue.message}`, this.bridgeIssue.message);
         this.toast(failedTitle, message, true);
         return { unknown: false, csrfRejected: true, message, requestId, jobId };
+      }
+      // Refused before it was queued, for a reason this window has words for.
+      // The envelope's own message is one constant for every refusal, so the
+      // code is the only thing that says which. Activity records the same
+      // refusal as `rejected-post` with `reason=<code>` and, when the request
+      // ID is shown here, the same ID -- so the two can be matched.
+      const rejectionCode = String((error && error.code) || "").toLowerCase();
+      const rejection = !unknown && !inspection && error && error.preAcceptance === true
+        && error.trustedRejection === true && Number(error.status) >= 400 && Number(error.status) < 500
+        ? POST_REJECTION_COPY[rejectionCode]
+        : undefined;
+      if (rejection && rejection.message) {
+        if (rejection.reload) {
+          this.bridgeIssue = { title: rejection.title, message: rejection.message };
+          this.connectionLabel = rejection.title;
+        }
+        const message = withCorrelation(`${rejection.title}. ${rejection.message}`, rejection.message);
+        this.toast(failedTitle, message, true);
+        return { unknown: false, inspection: false, rejected: true, code: rejectionCode, message, requestId, jobId };
       }
       const message = inspection
         ? withCorrelation(
@@ -5997,7 +6410,7 @@ export default {
             progress: (observed && observed.progress) || null,
             message: PROBE_VERDICT_COPY[verdict]
           };
-          if (verdict === "settled" && SELF_RELEASING_INCIDENT_SCOPES.includes(scope)) released.push(scope);
+          if ((verdict === "settled" || verdict === "rejected") && SELF_RELEASING_INCIDENT_SCOPES.includes(scope)) released.push(scope);
         }
       } finally {
         if (!this.disposed) this.incidentProbe = { ...this.incidentProbe, active: false };
@@ -6119,7 +6532,7 @@ export default {
         }
         return Math.max(interval, floor);
       }
-      if (named.retry === "stop") return 0;
+      if (bridgeFailureStopped(named, this.snapshotFailureStreak)) return 0;
       if (named.retry === "auto") return Math.max(interval, floor, WIDGET_ACTIVE_POLL_MS);
       const step = Number(this.snapshotFailureStreak) - 2;
       if (step < 0) return Math.max(interval, floor);
@@ -6134,6 +6547,15 @@ export default {
       return ` (NAS ${new Date((seconds + clock.offset) * 1000).toISOString().slice(0, 16).replace("T", " ")})`;
     },
     showMoreActivity() { this.activityRenderLimit = (Number(this.activityRenderLimit) || ACTIVITY_RENDER_STEP) + ACTIVITY_RENDER_STEP; },
+    toggleActivityGrouping() { this.activityGrouped = this.activityGrouped !== true; },
+    toggleActivityFold(key) {
+      const expanded = Object.assign({}, this.activityExpandedFolds);
+      if (expanded[key]) delete expanded[key];
+      else expanded[key] = true;
+      this.activityExpandedFolds = expanded;
+    },
+    activityFoldLabel(fold) { return fold.expanded ? ACTIVITY_FOLD_COPY.hide : ACTIVITY_FOLD_COPY.show(fold.count); },
+    activityGroupingLabel() { return this.activityGrouped === true ? ACTIVITY_FOLD_COPY.showAll : ACTIVITY_FOLD_COPY.groupRuns; },
     clockWatchdog() { clockWatchdog(this); },
     // `warnings` is the list of { code, text } the save returned, or null.
     noteMutationWarning(warnings) {
@@ -6240,16 +6662,19 @@ export default {
           if (manual) this.toast("Status refreshed", "The latest package snapshot is displayed.");
         } catch (error) {
           if (this.disposed || generation !== this.snapshotGeneration || this.snapshotRefreshBlocked) return false;
-          this.csrfToken = "";
-          this.connected = false;
-          this.snapshotFailureCode = String((error && error.code) || "").toLowerCase();
+          const failureCode = String((error && error.code) || "").toLowerCase();
+          if (!(KEEP_SESSION_FAILURES.includes(failureCode) && Number(this.snapshotFailureStreak) < 2)) {
+            this.csrfToken = "";
+            this.connected = false;
+          }
+          this.snapshotFailureCode = failureCode;
           this.snapshotFailureStatus = Number(error && error.status) || 0;
           this.staleFreshnessCode = this.snapshotFailureCode;
           this.snapshotFailureStreak = Math.min(Number(this.snapshotFailureStreak) + 1, WIDGET_BACKOFF_RAMP_MS.length + 1);
           this.bridgeIssue = this.describeBridgeError(error, "status");
           this.connectionLabel = this.bridgeIssue.title;
           this.freshness = this.snapshot
-            ? retainedDocumentFreshness(this.snapshotReceivedAtMs, this.snapshotFailureCode)
+            ? retainedDocumentFreshness(this.snapshotReceivedAtMs, this.snapshotFailureCode, Date.now(), this.snapshotFailureStreak)
             : "Status unavailable";
           if (manual) this.toast(this.bridgeIssue.title, this.bridgeIssue.message, true);
         } finally {
@@ -7065,6 +7490,7 @@ export default {
     // nothing else, so this has to be true for every routine that reaches it
     // rather than naming a specific log line or errno string.
     realtimeReasonGuidance(reason) { return REALTIME_REASON_GUIDANCE[reason] || ""; },
+    routineObservation(routine) { return routineObservationText(routine); },
     routinePayload() {
       const payload = { profile: this.routineForm.profile, enabled: this.routineForm.enabled === true, action: this.routineForm.action, mode: this.routineForm.mode, retry_count: this.integer(this.routineForm.retry_count, 5), retry_backoff_seconds: this.integer(this.routineForm.retry_backoff_seconds, 60), retry_exponential: this.routineForm.retry_exponential !== false, allow_delete: this.routineForm.allow_delete === true, max_total_delete: this.integer(this.routineForm.max_total_delete, 100), depends_on: this.routineForm.depends_on.map(String) };
       if (payload.mode === "interval") payload.interval_seconds = this.integer(this.routineForm.interval_seconds, 3600);
@@ -7203,7 +7629,12 @@ export default {
         recordIsolatedIncident(this, "operations", operation, error, report, { subject: boundedText(payload && payload.scope, operation) });
         if (kind === "doctor") {
           this.doctorReport = doctorReportFromResult(
-            { output: error.resultOutput || report.message, message: report.message },
+            {
+              output: error.resultOutput || report.message,
+              message: report.message,
+              code: error && typeof error.code === "string" ? error.code : "",
+              exit_code: error && Number.isInteger(error.exitCode) ? error.exitCode : null
+            },
             false,
             doctorLevel,
             payload && payload.write_test === true,
@@ -7905,7 +8336,7 @@ export default {
       }
     },
     applySettingsState(settings) {
-      this.settings = Object.assign({}, settings);
+      this.settings = selectableSettings(settings);
       this.notificationForm = Object.assign({}, this.notificationForm, {
         desktop_notifications: settings.desktop_notifications === true,
         audible: settings.audible === true

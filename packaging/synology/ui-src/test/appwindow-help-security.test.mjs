@@ -474,15 +474,16 @@ test("routine editor emits only mode-relevant timing fields with bounded retry p
 test("Manual refresh options clear timers without creating replacements", async () => {
   const component = await loadAppComponent(async () => ({ ok: true }), []);
   const methods = component.methods;
+  // No "Every second": the validator never accepted it, yet it polled at 1 s.
+  // String values, so a DSM select never reads 0 as "nothing selected".
   assert.deepEqual(component.computed.statusRefreshOptions(), [
-    { value: 0, label: "Manual only" },
-    { value: 1000, label: "Every second" },
-    { value: 3000, label: "Every 3 seconds" },
-    { value: 5000, label: "Every 5 seconds" },
-    { value: 10000, label: "Every 10 seconds" },
-    { value: 30000, label: "Every 30 seconds" }
+    { value: "0", label: "Manual only" },
+    { value: "3000", label: "Every 3 seconds" },
+    { value: "5000", label: "Every 5 seconds" },
+    { value: "10000", label: "Every 10 seconds" },
+    { value: "30000", label: "Every 30 seconds" }
   ]);
-  assert.equal(component.computed.logRefreshOptions()[0].value, 0);
+  assert.equal(component.computed.logRefreshOptions()[0].value, "0");
 
   const previousWindow = globalThis.window;
   const previousDocument = globalThis.document;
@@ -698,7 +699,7 @@ test("browser preference persistence and audit ordering preserve truthful outcom
     });
     await storageFailure.saveInterfaceSettings({ preventDefault() {} });
     assert.equal(postCount, 0, "failed local persistence must not submit a success audit event");
-    assert.deepEqual(storageFailure.settings, prior);
+    assert.deepEqual(storageFailure.settings, Object.assign({}, prior, { status_refresh: "5000", log_refresh: "5000" }));
     assert.equal(storageFailure.operationBusy, false);
     assert.equal(storageFailure.toasts.at(-1).title, "Preferences not persisted");
 
@@ -730,7 +731,7 @@ test("browser preference persistence and audit ordering preserve truthful outcom
     assert.notEqual(rejectedWrites[0], priorRaw);
     assert.equal(rejectedWrites[1], priorRaw);
     assert.equal(rejectedRaw, priorRaw);
-    assert.deepEqual(rejected.settings, prior);
+    assert.deepEqual(rejected.settings, Object.assign({}, prior, { status_refresh: "5000", log_refresh: "5000" }));
     assert.deepEqual(rejected.notificationForm, { desktop_notifications: false, audible: false });
     assert.equal(rejected.toasts.at(-1).title, "Session preferences not saved");
     assert.match(rejected.toasts.at(-1).message, new RegExp(rejectedRequestId));
@@ -762,7 +763,7 @@ test("browser preference persistence and audit ordering preserve truthful outcom
     assert.equal(unknownWrites.length, 1, "outcome-unknown must retain the candidate without rollback");
     assert.equal(JSON.parse(unknownRaw).theme, "light");
     assert.equal(unknown.settings.theme, "light");
-    assert.equal(unknown.settings.status_refresh, 10000);
+    assert.equal(Number(unknown.settings.status_refresh), 10000);
     assert.equal(unknown.toasts.at(-1).title, "Interface settings stored · audit outcome unknown");
     assert.match(unknown.toasts.at(-1).message, new RegExp(unknownRequestId));
   } finally {
