@@ -256,6 +256,13 @@ duplicate/unknown query key, invalid transfer encoding, or unsupported action. E
 request also requires the fixed custom marker `X-SDSYNC-Request: 1`; the package emits no CORS
 permission that would let a foreign origin manufacture that header.
 
+Every AppWindow request also carries `X-SDSYNC-Build`, the build of the page that sent it. A POST
+from any build but the one the package was released with, or from a page that sends none (every
+page from before this header existed), is refused with HTTP 409 and the code `ui_build_stale` before
+its CSRF token is read. Nothing is queued, the refusal is audited like any other (`reason=ui_build_stale`),
+and the page says to reload. A page left open across an upgrade therefore asks to be reloaded instead
+of posting a request shape the new package rejects as malformed.
+
 POST accepts only `application/json` with a canonical content length up to 64 KiB and no query
 parameters. Its flat envelope is:
 

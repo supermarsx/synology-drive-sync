@@ -250,6 +250,38 @@ class DsmUiContractTests(unittest.TestCase):
         ):
             self.assertIn(marker, bundle)
 
+    def test_dashboard_build_is_one_value_and_moves_with_the_request_contract(self) -> None:
+        # The bridge refuses a mutation from any page build but its own, so the
+        # page, the bridge and the real-supervisor fixture must name the same
+        # build. The digest is of api.js's request-argument tables: when it
+        # changes, the request contract changed, and a page from before the
+        # change would post a shape the bridge refuses as malformed. Bump
+        # DASHBOARD_BUILD in api.js and dsm_api.rs, then update the digest.
+        repository = HERE.parents[1]
+        backend = (repository / "src/dsm_api.rs").read_text(encoding="utf-8")
+        api = (UI_SOURCE / "src/api.js").read_text(encoding="utf-8")
+        supervisor = (HERE / "test_real_supervisor.sh").read_text(encoding="utf-8")
+        rust = re.search(r'^const DASHBOARD_BUILD: &str = "([0-9A-Za-z._-]{1,64})";$', backend, re.M)
+        ui = re.search(r'^export const DASHBOARD_BUILD = "([0-9A-Za-z._-]{1,64})";$', api, re.M)
+        fixture = re.search(r"^dashboard_build=([0-9A-Za-z._-]{1,64})$", supervisor, re.M)
+        self.assertIsNotNone(rust)
+        self.assertIsNotNone(ui)
+        self.assertIsNotNone(fixture)
+        self.assertEqual(ui.group(1), rust.group(1))
+        self.assertEqual(fixture.group(1), rust.group(1))
+        self.assertIn('authenticated["X-SDSYNC-Build"] = DASHBOARD_BUILD;', api)
+        self.assertIn("HTTP_X_SDSYNC_BUILD=$dashboard_build", supervisor)
+        self.assertIn('optional("HTTP_X_SDSYNC_BUILD", MAX_BUILD_HEADER_BYTES)', backend)
+        start = api.index("export const ARGUMENT_KEYS = Object.freeze({")
+        end = api.index("export function boundedText(", start)
+        contract = hashlib.sha256(api[start:end].encode("utf-8")).hexdigest()
+        self.assertEqual(
+            (rust.group(1), contract),
+            ("1", "44573f291891b81209f5149fd5e63a5766f57a9fe4daf8c83f0bc4bfa292fcb5"),
+            "the request contract changed: bump DASHBOARD_BUILD (api.js, dsm_api.rs, "
+            "test_real_supervisor.sh), then pin the new build and digest here",
+        )
+
     def test_every_rejected_mutation_reason_has_words(self) -> None:
         # The bridge names why it refused a mutation (REJECTED_POST_REASONS) in
         # the Activity row and the error envelope; the AppWindow renders each
@@ -916,6 +948,7 @@ global.fetch = async function (url, options) {
     assert.deepEqual(request.options.headers, {
       Accept: "application/json",
       "X-SDSYNC-Request": "1",
+      "X-SDSYNC-Build": DASHBOARD_BUILD,
       "X-SYNO-TOKEN": dsmToken
     });
   }
@@ -931,6 +964,7 @@ global.fetch = async function (url, options) {
       Accept: "application/json",
       "X-SDSYNC-CSRF": "csrf-token",
       "X-SDSYNC-Request": "1",
+      "X-SDSYNC-Build": DASHBOARD_BUILD,
       "X-SYNO-TOKEN": dsmToken
     });
   }

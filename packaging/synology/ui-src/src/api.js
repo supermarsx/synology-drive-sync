@@ -7,6 +7,14 @@ export const RESULT_STATUS_SCHEMA = "sdsync.dsm-result-status.v1";
 export const RESULT_SCHEMA = "sdsync.dsm-result.v1";
 export const REQUEST_STATUS_SCHEMA = "sdsync.dsm-request-status.v1";
 export const MAX_RESPONSE_BYTES = 1024 * 1024;
+// The build of this page, sent on every package request as X-SDSYNC-Build.
+// The bridge accepts mutations only from the build it was released with
+// (DASHBOARD_BUILD in dsm_api.rs; test_synology_ui.py compares the two), so a
+// page left open across an upgrade is refused as `ui_build_stale` and told to
+// reload instead of posting a shape the new package refuses as malformed. Bump
+// it with any change to the request contract below (ARGUMENT_KEYS and the
+// routine key tables): the UI suite pins a digest of them to remind you.
+export const DASHBOARD_BUILD = "1";
 export const AUTOSAVE_API_LIMITS = Object.freeze({
   csrfReissueTimeoutMs: 10000,
   // The CGI relay has a 30-second I/O ceiling. The browser must not cancel a
@@ -683,6 +691,7 @@ function dsmAuthSnapshot() {
 
 function authenticatedHeaders(headers, dsmAuth) {
   const authenticated = Object.assign({}, headers, { "X-SDSYNC-Request": "1" });
+  authenticated["X-SDSYNC-Build"] = DASHBOARD_BUILD;
   if (dsmAuth.token) authenticated["X-SYNO-TOKEN"] = dsmAuth.token;
   return authenticated;
 }

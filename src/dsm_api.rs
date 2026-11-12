@@ -105,6 +105,28 @@ const FAILED_CONTROLLER_CHILD_PATH: &str =
     "/var/packages/synology-drive-sync/var/run/failed-start.controller";
 const ADMINISTRATORS_GROUP: &str = "administrators";
 const RELAY_SCHEMA: &str = "sdsync.dsm-relay.v1";
+/// The dashboard build this bridge accepts mutations from, sent by every request of the AppWindow
+/// as `X-SDSYNC-Build` (`DASHBOARD_BUILD` in api.js; the UI suite compares the two).
+///
+/// A page stays open across a package upgrade, and the bundle in its memory is the old one: it
+/// can post an argument shape the new bridge refuses, which used to reach the operator as the
+/// constant "Request could not be completed." with nothing saying the page itself was stale. A
+/// mutation from any other build, or from a page that sends none (every build before this one), is
+/// refused as `ui_build_stale` before its token is even read, and the page says to reload.
+///
+/// Bump it with any change to the request contract: an operation, an argument, the request
+/// schema. The UI suite pins a digest of api.js's argument table to remind whoever changes it.
+const DASHBOARD_BUILD: &str = "1";
+/// A mutation from a page whose build is not [`DASHBOARD_BUILD`].
+const UI_BUILD_STALE: BridgeError = BridgeError::coded(ErrorKind::Conflict, "ui_build_stale");
+
+fn require_dashboard_build(build: Option<&str>) -> BridgeResult<()> {
+    if build == Some(DASHBOARD_BUILD) {
+        Ok(())
+    } else {
+        Err(UI_BUILD_STALE)
+    }
+}
 const CGI_ORIGIN_VARIABLES: &[&str] = &[
     "REQUEST_METHOD",
     "GATEWAY_INTERFACE",
@@ -115,6 +137,7 @@ const CGI_ORIGIN_VARIABLES: &[&str] = &[
     "HTTP_X_SDSYNC_REQUEST",
     "HTTP_X_SYNO_TOKEN",
     "HTTP_X_SDSYNC_CSRF",
+    "HTTP_X_SDSYNC_BUILD",
     "HTTP_TRANSFER_ENCODING",
     "HTTP_HOST",
     "REMOTE_ADDR",
@@ -173,6 +196,7 @@ const MAX_QUERY_BYTES: usize = 4 * 1024;
 const MAX_COOKIE_BYTES: usize = 16 * 1024;
 const MAX_TOKEN_BYTES: usize = 1024;
 const MAX_CSRF_BYTES: usize = 256;
+const MAX_BUILD_HEADER_BYTES: usize = 64;
 const MAX_POST_BODY_BYTES: usize = 64 * 1024;
 const MAX_JOB_BYTES: usize = 64 * 1024;
 const MAX_AUDIT_OUTBOX_BYTES: usize = 4 * 1024;
@@ -1158,6 +1182,7 @@ struct CgiEnvironment {
     request_marker: Option<String>,
     synology_token_header: Option<Zeroizing<String>>,
     csrf_header: Option<Zeroizing<String>>,
+    build_header: Option<String>,
     remote_address: Option<String>,
     server_address: Option<String>,
     server_name: Option<String>,
@@ -1253,6 +1278,7 @@ enum ValidatedHttpRequest {
     Post {
         content_length: usize,
         csrf_token: Zeroizing<String>,
+        build: Option<String>,
         authentication: AuthenticationInputs,
     },
 }
@@ -1279,6 +1305,10 @@ struct RelayRequestRef<'a> {
     request_marker: Option<&'a str>,
     synology_token_header: Option<&'a str>,
     csrf_header: Option<&'a str>,
+    // Absent from the document when the page sent none, so a relay between a CGI and a service of
+    // one release reads exactly as it did before the header existed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    build_header: Option<&'a str>,
     remote_address: Option<&'a str>,
     server_address: Option<&'a str>,
     server_name: Option<&'a str>,
@@ -1303,6 +1333,8 @@ struct RelayRequest {
     request_marker: Option<String>,
     synology_token_header: Option<String>,
     csrf_header: Option<String>,
+    #[serde(default)]
+    build_header: Option<String>,
     remote_address: Option<String>,
     server_address: Option<String>,
     server_name: Option<String>,
@@ -1332,6 +1364,7 @@ impl RelayRequest {
                 .csrf_header
                 .as_ref()
                 .map(|value| Zeroizing::new(value.clone())),
+            build_header: self.build_header.clone(),
             remote_address: self.remote_address.clone(),
             server_address: self.server_address.clone(),
             server_name: self.server_name.clone(),
@@ -1357,6 +1390,7 @@ impl RelayRequest {
             MAX_TOKEN_BYTES,
         )?;
         validate_optional_environment_value(self.csrf_header.as_deref(), MAX_CSRF_BYTES)?;
+        validate_optional_environment_value(self.build_header.as_deref(), MAX_BUILD_HEADER_BYTES)?;
         validate_optional_environment_value(self.remote_address.as_deref(), 128)?;
         validate_optional_environment_value(self.server_address.as_deref(), 128)?;
         validate_optional_environment_value(self.server_name.as_deref(), 255)?;
@@ -1391,6 +1425,7 @@ impl Drop for RelayRequest {
         self.request_marker.zeroize();
         self.synology_token_header.zeroize();
         self.csrf_header.zeroize();
+        self.build_header.zeroize();
         self.remote_address.zeroize();
         self.server_address.zeroize();
         self.server_name.zeroize();
@@ -1441,6 +1476,7 @@ fn encode_relay_request(
             .as_ref()
             .map(|value| value.as_str()),
         csrf_header: environment.csrf_header.as_ref().map(|value| value.as_str()),
+        build_header: environment.build_header.as_deref(),
         remote_address: environment.remote_address.as_deref(),
         server_address: environment.server_address.as_deref(),
         server_name: environment.server_name.as_deref(),
@@ -2391,6 +2427,7 @@ fn process_environment() -> BridgeResult<CgiEnvironment> {
         request_marker: optional("HTTP_X_SDSYNC_REQUEST", 8)?,
         synology_token_header: optional("HTTP_X_SYNO_TOKEN", MAX_TOKEN_BYTES)?.map(Zeroizing::new),
         csrf_header: optional("HTTP_X_SDSYNC_CSRF", MAX_CSRF_BYTES)?.map(Zeroizing::new),
+        build_header: optional("HTTP_X_SDSYNC_BUILD", MAX_BUILD_HEADER_BYTES)?,
         remote_address: optional("REMOTE_ADDR", 128)?,
         server_address: optional("SERVER_ADDR", 128)?,
         server_name: optional("SERVER_NAME", 255)?,
@@ -2495,6 +2532,10 @@ fn validate_http_request(mut environment: CgiEnvironment) -> BridgeResult<Valida
             Ok(ValidatedHttpRequest::Post {
                 content_length,
                 csrf_token,
+                build: environment
+                    .build_header
+                    .take()
+                    .filter(|value| !value.is_empty()),
                 authentication,
             })
         }
@@ -15729,7 +15770,12 @@ fn execute_authenticated_request(
                 execute_read_action(&PackagePaths::production(), &action, policy, package_uid)
             }
         },
-        ValidatedHttpRequest::Post { csrf_token, .. } => {
+        ValidatedHttpRequest::Post {
+            csrf_token, build, ..
+        } => {
+            // Before the token: a page from another build most likely holds a stale token too, and
+            // "reload this page" is the answer to both.
+            require_dashboard_build(build.as_deref())?;
             let key = linux_files::load_or_create_csrf_key(&control_paths, package_uid)?;
             verify_csrf_token(
                 &csrf_token,
@@ -22591,6 +22637,7 @@ mod tests {
             request_marker: Some("1".to_owned()),
             synology_token_header: None,
             csrf_header: None,
+            build_header: None,
             remote_address: Some("192.0.2.8".to_owned()),
             server_address: Some("192.0.2.2".to_owned()),
             server_name: Some("nas.example.invalid".to_owned()),
@@ -22653,6 +22700,7 @@ mod tests {
         environment.content_type = Some("application/json; charset=utf-8".to_owned());
         environment.synology_token_header = Some(Zeroizing::new("dsm-token".to_owned()));
         environment.csrf_header = Some(Zeroizing::new("csrf-token".to_owned()));
+        environment.build_header = Some(DASHBOARD_BUILD.to_owned());
         environment
     }
 
@@ -31967,6 +32015,65 @@ mod tests {
         let mut invalid_status = encoded.to_vec();
         invalid_status[..2].copy_from_slice(&201_u16.to_be_bytes());
         assert!(decode_relay_response(&invalid_status).is_err());
+    }
+
+    /// The page's build reaches the service through the relay, a page that sends none relays the
+    /// document it always did, and only the build this bridge is accepts a mutation.
+    #[test]
+    fn a_mutation_from_another_dashboard_build_is_refused_as_stale() {
+        let body = request("remove-profile", json!({"name":"nightly"}));
+        let current = post_environment(body.len());
+        let encoded =
+            encode_relay_request(&current, Some(&body), &authenticated_session()).unwrap();
+        let relay = decode_relay_request(&encoded).unwrap();
+        let (validated, _) = validate_relay_http_request(&relay).unwrap();
+        let ValidatedHttpRequest::Post { build, .. } = validated else {
+            panic!("a POST must validate as a POST");
+        };
+        assert_eq!(build.as_deref(), Some(DASHBOARD_BUILD));
+        assert_eq!(require_dashboard_build(build.as_deref()), Ok(()));
+
+        let mut legacy = post_environment(body.len());
+        legacy.build_header = None;
+        let encoded = encode_relay_request(&legacy, Some(&body), &authenticated_session()).unwrap();
+        let document: Value = serde_json::from_slice(&encoded).unwrap();
+        assert!(
+            document.get("build_header").is_none(),
+            "a page without the header relays the document it always did"
+        );
+        let relay = decode_relay_request(&encoded).unwrap();
+        let (validated, _) = validate_relay_http_request(&relay).unwrap();
+        let ValidatedHttpRequest::Post { build, .. } = validated else {
+            panic!("a POST must validate as a POST");
+        };
+        assert_eq!(build, None);
+        for stale in [None, Some(""), Some("0"), Some("2"), Some(" 1")] {
+            let refused = require_dashboard_build(stale).unwrap_err();
+            assert_eq!(refused, UI_BUILD_STALE, "{stale:?}");
+            assert_eq!(refused.kind, ErrorKind::Conflict);
+            assert_eq!(rejected_post_reason(refused), "ui_build_stale");
+            let response =
+                CgiResponse::failure(CgiFailure::new(CgiFailureStage::ServiceRequest, refused));
+            assert_eq!(response.status, 409);
+            let envelope: Value = serde_json::from_slice(&response.body).unwrap();
+            assert_eq!(envelope["code"], "ui_build_stale");
+        }
+        // An empty header is absent, and an oversized one is a malformed request.
+        let mut empty = post_environment(body.len());
+        empty.build_header = Some(String::new());
+        let ValidatedHttpRequest::Post { build, .. } = validate_http_request(empty).unwrap() else {
+            panic!("a POST must validate as a POST");
+        };
+        assert_eq!(build, None);
+        let mut oversized = decode_relay_request(
+            &encode_relay_request(&current, Some(&body), &authenticated_session()).unwrap(),
+        )
+        .unwrap();
+        oversized.build_header = Some("1".repeat(MAX_BUILD_HEADER_BYTES + 1));
+        assert_eq!(
+            oversized.validate_fields().unwrap_err().kind,
+            ErrorKind::BadRequest
+        );
     }
 
     #[test]
