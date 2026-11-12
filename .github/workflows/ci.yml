@@ -440,6 +440,36 @@ jobs:
           grep -Fq '"schema":"sdsync.dsm-error.v1"' <<<"$bridge_output"
           grep -Fq '"status":401' <<<"$bridge_output"
           grep -Fq '"code":"unauthorized"' <<<"$bridge_output"
+      - name: Smoke the shipped binaries on the target CPU
+        if: matrix.cross_compile == true
+        shell: bash
+        env:
+          QEMU_BINARY: ${{ matrix.qemu_binary }}
+          QEMU_CPU: ${{ matrix.qemu_cpu }}
+          RUST_TARGET: ${{ matrix.rust_target }}
+        run: |
+          bash .github/scripts/smoke-dsm-binaries.sh             "target/$RUST_TARGET/release/synology-drive-sync"             "target/$RUST_TARGET/release/sdsync-dsm-api"
+      - name: Run the pair-index codegen test in release under QEMU
+        if: matrix.synology_arch == 'armv7'
+        shell: bash
+        env:
+          RUST_TARGET: ${{ matrix.rust_target }}
+          QEMU_BINARY: ${{ matrix.qemu_binary }}
+          QEMU_CPU: ${{ matrix.qemu_cpu }}
+          SDSYNC_BUILD_VERSION: 0.0.0
+        run: |
+          set -euo pipefail
+          # rustc 1.90 miscompiles redb for armv7 in release builds only (a database header
+          # written without its page size), which no debug test sees; this test is built
+          # --release for the shipped target and run on the pinned D16-only CPU.
+          runner="$RUNNER_TEMP/qemu-test-runner"
+          # The extracted binfmt QEMU takes the first guest argument as argv[0].
+          printf '%s\n' '#!/bin/sh' "exec \"$RUNNER_TEMP/$QEMU_BINARY\" \"\$1\" \"\$@\"" > "$runner"
+          chmod 0755 "$runner"
+          target_env=$(printf '%s' "$RUST_TARGET" | tr 'a-z-' 'A-Z_')
+          export "CARGO_TARGET_${target_env}_RUNNER=$runner"
+          export QEMU_CPU
+          cargo-zigbuild test --release --locked --target "$RUST_TARGET" --test pair_index_codegen
       - name: Assemble and validate installable SPK
         shell: bash
         env:
