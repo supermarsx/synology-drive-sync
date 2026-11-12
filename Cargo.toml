@@ -101,6 +101,16 @@ fault-inject = []
 debug-assertions = false
 overflow-checks = false
 
+# rustc 1.90's LLVM miscompiles redb 4.4 for armv7 when the crate is one codegen unit at
+# opt-level 3: SROA drops every store into the header `TransactionalMemory::write_header` writes
+# but the magic number and the god byte, so each index an armv7 NAS built was unreadable at its
+# next open ("Database page size 0", set aside and rebuilt on every run). Found by
+# `-opt-bisect-limit` on the redb crate; i686 and x86_64 are unaffected. Several units keep
+# write_header out of the context that triggers it; `tests/pair_index_codegen.rs`, run in release
+# under QEMU in CI, is what shows a toolchain or redb update still does.
+[profile.release.package.redb]
+codegen-units = 16
+
 [profile.release]
 lto = "thin"
 codegen-units = 1
