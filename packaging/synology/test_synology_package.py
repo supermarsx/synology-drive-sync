@@ -8498,6 +8498,231 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
         finally:
             locked.chmod(0o700)
 
+    def _unobserved_rows(self, profile: str, needle: str = "") -> list[dict[str, object]]:
+        return [
+            event for event in self.activity_records()
+            if event["code"] == "routine.unobserved" and event["profile"] == profile
+            and needle in str(event["message"])
+        ]
+
+    def test_a_hung_poll_walk_is_killed_named_once_and_its_slot_freed(self) -> None:
+        # C1. The poll walk had no time bound: a find blocked in the filesystem
+        # held the single poll slot for good and every realtime routine's backstop
+        # with it, with nothing in controller.log, Activity or state. A walk that
+        # outlives its budget is now killed, logged, and its slot freed, and the
+        # episode reaches Activity once. The first walk hangs in a chmod shim (the
+        # S3-22 scratch-directory hook); the second is let through.
+        self.assertEqual(
+            self.configure("watch", self.source_two, "/home/Drive/Watch", True).returncode, 0
+        )
+        (self.source_two / "first.txt").write_text("one\n", encoding="utf-8")
+        realtime, _ = self.api(
+            "routine", "--profile", "watch", "--enabled", "true", "--action", "sync",
+            "--mode", "realtime", "--interval", "60", "--weekdays", "1,2,3,4,5,6,7",
+            "--time-window-start", "00:00", "--time-window-end", "23:59",
+            "--debounce-seconds", "1", "--retry-count", "1", "--retry-backoff-seconds", "10",
+            "--poll-seconds", "5", "--allow-delete", "false", "--max-total-delete", "100",
+        )
+        self.assertEqual(realtime.returncode, 0, realtime.stderr)
+        held = self.root / "hung-poll-held"
+        shim_bin = self.root / "hung-poll-bin"
+        shim_bin.mkdir(mode=0o700)
+        shim = shim_bin / "chmod"
+        shim.write_text(
+            "#!/bin/sh\n"
+            'case "${2:-}" in\n'
+            "  */fingerprint.*)\n"
+            f"    printf '%s\\n' \"$$\" >> {shlex.quote(str(held))}\n"
+            f"    if [ \"$(wc -l < {shlex.quote(str(held))})\" -le 1 ]; then exec /bin/sleep 300; fi ;;\n"
+            "esac\n"
+            'exec /bin/chmod "$@"\n',
+            encoding="utf-8",
+        )
+        shim.chmod(0o755)
+        if os.getuid() == 0:
+            os.chown(shim_bin, self.drop_uid, self.drop_gid)
+            os.chown(shim, self.drop_uid, self.drop_gid)
+        environment = self.fast_clock_environment(step=31)
+        environment["PATH"] = f"{shim_bin}:{environment['PATH']}"
+        environment["SDSYNC_DSM_POLL_WALK_BUDGET"] = "3"
+        started = self.shell(self.lifecycle, "start", extra_environment=environment, timeout=30)
+        self.assertEqual(started.returncode, 0, started.stdout + started.stderr)
+        self._wait_for(held.exists, "no poll walk reached its scratch directory", timeout=30)
+        hung = int(held.read_text(encoding="utf-8").split()[0])
+        self.addCleanup(lambda: subprocess.run(["kill", "-KILL", str(hung)], check=False, capture_output=True))
+        timeouts = self.wait_for_controller_event("poll_walk_timeout", timeout=40)
+        detail = str(timeouts[0].get("detail", ""))
+        self.assertIn("profile=watch", detail)
+        self.assertIn("budget=3", detail)
+        self.assertEqual(timeouts[0].get("level"), "warn")
+        # The hung walk is gone and the slot was handed on: a second walk starts
+        # and completes (the shim lets it through).
+        self._wait_for(
+            lambda: len(held.read_text(encoding="utf-8").split()) >= 2,
+            "the poll slot was not freed: no second walk started\n"
+            + bounded_file_tail(self.real_var / "log/controller.log"),
+            timeout=60,
+        )
+        def hung_walk_gone() -> bool:
+            try:
+                state = Path(f"/proc/{hung}/stat").read_text(encoding="ascii").rsplit(") ", 1)[1].split()[0]
+            except OSError:
+                return True
+            return state in ("Z", "X")
+
+        self._wait_for(hung_walk_gone, "the hung walk was left running", timeout=10)
+        self._wait_for(
+            lambda: self._unobserved_rows("watch", "did not finish within its budget"),
+            "the episode never reached Activity\n" + bounded_file_tail(self.real_var / "log/controller.log"),
+            timeout=40,
+        )
+        rows = self._unobserved_rows("watch", "did not finish within its budget")
+        self.assertEqual(len(rows), 1, rows)
+        self.assertEqual(rows[0]["level"], "warn")
+        # More turns (and more walks) of the same recovered episode write no more.
+        time.sleep(2.0)
+        self.assertEqual(len(self._unobserved_rows("watch", "did not finish within its budget")), 1)
+        state = self.wait_for_state(
+            self.real_var / "state/routines/watch.state",
+            lambda fields: fields.get("observe_cause") != "poll_walk_timeout",
+        )
+        self.assertNotEqual(state.get("last_poll_epoch"), "0", state)
+        self.assertIn("watching_via", state)
+        stopped = self.shell(self.lifecycle, "stop", timeout=60)
+        self.assertEqual(stopped.returncode, 0, stopped.stdout + stopped.stderr)
+
+    def test_a_disabled_routine_is_named_once_and_enabling_it_says_so(self) -> None:
+        # C2. A disabled routine was a silent `continue`: no row, no state.
+        self.configure_with_password("watch", self.source_two, True)
+        routine, _ = self.api(
+            "routine", "--profile", "watch", "--enabled", "false", "--action", "sync",
+            "--mode", "interval", "--interval", "3600", "--weekdays", "1,2,3,4,5,6,7",
+            "--time-window-start", "00:00", "--time-window-end", "23:59",
+            "--debounce-seconds", "1", "--retry-count", "0", "--retry-backoff-seconds", "10",
+            "--poll-seconds", "5", "--allow-delete", "false", "--max-total-delete", "100",
+        )
+        self.assertEqual(routine.returncode, 0, routine.stderr)
+        environment = self.fast_clock_environment(step=31)
+        started = self.shell(self.lifecycle, "start", extra_environment=environment, timeout=30)
+        self.assertEqual(started.returncode, 0, started.stdout + started.stderr)
+        self._wait_for(
+            lambda: self._unobserved_rows("watch", "disabled"),
+            "the disabled routine never reached Activity\n" + bounded_file_tail(self.real_var / "log/controller.log"),
+            timeout=30,
+        )
+        time.sleep(1.5)
+        rows = self._unobserved_rows("watch", "disabled")
+        self.assertEqual(len(rows), 1, rows)
+        self.assertEqual(rows[0]["level"], "info")
+        fields = self.wait_for_state(
+            self.real_var / "state/routines/watch.state",
+            lambda fields: fields.get("observe_state") == "disabled",
+        )
+        self.assertEqual(fields.get("observe_cause"), "disabled", fields)
+        self.assertNotEqual(fields.get("observe_since_epoch"), "0", fields)
+        # Enabled again: the episode ends and says so.
+        routine, _ = self.api(
+            "routine", "--profile", "watch", "--enabled", "true", "--action", "sync",
+            "--mode", "interval", "--interval", "3600", "--weekdays", "1,2,3,4,5,6,7",
+            "--time-window-start", "00:00", "--time-window-end", "23:59",
+            "--debounce-seconds", "1", "--retry-count", "0", "--retry-backoff-seconds", "10",
+            "--poll-seconds", "5", "--allow-delete", "false", "--max-total-delete", "100",
+        )
+        self.assertEqual(routine.returncode, 0, routine.stderr)
+        self._wait_for(
+            lambda: [
+                event for event in self.activity_records()
+                if event["code"] == "routine.observed" and event["profile"] == "watch"
+            ],
+            "enabling the routine again was not said\n" + bounded_file_tail(self.real_var / "log/controller.log"),
+            timeout=30,
+        )
+        fields = self.wait_for_state(
+            self.real_var / "state/routines/watch.state",
+            lambda fields: fields.get("observe_state") == "ok",
+        )
+        self.assertEqual(fields.get("observe_cause"), "none", fields)
+        self.assertEqual(fields.get("watching_via"), "schedule", fields)
+        stopped = self.shell(self.lifecycle, "stop", timeout=60)
+        self.assertEqual(stopped.returncode, 0, stopped.stdout + stopped.stderr)
+
+    def test_an_unreadable_poll_is_one_observation_episode(self) -> None:
+        # C2. A poll that cannot read its tree (the same permanent fault as
+        # row 1) left the routine with a degraded or absent observer and one
+        # controller.log line. It is now one Activity row per episode, whichever
+        # watcher the fixture ends up with.
+        if os.getuid() == 0:
+            self.skipTest("chmod 000 does not bind root")
+        self.configure_with_password("watch", self.source_two, True)
+        locked = self.source_two / "locked"
+        locked.mkdir()
+        locked.chmod(0o000)
+        try:
+            routine, _ = self.api(
+                "routine", "--profile", "watch", "--enabled", "true", "--action", "sync",
+                "--mode", "realtime", "--interval", "60", "--weekdays", "1,2,3,4,5,6,7",
+                "--time-window-start", "00:00", "--time-window-end", "23:59",
+                "--debounce-seconds", "1", "--retry-count", "1", "--retry-backoff-seconds", "10",
+                "--poll-seconds", "5", "--allow-delete", "false", "--max-total-delete", "100",
+            )
+            self.assertEqual(routine.returncode, 0, routine.stderr)
+            started = self.shell(
+                self.lifecycle, "start", extra_environment=self.fast_clock_environment(step=31), timeout=30
+            )
+            self.assertEqual(started.returncode, 0, started.stderr)
+            self._wait_for(
+                lambda: self._unobserved_rows("watch", "cannot read part of the source tree"),
+                "the unreadable poll never reached Activity\n" + bounded_file_tail(self.real_var / "log/controller.log"),
+                timeout=30,
+            )
+            time.sleep(1.5)
+            rows = self._unobserved_rows("watch", "cannot read part of the source tree")
+            self.assertEqual(len(rows), 1, rows)
+            fields = self.state_fields(self.real_var / "state/routines/watch.state")
+            self.assertEqual(fields.get("observe_cause"), "poll_unreadable", fields)
+            self.assertIn(fields.get("observe_state"), ("blind", "degraded"), fields)
+            stopped = self.shell(self.lifecycle, "stop", timeout=15)
+            self.assertEqual(stopped.returncode, 0, stopped.stdout + stopped.stderr)
+        finally:
+            locked.chmod(0o700)
+
+    def test_a_refused_native_event_is_marked_again(self) -> None:
+        # C5. The native event is consumed before the run it asked for is
+        # admitted; a run refused at admission (exit 75) left the poll as the
+        # only way to find the change again.
+        controller = (self.real_target / "libexec/sdsync-controller").read_text(encoding="utf-8")
+        function = controller.split("\nremark_realtime_event() {\n", 1)[1].split("\n}\n", 1)[0]
+        marker = self.root / "remark.events"
+        log = self.root / "remark.log"
+        script = self.root / "remark.sh"
+        script.write_text(
+            "#!/bin/sh\nset -eu\n"
+            "controller_log_event() { printf '%s %s %s\\n' \"$1\" \"$2\" \"$3\" >> "
+            + shlex.quote(str(log)) + "; }\n"
+            "routine_profile=watch\n"
+            "remark_realtime_event() {\n" + function + "\n}\n"
+            f"marker={shlex.quote(str(marker))}\n"
+            ': > "$marker"\n'
+            '[ ! -s "$marker" ]\n'
+            'remark_realtime_event "$marker"\n'
+            '[ -s "$marker" ]\n'
+            'if remark_realtime_event "$marker.missing"; then exit 3; fi\n',
+            encoding="utf-8",
+        )
+        script.chmod(0o755)
+        if os.getuid() == 0:
+            os.chown(script, self.drop_uid, self.drop_gid)
+        result = self.shell(script)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        lines = log.read_text(encoding="utf-8").splitlines()
+        self.assertTrue(lines[0].startswith("info routine_event_remarked"), lines)
+        self.assertTrue(lines[1].startswith("warn routine_event_remark_failed"), lines)
+        # The wiring: the exit-75 branch calls it for a native event, and falls
+        # back to making the poll due when the marker cannot be written.
+        branch = controller.split('elif [ "$scheduled_exit" -eq 75 ]; then', 1)[1].split("elif [ \"$routine_cancelled\"", 1)[0]
+        self.assertIn('if [ "$routine_native_event_due" = true ]; then', branch)
+        self.assertIn('remark_realtime_event "$watcher_event_path" || routine_last_poll_value=0', branch)
+
     def test_realtime_poll_prunes_eadir_instead_of_failing(self) -> None:
         # Row 3. @eaDir is pruned before find ever descends into it, so a
         # mode-0000 @eaDir (the normal shape under a share with restrictive
@@ -11807,10 +12032,11 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
         ]
         self.assertEqual(len(unavailable), 3)
         self.assertTrue(all(event["profile"] == profile for event in unavailable))
+        # C6: the row names why -- here the notifier ran and exited 23.
         self.assertTrue(
             all(
                 event["message"]
-                == "DSM desktop notification delivery unavailable"
+                == "DSM desktop notification delivery unavailable (cause=notifier_exit_23)"
                 for event in unavailable
             )
         )
@@ -13819,6 +14045,38 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
             + (self.daemon_capture.read_text(encoding="utf-8") if self.daemon_capture.exists() else "(core never ran)")
             + bounded_file_tail(self.real_var / "log/controller.log"),
         )
+        stopped = self.shell(self.lifecycle, "stop", timeout=60)
+        self.assertEqual(stopped.returncode, 0, stopped.stdout + stopped.stderr)
+
+    def test_daemon_engine_names_a_disabled_routine_once(self) -> None:
+        # C2, the daemon's half: a disabled routine was a silent `continue`, and
+        # every other state in which nothing observes a routine reached only
+        # controller.log. The same episode is one Activity row here too.
+        self._daemon_engine(None)
+        configured = self.configure("idle", self.source_one, "/home/Drive/Idle", True)
+        self.assertEqual(configured.returncode, 0, configured.stderr)
+        stored = self.shell(self.manager, "set-password", "idle", input_text="test-password\n")
+        self.assertEqual(stored.returncode, 0, stored.stderr)
+        routine = self.shell(
+            self.manager, "configure-routine", "--profile", "idle", "--enabled", "false",
+            "--action", "sync", "--mode", "realtime", "--debounce-seconds", "1",
+        )
+        self.assertEqual(routine.returncode, 0, routine.stderr)
+        self._start_daemon()
+        self._wait_for(
+            lambda: self._unobserved_rows("idle", "disabled"),
+            "the disabled routine never reached Activity\n"
+            + bounded_file_tail(self.real_var / "log/controller.log"),
+            timeout=30,
+        )
+        time.sleep(1.5)
+        rows = self._unobserved_rows("idle", "disabled")
+        self.assertEqual(len(rows), 1, rows)
+        fields = self.wait_for_state(
+            self.real_var / "state/routines/idle.state",
+            lambda fields: fields.get("observe_state") == "disabled",
+        )
+        self.assertEqual(fields.get("observe_cause"), "disabled", fields)
         stopped = self.shell(self.lifecycle, "stop", timeout=60)
         self.assertEqual(stopped.returncode, 0, stopped.stdout + stopped.stderr)
 
@@ -17887,6 +18145,50 @@ fi
         self.wait_for_absence(
             self.real_var / f"control/processing/{job_id}.json",
             "the processing request outlived its terminal result",
+        )
+
+    def test_a_dashboard_job_that_blocks_the_loop_is_named_once_and_its_end_said(self) -> None:
+        # C4. check_stalled_run returned at once unless the active child was a
+        # runner, so a status walk, Doctor or resync that never ended held the
+        # whole loop -- routines, polls, the schedule -- with nothing said. A
+        # primary dashboard job is now judged by how long it has run. The bound is
+        # shortened here (SDSYNC_DSM_CONSUMER_STALL_SECONDS); the real one is 30
+        # minutes.
+        bridge_capture = self.root / "consumer-stall-capture"
+        bridge_lock = self.root / "consumer-stall-lock"
+        self.write_api_mock(queue_capture=bridge_capture, queue_lock=bridge_lock)
+        ready = self.root / "consumer-stall-ready"
+        release = self.root / "consumer-stall-release"
+        job_id = "c3" * 24
+        self.write_mock_control_job(job_id, "sync-status", ready=ready, release=release)
+        started = self.shell(
+            self.lifecycle, "start",
+            extra_environment={"SDSYNC_DSM_CONSUMER_STALL_SECONDS": "2"}, timeout=30,
+        )
+        self.assertEqual(started.returncode, 0, started.stdout + started.stderr)
+        self.addCleanup(lambda: release.write_text("go\n", encoding="utf-8"))
+        self.addCleanup(lambda: self.shell(self.lifecycle, "stop", timeout=30))
+        self.wait_for_path(ready, "the job never started", timeout=15)
+        blocked = self.wait_for_controller_event("controller_blocked_by_stalled_consumer", timeout=60)
+        self.assertEqual(len(blocked), 1, blocked)
+        self.assertEqual(blocked[0].get("level"), "error")
+        self.assertIn("waiting=routines,polls,schedule", str(blocked[0].get("detail")))
+        self._wait_for(
+            lambda: self._unobserved_rows("all", "dashboard job"),
+            "the stall never reached Activity\n" + bounded_file_tail(self.real_var / "log/controller.log"),
+            timeout=15,
+        )
+        time.sleep(3.0)
+        self.assertEqual(len(self._unobserved_rows("all", "dashboard job")), 1)
+        self.assertEqual(len(self.event_details("controller_blocked_by_stalled_consumer")), 1)
+        release.write_text("go\n", encoding="utf-8")
+        self._wait_for(
+            lambda: [
+                event for event in self.activity_records()
+                if event["code"] == "routine.observed" and event["profile"] == "all"
+            ],
+            "the end of the stall was not said\n" + bounded_file_tail(self.real_var / "log/controller.log"),
+            timeout=30,
         )
 
     def test_controller_publishes_consumer_wrote_no_result_for_a_silent_clean_exit(self) -> None:
@@ -24484,6 +24786,8 @@ fi
         self.assertIn("status=69", result.stdout)
         unavailable = [e for e in self.activity_records() if e["code"] == "notification.unavailable"]
         self.assertEqual(len(unavailable), 1, unavailable)
+        # C6: a missing notifier and a refusing one read differently.
+        self.assertIn("(cause=notifier_missing)", str(unavailable[0]["message"]))
 
         self.write_private_state(self.real_var / "state/alerts.state", "failure_count=abc\n")
         self.write_private_state(self.real_var / "state/doctor.state", "failure_count=x\n")
@@ -25513,8 +25817,10 @@ fi
             if e["code"] == "notification.unavailable" and e["profile"] == "bad"
         ]
         # Failures 2, 3 and 4 reach the threshold. No notifier is installed, so
-        # no delivery succeeds and none starts the cooldown.
-        self.assertEqual(len(attempts), 3, attempts)
+        # no delivery succeeds -- but the cooldown starts on the attempt (C6), so
+        # the three failures are one episode, one row, not three.
+        self.assertEqual(len(attempts), 1, attempts)
+        self.assertIn("(cause=notifier_missing)", str(attempts[0]["message"]))
         bad = self.state_fields(self.real_var / "state/alerts-bad.state")
         self.assertEqual(bad["failure_count"], "4", bad)
         good = self.state_fields(self.real_var / "state/alerts-good.state")
