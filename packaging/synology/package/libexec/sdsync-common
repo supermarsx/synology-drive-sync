@@ -3687,6 +3687,25 @@ append_audit_event() {
     audit_client_request_field=
     audit_client_request_needle=
     audit_activity_message="Module $audit_operation $audit_state [$audit_transaction]"
+    # A refused dashboard mutation names why, and the client request ID its
+    # refused body carried; `sdsync-dsm api audit-rejected` validated both
+    # (REJECTED_POST_REASONS in dsm_api.rs). They reach this row only: the
+    # audit.log record keeps its fixed shape, and the request tag stays last
+    # because readers take a trailing ` request_id=` as the row's correlation
+    # ID. The verifier proves exactly this text.
+    if [ "$audit_operation" = rejected-post ] && [ -n "${SDSYNC_DSM_AUDIT_REASON:-}" ]; then
+        case $SDSYNC_DSM_AUDIT_REASON in *[!a-z_]*) return 64 ;; esac
+        [ "${#SDSYNC_DSM_AUDIT_REASON}" -le 64 ] || return 64
+        audit_activity_message="$audit_activity_message reason=$SDSYNC_DSM_AUDIT_REASON"
+        case ${SDSYNC_DSM_REJECTED_REQUEST_ID:-} in
+            '') ;;
+            *[!0-9a-f]*) return 64 ;;
+            *)
+                [ "${#SDSYNC_DSM_REJECTED_REQUEST_ID}" -eq 32 ] || return 64
+                audit_activity_message="$audit_activity_message request_id=$SDSYNC_DSM_REJECTED_REQUEST_ID"
+                ;;
+        esac
+    fi
     if [ -n "$audit_client_request_id" ]; then
         audit_client_request_json=$(json_quote "$audit_client_request_id") || return $?
         audit_client_request_field=",\"client_request_id\":$audit_client_request_json"
