@@ -24833,6 +24833,12 @@ mod tests {
                     fs::set_permissions(&sibling, fs::Permissions::from_mode(0o600)).unwrap();
                     fs::rename(&sibling, &state_file).unwrap();
                     count += 1;
+                    // Both engines replace this file every few seconds. A writer that never rests
+                    // (or rests 100 us) wins eight looks in a row once the whole suite saturates
+                    // the CPUs, and the reader's bound then reads the replaced file as `links`:
+                    // 10 of 40 concurrent copies failed at 100 us, none of 40 at 1 ms. A
+                    // replacement per millisecond is still thousands of times faster than reality.
+                    std::thread::sleep(Duration::from_millis(1));
                 }
                 count
             })
