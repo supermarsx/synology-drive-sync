@@ -196,7 +196,7 @@ const INDEX_ISSUE_COPY =Object.freeze({
   "pair-index-cleanup-failed": "a set-aside copy of the checksum index, or the record of a crash in it, could not be cleaned up, so it may stay and use disk space; the path and the reason are in the detail",
   "pair-index-remote-ctime-static": "the destination did not show this run's write in a file's change time, so the destination's checksums are always computed live and only the local read is skipped",
   "pair-index-unsettled-unusable": "the record of files that keep changing could not be used, so such files keep making runs partial until it can be; Logs name the file and the cause",
-  "pair-index-unsupported-storage": "the checksum index cannot be kept on the volume that holds the package, so every run checks every file live (slower, still correct); the package stopped trying, and the detail says why"
+  "pair-index-unkeepable": "the checksum index was found damaged every time it was opened again, so this system cannot keep it; it is no longer rebuilt and every file is checked live. It is tried again after a package update or in 7 days"
 });
 
 const SAFE_TOKEN = /^[A-Za-z0-9_:.-]{1,64}$/;

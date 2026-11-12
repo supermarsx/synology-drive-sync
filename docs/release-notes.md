@@ -335,7 +335,8 @@ lists its own commits.
   package is running", and no longer locks edits.
 - **The "Every second" status refresh is gone**; a saved one becomes 5 seconds.
 - **A damaged checksum index reads in plain words** (files were still compared in full; nothing to do),
-  with the library's message under **Technical detail**; a long detail keeps its file name.
+  with the library's message under **Technical detail**; a long detail keeps its file name. An index
+  this system cannot keep (`pair-index-unkeepable`) says so and when it is tried again.
 - **A file that keeps failing or changing names the file** and how many runs in a row.
 
 ## Read this before upgrading

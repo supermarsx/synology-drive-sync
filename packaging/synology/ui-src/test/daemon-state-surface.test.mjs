@@ -94,7 +94,7 @@ const ISSUES = {
   "pair-index-cleanup-failed": /could not be cleaned up/i,
   "pair-index-remote-ctime-static": /change time/i,
   "pair-index-unsettled-unusable": /keep changing could not be used/i,
-  "pair-index-unsupported-storage": /cannot be kept on the volume/i
+  "pair-index-unkeepable": /cannot keep it; it is no longer rebuilt and every file is checked live/
 };
 
 for (const [issue, words] of Object.entries(ISSUES)) {

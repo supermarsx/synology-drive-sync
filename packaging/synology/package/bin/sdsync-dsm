@@ -1440,8 +1440,8 @@ pair_index_stem() {
 # State the profile's own runs left beside its configuration: the alert counter
 # (never removed before, so a profile recreated under the name inherited its
 # failure streak), the verified-pair index, its quarantined copies, its panic
-# record and its record of files that keep changing (by the stem above), and
-# the daemon's lasting condition. The
+# record, its count of damaged opens and its record of files that keep changing
+# (by the stem above), and the daemon's lasting condition. The
 # configuration is already gone by now, so one that cannot be removed does not
 # undo the removal: it is named with its path and cause as a warning, which
 # `api` returns as the result's warning.
@@ -1451,7 +1451,10 @@ remove_profile_leftovers() {
     if pair_index_stem "$leftover_profile"; then
         set -- "$@" "$cache_root/pairs/$pair_index_stem_value.redb" \
             "$cache_root/pairs/$pair_index_stem_value.redb.corrupt-"* \
-            "$cache_root/pairs/$pair_index_stem_value.redb.panicked"             "$cache_root/pairs/$pair_index_stem_value.redb.unsettled"             "$cache_root/pairs/$pair_index_stem_value.redb.unsettled.tmp"
+            "$cache_root/pairs/$pair_index_stem_value.redb.panicked" \
+            "$cache_root/pairs/$pair_index_stem_value.redb.rebuilds" \
+            "$cache_root/pairs/$pair_index_stem_value.redb.unsettled" \
+            "$cache_root/pairs/$pair_index_stem_value.redb.unsettled.tmp"
     else
         echo "warning: the pair index files of profile $leftover_profile in $cache_root/pairs were not removed: $pair_index_stem_cause" >&2
     fi
