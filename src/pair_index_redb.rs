@@ -54,6 +54,7 @@ const MARKER_PREFIX: &str = "sdsync.pair-index.";
 const SUFFIX_DATABASE: &str = ".redb";
 const SUFFIX_CORRUPT: &str = ".redb.corrupt-";
 const SUFFIX_PANICKED: &str = ".redb.panicked";
+const SUFFIX_REBUILDS: &str = ".redb.rebuilds";
 /// The bytes of the file a [`Fingerprint`] keeps: redb's header (magic, flags, both commit
 /// slots with their transaction ids and checksums) is the first 320.
 const HEADER_BYTES: u64 = 512;
@@ -70,6 +71,18 @@ const QUARANTINE_AGE: Duration = Duration::from_secs(7 * 86_400);
 /// Earlier copies of one profile that could not be removed, past which a damaged file is deleted
 /// instead of set aside, so copies cannot pile up without bound.
 const MAX_STUCK_COPIES: usize = 3;
+/// Damaged opens in a row, each with the same cause and no sound reopen between them, past which
+/// the index is not rebuilt again (`pair-index-unkeepable`): a file this package keeps building
+/// and keeps finding damaged cannot be kept on this system, and rebuilding it every run only
+/// churns quarantine copies while serving nothing.
+pub const UNKEEPABLE_AFTER: u32 = 3;
+/// How long a `pair-index-unkeepable` verdict stands before the index is tried once more, for a
+/// cause that went away without a package update (one rebuild a week at most).
+const UNKEEPABLE_RETRY: Duration = QUARANTINE_AGE;
+/// The record of consecutive damaged opens (`<stem>.redb.rebuilds`).
+const REBUILDS_SCHEMA: &str = "sdsync.pair-index-rebuilds.v1";
+/// The most of a damage cause the record keeps.
+const REBUILDS_CAUSE_BYTES: usize = 300;
 /// The most a compacted (dense) file costs per stored pair, which the compaction rule budgets
 /// twice over: a commit compacts when the file exceeds `2 * this * entries + slack`.
 ///
@@ -184,6 +197,8 @@ pub struct IndexPaths {
     pub database: PathBuf,
     /// Where a panic inside redb on this file is recorded (see the module documentation).
     pub panicked: PathBuf,
+    /// Where consecutive damaged opens are counted (see [`UNKEEPABLE_AFTER`]).
+    pub rebuilds: PathBuf,
 }
 
 /// Characters of a long profile name kept in its file name.
@@ -256,6 +271,7 @@ impl IndexPaths {
             profile: profile.to_owned(),
             database: directory.join(format!("{stem}{SUFFIX_DATABASE}")),
             panicked: directory.join(format!("{stem}{SUFFIX_PANICKED}")),
+            rebuilds: directory.join(format!("{stem}{SUFFIX_REBUILDS}")),
             stem,
         })
     }
@@ -279,6 +295,9 @@ fn is_index_owned(name: &std::ffi::OsStr) -> bool {
             && epoch.bytes().all(|byte| byte.is_ascii_digit());
     }
     if let Some(stem) = name.strip_suffix(SUFFIX_PANICKED) {
+        return stem_is_owned(stem);
+    }
+    if let Some(stem) = name.strip_suffix(SUFFIX_REBUILDS) {
         return stem_is_owned(stem);
     }
     name.strip_suffix(SUFFIX_DATABASE)
@@ -783,6 +802,213 @@ impl Quarantined {
     }
 }
 
+/// Consecutive damaged opens of one profile's index, as `<stem>.redb.rebuilds` records them.
+///
+/// A file is damaged once in a while (a crash, a failing disk), and setting it aside and
+/// rebuilding it from the run's own evidence heals it. A file this package builds and then finds
+/// damaged when it opens it again, time after time with the same cause, is one this build or this
+/// system cannot keep: rustc 1.90's armv7 miscompile of redb (`tests/pair_index_codegen.rs`) was
+/// one. Rebuilding it every run serves nothing and only churns quarantine copies, so each damaged
+/// open is counted, an open that finds a file it closed earlier sound clears the count, and at
+/// [`UNKEEPABLE_AFTER`] the index is turned off by name (`pair-index-unkeepable`) until the
+/// package changes, [`UNKEEPABLE_RETRY`] passes, or the record is removed.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct Rebuilds {
+    /// The build that counted them; another build starts over.
+    writer: String,
+    count: u32,
+    /// When the first and the latest of them were found (Unix seconds).
+    since: i64,
+    last: i64,
+    cause: String,
+}
+
+/// The build a [`Rebuilds`] record belongs to: its version, commit and redb.
+fn rebuilds_writer() -> String {
+    let build = &crate::observability::BUILD;
+    format!("{}+{}/redb-{REDB_VERSION}", build.version, build.commit)
+}
+
+impl Rebuilds {
+    fn render(&self) -> String {
+        format!(
+            "{REBUILDS_SCHEMA}\nwriter={}\ncount={}\nsince={}\nlast={}\ncause={}\n",
+            self.writer, self.count, self.since, self.last, self.cause
+        )
+    }
+
+    fn parse(text: &str) -> Option<Self> {
+        let mut lines = text.lines();
+        if lines.next()? != REBUILDS_SCHEMA {
+            return None;
+        }
+        let mut field = |name: &str| {
+            lines
+                .next()
+                .and_then(|line| line.strip_prefix(name)?.strip_prefix('='))
+                .map(str::to_owned)
+        };
+        Some(Self {
+            writer: field("writer")?,
+            count: field("count")?.parse().ok()?,
+            since: field("since")?.parse().ok()?,
+            last: field("last")?.parse().ok()?,
+            cause: field("cause")?,
+        })
+    }
+
+    /// Whether the verdict stands for this build at `now`. A clock set back keeps it standing.
+    fn unkeepable(&self, now: i64) -> bool {
+        let retry = i64::try_from(UNKEEPABLE_RETRY.as_secs()).unwrap_or(i64::MAX);
+        self.count >= UNKEEPABLE_AFTER
+            && self.writer == rebuilds_writer()
+            && now.saturating_sub(self.last) < retry
+    }
+
+    /// The count after one more damaged open with `cause` at `now`: the same cause found by the
+    /// same build adds one, anything else starts over.
+    fn next(previous: Option<&Self>, cause: &str, now: i64) -> Self {
+        let cause: String = cause
+            .chars()
+            .map(|c| if c.is_control() { ' ' } else { c })
+            .take(REBUILDS_CAUSE_BYTES)
+            .collect();
+        let writer = rebuilds_writer();
+        match previous {
+            Some(previous) if previous.writer == writer && previous.cause == cause => Self {
+                count: previous.count.saturating_add(1),
+                last: now,
+                ..previous.clone()
+            },
+            _ => Self {
+                writer,
+                count: 1,
+                since: now,
+                last: now,
+                cause,
+            },
+        }
+    }
+}
+
+/// The `pair-index-unkeepable` condition `record` stands for.
+fn unkeepable_issue(paths: &IndexPaths, record: &Rebuilds) -> IndexIssue {
+    IndexIssue::warning(
+        "pair-index-unkeepable",
+        paths.label(),
+        format!(
+            "the index cannot be kept on this system: {} times in a row since {} it was found \
+             damaged when it was opened again ({}), so it is no longer rebuilt and every file is \
+             checked live; it is tried again after a package update, after {} days, or once {} \
+             is removed",
+            record.count,
+            record.since,
+            record.cause,
+            UNKEEPABLE_RETRY.as_secs() / 86_400,
+            paths.rebuilds.display()
+        ),
+    )
+}
+
+/// The record of consecutive damaged opens, if there is one. One that cannot be read, or is not
+/// a record this package writes, is named and counts as none: the count starts over, which costs
+/// at most [`UNKEEPABLE_AFTER`] more rebuilds.
+fn read_rebuilds(paths: &IndexPaths) -> (Option<Rebuilds>, Option<IndexIssue>) {
+    let unreadable = |cause: String| {
+        IndexIssue::warning(
+            "pair-index-cleanup-failed",
+            paths.rebuilds.display().to_string(),
+            format!("{cause}; the count of damaged opens starts over"),
+        )
+    };
+    match fs::symlink_metadata(&paths.rebuilds) {
+        Ok(metadata) if !metadata.is_file() => {
+            return (
+                None,
+                Some(unreadable(
+                    "the record of damaged opens is not a regular file".to_owned(),
+                )),
+            );
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return (None, None),
+        Err(error) => {
+            return (
+                None,
+                Some(unreadable(format!(
+                    "the record of damaged opens could not be examined: {error}"
+                ))),
+            );
+        }
+    }
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(target_os = "linux")]
+    options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK);
+    let mut text = String::new();
+    let read = options.open(&paths.rebuilds).and_then(|file| {
+        use std::io::Read as _;
+        file.take(4096).read_to_string(&mut text)
+    });
+    match read {
+        Err(error) => (
+            None,
+            Some(unreadable(format!(
+                "the record of damaged opens could not be read: {error}"
+            ))),
+        ),
+        Ok(_) => match Rebuilds::parse(&text) {
+            Some(record) => (Some(record), None),
+            None => (
+                None,
+                Some(unreadable(
+                    "the record of damaged opens is not one this package writes".to_owned(),
+                )),
+            ),
+        },
+    }
+}
+
+/// Record `record`, so the next run continues the count.
+fn write_rebuilds(paths: &IndexPaths, record: &Rebuilds) -> Result<(), IndexIssue> {
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true).mode(0o600);
+    #[cfg(target_os = "linux")]
+    options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+    options
+        .open(&paths.rebuilds)
+        .and_then(|mut file| {
+            file.write_all(record.render().as_bytes())?;
+            file.sync_all()
+        })
+        .map_err(|error| {
+            IndexIssue::warning(
+                "pair-index-store-failed",
+                paths.rebuilds.display().to_string(),
+                format!(
+                    "the count of damaged opens could not be recorded ({error}), so an index \
+                     that cannot be kept here would be rebuilt on every run"
+                ),
+            )
+        })
+}
+
+/// Remove the record: an open found a file sound, or the verdict no longer stands.
+fn clear_rebuilds(paths: &IndexPaths) -> Option<IndexIssue> {
+    match fs::remove_file(&paths.rebuilds) {
+        Ok(()) => None,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => Some(IndexIssue::warning(
+            "pair-index-cleanup-failed",
+            paths.rebuilds.display().to_string(),
+            format!(
+                "the record of damaged opens could not be removed ({error}), so a later damaged \
+                 open counts on from it"
+            ),
+        )),
+    }
+}
+
 /// What opening and checking the file found.
 #[derive(Debug, Eq, PartialEq)]
 pub enum CheckVerdict {
@@ -815,6 +1041,9 @@ struct Checked {
     verdict: CheckVerdict,
     /// `check_integrity()` ran (whatever it found).
     verified: bool,
+    /// The file held something before redb opened it: a file an earlier window or run closed,
+    /// not one this open created.
+    existed: bool,
 }
 
 /// Open the file, verified unless it is exactly `trusted` (see [`Fingerprint`]). A file with a
@@ -824,6 +1053,7 @@ fn open_checked(paths: &IndexPaths, cache_mib: u64, trusted: Option<&Fingerprint
         database: None,
         verdict,
         verified: false,
+        existed: false,
     };
     let recorded = match panic_record(paths) {
         Ok(recorded) => recorded,
@@ -859,11 +1089,13 @@ fn open_checked(paths: &IndexPaths, cache_mib: u64, trusted: Option<&Fingerprint
         Err(Opening::Issue(issue)) => return unopened(CheckVerdict::Unsafe(issue)),
         Err(Opening::Redb(error)) => return unopened(verdict_for(error)),
     };
+    let existed = found.as_ref().is_some_and(|found| found.length > 0);
     if trusted.is_some() && found.as_ref() == trusted {
         return Checked {
             database: Some(database),
             verdict: CheckVerdict::Passed { repaired: false },
             verified: false,
+            existed,
         };
     }
     match database.check_integrity() {
@@ -871,11 +1103,13 @@ fn open_checked(paths: &IndexPaths, cache_mib: u64, trusted: Option<&Fingerprint
             database: Some(database),
             verdict: CheckVerdict::Passed { repaired: !clean },
             verified: true,
+            existed,
         },
         Err(error) => Checked {
             database: None,
             verdict: verdict_for(error.into()),
             verified: true,
+            existed,
         },
     }
 }
@@ -982,6 +1216,8 @@ pub struct RedbPairIndex {
     discarded: bool,
     /// Pairs the last commit left, so the count needs no reopen.
     entries: Option<u64>,
+    /// Damaged opens counted so far without a sound one between them (see [`Rebuilds`]).
+    rebuilds: Option<Rebuilds>,
 }
 
 /// What opening the index for a run produced: a backend, or none, and the issues met on the way.
@@ -1024,8 +1260,9 @@ fn opened_database<'a>(
 
 impl RedbPairIndex {
     /// Open the index, verified. A damaged, repaired or foreign-format file is set aside and
-    /// replaced by an empty one; locked, read-only and unsafe files give no backend at all. Every
-    /// case but a clean pass is named.
+    /// replaced by an empty one; locked, read-only and unsafe files give no backend at all, and
+    /// neither does an index this system has shown it cannot keep (`pair-index-unkeepable`, see
+    /// [`Rebuilds`]). Every case but a clean pass is named.
     pub fn open(paths: IndexPaths, cache_mib: u64) -> Opened {
         let mut backend = Self {
             paths,
@@ -1039,7 +1276,26 @@ impl RedbPairIndex {
             integrity_checks: 0,
             discarded: false,
             entries: None,
+            rebuilds: None,
         };
+        let (record, unreadable) = read_rebuilds(&backend.paths);
+        backend.notes.extend(unreadable);
+        match record {
+            Some(record) if record.unkeepable(unix_now()) => {
+                // Nothing is opened, built or set aside: the verdict stands, by name, every run.
+                let mut issues = std::mem::take(&mut backend.notes);
+                issues.push(unkeepable_issue(&backend.paths, &record));
+                return Opened {
+                    backend: None,
+                    issues,
+                };
+            }
+            Some(record) if record.count >= UNKEEPABLE_AFTER => {
+                // Another build, or a week on: the index is tried again from a count of zero.
+                backend.notes.extend(clear_rebuilds(&backend.paths));
+            }
+            record => backend.rebuilds = record,
+        }
         let opened = backend.ensure_open();
         let mut issues = std::mem::take(&mut backend.notes);
         match opened {
@@ -1072,6 +1328,14 @@ impl RedbPairIndex {
         let reopen = self.trusted.is_some();
         let opened = open_checked(&self.paths, self.cache_mib, self.trusted.as_ref());
         self.integrity_checks += usize::from(opened.verified);
+        if opened.existed
+            && matches!(opened.verdict, CheckVerdict::Passed { repaired: false })
+            && self.rebuilds.take().is_some()
+        {
+            // A file an earlier window or run closed opened sound: this system keeps the index,
+            // and the damaged opens before it were not a pattern.
+            self.notes.extend(clear_rebuilds(&self.paths));
+        }
         self.settle(opened.database, opened.verdict, reopen)
     }
 
@@ -1122,6 +1386,10 @@ impl RedbPairIndex {
     /// Set the file aside and continue on a new, empty, verified one: nothing read from the old
     /// one is served (the session is told through [`PairIndex::take_discarded`]), and the run's
     /// commit rebuilds the index from its own live evidence. Named with what was found.
+    ///
+    /// The damaged open is counted first (see [`Rebuilds`]); the one that reaches
+    /// [`UNKEEPABLE_AFTER`] sets the file aside like any other but builds no new one, and the run
+    /// goes on without the index (`pair-index-unkeepable`).
     fn retire(&mut self, damage: Damage, cause: String) -> Result<(), IndexIssue> {
         self.pairs = None;
         self.respell = None;
@@ -1129,6 +1397,12 @@ impl RedbPairIndex {
         self.trusted = None;
         self.entries = None;
         let label = self.paths.label();
+        let record = Rebuilds::next(self.rebuilds.as_ref(), &cause, unix_now());
+        if let Err(issue) = write_rebuilds(&self.paths, &record) {
+            self.notes.push(issue);
+        }
+        let unkeepable = record.count >= UNKEEPABLE_AFTER;
+        self.rebuilds = Some(record);
         let quarantined = quarantine(&self.paths).map_err(|why| {
             IndexIssue::warning(damage.code(), label.clone(), format!("{cause}; {why}"))
         })?;
@@ -1136,14 +1410,21 @@ impl RedbPairIndex {
             damage.code(),
             label.clone(),
             format!(
-                "{cause}; {}: nothing from it is served, and the index is rebuilt from this \
-                 run's evidence",
-                quarantined.describe()
+                "{cause}; {}: nothing from it is served, {}",
+                quarantined.describe(),
+                if unkeepable {
+                    "and no new index is built (pair-index-unkeepable)"
+                } else {
+                    "and the index is rebuilt from this run's evidence"
+                }
             ),
         ));
         self.notes.extend(quarantined.cleanup);
         self.discarded = true;
         self.meta = Some(None);
+        if unkeepable && let Some(record) = &self.rebuilds {
+            return Err(unkeepable_issue(&self.paths, record));
+        }
         let fresh = open_checked(&self.paths, self.cache_mib, None);
         self.integrity_checks += usize::from(fresh.verified);
         match fresh.verdict {
@@ -1541,6 +1822,7 @@ mod tests {
             "photos.redb",
             "photos.redb.corrupt-1800000000",
             "photos.redb.panicked",
+            "photos.redb.rebuilds",
             MARKER,
         ] {
             assert!(is_index_owned(std::ffi::OsStr::new(owned)), "{owned}");

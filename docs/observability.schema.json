@@ -67,7 +67,8 @@
                   "pair-index-cleanup-failed",
                   "pair-index-plan-clock-unbounded",
                   "pair-index-failed-run",
-                  "pair-index-unsettled-unusable"
+                  "pair-index-unsettled-unusable",
+                  "pair-index-unkeepable"
                 ]
               },
               "severity": { "enum": ["info", "warning"] },

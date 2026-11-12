@@ -204,6 +204,7 @@ pub const ISSUE_CODES: &[&str] = &[
     "pair-index-plan-clock-unbounded",
     "pair-index-failed-run",
     "pair-index-unsettled-unusable",
+    "pair-index-unkeepable",
 ];
 
 impl IndexIssue {

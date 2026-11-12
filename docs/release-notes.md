@@ -95,6 +95,18 @@ lists its own commits.
   the next run (`applies_next_run`).
 - **Log rotation by the daemon takes the shell's `event-log.lock`.** A rotation that cannot be made
   keeps the line and writes `var/state/log-rotation.failed`.
+- **The checksum index works on armv7 NAS models.** On armv7 (for example the DS416) every index
+  the package built was found damaged at its next open (`pair-index-corrupt: Database page size 0
+  does not match expected 4096`), so it was set aside and rebuilt on every run and never saved a
+  checksum. The cause was a compiler fault in the armv7 release build of the database library,
+  which wrote back a header with everything but its first ten bytes zeroed. That build is now made
+  so the fault does not occur. A file left from an earlier release is set aside once more, and the
+  index is warm from the run after that.
+- **An index that cannot be kept is turned off by name (`pair-index-unkeepable`).** When the index is
+  found damaged three opens in a row with the same cause, it is set aside as before but not built
+  again. Each run names the condition as a warning and checks every file live, and no more copies
+  pile up. It is tried again after a package update, after 7 days, or when
+  `<profile>.redb.rebuilds` is removed from the index folder.
 
 ### Daemon fixes from the integration review
 
