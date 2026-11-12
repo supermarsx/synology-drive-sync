@@ -5095,9 +5095,23 @@ api_cgi_failure() {
     cgi_failure_code=$4
     cgi_failure_status=$6
     case "$cgi_failure_stage:$cgi_failure_code:$cgi_failure_status" in
-        request:invalid_request:400|request:method_not_allowed:405|request:payload_too_large:413|request:unsupported_media_type:415)
+        request:invalid_request:400|request:method_not_allowed:405|request:payload_too_large:413|request:unsupported_media_type:415|request:request_body_timeout:400)
             cgi_failure_event=bridge.failed
             cgi_failure_category=bridge
+            ;;
+        # The CGI's watchdog answered a request that ran out of time in this
+        # stage, or the response could not be written to a reader that stopped.
+        request:cgi_deadline_exceeded:503|bridge_connect:cgi_deadline_exceeded:503|bridge_io:cgi_deadline_exceeded:503|bridge_protocol:cgi_deadline_exceeded:503)
+            cgi_failure_event=bridge.failed
+            cgi_failure_category=bridge
+            ;;
+        cgi_identity:cgi_deadline_exceeded:503|cgi_runtime:cgi_deadline_exceeded:503|cgi_runtime:response_write_timeout:503)
+            cgi_failure_event=security.failed
+            cgi_failure_category=security
+            ;;
+        dsm_authentication:cgi_deadline_exceeded:503)
+            cgi_failure_event=authentication.failed
+            cgi_failure_category=authentication
             ;;
         cgi_identity:cgi_identity_unsafe:503|cgi_runtime:cgi_runtime_unsafe:503|cgi_runtime:cgi_runtime_unavailable:503)
             cgi_failure_event=security.failed

@@ -244,6 +244,23 @@ const CGI_SERVICE_CONNECT_WINDOW: Duration = Duration::from_secs(2);
 const CGI_SERVICE_RETRY_INTERVAL: Duration = Duration::from_millis(50);
 #[cfg(target_os = "linux")]
 const AUTH_HELPER_TIMEOUT: Duration = Duration::from_secs(5);
+/// How long the CGI waits for each part of a POST body. A body shorter than its Content-Length on
+/// a pipe that stays open used to hold the CGI forever.
+#[cfg(target_os = "linux")]
+const REQUEST_BODY_READ_TIMEOUT: Duration = Duration::from_secs(5);
+/// A POST body that stopped arriving.
+const REQUEST_BODY_TIMEOUT: BridgeError =
+    BridgeError::coded(ErrorKind::BadRequest, "request_body_timeout");
+/// The whole of one CGI request, after which the watchdog answers for it (`cgi_watchdog`). Reads
+/// get 12 s, two more than the dashboard waits for one, so the browser can still see the named
+/// answer; a POST gets 40 s, past the relay's 30 s and short of the dashboard's 45 s.
+#[cfg(target_os = "linux")]
+const CGI_READ_DEADLINE: Duration = Duration::from_secs(12);
+#[cfg(target_os = "linux")]
+const CGI_POST_DEADLINE: Duration = Duration::from_secs(40);
+/// How long writing the response may take before the CGI gives up on a reader that stopped.
+#[cfg(target_os = "linux")]
+const CGI_RESPONSE_WRITE_TIMEOUT: Duration = Duration::from_secs(2);
 #[cfg(target_os = "linux")]
 const READ_MANAGER_TIMEOUT: Duration = Duration::from_secs(20);
 #[cfg(target_os = "linux")]
@@ -1318,6 +1335,10 @@ struct RelayRequestRef<'a> {
     authenticated_username: &'a str,
     authenticated_uid: u32,
     session_binding: &'a str,
+    // Present (and true) only when the CGI could not run DSM's authenticate.cgi and leaves the
+    // session to the service's loopback query; see `encode_loopback_relay_request`.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    loopback_authentication: bool,
     body: Option<&'a str>,
 }
 
@@ -1344,6 +1365,8 @@ struct RelayRequest {
     authenticated_username: String,
     authenticated_uid: u32,
     session_binding: String,
+    #[serde(default)]
+    loopback_authentication: bool,
     body: Option<String>,
 }
 
@@ -1397,10 +1420,18 @@ impl RelayRequest {
         validate_optional_environment_value(self.server_port.as_deref(), 8)?;
         validate_optional_environment_value(self.https.as_deref(), 16)?;
         validate_optional_environment_value(self.transfer_encoding.as_deref(), 64)?;
-        if !valid_authenticated_username(&self.authenticated_username)
-            || self.authenticated_uid == 0
-            || hex_decode_exact::<32>(&self.session_binding).is_none()
-        {
+        // A loopback request carries no identity at all: the service establishes it. Anything
+        // half-filled is malformed rather than trusted in part.
+        let identity_valid = if self.loopback_authentication {
+            self.authenticated_username.is_empty()
+                && self.authenticated_uid == 0
+                && self.session_binding.is_empty()
+        } else {
+            valid_authenticated_username(&self.authenticated_username)
+                && self.authenticated_uid != 0
+                && hex_decode_exact::<32>(&self.session_binding).is_some()
+        };
+        if !identity_valid {
             return Err(BridgeError::bad_request());
         }
         if self
@@ -1459,10 +1490,38 @@ fn encode_relay_request(
     body: Option<&[u8]>,
     session: &AuthenticatedSession,
 ) -> BridgeResult<Zeroizing<Vec<u8>>> {
+    encode_relay_request_for(environment, body, Some(session))
+}
+
+/// A relay whose DSM session the service authenticates through the loopback user service.
+///
+/// On DSM 7 the package cannot execute `authenticate.cgi`, and the CGI used to make that loopback
+/// query itself, building a TLS client per request. A TLS client needs randomness; on the 3.10
+/// kernels DSM 7 still ships there is no `getrandom(2)`, so the first draw in every process waits
+/// in `poll(/dev/random, -1)` until the kernel's entropy count rises, and the client's `Drop`
+/// joins the thread that is waiting. Every dashboard request was a new process paying that wait,
+/// and on a drained pool CGIs hung for the better part of an hour. The service is one long-lived
+/// process with one client, so the wait is paid once per service life, and the CGI path needs no
+/// randomness at all. The service still checks the peer's UID, resolves the user through NSS and
+/// computes the session binding, exactly as for a relay the CGI authenticated.
+fn encode_loopback_relay_request(
+    environment: &CgiEnvironment,
+    body: Option<&[u8]>,
+) -> BridgeResult<Zeroizing<Vec<u8>>> {
+    encode_relay_request_for(environment, body, None)
+}
+
+fn encode_relay_request_for(
+    environment: &CgiEnvironment,
+    body: Option<&[u8]>,
+    session: Option<&AuthenticatedSession>,
+) -> BridgeResult<Zeroizing<Vec<u8>>> {
     let body = body
         .map(|bytes| std::str::from_utf8(bytes).map_err(|_| BridgeError::bad_request()))
         .transpose()?;
-    let session_binding = hex_encode(&session.binding);
+    let session_binding = session
+        .map(|session| hex_encode(&session.binding))
+        .unwrap_or_default();
     let request = RelayRequestRef {
         schema: RELAY_SCHEMA,
         method: &environment.method,
@@ -1483,9 +1542,10 @@ fn encode_relay_request(
         server_port: environment.server_port.as_deref(),
         https: environment.https.as_deref(),
         transfer_encoding: environment.transfer_encoding.as_deref(),
-        authenticated_username: &session.username,
-        authenticated_uid: session.uid,
+        authenticated_username: session.map_or("", |session| session.username.as_str()),
+        authenticated_uid: session.map_or(0, |session| session.uid),
         session_binding: &session_binding,
+        loopback_authentication: session.is_none(),
         body,
     };
     let encoded = serde_json::to_vec(&request).map_err(|_| BridgeError::internal())?;
@@ -3044,9 +3104,13 @@ fn read_exact_body(
     }
     let mut body = Zeroizing::new(Vec::with_capacity(content_length));
     let mut limited = reader.take((content_length + 1) as u64);
-    limited
-        .read_to_end(&mut body)
-        .map_err(|_| BridgeError::bad_request())?;
+    limited.read_to_end(&mut body).map_err(|error| {
+        if error.kind() == io::ErrorKind::TimedOut {
+            REQUEST_BODY_TIMEOUT
+        } else {
+            BridgeError::bad_request()
+        }
+    })?;
     if body.len() != content_length {
         return Err(BridgeError::bad_request());
     }
@@ -4767,16 +4831,65 @@ mod linux_runtime {
         }
     }
 
-    pub(super) fn authenticate_and_authorize_cgi(
+    /// The CGI's stdin, read with a bound on every wait for more of the body.
+    pub(super) struct PolledStdin {
+        timeout: Duration,
+    }
+
+    impl PolledStdin {
+        pub(super) fn new(timeout: Duration) -> Self {
+            Self { timeout }
+        }
+    }
+
+    impl Read for PolledStdin {
+        fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+            let mut poll = libc::pollfd {
+                fd: libc::STDIN_FILENO,
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            let millis =
+                libc::c_int::try_from(self.timeout.as_millis()).unwrap_or(libc::c_int::MAX);
+            loop {
+                // SAFETY: one live pollfd for the duration of the call.
+                let ready = unsafe { libc::poll(&mut poll, 1, millis) };
+                if ready < 0 {
+                    let error = io::Error::last_os_error();
+                    if error.kind() == io::ErrorKind::Interrupted {
+                        continue;
+                    }
+                    return Err(error);
+                }
+                if ready == 0 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "request body stopped arriving",
+                    ));
+                }
+                break;
+            }
+            // SAFETY: `buffer` is a live, writable slice of its own length.
+            let read =
+                unsafe { libc::read(libc::STDIN_FILENO, buffer.as_mut_ptr().cast(), buffer.len()) };
+            if read < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(read as usize)
+        }
+    }
+
+    /// The CGI's half of authentication: run DSM's authenticate.cgi when this process may, or
+    /// `None` when it may not, leaving the session to the service's loopback query
+    /// ([`authenticate_relayed_via_dsm_user_service`]). The CGI never builds a TLS client.
+    pub(super) fn authenticate_or_defer_cgi(
         inputs: &AuthenticationInputs,
         timeout: Duration,
-    ) -> Result<AuthenticatedSession, CgiFailure> {
+    ) -> Result<Option<AuthenticatedSession>, CgiFailure> {
         let helper = match select_authentication_helper(probe_caller_execute, |path| {
             validate_dsm_authentication_helper(path)
         })? {
-            AuthenticationHelperSelection::Loopback => {
-                return authenticate_via_dsm_user_service(inputs, timeout);
-            }
+            AuthenticationHelperSelection::Loopback => return Ok(None),
             AuthenticationHelperSelection::Direct(helper) => helper,
         };
         let mut command = Command::new(&helper.path);
@@ -4812,13 +4925,15 @@ mod linux_runtime {
             &output.stdout,
             inputs.native_context.http_host.as_deref(),
         )?;
-        authorize_authenticated_username(username, inputs).map_err(|error| {
-            CgiFailure::coded(
-                CgiFailureStage::Authentication,
-                error,
-                "dsm_authentication_forbidden",
-            )
-        })
+        authorize_authenticated_username(username, inputs)
+            .map(Some)
+            .map_err(|error| {
+                CgiFailure::coded(
+                    CgiFailureStage::Authentication,
+                    error,
+                    "dsm_authentication_forbidden",
+                )
+            })
     }
 
     pub(super) fn authenticated_helper_username(
@@ -4842,7 +4957,8 @@ mod linux_runtime {
         })
     }
 
-    fn authenticate_via_dsm_user_service(
+    /// The service's half: authenticate a relayed DSM session through the loopback user service.
+    pub(super) fn authenticate_relayed_via_dsm_user_service(
         inputs: &AuthenticationInputs,
         timeout: Duration,
     ) -> Result<AuthenticatedSession, CgiFailure> {
@@ -4972,6 +5088,44 @@ mod linux_runtime {
         is_admin: bool,
     }
 
+    /// The one loopback client this process keeps.
+    ///
+    /// Built once and never dropped: a `reqwest::blocking::Client` owns a runtime thread, and its
+    /// `Drop` joins that thread, so a client per request made every request wait for whatever the
+    /// thread was waiting on -- on a 3.10 kernel, `poll(/dev/random)` for the first random draw.
+    /// Kept, the client's thread pays that wait once per process; each request is still bounded by
+    /// its own timeout, because nothing waits on a drop. No connection is kept idle: the reuse is
+    /// of the runtime, the TLS configuration and the RNG state, not of a socket DSM may close.
+    ///
+    /// Through the workspace choke point rather than building a reqwest client directly: under
+    /// `rustls-no-provider` a client built without an installed provider panics on reqwest's
+    /// internal runtime thread instead of returning an error.
+    fn loopback_client() -> BridgeResult<reqwest::blocking::Client> {
+        static CLIENT: Mutex<Option<reqwest::blocking::Client>> = Mutex::new(None);
+        let mut held = CLIENT
+            .lock()
+            .map_err(|_| BridgeError::unavailable_because("loopback_client_poisoned"))?;
+        if let Some(client) = held.as_ref() {
+            return Ok(client.clone());
+        }
+        let client = synology_drive_sync::blocking_client_builder()
+            .map_err(|_| BridgeError::new(ErrorKind::Unavailable))?
+            .no_proxy()
+            .redirect(Policy::none())
+            .http1_only()
+            .pool_max_idle_per_host(0)
+            .connect_timeout(AUTH_HELPER_TIMEOUT)
+            // DSM commonly uses a user-selected or self-signed certificate.
+            // The peer is still pinned to the IPv4 loopback literal the URL
+            // names; no hostname, proxy, redirect, or remote address is
+            // accepted. Over plain HTTP the setting has nothing to act on.
+            .danger_accept_invalid_certs(true)
+            .build()
+            .map_err(|_| BridgeError::new(ErrorKind::Unavailable))?;
+        *held = Some(client.clone());
+        Ok(client)
+    }
+
     pub(super) fn query_dsm_user_service(
         inputs: &AuthenticationInputs,
         timeout: Duration,
@@ -4996,30 +5150,13 @@ mod linux_runtime {
         let url = format!(
             "{scheme}://127.0.0.1:{port}{DSM_USER_SERVICE_PATH}?api={DSM_USER_SERVICE_API}&version=1&method=get_user_service"
         );
-        // Through the workspace choke point rather than building a reqwest
-        // client here: this is the DSM package's own API server, and under
-        // `rustls-no-provider` a client built without an installed provider
-        // panics on reqwest's internal runtime thread instead of returning an
-        // error. This path is why the choke point exists -- it reaches TLS
-        // without going through ApiClient at all.
-        let client = synology_drive_sync::blocking_client_builder()
-            .map_err(|_| BridgeError::new(ErrorKind::Unavailable))?
-            .no_proxy()
-            .redirect(Policy::none())
-            .http1_only()
-            .connect_timeout(timeout)
-            .timeout(timeout)
-            // DSM commonly uses a user-selected or self-signed certificate.
-            // The peer is still pinned to the IPv4 loopback literal above;
-            // no hostname, proxy, redirect, or remote address is accepted.
-            .danger_accept_invalid_certs(https)
-            .build()
-            .map_err(|_| BridgeError::new(ErrorKind::Unavailable))?;
+        let client = loopback_client()?;
         let mut cookie = HeaderValue::from_str(inputs.cookie.as_str())
             .map_err(|_| BridgeError::new(ErrorKind::Unauthorized))?;
         cookie.set_sensitive(true);
         let mut request = client
             .get(&url)
+            .timeout(timeout)
             .header(ACCEPT, "application/json")
             .header(COOKIE, cookie);
         if let Some(token) = &inputs.synology_token {
@@ -7175,7 +7312,32 @@ mod linux_process {
         }
         // Fall back to the direct child if the group disappeared or changed.
         let _ = child.kill();
-        let _ = child.wait();
+        // SIGKILL is not instant for a process in uninterruptible I/O, and an unbounded wait
+        // here held the request (and, on the CGI's Direct branch, the CGI) for as long as the
+        // kernel did. Reap within two seconds or abandon it, and say so.
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            match child.try_wait() {
+                Ok(Some(_)) => return,
+                Ok(None) if Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                Ok(None) => {
+                    eprintln!(
+                        "sdsync-dsm-api: manager_unkillable pid={} did not exit within 2 s of SIGKILL; abandoned",
+                        child.id()
+                    );
+                    return;
+                }
+                Err(error) => {
+                    eprintln!(
+                        "sdsync-dsm-api: manager_unkillable pid={} could not be reaped: {error}",
+                        child.id()
+                    );
+                    return;
+                }
+            }
+        }
     }
 
     fn terminate_queued_process_group(
@@ -14133,6 +14295,15 @@ pub(crate) fn main_entry() -> ExitCode {
     }
     if arguments.is_empty() {
         let is_get = std::env::var("REQUEST_METHOD").is_ok_and(|method| method == "GET");
+        #[cfg(target_os = "linux")]
+        cgi_watchdog::arm(
+            if is_get {
+                CGI_READ_DEADLINE
+            } else {
+                CGI_POST_DEADLINE
+            },
+            is_get,
+        );
         let response = match run_cgi() {
             Ok(response) => response,
             Err(failure) => {
@@ -14142,6 +14313,25 @@ pub(crate) fn main_entry() -> ExitCode {
             }
         }
         .for_cgi_transport(is_get);
+        #[cfg(target_os = "linux")]
+        {
+            // The watchdog may already be answering: then it writes, records and exits, and this
+            // thread must not interleave a second response.
+            if !cgi_watchdog::claim_response() {
+                cgi_watchdog::park();
+            }
+            let written =
+                cgi_watchdog::write_response_bounded(&response, CGI_RESPONSE_WRITE_TIMEOUT);
+            if !written {
+                record_pre_relay_cgi_failure(&CgiFailure::coded(
+                    CgiFailureStage::Runtime,
+                    BridgeError::unavailable_because("response_write_timeout"),
+                    "response_write_timeout",
+                ));
+            }
+            cgi_exit_code(written)
+        }
+        #[cfg(not(target_os = "linux"))]
         cgi_exit_code(write_cgi_response(&response).is_ok())
     } else if arguments.len() == 1 && arguments[0] == "--serve" {
         match run_server() {
@@ -14764,12 +14954,15 @@ fn run_cgi() -> Result<CgiResponse, CgiFailure> {
 
     #[cfg(target_os = "linux")]
     {
+        cgi_watchdog::enter(CgiFailureStage::Request);
         let environment = process_environment()
             .map_err(|error| CgiFailure::new(CgiFailureStage::Request, error))?;
+        cgi_watchdog::enter(CgiFailureStage::Identity);
         let identity = linux_runtime::identity_state()
             .map_err(|error| CgiFailure::new(CgiFailureStage::Identity, error))?;
         let package_uid = validate_cgi_identity(&identity)
             .map_err(|error| CgiFailure::new(CgiFailureStage::Identity, error))?;
+        cgi_watchdog::enter(CgiFailureStage::Request);
         let request = validate_http_request(environment.clone())
             .map_err(|error| CgiFailure::new(CgiFailureStage::Request, error))?;
         let authentication = match &request {
@@ -14778,23 +14971,31 @@ fn run_cgi() -> Result<CgiResponse, CgiFailure> {
         };
         // Synology documents authenticate.cgi being invoked from the custom
         // CGI, where DSM's native request environment is still authoritative.
+        // Where the package may not execute it (DSM 7), the service makes the
+        // loopback query instead (`encode_loopback_relay_request`).
+        cgi_watchdog::enter(CgiFailureStage::Authentication);
         let session =
-            linux_runtime::authenticate_and_authorize_cgi(authentication, AUTH_HELPER_TIMEOUT)?;
+            linux_runtime::authenticate_or_defer_cgi(authentication, AUTH_HELPER_TIMEOUT)?;
+        cgi_watchdog::enter(CgiFailureStage::Request);
         let body = match request {
             ValidatedHttpRequest::Get { .. } => None,
             ValidatedHttpRequest::Post { content_length, .. } => Some(
-                read_exact_body(&mut io::stdin().lock(), content_length)
-                    .map_err(|error| CgiFailure::new(CgiFailureStage::Request, error))?,
+                read_exact_body(
+                    &mut linux_runtime::PolledStdin::new(REQUEST_BODY_READ_TIMEOUT),
+                    content_length,
+                )
+                .map_err(|error| CgiFailure::new(CgiFailureStage::Request, error))?,
             ),
         };
-        let encoded = encode_relay_request(
-            &environment,
-            body.as_ref().map(|value| value.as_slice()),
-            &session,
-        )
+        let body = body.as_ref().map(|value| value.as_slice());
+        let encoded = match &session {
+            Some(session) => encode_relay_request(&environment, body, session),
+            None => encode_loopback_relay_request(&environment, body),
+        }
         .map_err(|error| CgiFailure::new(CgiFailureStage::Runtime, error))?;
         linux_runtime::clear_environment()
             .map_err(|error| CgiFailure::new(CgiFailureStage::Runtime, error))?;
+        cgi_watchdog::enter(CgiFailureStage::BridgeConnect);
         let mut stream = match linux_socket::connect_for_cgi(
             Path::new(API_SOCKET_PATH),
             package_uid,
@@ -14808,6 +15009,7 @@ fn run_cgi() -> Result<CgiResponse, CgiFailure> {
                 return Err(CgiFailure::new(CgiFailureStage::BridgeConnect, error));
             }
         };
+        cgi_watchdog::enter(CgiFailureStage::BridgeIo);
         write_frame(&mut stream, &encoded, MAX_RELAY_REQUEST_BYTES)
             .map_err(|error| CgiFailure::new(CgiFailureStage::BridgeIo, error))?;
         linux_socket::shutdown_write(&stream)
@@ -15588,6 +15790,17 @@ fn record_in_service_failure(
         ),
     };
     if recorded.is_ok_and(|recorded| recorded) {
+        // Authentication is decided here for a loopback relay, so its refusal gets the Activity
+        // row (`authentication.failed`) the CGI wrote when it decided it; the shell allowlists
+        // exactly these triples already.
+        if stage == CgiFailureStage::Authentication.as_str()
+            && let Err(error) = record_pre_relay_activity(stage, code, status)
+        {
+            eprintln!(
+                "sdsync-dsm-api: activity mirror of api.log failure {stage}/{code} not appended: {}",
+                resolved_error_code(error, None, None)
+            );
+        }
         return;
     }
     if let Ok(mut coalescer) = IN_SERVICE_FAILURES.lock() {
@@ -15657,10 +15870,17 @@ fn handle_relay_request_under_policy(
     // independently resolves the relayed username through NSS, rechecks
     // administrator membership, requires the exact package UID at SO_PEERCRED
     // in serve_connection, and recomputes the cookie/token session binding.
-    let resolved_uid = linux_runtime::authorize_relayed_username(&relay.authenticated_username)
-        .map_err(|error| CgiFailure::new(CgiFailureStage::Authentication, error))?;
-    let session = validate_relay_authenticated_session(&relay, authentication, resolved_uid)
-        .map_err(|error| CgiFailure::new(CgiFailureStage::Authentication, error))?;
+    let session = if relay.loopback_authentication {
+        linux_runtime::authenticate_relayed_via_dsm_user_service(
+            authentication,
+            AUTH_HELPER_TIMEOUT,
+        )?
+    } else {
+        let resolved_uid = linux_runtime::authorize_relayed_username(&relay.authenticated_username)
+            .map_err(|error| CgiFailure::new(CgiFailureStage::Authentication, error))?;
+        validate_relay_authenticated_session(&relay, authentication, resolved_uid)
+            .map_err(|error| CgiFailure::new(CgiFailureStage::Authentication, error))?
+    };
     let control_paths = ControlPaths::for_request();
     linux_files::require_open_runtime_admission(&control_paths, package_uid)
         .map_err(|error| CgiFailure::new(CgiFailureStage::ServiceRequest, error))?;
@@ -21521,7 +21741,162 @@ fn current_epoch() -> BridgeResult<u64> {
         .map_err(|_| BridgeError::unavailable_because("clock_unavailable"))
 }
 
-fn write_cgi_response(response: &CgiResponse) -> io::Result<()> {
+/// The CGI's watchdog: nothing a request does may hold the process past its deadline.
+///
+/// The CGI is a child of DSM's web server, not of the package supervisor, so stopping the package
+/// signals nothing, and a CGI blocked on a kernel event left no record of any kind: failures were
+/// recorded only after `run_cgi` returned. The watchdog thread is armed before anything else.
+/// When the deadline passes it answers the request itself -- a 503 naming `cgi_deadline_exceeded`
+/// and the stage the request was in -- records it in api.log (and Activity), and ends the process
+/// with `_exit`, because the main thread may be the one that is blocked.
+#[cfg(target_os = "linux")]
+mod cgi_watchdog {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, AtomicU8};
+
+    static STAGE: AtomicU8 = AtomicU8::new(0);
+    static RESPONDING: AtomicBool = AtomicBool::new(false);
+
+    const STAGES: [CgiFailureStage; 8] = [
+        CgiFailureStage::Request,
+        CgiFailureStage::Identity,
+        CgiFailureStage::Authentication,
+        CgiFailureStage::Runtime,
+        CgiFailureStage::BridgeConnect,
+        CgiFailureStage::BridgeIo,
+        CgiFailureStage::BridgeProtocol,
+        CgiFailureStage::ServiceRequest,
+    ];
+
+    /// The stage the request is in, for the watchdog's answer.
+    pub(super) fn enter(stage: CgiFailureStage) {
+        if let Some(index) = STAGES.iter().position(|candidate| *candidate == stage) {
+            STAGE.store(index as u8, AtomicOrdering::Relaxed);
+        }
+    }
+
+    pub(super) fn stage() -> CgiFailureStage {
+        STAGES
+            .get(usize::from(STAGE.load(AtomicOrdering::Relaxed)))
+            .copied()
+            .unwrap_or(CgiFailureStage::Request)
+    }
+
+    /// The right to write this process's one response; the loser must not write.
+    pub(super) fn claim_response() -> bool {
+        RESPONDING
+            .compare_exchange(false, true, AtomicOrdering::AcqRel, AtomicOrdering::Acquire)
+            .is_ok()
+    }
+
+    /// Wait for the watchdog, which holds the response, to end the process.
+    pub(super) fn park() -> ! {
+        loop {
+            std::thread::sleep(Duration::from_secs(60));
+        }
+    }
+
+    /// The answer the watchdog writes for a request that ran out of time in `stage`.
+    pub(super) fn deadline_failure(stage: CgiFailureStage) -> CgiFailure {
+        CgiFailure::coded(
+            stage,
+            BridgeError::unavailable_because("cgi_deadline_exceeded"),
+            "cgi_deadline_exceeded",
+        )
+    }
+
+    /// Start the watchdog thread. If it cannot be started the request still runs, and says so
+    /// on stderr, which DSM's web server keeps.
+    pub(super) fn arm(deadline: Duration, is_get: bool) {
+        let started = std::thread::Builder::new()
+            .name("cgi-watchdog".to_owned())
+            .spawn(move || {
+                std::thread::sleep(deadline);
+                expire(is_get);
+            });
+        if started.is_err() {
+            eprintln!(
+                "sdsync-dsm-api: cgi watchdog could not be started; this request is unbounded"
+            );
+        }
+    }
+
+    fn expire(is_get: bool) -> ! {
+        let stage = stage();
+        if claim_response() {
+            let failure = deadline_failure(stage);
+            let response = CgiResponse::failure(failure).for_cgi_transport(is_get);
+            let written = write_response_bounded(&response, CGI_RESPONSE_WRITE_TIMEOUT);
+            record_pre_relay_cgi_failure(&failure);
+            eprintln!(
+                "sdsync-dsm-api: cgi_deadline_exceeded at stage {} (response {})",
+                stage.as_str(),
+                if written { "written" } else { "not written" }
+            );
+        } else {
+            // The main thread is writing its own answer, under its own bound. Give it that long.
+            std::thread::sleep(CGI_RESPONSE_WRITE_TIMEOUT + Duration::from_secs(1));
+            eprintln!("sdsync-dsm-api: cgi response write outlived its bound; process ended");
+        }
+        // SAFETY: _exit ends the process without running destructors or flushing stdio, which is
+        // the point: the thread that would run them may be the blocked one.
+        unsafe { libc::_exit(1) }
+    }
+
+    /// Write the whole response to stdout within `timeout`, never blocking past it.
+    ///
+    /// Each write is at most PIPE_BUF bytes after `poll` says the descriptor is writable, so a
+    /// write to a pipe can never block; a reader that stops reading costs `timeout`, not forever.
+    pub(super) fn write_response_bounded(response: &CgiResponse, timeout: Duration) -> bool {
+        let bytes = rendered_cgi_response(response);
+        write_all_bounded(libc::STDOUT_FILENO, &bytes, timeout)
+    }
+
+    pub(super) fn write_all_bounded(
+        descriptor: libc::c_int,
+        mut bytes: &[u8],
+        timeout: Duration,
+    ) -> bool {
+        let deadline = Instant::now() + timeout;
+        while !bytes.is_empty() {
+            let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+                return false;
+            };
+            let mut poll = libc::pollfd {
+                fd: descriptor,
+                events: libc::POLLOUT,
+                revents: 0,
+            };
+            let millis =
+                libc::c_int::try_from(remaining.as_millis().max(1)).unwrap_or(libc::c_int::MAX);
+            // SAFETY: one live pollfd for the duration of the call.
+            let ready = unsafe { libc::poll(&mut poll, 1, millis) };
+            if ready < 0 {
+                if io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
+                    continue;
+                }
+                return false;
+            }
+            if ready == 0 || poll.revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL) != 0 {
+                return false;
+            }
+            let chunk = bytes.len().min(libc::PIPE_BUF);
+            // SAFETY: `chunk` bytes of a live slice.
+            let written = unsafe { libc::write(descriptor, bytes.as_ptr().cast(), chunk) };
+            if written < 0 {
+                if io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
+                    continue;
+                }
+                return false;
+            }
+            bytes = &bytes[written as usize..];
+        }
+        true
+    }
+}
+
+/// The CGI response, headers and body, as the bytes written to stdout.
+fn rendered_cgi_response(response: &CgiResponse) -> Vec<u8> {
     let reason = match response.status {
         200 => "OK",
         202 => "Accepted",
@@ -21537,15 +21912,20 @@ fn write_cgi_response(response: &CgiResponse) -> io::Result<()> {
         503 => "Service Unavailable",
         _ => "Error",
     };
-    let mut stdout = io::stdout().lock();
-    write!(
-        stdout,
+    let mut bytes = format!(
         "Status: {} {}\r\nContent-Type: application/json; charset=utf-8\r\nCache-Control: no-store\r\nPragma: no-cache\r\nX-Content-Type-Options: nosniff\r\nContent-Security-Policy: default-src 'none'\r\nContent-Length: {}\r\n\r\n",
         response.status,
         reason,
         response.body.len()
-    )?;
-    stdout.write_all(&response.body)?;
+    )
+    .into_bytes();
+    bytes.extend_from_slice(&response.body);
+    bytes
+}
+
+fn write_cgi_response(response: &CgiResponse) -> io::Result<()> {
+    let mut stdout = io::stdout().lock();
+    stdout.write_all(&rendered_cgi_response(response))?;
     stdout.flush()
 }
 
@@ -29788,6 +30168,228 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    /// A CGI blocked on a source that never becomes readable -- what `poll(/dev/random, -1)` is on
+    /// a 3.10 kernel with a drained pool -- is answered by its watchdog with a named 503 for the
+    /// stage it was in, and the process ends, instead of living for the better part of an hour.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_cgi_blocked_on_a_random_source_is_answered_by_its_watchdog() {
+        const CHILD_MODE: &str = "SDSYNC_TEST_CGI_WATCHDOG_CHILD";
+        if std::env::var_os(CHILD_MODE).is_some() {
+            cgi_watchdog::arm(Duration::from_millis(300), false);
+            cgi_watchdog::enter(CgiFailureStage::Authentication);
+            // A pipe whose write end is held open and never written: a stand-in for a random
+            // device that never reports enough entropy.
+            let mut ends = [0; 2];
+            // SAFETY: two live descriptors are returned into `ends`.
+            assert_eq!(unsafe { libc::pipe(ends.as_mut_ptr()) }, 0);
+            let mut poll = libc::pollfd {
+                fd: ends[0],
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            // SAFETY: one live pollfd; -1 waits forever, exactly as getrandom's readiness wait.
+            unsafe { libc::poll(&mut poll, 1, -1) };
+            unreachable!("the blocked source became readable");
+        }
+        let started = Instant::now();
+        let child = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "a_cgi_blocked_on_a_random_source_is_answered_by_its_watchdog",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(CHILD_MODE, "true")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let output = child.wait_with_output().unwrap();
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "the watchdog must end the process: {:?}",
+            started.elapsed()
+        );
+        assert_eq!(output.status.code(), Some(1));
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            stdout.contains("Status: 503 Service Unavailable\r\n"),
+            "{stdout}"
+        );
+        assert!(
+            stdout.contains(r#""code":"cgi_deadline_exceeded""#),
+            "{stdout}"
+        );
+        assert!(
+            stdout.contains(r#""stage":"dsm_authentication""#),
+            "{stdout}"
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("cgi_deadline_exceeded at stage dsm_authentication (response written)"),
+            "{stderr}"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_watchdog_answer_is_a_trusted_named_envelope_for_every_stage() {
+        for stage in [
+            CgiFailureStage::Request,
+            CgiFailureStage::Identity,
+            CgiFailureStage::Authentication,
+            CgiFailureStage::Runtime,
+            CgiFailureStage::BridgeConnect,
+            CgiFailureStage::BridgeIo,
+            CgiFailureStage::BridgeProtocol,
+        ] {
+            let response = CgiResponse::failure(cgi_watchdog::deadline_failure(stage));
+            assert_eq!(response.status, 503);
+            assert!(response.is_trusted_error_envelope(), "{stage:?}");
+            let envelope: Value = serde_json::from_slice(&response.body).unwrap();
+            assert_eq!(envelope["code"], "cgi_deadline_exceeded");
+            assert_eq!(envelope["stage"], stage.as_str());
+            // A read keeps its status inside the envelope, as every other GET failure does.
+            assert_eq!(
+                CgiResponse::failure(cgi_watchdog::deadline_failure(stage))
+                    .for_cgi_transport(true)
+                    .status,
+                200
+            );
+        }
+        // The watchdog and the main thread can never both write a response.
+        assert!(cgi_watchdog::claim_response());
+        assert!(!cgi_watchdog::claim_response());
+    }
+
+    /// A reader that stopped reading costs the bound, not forever.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_response_write_to_a_reader_that_stopped_is_bounded() {
+        let mut ends = [0; 2];
+        // SAFETY: two live descriptors are returned into `ends`.
+        assert_eq!(unsafe { libc::pipe(ends.as_mut_ptr()) }, 0);
+        let started = Instant::now();
+        let written = cgi_watchdog::write_all_bounded(
+            ends[1],
+            &vec![b'x'; 1024 * 1024],
+            Duration::from_millis(200),
+        );
+        assert!(!written);
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "{:?}",
+            started.elapsed()
+        );
+        // A reader that keeps up receives every byte.
+        let reader = std::thread::spawn(move || {
+            use std::os::fd::FromRawFd;
+            // SAFETY: the read end is owned by this thread from here on.
+            let mut file = unsafe { File::from_raw_fd(ends[0]) };
+            let mut sink = Vec::new();
+            file.read_to_end(&mut sink).unwrap();
+            sink.len()
+        });
+        // Drain what the first attempt left first, then write a known amount.
+        let payload = vec![b'y'; 300 * 1024];
+        assert!(cgi_watchdog::write_all_bounded(
+            ends[1],
+            &payload,
+            Duration::from_secs(5)
+        ));
+        // SAFETY: the write end is closed exactly once so the reader sees EOF.
+        unsafe { libc::close(ends[1]) };
+        assert!(reader.join().unwrap() >= payload.len());
+    }
+
+    #[test]
+    fn a_post_body_that_stops_arriving_is_named() {
+        struct Stalled;
+        impl Read for Stalled {
+            fn read(&mut self, _buffer: &mut [u8]) -> io::Result<usize> {
+                Err(io::Error::new(io::ErrorKind::TimedOut, "stalled"))
+            }
+        }
+        let error = read_exact_body(&mut Stalled, 10).unwrap_err();
+        assert_eq!(error, REQUEST_BODY_TIMEOUT);
+        let response = CgiResponse::failure(CgiFailure::new(CgiFailureStage::Request, error));
+        assert_eq!(response.status, 400);
+        let envelope: Value = serde_json::from_slice(&response.body).unwrap();
+        assert_eq!(envelope["code"], "request_body_timeout");
+        // Any other read failure is the malformed request it always was.
+        struct Broken;
+        impl Read for Broken {
+            fn read(&mut self, _buffer: &mut [u8]) -> io::Result<usize> {
+                Err(io::Error::other("broken"))
+            }
+        }
+        assert_eq!(
+            read_exact_body(&mut Broken, 10).unwrap_err(),
+            BridgeError::bad_request()
+        );
+    }
+
+    /// The CGI defers DSM 7's loopback authentication to the service and builds no TLS client;
+    /// the relay carries no identity for it to be trusted with, and a half-filled one is refused.
+    #[test]
+    fn a_loopback_relay_carries_no_identity_and_the_cgi_builds_no_tls_client() {
+        let body = request("remove-profile", json!({"name":"nightly"}));
+        let environment = post_environment(body.len());
+        let encoded = encode_loopback_relay_request(&environment, Some(&body)).unwrap();
+        let document: Value = serde_json::from_slice(&encoded).unwrap();
+        assert_eq!(document["loopback_authentication"], true);
+        assert_eq!(document["authenticated_username"], "");
+        assert_eq!(document["authenticated_uid"], 0);
+        assert_eq!(document["session_binding"], "");
+        let relay = decode_relay_request(&encoded).unwrap();
+        assert!(relay.loopback_authentication);
+        let (validated, relayed) = validate_relay_http_request(&relay).unwrap();
+        assert!(matches!(validated, ValidatedHttpRequest::Post { .. }));
+        assert_eq!(relayed, Some(body.as_slice()));
+
+        // An authenticated relay is the document it always was.
+        let authenticated =
+            encode_relay_request(&environment, Some(&body), &authenticated_session()).unwrap();
+        let document: Value = serde_json::from_slice(&authenticated).unwrap();
+        assert!(document.get("loopback_authentication").is_none());
+
+        let mut half = decode_relay_request(&encoded).unwrap();
+        half.authenticated_username = "admin".to_owned();
+        assert!(half.validate_fields().is_err());
+        let mut half = decode_relay_request(&encoded).unwrap();
+        half.authenticated_uid = 1000;
+        assert!(half.validate_fields().is_err());
+        let mut claimed = decode_relay_request(&authenticated).unwrap();
+        claimed.loopback_authentication = true;
+        assert!(claimed.validate_fields().is_err());
+
+        // Structural: the CGI path names no loopback query and no client builder.
+        let source = include_str!("dsm_api.rs");
+        let cgi = &source[source
+            .find("\nfn run_cgi() -> Result<CgiResponse, CgiFailure> {")
+            .unwrap()..];
+        let cgi = &cgi[..cgi.find("\n}\n").unwrap()];
+        for forbidden in [
+            "query_dsm_user_service",
+            "blocking_client_builder",
+            "reqwest",
+            "authenticate_relayed_via_dsm_user_service",
+        ] {
+            assert!(
+                !cgi.contains(forbidden),
+                "run_cgi must not reach {forbidden}"
+            );
+        }
+        assert!(cgi.contains("authenticate_or_defer_cgi"));
+        let defer = &source[source
+            .find("pub(super) fn authenticate_or_defer_cgi(")
+            .unwrap()..];
+        let defer = &defer[..defer.find("\n    }\n").unwrap()];
+        assert!(defer.contains("AuthenticationHelperSelection::Loopback => return Ok(None),"));
+        assert!(!defer.contains("query_dsm_user_service"));
     }
 
     #[cfg(target_os = "linux")]

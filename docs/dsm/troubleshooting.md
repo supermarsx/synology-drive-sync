@@ -464,6 +464,19 @@ Use `status`, `paths`, the bounded logs above, and a Package Center Stop followe
 CGI/socket, add any identity-changing permission or capability, expose the socket, or hand-create
 the CSRF key.
 
+## A dashboard request timed out (`cgi_deadline_exceeded`)
+
+The package's CGI answers every request within 12 seconds for a read and 40 seconds for a change. A
+request still running then is answered with HTTP 503 `cgi_deadline_exceeded` and the stage it was in
+(`dsm_authentication`, `request`, `bridge_connect`, `bridge_io`, ...), and recorded in `api.log` and
+Activity. A `request_body_timeout` means a change's body stopped arriving; `response_write_timeout`
+means the web server stopped reading the answer. Before this release such a CGI could stay alive for
+most of an hour on a DSM 7 NAS with a drained entropy pool, because each one built a TLS client of
+its own; the service now makes that query with one client for its life.
+
+If they repeat: `cat /proc/sys/kernel/random/entropy_avail` (below 64 on a 3.x kernel means the pool
+is drained), the stage named in the record, and the `api.log` and `controller.log` lines at that time.
+
 ## A dashboard change was refused (`rejected-post`)
 
 A change the package refused after DSM authentication, before anything was queued, is recorded as

@@ -120,9 +120,15 @@ package action query are never inherited. The CGI accepts one bounded safe non-r
 independently requires administrator membership before relay.
 
 When the initial fixed-path `X_OK` probe returns `EACCES`—as on a protected `root:system 0750`
-layout—the CGI does not validate or attempt to execute the inaccessible helper. It issues one bounded
-HTTP/1 request to literal `127.0.0.1:$SERVER_PORT/webapi/entry.cgi` using the current request's
-`HTTPS` state. The only query fields are `api=SYNO.Core.Desktop.Initdata`, `version=1`, and
+layout—the CGI does not validate or attempt to execute the inaccessible helper. It relays the request
+to the package service marked for loopback authentication, carrying no identity, and the service
+issues one bounded HTTP/1 request to literal `127.0.0.1:$SERVER_PORT/webapi/entry.cgi` using the
+relayed request's `HTTPS` state. The query is made by the service, not the CGI, because a TLS client
+needs randomness: on the 3.10 kernels DSM 7 still ships there is no `getrandom(2)`, so the first
+random draw in a process waits in `poll(/dev/random)` until the kernel's entropy count rises. A
+client per CGI made every dashboard request pay that wait, and on a drained entropy pool CGIs hung
+for most of an hour. The service keeps one client for its life, so the wait is paid once per service
+start, and the CGI path needs no randomness. The only query fields are `api=SYNO.Core.Desktop.Initdata`, `version=1`, and
 `method=get_user_service`. Proxy use and redirects are disabled, `SERVER_NAME` and remote addresses
 are not destination inputs, connect and request time are bounded, and at most 1 MiB of response is
 accepted. The DSM cookie and optional normalized token are sensitive headers; the token is sent as
@@ -130,15 +136,28 @@ accepted. The DSM cookie and optional normalized token are sensitive headers; th
 
 The loopback response must be HTTP 200 and valid JSON with `success=true`, a valid string
 `data.Session.user`, and Boolean `data.Session.is_admin=true`. Missing, malformed, oversized,
-redirected, timed-out, non-administrator, and failed responses fail closed. The CGI then resolves the
+redirected, timed-out, non-administrator, and failed responses fail closed. The service then resolves the
 reported username through NSS, rejects root, and independently requires membership in DSM's
 `administrators` group. A validated helper that is executable but fails to start, times out, changes,
 or rejects the cookie does not fall back to the user service; nor does any kernel probe failure other
 than permission denial.
 
-The package daemon never executes the DSM authentication helper or calls the loopback user service. It
+The package service never executes the DSM authentication helper, and calls the loopback user
+service only for a relay the CGI marked for it (one that carries no username, UID or binding; a relay
+that carries part of an identity is refused as malformed). For a relay the CGI authenticated, it
 independently resolves the relayed username, checks exact UID/name and administrator consistency, and
-recomputes the cookie/token session binding before authorizing any action.
+recomputes the cookie/token session binding before authorizing any action; for a loopback relay it
+establishes the username itself and computes the binding the same way. A loopback refusal is
+recorded in `api.log` and Activity (`authentication.failed`) exactly as the CGI's was.
+
+Nothing in a CGI request may hold the CGI past a deadline: 12 seconds for a read and 40 seconds for a
+POST. The CGI is a child of DSM's web server, not of the package, so stopping the package does not
+end it. A watchdog thread answers a request still running at its deadline with HTTP 503
+`cgi_deadline_exceeded`, naming the stage it was in, records it in `api.log` and Activity, and ends
+the process. A POST body that stops arriving for 5 seconds is refused as `request_body_timeout`, a
+response the web server stops reading for 2 seconds is abandoned and recorded as
+`response_write_timeout`, and a helper process group that does not exit within 2 seconds of SIGKILL
+is abandoned with a `manager_unkillable` line on stderr.
 
 The native AppWindow has no standalone HTML launch document and receives no package-owned launch
 URL. It does not inspect or rewrite `window.location` and does not depend on DSM browser globals. DSM
@@ -193,13 +212,15 @@ Every native AppWindow API request goes through these checks:
 5. Only after `X_OK` succeeds does the CGI validate the canonical target, ancestors, ownership,
    writability, type, and stable identity, then revalidate immediately before direct execution.
 6. The direct helper receives the bounded native CGI allowlist, forced GET, token-only query, cookie,
-   and optional `X-SYNO-TOKEN`. The `EACCES` branch instead calls the fixed bounded loopback user
-   service with credentials in headers only. That fallback requires `Session.user` and
-   `is_admin=true`; it uses no proxy, redirect, remote host, or token URL.
-7. The CGI validates one safe returned identity, rejects root, independently resolves its numeric NSS
+   and optional `X-SYNO-TOKEN`. On the `EACCES` branch the CGI instead relays the request marked for
+   loopback authentication, and the service calls the fixed bounded loopback user service with
+   credentials in headers only. That fallback requires `Session.user` and `is_admin=true`; it uses
+   no proxy, redirect, remote host, or token URL.
+7. The CGI (the service, on the loopback branch) validates one safe returned identity, rejects root, independently resolves its numeric NSS
    UID, and requires DSM `administrators` membership regardless of the selected branch.
 8. It clears its environment and sends one length-bounded frame containing that exact authenticated
-   username, numeric UID, and session binding to the fixed package-owned `0600` socket after
+   username, numeric UID, and session binding (on the loopback branch, none of them and the loopback
+   mark) to the fixed package-owned `0600` socket after
    validating the socket, inode, and server peer identity. The pre-commit `0000` state is never
    connectable.
 9. The package-user server validates the CGI peer UID, decodes one strict relay schema, and repeats
