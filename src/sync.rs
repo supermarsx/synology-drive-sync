@@ -719,6 +719,12 @@ pub enum DeferReason {
     /// use, so nothing was listed, compared or written (SC-2). Lasting: it recurs until the
     /// profile is split, and a partial run would re-trigger a realtime profile forever.
     TreeTooLargeForMemory,
+    /// The path changed while the run worked (`source-changed`, `source-vanished` or
+    /// `remote-changed`) in [`crate::pair_index::unsettled::KEEPS_CHANGING_RUNS`] consecutive runs:
+    /// an Office lock file, an open mailbox or database, a log. Lasting, so the run is not partial
+    /// and a realtime routine stops re-running for it; it is still tried on every run, named until
+    /// it settles, and the name clears the first run it syncs.
+    FileKeepsChanging,
 }
 
 impl DeferReason {
@@ -742,6 +748,7 @@ impl DeferReason {
             Self::UnsupportedEntry => "unsupported-entry",
             Self::DeleteNotPermitted => "delete-not-permitted",
             Self::TreeTooLargeForMemory => "tree-too-large-for-memory",
+            Self::FileKeepsChanging => "file-keeps-changing",
         }
     }
 
@@ -792,6 +799,9 @@ impl DeferReason {
             Self::TreeTooLargeForMemory => {
                 "the tree needs more memory than this run may use, so nothing was synced; split the profile with a scope or into subfolder profiles"
             }
+            Self::FileKeepsChanging => {
+                "changed while each of the last runs worked, so none could carry it; tried again every run and named until it settles"
+            }
         }
     }
 
@@ -815,11 +825,21 @@ impl DeferReason {
                 | Self::UnsupportedEntry
                 | Self::CaseRenamePending
                 | Self::TreeTooLargeForMemory
+                | Self::FileKeepsChanging
+        )
+    }
+
+    /// Whether this deferral means the path changed while the run worked, the condition that can
+    /// recur on every run for a file that is always being written (see [`Self::FileKeepsChanging`]).
+    pub fn is_change_during_run(self) -> bool {
+        matches!(
+            self,
+            Self::SourceChanged | Self::SourceVanished | Self::RemoteChanged
         )
     }
 
     /// Every reason, so readers can be checked against the whole vocabulary.
-    pub const ALL: [Self; 18] = [
+    pub const ALL: [Self; 19] = [
         Self::SourceChanged,
         Self::SourceVanished,
         Self::SourceUnreadable,
@@ -838,6 +858,7 @@ impl DeferReason {
         Self::UnsupportedEntry,
         Self::DeleteNotPermitted,
         Self::TreeTooLargeForMemory,
+        Self::FileKeepsChanging,
     ];
 
     /// The reason a failure reading one local file defers it, or `None` when the failure is not

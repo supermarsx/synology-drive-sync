@@ -288,3 +288,86 @@ fn a_first_scan_path_that_still_differs_fails_by_name_and_keeps_the_other_eviden
         Some(b"rewritten.txt content".to_vec())
     );
 }
+
+/// R6: a file that is rewritten while every run works (a log, an open mailbox, an Office lock
+/// file) is a transient deferral twice, then the lasting `file-keeps-changing`: the third run
+/// exits 0, so a realtime routine stops re-running for it, and still names it. The name clears the
+/// first run the file holds still long enough to sync.
+#[test]
+fn a_file_rewritten_during_every_run_is_named_lasting_on_the_third_run() {
+    let fixture = Fixture::new("first-scan-keeps-changing", &["steady.txt"]);
+    let busy = fixture.source.join("busy.log");
+    fs::write(&busy, b"line 0\n").expect("write busy file");
+    for round in 1..=3_u32 {
+        let appended = busy.clone();
+        fixture
+            .server
+            .on_next_request("SYNO.FileStation.List.list", move || {
+                let mut text = fs::read(&appended).expect("read busy file");
+                text.extend_from_slice(format!("line {round}\n").as_bytes());
+                fs::write(&appended, text).expect("append to busy file");
+            });
+        let output = fixture.sync();
+        let document = stdout_json(&output);
+        let deferred = document["result"]["deferred"]
+            .as_array()
+            .expect("named deferrals")
+            .iter()
+            .find(|record| record["path"] == "busy.log")
+            .cloned()
+            .unwrap_or_else(|| panic!("run {round} names busy.log: {document}"));
+        if round < 3 {
+            assert_eq!(
+                output.status.code(),
+                Some(3),
+                "run {round}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert_eq!(deferred["reason"], "source-changed", "run {round}");
+            assert_eq!(document["result"]["outcome"], "partial");
+        } else {
+            assert_eq!(
+                output.status.code(),
+                Some(0),
+                "a path that keeps changing no longer makes the run partial: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert_eq!(document["result"]["outcome"], "complete");
+            assert_eq!(deferred["reason"], "file-keeps-changing");
+            assert!(
+                deferred["detail"]
+                    .as_str()
+                    .is_some_and(|detail| detail.starts_with(
+                        "file_keeps_changing path=busy.log runs=3; last cause source-changed: "
+                    )),
+                "{deferred}"
+            );
+        }
+    }
+    assert_eq!(
+        fixture.server.file_contents(&format!("{ROOT}/busy.log")),
+        None,
+        "nothing torn was written"
+    );
+
+    // It settles: the next run syncs it, names nothing, and the count is gone.
+    let settled = fixture.sync();
+    assert_eq!(
+        settled.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&settled.stderr)
+    );
+    let document = stdout_json(&settled);
+    assert_eq!(document["result"]["deferred"], serde_json::json!([]));
+    assert_eq!(
+        fixture.server.file_contents(&format!("{ROOT}/busy.log")),
+        Some(fs::read(&busy).unwrap())
+    );
+    let leftovers = fs::read_dir(&fixture.index)
+        .unwrap()
+        .flatten()
+        .filter(|entry| entry.file_name().to_string_lossy().ends_with(".unsettled"))
+        .count();
+    assert_eq!(leftovers, 0, "a record that counts nothing is removed");
+}

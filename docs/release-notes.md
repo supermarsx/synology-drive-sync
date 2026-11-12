@@ -321,6 +321,14 @@ lists its own commits.
 - **A run with nothing to do reports what the index did.** The result record of a no-change run now
   carries `pair_index`, so the daemon's profile state (`index_state`, `index_hits`, ...) shows the
   warm run the index exists for. Before, it showed nothing for that run.
+- **A file that is always being written no longer makes every run partial.** A log, an open mailbox
+  or database, or an Office lock file changes while every run works, so every run deferred it and
+  exited `3`, and a realtime routine re-ran for it forever. With `--pair-index` (the package always
+  passes it), a path deferred for a change during the run in three consecutive runs is named
+  `file-keeps-changing` (`file_keeps_changing path=<path> runs=<n>` and the last cause): lasting, so
+  the run exits `0`, still tried on every run, and cleared the first run it syncs. The count lives in
+  `<profile>.redb.unsettled` beside the index; a record that cannot be used is
+  `pair-index-unsettled-unusable`, and its paths stay transient.
 - **Doctor keeps its report when its log cannot be written.** A log that could not be opened, or a failed log write (a full volume) at the start, before
   discovery, before authentication, at the end, or at shutdown, used to replace the whole report with
   one line on standard error, which the package's UI showed as every step skipped. The sections

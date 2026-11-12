@@ -840,6 +840,10 @@ pub enum DeferredReason {
     /// The tree needs more memory than the run may use; nothing was synced. Lasting until the
     /// tree is split. The SDK does not run this check itself; the variant mirrors the engine's.
     TreeTooLargeForMemory,
+    /// The path changed while each of several consecutive runs worked; lasting, and named until
+    /// it settles. The SDK keeps no record across runs, so it never reports this itself; the
+    /// variant mirrors the engine's.
+    FileKeepsChanging,
 }
 
 impl DeferredReason {
@@ -871,6 +875,7 @@ impl DeferredReason {
             Self::UnsupportedEntry => sync::DeferReason::UnsupportedEntry,
             Self::DeleteNotPermitted => sync::DeferReason::DeleteNotPermitted,
             Self::TreeTooLargeForMemory => sync::DeferReason::TreeTooLargeForMemory,
+            Self::FileKeepsChanging => sync::DeferReason::FileKeepsChanging,
         }
     }
 }
@@ -896,6 +901,7 @@ impl From<sync::DeferReason> for DeferredReason {
             sync::DeferReason::UnsupportedEntry => Self::UnsupportedEntry,
             sync::DeferReason::DeleteNotPermitted => Self::DeleteNotPermitted,
             sync::DeferReason::TreeTooLargeForMemory => Self::TreeTooLargeForMemory,
+            sync::DeferReason::FileKeepsChanging => Self::FileKeepsChanging,
         }
     }
 }

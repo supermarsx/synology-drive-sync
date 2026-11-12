@@ -189,7 +189,9 @@ is partial (exit `3`), no alert is raised, and the next run carries it. Anything
 failure (exit `1`), because it means the run did not do what it planned: a deletion this run made
 that did not take, a write this run made that the NAS still disagrees with, a path in the first scan,
 unchanged since, whose NAS copy still differs, a type conflict or case-only rename left unresolved,
-and a missing destination root. The failure names the first five operations with their action, path
+and a missing destination root. With `--pair-index`, a path deferred this way in three consecutive runs
+(a file always being written) is named `file-keeps-changing` instead: lasting, so the run is not partial,
+still tried on every run, and cleared the first run it syncs. The failure names the first five operations with their action, path
 and cause (`upload docs/a.pdf (in the first scan, unchanged since, and the NAS still differs)`),
 counts only those that nothing excused, and puts the first path in the result record's `error.path`;
 each named path is also logged as an `entry.skipped` warning with reason `reconciliation_pending`.

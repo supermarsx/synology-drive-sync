@@ -2854,6 +2854,17 @@ fn prepare_and_run_sync_reporting(
     // The verified-pair index's directory is claimed before anything is read; a directory it
     // cannot use is named, and the run goes on live.
     let index_start = run_index::begin(profile, settings);
+    // Beside the index, the count of runs each path changed under (R6); kept only where the
+    // index directory is claimed.
+    #[cfg(unix)]
+    let unsettled_path = match &index_start {
+        run_index::IndexStart::Ready { paths, .. } => {
+            Some(pair_index::unsettled::record_path(&paths.database))
+        }
+        _ => None,
+    };
+    #[cfg(not(unix))]
+    let unsettled_path: Option<std::path::PathBuf> = None;
     cancellation.phase("scan_local");
     let mut local = local::scan_scoped(
         &settings.source,
@@ -3154,6 +3165,13 @@ fn prepare_and_run_sync_reporting(
             if let Some(session) = index_session.take() {
                 index_report = Some(session.commit(Some(&local), None, scope.is_root()));
             }
+            let issues = count_keeps_changing(
+                unsettled_path.as_deref(),
+                settings,
+                &scope,
+                completion_out.as_mut(),
+            );
+            name_unsettled_issues(&mut index_report, issues);
             return Ok(());
         }
 
@@ -3350,6 +3368,13 @@ fn prepare_and_run_sync_reporting(
         if let Some(session) = index_session.take() {
             index_report = Some(session.commit(Some(&local), Some(&touched), scope.is_root()));
         }
+        let issues = count_keeps_changing(
+            unsettled_path.as_deref(),
+            settings,
+            &scope,
+            completion_out.as_mut(),
+        );
+        name_unsettled_issues(&mut index_report, issues);
         Ok(())
     })();
     if let Some(session) = index_session.take() {
@@ -3544,9 +3569,9 @@ fn log_run_entries(
 /// The closed event vocabulary's name for a deferral.
 fn defer_event_reason(reason: sync::DeferReason) -> EventReason {
     match reason {
-        sync::DeferReason::SourceChanged | sync::DeferReason::SourceVanished => {
-            EventReason::ChangedDuringRun
-        }
+        sync::DeferReason::SourceChanged
+        | sync::DeferReason::SourceVanished
+        | sync::DeferReason::FileKeepsChanging => EventReason::ChangedDuringRun,
         sync::DeferReason::SourceUnreadable | sync::DeferReason::LocalPermissionDenied => {
             EventReason::LocalIo
         }
@@ -4033,6 +4058,52 @@ fn build_reconciliation_plan(
         remote,
         incomplete_directories: scanned.incomplete_directories,
     })
+}
+
+/// R6: count, across runs, the paths each run deferred for a change while it worked, and name a
+/// path that keeps changing (`file-keeps-changing`, lasting) instead of making every run partial
+/// for it. Without the index directory there is nowhere to count, and every such deferral stays
+/// transient, as it always was. What the record could not do is returned, to be named in the
+/// index's issues.
+fn count_keeps_changing(
+    path: Option<&Path>,
+    settings: &config::ResolvedSync,
+    scope: &plan::Scope,
+    completion: Option<&mut SyncCompletion>,
+) -> Vec<pair_index::IndexIssue> {
+    let Some(path) = path else {
+        return Vec::new();
+    };
+    let mut issues = Vec::new();
+    let (mut record, issue) = pair_index::unsettled::UnsettledRecord::load(
+        path,
+        &settings.source.display().to_string(),
+        &settings.remote,
+    );
+    issues.extend(issue);
+    let named = match completion {
+        Some(completion) => record.count(&mut completion.deferred, scope),
+        None => record.count(&mut [], scope),
+    };
+    if named > 0 && !settings.output.quiet {
+        eprintln!(
+            "warning: {named} path(s) changed while each of the last {} runs worked; they are              named file-keeps-changing and tried again every run",
+            pair_index::unsettled::KEEPS_CHANGING_RUNS
+        );
+    }
+    if let Err(issue) = record.store() {
+        issues.push(issue);
+    }
+    issues
+}
+
+fn name_unsettled_issues(
+    report: &mut Option<pair_index::IndexReport>,
+    issues: Vec<pair_index::IndexIssue>,
+) {
+    if let Some(report) = report.as_mut() {
+        report.issues.extend(issues);
+    }
 }
 
 /// Every local path a plan names, in its local spelling.

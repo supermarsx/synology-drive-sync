@@ -415,6 +415,7 @@ that clears by itself (a file still changing, a lock, a checksum the NAS could n
 | `local-permission-denied` | This account may not read the local file or list the folder (permission denied). A folder that cannot be listed is withheld whole: nothing beneath it is deleted on the NAS. Change the permission. | yes |
 | `delete-not-permitted` | DSM refused to delete the entry for permission (105 once the session is proven alive, or 407). The entry stays until the folder's rights change. Any other refused deletion (for example code 900) is `delete-failed`. | yes |
 | `case-rename-pending` | A case-only rename on the NAS was not made or did not finish: File Station refused it, the DSM has no `Rename` v2, the old spelling holds entries a rename must not move (excluded, DSM-managed, mounted or set-aside ones, or anything deferred in this run), or the NAS still holds the old spelling beside the new one. Nothing is deleted on its account and the content keeps syncing under the NAS spelling. A leftover second spelling is never touched and is always reported. Rename or remove it in File Station. | yes |
+| `file-keeps-changing` | The path changed while each of the last three runs worked (`source-changed`, `source-vanished` or `remote-changed` three runs in a row): an Office lock file, an open mailbox or database, a log. It is still tried on every run and named, with `file_keeps_changing path=<path> runs=<n>` and the last cause in its detail, but no longer makes the run `partial`, so a realtime routine stops re-running for it. The name clears the first run it syncs. Counted in a small record beside the profile's index (`<profile>.redb.unsettled` in the `--pair-index` directory); without `--pair-index` such a path stays `source-changed`. A record that cannot be read or written is `pair-index-unsettled-unusable`. Exclude it if it should never sync. | yes |
 
 `result.skipped` is a count and `plan.skipped[]` is `{path, reason, detail}` for paths the plan
 declines to carry for a lasting reason. The scan no longer aborts on them:
@@ -447,7 +448,8 @@ The remaining fields say what the run recovered from, so nothing is silent:
   `Recovered:` line when any is non-zero.
 
 The `reason` on `entry.deferred` and `entry.skipped` is the closed event vocabulary, not the result
-token. Deferrals map as follows: `source-changed` and `source-vanished` to `changed_during_run`,
+token. Deferrals map as follows: `source-changed`, `source-vanished` and `file-keeps-changing` to
+`changed_during_run`,
 `source-unreadable` and `local-permission-denied` to `local_io`, `unsupported-local-entry`,
 `unsupported-entry` and `unrepresentable-name` to `local_entry_unsupported`,
 `remote-digest-unavailable`, `remote-unreadable`, `delete-failed` and `case-rename-pending` to

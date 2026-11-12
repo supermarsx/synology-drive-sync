@@ -38,6 +38,7 @@ use crate::local::{EntryKind, LocalEntry, LocalInventory};
 pub const SCHEMA: &str = "sdsync.pair-index.v1";
 
 mod racy;
+pub mod unsettled;
 pub use racy::{
     FALLBACK_WINDOW_NS, NAS_CLOCK_TOLERANCE_SECONDS, NAS_WINDOW_SECONDS, RACY_FLOOR_NS,
     RacyWindows, WRITEBACK_MARGIN_NS,
@@ -202,6 +203,7 @@ pub const ISSUE_CODES: &[&str] = &[
     "pair-index-cleanup-failed",
     "pair-index-plan-clock-unbounded",
     "pair-index-failed-run",
+    "pair-index-unsettled-unusable",
 ];
 
 impl IndexIssue {
