@@ -2047,7 +2047,10 @@ mod tests {
             let detail = long.issue_detail.as_deref().expect("the detail is kept");
             assert_eq!(detail.len(), 160, "{detail}");
             assert!(detail.starts_with("..."), "{detail}");
-            assert!(detail.ends_with("checkoffice_nas.redb.corrupt-1"), "{detail}");
+            assert!(
+                detail.ends_with("checkoffice_nas.redb.corrupt-1"),
+                "{detail}"
+            );
             let short = IndexFacts::from_value(&json!({
                 "state": "cold",
                 "entries": 0,

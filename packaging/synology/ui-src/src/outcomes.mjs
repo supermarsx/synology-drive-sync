@@ -120,6 +120,7 @@ const REASONS = Object.freeze({
   pair_index_unusable: ["the verified-checksum index could not be used, so every file was checked live (slower, still correct)", "Review Logs for the cause; the index is rebuilt on its own."],
   pair_index_store_failed: ["the verified-checksum index could not be saved, so the next run checks files live again", "Check free space on the volume holding the package."],
   tree_too_large_for_memory: ["the source holds more entries than this run has memory for, so nothing was synced", "Split the profile into smaller ones (a scope or subfolder profiles)."],
+  entropy_unavailable: ["the NAS's random number generator did not answer within 15 seconds, so a secure connection could not start and nothing was synced (this DSM kernel has no getrandom, and its entropy pool is empty)", "It clears by itself once the NAS has gathered entropy (disk, network and login activity); the next run asks again. If it repeats for hours, restart the package or the NAS."],
   "tree-too-large-for-memory": ["not synced until you fix this: the source holds more entries than this run has memory for, so nothing was synced", "Split the profile into smaller ones (a scope or subfolder profiles)."],
   "source-changed": ["files changed during the run", "They sync next run."],
   // Lasting, and clear by themselves: the run exits 0 and the file is tried every run. Their detail

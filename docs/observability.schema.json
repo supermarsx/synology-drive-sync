@@ -301,7 +301,8 @@
         "evidence_canary_mismatch",
         "pair_index_unusable",
         "pair_index_store_failed",
-        "tree_too_large_for_memory"
+        "tree_too_large_for_memory",
+        "entropy_unavailable"
       ]
     },
     "buildIdentity": {

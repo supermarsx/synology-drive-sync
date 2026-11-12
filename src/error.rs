@@ -274,6 +274,15 @@ pub enum Error {
     #[error("{0}")]
     Configuration(String),
 
+    /// The system random number generator did not answer in time, so TLS cannot start. On a
+    /// kernel without `getrandom(2)` the first draw waits for the entropy pool and has no end on
+    /// a drained one (see [`crate::entropy`]). It clears when the system gathers entropy, so the
+    /// next run asks again.
+    #[error(
+        "entropy_unavailable: the system random number generator did not answer within          {waited_secs} s ({cause}); this system's kernel has no getrandom(2), so TLS cannot start          until its entropy pool fills; nothing was synced, and the next run asks again"
+    )]
+    EntropyUnavailable { waited_secs: u64, cause: String },
+
     #[error("{0}")]
     Message(String),
 }

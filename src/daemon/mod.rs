@@ -74,6 +74,15 @@ pub(crate) fn dispatch(arguments: &[std::ffi::OsString]) -> Option<std::process:
             eprintln!("sdsyncd: unexpected arguments: {}", rest.join(" "));
             return Some(std::process::ExitCode::from(64));
         }
+        // The first draw from the system generator can wait for the kernel's entropy pool on a
+        // kernel without getrandom(2). Start it now; every TLS client the daemon builds waits for
+        // it with a bound and names `entropy_unavailable` instead of hanging the job queue.
+        if flag == "--daemon"
+            && let Err(error) = synology_drive_sync::entropy::begin_warmup()
+        {
+            eprintln!("sdsyncd: {error}");
+            return Some(std::process::ExitCode::from(69));
+        }
         Some(match flag {
             "--daemon" => lifecycle::run_daemon(&options),
             "--launch-daemon" => lifecycle::run_launch(&options),

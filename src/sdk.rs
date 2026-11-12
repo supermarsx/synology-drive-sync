@@ -195,9 +195,10 @@ impl SdkError {
             | Error::UnsupportedLocalEntry { .. }
             | Error::FileIo { .. }
             | Error::SourceChanged(_) => ErrorCode::LocalFilesystem,
-            Error::Http { .. } | Error::HttpBody { .. } | Error::HttpStatus { .. } => {
-                ErrorCode::Network
-            }
+            Error::Http { .. }
+            | Error::HttpBody { .. }
+            | Error::HttpStatus { .. }
+            | Error::EntropyUnavailable { .. } => ErrorCode::Network,
             Error::TypeConflict { .. }
             | Error::ProtectedConflict(_)
             | Error::EmptySourceDeletion

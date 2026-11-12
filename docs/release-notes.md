@@ -439,6 +439,16 @@ observing a routine wrote controller.log at most, so the Activity page read as h
   this system cannot keep (`pair-index-unkeepable`) says so and when it is tried again.
 - **A file that keeps failing or changing names the file** and how many runs in a row.
 
+### A drained entropy pool no longer hangs a run
+
+On DSM 7 kernels (3.10) there is no `getrandom(2)`: the first random draw in a process waits for the
+kernel's entropy pool, with no end on a drained one, inside the first TLS client construction that
+no request deadline covers. A run, or a daemon job, could hang with no record. The first draw is now
+made on a helper thread and waited for at most 15 seconds; on expiry the run fails by name,
+`entropy_unavailable`, with the bound and the cause in the run record, the log (`run.failed` reason
+`entropy_unavailable`), the run state and the dashboard. The next run asks again. The random source
+itself is unchanged.
+
 ## Read this before upgrading
 
 - **Rust 1.90 or newer is needed to build from source** (was 1.88). The verified-pair index uses redb

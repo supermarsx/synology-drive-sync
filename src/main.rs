@@ -143,6 +143,10 @@ fn dispatch(arguments: &cli::Cli) -> Result<ExitCode> {
         // Set once, before any job runs; nothing else writes it.
         let _ = RESULT_RECORD.set(path.clone());
     }
+    // On a kernel without getrandom(2) the first draw waits for the entropy pool, with no end on
+    // a drained one. Start it now so the wait overlaps the work before the first TLS client,
+    // which waits for it with a bound and names `entropy_unavailable` rather than hanging.
+    synology_drive_sync::entropy::begin_warmup()?;
     let loaded = load_optional_config(&arguments.global)?;
     match arguments.invocation() {
         cli::Invocation::Sync {
@@ -4828,6 +4832,9 @@ fn safe_doctor_error(error: &Error) -> String {
         }
         Error::FileIo { .. } => "a configured local file could not be read".to_owned(),
         Error::Configuration(_) => "diagnostic configuration was rejected".to_owned(),
+        Error::EntropyUnavailable { waited_secs, .. } => format!(
+            "entropy_unavailable: the system random number generator did not answer within {waited_secs} s, so TLS cannot start; the kernel's entropy pool is empty"
+        ),
         Error::Message(message) if message.starts_with(api::DISCOVERY_FAILED_PREFIX) =>
         {
             "DSM API discovery failed on both entry.cgi and query.cgi routes; inspect the protected logs"

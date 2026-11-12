@@ -4,6 +4,7 @@ pub mod api;
 pub mod batch;
 pub mod cancel;
 pub mod digest_evidence;
+pub mod entropy;
 pub mod error;
 pub mod evidence_dir;
 pub mod integrity;
@@ -302,12 +303,14 @@ static CRYPTO_PROVIDER: std::sync::OnceLock<core::result::Result<(), &'static st
 /// "event loop thread panicked" with no actionable cause.
 pub fn blocking_client_builder() -> Result<reqwest::blocking::ClientBuilder> {
     install_crypto_provider()?;
+    entropy::ensure_ready()?;
     Ok(reqwest::blocking::Client::builder())
 }
 
 /// Build an asynchronous reqwest client. See [`blocking_client_builder`].
 pub fn async_client_builder() -> Result<reqwest::ClientBuilder> {
     install_crypto_provider()?;
+    entropy::ensure_ready()?;
     Ok(reqwest::Client::builder())
 }
 

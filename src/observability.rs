@@ -388,11 +388,14 @@ pub enum EventReason {
     PairIndexStoreFailed,
     /// The tree needs more memory than the run may use (SC-2).
     TreeTooLargeForMemory,
+    /// The system random number generator did not answer within its bound, so TLS could not
+    /// start; it clears by itself once the kernel's entropy pool fills.
+    EntropyUnavailable,
 }
 
 impl EventReason {
     /// Every reason, so the published vocabulary can be checked against this enum.
-    pub const ALL: [Self; 40] = [
+    pub const ALL: [Self; 41] = [
         Self::Authentication,
         Self::Network,
         Self::HttpStatus,
@@ -433,6 +436,7 @@ impl EventReason {
         Self::PairIndexUnusable,
         Self::PairIndexStoreFailed,
         Self::TreeTooLargeForMemory,
+        Self::EntropyUnavailable,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -477,6 +481,7 @@ impl EventReason {
             Self::PairIndexUnusable => "pair_index_unusable",
             Self::PairIndexStoreFailed => "pair_index_store_failed",
             Self::TreeTooLargeForMemory => "tree_too_large_for_memory",
+            Self::EntropyUnavailable => "entropy_unavailable",
         }
     }
 
@@ -529,6 +534,7 @@ impl EventReason {
             // The two breakers were `Error::Message`, so `unclassified`, until each was named.
             Error::RemoteRefusalsShareWide { .. } => Self::RemoteRefusedShareWide,
             Error::RemoteRealPathUnusable { .. } => Self::RemoteRealPathUnusable,
+            Error::EntropyUnavailable { .. } => Self::EntropyUnavailable,
             Error::Message(_) => Self::Unclassified,
         }
     }
@@ -600,6 +606,7 @@ pub fn failure_path(error: &crate::error::Error, source: Option<&Path>) -> Optio
         | Error::Vault { .. }
         | Error::RemoteRefusalsShareWide { .. }
         | Error::RemoteRealPathUnusable { .. }
+        | Error::EntropyUnavailable { .. }
         | Error::Message(_) => None,
     }
 }

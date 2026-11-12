@@ -183,6 +183,7 @@ unclassified
 changed_during_run        delete_bound              server_copy_fallback      excluded
 upload_failed
 evidence_canary_mismatch  pair_index_unusable       pair_index_store_failed   tree_too_large_for_memory
+entropy_unavailable
 ```
 
 `reconcile.evidence` counts the pairs post-run reconciliation carried from the plan pass
