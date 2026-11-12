@@ -128,7 +128,8 @@ needs randomness: on the 3.10 kernels DSM 7 still ships there is no `getrandom(2
 random draw in a process waits in `poll(/dev/random)` until the kernel's entropy count rises. A
 client per CGI made every dashboard request pay that wait, and on a drained entropy pool CGIs hung
 for most of an hour. The service keeps one client for its life, so the wait is paid once per service
-start, and the CGI path needs no randomness. The only query fields are `api=SYNO.Core.Desktop.Initdata`, `version=1`, and
+start (bounded at 15 seconds: past that the query fails as `entropy_unavailable` instead of
+hanging, and the next one asks again), and the CGI path needs no randomness. The only query fields are `api=SYNO.Core.Desktop.Initdata`, `version=1`, and
 `method=get_user_service`. Proxy use and redirects are disabled, `SERVER_NAME` and remote addresses
 are not destination inputs, connect and request time are bounded, and at most 1 MiB of response is
 accepted. The DSM cookie and optional normalized token are sensitive headers; the token is sent as
