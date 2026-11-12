@@ -196,7 +196,9 @@ each named path is also logged as an `entry.skipped` warning with reason `reconc
 
 A run that fails after performing some of its work still reports that work. The plan and the counts
 of what completed are printed before the failure is returned, and the machine-readable result carries
-`failed: true` alongside them.
+`failed: true` alongside them. With `--pair-index`, a failed run still stores the pairs it proved;
+only those it planned to change on the NAS, and those reconciliation found unconverged, are left out
+and named (`pair-index-failed-run`).
 
 ## Safe rollout
 

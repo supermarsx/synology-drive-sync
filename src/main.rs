@@ -3333,6 +3333,10 @@ fn prepare_and_run_sync_reporting(
         ) {
             Ok(verdict) => verdict,
             Err(error) => {
+                // No evidence survives about a path whose destination did not converge.
+                if let Some(session) = index_session.as_mut() {
+                    session.retract(plan_local_paths(&reconciliation));
+                }
                 log_reconciliation_pending(&settings.output, logger.as_ref(), profile, &error);
                 return Err(error);
             }
@@ -3348,10 +3352,31 @@ fn prepare_and_run_sync_reporting(
         }
         Ok(())
     })();
-    // A run that stopped before its end writes no evidence: what it gathered stays unwritten,
-    // and the index stays exactly as it was.
     if let Some(session) = index_session.take() {
-        index_report = Some(session.abandon());
+        index_report = Some(match &operation {
+            // A failed run keeps what it proved: a proof is keyed by the facts it was made under,
+            // so it holds whatever happened afterwards. Only what the run planned to change on the
+            // NAS, and what reconciliation found unconverged, is dropped, and named.
+            Err(error) => {
+                let touched = plan_out.as_ref().map(|plan| {
+                    TouchedPaths::from_run(
+                        plan,
+                        completion_out
+                            .as_ref()
+                            .map_or(&[][..], |completion| completion.deferred.as_slice()),
+                    )
+                });
+                session.commit_after_failure(
+                    Some(&local),
+                    touched.as_ref(),
+                    scope.is_root(),
+                    EventReason::of(error).as_str(),
+                )
+            }
+            // Stopped before its end without failing (the memory guard's refusal): nothing was
+            // compared, so the index stays exactly as it was.
+            Ok(()) => session.abandon(),
+        });
     }
     if let Some(report) = index_report {
         run_index::report(&report, &settings.output, logger.as_ref(), profile)?;
@@ -4002,6 +4027,22 @@ fn build_reconciliation_plan(
         remote,
         incomplete_directories: scanned.incomplete_directories,
     })
+}
+
+/// Every local path a plan names, in its local spelling.
+fn plan_local_paths(plan: &SyncPlan) -> impl Iterator<Item = &str> {
+    plan.pre_deletes
+        .iter()
+        .chain(&plan.post_deletes)
+        .map(|action| action.local_relative.as_str())
+        .chain(plan.creates.iter().map(|action| action.relative.as_str()))
+        .chain(plan.copies.iter().map(|action| action.to_relative.as_str()))
+        .chain(
+            plan.uploads
+                .iter()
+                .map(|action| action.local.relative.as_str()),
+        )
+        .chain(plan.renames.iter().map(|action| action.relative.as_str()))
 }
 
 /// The reconciliation pass: its plan, and what `ensure_reconciled` compares with the first scan.

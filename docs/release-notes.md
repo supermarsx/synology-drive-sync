@@ -313,6 +313,11 @@ lists its own commits.
   an `entry.skipped` warning with reason `reconciliation_pending`. Exit `1` is kept for a deletion
   the run made that did not take, a write the NAS still disagrees with, a path in the first scan
   that still differs, an unresolved type conflict or rename, and a missing destination root.
+- **A failed run keeps the index evidence it proved.** Before, any failure abandoned the run's index
+  session, so the retry after a reconciliation failure started cold. A failed run now stores every
+  proof except those for paths it planned to change on the NAS and paths reconciliation found
+  unconverged. Those are dropped, their old records are removed, and the count is named in the new
+  information issue `pair-index-failed-run`.
 
 ## Read this before upgrading
 

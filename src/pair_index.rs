@@ -201,6 +201,7 @@ pub const ISSUE_CODES: &[&str] = &[
     "pair-index-nas-clock-skewed",
     "pair-index-cleanup-failed",
     "pair-index-plan-clock-unbounded",
+    "pair-index-failed-run",
 ];
 
 impl IndexIssue {
@@ -430,6 +431,8 @@ pub struct IndexSession {
     upserts: BTreeMap<String, StoredPair>,
     /// Keys looked up whose facts no longer matched.
     invalidated: BTreeSet<String>,
+    /// Proofs a failed run did not store (see [`Self::commit_after_failure`]).
+    dropped_after_failure: usize,
     canary_at: i64,
     /// `pair-index-nas-clock-skewed` was named this run: once is enough.
     clock_skew_named: bool,
@@ -527,6 +530,7 @@ impl IndexSession {
             broken,
             upserts: BTreeMap::new(),
             invalidated: BTreeSet::new(),
+            dropped_after_failure: 0,
             canary_at,
             clock_skew_named: false,
             report,
@@ -851,6 +855,54 @@ impl IndexSession {
         if matches!(self.report.state, IndexState::Warm | IndexState::LocalOnly) {
             self.report.state = IndexState::Cold;
         }
+    }
+
+    /// Forget, for this run's commit, every proof about `relatives` (local spellings), and remove
+    /// what the index holds for them: reconciliation found their destination unconverged, so no
+    /// evidence about them survives the run. Counted for [`Self::commit_after_failure`].
+    pub fn retract<'path>(&mut self, relatives: impl IntoIterator<Item = &'path str>) {
+        for relative in relatives {
+            if self.upserts.remove(relative).is_some() {
+                self.dropped_after_failure += 1;
+            }
+            self.invalidated.insert(relative.to_owned());
+        }
+    }
+
+    /// Write what a failed run proved, and nothing it cannot vouch for.
+    ///
+    /// A pair's evidence is keyed by the facts it was proven under, so a proof made before the
+    /// run failed is as good as one made by a run that succeeded. What a failure leaves unproven is
+    /// the NAS side of every path the plan meant to write, delete or rename (`touched`, planned or
+    /// performed alike): those proofs are dropped and the stored records removed, as are those
+    /// [`Self::retract`] named. Everything dropped is counted in a `pair-index-failed-run`
+    /// information issue naming `cause`. Without this, every failed run threw away every digest it
+    /// had just proven, and the retry started cold.
+    pub fn commit_after_failure(
+        mut self,
+        local: Option<&LocalInventory>,
+        touched: Option<&TouchedPaths>,
+        unscoped: bool,
+        cause: &str,
+    ) -> IndexReport {
+        if let Some(touched) = touched {
+            let before = self.upserts.len();
+            self.upserts.retain(|key, _| !touched.touches(key));
+            self.dropped_after_failure += before - self.upserts.len();
+        }
+        if self.dropped_after_failure > 0 && !self.broken {
+            let dropped = self.dropped_after_failure;
+            self.report.issues.push(IndexIssue::info(
+                "pair-index-failed-run",
+                &self.binding.remote,
+                format!(
+                    "the run failed ({cause}); its other proofs were stored, but {dropped} {}                      not, because the run planned to change the NAS there or found it                      unconverged; {} verified live next run",
+                    if dropped == 1 { "pair was" } else { "pairs were" },
+                    if dropped == 1 { "it is" } else { "they are" },
+                ),
+            ));
+        }
+        self.commit(local, touched, unscoped)
     }
 
     /// The run did not finish its digest pass (a breaker trip, a failed run): nothing is written,

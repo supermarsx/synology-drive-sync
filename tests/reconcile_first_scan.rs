@@ -201,3 +201,90 @@ fn a_file_moved_in_during_the_run_is_a_named_transient_deferral_and_the_index_is
         Some(b"moved in from elsewhere".to_vec())
     );
 }
+
+/// R1 and R3: a path in the first scan, unchanged locally, whose NAS copy a third party rewrote
+/// keeping its size and modification time, is not converged: exit 1, with the path, the action and
+/// the cause on standard error and in the result record. The failed run still stores what it
+/// proved about the other pairs, and names what it dropped.
+#[test]
+fn a_first_scan_path_that_still_differs_fails_by_name_and_keeps_the_other_evidence() {
+    // More pairs than the canary (25) samples, so the next run has some to serve.
+    let mut names = (0..40)
+        .map(|index| format!("kept-{index:02}.txt"))
+        .collect::<Vec<_>>();
+    names.push("rewritten.txt".to_owned());
+    let names = names.iter().map(String::as_str).collect::<Vec<_>>();
+    let fixture = Fixture::new("first-scan-differs", &names);
+    let mut altered = b"rewritten.txt content".to_vec();
+    altered[0] = b'X';
+    fixture.server.edit_file_on_next(
+        "SYNO.FileStation.Upload.upload",
+        &format!("{ROOT}/rewritten.txt"),
+        &altered,
+        false,
+    );
+
+    let output = fixture.sync();
+    assert_eq!(output.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains(
+            "upload rewritten.txt (in the first scan, unchanged since, and the NAS still differs)"
+        ),
+        "the failure names the path, the action and the cause: {stderr}"
+    );
+    let record = fixture.result_record();
+    assert_eq!(
+        record["error"]["code"], "reconciliation_pending",
+        "{record}"
+    );
+    assert_eq!(record["error"]["path"], "rewritten.txt", "{record}");
+    assert!(
+        record["error"]["detail"]
+            .as_str()
+            .is_some_and(|detail| detail.contains("did not converge on 1 in-scope path(s)")),
+        "{record}"
+    );
+
+    let document = stdout_json(&output);
+    let index = &document["result"]["pair_index"];
+    assert!(
+        index["stored"].as_u64().is_some_and(|stored| stored >= 1),
+        "the pairs the run proved are kept: {index}"
+    );
+    let issues = index["issues"].as_array().expect("index issues");
+    let dropped = issues
+        .iter()
+        .find(|issue| issue["code"] == "pair-index-failed-run")
+        .unwrap_or_else(|| panic!("what was dropped is named: {issues:?}"));
+    assert_eq!(dropped["severity"], "info");
+    assert!(
+        dropped["cause"]
+            .as_str()
+            .is_some_and(|cause| cause.contains("reconciliation_pending")),
+        "{dropped}"
+    );
+
+    // The next run is warm for the pairs the failed run proved, and repairs the other.
+    let next = fixture.sync();
+    assert_eq!(
+        next.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&next.stderr)
+    );
+    let document = stdout_json(&next);
+    assert!(
+        document["plan"]["pair_index"]["served"]
+            .as_u64()
+            .is_some_and(|served| served >= 1),
+        "{}",
+        document["plan"]["pair_index"]
+    );
+    assert_eq!(
+        fixture
+            .server
+            .file_contents(&format!("{ROOT}/rewritten.txt")),
+        Some(b"rewritten.txt content".to_vec())
+    );
+}

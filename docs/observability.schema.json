@@ -65,7 +65,8 @@
                   "pair-index-writeback-unbounded",
                   "pair-index-nas-clock-skewed",
                   "pair-index-cleanup-failed",
-                  "pair-index-plan-clock-unbounded"
+                  "pair-index-plan-clock-unbounded",
+                  "pair-index-failed-run"
                 ]
               },
               "severity": { "enum": ["info", "warning"] },
