@@ -142,7 +142,7 @@
               </div>
             </div>
 
-            <ul v-if="attentionItems.length" class="sdsync-attention" role="status" aria-label="Run outcomes needing attention"><li v-for="item in attentionItems" :key="item.id" :class="'is-' + item.level"><strong>{{ item.title }}</strong> <span>{{ item.detail }}</span></li></ul>
+            <ul v-if="attentionItems.length" class="sdsync-attention" role="status" aria-label="Run outcomes needing attention"><li v-for="item in attentionItems" :key="item.id" :class="'is-' + item.level"><strong>{{ item.title }}</strong> <span>{{ item.detail }}</span><details v-if="item.raw"><summary>Technical detail</summary><code>{{ item.raw }}</code></details></li></ul>
             <details v-if="runStderrView" class="sdsync-run-stderr"><summary>Core error output of the last run<span v-if="runStderrView.error"> (could not be read)</span></summary><p v-if="runStderrView.error" class="is-fail">{{ runStderrView.error }}</p><pre v-else>{{ runStderrView.text }}</pre></details>
             <div class="sdsync-metrics" aria-label="Package summary">
               <article><span>Profiles</span><strong>{{ snapshotRead ? profiles.length : 'Not read' }}</strong><small>{{ snapshotRead ? readyProfileCount + ' with protected password material' : 'Waiting for the package status' }}</small></article>
@@ -474,7 +474,7 @@
 
           <section v-else-if="route === 'activity'" class="sdsync-page" aria-labelledby="sdsync-page-title">
             <div class="sdsync-page-actions"><v-button suffix="grey" display="icon-text" tooltip="Pause or resume browser-side log refreshes" @click="toggleLogs"><template #icon><action-icon :name="logsPaused ? 'run' : 'pause'" /></template>{{ logsPaused ? 'Resume live updates' : 'Pause live updates' }}</v-button><v-button suffix="grey" display="icon-text" tooltip="Clear only this rendered view; package logs remain intact" @click="clearLogView"><template #icon><action-icon name="clear" /></template>Clear view</v-button></div>
-            <ul v-if="attentionItems.length" class="sdsync-attention" role="status" aria-label="Run outcomes needing attention"><li v-for="item in attentionItems" :key="item.id" :class="'is-' + item.level"><strong>{{ item.title }}</strong> <span>{{ item.detail }}</span></li></ul>
+            <ul v-if="attentionItems.length" class="sdsync-attention" role="status" aria-label="Run outcomes needing attention"><li v-for="item in attentionItems" :key="item.id" :class="'is-' + item.level"><strong>{{ item.title }}</strong> <span>{{ item.detail }}</span><details v-if="item.raw"><summary>Technical detail</summary><code>{{ item.raw }}</code></details></li></ul>
             <ul v-if="feedProblem" class="sdsync-attention sdsync-feed-problem" role="alert" aria-label="Activity feed problem"><li class="is-fail"><strong>Activity feed unavailable</strong> <span>{{ feedProblem }}</span></li></ul>
             <p class="sdsync-field-note">{{ activityHistoryNote }}</p>
             <div class="sdsync-subtabs" data-subtabs="activity" role="tablist" aria-label="Activity views" @keydown="moveSubtab('activityTab', activityTabs, $event)">

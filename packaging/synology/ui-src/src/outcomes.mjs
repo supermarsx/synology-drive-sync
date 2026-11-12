@@ -122,6 +122,12 @@ const REASONS = Object.freeze({
   tree_too_large_for_memory: ["the source holds more entries than this run has memory for, so nothing was synced", "Split the profile into smaller ones (a scope or subfolder profiles)."],
   "tree-too-large-for-memory": ["not synced until you fix this: the source holds more entries than this run has memory for, so nothing was synced", "Split the profile into smaller ones (a scope or subfolder profiles)."],
   "source-changed": ["files changed during the run", "They sync next run."],
+  // Lasting, and clear by themselves: the run exits 0 and the file is tried every run. Their detail
+  // names the file (`keeps_failing path=<p> runs=<n> ...`); keepsFailingSentence reads it.
+  "file-keeps-changing": ["a file kept changing while each of the last three runs worked (a log, an open mailbox or database, an Office lock file), so it is named instead of re-running for it", "It is tried again every run and syncs once it holds still; close the program that writes it, or exclude it if it should never sync."],
+  "source-stays-unreadable": ["a source file could not be read in each of the last three runs (locked for good, or failing)", "It is tried again every run; close the program holding it, fix its permissions, or exclude it."],
+  "remote-digest-keeps-failing": ["the NAS could not checksum a file in each of the last three runs", "It is compared again every run; if it persists, review Logs for the DSM code and check the volume's health on the NAS."],
+  "delete-keeps-failing": ["the NAS refused a deletion in each of the last three runs", "It is tried again every run; review Logs for the DSM code, or remove it in File Station."],
   "source-vanished": ["a source file disappeared during the run", "Nothing to do unless it was unintended."],
   "source-unreadable": ["a source file could not be read", "Check its permissions."],
   "unsupported-local-entry": ["an unsupported local entry was left out", "Remove or exclude it."],
@@ -162,17 +168,20 @@ const RECORD_ERROR_COPY = Object.freeze({
 // The verified-pair (checksum) index a profile's last run used. States are the closed list the
 // package writes; the issue codes below are the warning-level ones it names, in plain words.
 const INDEX_STATES = Object.freeze(["off", "cold", "warm", "refreshed", "unusable", "local-only"]);
-const INDEX_INFO_ISSUES = Object.freeze(["pair-index-retired", "pair-index-not-applicable", "pair-index-unsupported-platform", "pair-index-plan-clock-unbounded", "pair-index-compaction-failed", "pair-index-link-guard-unchecked"]);
+const INDEX_INFO_ISSUES = Object.freeze(["pair-index-retired", "pair-index-not-applicable", "pair-index-unsupported-platform", "pair-index-plan-clock-unbounded", "pair-index-compaction-failed", "pair-index-link-guard-unchecked", "pair-index-failed-run", "pair-index-compacted", "pair-index-remote-ctime-unavailable"]);
 const INDEX_INFO_NOTES = Object.freeze({
   "pair-index-retired": "rebuilt, it belonged to another source or remote",
   "pair-index-not-applicable": "not used for this profile",
   "pair-index-unsupported-platform": "not supported on this platform",
   "pair-index-plan-clock-unbounded": "some files were checked live again because the destination's clock is more than 20 seconds from this NAS's; check the time settings",
   "pair-index-compaction-failed": "the index file could not be compacted this run and stays larger than it needs to be; it still works",
-  "pair-index-link-guard-unchecked": "stored checksums were not used this run because the destination listed some folders without a real path, so every file was checked live"
+  "pair-index-link-guard-unchecked": "stored checksums were not used this run because the destination listed some folders without a real path, so every file was checked live",
+  "pair-index-failed-run": "the last run failed; the checksums it proved were kept, and the files it was changing are checked live next run",
+  "pair-index-compacted": "the index file was compacted to reclaim space; nothing to do",
+  "pair-index-remote-ctime-unavailable": "the NAS does not report file change times, so its checksums are always computed and only the local read is skipped; nothing to do"
 });
 const INDEX_ISSUE_COPY =Object.freeze({
-  "pair-index-corrupt": "the checksum index was damaged; it was set aside and rebuilt from this run, so every file was checked live",
+  "pair-index-corrupt": "the checksum index was damaged; it was set aside and rebuilt from this run, so every file was checked live. Your files were still compared in full and nothing needs doing: the next run is fast again. If it happens again, check the health of the volume holding the package in Storage Manager",
   "pair-index-locked": "another process was using the checksum index, so this run did not use it and every file was checked live",
   "pair-index-readonly": "the checksum index is on a read-only location, so it could not be used or updated and every file was checked live",
   "pair-index-store-failed": "the checksum index could not be saved, so the next run checks files live again",
@@ -185,7 +194,9 @@ const INDEX_ISSUE_COPY =Object.freeze({
   "pair-index-writeback-unbounded": "periodic writeback is switched off on this NAS (vm.dirty_writeback_centisecs is 0), so the checksum index cannot tell when a changed file has settled and every file was checked live",
   "pair-index-nas-clock-skewed": "the destination's clock (or a proxy's in front of it) is more than 20 seconds from this NAS's, so the files it reported were checked live again; check the time settings",
   "pair-index-cleanup-failed": "a set-aside copy of the checksum index, or the record of a crash in it, could not be cleaned up, so it may stay and use disk space; the path and the reason are in the detail",
-  "pair-index-remote-ctime-static": "the destination did not show this run's write in a file's change time, so the destination's checksums are always computed live and only the local read is skipped"
+  "pair-index-remote-ctime-static": "the destination did not show this run's write in a file's change time, so the destination's checksums are always computed live and only the local read is skipped",
+  "pair-index-unsettled-unusable": "the record of files that keep changing could not be used, so such files keep making runs partial until it can be; Logs name the file and the cause",
+  "pair-index-unsupported-storage": "the checksum index cannot be kept on the volume that holds the package, so every run checks every file live (slower, still correct); the package stopped trying, and the detail says why"
 });
 
 const SAFE_TOKEN = /^[A-Za-z0-9_:.-]{1,64}$/;
@@ -275,9 +286,13 @@ function indexAttentionItem(profile) {
   const cause = known
     ? `${INDEX_ISSUE_COPY[index.issue].charAt(0).toUpperCase()}${INDEX_ISSUE_COPY[index.issue].slice(1)}`
     : `The checksum index reported an unknown index issue (${shown(index.issue)})`;
+  // The raw detail (a path and the index library's own message, such as "Database page size 0
+  // does not match expected 4096") is evidence, not advice: it rides as `raw`, shown behind a
+  // disclosure, and the line itself says what it means and what happens next.
   return {
     id, level: "warn", title: `${name}: checksum index needs attention`,
-    detail: `${cause}${index.issueDetail ? `. ${index.issueDetail}` : ""}.`.replace(/\.+$/, ".")
+    detail: `${cause}.`.replace(/\.+$/, "."),
+    raw: index.issueDetail || ""
   };
 }
 
@@ -622,6 +637,20 @@ export function normalizeOutcomes(raw) {
   };
 }
 
+/**
+ * "the file <path> (3 runs in a row; last cause: source-changed)" from a lasting-deferral detail
+ * (`keeps_failing path=<percent-encoded> runs=<n> cause=<reason>; ...` or
+ * `file_keeps_changing path=<...> runs=<n>; last cause <reason>: ...`), or "" for any other text.
+ */
+export function keepsFailingSentence(detail) {
+  if (typeof detail !== "string") return "";
+  const match = /^(?:keeps_failing|file_keeps_changing) path=(\S+) runs=(\d+)(?:;? ?(?:cause=|last cause )([a-z_-]+))?/.exec(detail);
+  if (!match) return "";
+  const path = decodePercentPath(match[1].replace(/[;,]$/, ""));
+  const runs = Number(match[2]);
+  return `the file ${visibleText(path)} (${runs} run${runs === 1 ? "" : "s"} in a row${match[3] ? `; last cause: ${match[3]}` : ""})`;
+}
+
 /** Plain-language line for a run or profile outcome with its reason. */
 export function outcomeSentence(outcome, reason) {
   const label = outcomeLabel(outcome);
@@ -657,7 +686,9 @@ export function profileOutcomeRow(entry, nowSeconds = Date.now() / 1000) {
   // the detail, and the row is at least a warning until someone has looked.
   if (p.reason && !reasonCopy(p.reason).known && (level === "ok" || level === "idle")) level = "warn";
   if (tokens(p.warnings).length) parts.push(warningsSentence(p));
-  if (p.detail) parts.push(`core said: ${p.detail}`);
+  const keeps = keepsFailingSentence(p.detail);
+  if (keeps) parts.push(keeps);
+  else if (p.detail) parts.push(`core said: ${p.detail}`);
   if (p.failedPath) parts.push(`failed on ${p.failedPath}`);
   return {
     profile: p.profile,

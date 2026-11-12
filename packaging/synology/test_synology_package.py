@@ -13503,6 +13503,8 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
                 state / f"cache/pairs/{name}.redb",
                 state / f"cache/pairs/{name}.redb.corrupt-123",
                 state / f"cache/pairs/{name}.redb.panicked",
+                state / f"cache/pairs/{name}.redb.unsettled",
+                state / f"cache/pairs/{name}.redb.unsettled.tmp",
             ]
 
         for name, source, default in (
@@ -13581,6 +13583,7 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
                 pairs / f"{stem}.redb",
                 pairs / f"{stem}.redb.corrupt-123",
                 pairs / f"{stem}.redb.panicked",
+                pairs / f"{stem}.redb.unsettled",
             ]
 
         for name, source in ((gone_name, self.source_one), (other_name, self.source_two)):

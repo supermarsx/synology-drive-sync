@@ -1451,7 +1451,7 @@ remove_profile_leftovers() {
     if pair_index_stem "$leftover_profile"; then
         set -- "$@" "$cache_root/pairs/$pair_index_stem_value.redb" \
             "$cache_root/pairs/$pair_index_stem_value.redb.corrupt-"* \
-            "$cache_root/pairs/$pair_index_stem_value.redb.panicked"
+            "$cache_root/pairs/$pair_index_stem_value.redb.panicked"             "$cache_root/pairs/$pair_index_stem_value.redb.unsettled"             "$cache_root/pairs/$pair_index_stem_value.redb.unsettled.tmp"
     else
         echo "warning: the pair index files of profile $leftover_profile in $cache_root/pairs were not removed: $pair_index_stem_cause" >&2
     fi

@@ -19287,16 +19287,13 @@ fn profile_index_value(record: &OutcomeRecord<'_>, errors: &mut OutcomeErrors) -
             None
         }
     });
+    // Shown, never dropped: a detail that is longer than the 160 bytes the dashboard carries, or
+    // holds a byte it does not print, used to make the whole record "malformed" and vanish, so the
+    // issue lost its evidence exactly when the path in it was long. Unprintable bytes read `?`,
+    // and a long detail keeps its tail, where the file name and the library's message are.
     let issue_detail = record
         .text("index_issue_detail", errors)
-        .and_then(|detail| {
-            if detail.len() <= 160 && detail.iter().all(|b| (b' '..=b'~').contains(b)) {
-                String::from_utf8(detail).ok()
-            } else {
-                errors.push(record.source, "malformed");
-                None
-            }
-        });
+        .map(|detail| shown_index_detail(&detail));
     json!({
         "state": String::from_utf8_lossy(&state),
         "entries": record.number("index_entries", errors),
@@ -19308,6 +19305,28 @@ fn profile_index_value(record: &OutcomeRecord<'_>, errors: &mut OutcomeErrors) -
         "issue": issue,
         "issue_detail": issue_detail,
     })
+}
+
+/// An index issue's detail as the dashboard carries it: printable ASCII, at most 160 bytes, the
+/// tail kept behind `...` when it is longer.
+#[cfg(target_os = "linux")]
+fn shown_index_detail(detail: &[u8]) -> String {
+    const LIMIT: usize = 160;
+    let printable: String = detail
+        .iter()
+        .map(|byte| {
+            if (b' '..=b'~').contains(byte) {
+                char::from(*byte)
+            } else {
+                '?'
+            }
+        })
+        .collect();
+    if printable.len() <= LIMIT {
+        printable
+    } else {
+        format!("...{}", &printable[printable.len() - (LIMIT - 3)..])
+    }
 }
 
 /// `detail=` in a profile record: the core's error line for that profile (S-18), written by the
@@ -24942,6 +24961,21 @@ mod tests {
                 "{refused}"
             );
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_long_index_issue_detail_keeps_its_tail_instead_of_being_dropped() {
+        let nas = b"/var/packages/synology-drive-sync/var/state/cache/pairs/checkoffice_nas.redb: DB corrupted: Database page size 0 does not match expected 4096; set aside as /var/packages/synology-drive-sync/var/state/cache/pairs/checkoffice_nas.redb.corrupt-1794446729";
+        let shown = shown_index_detail(nas);
+        assert_eq!(shown.len(), 160);
+        assert!(shown.starts_with("..."), "{shown}");
+        assert!(
+            shown.ends_with("checkoffice_nas.redb.corrupt-1794446729"),
+            "{shown}"
+        );
+        assert_eq!(shown_index_detail(b"short: fine"), "short: fine");
+        assert_eq!(shown_index_detail(b"tab\there\x07"), "tab?here?");
     }
 
     /// Fault-injection rows 24-26: `backend_reason` on the routine object.
