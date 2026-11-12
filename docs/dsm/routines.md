@@ -230,6 +230,27 @@ with the end kept and the middle cut: `next_walk_deadline_seconds=N` survives; `
 none, cleared when the routine is armed or disarmed), and each new cause is also a
 `routine_backend` line in `controller.log`.
 
+### Idle or blind
+
+A realtime routine that has not run for a day is either idle (nothing changed) or blind (nothing is
+looking). The routine's state record says which, under both engines, in keys appended after
+`escalated_epoch`: `watching_via` (`native`, `poll`, `schedule` or `none`), `observe_state` (`ok`,
+`degraded`, `blind` or `disabled`), `observe_cause` (a token, `none` while observed),
+`observe_since_epoch`, `last_trigger_epoch` (the last change seen, or the last time the routine was
+due) and `last_run_epoch` (the last run that finished; a refusal is not a run). A reader that predates
+them ignores them, and a record that lacks them reads as observed.
+
+`degraded` still has an observer: the native watch is down but the poll runs, or the poll floor under a
+healthy native watch cannot finish its walk. `blind` has none: the poll cannot read its tree or was
+killed for taking longer than its budget (900 seconds under the shell engine, bounded by
+`SDSYNC_DSM_POLL_WALK_BUDGET`), the process-wide walk cap refused the arm (daemon), a lasting block holds
+the routine (daemon), the watcher never reported (daemon), or the source is missing. Each change of
+state or cause is one `routine.unobserved` Activity row once it has held for 30 seconds (a watcher that is
+still starting says nothing; a disabled routine is said at once), and the end of it a `routine.observed` row;
+`ctl status` carries the same fields. Under the shell engine, a run with no heartbeat for 30 minutes,
+or a dashboard job that has run longer than 30 minutes, also writes one row for `all` profiles (cause
+`controller_blocked`), since the controller loop waits on it.
+
 ## Retry and backoff
 
 Profile **Retries** handle eligible network operations inside one engine run. Routine **Retry

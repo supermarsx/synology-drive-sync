@@ -3194,7 +3194,7 @@ append_activity() {
     activity_actor=${9:-}
     case $activity_code in
         run.started|run.succeeded|run.failed|run.deferred|run.cancelled|routine.deferred|routine.retry_scheduled|\
-        routine.retries_exhausted|routine.watch_abandoned|\
+        routine.retries_exhausted|routine.watch_abandoned|routine.unobserved|routine.observed|\
         doctor.succeeded|doctor.failed|doctor.inventory|configuration.changed|notification.unavailable|\
         audit.requested|audit.succeeded|audit.failed|audit.outcome_unknown|\
         module.requested|module.succeeded|module.failed|module.outcome_unknown|\
@@ -3687,6 +3687,25 @@ append_audit_event() {
     audit_client_request_field=
     audit_client_request_needle=
     audit_activity_message="Module $audit_operation $audit_state [$audit_transaction]"
+    # A refused dashboard mutation names why, and the client request ID its
+    # refused body carried; `sdsync-dsm api audit-rejected` validated both
+    # (REJECTED_POST_REASONS in dsm_api.rs). They reach this row only: the
+    # audit.log record keeps its fixed shape, and the request tag stays last
+    # because readers take a trailing ` request_id=` as the row's correlation
+    # ID. The verifier proves exactly this text.
+    if [ "$audit_operation" = rejected-post ] && [ -n "${SDSYNC_DSM_AUDIT_REASON:-}" ]; then
+        case $SDSYNC_DSM_AUDIT_REASON in *[!a-z_]*) return 64 ;; esac
+        [ "${#SDSYNC_DSM_AUDIT_REASON}" -le 64 ] || return 64
+        audit_activity_message="$audit_activity_message reason=$SDSYNC_DSM_AUDIT_REASON"
+        case ${SDSYNC_DSM_REJECTED_REQUEST_ID:-} in
+            '') ;;
+            *[!0-9a-f]*) return 64 ;;
+            *)
+                [ "${#SDSYNC_DSM_REJECTED_REQUEST_ID}" -eq 32 ] || return 64
+                audit_activity_message="$audit_activity_message request_id=$SDSYNC_DSM_REJECTED_REQUEST_ID"
+                ;;
+        esac
+    fi
     if [ -n "$audit_client_request_id" ]; then
         audit_client_request_json=$(json_quote "$audit_client_request_id") || return $?
         audit_client_request_field=",\"client_request_id\":$audit_client_request_json"
@@ -3853,7 +3872,10 @@ append_audit_event() {
     if [ "$audit_append_status" -eq 0 ]; then
         case $audit_state in
             requested) audit_subject_code=module.requested; audit_subject_event_level=debug ;;
-            succeeded) audit_subject_code=module.succeeded; audit_subject_event_level=info ;;
+            # audit.succeeded, written above for the same transaction, is the row
+            # the dashboard reads; this one said the same thing a second time, at
+            # info, for every run. Debug keeps it for whoever traces a module.
+            succeeded) audit_subject_code=module.succeeded; audit_subject_event_level=debug ;;
             failed) audit_subject_code=module.failed; audit_subject_event_level=error ;;
             outcome_unknown) audit_subject_code=module.outcome_unknown; audit_subject_event_level=warn ;;
         esac
@@ -3924,6 +3946,7 @@ safe_notify() {
     case $notify_exit in ''|*[!0-9]*) return 64 ;; esac
     notify_status=69
     notify_error="the DSM notifier is not installed"
+    notify_cause_code=notifier_missing
     if [ -x /usr/syno/bin/synodsmnotify ] && [ ! -L /usr/syno/bin/synodsmnotify ]; then
         notify_error="the DSM notifier refused the notification"
         # DSM receives only reviewed application and I18N identifiers. Dynamic
@@ -3951,6 +3974,9 @@ safe_notify() {
                     >/dev/null 2>&1; then return 0; else notify_status=$?; fi
                 ;;
         esac
+        # Reached only by a call that failed (a delivered one returned above, and
+        # the key was validated against these three): its status is the cause.
+        notify_cause_code=notifier_exit_$notify_status
     fi
     # The Activity text is fixed (the callers log the status). A record that
     # cannot be written says so on stderr, with the status and which of the two
@@ -3959,12 +3985,14 @@ safe_notify() {
     # and redirections as the reviewed contract.)
     notify_cause=$(one_safe_line "$notify_error")
     notify_record_status=0
+    # The cause is a token -- notifier_missing, notifier_exit_N -- so a missing
+    # binary and a refusing one read differently on the Activity page.
     append_activity notification.unavailable "$notify_profile" unavailable \
-        "DSM desktop notification delivery unavailable" \
+        "DSM desktop notification delivery unavailable (cause=$notify_cause_code)" \
         notifications warn || notify_record_status=$?
     if [ "$notify_record_status" -ne 0 ]; then
-        printf 'error: DSM desktop notification failed (status %s%s) and its Activity record could not be written (status %s)\n' \
-            "$notify_status" "${notify_cause:+: $notify_cause}" "$notify_record_status" >&2
+        printf 'error: DSM desktop notification failed (status %s, cause=%s%s) and its Activity record could not be written (status %s)\n' \
+            "$notify_status" "$notify_cause_code" "${notify_cause:+: $notify_cause}" "$notify_record_status" >&2
     fi
     return "$notify_status"
 }
@@ -4058,7 +4086,13 @@ handle_alert_result() {
         should_notify=false
     fi
     if [ "$should_notify" = true ]; then
-        if safe_notify "$notify_key" "$alert_profile" "$alert_exit"; then last_notify=$alert_now; fi
+        # The cooldown starts on the attempt, not on a delivery. A notifier that
+        # always fails never started it, so every failed run wrote another
+        # notification.unavailable row beside the run's own failure; the row is
+        # now one per episode (per cooldown), and the DSM system log event above
+        # stays the durable record of every failure.
+        safe_notify "$notify_key" "$alert_profile" "$alert_exit" || :
+        last_notify=$alert_now
     fi
     # sdsync-run invokes this as `handle_alert_result ... || true`, which
     # suspends errexit for this entire body, not just for the return status. An
@@ -4109,7 +4143,9 @@ handle_doctor_alert() {
     fi
     if [ "$doctor_enabled" = true ] && [ "$doctor_failure" = true ] && [ "$doctor_failures" -ge "$doctor_threshold" ]; then
         if [ "$doctor_last_notify" -eq 0 ] || [ $((doctor_now - doctor_last_notify)) -ge "$doctor_cooldown" ]; then
-            if safe_notify doctor_failed "$doctor_profile" "$doctor_exit"; then doctor_last_notify=$doctor_now; fi
+            # On the attempt, as in handle_alert_result: one row per episode.
+            safe_notify doctor_failed "$doctor_profile" "$doctor_exit" || :
+            doctor_last_notify=$doctor_now
         fi
     fi
     # sdsync-dsm invokes this as `handle_doctor_alert ... || true`, with the same

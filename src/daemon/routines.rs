@@ -715,6 +715,81 @@ pub(crate) struct RoutineState {
     pub(crate) last_reason: String,
     pub(crate) partial_streak: u64,
     pub(crate) escalated: u64,
+    /// The last instant a change (or a due cadence) was seen for the routine.
+    pub(crate) last_trigger: u64,
+    /// The last instant a run of the routine finished (a refusal is not a run).
+    pub(crate) last_run: u64,
+    /// What is looking at the source for the routine right now.
+    pub(crate) watching_via: WatchingVia,
+    /// Whether anything is observing the routine (the idle-or-blind answer).
+    pub(crate) observe: Observe,
+    /// Why not, as one token (`none` while observed).
+    pub(crate) observe_cause: String,
+    /// When the current observation state began (0 while observed).
+    pub(crate) observe_since: u64,
+}
+
+/// What looks at a routine's source: the dashboard's "watching via".
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum WatchingVia {
+    /// Native change events (inotify).
+    Native,
+    /// A stat walk of the tree.
+    Poll,
+    /// The clock: an interval or daily routine needs no watcher.
+    Schedule,
+    None,
+}
+
+impl WatchingVia {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Native => "native",
+            Self::Poll => "poll",
+            Self::Schedule => "schedule",
+            Self::None => "none",
+        }
+    }
+    fn parse(value: &str) -> Option<Self> {
+        Some(match value {
+            "native" => Self::Native,
+            "poll" => Self::Poll,
+            "schedule" => Self::Schedule,
+            "none" => Self::None,
+            _ => return None,
+        })
+    }
+}
+
+/// Whether a routine is being observed. `Degraded` still has an observer (a
+/// backstop is down, a poll is the only watcher); `Blind` has none; `Disabled`
+/// is the user's own switch.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Observe {
+    Ok,
+    Degraded,
+    Blind,
+    Disabled,
+}
+
+impl Observe {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Ok => "ok",
+            Self::Degraded => "degraded",
+            Self::Blind => "blind",
+            Self::Disabled => "disabled",
+        }
+    }
+    fn parse(value: &str) -> Option<Self> {
+        Some(match value {
+            "ok" => Self::Ok,
+            "degraded" => Self::Degraded,
+            "blind" => Self::Blind,
+            "disabled" => Self::Disabled,
+            _ => return None,
+        })
+    }
 }
 
 impl Default for RoutineState {
@@ -739,6 +814,12 @@ impl Default for RoutineState {
             last_reason: "none".into(),
             partial_streak: 0,
             escalated: 0,
+            last_trigger: 0,
+            last_run: 0,
+            watching_via: WatchingVia::None,
+            observe: Observe::Ok,
+            observe_cause: "none".into(),
+            observe_since: 0,
         }
     }
 }
@@ -825,10 +906,30 @@ impl RoutineState {
             parse_u64(streak).unwrap_or(0)
         };
         state.escalated = doc.get("escalated_epoch").and_then(parse_u64).unwrap_or(0);
+        // Additive liveness fields: repaired, never refused, like every field
+        // after `partial_streak`. A state from before them reads as observed.
+        state.last_trigger = doc
+            .get("last_trigger_epoch")
+            .and_then(parse_u64)
+            .unwrap_or(0);
+        state.last_run = doc.get("last_run_epoch").and_then(parse_u64).unwrap_or(0);
+        state.watching_via =
+            WatchingVia::parse(doc.get_or("watching_via", "none")).unwrap_or(WatchingVia::None);
+        state.observe = Observe::parse(doc.get_or("observe_state", "ok")).unwrap_or(Observe::Ok);
+        let cause = doc.get_or("observe_cause", "none");
+        state.observe_cause = if valid_token(cause) {
+            cause.to_owned()
+        } else {
+            "none".into()
+        };
+        state.observe_since = doc
+            .get("observe_since_epoch")
+            .and_then(parse_u64)
+            .unwrap_or(0);
         Ok(state)
     }
 
-    /// `write_routine_state`: the same 19 keys in the same order.
+    /// `write_routine_state`: the same 25 keys in the same order.
     pub(crate) fn render(&self) -> Vec<u8> {
         let token = |value: &str| {
             if valid_token(value) {
@@ -850,7 +951,9 @@ impl RoutineState {
              backend_reason={}\npending_fingerprint={}\npending_since_epoch={}\n\
              event_first_seen_epoch={}\npoll_retries={}\n\
              defer_reason={}\nlast_exit_code={}\nlast_reason={}\n\
-             partial_streak={}\nescalated_epoch={}\n",
+             partial_streak={}\nescalated_epoch={}\n\
+             last_trigger_epoch={}\nlast_run_epoch={}\nwatching_via={}\n\
+             observe_state={}\nobserve_cause={}\nobserve_since_epoch={}\n",
             self.state.as_str(),
             self.next_run,
             self.last_success,
@@ -870,6 +973,12 @@ impl RoutineState {
             token(&self.last_reason),
             self.partial_streak,
             self.escalated,
+            self.last_trigger,
+            self.last_run,
+            self.watching_via.as_str(),
+            self.observe.as_str(),
+            token(&self.observe_cause),
+            self.observe_since,
         )
         .into_bytes()
     }
@@ -1282,6 +1391,8 @@ pub(crate) fn evaluate(
     };
     state.state = RoutineRunState::Running;
     state.last_attempt = now;
+    // A dispatch is a trigger: the change (or the cadence) that made it due.
+    state.last_trigger = now;
     if !effects.contains(&Effect::Save) {
         effects.push(Effect::Save);
     }
@@ -1319,6 +1430,10 @@ pub(crate) fn apply_outcome(
     effects: &mut Vec<Effect>,
 ) {
     let exit = end.exit;
+    // A refusal never ran; every other end is the last run (any outcome).
+    if !end.admission_refused {
+        state.last_run = finished;
+    }
     state.last_exit = i64::from(exit).max(-1);
     state.defer_reason = DeferReason::None;
     let close_day = |state: &mut RoutineState| {
@@ -1771,7 +1886,9 @@ mod tests {
              retry_attempt=0\nlast_day=none\nlast_poll_epoch=0\nfingerprint=none\nbackend=none\n\
              backend_reason=ok\npending_fingerprint=0\npending_since_epoch=0\n\
              event_first_seen_epoch=0\npoll_retries=0\ndefer_reason=none\nlast_exit_code=-1\n\
-             last_reason=none\npartial_streak=0\nescalated_epoch=0\n"
+             last_reason=none\npartial_streak=0\nescalated_epoch=0\n\
+             last_trigger_epoch=0\nlast_run_epoch=0\nwatching_via=none\n\
+             observe_state=ok\nobserve_cause=none\nobserve_since_epoch=0\n"
         );
         state.state = RoutineRunState::Failed;
         state.next_run = 1_800_000_000;

@@ -458,11 +458,13 @@ codes are:
 | `routine.retry_scheduled` | A whole-action retry was scheduled |
 | `routine.retries_exhausted` | A routine used all its retry attempts (`error`, `failed`; the message carries the attempt count and last reason), or a realtime routine's sixth consecutive partial run (`warn`, `deferred`) |
 | `routine.watch_abandoned` | The controller stopped retrying a native watcher |
+| `routine.unobserved` | Nothing, or not everything, is observing a routine: its backend is blind, its poll floor cannot finish, its poll walk was killed for outliving its budget, the walk cap refused it, a lasting block holds it, scheduling is blocked by a long job, or it is disabled. One row per episode (`warn`; `info` for disabled); the message names the cause and `Logs` the detail. The routine's state record keeps the episode (`observe_state`, `observe_cause`, `observe_since_epoch`), so a restart does not repeat it |
+| `routine.observed` | The episode above ended: something observes the routine again, it was enabled again, or scheduling resumed (`info`) |
 | `doctor.succeeded` | Doctor completed successfully |
 | `doctor.failed` | Doctor completed with a nonzero result |
 | `doctor.inventory` | The DSM package retained one bounded private Doctor discovery record |
 | `configuration.changed` | Profile, routine, alert, or schedule configuration changed |
-| `notification.unavailable` | The DSM desktop notification helper was unavailable or failed |
+| `notification.unavailable` | The DSM desktop notification helper was unavailable or failed; the message ends `(cause=notifier_missing)` or `(cause=notifier_exit_N)`. One row per failure episode: the alert cooldown starts on the attempt, not on a delivery |
 
 Each event contains an epoch, fixed code, validated profile/`all`/`none` scope, fixed state, and
 bounded message. A `doctor.inventory` message embeds the corresponding private maximum-five record,
@@ -625,8 +627,8 @@ Re-levelled from `warn` to `error` because each records a failed write or delive
 `activity_append_failed`, `alert_unavailable`, `observability_write_failed` (which now carries the
 helper's `cause=`), `state_unreadable` for `controller.pid`, `dsm_log_emit_failed`,
 `run_stderr_unavailable`, and the runner's `runner_message` for every failure (a busy deferral's
-stays `warn`). `notification.unavailable` now says why (`status N`: the notifier is not installed or
-refused).
+stays `warn`). `notification.unavailable` now says why: its message ends `(cause=notifier_missing)` when
+the notifier is not installed and `(cause=notifier_exit_N)` when it refused with status N.
 
 A log rotation that fails never drops the line: it is appended to the still-valid active file past the
 size limit, and the failure is recorded once per episode on standard error and in
@@ -748,7 +750,9 @@ scope with no file of its own starts from the package-wide `alerts.state`, which
 (the consecutive failures of the scope that ran last) and the newest `last_notify_epoch` for older
 readers. Cooldown rate-limits delivery. If
 `/usr/syno/bin/synodsmnotify` is unavailable or fails, synchronization keeps its own result and
-records `notification.unavailable`; alert failure is not disguised as successful delivery.
+records `notification.unavailable` (naming the cause), once per cooldown rather than once per failed
+run, because the cooldown starts on the attempt; alert failure is not disguised as successful delivery,
+and the DSM system-log entry stays the durable record of every failure.
 
 CLI parity:
 

@@ -298,8 +298,8 @@ pub(crate) struct IndexFacts {
     /// The most serious issue the run named (`pair-index-corrupt`, ...), with
     /// its path and cause on one line. Of the info-level notes only
     /// `pair-index-retired`, `pair-index-plan-clock-unbounded`,
-    /// `pair-index-compaction-failed` and `pair-index-link-guard-unchecked` are
-    /// kept, when nothing worse was named.
+    /// `pair-index-compaction-failed`, `pair-index-link-guard-unchecked` and
+    /// `pair-index-failed-run` are kept, when nothing worse was named.
     pub(crate) issue: Option<String>,
     pub(crate) issue_detail: Option<String>,
 }
@@ -325,6 +325,7 @@ impl IndexFacts {
                         | "pair-index-plan-clock-unbounded"
                         | "pair-index-compaction-failed"
                         | "pair-index-link-guard-unchecked"
+                        | "pair-index-failed-run"
                 ) =>
             {
                 1
@@ -2027,6 +2028,7 @@ mod tests {
             for code in [
                 "pair-index-compaction-failed",
                 "pair-index-link-guard-unchecked",
+                "pair-index-failed-run",
             ] {
                 let facts = IndexFacts::from_value(&json!({
                     "state": "warm",
