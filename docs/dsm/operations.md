@@ -661,7 +661,10 @@ service's own view of the package.
 
 Two codes belong to reads the service answers itself, without running the manager.
 `config_file_unsafe` means a package file failed the ownership, mode, link-count or size contract,
-and names a file to repair rather than a service to restart. `package_state_corrupt` means a
+and names a file to repair rather than a service to restart: the envelope carries `file` (its path
+under the package root, at most 160 bytes, the tail kept) and `check`, and the same pair is an
+`unsafe_file` record in `api.log`. A rename replacement, a read that came back a different length,
+and a file removed between listing and reading are looked at again before they count. `package_state_corrupt` means a
 package file was readable and holds a record the service cannot parse. Neither is ever a reason to
 retry the read through the manager instead: the manager checks less, so falling back would serve
 exactly the file the service had just refused.

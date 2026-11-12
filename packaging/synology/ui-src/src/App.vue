@@ -885,11 +885,14 @@ const BRIDGE_FAILURE_COPY = Object.freeze({
     cause: "the UI and package versions differ",
     retry: "backoff"
   }),
+  // Stops only after three in a row: a one-off read that raced a writer is
+  // looked at again rather than freezing the window (`stopAfter`).
   config_file_unsafe: Object.freeze({
     title: "Package file permissions are unsafe",
     message: "A package file has unexpected ownership or permissions. Repair the package rather than changing the file yourself.",
     cause: "a package file has unexpected ownership or permissions",
-    retry: "stop"
+    retry: "stop",
+    stopAfter: 3
   }),
   // Kind Unavailable, but it does not clear on its own: a stored record stays
   // unparseable until the file rotates or is cleared, so polling through it
@@ -906,8 +909,48 @@ const BRIDGE_FAILURE_COPY = Object.freeze({
     message: "The NAS clock is not set correctly. Correct the system time, then retry.",
     cause: "the NAS clock is not set correctly",
     retry: "stop"
+  }),
+  // This window's own read limit, not the package's verdict: the NAS is busy,
+  // or a request is stuck. Not "confirm the package is running", which is what
+  // it used to read as, and changes stay available (KEEP_SESSION_FAILURES).
+  client_timeout: Object.freeze({
+    title: "Package is slow to answer",
+    message: "The package did not answer within 10 seconds: the NAS is busy, or a request is stuck. Retrying; your changes stay available.",
+    cause: "the package did not answer within 10 seconds",
+    retry: "backoff"
+  }),
+  // The package's own CGI gave up on a request at its deadline and recorded
+  // the stage it was in.
+  cgi_deadline_exceeded: Object.freeze({
+    title: "Package request timed out",
+    message: "The package's web handler gave up on a request at its deadline and recorded the stage in the package API log. Retrying; your changes stay available.",
+    cause: "a package request timed out",
+    retry: "backoff"
   })
 });
+// Read failures that say the NAS was slow, not that the session or package is
+// gone: the first two in a row keep the mutation token and the connected state,
+// so one slow read does not lock every edit until the next good poll.
+const KEEP_SESSION_FAILURES = Object.freeze(["client_timeout", "cgi_deadline_exceeded"]);
+// Why a package file was refused, by the check the package names (B7).
+const UNSAFE_FILE_CHECK_COPY = Object.freeze({
+  open: "it could not be opened",
+  type: "it is a link or not a regular file",
+  owner: "it is not owned by the package user",
+  mode: "its permissions are not 600",
+  links: "it has a second hard link",
+  size: "it is larger than the package ever writes",
+  length: "it kept changing length while it was read",
+  read: "it could not be read",
+  list: "its folder could not be listed"
+});
+
+// Whether a named failure has stood the poll down: `retry: "stop"`, and for a
+// row with `stopAfter`, only once that many have come in a row.
+function bridgeFailureStopped(named, streak) {
+  if (!named || named.retry !== "stop") return false;
+  return !(named.stopAfter > 0 && Number(streak) < named.stopAfter);
+}
 // What a mutation the bridge refused before queueing it means, keyed by the code
 // of its error envelope. That is also the code its Activity row names as
 // `reason=` (REJECTED_POST_REASONS in dsm_api.rs; test_synology_ui.py compares
@@ -3800,13 +3843,13 @@ function snapshotStaleEscalationMs() {
   return WIDGET_BACKOFF_RAMP_MS[WIDGET_BACKOFF_RAMP_MS.length - 1];
 }
 
-function retainedDocumentFreshness(receivedAtMs, code, nowMs = Date.now()) {
+function retainedDocumentFreshness(receivedAtMs, code, nowMs = Date.now(), streak = Number.POSITIVE_INFINITY) {
   const received = Number(receivedAtMs);
   const named = BRIDGE_FAILURE_COPY[String(code || "").toLowerCase()];
   const because = named ? `: ${named.cause}` : "";
-  const stopped = named && named.retry === "stop"
+  const stopped = bridgeFailureStopped(named, streak)
     ? " Automatic refresh has stopped; select Retry once the package is repaired."
-    : "";
+    : (named && named.stopAfter > 0 ? ` Checking again (${Math.max(1, Number(streak) || 1)} of ${named.stopAfter}).` : "");
   if (!Number.isFinite(received) || received <= 0) {
     return `Stale · the package could not refresh it${because}.${stopped}`;
   }
@@ -4028,6 +4071,13 @@ function describeBridgeFailure(error, phase = "status") {
   // code a newer package emits that this release has never heard of.
   const named = BRIDGE_FAILURE_COPY[code];
   if (named && (status === 503 || status === 0)) {
+    const refused = code === "config_file_unsafe" && error && error.unsafeFile;
+    if (refused && UNSAFE_FILE_CHECK_COPY[refused.check]) {
+      return issue(
+        named.title,
+        `The package refused ${refused.file}: ${UNSAFE_FILE_CHECK_COPY[refused.check]}. Repair the package from Package Center (or reinstall the same release), which restores its files; do not change the file by hand. If this happened once, the next read checks again.`
+      );
+    }
     return issue(named.title, named.message);
   }
   if (status === 503) {
@@ -4152,7 +4202,7 @@ function logsPollDelay(vm, interval) {
 function tickClock(vm, nowMs = Date.now()) {
   vm.nowMs = nowMs;
   if (vm.staleFreshnessCode !== null && vm.staleFreshnessCode !== undefined && !vm.connected && vm.snapshot) {
-    vm.freshness = retainedDocumentFreshness(vm.snapshotReceivedAtMs, vm.staleFreshnessCode, nowMs);
+    vm.freshness = retainedDocumentFreshness(vm.snapshotReceivedAtMs, vm.staleFreshnessCode, nowMs, vm.snapshotFailureStreak);
   }
 }
 
@@ -4183,7 +4233,7 @@ function clockWatchdog(vm) {
 function probeSnapshotAfterAnswer(vm) {
   if (vm.disposed || vm.connected || !vm.snapshot || vm.snapshotLoading || vm.snapshotPromise) return;
   const named = BRIDGE_FAILURE_COPY[vm.snapshotFailureCode];
-  if (named && named.retry === "stop") return;
+  if (bridgeFailureStopped(named, vm.snapshotFailureStreak)) return;
   vm.snapshotFailureStreak = 0;
   vm.refreshSnapshot(false);
 }
@@ -6457,7 +6507,7 @@ export default {
         }
         return Math.max(interval, floor);
       }
-      if (named.retry === "stop") return 0;
+      if (bridgeFailureStopped(named, this.snapshotFailureStreak)) return 0;
       if (named.retry === "auto") return Math.max(interval, floor, WIDGET_ACTIVE_POLL_MS);
       const step = Number(this.snapshotFailureStreak) - 2;
       if (step < 0) return Math.max(interval, floor);
@@ -6587,16 +6637,19 @@ export default {
           if (manual) this.toast("Status refreshed", "The latest package snapshot is displayed.");
         } catch (error) {
           if (this.disposed || generation !== this.snapshotGeneration || this.snapshotRefreshBlocked) return false;
-          this.csrfToken = "";
-          this.connected = false;
-          this.snapshotFailureCode = String((error && error.code) || "").toLowerCase();
+          const failureCode = String((error && error.code) || "").toLowerCase();
+          if (!(KEEP_SESSION_FAILURES.includes(failureCode) && Number(this.snapshotFailureStreak) < 2)) {
+            this.csrfToken = "";
+            this.connected = false;
+          }
+          this.snapshotFailureCode = failureCode;
           this.snapshotFailureStatus = Number(error && error.status) || 0;
           this.staleFreshnessCode = this.snapshotFailureCode;
           this.snapshotFailureStreak = Math.min(Number(this.snapshotFailureStreak) + 1, WIDGET_BACKOFF_RAMP_MS.length + 1);
           this.bridgeIssue = this.describeBridgeError(error, "status");
           this.connectionLabel = this.bridgeIssue.title;
           this.freshness = this.snapshot
-            ? retainedDocumentFreshness(this.snapshotReceivedAtMs, this.snapshotFailureCode)
+            ? retainedDocumentFreshness(this.snapshotReceivedAtMs, this.snapshotFailureCode, Date.now(), this.snapshotFailureStreak)
             : "Status unavailable";
           if (manual) this.toast(this.bridgeIssue.title, this.bridgeIssue.message, true);
         } finally {

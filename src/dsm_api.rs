@@ -1113,6 +1113,103 @@ impl CgiFailure {
     }
 }
 
+/// Which package file a request judged unsafe, and the check it failed.
+///
+/// `config_file_unsafe` used to collapse every cause -- a wrong owner, a wrong mode, a second hard
+/// link, a file that changed length while it was read, a read error -- into one code with no path,
+/// so four of them in a NAS's api.log could not be told apart or traced to a file. The reader that
+/// refuses a file names it here; the envelope and the api.log record for the request carry it. One
+/// per thread, because the service answers each request on one worker thread, and cleared when the
+/// thread takes the next request.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct UnsafeFile {
+    /// The path, relative to the package's roots where it is under one, bounded and with every
+    /// byte outside `[A-Za-z0-9._/-]` written as `_`.
+    file: String,
+    /// `open`, `type`, `owner`, `mode`, `links`, `size`, `length`, `read` or `list`.
+    check: &'static str,
+}
+
+thread_local! {
+    static UNSAFE_FILE: std::cell::RefCell<Option<UnsafeFile>> = const { std::cell::RefCell::new(None) };
+}
+
+const UNSAFE_FILE_CHECKS: [&str; 9] = [
+    "open", "type", "owner", "mode", "links", "size", "length", "read", "list",
+];
+const MAX_UNSAFE_FILE_BYTES: usize = 160;
+
+/// The bounded, shown form of a package path: its roots stripped, unsafe bytes replaced, and the
+/// tail kept when it is too long, because the file's own name is the part that identifies it.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn shown_package_path(path: &Path) -> String {
+    let text = path.to_string_lossy();
+    let mut relative: String = text.to_string();
+    if let Some(rest) = text.strip_prefix("/var/packages/synology-drive-sync/") {
+        relative = rest.to_owned();
+    } else if let Some(volume) = text.strip_prefix("/volume")
+        && let Some((digits, rest)) = volume.split_once('/')
+        && !digits.is_empty()
+        && digits.bytes().all(|byte| byte.is_ascii_digit())
+        && let Some((area, rest)) = rest.split_once("/synology-drive-sync/")
+        && matches!(area, "@apphome" | "@appdata" | "@appstore")
+    {
+        // DSM's physical package roots, behind the `home`, `var` and `target` symlinks.
+        relative = format!("{}/{rest}", &area[1..]);
+    }
+    let cleaned: String = relative
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '/' | '-') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>()
+        .replace("..", "__");
+    if cleaned.len() <= MAX_UNSAFE_FILE_BYTES {
+        cleaned
+    } else {
+        format!(
+            "...{}",
+            &cleaned[cleaned.len() - (MAX_UNSAFE_FILE_BYTES - 3)..]
+        )
+    }
+}
+
+/// Name the file this thread's request refused, and the check it failed. The first refusal wins:
+/// it is the one the request failed on.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn note_unsafe_file(path: &Path, check: &'static str) {
+    debug_assert!(UNSAFE_FILE_CHECKS.contains(&check));
+    UNSAFE_FILE.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        if slot.is_none() {
+            *slot = Some(UnsafeFile {
+                file: shown_package_path(path),
+                check,
+            });
+        }
+    });
+}
+
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn take_unsafe_file() -> Option<UnsafeFile> {
+    UNSAFE_FILE.with(|slot| slot.borrow_mut().take())
+}
+
+fn peek_unsafe_file() -> Option<UnsafeFile> {
+    UNSAFE_FILE.with(|slot| slot.borrow().clone())
+}
+
+/// A file a reader refused: `config_file_unsafe`, with the file and the check noted.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn unsafe_file(path: &Path, check: &'static str) -> BridgeError {
+    note_unsafe_file(path, check);
+    BridgeError::unsafe_because("config_file_unsafe")
+}
+
 /// A runtime marker under `var/run` is unreadable, mis-owned, or holds a value
 /// this service does not recognise. The service refuses to act on a lifecycle
 /// state it cannot verify, and says so rather than reporting a generic outage.
@@ -10664,6 +10761,7 @@ mod linux_files {
             match open_private_log_file(&path, package_uid, MAX_ACTIVITY_LOG_BYTES, true) {
                 Ok(Some((_, bytes))) => history.push(bytes),
                 Ok(None) => {}
+                // The reader already named the file and the check.
                 Err(_) => return Err(BridgeError::unsafe_because("config_file_unsafe")),
             }
         }
@@ -10692,20 +10790,15 @@ mod linux_files {
         options.read(true).custom_flags(NOFOLLOW_CLOEXEC);
         let file = options
             .open(oldest)
-            .map_err(|_| BridgeError::unsafe_because("config_file_unsafe"))?;
-        let metadata = file
-            .metadata()
-            .map_err(|_| BridgeError::unsafe_because("config_file_unsafe"))?;
-        if !metadata.file_type().is_file()
-            || metadata.st_uid() != package_uid
-            || metadata.st_mode() & 0o7777 != 0o600
-        {
-            return Err(BridgeError::unsafe_because("config_file_unsafe"));
+            .map_err(|_| unsafe_file(oldest, "open"))?;
+        let metadata = file.metadata().map_err(|_| unsafe_file(oldest, "read"))?;
+        if let Some(check) = private_file_check(&metadata, package_uid, false) {
+            return Err(unsafe_file(oldest, check));
         }
         let mut head = Vec::with_capacity(32);
         file.take(32)
             .read_to_end(&mut head)
-            .map_err(|_| BridgeError::unsafe_because("config_file_unsafe"))?;
+            .map_err(|_| unsafe_file(oldest, "read"))?;
         let epoch = head
             .split(|byte| *byte == b'|')
             .next()
@@ -10742,12 +10835,8 @@ mod linux_files {
         let Ok(metadata) = fs::symlink_metadata(path) else {
             return Ok(false);
         };
-        if !metadata.file_type().is_file()
-            || metadata.st_uid() != package_uid
-            || metadata.st_mode() & 0o7777 != 0o600
-            || metadata.st_nlink() != 1
-        {
-            return Err(BridgeError::unsafe_because("config_file_unsafe"));
+        if let Some(check) = private_file_check(&metadata, package_uid, true) {
+            return Err(unsafe_file(path, check));
         }
         Ok(true)
     }
@@ -10762,22 +10851,25 @@ mod linux_files {
     ) -> BridgeResult<Option<(File, u64)>> {
         let mut options = OpenOptions::new();
         options.read(true).custom_flags(NOFOLLOW_CLOEXEC);
-        let file = match options.open(path) {
-            Ok(file) => file,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
-            Err(_) => return Err(BridgeError::unsafe_because("config_file_unsafe")),
-        };
-        let metadata = file
-            .metadata()
-            .map_err(|_| BridgeError::unsafe_because("config_file_unsafe"))?;
-        if !metadata.file_type().is_file()
-            || metadata.st_uid() != package_uid
-            || metadata.st_mode() & 0o7777 != 0o600
-            || metadata.st_nlink() != 1
-        {
-            return Err(BridgeError::unsafe_because("config_file_unsafe"));
+        // The same second look as a document read: a log rotated over (`mv .2 .3`) while it is
+        // opened reaches `fstat` with no links, which is not an unsafe file.
+        let mut look = 0;
+        loop {
+            let file = match options.open(path) {
+                Ok(file) => file,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+                Err(_) => return Err(unsafe_file(path, "open")),
+            };
+            let metadata = file.metadata().map_err(|_| unsafe_file(path, "read"))?;
+            look += 1;
+            if metadata.st_nlink() == 0 && look < REPLACED_DURING_READ_LOOKS {
+                continue;
+            }
+            if let Some(check) = private_file_check(&metadata, package_uid, true) {
+                return Err(unsafe_file(path, check));
+            }
+            return Ok(Some((file, metadata.len())));
         }
-        Ok(Some((file, metadata.len())))
     }
 
     /// The secret values the log reader redacts: the first line of every profile password,
@@ -10791,12 +10883,10 @@ mod linux_files {
         let mut needles = Vec::new();
         for suffix in [".password", ".totp", ".remote-log-token"] {
             for name in private_fragment_names(secrets_dir, suffix, package_uid)? {
-                let bytes = read_exact_single_link_private_file(
-                    &secrets_dir.join(&name),
-                    package_uid,
-                    MAX_SECRET_BYTES + 1,
-                )
-                .map_err(|_| BridgeError::unsafe_because("config_file_unsafe"))?;
+                let secret = secrets_dir.join(&name);
+                let bytes =
+                    read_exact_single_link_private_file(&secret, package_uid, MAX_SECRET_BYTES + 1)
+                        .map_err(|_| unsafe_file(&secret, "read"))?;
                 let line = bytes
                     .split(|byte| *byte == b'\n')
                     .next()
@@ -10824,11 +10914,11 @@ mod linux_files {
         let entries = match fs::read_dir(directory) {
             Ok(entries) => entries,
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
-            Err(_) => return Err(BridgeError::unsafe_because("config_file_unsafe")),
+            Err(_) => return Err(unsafe_file(directory, "list")),
         };
         let mut files = Vec::new();
         for entry in entries {
-            let entry = entry.map_err(|_| BridgeError::unsafe_because("config_file_unsafe"))?;
+            let entry = entry.map_err(|_| unsafe_file(directory, "list"))?;
             let Ok(name) = entry.file_name().into_string() else {
                 continue;
             };
@@ -10836,10 +10926,18 @@ mod linux_files {
             if name.starts_with('.') || !name.ends_with(suffix) || name.len() == suffix.len() {
                 continue;
             }
-            let metadata = fs::symlink_metadata(entry.path())
-                .map_err(|_| BridgeError::unsafe_because("config_file_unsafe"))?;
-            if !metadata.file_type().is_file() || metadata.st_uid() != package_uid {
-                return Err(BridgeError::unsafe_because("config_file_unsafe"));
+            let metadata = match fs::symlink_metadata(entry.path()) {
+                Ok(metadata) => metadata,
+                // Removed between the listing and the look: it is no longer there to be unsafe,
+                // exactly as the manager's glob would no longer match it.
+                Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                Err(_) => return Err(unsafe_file(&entry.path(), "read")),
+            };
+            if !metadata.file_type().is_file() {
+                return Err(unsafe_file(&entry.path(), "type"));
+            }
+            if metadata.st_uid() != package_uid {
+                return Err(unsafe_file(&entry.path(), "owner"));
             }
             files.push(name);
         }
@@ -11196,42 +11294,77 @@ mod linux_files {
         let mut options = OpenOptions::new();
         options.read(true).custom_flags(NOFOLLOW_CLOEXEC);
         let mut look = 0;
-        let (mut file, metadata) = loop {
-            let file = match options.open(path) {
+        // A read that came back shorter or longer than `fstat` said, or failed, is looked at
+        // again a few times before it is called unsafe: an in-place truncation (a log clear) or a
+        // writer mid-write produces it and clears in milliseconds. Ownership, mode, type, a second
+        // link or an oversized file are refused on the first look, as before.
+        let mut transient_looks = 0;
+        loop {
+            let mut file = match options.open(path) {
                 Ok(file) => file,
                 Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
-                Err(_) => return Err(BridgeError::unsafe_runtime()),
+                Err(_) => return Err(unsafe_file_runtime(path, "open")),
             };
             between_open_and_stat(look);
-            let metadata = file.metadata().map_err(|_| BridgeError::unsafe_runtime())?;
+            let metadata = file
+                .metadata()
+                .map_err(|_| unsafe_file_runtime(path, "read"))?;
             look += 1;
             if metadata.st_nlink() == 0 && look < REPLACED_DURING_READ_LOOKS {
                 continue;
             }
-            break (file, metadata);
-        };
-        if !metadata.file_type().is_file()
-            || metadata.st_uid() != package_uid
-            || metadata.st_mode() & 0o7777 != 0o600
-            || metadata.st_nlink() != 1
-            || metadata.len() > maximum as u64
-        {
-            return Err(BridgeError::unsafe_runtime());
+            if let Some(check) = private_file_check(&metadata, package_uid, true) {
+                return Err(unsafe_file_runtime(path, check));
+            }
+            if metadata.len() > maximum as u64 {
+                return Err(unsafe_file_runtime(path, "size"));
+            }
+            let mut bytes = Vec::with_capacity(metadata.len() as usize);
+            let limit = if append_only {
+                metadata.len()
+            } else {
+                (maximum + 1) as u64
+            };
+            let read = Read::by_ref(&mut file).take(limit).read_to_end(&mut bytes);
+            let check = match read {
+                Err(_) => "read",
+                Ok(_) if bytes.len() > maximum => return Err(unsafe_file_runtime(path, "size")),
+                Ok(_) if bytes.len() as u64 != metadata.len() => "length",
+                Ok(_) => return Ok(Some((file, bytes))),
+            };
+            transient_looks += 1;
+            if transient_looks >= TRANSIENT_READ_LOOKS {
+                return Err(unsafe_file_runtime(path, check));
+            }
+            std::thread::sleep(TRANSIENT_READ_PAUSE);
         }
-        let mut bytes = Vec::with_capacity(metadata.len() as usize);
-        let limit = if append_only {
-            metadata.len()
+    }
+
+    /// The check a package-private file's metadata fails, or `None`: a regular file, owned by the
+    /// package, mode `0600`, and (when `single_link`) exactly one link.
+    pub(super) fn private_file_check(
+        metadata: &fs::Metadata,
+        package_uid: u32,
+        single_link: bool,
+    ) -> Option<&'static str> {
+        if !metadata.file_type().is_file() {
+            Some("type")
+        } else if metadata.st_uid() != package_uid {
+            Some("owner")
+        } else if metadata.st_mode() & 0o7777 != 0o600 {
+            Some("mode")
+        } else if single_link && metadata.st_nlink() != 1 {
+            Some("links")
         } else {
-            (maximum + 1) as u64
-        };
-        Read::by_ref(&mut file)
-            .take(limit)
-            .read_to_end(&mut bytes)
-            .map_err(|_| BridgeError::unsafe_runtime())?;
-        if bytes.len() > maximum || bytes.len() as u64 != metadata.len() {
-            return Err(BridgeError::unsafe_runtime());
+            None
         }
-        Ok(Some((file, bytes)))
+    }
+
+    /// As `unsafe_file`, for the readers whose callers fold the error into their own code: the
+    /// kind stays `UnsafeRuntime` with no code of its own, as it always was.
+    fn unsafe_file_runtime(path: &Path, check: &'static str) -> BridgeError {
+        note_unsafe_file(path, check);
+        BridgeError::unsafe_runtime()
     }
 
     pub(super) fn load_security_policy(package_uid: u32) -> BridgeResult<SecurityPolicyArgs> {
@@ -13743,6 +13876,10 @@ mod linux_files {
     /// complete when the descriptor's link count reads zero. Eight is a bound, not an
     /// expectation, so a path that keeps being replaced cannot hold a reader forever.
     const REPLACED_DURING_READ_LOOKS: usize = 8;
+    /// How many times a document whose read did not match its `fstat` is looked at, and how long
+    /// apart, before it is called unsafe.
+    const TRANSIENT_READ_LOOKS: usize = 3;
+    const TRANSIENT_READ_PAUSE: Duration = Duration::from_millis(50);
 
     fn read_private_file_with_link_contract(
         path: &Path,
@@ -13985,6 +14122,11 @@ struct RenderedCgiError<'a> {
     code: &'a str,
     stage: Option<&'a str>,
     message: &'a str,
+    /// Only on `config_file_unsafe`: the file refused and the check it failed (`UnsafeFile`).
+    #[serde(default, borrow)]
+    file: Option<&'a str>,
+    #[serde(default, borrow)]
+    check: Option<&'a str>,
 }
 
 impl CgiResponse {
@@ -14038,14 +14180,21 @@ impl CgiResponse {
         } else {
             "Request could not be completed."
         };
-        let body = serde_json::to_vec(&json!({
+        let mut envelope = json!({
             "schema": "sdsync.dsm-error.v1",
             "ok": false,
             "status": status,
             "code": code,
             "stage": stage.map(CgiFailureStage::as_str),
             "message": message,
-        }))
+        });
+        if code == "config_file_unsafe"
+            && let Some(unsafe_file) = peek_unsafe_file()
+        {
+            envelope["file"] = json!(unsafe_file.file);
+            envelope["check"] = json!(unsafe_file.check);
+        }
+        let body = serde_json::to_vec(&envelope)
         .unwrap_or_else(|_| {
             format!(
                 r#"{{"schema":"sdsync.dsm-error.v1","ok":false,"status":{status},"code":"internal_error","stage":null,"message":"Request could not be completed."}}"#
@@ -14080,6 +14229,18 @@ impl CgiResponse {
                 .code
                 .bytes()
                 .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
+            && payload.file.is_none_or(|file| {
+                payload.code == "config_file_unsafe"
+                    && !file.is_empty()
+                    && file.len() <= MAX_UNSAFE_FILE_BYTES
+                    && file.bytes().all(|byte| {
+                        byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'/' | b'-')
+                    })
+            })
+            && payload.check.is_none_or(|check| {
+                payload.code == "config_file_unsafe" && UNSAFE_FILE_CHECKS.contains(&check)
+            })
+            && payload.file.is_some() == payload.check.is_some()
             && payload.stage.is_none_or(|stage| {
                 matches!(
                     stage,
@@ -15770,6 +15931,14 @@ fn record_in_service_failure(
         return;
     };
     let (stage, code, status) = claim.triple;
+    // Which file a `config_file_unsafe` refused, in its own record: the coalesced failure record
+    // is keyed by stage, code and status only, so it could never say which of the package's files
+    // was refused or why.
+    if code == "config_file_unsafe"
+        && let Some(unsafe_file) = peek_unsafe_file()
+    {
+        record_unsafe_file(package_uid, policy, stage, &unsafe_file);
+    }
     let recorded = match policy {
         Some(policy) => linux_files::record_cgi_failure_under_policy(
             package_uid,
@@ -15808,6 +15977,49 @@ fn record_in_service_failure(
     }
 }
 
+/// One `unsafe_file` record in api.log naming the refused file and the check; on stderr (the
+/// service's log) when api.log cannot take it.
+#[cfg(target_os = "linux")]
+fn record_unsafe_file(
+    package_uid: u32,
+    policy: Option<&SecurityPolicyArgs>,
+    stage: &str,
+    unsafe_file: &UnsafeFile,
+) {
+    let mut members = serde_json::Map::new();
+    members.insert("code".to_owned(), json!("config_file_unsafe"));
+    members.insert("stage".to_owned(), json!(stage));
+    members.insert("file".to_owned(), json!(unsafe_file.file));
+    members.insert("check".to_owned(), json!(unsafe_file.check));
+    let loaded;
+    let policy = match policy {
+        Some(policy) => Ok(policy),
+        None => {
+            loaded = linux_files::load_security_policy(package_uid);
+            loaded.as_ref().map_err(|error| *error)
+        }
+    };
+    let written = policy.and_then(|policy| {
+        current_epoch().and_then(|now| {
+            linux_files::record_bridge_warning_at(
+                Path::new(LOG_ROOT),
+                Path::new(API_LOG_PATH),
+                package_uid,
+                now,
+                policy,
+                "unsafe_file",
+                &members,
+            )
+        })
+    });
+    if written != Ok(true) {
+        eprintln!(
+            "sdsync-dsm-api: config_file_unsafe file={} check={} stage={stage}",
+            unsafe_file.file, unsafe_file.check
+        );
+    }
+}
+
 #[cfg(target_os = "linux")]
 fn serve_connection(
     stream: &mut std::os::unix::net::UnixStream,
@@ -15842,6 +16054,8 @@ fn serve_connection(
 /// where the security policy that governs whether it may be written is loaded.
 #[cfg(target_os = "linux")]
 fn handle_relay_request(encoded: &[u8], package_uid: u32) -> Result<CgiResponse, CgiFailure> {
+    // A worker serves one request after another; what the last one refused is not this one's.
+    take_unsafe_file();
     let mut loaded_policy = None;
     let outcome = handle_relay_request_under_policy(encoded, package_uid, &mut loaded_policy);
     if let Err(failure) = &outcome {
@@ -24499,6 +24713,155 @@ mod tests {
         assert_eq!(realtime["retry_backoff_seconds"], 300);
         assert_eq!(realtime["backend_reason"], "ok");
         assert_eq!(realtime["last_poll_epoch"], 0);
+    }
+
+    #[test]
+    fn an_unsafe_file_is_shown_by_its_package_path_bounded_from_the_tail() {
+        assert_eq!(
+            shown_package_path(Path::new(
+                "/var/packages/synology-drive-sync/var/state/routines/nightly.state"
+            )),
+            "var/state/routines/nightly.state"
+        );
+        assert_eq!(
+            shown_package_path(Path::new(
+                "/volume3/@apphome/synology-drive-sync/etc/profiles.d/office.toml"
+            )),
+            "apphome/etc/profiles.d/office.toml"
+        );
+        assert_eq!(
+            shown_package_path(Path::new("/var/packages/synology-drive-sync/var/a b\n../c")),
+            "var/a_b___/c"
+        );
+        let long = format!(
+            "/var/packages/synology-drive-sync/var/{}/end.state",
+            "d".repeat(400)
+        );
+        let shown = shown_package_path(Path::new(&long));
+        assert_eq!(shown.len(), MAX_UNSAFE_FILE_BYTES);
+        assert!(
+            shown.starts_with("...") && shown.ends_with("/end.state"),
+            "{shown}"
+        );
+    }
+
+    #[test]
+    fn a_config_file_unsafe_envelope_names_the_file_and_check_and_stays_trusted() {
+        take_unsafe_file();
+        note_unsafe_file(
+            Path::new("/var/packages/synology-drive-sync/var/state/controller.state"),
+            "mode",
+        );
+        // The first refusal is the one the request failed on.
+        note_unsafe_file(
+            Path::new("/var/packages/synology-drive-sync/var/other"),
+            "owner",
+        );
+        let response = CgiResponse::failure(CgiFailure::new(
+            CgiFailureStage::ServiceRequest,
+            BridgeError::unsafe_because("config_file_unsafe"),
+        ));
+        assert!(response.is_trusted_error_envelope());
+        let envelope: Value = serde_json::from_slice(&response.body).unwrap();
+        assert_eq!(envelope["code"], "config_file_unsafe");
+        assert_eq!(envelope["file"], "var/state/controller.state");
+        assert_eq!(envelope["check"], "mode");
+        // Any other code carries neither, and a file on another code is not trusted.
+        let other = CgiResponse::failure(CgiFailure::new(
+            CgiFailureStage::ServiceRequest,
+            BridgeError::unavailable_because("manager_busy"),
+        ));
+        let envelope: Value = serde_json::from_slice(&other.body).unwrap();
+        assert!(envelope.get("file").is_none());
+        let mut forged: Value = serde_json::from_slice(&other.body).unwrap();
+        forged["file"] = json!("var/x");
+        forged["check"] = json!("mode");
+        let forged = CgiResponse {
+            status: other.status,
+            body: serde_json::to_vec(&forged).unwrap(),
+        };
+        assert!(!forged.is_trusted_error_envelope());
+        take_unsafe_file();
+        assert!(peek_unsafe_file().is_none());
+    }
+
+    /// On a DSM-shaped layout (home and var are symlinks into the volume's app roots), a routine
+    /// state replaced by rename over and over while the snapshot reads it is never refused, and
+    /// a state file that really is unsafe is refused naming the file and the check.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_snapshot_names_an_unsafe_file_and_survives_a_writer_renaming_over_it() {
+        let fixture = TestShellPackageFixture::new("unsafe-file-named");
+        write_snapshot_inputs(&fixture);
+        let policy = SecurityPolicyArgs::default();
+        let state_file = fixture.routine_state_dir.join("alpha.state");
+        let state = "state=succeeded\nnext_run_epoch=1700003000\nlast_success_epoch=1700002900\n\
+                     backend=daily\nlast_poll_epoch=1700003100\n";
+        fixture.write_config(&state_file, state);
+        fixture.hand_over();
+
+        // A writer that replaces the file the way both engines do: a 0600 sibling, then rename.
+        let stop = std::sync::Arc::new(AtomicBool::new(false));
+        let writer = {
+            let stop = std::sync::Arc::clone(&stop);
+            let state_file = state_file.clone();
+            std::thread::spawn(move || {
+                let sibling = state_file.with_extension("state.tmp");
+                let mut count = 0_u64;
+                while !stop.load(AtomicOrdering::Relaxed) {
+                    let _ = fs::remove_file(&sibling);
+                    fs::write(&sibling, state).unwrap();
+                    fs::set_permissions(&sibling, fs::Permissions::from_mode(0o600)).unwrap();
+                    fs::rename(&sibling, &state_file).unwrap();
+                    count += 1;
+                }
+                count
+            })
+        };
+        for _ in 0..150 {
+            take_unsafe_file();
+            if let Err(error) = snapshot_document(&fixture.paths(), fixture.package_uid(), &policy)
+            {
+                stop.store(true, AtomicOrdering::Relaxed);
+                writer.join().unwrap();
+                panic!(
+                    "a rename-replaced state file was refused: {:?} {:?}",
+                    error.code,
+                    peek_unsafe_file()
+                );
+            }
+        }
+        stop.store(true, AtomicOrdering::Relaxed);
+        assert!(
+            writer.join().unwrap() > 0,
+            "the writer never replaced the file"
+        );
+
+        // A state file left at 0644 is refused on the first look, and named.
+        fs::set_permissions(&state_file, fs::Permissions::from_mode(0o644)).unwrap();
+        take_unsafe_file();
+        assert_eq!(
+            snapshot_document(&fixture.paths(), fixture.package_uid(), &policy)
+                .unwrap_err()
+                .code,
+            Some("config_file_unsafe")
+        );
+        let named = peek_unsafe_file().expect("the refused file is named");
+        assert_eq!(named.check, "mode");
+        assert!(
+            named.file.ends_with("routines/alpha.state"),
+            "{}",
+            named.file
+        );
+        // A second hard link is refused as links, not lumped in with the rest.
+        fs::set_permissions(&state_file, fs::Permissions::from_mode(0o600)).unwrap();
+        let link = fixture.routine_state_dir.join("alpha.state.link");
+        fs::hard_link(&state_file, &link).unwrap();
+        take_unsafe_file();
+        assert!(snapshot_document(&fixture.paths(), fixture.package_uid(), &policy).is_err());
+        assert_eq!(peek_unsafe_file().unwrap().check, "links");
+        fs::remove_file(&link).unwrap();
+        take_unsafe_file();
     }
 
     /// What observes a routine: six fields both engines append to its state file. Absent they read

@@ -1439,8 +1439,9 @@ pair_index_stem() {
 
 # State the profile's own runs left beside its configuration: the alert counter
 # (never removed before, so a profile recreated under the name inherited its
-# failure streak), the verified-pair index, its quarantined copies and its panic
-# record (by the stem above), and the daemon's lasting condition. The
+# failure streak), the verified-pair index, its quarantined copies, its panic
+# record and its record of files that keep changing (by the stem above), and
+# the daemon's lasting condition. The
 # configuration is already gone by now, so one that cannot be removed does not
 # undo the removal: it is named with its path and cause as a warning, which
 # `api` returns as the result's warning.
@@ -3009,6 +3010,22 @@ manager_best_effort() {
     return 0
 }
 
+# Refuse a package state file, naming it and the check it failed, as the
+# compiled rung's `config_file_unsafe` record does: the path under the package
+# root (bytes outside [A-Za-z0-9._/-] as _, at most 160 bytes) and one of
+# type, read. Never returns.
+api_unsafe_state_file() {
+    unsafe_state_path=$1
+    if [ -L "$unsafe_state_path" ] || [ ! -f "$unsafe_state_path" ]; then
+        unsafe_state_check=type
+    else
+        unsafe_state_check=read
+    fi
+    unsafe_state_shown=${unsafe_state_path#/var/packages/synology-drive-sync/}
+    unsafe_state_shown=$(printf '%s' "$unsafe_state_shown" | LC_ALL=C tr -c 'A-Za-z0-9._/-' '_' | tail -c 160)
+    api_error unsafe_state "unsafe package state file $unsafe_state_shown ($unsafe_state_check)" 73
+}
+
 api_load_kv() {
     kv_file=$1
     kv_key=$2
@@ -3016,7 +3033,7 @@ api_load_kv() {
     kv_value=$kv_default
     [ -e "$kv_file" ] || return 0
     if [ -L "$kv_file" ] || [ ! -f "$kv_file" ] || [ ! -r "$kv_file" ]; then
-        api_error unsafe_state "unsafe package state file" 73
+        api_unsafe_state_file "$kv_file"
     fi
     kv_count=$(grep -c "^${kv_key}=" "$kv_file" 2>/dev/null || true)
     [ "$kv_count" = 1 ] || api_error corrupt_state "package state is missing or duplicates $kv_key" 73
@@ -3032,7 +3049,7 @@ api_load_kv_optional() {
     kv_default=$3
     kv_value=$kv_default
     [ -e "$kv_file" ] || return 0
-    if [ -L "$kv_file" ] || [ ! -f "$kv_file" ] || [ ! -r "$kv_file" ]; then api_error unsafe_state "unsafe package state file" 73; fi
+    if [ -L "$kv_file" ] || [ ! -f "$kv_file" ] || [ ! -r "$kv_file" ]; then api_unsafe_state_file "$kv_file"; fi
     kv_count=$(grep -c "^${kv_key}=" "$kv_file" 2>/dev/null || true)
     case $kv_count in 0) return 0 ;; 1) ;; *) api_error corrupt_state "package state duplicates $kv_key" 73 ;; esac
     kv_value=$(sed -n "s/^${kv_key}=//p" "$kv_file")

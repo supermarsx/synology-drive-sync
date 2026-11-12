@@ -132,7 +132,7 @@ const SHIPPED_COPY = Object.freeze([
     cause: "the UI and package versions differ"
   }),
   Object.freeze({
-    code: "config_file_unsafe", kind: "UnsafeRuntime", retry: "stop",
+    code: "config_file_unsafe", kind: "UnsafeRuntime", retry: "stop", stopAfter: 3,
     title: "Package file permissions are unsafe",
     message: "A package file has unexpected ownership or permissions. Repair the package rather than changing the file yourself.",
     cause: "a package file has unexpected ownership or permissions"
@@ -150,6 +150,18 @@ const SHIPPED_COPY = Object.freeze([
     title: "NAS clock is not set",
     message: "The NAS clock is not set correctly. Correct the system time, then retry.",
     cause: "the NAS clock is not set correctly"
+  }),
+  Object.freeze({
+    code: "client_timeout", kind: "Client", retry: "backoff",
+    title: "Package is slow to answer",
+    message: "The package did not answer within 10 seconds: the NAS is busy, or a request is stuck. Retrying; your changes stay available.",
+    cause: "the package did not answer within 10 seconds"
+  }),
+  Object.freeze({
+    code: "cgi_deadline_exceeded", kind: "Unavailable", retry: "backoff",
+    title: "Package request timed out",
+    message: "The package's web handler gave up on a request at its deadline and recorded the stage in the package API log. Retrying; your changes stay available.",
+    cause: "a package request timed out"
   })
 ]);
 
@@ -418,7 +430,12 @@ test("each named failure selects its own bounded retry ladder", () => {
 
   for (const row of SHIPPED_COPY) {
     if (row.retry !== "stop") continue;
-    assert.equal(delay(row.code, 1), 0, `${row.code} scheduled another read`);
+    if (row.stopAfter) {
+      // Looked at again before the window stands down: a one-off race is not a verdict.
+      assert.equal(delay(row.code, 1), 5000, `${row.code} stood down on its first occurrence`);
+      assert.equal(delay(row.code, row.stopAfter - 1), WIDGET_BACKOFF_RAMP_MS[0], row.code);
+    }
+    assert.equal(delay(row.code, row.stopAfter || 1), 0, `${row.code} scheduled another read`);
     assert.equal(delay(row.code, 9), 0, `${row.code} scheduled another read`);
   }
 
@@ -495,7 +512,7 @@ test("scheduleSnapshot honours the ladder, Manual only, and the profile-draft bl
     assert.deepEqual(scheduled, [5000]);
 
     context.snapshotFailureCode = "config_file_unsafe";
-    context.snapshotFailureStreak = 1;
+    context.snapshotFailureStreak = 3;
     schedule();
     assert.deepEqual(scheduled, [5000], "a stood-down ladder created a timer");
     assert.equal(context.snapshotTimer, 0);
@@ -537,7 +554,7 @@ test("the stale header carries the retained document's age and the named cause",
     for (const [code, expected] of [
       ["manager_busy", /^Stale · as of less than a minute ago; the package could not refresh it: the package is busy\.$/],
       ["manager_timeout", /the package took too long to answer\.$/],
-      ["config_file_unsafe", /a package file has unexpected ownership or permissions\. Automatic refresh has stopped; select Retry once the package is repaired\.$/]
+      ["config_file_unsafe", /a package file has unexpected ownership or permissions\. Checking again \(1 of 3\)\.$/]
     ]) {
       const context = snapshotContext(component, { snapshot: validSnapshot(), snapshotReceivedAtMs: received });
       failures.push(Object.assign(new Error(code), { status: 503, code }));
@@ -879,4 +896,33 @@ test("a failed log or activity feed dates the rows it leaves on screen", async (
   const data = loadAppComponent().data();
   assert.equal(data.logsReceivedAtMs, 0);
   assert.equal(data.activityReceivedAtMs, 0);
+});
+
+// A slow read is not a lost session: the first two in a row keep the mutation
+// token and the connected state, so one 10-second timeout no longer disables
+// every edit until the next good poll; a third is treated like any outage.
+test("a slow read keeps the token and edits for two misses in a row, not three", async () => {
+  const failures = [];
+  const component = loadAppComponent({ apiGet: async () => { throw failures.shift(); } });
+  await withBrowserGlobals(async () => {
+    const context = snapshotContext(component, { snapshot: validSnapshot(), snapshotReceivedAtMs: Date.now() - 5000, csrfToken: "token", connected: true });
+    for (const [streak, kept] of [[0, true], [1, true], [2, false]]) {
+      context.snapshotFailureStreak = streak;
+      context.csrfToken = "token";
+      context.connected = true;
+      failures.push(Object.assign(new Error("no answer"), { name: "ClientRequestTimeoutError", status: 0, code: "client_timeout" }));
+      await context.refreshSnapshot(false);
+      assert.equal(context.csrfToken === "token", kept, `streak ${streak}`);
+      assert.equal(context.connected, kept, `streak ${streak}`);
+      assert.equal(context.bridgeIssue.title, "Package is slow to answer");
+    }
+    // Any other failure still clears both at once.
+    context.snapshotFailureStreak = 0;
+    context.csrfToken = "token";
+    context.connected = true;
+    failures.push(Object.assign(new Error("x"), { status: 503, code: "manager_busy" }));
+    await context.refreshSnapshot(false);
+    assert.equal(context.csrfToken, "");
+    assert.equal(context.connected, false);
+  });
 });

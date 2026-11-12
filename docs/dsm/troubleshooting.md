@@ -420,7 +420,9 @@ says so, and **Retry** re-arms it once the package is repaired.
 | `manager_exit_status` | The manager exited non-zero | Inspect `api.log`. Retried on a bounded ramp |
 | `manager_output_invalid` | Manager output was not JSON, not an object, or missing a required key | Inspect `api.log`. Retried on a bounded ramp |
 | `manager_output_schema` | The document's schema string is not the one this bundle expects | Repair or reinstall one complete release. Retried on a bounded ramp |
-| `config_file_unsafe` | A configuration or state file failed the ownership and mode contract | Repair the package rather than editing the file. **Not retried** |
+| `config_file_unsafe` | A configuration or state file failed its contract. The envelope and an `unsafe_file` record in `api.log` name the file (under the package root) and the check: `owner`, `mode` (not `0600`), `links` (a second hard link), `type` (a link or not a regular file), `size`, `length` (it changed length while read), `read`, `open` or `list` | Repair the package rather than editing the file. A read that changed length or failed is looked at again three times, 50 ms apart, before it counts; the page checks again twice and stops refreshing only after three in a row |
+| `client_timeout` | This window got no answer within 10 seconds (the NAS is busy, or a request is stuck) | Nothing; the page retries with backoff, and the first two in a row keep edits available |
+| `cgi_deadline_exceeded` | The package's CGI answered for a request at its deadline (see [A dashboard request timed out](#a-dashboard-request-timed-out-cgi_deadline_exceeded)) | Retried with backoff; the stage is in `api.log` |
 | `package_state_corrupt` | A stored package record could not be parsed; the Activity feed is where this surfaces today | Inspect Logs and Activity for the affected file. A restart does not repair it; the record clears when the file rotates or is cleared. **Not retried** |
 | `clock_unavailable` | The system clock reads before the epoch | Correct the NAS system time. **Not retried** |
 

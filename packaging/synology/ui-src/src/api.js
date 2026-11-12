@@ -39,6 +39,8 @@ const TERMINAL_API_ATTEMPT_TIMEOUTS = Object.freeze({
 });
 
 const CSRF_SCHEMA = "sdsync.dsm-csrf.v1";
+// The checks a package file can fail (UNSAFE_FILE_CHECKS in dsm_api.rs).
+export const UNSAFE_FILE_CHECKS = Object.freeze(["open", "type", "owner", "mode", "links", "size", "length", "read", "list"]);
 // A mutation token is replaced this long before the package would refuse it.
 // The token names its own lifetime (`v1.<issued>.<expires>.<nonce>.<mac>`), so
 // the deadline is that lifetime measured on this window's clock from the moment
@@ -595,6 +597,15 @@ async function responseJson(response, allowGoneResult = false, preserveSemanticS
     error.trustedRejection = effectiveStatus >= 400
       && effectiveStatus < 600
       && trustedErrorDocument;
+    // Which package file a `config_file_unsafe` refused, and the check it failed: a bounded
+    // path under the package root and one closed token, so the window can name them.
+    if (trustedErrorDocument
+      && model.code === "config_file_unsafe"
+      && typeof model.file === "string"
+      && /^[A-Za-z0-9._/-]{1,160}$/.test(model.file)
+      && UNSAFE_FILE_CHECKS.includes(model.check)) {
+      error.unsafeFile = Object.freeze({ file: model.file, check: model.check });
+    }
     throw error;
   }
   return model;
