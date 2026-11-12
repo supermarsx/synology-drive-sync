@@ -28,7 +28,7 @@ use std::time::Instant;
 use super::routines::Level;
 
 /// The Activity codes `append_activity` accepts.
-pub(crate) const ACTIVITY_CODES: [&str; 31] = [
+pub(crate) const ACTIVITY_CODES: [&str; 33] = [
     "run.started",
     "run.succeeded",
     "run.failed",
@@ -38,6 +38,8 @@ pub(crate) const ACTIVITY_CODES: [&str; 31] = [
     "routine.retry_scheduled",
     "routine.retries_exhausted",
     "routine.watch_abandoned",
+    "routine.unobserved",
+    "routine.observed",
     "doctor.succeeded",
     "doctor.failed",
     "doctor.inventory",

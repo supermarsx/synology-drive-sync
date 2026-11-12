@@ -33,6 +33,16 @@ use super::changes::{ArmSpec, ChangeEvent, ChangeSink, ChangeSource};
 use super::poll::{PollConfig, SharedCarry, new_carry, spawn_poller};
 use super::routines::{Backend, BackendReason, SourceStatus};
 
+/// What the backend detail says while the process-wide walk cap leaves a
+/// routine with nothing watching or polling it. The control thread names the
+/// observation cause `walk_cap` by this text.
+pub(crate) const WALK_CAP_NOTE: &str =
+    "nothing is watching or polling this tree until a walk is admitted";
+
+/// The notice detail that opens a floor-failure episode, and the one that ends it.
+pub(crate) const FLOOR_FAILED: &str = "poll_floor_failed";
+pub(crate) const FLOOR_RECOVERED: &str = "poll_floor_recovered";
+
 /// Timing of the change source. Tests shorten it.
 #[derive(Clone, Debug)]
 pub(crate) struct WatchSettings {
@@ -329,8 +339,7 @@ impl Worker {
                         Backend::None,
                         BackendReason::WatchSetupFailed,
                         format!(
-                            "{failure}; retrying every {} s; nothing is watching or polling \
-                             this tree until a walk is admitted",
+                            "{failure}; retrying every {} s; {WALK_CAP_NOTE}",
                             self.settings.walk_cap_retry.as_secs()
                         ),
                     )
@@ -911,7 +920,7 @@ impl Floor {
             let _ = worker.emit(ChangeEvent::Notice {
                 routine: worker.spec.routine.clone(),
                 warn: true,
-                detail: format!("poll_floor_failed cause={cause}"),
+                detail: format!("{FLOOR_FAILED} cause={cause}"),
             });
         }
         Self {
@@ -974,14 +983,23 @@ impl Floor {
                     return worker.emit(ChangeEvent::Notice {
                         routine: worker.spec.routine.clone(),
                         warn: true,
-                        detail: format!("poll_floor_failed cause={cause}"),
+                        detail: format!("{FLOOR_FAILED} cause={cause}"),
                     });
                 }
                 return true;
             }
         };
-        self.failing = false;
-        let mut alive = true;
+        // The end of a failure episode is said too, so the observation the
+        // control thread keeps for the routine can close (C2).
+        let mut alive = if std::mem::replace(&mut self.failing, false) {
+            worker.emit(ChangeEvent::Notice {
+                routine: worker.spec.routine.clone(),
+                warn: false,
+                detail: FLOOR_RECOVERED.to_owned(),
+            })
+        } else {
+            true
+        };
         if let Some(old) = &self.baseline
             && !self.overflowed
         {

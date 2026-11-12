@@ -43,9 +43,9 @@ use super::executor::{
     classify,
 };
 use super::routines::{
-    self, Action, Backend, BackendReason, Effect, Inputs, Level, Mode, ProfileFacts, RealtimeView,
-    Routine, RoutineRunState, RoutineState, RunEnd, Schedule, SkipField, SourceStatus, Verdict,
-    valid_name,
+    self, Action, Backend, BackendReason, Effect, Inputs, Level, Mode, Observe, ProfileFacts,
+    RealtimeView, Routine, RoutineRunState, RoutineState, RunEnd, Schedule, SkipField,
+    SourceStatus, Verdict, WatchingVia, valid_name,
 };
 use super::state::{
     ControllerDegraded, DEGRADED_CAUSE_MAX, ProfileOutcome, ProfileRecord, RunOutcome, RunRecord,
@@ -296,6 +296,14 @@ struct Entry {
     /// When the safety-net whole-tree run is next due (design §2.3: inotify
     /// misses some writes, e.g. mmap without close, other mount namespaces).
     full_due: Option<Instant>,
+    /// Whether the poll floor under the native watch is failing: a
+    /// `poll_floor_failed` notice opens it, `poll_floor_recovered` ends it.
+    floor_failing: bool,
+    /// The wall epoch of the last change the watcher reported, not yet carried
+    /// into the state record's `last_trigger_epoch`.
+    trigger_seen: Option<u64>,
+    /// When the routine was armed: a backend that never reports is blind.
+    armed_at: Option<Instant>,
 }
 
 /// Why a profile's automatic runs are held (daemon/lasting.rs).
@@ -317,6 +325,51 @@ impl Blocked {
 
 /// How often one held trigger is logged.
 const SUPPRESSED_LOG_EVERY: Duration = Duration::from_secs(3600);
+
+/// An armed realtime routine whose watcher has not reported a backend after
+/// this long is not being observed (arming reports within its own bounded
+/// deadline, so silence past it is a hung worker).
+const UNREPORTED_AFTER: Duration = Duration::from_secs(600);
+
+/// A change seen again refreshes the state record's `last_trigger_epoch` at
+/// most this often (seconds): a source under constant change must not rewrite
+/// the record on every turn.
+const TRIGGER_WRITE_EVERY: u64 = 60;
+
+/// The Activity text for a routine nothing fully observes.
+fn observe_message(observe: Observe, cause: &str, via: WatchingVia) -> String {
+    let what = match cause {
+        "disabled" => {
+            return "Routine is disabled: nothing is watching or scheduling it".to_owned();
+        }
+        "lasting_block" => {
+            "its automatic runs are held after a failed run; Run now or a settings change lifts it"
+        }
+        "walk_cap" => {
+            "too many tree walks are in flight, so nothing is watching or polling its source until one is admitted"
+        }
+        "poll_floor_failed" => {
+            "the backstop poll under the native watch cannot finish its walk, so a missed event is not caught"
+        }
+        "watch_not_reporting" => "its watcher started but never reported",
+        "watch_setup_failed" => "the realtime watch failed to start",
+        "watch_unavailable" => "native watching is unavailable on this system",
+        "watch_limit" => "the native watch limit was reached",
+        "watch_stopped" => "the native watch stopped",
+        "poll_unreadable" => "the poll cannot read part of the source tree",
+        "poll_unavailable" => "the poll cannot run",
+        _ => "its source is not being watched",
+    };
+    match observe {
+        Observe::Degraded => format!(
+            "Routine is only partly observed (watching via {}): {what}; Logs name the cause",
+            via.as_str()
+        ),
+        _ => format!(
+            "Routine is not observed: {what}; changes are not noticed until it clears; Logs name the cause"
+        ),
+    }
+}
 
 /// `config_unreadable kept=` for a configuration document: what was read
 /// last stays in force.
@@ -1229,6 +1282,9 @@ impl Control {
                 backend_reports: BackendReports::default(),
                 armed: None,
                 full_due: None,
+                floor_failing: false,
+                trigger_seen: None,
+                armed_at: None,
             });
             entry.state = state;
             let realtime =
@@ -1287,6 +1343,8 @@ impl Control {
                             changes.arm(wanted.clone());
                         }
                         entry.armed = Some(wanted);
+                        entry.armed_at = Some(Instant::now());
+                        entry.floor_failing = false;
                         entry.backend_detail = None;
                         self.end_backend_episode(&name, &mut entry);
                     }
@@ -1295,6 +1353,8 @@ impl Control {
                             changes.disarm(&name);
                         }
                         entry.armed = None;
+                        entry.armed_at = None;
+                        entry.floor_failing = false;
                         entry.backend_detail = None;
                         self.end_backend_episode(&name, &mut entry);
                         entry.dirty = DirtySet::default();
@@ -1351,6 +1411,7 @@ impl Control {
         self.schedule_aggregate(now);
         self.start_next(now);
         self.evaluate_routines(now);
+        self.observe_routines(now);
         if self
             .last_controller_write
             .is_none_or(|at| at.elapsed() >= Duration::from_secs(30))
@@ -1929,6 +1990,212 @@ impl Control {
                 Verdict::Idle | Verdict::ClockUnavailable => {}
             }
         }
+    }
+
+    /// What looks at `name`'s source, and whether anything fully does. `None`
+    /// when the routine is not evaluated at all (`skip` names that).
+    ///
+    /// The cause is one of the `OBSERVE_CAUSES`. A realtime routine whose
+    /// native watch is down but whose poll runs is `Degraded`, never `Blind`;
+    /// `Blind` is nothing at all looking, which is what 54 silent hours were.
+    fn observation(&self, name: &str, entry: &Entry) -> Option<(WatchingVia, Observe, String)> {
+        let routine = match &entry.routine {
+            Ok(None) => {
+                return Some((WatchingVia::None, Observe::Disabled, "disabled".into()));
+            }
+            Ok(Some(routine)) => routine,
+            Err(_) => return None,
+        };
+        let (via, mut observe, mut cause) = match routine.mode {
+            Mode::Interval { .. } | Mode::Daily { .. } => {
+                (WatchingVia::Schedule, Observe::Ok, "none".to_owned())
+            }
+            // No change source in this process (a build without one): nothing
+            // to judge; the routine's own state names it.
+            Mode::Realtime { .. } if self.changes.is_none() => {
+                (WatchingVia::None, Observe::Ok, "none".to_owned())
+            }
+            Mode::Realtime { .. } => match entry.backend {
+                None => {
+                    let waited = entry.armed_at.map(|at| at.elapsed());
+                    if waited.is_some_and(|waited| waited >= UNREPORTED_AFTER) {
+                        (
+                            WatchingVia::None,
+                            Observe::Blind,
+                            "watch_not_reporting".into(),
+                        )
+                    } else {
+                        // Just armed: the first report is still on its way.
+                        (WatchingVia::None, Observe::Ok, "none".to_owned())
+                    }
+                }
+                Some((backend, reason)) => {
+                    let reason_word = reason.as_str();
+                    match (backend, reason) {
+                        (_, BackendReason::SourceMissing | BackendReason::SourceSymlink) => {
+                            (WatchingVia::None, Observe::Blind, reason_word.into())
+                        }
+                        (Backend::None, _) => {
+                            let capped = entry
+                                .backend_detail
+                                .as_deref()
+                                .is_some_and(|d| d.contains(super::watch_source::WALK_CAP_NOTE));
+                            let cause = if capped { "walk_cap" } else { reason_word };
+                            (WatchingVia::None, Observe::Blind, cause.into())
+                        }
+                        (
+                            Backend::Polling,
+                            BackendReason::PollUnreadable | BackendReason::PollUnavailable,
+                        ) => (WatchingVia::None, Observe::Blind, reason_word.into()),
+                        (Backend::Polling, BackendReason::Ok) => {
+                            (WatchingVia::Poll, Observe::Ok, "none".to_owned())
+                        }
+                        (Backend::Polling, _) => {
+                            (WatchingVia::Poll, Observe::Degraded, reason_word.into())
+                        }
+                        (Backend::Inotify, _) if entry.floor_failing => (
+                            WatchingVia::Native,
+                            Observe::Degraded,
+                            "poll_floor_failed".into(),
+                        ),
+                        (Backend::Inotify, BackendReason::Ok) => {
+                            (WatchingVia::Native, Observe::Ok, "none".to_owned())
+                        }
+                        (Backend::Inotify, _) => {
+                            (WatchingVia::Native, Observe::Degraded, reason_word.into())
+                        }
+                        (Backend::Interval | Backend::Daily, _) => {
+                            (WatchingVia::Schedule, Observe::Ok, "none".to_owned())
+                        }
+                    }
+                }
+            },
+        };
+        if self.blocked.contains_key(name) {
+            observe = Observe::Blind;
+            cause = "lasting_block".into();
+        }
+        Some((via, observe, cause))
+    }
+
+    /// C2, C3: keep each routine's observation in its state record and say it
+    /// in Activity, once per episode.
+    ///
+    /// An episode is a (state, cause) pair kept in the record itself, so it
+    /// survives a restart: a routine still blind for the same cause is not
+    /// announced again, and the record's `observe_since_epoch` says since when.
+    /// A routine that was never evaluated before (a record from an older build)
+    /// reads as observed, so its first blind reading is announced.
+    fn observe_routines(&mut self, now: u64) {
+        let names: Vec<String> = self.routines.keys().cloned().collect();
+        for name in names {
+            let Some(entry) = self.routines.get(&name) else {
+                continue;
+            };
+            let Ok(state) = &entry.state else {
+                continue;
+            };
+            let Some((via, observe, cause)) = self.observation(&name, entry) else {
+                continue;
+            };
+            let mut next = state.clone();
+            let announce = (next.observe, next.observe_cause.as_str()) != (observe, cause.as_str());
+            next.watching_via = via;
+            if announce {
+                next.observe = observe;
+                next.observe_cause = cause.clone();
+                next.observe_since = if observe == Observe::Ok { 0 } else { now };
+            }
+            let mut trigger_moved = false;
+            if let Some(seen) = entry.trigger_seen
+                && seen > next.last_trigger
+                && (next.last_trigger == 0 || seen >= next.last_trigger + TRIGGER_WRITE_EVERY)
+            {
+                next.last_trigger = seen;
+                trigger_moved = true;
+            }
+            let changed = next != *state;
+            let previous = (state.observe, state.observe_cause.clone());
+            if trigger_moved && let Some(entry) = self.routines.get_mut(&name) {
+                entry.trigger_seen = None;
+            }
+            if !changed {
+                continue;
+            }
+            if let Some(entry) = self.routines.get_mut(&name) {
+                entry.state = Ok(next);
+            }
+            self.save_routine(&name);
+            if announce {
+                self.announce_observation(&name, previous, observe, &cause, via);
+            }
+        }
+    }
+
+    fn announce_observation(
+        &mut self,
+        name: &str,
+        previous: (Observe, String),
+        observe: Observe,
+        cause: &str,
+        via: WatchingVia,
+    ) {
+        let profile = if valid_name(name) { name } else { "none" };
+        if observe == Observe::Ok {
+            self.log(
+                Level::Info,
+                "scheduler",
+                "routine_observed",
+                format!(
+                    "profile={name} watching_via={} previous={} cause={}",
+                    via.as_str(),
+                    previous.0.as_str(),
+                    previous.1
+                ),
+            );
+            let message = if previous.0 == Observe::Disabled {
+                "Routine is enabled again".to_owned()
+            } else {
+                format!("Routine is observed again (watching via {})", via.as_str())
+            };
+            self.activity(
+                "routine.observed",
+                profile,
+                "changed",
+                "routines",
+                Level::Info,
+                message,
+            );
+            return;
+        }
+        let level = if observe == Observe::Disabled {
+            Level::Info
+        } else {
+            Level::Warn
+        };
+        self.log(
+            level,
+            "scheduler",
+            "routine_unobserved",
+            format!(
+                "profile={name} state={} cause={cause} watching_via={}",
+                observe.as_str(),
+                via.as_str()
+            ),
+        );
+        // The source's own absence already has its Activity row
+        // (routine.deferred, "Routine source is unavailable").
+        if matches!(cause, "source_missing" | "source_symlink") {
+            return;
+        }
+        self.activity(
+            "routine.unobserved",
+            profile,
+            "unavailable",
+            "routines",
+            level,
+            observe_message(observe, cause, via),
+        );
     }
 
     fn skip(&mut self, name: &str, field: SkipField) {
@@ -2890,6 +3157,7 @@ impl Control {
 
     fn change(&mut self, event: ChangeEvent) {
         let now = Instant::now();
+        let wall = (self.wall)().unwrap_or(0);
         // N-D5: the backend's cause is carried into `ctl status`
         // (`backend_detail`), whatever the log below makes of the report. Cut
         // at 240 bytes with its tail kept: `next_walk_deadline_seconds` is
@@ -2906,12 +3174,14 @@ impl Control {
             ChangeEvent::Changed { routine, dir } => {
                 if let Some(entry) = self.routines.get_mut(&routine) {
                     entry.dirty.mark(&dir, now);
+                    entry.trigger_seen = Some(wall);
                 }
             }
             ChangeEvent::Overflow { routine } => {
                 for (name, entry) in &mut self.routines {
                     if routine.as_ref().is_none_or(|r| r == name) && entry.armed.is_some() {
                         entry.dirty.mark_whole_tree(now);
+                        entry.trigger_seen = Some(wall);
                     }
                 }
                 self.log(
@@ -2979,6 +3249,14 @@ impl Control {
                 warn,
                 detail,
             } => {
+                // The floor's episode is what the observation keeps (C2).
+                if let Some(entry) = self.routines.get_mut(&routine) {
+                    if detail.starts_with(super::watch_source::FLOOR_FAILED) {
+                        entry.floor_failing = true;
+                    } else if detail.starts_with(super::watch_source::FLOOR_RECOVERED) {
+                        entry.floor_failing = false;
+                    }
+                }
                 self.log(
                     if warn { Level::Warn } else { Level::Info },
                     "scheduler",
@@ -3292,6 +3570,12 @@ impl Control {
                     "backend_reason": state.map(|s| s.backend_reason.as_str()),
                     "backend_detail": e.backend_detail,
                     "next_run_epoch": state.map(|s| s.next_run),
+                    "watching_via": state.map(|s| s.watching_via.as_str()),
+                    "observe": state.map(|s| s.observe.as_str()),
+                    "observe_cause": state.map(|s| s.observe_cause.as_str()),
+                    "observe_since_epoch": state.map(|s| s.observe_since),
+                    "last_trigger_epoch": state.map(|s| s.last_trigger),
+                    "last_run_epoch": state.map(|s| s.last_run),
                     "pending_change": !e.dirty.is_empty(),
                     "mode": e.routine.as_ref().ok().and_then(|r| r.as_ref()).map(|r| r.mode.as_str()),
                 })

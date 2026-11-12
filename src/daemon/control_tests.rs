@@ -2440,3 +2440,198 @@ fn status_names_an_unreadable_profile_directory() {
         "{status:#}"
     );
 }
+
+// ------------------------------------------------------------ observation (C2, C3)
+
+/// The Activity rows of one code for one profile, as `(state, level, message)`.
+fn observation_rows(h: &Harness, code: &str, profile: &str) -> Vec<(String, Level, String)> {
+    h.sink
+        .rows
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|r| r.code == code && r.profile == profile)
+        .map(|r| (r.state.to_owned(), r.level, r.message.clone()))
+        .collect()
+}
+
+fn report_backend(h: &Harness, backend: Backend, reason: BackendReason, detail: &str) {
+    h.tx.send(Msg::Change(ChangeEvent::Backend {
+        routine: "docs".into(),
+        backend,
+        reason,
+        detail: detail.into(),
+    }))
+    .unwrap();
+}
+
+fn notice(h: &Harness, detail: &str) {
+    h.tx.send(Msg::Change(ChangeEvent::Notice {
+        routine: "docs".into(),
+        warn: true,
+        detail: detail.into(),
+    }))
+    .unwrap();
+}
+
+/// The walk cap leaves nothing watching or polling the tree; before this it was
+/// a controller.log line only, so the Activity page read as healthy. One row per
+/// episode, however many turns and repeated reports, and one when it clears.
+#[test]
+fn a_blind_routine_writes_one_activity_row_per_episode() {
+    let h = realtime_harness("observe-walk-cap");
+    h.wait_for("arm", PATIENT, |h| armed_generation(h, "docs").is_some());
+    let capped = format!(
+        "walk cap reached; retrying every 30 s; {}",
+        super::super::watch_source::WALK_CAP_NOTE
+    );
+    report_backend(&h, Backend::None, BackendReason::WatchSetupFailed, &capped);
+    h.wait_for("the row", PATIENT, |h| {
+        observation_rows(h, "routine.unobserved", "docs").len() == 1
+    });
+    // More reports and turns of the same episode say nothing more.
+    report_backend(&h, Backend::None, BackendReason::WatchSetupFailed, &capped);
+    let _ = h.ask(Request::Wake);
+    let _ = h.ask(Request::Wake);
+    thread::sleep(Duration::from_millis(400));
+    let rows = observation_rows(&h, "routine.unobserved", "docs");
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0].0, "unavailable");
+    assert_eq!(rows[0].1, Level::Warn);
+    assert!(rows[0].2.contains("too many tree walks"), "{rows:?}");
+    let state = h.state("routines/docs.state");
+    assert!(
+        state.contains("observe_state=blind\n")
+            && state.contains("observe_cause=walk_cap\n")
+            && state.contains("watching_via=none\n"),
+        "{state}"
+    );
+    let routine = h.ask(Request::Status)["routines"]
+        .as_array()
+        .and_then(|list| list.iter().find(|r| r["profile"] == "docs").cloned())
+        .unwrap();
+    assert_eq!(routine["observe"], "blind", "{routine}");
+    assert_eq!(routine["observe_cause"], "walk_cap", "{routine}");
+    // The episode ends when a watcher reports in.
+    report_backend(&h, Backend::Inotify, BackendReason::Ok, "armed");
+    h.wait_for("the recovery row", PATIENT, |h| {
+        observation_rows(h, "routine.observed", "docs").len() == 1
+    });
+    let state = h.state("routines/docs.state");
+    assert!(
+        state.contains("observe_state=ok\n")
+            && state.contains("observe_cause=none\n")
+            && state.contains("observe_since_epoch=0\n")
+            && state.contains("watching_via=native\n"),
+        "{state}"
+    );
+    assert_eq!(observation_rows(&h, "routine.unobserved", "docs").len(), 1);
+}
+
+/// A poll floor that cannot finish its walk is named once, degraded not blind
+/// (the native watch still looks), and its recovery is said too.
+#[test]
+fn a_failing_poll_floor_is_one_degraded_episode() {
+    let h = realtime_harness("observe-floor");
+    h.wait_for("arm", PATIENT, |h| armed_generation(h, "docs").is_some());
+    report_backend(&h, Backend::Inotify, BackendReason::Ok, "armed");
+    notice(&h, "poll_floor_failed cause=walk_deadline_exceeded");
+    h.wait_for("the row", PATIENT, |h| {
+        observation_rows(h, "routine.unobserved", "docs").len() == 1
+    });
+    notice(&h, "poll_floor_failed cause=walk_deadline_exceeded");
+    let _ = h.ask(Request::Wake);
+    thread::sleep(Duration::from_millis(300));
+    let rows = observation_rows(&h, "routine.unobserved", "docs");
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert!(rows[0].2.contains("backstop poll"), "{rows:?}");
+    let state = h.state("routines/docs.state");
+    assert!(
+        state.contains("observe_state=degraded\n")
+            && state.contains("observe_cause=poll_floor_failed\n")
+            && state.contains("watching_via=native\n"),
+        "{state}"
+    );
+    notice(&h, "poll_floor_recovered");
+    h.wait_for("the recovery", PATIENT, |h| {
+        observation_rows(h, "routine.observed", "docs").len() == 1
+    });
+}
+
+/// A routine held by a lasting block, and one the user disabled, each write one
+/// row, however many turns pass.
+#[test]
+fn a_lasting_block_and_a_disabled_routine_each_write_one_row() {
+    let h = Harness::new("observe-held", |home, var| {
+        due_alpha(home, var);
+        plant_block(var);
+        profile(home, "beta");
+        routine(
+            home,
+            "beta",
+            "enabled=false\nmode=interval\ninterval_seconds=60\n",
+        );
+    });
+    h.wait_for("both rows", PATIENT, |h| {
+        observation_rows(h, "routine.unobserved", "alpha").len() == 1
+            && observation_rows(h, "routine.unobserved", "beta").len() == 1
+    });
+    h.advance(1);
+    h.advance(1);
+    thread::sleep(Duration::from_millis(300));
+    let alpha = observation_rows(&h, "routine.unobserved", "alpha");
+    let beta = observation_rows(&h, "routine.unobserved", "beta");
+    assert_eq!((alpha.len(), beta.len()), (1, 1), "{alpha:?} {beta:?}");
+    assert_eq!(alpha[0].1, Level::Warn);
+    assert!(alpha[0].2.contains("held"), "{alpha:?}");
+    assert_eq!(beta[0].1, Level::Info);
+    assert!(beta[0].2.contains("disabled"), "{beta:?}");
+    let state = h.state("routines/alpha.state");
+    assert!(
+        state.contains("observe_state=blind\n") && state.contains("observe_cause=lasting_block\n"),
+        "{state}"
+    );
+    let state = h.state("routines/beta.state");
+    assert!(
+        state.contains("observe_state=disabled\n") && state.contains("observe_cause=disabled\n"),
+        "{state}"
+    );
+}
+
+/// A record that already holds the episode is not announced again after a restart.
+#[test]
+fn an_episode_on_disk_is_not_announced_again_after_a_restart() {
+    let h = Harness::new("observe-restart", |home, var| {
+        profile(home, "beta");
+        routine(
+            home,
+            "beta",
+            "enabled=false\nmode=interval\ninterval_seconds=60\n",
+        );
+        fs::write(
+            var.join("state/routines/beta.state"),
+            "state=never\nobserve_state=disabled\nobserve_cause=disabled\nobserve_since_epoch=5\n",
+        )
+        .unwrap();
+    });
+    h.advance(1);
+    thread::sleep(Duration::from_millis(400));
+    assert!(observation_rows(&h, "routine.unobserved", "beta").is_empty());
+    let state = h.state("routines/beta.state");
+    assert!(state.contains("observe_since_epoch=5\n"), "{state}");
+}
+
+/// C3: the record says when a change was last seen and when a run last finished.
+#[test]
+fn the_state_record_carries_the_last_trigger_and_the_last_run() {
+    let h = realtime_harness("observe-liveness");
+    h.wait_for("arm", PATIENT, |h| armed_generation(h, "docs").is_some());
+    report_backend(&h, Backend::Inotify, BackendReason::Ok, "armed");
+    change(&h, "Projects");
+    h.wait_for("the run", PATIENT, |h| h.launched() == 1);
+    h.wait_for("idle", PATIENT, Harness::idle);
+    let state = h.state("routines/docs.state");
+    assert!(!state.contains("last_trigger_epoch=0\n"), "{state}");
+    assert!(!state.contains("last_run_epoch=0\n"), "{state}");
+    assert!(state.contains("watching_via=native\n"), "{state}");
+}
