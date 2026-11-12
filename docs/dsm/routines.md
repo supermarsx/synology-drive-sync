@@ -224,6 +224,17 @@ failing poll leaves it holding whatever it last reported rather than updating to
 Overview and Routines surface both the backend and, when it is not `ok`, the reason explicitly. Do
 not infer native realtime support from the requested `mode=realtime` alone.
 
+Each routine also reports what observes it: `watching_via` (`native`, `poll`, `schedule`, `none`),
+`observe_state` (`ok`, `degraded`, `blind`, `disabled`) with `observe_cause` and
+`observe_since_epoch`, and `last_trigger_epoch` and `last_run_epoch` (when a change or a due cadence
+was last seen, and when a run last finished). A state file written before these fields reads as `ok`,
+watching via `none`, with zero epochs; an unknown `observe_state` or `watching_via` fails the snapshot
+closed like an unknown `backend_reason`. The realtime editor shows the result as one line, for
+example `idle: watching via native events, last change seen …, last run …` or `blind since …: the poll
+walk of the source did not finish within its budget and was killed; changes are not noticed until it
+clears`. A blind or partly observed routine of any mode is an amber item on the Overview and is marked
+on its Routines row, and a blind realtime routine counts as not observing changes.
+
 Under the daemon engine, `sdsync-dsm-api --ctl status` carries the cause behind the reason: each entry of
 `routines` has `backend_detail`, the detail of the routine's latest backend report (at most 240 bytes,
 with the end kept and the middle cut: `next_walk_deadline_seconds=N` survives; `null` when there is

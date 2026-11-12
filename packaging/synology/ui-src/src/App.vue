@@ -298,7 +298,7 @@
               <article v-if="!routineEditorOpen" key="routine-catalog" class="sdsync-panel sdsync-routine-catalog">
                 <div class="sdsync-panel-heading"><div><p class="sdsync-eyebrow">Configured routines</p><h3>Per-profile automation</h3></div><span class="sdsync-mini-badge">{{ routines.length }} total</span></div>
                 <p v-if="!routines.length" class="sdsync-empty">{{ routinesEmptyText }}</p>
-                <button v-for="routine in routines" :key="routine.profile" type="button" :class="['sdsync-routine-row', { 'is-selected': selectedRoutine && selectedRoutine.profile === routine.profile }]" :title="'Edit routine for ' + routine.profile" :disabled="operationBusy" @click="openRoutine(routine.profile)"><span><strong><action-icon name="edit" />&nbsp;<bdi>{{ shownName(routine.profile) }}</bdi></strong><small>{{ routine.mode || 'interval' }} · {{ routine.backend || 'fallback unreported' }} · {{ routine.state || (routine.enabled ? 'enabled' : 'disabled') }}{{ routine.backend_reason && routine.backend_reason !== 'ok' ? ' · ' + routine.backend_reason : '' }}</small></span><time>{{ routineNextRunLabel(routine) }}</time></button>
+                <button v-for="routine in routines" :key="routine.profile" type="button" :class="['sdsync-routine-row', { 'is-selected': selectedRoutine && selectedRoutine.profile === routine.profile }]" :title="'Edit routine for ' + routine.profile" :disabled="operationBusy" @click="openRoutine(routine.profile)"><span><strong><action-icon name="edit" />&nbsp;<bdi>{{ shownName(routine.profile) }}</bdi></strong><small>{{ routine.mode || 'interval' }} · {{ routine.backend || 'fallback unreported' }} · {{ routine.state || (routine.enabled ? 'enabled' : 'disabled') }}{{ routine.backend_reason && routine.backend_reason !== 'ok' ? ' · ' + routine.backend_reason : '' }}{{ routine.observe_state === 'blind' ? ' · blind' : (routine.observe_state === 'degraded' ? ' · partly observed' : '') }}</small></span><time>{{ routineNextRunLabel(routine) }}</time></button>
               </article>
               <v-form v-else key="routine-editor" v-model="routineForm" class="sdsync-panel sdsync-editor sdsync-horizontal-form sdsync-routine-editor" direction="horizontal" @submit="saveRoutine">
                     <div class="sdsync-panel-heading"><div><p class="sdsync-eyebrow">Routine editor</p><h3>{{ selectedRoutine ? 'Edit ' + selectedRoutine.profile : 'New profile routine' }}</h3></div><v-button type="border" display="icon-text" tooltip="Close the routine editor and discard unsaved values" @click="closeRoutine"><template #icon><action-icon name="close" /></template>Close</v-button></div>
@@ -316,6 +316,7 @@
                       <div v-if="routineForm.mode === 'realtime' && selectedRoutine" class="sdsync-form-item span-2">
                         <p class="sdsync-field-note">Realtime status: {{ selectedRoutine.backend || 'none' }} · {{ selectedRoutine.state || (selectedRoutine.enabled ? 'enabled' : 'disabled') }}{{ selectedRoutine.backend_reason && selectedRoutine.backend_reason !== 'ok' ? ' · ' + selectedRoutine.backend_reason : '' }} · last poll {{ formatDate(selectedRoutine.last_poll_epoch) }}</p>
                         <p v-if="selectedRoutine.backend_reason && selectedRoutine.backend_reason !== 'ok'" class="sdsync-field-note">{{ realtimeReasonGuidance(selectedRoutine.backend_reason) }}</p>
+                        <p class="sdsync-field-note">Observation: {{ routineObservation(selectedRoutine) }}</p>
                       </div>
                       <v-form-item class="sdsync-form-item sdsync-inline-form-item" label="Retry attempts" label-flex="0 0 150px" control-flex="1 1 auto"><template #label-after><control-help class="sdsync-form-label-help" help-key="routine-retries" /></template><v-input class="sdsync-input-control" v-model="routineForm.retry_count" number-only aria-describedby="sdsync-help-routine-retries" :disabled="!canChangeRoutines" /></v-form-item>
                       <v-form-item class="sdsync-form-item sdsync-inline-form-item" label="Retry backoff (seconds)" label-flex="0 0 150px" control-flex="1 1 auto"><template #label-after><control-help class="sdsync-form-label-help" help-key="routine-backoff" /></template><v-input class="sdsync-input-control" v-model="routineForm.retry_backoff_seconds" number-only min="10" max="300" aria-describedby="sdsync-help-routine-backoff" :disabled="!canChangeRoutines" /></v-form-item>
@@ -2009,6 +2010,49 @@ const REALTIME_REASON_GUIDANCE = Object.freeze({
   poll_unreadable: "Part of the source could not be read during the last poll. Fix permissions on the unreadable subtree; the readable part is still observed.",
   poll_unavailable: "The last poll of the source failed outright. Confirm the source path is reachable and readable."
 });
+// What observes a routine, from the six fields both engines write to its
+// state (`watching_via`, `observe_state`, `observe_cause`,
+// `observe_since_epoch`, `last_trigger_epoch`, `last_run_epoch`; a package that
+// predates them reads as ok and watching via nothing). This is what tells
+// "no run for two days" apart: idle and watching, or blind since a time.
+const ROUTINE_OBSERVATION_COPY = Object.freeze({
+  via: Object.freeze({ native: "native events", poll: "polling", schedule: "the schedule", none: "nothing" }),
+  causes: Object.freeze({
+    poll_walk_timeout: "the poll walk of the source did not finish within its budget and was killed",
+    poll_floor_failed: "the backstop poll under the native watch cannot finish",
+    walk_cap: "too many tree walks are in flight",
+    lasting_block: "automatic runs are held after a failed run; Run now or a settings change lifts it",
+    watch_not_reporting: "the watcher started and never reported",
+    backend_none: "its source is not being watched",
+    controller_blocked: "a long run or dashboard job holds the shell controller, so scheduling is blocked",
+    disabled: "the routine is disabled"
+  }),
+  unknownCause: "its source is not being watched",
+  never: "none yet",
+  ok: (via, trigger, run) => `idle: watching via ${via}, last change seen ${trigger}, last run ${run}`,
+  degraded: (since, cause, via) => `partly observed since ${since}: ${cause} (watching via ${via})`,
+  blind: (since, cause) => `blind since ${since}: ${cause}; changes are not noticed until it clears`,
+  disabled: "disabled",
+  degradedTitle: (profile, cause) => `Routine ${profile} is only partly observed (${cause})`,
+  blindTitle: (profile, cause) => `Routine ${profile} is not observing changes (${cause})`
+});
+
+function routineObservationCause(routine) {
+  const cause = String((routine && routine.observe_cause) || "none");
+  return ROUTINE_OBSERVATION_COPY.causes[cause]
+    || REALTIME_REASON_GUIDANCE[cause]
+    || ROUTINE_OBSERVATION_COPY.unknownCause;
+}
+
+function routineObservationText(routine) {
+  const state = String((routine && routine.observe_state) || "ok");
+  const via = ROUTINE_OBSERVATION_COPY.via[String((routine && routine.watching_via) || "none")] || ROUTINE_OBSERVATION_COPY.via.none;
+  const when = (epoch) => (Number(epoch) > 0 ? formatDate(Number(epoch)) : ROUTINE_OBSERVATION_COPY.never);
+  if (state === "disabled") return ROUTINE_OBSERVATION_COPY.disabled;
+  if (state === "blind") return ROUTINE_OBSERVATION_COPY.blind(when(routine.observe_since_epoch), routineObservationCause(routine));
+  if (state === "degraded") return ROUTINE_OBSERVATION_COPY.degraded(when(routine.observe_since_epoch), routineObservationCause(routine), via);
+  return ROUTINE_OBSERVATION_COPY.ok(via, when(routine && routine.last_trigger_epoch), when(routine && routine.last_run_epoch));
+}
 
 const SECURITY_BOOLEAN_FIELDS = Object.freeze([
   "require_https", "allow_interface_changes", "allow_profile_changes", "allow_secret_changes",
@@ -4361,7 +4405,8 @@ export default {
     realtimeRoutines() { return this.enabledRoutines.filter((routine) => routine.mode === "realtime"); },
     realtimeDetail() {
       if (!this.realtimeRoutines.length) return "No enabled realtime routine";
-      const notObserving = this.realtimeRoutines.filter((routine) => REALTIME_NOT_OBSERVING_REASONS.includes(String(routine.backend_reason || "ok"))).length;
+      const notObserving = this.realtimeRoutines.filter((routine) => REALTIME_NOT_OBSERVING_REASONS.includes(String(routine.backend_reason || "ok"))
+        || routine.observe_state === "blind").length;
       if (notObserving) return `${notObserving} not observing changes`;
       const fallbacks = this.realtimeRoutines.filter((routine) => String(routine.backend || "").includes("poll")).length;
       if (fallbacks) return `${fallbacks} using polling fallback`;
@@ -4810,7 +4855,7 @@ export default {
     // named by its reason and carrying the same guidance as the routine editor.
     realtimeAttentionItems() {
       const routines = Array.isArray(this.routines) ? this.routines : [];
-      return routines
+      const demoted = routines
         .filter((routine) => routine && routine.enabled === true && routine.mode === "realtime")
         .filter((routine) => REALTIME_WATCHER_DEMOTED_REASONS.includes(String(routine.backend_reason || "ok")))
         .map((routine) => ({
@@ -4819,6 +4864,22 @@ export default {
           title: `Realtime routine ${routine.profile} is not watched natively (${routine.backend_reason})`,
           detail: REALTIME_REASON_GUIDANCE[routine.backend_reason]
         }));
+      // A routine that is blind, or only partly observed, whatever its mode --
+      // unless the item above already names the same cause for it.
+      const observed = routines
+        .filter((routine) => routine && routine.enabled === true
+          && (routine.observe_state === "blind" || routine.observe_state === "degraded"))
+        .filter((routine) => !(demoted.some((item) => item.id === `realtime-${routine.profile}`)
+          && routine.observe_cause === routine.backend_reason))
+        .map((routine) => ({
+          id: `observe-${routine.profile}`,
+          level: "warn",
+          title: routine.observe_state === "blind"
+            ? ROUTINE_OBSERVATION_COPY.blindTitle(routine.profile, routine.observe_cause)
+            : ROUTINE_OBSERVATION_COPY.degradedTitle(routine.profile, routine.observe_cause),
+          detail: routineObservationText(routine)
+        }));
+      return demoted.concat(observed);
     },
     // One line visible on every page. The Overview's attention list exists only on
     // the Overview and Activity, and a failure toast is gone before anyone looks.
@@ -7351,6 +7412,7 @@ export default {
     // nothing else, so this has to be true for every routine that reaches it
     // rather than naming a specific log line or errno string.
     realtimeReasonGuidance(reason) { return REALTIME_REASON_GUIDANCE[reason] || ""; },
+    routineObservation(routine) { return routineObservationText(routine); },
     routinePayload() {
       const payload = { profile: this.routineForm.profile, enabled: this.routineForm.enabled === true, action: this.routineForm.action, mode: this.routineForm.mode, retry_count: this.integer(this.routineForm.retry_count, 5), retry_backoff_seconds: this.integer(this.routineForm.retry_backoff_seconds, 60), retry_exponential: this.routineForm.retry_exponential !== false, allow_delete: this.routineForm.allow_delete === true, max_total_delete: this.integer(this.routineForm.max_total_delete, 100), depends_on: this.routineForm.depends_on.map(String) };
       if (payload.mode === "interval") payload.interval_seconds = this.integer(this.routineForm.interval_seconds, 3600);

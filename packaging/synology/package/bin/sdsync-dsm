@@ -4338,6 +4338,46 @@ api_routine_json() {
         *) api_error corrupt_state "invalid routine backend reason" 73 ;; \
     esac
     case $routine_next:$routine_last_success:$routine_last_poll in *[!0-9:]*) api_error corrupt_state "invalid routine epoch" 73 ;; esac
+    # What observes the routine (both engines append these after
+    # escalated_epoch), optional on read with the same defaults and the same
+    # validation as the compiled rung. One awk pass for all six, not two forks
+    # per key: this runs once per routine on every snapshot.
+    routine_last_trigger=0 routine_last_run=0 routine_watching_via=none
+    routine_observe_state=ok routine_observe_cause=none routine_observe_since=0
+    if [ -e "$routine_state_file" ]; then
+        routine_observation=$(LC_ALL=C awk '
+            BEGIN { split("last_trigger_epoch last_run_epoch watching_via observe_state observe_cause observe_since_epoch", keys, " ") }
+            {
+                for (i = 1; i <= 6; i++) {
+                    prefix = keys[i] "="
+                    if (substr($0, 1, length(prefix)) == prefix) { seen[i]++; value[i] = substr($0, length(prefix) + 1) }
+                }
+            }
+            END {
+                for (i = 1; i <= 6; i++) if (seen[i] > 1) exit 3
+                for (i = 1; i <= 6; i++) if (seen[i]) printf "%s=%s\n", keys[i], value[i]
+            }
+        ' "$routine_state_file") || api_error corrupt_state "package state duplicates a routine observation field" 73
+        while IFS= read -r routine_observation_line; do
+            case $routine_observation_line in
+                last_trigger_epoch=*) routine_last_trigger=${routine_observation_line#*=} ;;
+                last_run_epoch=*) routine_last_run=${routine_observation_line#*=} ;;
+                watching_via=*) routine_watching_via=${routine_observation_line#*=} ;;
+                observe_state=*) routine_observe_state=${routine_observation_line#*=} ;;
+                observe_cause=*) routine_observe_cause=${routine_observation_line#*=} ;;
+                observe_since_epoch=*) routine_observe_since=${routine_observation_line#*=} ;;
+            esac
+        done <<ROUTINE_OBSERVATION
+$routine_observation
+ROUTINE_OBSERVATION
+    fi
+    case $routine_watching_via in native|poll|schedule|none) ;; *) api_error corrupt_state "invalid routine watching_via" 73 ;; esac
+    case $routine_observe_state in ok|degraded|blind|disabled) ;; *) api_error corrupt_state "invalid routine observe_state" 73 ;; esac
+    case $routine_observe_cause in ''|*[!a-z0-9_]*) api_error corrupt_state "invalid routine observe_cause" 73 ;; esac
+    [ "${#routine_observe_cause}" -le 64 ] || api_error corrupt_state "invalid routine observe_cause" 73
+    case $routine_last_trigger:$routine_last_run:$routine_observe_since in
+        :*|*::*|*:|*[!0-9:]*) api_error corrupt_state "invalid routine observation epoch" 73 ;;
+    esac
     printf '{"profile":%s,"enabled":%s,"action":%s,"mode":%s,' \
         "$(json_quote "$routine_name")" "$routine_enabled" "$(json_quote "$routine_action")" "$(json_quote "$routine_mode")"
     case $routine_mode in
@@ -4351,9 +4391,12 @@ api_routine_json() {
     printf '"retry_count":%s,"retry_backoff_seconds":%s,"retry_exponential":%s,"allow_delete":%s,"max_total_delete":%s,"depends_on":' \
         "$routine_retries" "$routine_backoff" "$routine_retry_exponential" "$routine_delete" "$routine_max_total"
     api_dependencies_json "$routine_dependencies"
-    printf ',"backend":%s,"backend_reason":%s,"state":%s,"next_run_epoch":%s,"last_success_epoch":%s,"last_poll_epoch":%s}' \
+    printf ',"backend":%s,"backend_reason":%s,"state":%s,"next_run_epoch":%s,"last_success_epoch":%s,"last_poll_epoch":%s' \
         "$(json_quote "$routine_backend")" "$(json_quote "$routine_backend_reason")" "$(json_quote "$routine_state")" \
         "$routine_next" "$routine_last_success" "$routine_last_poll"
+    printf ',"last_trigger_epoch":%s,"last_run_epoch":%s,"watching_via":"%s","observe_state":"%s","observe_cause":"%s","observe_since_epoch":%s}' \
+        "$routine_last_trigger" "$routine_last_run" "$routine_watching_via" "$routine_observe_state" \
+        "$routine_observe_cause" "$routine_observe_since"
 }
 
 # 0 when daemon.ready names a daemon that is still that process (the in-process

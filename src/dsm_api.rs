@@ -17523,6 +17523,34 @@ fn render_routine(
     // as its own `matches!` rather than merged with it.
     let backend_reason = manager_kv_optional(state_document, "backend_reason", "ok")?;
     let last_poll = manager_kv(state_document, "last_poll_epoch", "0")?;
+    // What observes the routine, which both engines append after `escalated_epoch`: when a change
+    // (or a due cadence) was last seen, when a run last finished, the backend watching it, and
+    // whether anything is watching at all. Optional on read like `backend_reason`, so a record
+    // from before them reads as their defaults; `watching_via` and `observe_state` fail closed on
+    // an unknown value, and `observe_cause` is an open token held to its shape.
+    let last_trigger = manager_kv_optional(state_document, "last_trigger_epoch", "0")?;
+    let last_run = manager_kv_optional(state_document, "last_run_epoch", "0")?;
+    let watching_via = manager_kv_optional(state_document, "watching_via", "none")?;
+    let observe_state = manager_kv_optional(state_document, "observe_state", "ok")?;
+    let observe_cause = manager_kv_optional(state_document, "observe_cause", "none")?;
+    let observe_since = manager_kv_optional(state_document, "observe_since_epoch", "0")?;
+    if !matches!(
+        watching_via.as_slice(),
+        b"native" | b"poll" | b"schedule" | b"none"
+    ) || !matches!(
+        observe_state.as_slice(),
+        b"ok" | b"degraded" | b"blind" | b"disabled"
+    ) || observe_cause.is_empty()
+        || observe_cause.len() > 64
+        || !observe_cause
+            .iter()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || *byte == b'_')
+        || !digits(&last_trigger)
+        || !digits(&last_run)
+        || !digits(&observe_since)
+    {
+        return Err(PACKAGE_STATE_CORRUPT);
+    }
     if !matches!(
         state.as_slice(),
         b"never" | b"scheduled" | b"running" | b"succeeded" | b"failed" | b"deferred"
@@ -17609,6 +17637,18 @@ fn render_routine(
     push_raw_member(&mut routine, "last_success_epoch", &last_success);
     routine.push(b',');
     push_raw_member(&mut routine, "last_poll_epoch", &last_poll);
+    routine.push(b',');
+    push_raw_member(&mut routine, "last_trigger_epoch", &last_trigger);
+    routine.push(b',');
+    push_raw_member(&mut routine, "last_run_epoch", &last_run);
+    routine.push(b',');
+    push_quoted_member(&mut routine, "watching_via", &watching_via);
+    routine.push(b',');
+    push_quoted_member(&mut routine, "observe_state", &observe_state);
+    routine.push(b',');
+    push_quoted_member(&mut routine, "observe_cause", &observe_cause);
+    routine.push(b',');
+    push_raw_member(&mut routine, "observe_since_epoch", &observe_since);
     routine.push(b'}');
     Ok(routine)
 }
@@ -24079,6 +24119,86 @@ mod tests {
         assert_eq!(realtime["retry_backoff_seconds"], 300);
         assert_eq!(realtime["backend_reason"], "ok");
         assert_eq!(realtime["last_poll_epoch"], 0);
+    }
+
+    /// What observes a routine: six fields both engines append to its state file. Absent they read
+    /// as their defaults on both rungs, written they round-trip byte-identically on both rungs, and
+    /// an unknown `observe_state` or `watching_via`, a malformed cause or a non-numeric epoch fails
+    /// the whole snapshot closed on both, like an unknown `backend_reason`.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn routine_observation_fields_default_round_trip_and_fail_closed_on_both_rungs() {
+        let fixture = TestShellPackageFixture::new("routine-observation");
+        write_snapshot_inputs(&fixture);
+        let policy = SecurityPolicyArgs::default();
+        let state_file = fixture.routine_state_dir.join("alpha.state");
+        let base = "state=succeeded\nnext_run_epoch=1700003000\nlast_success_epoch=1700002900\n\
+                    backend=daily\nlast_poll_epoch=1700003100\n";
+
+        fixture.write_config(&state_file, base);
+        let document = assert_snapshot_parity(&fixture);
+        let daily = &document["routines"].as_array().unwrap()[1];
+        assert_eq!(daily["last_trigger_epoch"], 0);
+        assert_eq!(daily["last_run_epoch"], 0);
+        assert_eq!(daily["watching_via"], "none");
+        assert_eq!(daily["observe_state"], "ok");
+        assert_eq!(daily["observe_cause"], "none");
+        assert_eq!(daily["observe_since_epoch"], 0);
+        // A routine with no state file at all reads the same defaults.
+        assert_eq!(
+            document["routines"].as_array().unwrap()[0]["observe_state"],
+            "ok"
+        );
+
+        for (via, state, cause) in [
+            ("native", "ok", "none"),
+            ("poll", "degraded", "poll_floor_failed"),
+            ("schedule", "blind", "poll_walk_timeout"),
+            ("none", "disabled", "disabled"),
+        ] {
+            fixture.write_config(
+                &state_file,
+                &format!(
+                    "{base}last_trigger_epoch=1700003050\nlast_run_epoch=1700003060\n\
+                     watching_via={via}\nobserve_state={state}\nobserve_cause={cause}\n\
+                     observe_since_epoch=1700003070\n"
+                ),
+            );
+            let document = assert_snapshot_parity(&fixture);
+            let daily = &document["routines"].as_array().unwrap()[1];
+            assert_eq!(daily["last_trigger_epoch"], 1_700_003_050);
+            assert_eq!(daily["last_run_epoch"], 1_700_003_060);
+            assert_eq!(daily["watching_via"], via);
+            assert_eq!(daily["observe_state"], state);
+            assert_eq!(daily["observe_cause"], cause);
+            assert_eq!(daily["observe_since_epoch"], 1_700_003_070);
+        }
+
+        for refused in [
+            "observe_state=asleep\n",
+            "watching_via=carrier_pigeon\n",
+            "observe_cause=Not-A-Token\n",
+            "observe_cause=\n",
+            "last_run_epoch=soon\n",
+            "observe_since_epoch=1\nobserve_since_epoch=2\n",
+        ] {
+            fixture.write_config(&state_file, &format!("{base}{refused}"));
+            let shell = fixture.run_manager(&["api", "snapshot"]);
+            assert!(!shell.status.success(), "{refused}");
+            assert!(
+                String::from_utf8_lossy(&shell.stdout).contains("corrupt_state"),
+                "{refused}: {}",
+                String::from_utf8_lossy(&shell.stdout)
+            );
+            fixture.hand_over();
+            assert_eq!(
+                snapshot_document(&fixture.paths(), fixture.package_uid(), &policy)
+                    .unwrap_err()
+                    .code,
+                Some("package_state_corrupt"),
+                "{refused}"
+            );
+        }
     }
 
     /// Fault-injection rows 24-26: `backend_reason` on the routine object.
