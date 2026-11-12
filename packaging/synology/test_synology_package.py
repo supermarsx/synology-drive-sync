@@ -18148,6 +18148,44 @@ fi
             "the processing request outlived its terminal result",
         )
 
+    def test_a_succeeded_module_row_is_debug_and_a_failed_one_is_not(self) -> None:
+        # C7. module.succeeded repeated audit.succeeded for every transaction, at
+        # info. It is debug now (below the default threshold); module.failed and the
+        # audit.* rows are unchanged.
+        emitter = self.root / "emit-module-rows.sh"
+        emitter.write_text(
+            "#!/bin/sh\n"
+            "set -eu\n"
+            f". {shlex.quote(str(self.real_target / 'libexec/sdsync-common'))}\n"
+            "SDSYNC_DSM_AUDIT_ACTOR=admin\n"
+            f"SDSYNC_DSM_AUDIT_ACTOR_UID={self.drop_uid}\n"
+            "SDSYNC_DSM_AUDIT_ORIGIN=bridge\n"
+            "SDSYNC_DSM_AUDIT_TRANSACTION=$1\n"
+            "unset SDSYNC_DSM_CLIENT_REQUEST_ID\n"
+            "export SDSYNC_DSM_AUDIT_ACTOR SDSYNC_DSM_AUDIT_ACTOR_UID \\\n"
+            "    SDSYNC_DSM_AUDIT_ORIGIN SDSYNC_DSM_AUDIT_TRANSACTION\n"
+            'append_audit_event configure-profile "$2" personal\n',
+            encoding="utf-8",
+        )
+        emitter.chmod(0o755)
+        transaction = "modules-" + ("a" * 40)
+        for state in ("requested", "succeeded"):
+            result = self.shell(emitter, transaction, state)
+            self.assertEqual(result.returncode, 0, result.stderr)
+        failed = "modules-" + ("b" * 40)
+        for state in ("requested", "failed"):
+            result = self.shell(emitter, failed, state)
+            self.assertEqual(result.returncode, 0, result.stderr)
+        rows = [
+            line.split("|") for line in (self.real_var / "log/activity.log").read_text(encoding="utf-8").splitlines()
+            if transaction in line or failed in line
+        ]
+        codes = sorted(row[1] for row in rows)
+        self.assertIn("audit.succeeded", codes, rows)
+        self.assertNotIn("module.succeeded", codes, rows)
+        self.assertIn("module.failed", codes, rows)
+        self.assertIn("audit.failed", codes, rows)
+
     def test_a_rejected_mutation_row_names_its_reason_and_request(self) -> None:
         # C8 (B2). The refused-POST Activity row carried no reason, so the toast's
         # "match the request ID" advice had nothing to match. The reason and the
