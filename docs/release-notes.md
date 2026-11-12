@@ -336,6 +336,10 @@ lists its own commits.
   `remote-digest-keeps-failing` and `delete-keeps-failing` (`keeps_failing path=<path> runs=<n>
   cause=<reason>`). The run exits `0`, the path is tried every run, and the name clears when it
   succeeds.
+- **Office lock and temporary files are excluded by default.** LibreOffice's `.~lock.*#`, Office's
+  `~*.tmp` save files, and Access's `*.laccdb` and `*.ldb` join Office's `~$*` among the built-in
+  excludes. They exist only while a document is open and change while it is. A copy already on the
+  NAS is left there, and a mirror run does not delete it. A rule such as `!*.ldb` re-includes one.
 - **Doctor keeps its report when its log cannot be written.** A log that could not be opened, or a failed log write (a full volume) at the start, before
   discovery, before authentication, at the end, or at shutdown, used to replace the whole report with
   one line on standard error, which the package's UI showed as every step skipped. The sections

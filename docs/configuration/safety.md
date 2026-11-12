@@ -38,7 +38,9 @@ synology-drive-sync plan --profile production \
 ```
 
 Built-in default excludes come first, ahead of every rule above: `desktop.ini`, `Thumbs.db` and
-`ehthumbs.db` (any case), `.DS_Store`, a macOS `Icon\r` file, and Office lock files (`~$*`). They are
+`ehthumbs.db` (any case), `.DS_Store`, a macOS `Icon\r` file, and the lock and temporary files
+office applications keep beside an open document: Office's `~$*` and `~*.tmp`, LibreOffice's
+`.~lock.*#`, and Access's `*.laccdb` and `*.ldb` (extensions in any case). They are
 never uploaded, and any copy already on the NAS is protected from `--delete`. Because they are ordinary
 rules evaluated first, a rule of your own such as `!desktop.ini` re-includes one.
 

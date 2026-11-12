@@ -246,7 +246,8 @@ impl SkipReason {
     }
 }
 
-/// OS metadata files no client means to synchronize, excluded unless a rule re-includes them.
+/// OS metadata files and application lock and temporary files no client means to synchronize,
+/// excluded unless a rule re-includes them.
 ///
 /// Synology Drive's own client skips these. Without the defaults, Windows' `desktop.ini` --
 /// Hidden+System in every Documents, Pictures, Music and Desktop folder -- failed every scan of a
@@ -255,6 +256,12 @@ impl SkipReason {
 /// `.sdsyncignore` or `--exclude` still wins, and spelled case-insensitively where Windows itself
 /// varies the case. `Icon[\r]` is a character class because a trailing `\r` would be trimmed as
 /// whitespace; the class keeps it and still never matches a plain `Icon`.
+///
+/// The lock and temporary files (fix8 R7b, approved by the operator): Office's owner file `~$*`,
+/// LibreOffice's `.~lock.<name>#`, Office's `~*.tmp` save files, and Access's `*.laccdb` and
+/// `*.ldb`. Each exists only while a document is open and changes while it is, so carrying one
+/// made every run of an office share defer it as a change during the run. Generic `*.tmp`,
+/// AppleDouble `._*`, `.TemporaryItems` and `$RECYCLE.BIN` are deliberately not here.
 pub const DEFAULT_EXCLUDES: &[&str] = &[
     "[Dd][Ee][Ss][Kk][Tt][Oo][Pp].[Ii][Nn][Ii]",
     "[Tt][Hh][Uu][Mm][Bb][Ss].[Dd][Bb]",
@@ -262,6 +269,10 @@ pub const DEFAULT_EXCLUDES: &[&str] = &[
     ".DS_Store",
     "Icon[\r]",
     "~$*",
+    ".~lock.*#",
+    "~*.[Tt][Mm][Pp]",
+    "*.[Ll][Aa][Cc][Cc][Dd][Bb]",
+    "*.[Ll][Dd][Bb]",
 ];
 
 impl LocalInventory {
@@ -2549,8 +2560,9 @@ mod tests {
         assert_eq!(output.skipped.len(), 2);
     }
 
-    /// Built-in exclusions cover the OS metadata files that otherwise abort or pollute a run, in the
-    /// case variants Windows produces, and stay overridable by an operator negation.
+    /// Built-in exclusions cover the OS metadata files and the office lock and temporary files
+    /// that otherwise abort or pollute a run, in the case variants Windows produces, and stay
+    /// overridable by an operator negation.
     #[test]
     fn default_excludes_cover_os_metadata_files_and_can_be_negated() {
         let root = temp_dir("default-excludes");
@@ -2566,21 +2578,39 @@ mod tests {
             "deep/dir/.DS_Store",
             "Icon\r",
             "~$report.docx",
+            ".~lock.report.odt#",
+            "docs/.~lock.Budget 2026.xlsx#",
+            "~WRL0001.tmp",
+            "~DF1A2B.TMP",
+            "orders.laccdb",
+            "orders.LDB",
+            "legacy/stock.ldb",
         ] {
             assert!(rules.is_ignored(name, false), "{name:?} should be excluded");
         }
+        // Approved lock and temporary files only: a generic `.tmp`, AppleDouble files and the
+        // Windows and macOS trash folders stay payload.
         for name in [
             "Icon",
             "Iconr",
             "desktop.ini.bak",
             "my thumbs.db",
             "report.docx",
+            "build.tmp",
+            "._report.docx",
+            ".TemporaryItems",
+            "$RECYCLE.BIN",
+            "orders.accdb",
+            ".~lock.report.odt",
+            "report.ldb.txt",
         ] {
             assert!(!rules.is_ignored(name, false), "{name:?} must stay payload");
         }
 
-        let negated = IgnoreRules::build(&root, &["!desktop.ini".to_owned()]).unwrap();
+        let negated =
+            IgnoreRules::build(&root, &["!desktop.ini".to_owned(), "!*.ldb".to_owned()]).unwrap();
         assert!(!negated.is_ignored("desktop.ini", false));
+        assert!(!negated.is_ignored("stock.ldb", false));
         assert!(negated.is_ignored("Thumbs.db", false));
 
         fs::remove_dir_all(root).unwrap();

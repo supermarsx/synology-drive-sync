@@ -370,8 +370,8 @@ prevent overlap, and allow enough time for the complete scan-transfer-verify wor
   rejected. The operating system remains responsible for mounting and source-share authentication.
 - Symlinks, junctions, SYSTEM/TEMPORARY entries, dehydrated cloud placeholders, and names that
   collide by case or Unicode normalisation are skipped and reported by name, never uploaded and never
-  deleted from the NAS; OS metadata files (`desktop.ini`, `Thumbs.db`, `.DS_Store`, `~$*`) are
-  excluded by default. Special files, unreadable folders, unsafe or over-long names and names the
+  deleted from the NAS; OS metadata files (`desktop.ini`, `Thumbs.db`, `.DS_Store`) and office lock
+  and temporary files (`~$*`, `~*.tmp`, `.~lock.*#`, `*.laccdb`, `*.ldb`) are excluded by default. Special files, unreadable folders, unsafe or over-long names and names the
   NAS refuses are set aside by name, never uploaded and never deleted from the NAS, and the rest of the
   run proceeds with exit `0` and a named warning; so is a NAS folder this account may not list. A file
   that changes or is locked mid-run is deferred, and the run exits `3` (partial) so it is retried. Keep

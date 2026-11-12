@@ -109,8 +109,9 @@ nothing about them changes on the next run. See the
 [reason vocabulary](observability.md#partial-runs-deferrals-and-skips).
 
 **Excluded by default** (so they are never uploaded, and any remote copy is protected): `desktop.ini`,
-`Thumbs.db` and `ehthumbs.db` (any case), `.DS_Store`, a macOS `Icon\r` file, and Office lock files
-(`~$*`). These are ordinary ignore rules applied before yours, so an operator rule such as
+`Thumbs.db` and `ehthumbs.db` (any case), `.DS_Store`, a macOS `Icon\r` file, and the lock and
+temporary files office applications keep beside an open document (`~$*`, `~*.tmp`, `.~lock.*#`,
+`*.laccdb`, `*.ldb`). These are ordinary ignore rules applied before yours, so an operator rule such as
 `!desktop.ini` in `.sdsyncignore` wins.
 
 **Skipped and reported:**
