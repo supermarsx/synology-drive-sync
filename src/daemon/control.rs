@@ -43,9 +43,9 @@ use super::executor::{
     classify,
 };
 use super::routines::{
-    self, Action, Backend, BackendReason, Effect, Inputs, Level, Mode, Observe, ProfileFacts,
-    RealtimeView, Routine, RoutineRunState, RoutineState, RunEnd, Schedule, SkipField,
-    SourceStatus, Verdict, WatchingVia, valid_name,
+    self, Action, Backend, BackendReason, DeferReason, Effect, Inputs, Level, Mode, Observe,
+    ProfileFacts, RealtimeView, Routine, RoutineRunState, RoutineState, RunEnd, Schedule,
+    SkipField, SourceStatus, Verdict, WatchingVia, valid_name,
 };
 use super::state::{
     ControllerDegraded, DEGRADED_CAUSE_MAX, ProfileOutcome, ProfileRecord, RunOutcome, RunRecord,
@@ -2006,6 +2006,14 @@ impl Control {
             Ok(Some(routine)) => routine,
             Err(_) => return None,
         };
+        // A deletion bound weaker than the profile's can never be admitted: it
+        // has its own Activity row (routine.deferred) and watches nothing.
+        if let Ok(state) = &entry.state
+            && state.state == RoutineRunState::Deferred
+            && state.defer_reason == DeferReason::DeleteBound
+        {
+            return Some((WatchingVia::None, Observe::Blind, "delete_bound".into()));
+        }
         let (via, mut observe, mut cause) = match routine.mode {
             Mode::Interval { .. } | Mode::Daily { .. } => {
                 (WatchingVia::Schedule, Observe::Ok, "none".to_owned())
@@ -2040,7 +2048,13 @@ impl Control {
                                 .backend_detail
                                 .as_deref()
                                 .is_some_and(|d| d.contains(super::watch_source::WALK_CAP_NOTE));
-                            let cause = if capped { "walk_cap" } else { reason_word };
+                            let cause = if capped {
+                                "walk_cap"
+                            } else if reason == BackendReason::Ok {
+                                "backend_none"
+                            } else {
+                                reason_word
+                            };
                             (WatchingVia::None, Observe::Blind, cause.into())
                         }
                         (
@@ -2183,9 +2197,9 @@ impl Control {
                 via.as_str()
             ),
         );
-        // The source's own absence already has its Activity row
-        // (routine.deferred, "Routine source is unavailable").
-        if matches!(cause, "source_missing" | "source_symlink") {
+        // These causes already have their Activity row where they arise
+        // (routine.deferred: "Routine source is unavailable", the deletion bound).
+        if matches!(cause, "source_missing" | "source_symlink" | "delete_bound") {
             return;
         }
         self.activity(
