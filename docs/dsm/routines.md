@@ -245,7 +245,8 @@ healthy native watch cannot finish its walk. `blind` has none: the poll cannot r
 killed for taking longer than its budget (900 seconds under the shell engine, bounded by
 `SDSYNC_DSM_POLL_WALK_BUDGET`), the process-wide walk cap refused the arm (daemon), a lasting block holds
 the routine (daemon), the watcher never reported (daemon), or the source is missing. Each change of
-state or cause is one `routine.unobserved` Activity row, and the end of it a `routine.observed` row;
+state or cause is one `routine.unobserved` Activity row once it has held for 30 seconds (a watcher that is
+still starting says nothing; a disabled routine is said at once), and the end of it a `routine.observed` row;
 `ctl status` carries the same fields. Under the shell engine, a run with no heartbeat for 30 minutes,
 or a dashboard job that has run longer than 30 minutes, also writes one row for `all` profiles (cause
 `controller_blocked`), since the controller loop waits on it.

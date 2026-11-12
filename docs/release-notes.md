@@ -301,7 +301,9 @@ observing a routine wrote controller.log at most, so the Activity page read as h
 - **Nothing observing a routine is now one Activity row per episode, in both engines.** `routine.unobserved`
   (`warn`; `info` for a disabled routine) names the cause: a non-ok backend, `poll_floor_failed`, the walk
   cap, a lasting block, a watcher that never reported, a poll that cannot read its tree or was killed, or a
-  disabled routine. `routine.observed` closes the episode. The episode is kept in the routine's state
+  disabled routine. A reading must hold 30 seconds before it is announced (`SDSYNC_DSM_OBSERVE_GRACE` in the
+  shell engine), so a watcher that is still starting says nothing; a disabled routine and a recovery are said
+  at once. `routine.observed` closes the episode. The episode is kept in the routine's state
   record, so a restart does not repeat it. Both codes are in the shell and daemon Activity vocabularies.
 - **The routine state record can tell idle from blind.** Six keys follow `escalated_epoch`:
   `last_trigger_epoch`, `last_run_epoch`, `watching_via`, `observe_state`, `observe_cause` and
