@@ -297,8 +297,10 @@ controller could not be told to reload, so the previous schedule or policy is st
 as saved with a persistent red *Saved, but it is not fully in effect* notice that names each warning
 and can be dismissed; it is never reported as plain success. Configuration is applied first, followed by
 each requested secret operation in order. A lost POST acknowledgement is recovered by replaying the exact serialized
-request, request ID, authentication snapshot, and CSRF token up to two times; the package returns the
-same job instead of creating a duplicate. Configuration and secret stages also have bounded result
+request, request ID and authentication snapshot up to two times; the package returns the same job
+instead of creating a duplicate. A replay carries a fresh CSRF token when the earlier one has gone
+stale or was answered with a 403 the page could not read, and is not sent at all if no fresh token
+can be had. Configuration and secret stages also have bounded result
 observation so the editor cannot stay busy indefinitely.
 
 If a later stage fails or remains outcome-unknown after recovery, the page reports the profile as
@@ -486,9 +488,10 @@ Configuration/secret/routine/policy calls and Doctor poll that response before r
 result. Plan and Run remain asynchronous. Therefore:
 
 1. Before declaring a POST outcome unknown, the AppWindow makes at most two automatic replays of the
-   exact original request body, client request ID, DSM authentication snapshot, and CSRF token. An
-   accepted replay returns the original job ID. No retry creates a new request identity or changes the
-   payload.
+   exact original request body, client request ID and DSM authentication snapshot. An accepted replay
+   returns the original job ID. No retry creates a new request identity or changes the payload. A
+   replay never repeats a CSRF token the package may already have refused (a 403 whose body could not
+   be read) or one that has gone stale; it fetches a fresh one first, or is not sent.
 2. A configuration success toast proves a sanitized terminal manager result, but the refreshed
    snapshot remains the authoritative displayed state.
 3. Profile saves, profile-connection probes, and autosave calls use explicit overall observation

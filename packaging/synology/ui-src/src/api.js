@@ -39,6 +39,11 @@ const TERMINAL_API_ATTEMPT_TIMEOUTS = Object.freeze({
 });
 
 const CSRF_SCHEMA = "sdsync.dsm-csrf.v1";
+// A mutation token is replaced this long before the package would refuse it.
+// The token names its own lifetime (`v1.<issued>.<expires>.<nonce>.<mac>`), so
+// the deadline is that lifetime measured on this window's clock from the moment
+// the token arrived: clock skew between browser and NAS does not move it.
+const CSRF_REISSUE_MARGIN_SECONDS = 30;
 // Terminal reads are side-effect free, so the first observations can be cheap and
 // frequent and then decay toward the bounded long-operation cadence that Doctor and
 // other slow jobs need. The previous two-step ladder (500 ms once, then 2000 ms flat)
@@ -85,6 +90,12 @@ let dsmTokenBootstrapPromise = null;
 let dsmTokenRetryAfter = 0;
 let dsmAuthGeneration = 0;
 const csrfGenerationByAuth = new WeakMap();
+// When each AppWindow's current mutation token is due for replacement, and
+// whether the package has already refused it. Written wherever a token is
+// accepted (rememberCsrfGeneration), so no POST is sent with a token this
+// window knows to be stale -- the five-minute token used to be fetched once at
+// mount and then sent for as long as the page stayed open.
+const csrfFreshnessByAuth = new WeakMap();
 const reconciliationAuthByOwner = new WeakMap();
 
 function validClientRequestId(value) {
@@ -735,10 +746,60 @@ function validCsrfModel(model) {
     && model.csrf_token.length <= MAX_CSRF_TOKEN_BYTES;
 }
 
+function csrfClock() {
+  return typeof window === "object" && window && typeof window.now === "function" ? window.now() : Date.now();
+}
+
+// The moment, on this window's clock, a token received at `receivedAtMs` is to
+// be replaced. A token whose lifetime cannot be read has no deadline here; it is
+// still replaced when the DSM authentication changes or the package refuses it.
+function csrfReissueDueAtMs(token, receivedAtMs) {
+  const parts = String(token || "").split(".");
+  const issued = Number(parts[1]);
+  const expires = Number(parts[2]);
+  if (parts.length !== 5 || parts[0] !== "v1" || !Number.isSafeInteger(issued)
+    || !Number.isSafeInteger(expires) || expires <= issued) {
+    return Number.POSITIVE_INFINITY;
+  }
+  return receivedAtMs + Math.max(0, expires - issued - CSRF_REISSUE_MARGIN_SECONDS) * 1000;
+}
+
 function rememberCsrfGeneration(auth, model, generation) {
   if (auth && typeof auth === "object" && validCsrfModel(model)) {
     csrfGenerationByAuth.set(auth, generation);
+    csrfFreshnessByAuth.set(auth, {
+      token: model.csrf_token,
+      dueAtMs: csrfReissueDueAtMs(model.csrf_token, csrfClock()),
+      refused: false
+    });
   }
+}
+
+// Whether `csrfToken` must be replaced before it is sent: it is due, the
+// package has refused it, or it is not the token this window last accepted.
+// A window that never fetched a token through this module has nothing to judge
+// by and keeps its token, exactly as before.
+function csrfReissueRequired(auth, csrfToken) {
+  const freshness = auth && typeof auth === "object" ? csrfFreshnessByAuth.get(auth) : undefined;
+  if (!freshness) return false;
+  return freshness.refused || freshness.token !== csrfToken || csrfClock() >= freshness.dueAtMs;
+}
+
+// The package answered a request carrying this token with a refusal this
+// window could not read. It may have been the token, so it is never sent again.
+function retireCsrfToken(auth, csrfToken) {
+  const freshness = auth && typeof auth === "object" ? csrfFreshnessByAuth.get(auth) : undefined;
+  if (freshness && freshness.token === csrfToken) freshness.refused = true;
+}
+
+/**
+ * Whether the AppWindow's mutation token is due for replacement now. The
+ * AppWindow asks when it becomes visible again, because a tab left in the
+ * background for longer than the token's lifetime returns holding a token the
+ * package will refuse.
+ */
+export function csrfTokenStale(auth, csrfToken) {
+  return csrfReissueRequired(auth, csrfToken);
 }
 
 function exactKeys(actual, expected, label) {
@@ -1668,7 +1729,8 @@ export async function reconcileMutationRequest(
 async function csrfForCurrentAuthGeneration(auth, csrfToken, dsmAuth, limits = null) {
   if (!auth || typeof auth !== "object") return csrfToken;
   const issuedGeneration = csrfGenerationByAuth.get(auth);
-  if (issuedGeneration === undefined || issuedGeneration === dsmAuth.generation) return csrfToken;
+  if (issuedGeneration === undefined) return csrfToken;
+  if (issuedGeneration === dsmAuth.generation && !csrfReissueRequired(auth, csrfToken)) return csrfToken;
 
   const previousToken = csrfToken;
   // A timed-out reissue may still settle later at the fetch layer. Do not let
@@ -1869,6 +1931,13 @@ export async function apiPost(
   // DSM session cookie. Keep the token snapshot only in this AppWindow's
   // memory and never copy it into an error, incident, log, or rendered status.
   rememberReconciliationAuth(auth, id, requestDsmAuth);
+  // The token each attempt carries. A replay sends the byte-identical body
+  // under the same request ID -- that is what makes it safe -- but never a
+  // token the package may already have refused or that has gone stale while
+  // earlier attempts were in flight: such a replay can only be refused again,
+  // and each refusal is one more audited failure.
+  let dispatchCsrfToken = effectiveCsrfToken;
+  let tokenRefused = false;
   let queued;
   let dispatchAmbiguous = false;
   let dispatchStage = "post_dispatch_observation";
@@ -1886,7 +1955,7 @@ export async function apiPost(
           headers: authenticatedHeaders({
             Accept: "application/json",
             "Content-Type": "application/json",
-            "X-SDSYNC-CSRF": effectiveCsrfToken
+            "X-SDSYNC-CSRF": dispatchCsrfToken
           }, requestDsmAuth),
           body: request
         });
@@ -1905,6 +1974,10 @@ export async function apiPost(
       }
 
       if (response) {
+        // A 403 is how the package refuses a token. If its body could not be
+        // read the refusal cannot be confirmed, so the token is treated as
+        // refused rather than replayed.
+        if (Number(response.status) === 403) tokenRefused = true;
         try {
           const body = responseJson(response);
           queued = limits
@@ -1924,13 +1997,19 @@ export async function apiPost(
             error.preAcceptance = true;
             error.requestId = id;
             error.trustedRequestId = true;
-            if (isExplicitCsrfRejection(error)) error.csrfRejected = true;
+            if (isExplicitCsrfRejection(error)) {
+              error.csrfRejected = true;
+              retireCsrfToken(auth, dispatchCsrfToken);
+            }
             forgetReconciliationAuth(auth, id);
             throw error;
           }
           if (dispatchAmbiguous
             && error instanceof DsmApiError
             && error.trustedRejection === true) {
+            // The package called this token stale: whatever happened to the
+            // earlier attempt, the next request this window sends replaces it.
+            if (isExplicitCsrfRejection(error)) retireCsrfToken(auth, dispatchCsrfToken);
             throw dispatchedOutcomeUnknown(id, action, dispatchStage);
           }
           dispatchAmbiguous = true;
@@ -1999,6 +2078,18 @@ export async function apiPost(
     } catch (_error) {
       throw dispatchedOutcomeUnknown(id, action, dispatchStage);
     }
+    if (tokenRefused) retireCsrfToken(auth, dispatchCsrfToken);
+    let replayCsrfToken;
+    try {
+      replayCsrfToken = await csrfForCurrentAuthGeneration(auth, dispatchCsrfToken, requestDsmAuth, limits);
+    } catch (_error) {
+      // No replay without a token this window can vouch for. The bounded
+      // read-only reconciliation below settles the request or fails closed.
+      break;
+    }
+    if (tokenRefused && replayCsrfToken === dispatchCsrfToken) break;
+    dispatchCsrfToken = replayCsrfToken;
+    tokenRefused = false;
   }
   if (!queued) {
     const recovered = await recoverQueuedRequest(

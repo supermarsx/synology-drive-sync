@@ -230,9 +230,15 @@ DSM cookie authentication is necessary but not sufficient for POST. An authentic
 The signing key is a package-owned private file. Mutation POSTs require the token in
 `X-SDSYNC-CSRF`; expired, malformed, replayed in another session, or incorrectly signed values are
 rejected with the stable pre-acceptance code `csrf_rejected`. The UI holds it only in memory and
-automatically replays ambiguous POST delivery at most twice with the identical serialized body,
-client request ID, DSM authentication snapshot, and CSRF token. After that exact-request recovery is
-exhausted, it never invents a new request automatically. If a bounded token-bootstrap retry changes
+replaces it before it is refused: before each POST once fewer than 30 seconds of its lifetime remain
+(the lifetime is read from the token and timed on the browser's clock from when it arrived, so clock
+skew between browser and NAS does not move it), when the AppWindow becomes visible again after its
+token went stale in the background, and after the package refuses it. It automatically replays
+ambiguous POST delivery at most twice with the identical serialized body, client request ID and DSM
+authentication snapshot. A replay carries a fresh token when the earlier one has gone stale or was
+answered with a 403 the page could not read, and is not sent if no fresh token can be had, so a
+replay never repeats a token the package may already have refused. After that exact-request recovery
+is exhausted, it never invents a new request automatically. If a bounded token-bootstrap retry changes
 the AppWindow's DSM authentication generation, the client first reissues CSRF under that exact
 generation, replaces its module-memory token, and only then serializes the mutation and begins its
 bounded exact-delivery recovery.
@@ -334,9 +340,10 @@ state, then explicitly repeat the operation only when it is safe.
 
 Configuration and secret saves, routine/policy changes, and Doctor observe terminal results before
 the UI reports success. The AppWindow serializes each POST once and, when delivery or acknowledgement
-is ambiguous, makes no more than two automatic replays with the identical body, client request ID,
-DSM authentication snapshot, and CSRF token. Replaying the same authenticated request ID and payload
-returns the original job ID; reusing it for a different payload is a conflict.
+is ambiguous, makes no more than two automatic replays with the identical body, client request ID
+and DSM authentication snapshot, each with a CSRF token the package has not refused. Replaying the
+same authenticated request ID and payload returns the original job ID; reusing it for a different
+payload is a conflict.
 
 Profile saves, connection probes, and autosave mutations have explicit overall observation limits;
 transient result-read failures remain retryable until that limit. Unbounded terminal observers report

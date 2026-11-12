@@ -2183,10 +2183,10 @@ assert.equal(
                     b"headers: authenticatedHeaders(", b"headers: (", 1
                 )
             )
-        with self.assertRaisesRegex(validate_spk.ValidationError, "effectiveCsrfToken"):
+        with self.assertRaisesRegex(validate_spk.ValidationError, "dispatchCsrfToken"):
             validate_build(
                 api=source["api"].replace(
-                    b'"X-SDSYNC-CSRF": effectiveCsrfToken',
+                    b'"X-SDSYNC-CSRF": dispatchCsrfToken',
                     b'"X-SDSYNC-CSRF": csrfToken',
                     1,
                 )

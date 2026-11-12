@@ -705,6 +705,7 @@ import {
   SYNC_STATUS_MAX_LIMIT,
   apiGet,
   apiPost,
+  csrfTokenStale,
   trustedRequestProgress,
   probeRequestOutcome,
   purgeReconciliationAuth,
@@ -5016,6 +5017,10 @@ export default {
         if (this.autosaveCoordinator) this.autosaveCoordinator.setGlobalBusy(this.operationBusy);
         tickClock(this);
         scheduleClock(this);
+        // A tab left in the background past the token's lifetime comes back
+        // holding a token the package would refuse. Dropping it here makes the
+        // snapshot refresh below fetch a fresh one first, before any click.
+        if (this.csrfToken && csrfTokenStale(this.auth, this.csrfToken)) this.csrfToken = "";
         this.refreshSnapshot(false);
         if (this.route === "activity") this.refreshLogs();
         this.scheduleIncidentProbe();

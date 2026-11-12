@@ -474,7 +474,7 @@ also shows the reason in words, and the toast is worded by the same code. Nothin
 
 | `reason=` | Meaning | What to do |
 | --- | --- | --- |
-| `csrf_rejected` | The mutation token was expired or belonged to another session | Select **Retry** and submit again |
+| `csrf_rejected` | The mutation token was expired or belonged to another session | Select **Retry** and submit again. The page now replaces its token before it expires and when it becomes visible again, so this should follow only a session change |
 | `ui_build_stale` | The page was loaded from an older package version | Reload the app (close and reopen it, or refresh the browser tab) |
 | `forbidden` | The security policy does not allow this change | Review **Settings > Security** |
 | `invalid_request` | The request was malformed or does not match the installed package | Reload the app; if it repeats, collect `api.log` |
