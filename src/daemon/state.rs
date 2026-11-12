@@ -347,8 +347,18 @@ impl IndexFacts {
                             .and_then(serde_json::Value::as_str)
                             .unwrap_or("")
                     };
-                    let detail =
-                        sanitize_detail(&format!("{}: {}", text("path"), text("cause")), 160);
+                    let path = text("path");
+                    let path = path
+                        .strip_prefix("/var/packages/synology-drive-sync/")
+                        .unwrap_or(path);
+                    let full = sanitize_detail(&format!("{path}: {}", text("cause")), usize::MAX);
+                    let detail = if full.len() <= 160 {
+                        full
+                    } else {
+                        // The end holds the set-aside path and the library's message, so a long
+                        // detail keeps its tail; `sanitize_detail` left printable ASCII only.
+                        format!("...{}", &full[full.len() - 157..])
+                    };
                     (severity, code.to_owned(), detail)
                 })
             })
@@ -2020,6 +2030,38 @@ mod tests {
             assert_eq!(
                 facts.issue_detail.as_deref(),
                 Some(": 3 pairs were not carried")
+            );
+            // B8: a long detail keeps its END, where the set-aside path and the library's message
+            // are, and the package root is not spent on the path.
+            let long = IndexFacts::from_value(&json!({
+                "state": "cold",
+                "entries": 0,
+                "issues": [{
+                    "code": "pair-index-corrupt",
+                    "severity": "warning",
+                    "path": "/var/packages/synology-drive-sync/var/state/cache/pairs/checkoffice_nas.redb",
+                    "cause": "DB corrupted: Database page size 0 does not match expected 4096; set aside as /var/packages/synology-drive-sync/var/state/cache/pairs/checkoffice_nas.redb.corrupt-1"
+                }]
+            }))
+            .expect("the record reads");
+            let detail = long.issue_detail.as_deref().expect("the detail is kept");
+            assert_eq!(detail.len(), 160, "{detail}");
+            assert!(detail.starts_with("..."), "{detail}");
+            assert!(detail.ends_with("checkoffice_nas.redb.corrupt-1"), "{detail}");
+            let short = IndexFacts::from_value(&json!({
+                "state": "cold",
+                "entries": 0,
+                "issues": [{
+                    "code": "pair-index-corrupt",
+                    "severity": "warning",
+                    "path": "/var/packages/synology-drive-sync/var/state/cache/pairs/a.redb",
+                    "cause": "bad"
+                }]
+            }))
+            .expect("the record reads");
+            assert_eq!(
+                short.issue_detail.as_deref(),
+                Some("var/state/cache/pairs/a.redb: bad")
             );
             // S3-21: the other two info notes a run can name were dropped on the way
             // to the dashboard (no rank), so the line never said the index was not
