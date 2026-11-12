@@ -674,6 +674,24 @@ the last poll; the readable part stays observed, and the controller log names th
 `routine_poll_unavailable`. Fix permissions on the unreadable path — `@eaDir`, `#recycle`,
 `#snapshot`, and `@tmp` are already pruned from the walk and cannot be the cause.
 
+## Routine is not observed
+
+Activity shows `routine.unobserved` when nothing, or not everything, is looking at a routine's source.
+The row's message names the cause, and the routine's state record keeps it (`observe_cause`,
+`observe_since_epoch`; see [Idle or blind](routines.md#idle-or-blind)). The causes:
+
+| `observe_cause` | What to do |
+| --- | --- |
+| `poll_walk_timeout` | The poll walk of the source did not finish within its budget and was killed. Check the volume for a hung mount or a stalled disk; `poll_walk_timeout` in `controller.log` names the seconds. |
+| `poll_floor_failed` | The backstop poll under the native watch cannot finish. Native events still work; a missed event is not caught until the floor does. |
+| `walk_cap` | Too many tree walks were in flight (daemon). It is retried within seconds; a lasting one means a stalled disk holds the walks. |
+| `lasting_block` | A run was killed by the out-of-memory killer and the routine is held (daemon). Run now, or change the profile settings, to lift it. |
+| `watch_not_reporting` | The daemon's watcher started and never reported (daemon). Restart the package. |
+| `controller_blocked` | A long run or dashboard job holds the shell controller's loop; scheduling resumes when it ends (shell engine). |
+| `disabled` | The routine is switched off; enable it on the Routines page. |
+
+The other causes are the `backend_reason` values below.
+
 ## Realtime routine never runs
 
 Check the routine's `backend_reason` first, in the Routines catalog row or the routine editor; it

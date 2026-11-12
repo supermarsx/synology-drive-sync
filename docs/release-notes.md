@@ -293,6 +293,36 @@ lists its own commits.
   Synology package build (<target>)`, and a package API that reports neither reads `Not reported by
   package API`. See [Compatibility](dsm/compatibility.md#four-release-spks).
 
+### Scheduler observability (fix8)
+
+A NAS went 54 hours without a sync and without one Activity row. Every state in which nothing was
+observing a routine wrote controller.log at most, so the Activity page read as healthy.
+
+- **Nothing observing a routine is now one Activity row per episode, in both engines.** `routine.unobserved`
+  (`warn`; `info` for a disabled routine) names the cause: a non-ok backend, `poll_floor_failed`, the walk
+  cap, a lasting block, a watcher that never reported, a poll that cannot read its tree or was killed, or a
+  disabled routine. `routine.observed` closes the episode. The episode is kept in the routine's state
+  record, so a restart does not repeat it. Both codes are in the shell and daemon Activity vocabularies.
+- **The routine state record can tell idle from blind.** Six keys follow `escalated_epoch`:
+  `last_trigger_epoch`, `last_run_epoch`, `watching_via`, `observe_state`, `observe_cause` and
+  `observe_since_epoch`. `backend` and `backend_reason` are unchanged. A record without them reads as
+  observed, and `ctl status` carries the same fields.
+- **The shell poll walk is bounded** (900 seconds, `SDSYNC_DSM_POLL_WALK_BUDGET` overrides it). A walk that
+  outlives it is killed with its `find`, `poll_walk_timeout` is logged with the profile and seconds, its slot
+  is freed and the episode is one Activity row. Walks whose `find` survives SIGKILL on a dead mount are
+  counted, and no new walk starts while three are still alive.
+- **The shell stall check covers dashboard jobs.** A primary job running longer than 30 minutes
+  (`SDSYNC_DSM_CONSUMER_STALL_SECONDS`) is named once with `controller_blocked_by_stalled_consumer` and an
+  Activity row for `all` profiles, as a run with no heartbeat is; the end of either is a `routine.observed` row.
+- **A native event is marked again when its run is refused at admission** (exit 75), so the retry no longer
+  depends on the poll finding the change. A marker that cannot be written is named
+  (`routine_event_remark_failed`) and makes the poll due at once.
+- **`notification.unavailable` says why and is one row per failure episode.** Its message ends
+  `(cause=notifier_missing)` or `(cause=notifier_exit_N)`, and the alert cooldown starts on the attempt, not on a
+  delivery, so a notifier that always fails no longer adds a row to every failed run.
+- **`module.succeeded` is `debug`.** It repeated `audit.succeeded` for every run; `module.failed` and the
+  `audit.*` rows are unchanged.
+
 ## Read this before upgrading
 
 - **Rust 1.90 or newer is needed to build from source** (was 1.88). The verified-pair index uses redb
