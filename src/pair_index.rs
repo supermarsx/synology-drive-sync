@@ -898,8 +898,14 @@ impl IndexSession {
                 "pair-index-failed-run",
                 &self.binding.remote,
                 format!(
-                    "the run failed ({cause}); its other proofs were stored, but {dropped} {}                      not, because the run planned to change the NAS there or found it                      unconverged; {} verified live next run",
-                    if dropped == 1 { "pair was" } else { "pairs were" },
+                    "the run failed ({cause}); its other proofs were stored, but {dropped} {} \
+                     not, because the run planned to change the NAS there or found it \
+                     unconverged; {} verified live next run",
+                    if dropped == 1 {
+                        "pair was"
+                    } else {
+                        "pairs were"
+                    },
                     if dropped == 1 { "it is" } else { "they are" },
                 ),
             ));

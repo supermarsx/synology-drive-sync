@@ -261,7 +261,9 @@ fn a_first_scan_path_that_still_differs_fails_by_name_and_keeps_the_other_eviden
     assert!(
         dropped["cause"]
             .as_str()
-            .is_some_and(|cause| cause.contains("reconciliation_pending")),
+            .is_some_and(|cause| cause.contains("reconciliation_pending")
+                && cause.contains(" not, because the run planned")
+                && !cause.contains("  ")),
         "{dropped}"
     );
 
