@@ -417,13 +417,15 @@ was `refreshed`, and the most serious issue the run named with its path and caus
 
 - A damaged index is named `pair-index-corrupt`, set aside as `<profile>.redb.corrupt-<epoch>` and
   rebuilt from the run. It is an amber item.
+- An index found damaged three opens in a row is named `pair-index-unkeepable` (amber) and is not
+  rebuilt: every file is checked live. It is tried again after a package update or in 7 days.
 - An index kept for a profile that was re-created with another source, remote or NAS is retired and
   rebuilt: `pair-index-retired`, shown as information on the line, not as a problem. It explains the
   slow first run.
 - A read of an index that a run of the same profile is using reports `index: "busy"`, not an
   error.
 - `remove-profile` removes the profile's index file, its quarantined copies (`.redb.corrupt-<epoch>`),
-  its panic record (`.redb.panicked`), its lasting block and its alerts state. For a name over 64
+  its panic record (`.redb.panicked`), its count of damaged opens (`.redb.rebuilds`), its lasting block and its alerts state. For a name over 64
   characters the files are the hashed ones, `<first 48>-<16 hex of the SHA-256>.redb` and its
   siblings, found by that exact stem and never by a prefix glob, so another long profile's index is
   left alone. A file it could not remove, or a stem it could not compute (no `sha256sum`), is named

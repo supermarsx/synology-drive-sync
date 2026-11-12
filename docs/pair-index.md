@@ -118,6 +118,7 @@ and a fully live run. None fails a run or makes it partial.
 | `pair-index-locked` | Another process held the file for more than 30 s. |
 | `pair-index-readonly` | The file or its volume does not let this account write. |
 | `pair-index-corrupt` | The file failed its integrity check (on the run's first open, or on a reopen that found it changed), redb repaired damage in it, a stored record, path or `meta` value does not decode, or a previous run stopped inside redb on it (`<profile>.redb.panicked`). The file is set aside as `<profile>.redb.corrupt-<epoch>` (one copy, swept after 7 days; earlier copies that cannot be removed are named `pair-index-cleanup-failed`, and with three of them the damaged file is deleted instead of kept), nothing from it is served, and the index is rebuilt from this run. |
+| `pair-index-unkeepable` | The index was found damaged three opens in a row with the same cause and no sound open between them (counted in `<profile>.redb.rebuilds`). The file is set aside as for `pair-index-corrupt` (one copy), no new index is built, and every run names this warning and checks every file live without touching the folder. It is tried again after a package update, after 7 days, or once the record is removed. |
 | `pair-index-format-unsupported` | The file is in a format this build's redb does not read; set aside and rebuilt. |
 | `pair-index-store-failed` | The end-of-run write failed (a full volume); the previous evidence stays valid. |
 | `pair-index-unsafe` | The file is a link, not a regular file, owned by someone else, or shared with group or other; or the file, its directory, or the panic record beside it could not be examined at all (the path and cause are named), so the index is not used. |
@@ -188,11 +189,12 @@ sync with `--pair-index /var/packages/synology-drive-sync/var/state/cache/pairs`
   while a run of that profile uses it says `busy` instead of opening it.
 - **A damaged file** is named `pair-index-corrupt` (an amber item on the dashboard), set aside as
   `<profile>.redb.corrupt-<epoch>` and rebuilt from the run.
+- **An index this system cannot keep** is named `pair-index-unkeepable` (amber) and is not rebuilt; see the table.
 - **A retired index** (the profile was re-created with another source, remote or NAS) is named
   `pair-index-retired` and shown as information on the profile's line, because it explains why the
   first run afterwards is slow.
 - **Removing the profile** deletes its `.redb`, the quarantined copies (`.redb.corrupt-<epoch>`), a
-  panic record (`.redb.panicked`), its lasting block and its alerts state. For a name over 64
+  panic record (`.redb.panicked`), its count of damaged opens (`.redb.rebuilds`), its lasting block and its alerts state. For a name over 64
   characters these are the files of the hashed stem (`<first 48>-<16 hex of the SHA-256>`, see
   [Where it lives](#where-it-lives)), matched by that exact stem. A file that cannot be removed, or
   a stem that cannot be computed, is named as a warning.
