@@ -318,6 +318,9 @@ lists its own commits.
   proof except those for paths it planned to change on the NAS and paths reconciliation found
   unconverged. Those are dropped, their old records are removed, and the count is named in the new
   information issue `pair-index-failed-run`.
+- **A run with nothing to do reports what the index did.** The result record of a no-change run now
+  carries `pair_index`, so the daemon's profile state (`index_state`, `index_hits`, ...) shows the
+  warm run the index exists for. Before, it showed nothing for that run.
 - **Doctor keeps its report when its log cannot be written.** A log that could not be opened, or a failed log write (a full volume) at the start, before
   discovery, before authentication, at the end, or at shutdown, used to replace the whole report with
   one line on standard error, which the package's UI showed as every step skipped. The sections

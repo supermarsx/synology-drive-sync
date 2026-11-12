@@ -3669,14 +3669,20 @@ fn result_record_result(
                     json!({"path": entry.relative, "reason": reason, "detail": detail})
                 })
                 .collect::<Vec<_>>();
-            json!({
+            let mut verdict = json!({
                 "outcome": if run_is_partial(Some(plan), None) { "partial" } else { "complete" },
                 "changed": !plan.is_empty(),
                 "planned_only": plan_only,
                 "deferred": deferred,
                 "skipped": lasting_skips(plan),
                 "elapsed_ms": duration_millis(elapsed),
-            })
+            });
+            // A run with nothing to do is the warm run: what the index served is exactly what
+            // a supervisor needs to see, and the run state was blind to it without this.
+            if let Some(report) = &plan.pair_index {
+                verdict["pair_index"] = run_index::value(report);
+            }
+            verdict
         }
         (None, None) => Value::Null,
     }

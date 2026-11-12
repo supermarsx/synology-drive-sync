@@ -1013,6 +1013,10 @@
           "description": "NAS folders this run listed, or passed through on the way to its scope, for which the NAS reported no real path, so a NAS link among their entries could not be told from a folder and is synced and deleted through like one. 0 means the link guard ran everywhere it was needed. A lasting, user-fixable warning: it never changes the outcome or the exit code.",
           "$ref": "#/$defs/nonNegativeInteger"
         },
+        "pair_index": {
+          "description": "What the verified-pair index did, when the job asked for one (`--pair-index`). Present on a run that found nothing to do, which is the warm run the index exists for.",
+          "$ref": "#/$defs/pairIndex"
+        },
         "elapsed_ms": { "$ref": "#/$defs/nonNegativeInteger" }
       }
     },
