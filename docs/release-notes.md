@@ -322,6 +322,21 @@ lists its own commits.
 - **Routines say what observes them**: idle and watching via native events, polling or the schedule,
   partly observed, or blind since a time with the cause. Blind and partly observed routines are amber
   Overview items.
+- **A dashboard request can no longer hang the NAS's web server for most of an hour.** On DSM 7 each
+  request's CGI built its own TLS client for DSM's session check, and on a 3.10 kernel with a drained
+  entropy pool that client waited forever for randomness. The session check now runs in the package's
+  long-lived service with one client, and every CGI request is answered within 12 seconds (40 for a
+  change), at worst with a named `cgi_deadline_exceeded` that is recorded in `api.log`. See
+  [A dashboard request timed out](dsm/troubleshooting.md#a-dashboard-request-timed-out-cgi_deadline_exceeded).
+- **`config_file_unsafe` names the file and the check** (owner, mode, links, ...) on the page and in
+  `api.log`, a read that raced a writer is looked at again, and the page stops refreshing only after
+  three in a row.
+- **A slow read says the NAS is slow** ("did not answer within 10 seconds") instead of "confirm the
+  package is running", and no longer locks edits.
+- **The "Every second" status refresh is gone**; a saved one becomes 5 seconds.
+- **A damaged checksum index reads in plain words** (files were still compared in full; nothing to do),
+  with the library's message under **Technical detail**; a long detail keeps its file name.
+- **A file that keeps failing or changing names the file** and how many runs in a row.
 
 ## Read this before upgrading
 
