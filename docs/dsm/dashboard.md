@@ -183,9 +183,17 @@ whether the window keeps asking:
   repaired. Polling through a fault that waiting cannot fix only buries the operator's own repair
   under identical failures.
 
-The Activity feed draws the newest 200 events that match its filter and says "N older events not shown"
+The Activity feed draws the newest 200 rows that match its filter and says "N older events not shown"
 with a **Show older** button that draws 200 more (the heading still counts the whole filtered list,
 and **Copy visible** copies every match), so a thousand-event feed does not stall the page.
+
+By default the feed folds the rows of one run into one row with its outcome and duration (`Run of
+nightly succeeded in 25 s · 5 events`): the run's audit records (`audit.*`/`module.*` rows of one
+`[<transaction>]`) and its `run.started` with the next terminal `run.*` row of the same profile. An
+audited change folds by its transaction the same way. **Show its events** opens a fold, **Show every
+event** draws every row as recorded, and **Group by run** folds them again. A `warn` or `error` row is
+never folded away: it is drawn under its run's row while the fold is closed. A run or change without a
+terminal row yet is not folded. Searching, the filters and copying act on the recorded events.
 
 The Activity and Logs feeds settle independently of each other and retain their rows the same way,
 so the feed state beside them dates what is left on screen: `activity feed unavailable, retained

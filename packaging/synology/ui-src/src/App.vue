@@ -493,7 +493,7 @@
                   <article class="sdsync-panel">
                     <div class="sdsync-panel-heading">
                       <div><p class="sdsync-eyebrow">Structured activity</p><h3>Recent package events</h3></div>
-                      <div class="sdsync-evidence-heading-actions"><span class="sdsync-freshness">{{ reversedActivity.length }} of {{ activityLensTotal }} event{{ activityLensTotal === 1 ? '' : 's' }}</span><v-button type="border" display="icon-text" aria-label="Copy all visible activity events" tooltip="Copy the filtered activity events as bounded, sanitized troubleshooting text" :disabled="!reversedActivity.length" @click="copyVisibleActivity"><template #icon><action-icon name="copy" /></template>Copy visible</v-button></div>
+                      <div class="sdsync-evidence-heading-actions"><span class="sdsync-freshness">{{ reversedActivity.length }} of {{ activityLensTotal }} event{{ activityLensTotal === 1 ? '' : 's' }}</span><v-button type="border" display="icon-text" aria-label="Group activity by run or show every event" tooltip="Fold each run's rows into one row with its outcome, or draw every event; failures are always drawn" :disabled="!reversedActivity.length" @click="toggleActivityGrouping">{{ activityGroupingLabel() }}</v-button><v-button type="border" display="icon-text" aria-label="Copy all visible activity events" tooltip="Copy the filtered activity events as bounded, sanitized troubleshooting text" :disabled="!reversedActivity.length" @click="copyVisibleActivity"><template #icon><action-icon name="copy" /></template>Copy visible</v-button></div>
                     </div>
                     <p v-if="nasTimeNote" class="sdsync-field-note">{{ nasTimeNote }}</p>
                     <div class="sdsync-filter-list" aria-label="Activity filters">
@@ -501,7 +501,7 @@
                       <div class="sdsync-filter-row"><span class="sdsync-filter-label">Category</span><div class="sdsync-filter-control"><v-single-select class="sdsync-select-control" v-model="activityCategory" :options="activityLensCategoryOptions" width="100%" :custom-dropdown-cls="'sdsync-select-dropdown ' + themeClass" aria-label="Activity category" aria-describedby="sdsync-help-activity-category"><template #dropdown-icon><action-icon name="chevron-down" /></template></v-single-select><control-help help-key="activity-category" /></div></div>
                       <div class="sdsync-filter-row"><span class="sdsync-filter-label">Level</span><div class="sdsync-filter-control"><v-single-select class="sdsync-select-control" v-model="activityLevel" :options="activityLevelOptions" width="100%" :custom-dropdown-cls="'sdsync-select-dropdown ' + themeClass" aria-label="Activity level" aria-describedby="sdsync-help-activity-level"><template #dropdown-icon><action-icon name="chevron-down" /></template></v-single-select><control-help help-key="activity-level" /></div></div>
                     </div>
-                    <ol class="sdsync-activity-feed"><li v-if="!reversedActivity.length" class="sdsync-empty">{{ activityEmptyText }}</li><li v-for="event in shownActivity" :key="event.rowKey"><time>{{ formatDate(event.epoch) }}{{ nasTimeSuffix(event.epoch) }}</time><div class="sdsync-activity-detail"><strong>{{ event.code }}</strong><p v-if="event.message && !event.doctor_inventory">{{ event.message }}</p><p v-if="event.rejection_reason">{{ rejectionReasonText(event.rejection_reason) }}</p><div v-if="event.doctor_inventory" class="sdsync-inventory-evidence"><div class="sdsync-inventory-evidence-summary"><strong>{{ doctorInventoryScopeLabel(event.doctor_inventory.inventory.scope) }}</strong><span>{{ event.doctor_inventory.inventory.total }} total · {{ event.doctor_inventory.inventory.entries.length }} shown<span v-if="event.doctor_inventory.inventory.truncated"> · truncated</span></span></div><p v-if="!event.doctor_inventory.inventory.entries.length">No logical entries were visible.</p><div v-for="(entry, index) in event.doctor_inventory.inventory.entries" :key="entry.path + ':' + index" class="sdsync-inventory-evidence-entry"><span>{{ entry.kind }}</span><code>{{ entry.path }}</code><small>{{ entry.name }}</small></div></div><code v-if="event.client_request_id">Client request ID: {{ event.client_request_id }}</code></div><small><bdi>{{ shownName(event.profile) }}</bdi> · {{ event.state }} · {{ event.category }} / {{ event.level }}</small><v-button class="sdsync-evidence-copy" type="border" display="icon-text" :aria-label="'Copy activity event ' + event.code" tooltip="Copy this event as bounded, sanitized troubleshooting text" @click="copyActivityEvent(event)"><template #icon><action-icon name="copy" /></template>Copy</v-button></li><li v-if="activityHiddenCount" class="sdsync-empty sdsync-activity-more"><span>{{ activityMoreLabel }}</span> <v-button type="border" display="icon-text" tooltip="Draw the next 200 older events" @click="showMoreActivity">Show older</v-button></li></ol>
+                    <ol class="sdsync-activity-feed"><li v-if="!reversedActivity.length" class="sdsync-empty">{{ activityEmptyText }}</li><li v-for="event in shownActivity" :key="event.rowKey"><time>{{ formatDate(event.epoch) }}{{ nasTimeSuffix(event.epoch) }}</time><div class="sdsync-activity-detail"><strong>{{ event.code }}</strong><p v-if="event.message && !event.doctor_inventory">{{ event.message }}</p><p v-if="event.rejection_reason">{{ rejectionReasonText(event.rejection_reason) }}</p><div v-if="event.doctor_inventory" class="sdsync-inventory-evidence"><div class="sdsync-inventory-evidence-summary"><strong>{{ doctorInventoryScopeLabel(event.doctor_inventory.inventory.scope) }}</strong><span>{{ event.doctor_inventory.inventory.total }} total · {{ event.doctor_inventory.inventory.entries.length }} shown<span v-if="event.doctor_inventory.inventory.truncated"> · truncated</span></span></div><p v-if="!event.doctor_inventory.inventory.entries.length">No logical entries were visible.</p><div v-for="(entry, index) in event.doctor_inventory.inventory.entries" :key="entry.path + ':' + index" class="sdsync-inventory-evidence-entry"><span>{{ entry.kind }}</span><code>{{ entry.path }}</code><small>{{ entry.name }}</small></div></div><code v-if="event.client_request_id">Client request ID: {{ event.client_request_id }}</code><v-button v-if="event.fold" type="border" display="icon-text" :aria-label="activityFoldLabel(event.fold)" tooltip="Draw or hide the rows this run folds; failures are drawn either way" @click="toggleActivityFold(event.fold.key)">{{ activityFoldLabel(event.fold) }}</v-button></div><small><bdi>{{ shownName(event.profile) }}</bdi> · {{ event.state }} · {{ event.category }} / {{ event.level }}</small><v-button class="sdsync-evidence-copy" type="border" display="icon-text" :aria-label="'Copy activity event ' + event.code" tooltip="Copy this event as bounded, sanitized troubleshooting text" @click="copyActivityEvent(event)"><template #icon><action-icon name="copy" /></template>Copy</v-button></li><li v-if="activityHiddenCount" class="sdsync-empty sdsync-activity-more"><span>{{ activityMoreLabel }}</span> <v-button type="border" display="icon-text" tooltip="Draw the next 200 older events" @click="showMoreActivity">Show older</v-button></li></ol>
                   </article>
                 </div>
               </transition>
@@ -3465,6 +3465,137 @@ function normalizedEvents(events) {
   return normalized;
 }
 
+// Activity folding. A scheduled run writes five rows -- audit.requested,
+// run.started, run.succeeded, audit.succeeded, module.succeeded -- so 200 rows
+// held about forty runs and the three failures among them were buried. The
+// default view folds the rows of one audited transaction (`[<transaction>]` in
+// an audit.* or module.* message) and one run pair (run.started and the next
+// terminal run row of the same profile, which carry no transaction) into one
+// row per run that names its outcome. Nothing leaves the data: the rows stay in
+// the feed, copying copies all of them, each fold expands, and the whole view
+// can be switched back to every event. A row at warn or error is never folded
+// away: it is drawn under its fold's row even while the fold is closed. A
+// transaction or run with no terminal row yet is not folded, so a change still
+// in flight reads as its own rows.
+const ACTIVITY_TERMINAL_RUN_CODES = Object.freeze(["run.succeeded", "run.failed", "run.cancelled"]);
+const ACTIVITY_LEVEL_RANK = Object.freeze({ trace: 0, debug: 1, info: 2, warn: 3, error: 4 });
+const ACTIVITY_FOLD_COPY = Object.freeze({
+  outcome: Object.freeze({
+    succeeded: "succeeded",
+    failed: "failed",
+    cancelled: "cancelled",
+    outcome_unknown: "outcome unknown"
+  }),
+  run: (profile, outcome, duration, count) =>
+    `Run of ${profile === "all" ? "all profiles" : profile} ${outcome}${duration ? ` in ${duration}` : ""} · ${count} events`,
+  change: (operation, profile, outcome, count) =>
+    `${operation}${profile && profile !== "none" && profile !== "all" ? ` of ${profile}` : ""} ${outcome} · ${count} events`,
+  show: (count) => `Show its ${count} events`,
+  hide: "Hide its events",
+  showAll: "Show every event",
+  groupRuns: "Group by run"
+});
+
+function activityTransactionOf(event) {
+  if (!/^(?:audit|module)\./.test(event.code)) return null;
+  const match = /^Module ([a-z][a-z0-9-]{0,63}) (requested|succeeded|failed|outcome_unknown) \[([A-Za-z0-9_-]{1,96})\]/.exec(event.message);
+  return match ? { operation: match[1], state: match[2], transaction: match[3] } : null;
+}
+
+function activityDurationText(seconds) {
+  const value = Math.max(0, Math.round(Number(seconds) || 0));
+  if (value < 120) return `${value} s`;
+  if (value < 7200) return `${Math.round(value / 60)} min`;
+  return `${Math.round(value / 3600)} h`;
+}
+
+// `events` newest first, as the feed draws them; `expanded` names the open folds.
+function foldedActivityRows(events, expanded) {
+  const chronological = events.slice().reverse();
+  const groups = [];
+  const byTransaction = new Map();
+  const groupOf = new Map();
+  const join = (group, event) => { group.members.push(event); groupOf.set(event, group); };
+  for (const event of chronological) {
+    const transaction = activityTransactionOf(event);
+    if (!transaction) continue;
+    let group = byTransaction.get(transaction.transaction);
+    if (!group) {
+      group = { key: `tx:${transaction.transaction}`, operation: transaction.operation, profile: event.profile, members: [], outcome: "", run: null };
+      byTransaction.set(transaction.transaction, group);
+      groups.push(group);
+    }
+    if (transaction.state !== "requested") group.outcome = transaction.state;
+    join(group, event);
+  }
+  const openRuns = new Map();
+  for (const event of chronological) {
+    if (event.code === "run.started") {
+      openRuns.set(event.profile, event);
+      continue;
+    }
+    if (!ACTIVITY_TERMINAL_RUN_CODES.includes(event.code) || !openRuns.has(event.profile)) continue;
+    const started = openRuns.get(event.profile);
+    openRuns.delete(event.profile);
+    // The audited run this pair belongs to: a run or plan transaction of the
+    // same profile whose own rows bracket it.
+    let group = groups.find((candidate) => !candidate.run
+      && (candidate.operation === "run" || candidate.operation === "plan")
+      && candidate.profile === event.profile
+      && candidate.members[0].epoch <= started.epoch + 5
+      && candidate.members[candidate.members.length - 1].epoch + 5 >= event.epoch);
+    if (!group) {
+      group = { key: `run:${started.rowKey}`, operation: "run", profile: event.profile, members: [], outcome: "", run: null };
+      groups.push(group);
+    }
+    group.run = { started, finished: event };
+    join(group, started);
+    join(group, event);
+  }
+  const foldable = (group) => group.members.length >= 2 && Boolean(group.run || group.outcome);
+  const position = new Map(events.map((event, index) => [event, index]));
+  const rows = [];
+  const drawn = new Set();
+  for (const event of events) {
+    const group = groupOf.get(event);
+    if (!group || !foldable(group)) {
+      rows.push(event);
+      continue;
+    }
+    if (drawn.has(group)) continue;
+    drawn.add(group);
+    // In the feed's own order, so an opened fold reads exactly as the rows did.
+    const members = group.members.slice().sort((left, right) => position.get(left) - position.get(right));
+    const open = Boolean(expanded && expanded[group.key]);
+    const worst = members.reduce((level, member) => (
+      (ACTIVITY_LEVEL_RANK[member.level] || 0) > (ACTIVITY_LEVEL_RANK[level] || 0) ? member.level : level
+    ), "trace");
+    const state = group.run ? group.run.finished.state : group.outcome;
+    const outcome = ACTIVITY_FOLD_COPY.outcome[group.run ? group.run.finished.code.slice(4) : group.outcome] || state;
+    const message = group.run
+      ? ACTIVITY_FOLD_COPY.run(group.profile, outcome, activityDurationText(group.run.finished.epoch - group.run.started.epoch), members.length)
+      : ACTIVITY_FOLD_COPY.change(group.operation, group.profile, outcome, members.length);
+    const terminal = group.run ? group.run.finished : members.find((member) => member.code.startsWith("audit.")) || members[0];
+    rows.push({
+      rowKey: `fold:${group.key}`,
+      epoch: members[0].epoch,
+      code: terminal.code,
+      profile: group.profile,
+      state,
+      category: terminal.category,
+      level: worst,
+      message,
+      client_request_id: (members.find((member) => member.client_request_id) || {}).client_request_id || "",
+      doctor_inventory: null,
+      fold: { key: group.key, count: members.length, expanded: open }
+    });
+    for (const member of members) {
+      if (open || (ACTIVITY_LEVEL_RANK[member.level] || 0) >= ACTIVITY_LEVEL_RANK.warn) rows.push(member);
+    }
+  }
+  return rows;
+}
+
 function canonicalProfileConfiguration(value, snapshot = false) {
   if (!value || typeof value !== "object" || Array.isArray(value)) return null;
   const field = (direct, ...aliases) => snapshot ? pick(value, direct, ...aliases) : value[direct];
@@ -4155,6 +4286,7 @@ export default {
       // activitySearch for immediate typing feedback.
       activitySearchDebounced: "", activitySearchDebounceTimer: 0,
       activityCategory: "all", activityLevel: "all", activityRenderLimit: ACTIVITY_RENDER_STEP,
+      activityGrouped: true, activityExpandedFolds: {},
       activityTabs: [
         { id: "events", label: "All events" },
         { id: "changes", label: "Changes" },
@@ -4893,8 +5025,16 @@ export default {
     },
     // Only the newest rows are drawn; the filtered total above still counts every event,
     // and the control under the list says how many are not drawn.
-    shownActivity() { return this.reversedActivity.slice(0, Math.max(ACTIVITY_RENDER_STEP, Number(this.activityRenderLimit) || 0)); },
-    activityHiddenCount() { return Math.max(0, this.reversedActivity.length - this.shownActivity.length); },
+    // The rows the feed draws: every matching event, or with grouping on (the
+    // AppWindow's default; a context built without the flag draws every event)
+    // one row per run with its failures beneath it. See foldedActivityRows.
+    displayedActivity() {
+      return this.activityGrouped === true
+        ? foldedActivityRows(this.reversedActivity, this.activityExpandedFolds)
+        : this.reversedActivity;
+    },
+    shownActivity() { return this.displayedActivity.slice(0, Math.max(ACTIVITY_RENDER_STEP, Number(this.activityRenderLimit) || 0)); },
+    activityHiddenCount() { return Math.max(0, this.displayedActivity.length - this.shownActivity.length); },
     activityMoreLabel() {
       const hidden = this.activityHiddenCount;
       return hidden ? `${hidden} older event${hidden === 1 ? "" : "s"} not shown.` : "";
@@ -6271,6 +6411,15 @@ export default {
       return ` (NAS ${new Date((seconds + clock.offset) * 1000).toISOString().slice(0, 16).replace("T", " ")})`;
     },
     showMoreActivity() { this.activityRenderLimit = (Number(this.activityRenderLimit) || ACTIVITY_RENDER_STEP) + ACTIVITY_RENDER_STEP; },
+    toggleActivityGrouping() { this.activityGrouped = this.activityGrouped !== true; },
+    toggleActivityFold(key) {
+      const expanded = Object.assign({}, this.activityExpandedFolds);
+      if (expanded[key]) delete expanded[key];
+      else expanded[key] = true;
+      this.activityExpandedFolds = expanded;
+    },
+    activityFoldLabel(fold) { return fold.expanded ? ACTIVITY_FOLD_COPY.hide : ACTIVITY_FOLD_COPY.show(fold.count); },
+    activityGroupingLabel() { return this.activityGrouped === true ? ACTIVITY_FOLD_COPY.showAll : ACTIVITY_FOLD_COPY.groupRuns; },
     clockWatchdog() { clockWatchdog(this); },
     // `warnings` is the list of { code, text } the save returned, or null.
     noteMutationWarning(warnings) {
