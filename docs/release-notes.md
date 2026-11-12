@@ -293,6 +293,36 @@ lists its own commits.
   Synology package build (<target>)`, and a package API that reports neither reads `Not reported by
   package API`. See [Compatibility](dsm/compatibility.md#four-release-spks).
 
+### Dashboard bridge fixes from the NAS field report
+
+- **Doctor over many profiles reports again.** The package keeps up to 320 KiB of Doctor output, but
+  the bridge refused any result output over 64 KiB, so a Doctor over three or four profiles showed
+  every step as skipped and "The operation could not be started". The bridge now accepts what the
+  package carries; past that the result is `response_too_large`, never "could not be started". A
+  result the bridge refuses names the check (`result_shape_invalid`, `result_output_too_large`, ...)
+  in its message and in a `consume_failed` record in `api.log`.
+- **A read-only Doctor runs beside a sync.** It was refused while a shell-runner run held the run
+  lock, with a message about changing profiles. Only `doctor --write-test` is still refused there,
+  in its own words.
+- **A Doctor with no report says why on every step**: `Not run: Doctor produced no report. Cause:
+  <code, exit code>: <first line>`, closed by a **Why Doctor produced no report** row.
+- **A refused dashboard change names its reason.** Its Activity row ends `reason=<code>` and, when the
+  request named one, `request_id=<id>` (the ID the error message shows), and reads the reason in
+  words; the error message is worded by the reason instead of "Request could not be completed". See
+  [A dashboard change was refused](dsm/troubleshooting.md#a-dashboard-change-was-refused-rejected-post).
+  Conflicting or queue-full refusals (409) are now also in `api.log`.
+- **An open page renews its mutation token before it expires**, and when its tab becomes visible
+  again, so the first change after five idle minutes is no longer refused. A replay after a refusal
+  the page could not read carries a fresh token instead of repeating the refused one.
+- **A page left open across an upgrade is told to reload.** Every request carries `X-SDSYNC-Build`;
+  a change from another build is refused as `ui_build_stale` with that advice. Pages loaded before
+  this release send no build and are refused the same way: reload them once after upgrading.
+- **Activity folds each run into one row** with its outcome and duration; warnings and errors are
+  always drawn, each fold opens, and **Show every event** draws every row as recorded.
+- **Routines say what observes them**: idle and watching via native events, polling or the schedule,
+  partly observed, or blind since a time with the cause. Blind and partly observed routines are amber
+  Overview items.
+
 ## Read this before upgrading
 
 - **Rust 1.90 or newer is needed to build from source** (was 1.88). The verified-pair index uses redb
