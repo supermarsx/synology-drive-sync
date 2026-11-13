@@ -2933,3 +2933,30 @@ fn a_delete_event_dispatches_for_a_routine_that_can_delete() {
         h.logs()
     );
 }
+
+/// A routine edited since the last convergence may make a run do what an
+/// unchanged tree no longer says it would (deletion allowed, say): what was
+/// recorded is forgotten.
+#[cfg(unix)]
+#[test]
+fn an_edited_routine_forgets_what_was_recorded() {
+    let h = realtime_harness("converged-edited");
+    h.world.lock().unwrap().converged_record = true;
+    h.wait_for("arm", PATIENT, |h| armed_generation(h, "docs").is_some());
+    let _source = quiet_tree(&h);
+    change(&h, "a");
+    h.wait_for("the first run", PATIENT, |h| h.launched() == 1);
+    h.wait_for("idle", PATIENT, Harness::idle);
+    assert_eq!(converged_dirs(&h), 1);
+    routine(
+        &h.root.join("home"),
+        "docs",
+        "enabled=true\nmode=realtime\ndebounce_seconds=1\nretry_backoff_seconds=10\nallow_delete=true\n",
+    );
+    let _ = h.ask(Request::Reload);
+    h.wait_for("the record is forgotten", PATIENT, |h| {
+        converged_dirs(h) == 0
+    });
+    change(&h, "a");
+    h.wait_for("the change runs", PATIENT, |h| h.launched() == 2);
+}

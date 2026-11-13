@@ -348,6 +348,16 @@ struct Convergence {
     unavailable: Option<String>,
 }
 
+impl Convergence {
+    /// What the record says is no longer vouched for (the watch was replaced,
+    /// the routine or its profile was edited): the manifest goes, and a check
+    /// in flight is answered for nothing (its token no longer matches).
+    fn forget(&mut self) {
+        self.manifest.clear();
+        self.gate = Gate::Idle;
+    }
+}
+
 #[derive(Default)]
 enum Gate {
     #[default]
@@ -1385,6 +1395,11 @@ impl Control {
             let realtime =
                 matches!(&routine, Ok(Some(r)) if matches!(r.mode, Mode::Realtime { .. }));
             let source = facts.as_ref().ok().and_then(|f| f.source.clone());
+            // A routine or profile edited since the last convergence may make a
+            // run do what an unchanged tree no longer says it would.
+            if entry.routine != routine || entry.facts != facts {
+                entry.convergence.forget();
+            }
             entry.routine = routine;
             entry.facts = facts;
             let wanted = match (&entry.routine, &source) {
@@ -1439,7 +1454,7 @@ impl Control {
                         }
                         entry.armed = Some(wanted);
                         entry.armed_at = Some(Instant::now());
-                        entry.convergence = Convergence::default();
+                        entry.convergence.forget();
                         entry.floor_failing = false;
                         entry.backend_detail = None;
                         self.end_backend_episode(&name, &mut entry);
@@ -1450,7 +1465,7 @@ impl Control {
                         }
                         entry.armed = None;
                         entry.armed_at = None;
-                        entry.convergence = Convergence::default();
+                        entry.convergence.forget();
                         entry.floor_failing = false;
                         entry.backend_detail = None;
                         self.end_backend_episode(&name, &mut entry);
