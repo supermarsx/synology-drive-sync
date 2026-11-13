@@ -201,6 +201,20 @@ impl DirtySet {
         self.last_event = Some(now);
     }
 
+    /// A directory that no longer exists, for a routine that cannot delete: whatever was marked
+    /// at it or below it has nothing left to upload and nothing the routine may remove, and a
+    /// scope that names it would be one that is on neither side. Forgotten, so a folder made and
+    /// removed inside the quiet period leaves no run behind. Anything marked at its parent, or
+    /// beside it, stays.
+    pub(crate) fn forget_below(&mut self, dir: &str) {
+        let dir = dir.trim_matches('/');
+        if self.whole_tree || dir.is_empty() {
+            return;
+        }
+        self.dirs
+            .retain(|path, _| path != dir && !is_ancestor(dir, path));
+    }
+
     pub(crate) fn mark_whole_tree(&mut self, now: Instant) {
         self.dirs.clear();
         self.whole_tree = true;
@@ -399,6 +413,26 @@ impl ChangeSource for FakeChangeSource {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_removed_directory_forgets_what_was_marked_at_or_below_it_and_nothing_else() {
+        let now = Instant::now();
+        let mut set = DirtySet::default();
+        set.mark("a/scratch", Depth::Recursive, now);
+        set.mark("a/scratch/deep", Depth::Shallow, now);
+        set.mark("a/scratchy", Depth::Shallow, now);
+        set.mark("a", Depth::Shallow, now);
+        set.mark("b", Depth::Shallow, now);
+        set.forget_below("a/scratch");
+        let kept: Vec<&str> = set.dirs.keys().map(String::as_str).collect();
+        assert_eq!(kept, ["a", "a/scratchy", "b"]);
+        // The root is never forgotten, and a whole-tree mark is left alone.
+        set.forget_below("");
+        assert_eq!(set.dirs.len(), 3);
+        set.mark_whole_tree(now);
+        set.forget_below("a");
+        assert!(set.whole_tree);
+    }
 
     #[test]
     fn ceilings_match_the_shell() {

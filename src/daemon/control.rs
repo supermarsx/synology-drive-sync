@@ -3715,6 +3715,12 @@ impl Control {
                     // not allow deletion, so a removal can only be news to a
                     // routine that does.
                     if matches!(&entry.routine, Ok(Some(r)) if !r.allow_delete) {
+                        // A directory that went also takes with it what was marked at it: a
+                        // folder made and removed inside the quiet period is on neither side,
+                        // and a run scoped to it would fail as `scope_not_found`.
+                        if depth == Depth::Recursive {
+                            entry.dirty.forget_below(&dir);
+                        }
                         entry.ignored_deletes += 1;
                         if entry
                             .ignored_deletes_logged

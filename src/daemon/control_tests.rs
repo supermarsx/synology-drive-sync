@@ -2937,6 +2937,86 @@ fn a_delete_only_event_is_ignored_by_a_routine_that_cannot_delete() {
     h.wait_for("a real change runs", PATIENT, |h| h.launched() == 1);
 }
 
+/// A folder made and removed inside the quiet period is on neither side when a run would start.
+/// For a routine that cannot delete it leaves nothing to run for: a run scoped to the folder
+/// would fail as `scope_not_found` and be retried.
+#[test]
+fn a_folder_made_and_removed_leaves_nothing_to_run_for_a_routine_that_cannot_delete() {
+    let h = realtime_harness("transient-folder");
+    h.wait_for("arm", PATIENT, |h| armed_generation(h, "docs").is_some());
+    let send = |event: ChangeEvent| {
+        let _ = h.tx.send(Msg::Change(event));
+    };
+    send(ChangeEvent::Changed {
+        routine: "docs".into(),
+        dir: "a/scratch".into(),
+        depth: Depth::Recursive,
+    });
+    send(ChangeEvent::Deleted {
+        routine: "docs".into(),
+        dir: "a".into(),
+        depth: Depth::Shallow,
+    });
+    send(ChangeEvent::Deleted {
+        routine: "docs".into(),
+        dir: "a/scratch".into(),
+        depth: Depth::Recursive,
+    });
+    thread::sleep(Duration::from_millis(1600));
+    assert_eq!(h.launched(), 0, "{:?}", h.logs());
+    let status = h.ask(Request::Status);
+    assert_eq!(status["routines"][0]["pending_change"], false, "{status}");
+    // A real change beside it still runs, and names only what exists.
+    change(&h, "b");
+    h.wait_for("a real change runs", PATIENT, |h| h.launched() == 1);
+    let args = launched_args(&h, 0);
+    assert!(
+        !args.iter().any(|a| a == "a/scratch"),
+        "the removed folder is not a scope element: {args:?}"
+    );
+}
+
+/// A routine that may delete keeps the removed folder's own element (the NAS may hold it) and
+/// its parent's, so the set always names a folder that exists.
+#[test]
+fn a_removed_folder_is_its_own_element_beside_its_parent_for_a_routine_that_can_delete() {
+    let h = Harness::new("removed-folder-delete", |home, _| {
+        profile(home, "docs");
+        routine(
+            home,
+            "docs",
+            "enabled=true
+mode=realtime
+debounce_seconds=1
+allow_delete=true
+",
+        );
+    });
+    h.wait_for("arm", PATIENT, |h| armed_generation(h, "docs").is_some());
+    let _ = h.tx.send(Msg::Change(ChangeEvent::Deleted {
+        routine: "docs".into(),
+        dir: "a".into(),
+        depth: Depth::Shallow,
+    }));
+    let _ = h.tx.send(Msg::Change(ChangeEvent::Deleted {
+        routine: "docs".into(),
+        dir: "a/gone".into(),
+        depth: Depth::Recursive,
+    }));
+    h.wait_for("the dispatch", PATIENT, |h| h.launched() == 1);
+    let args = launched_args(&h, 0);
+    let elements: Vec<(&str, &str)> = args
+        .windows(2)
+        .filter(|w| w[0] == "--scope" || w[0] == "--scope-shallow")
+        .map(|w| (w[0].as_str(), w[1].as_str()))
+        .collect();
+    assert_eq!(
+        elements,
+        [("--scope-shallow", "a"), ("--scope", "a/gone")],
+        "{args:?}"
+    );
+}
+
 /// A routine that may delete treats a removal as any other change.
 #[test]
 fn a_delete_event_dispatches_for_a_routine_that_can_delete() {
