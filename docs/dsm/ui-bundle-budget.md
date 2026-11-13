@@ -35,7 +35,7 @@ stylesheet is now spent as a lever, and the numbers say so:
   `from`/`to`, `minmax(112px, 0.72fr)`, newline-anchored selectors, and the 260/220-char keyframe
   windows. No minifier has a knob for any of them.
 
-The bundle exceeds the 512,000-byte hint by about 118.0 KB (630,045 bytes; the figures below are older and
+The speed round (fix9: the Activity unchanged-token, a result-poll cache, parallel startup, hidden-tab polling, terminal cancel, the sync-page memory and the toast causes) grew it by 9,299 bytes to 657,455 (the stylesheet grew 158 bytes to 124,652). Before that, the bundle exceeded the 512,000-byte hint by about 118.0 KB (630,045 bytes; the figures below are older and
 were not all re-measured). The About page's installed-package-build row (one `<dt>`/`<dd>` pair, the
 `installedPackageBuildLabel` helper and its computed) grew it by 404 bytes from 629,641; the stylesheet did not
 move: 124,494 bytes. Round 7 grew it by 530 bytes from 629,111 (reworded index-issue copy and
