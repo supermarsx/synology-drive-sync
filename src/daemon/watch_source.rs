@@ -521,11 +521,18 @@ impl Worker {
         use synology_drive_sync::watch::Change;
         for change in changes {
             let event = match change {
-                Change::Path { dir, .. } => {
+                Change::Path { dir, kind, .. } => {
                     floor.reported(&dir);
-                    ChangeEvent::Changed {
-                        routine: self.spec.routine.clone(),
-                        dir,
+                    if kind == "delete" {
+                        ChangeEvent::Deleted {
+                            routine: self.spec.routine.clone(),
+                            dir,
+                        }
+                    } else {
+                        ChangeEvent::Changed {
+                            routine: self.spec.routine.clone(),
+                            dir,
+                        }
                     }
                 }
                 Change::Overflow => {

@@ -25,6 +25,11 @@ use super::routines::{Backend, BackendReason, SourceStatus};
 pub(crate) enum ChangeEvent {
     /// Something changed in `dir`, relative to the routine's source (`""` is the root).
     Changed { routine: String, dir: String },
+    /// An entry was removed from `dir` (an inotify delete, and nothing else).
+    /// A routine that cannot delete on the NAS has no work for it: the control
+    /// thread drops it, counted and named, instead of running a sync that can
+    /// only find nothing to do. Any other routine treats it as `Changed`.
+    Deleted { routine: String, dir: String },
     /// The kernel queue overflowed: events were lost. `None` means every routine.
     Overflow { routine: Option<String> },
     /// The routine's backend as the source now runs it, with the existing

@@ -2856,3 +2856,80 @@ fn a_check_that_cannot_be_made_dispatches_and_says_why() {
         "{line}"
     );
 }
+
+// ------------------------------------------------------- P3: delete-only events
+
+fn deleted(h: &Harness, dir: &str) {
+    let _ = h.tx.send(Msg::Change(ChangeEvent::Deleted {
+        routine: "docs".into(),
+        dir: dir.into(),
+    }));
+}
+
+/// A routine that cannot delete has no work for a removal: the event is
+/// dropped, counted in the status and named, and a real change still runs.
+#[test]
+fn a_delete_only_event_is_ignored_by_a_routine_that_cannot_delete() {
+    let h = realtime_harness("delete-ignored");
+    h.wait_for("arm", PATIENT, |h| armed_generation(h, "docs").is_some());
+    deleted(&h, "a");
+    deleted(&h, "b");
+    h.wait_for("the first event is named", PATIENT, |h| {
+        h.logs()
+            .iter()
+            .any(|l| l.starts_with("routine_events_ignored "))
+    });
+    let line = h
+        .logs()
+        .into_iter()
+        .find(|l| l.starts_with("routine_events_ignored "))
+        .unwrap();
+    assert!(
+        line.contains("profile=docs")
+            && line.contains("reason=delete_only_no_delete")
+            && line.contains("first_dir=a"),
+        "{line}"
+    );
+    // Past the debounce nothing was dispatched, and nothing is pending.
+    thread::sleep(Duration::from_millis(1600));
+    assert_eq!(h.launched(), 0);
+    let status = h.ask(Request::Status);
+    assert_eq!(status["routines"][0]["pending_change"], false, "{status}");
+    assert_eq!(
+        status["routines"][0]["ignored_delete_events"], 2,
+        "{status}"
+    );
+    // Only the first of a burst is logged.
+    assert_eq!(
+        h.logs()
+            .iter()
+            .filter(|l| l.starts_with("routine_events_ignored "))
+            .count(),
+        1
+    );
+    change(&h, "a");
+    h.wait_for("a real change runs", PATIENT, |h| h.launched() == 1);
+}
+
+/// A routine that may delete treats a removal as any other change.
+#[test]
+fn a_delete_event_dispatches_for_a_routine_that_can_delete() {
+    let h = Harness::new("delete-allowed", |home, _| {
+        profile(home, "docs");
+        routine(
+            home,
+            "docs",
+            "enabled=true\nmode=realtime\ndebounce_seconds=1\nallow_delete=true\n",
+        );
+    });
+    h.wait_for("arm", PATIENT, |h| armed_generation(h, "docs").is_some());
+    deleted(&h, "a");
+    h.wait_for("the dispatch", PATIENT, |h| h.launched() == 1);
+    assert!(
+        !h.logs()
+            .iter()
+            .any(|l| l.starts_with("routine_events_ignored ")),
+        "{:?}",
+        h.logs()
+    );
+}

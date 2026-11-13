@@ -108,6 +108,12 @@ tree once every 24 hours (`routine_full_reconcile`, `info`). A profile held by a
 block](operations.md#lasting-block-after-an-out-of-memory-kill) is not run by its routine, and each
 held trigger is logged at most once an hour (`routine_suppressed`).
 
+**Removals are not changes when deletion is off.** A routine that does not allow deletion (`allow_delete=false`, so the run
+is started with `--no-delete`) ignores an inotify delete event: it can only find nothing to do. The events are counted in
+`ctl status` (`ignored_delete_events`) and named (`routine_events_ignored`, the first and then at most hourly). A rename
+still counts, because its new name is something to upload. The polling fallback cannot tell a removal from any other change
+and reports them all.
+
 **A change that changes nothing is not run.** Many events leave a directory exactly as the last sync saw it
 (a temporary file created and removed, a file renamed away and back). When the quiet period ends, the daemon
 reads the changed directories (names, sizes, modification and change times and inodes of the entries the sync

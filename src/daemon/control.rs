@@ -326,6 +326,10 @@ struct Entry {
     observe_pending: Option<(Observe, String, Instant)>,
     /// What the last converged runs left (daemon/converged.rs).
     convergence: Convergence,
+    /// Delete events dropped because the routine cannot delete (counted in
+    /// `ctl status`; logged on the first and then at most hourly).
+    ignored_deletes: u64,
+    ignored_deletes_logged: Option<Instant>,
 }
 
 /// P8: a realtime routine's converged-directories record and the check that
@@ -396,6 +400,10 @@ impl Blocked {
 
 /// How often one held trigger is logged.
 const SUPPRESSED_LOG_EVERY: Duration = Duration::from_secs(3600);
+
+/// How often a routine's dropped delete events are logged (they are counted
+/// in `ctl status` meanwhile).
+const IGNORED_LOG_EVERY: Duration = Duration::from_secs(3600);
 
 /// An armed realtime routine whose watcher has not reported a backend after
 /// this long is not being observed (arming reports within its own bounded
@@ -1370,6 +1378,8 @@ impl Control {
                 armed_at: None,
                 observe_pending: None,
                 convergence: Convergence::default(),
+                ignored_deletes: 0,
+                ignored_deletes_logged: None,
             });
             entry.state = state;
             let realtime =
@@ -3549,6 +3559,38 @@ impl Control {
                     entry.trigger_seen = Some(wall);
                 }
             }
+            ChangeEvent::Deleted { routine, dir } => {
+                let mut named = None;
+                if let Some(entry) = self.routines.get_mut(&routine) {
+                    // The core is started with `--no-delete` when the routine does
+                    // not allow deletion, so a removal can only be news to a
+                    // routine that does.
+                    if matches!(&entry.routine, Ok(Some(r)) if !r.allow_delete) {
+                        entry.ignored_deletes += 1;
+                        if entry
+                            .ignored_deletes_logged
+                            .is_none_or(|at| now.duration_since(at) >= IGNORED_LOG_EVERY)
+                        {
+                            entry.ignored_deletes_logged = Some(now);
+                            named = Some(entry.ignored_deletes);
+                        }
+                    } else {
+                        entry.dirty.mark(&dir, now);
+                        entry.trigger_seen = Some(wall);
+                    }
+                }
+                if let Some(total) = named {
+                    self.log(
+                        Level::Info,
+                        "scheduler",
+                        "routine_events_ignored",
+                        format!(
+                            "profile={routine} reason=delete_only_no_delete ignored_total={total}                              first_dir={}",
+                            sanitize_detail(&dir, 120)
+                        ),
+                    );
+                }
+            }
             ChangeEvent::Overflow { routine } => {
                 for (name, entry) in &mut self.routines {
                     if routine.as_ref().is_none_or(|r| r == name) && entry.armed.is_some() {
@@ -3951,6 +3993,7 @@ impl Control {
                     "last_trigger_epoch": state.map(|s| s.last_trigger),
                     "last_run_epoch": state.map(|s| s.last_run),
                     "pending_change": !e.dirty.is_empty(),
+                    "ignored_delete_events": e.ignored_deletes,
                     "converged_dirs": e.convergence.manifest.len(),
                     "skipped_runs": e.convergence.skipped_runs,
                     "last_skip_epoch": e.convergence.last_skip_epoch,
@@ -4339,6 +4382,7 @@ fn profile_names_in(dir: &Path) -> Result<Vec<String>, String> {
 fn change_routine(event: &ChangeEvent) -> &str {
     match event {
         ChangeEvent::Changed { routine, .. }
+        | ChangeEvent::Deleted { routine, .. }
         | ChangeEvent::Backend { routine, .. }
         | ChangeEvent::Source { routine, .. }
         | ChangeEvent::Notice { routine, .. } => routine,
