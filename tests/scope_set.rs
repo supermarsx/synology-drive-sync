@@ -229,6 +229,30 @@ fn a_shallow_scope_never_replaces_a_subfolder_with_a_file() {
     );
 }
 
+/// A shallow element that is a file here and a folder on the NAS (a folder replaced by a file
+/// between the event and the run): neither is replaced, nothing in the folder is deleted, and
+/// the conflict is named.
+#[test]
+fn a_shallow_element_that_became_a_file_never_replaces_the_nas_folder() {
+    let fixture = Fixture::new("scope-element-clash", "/team/element");
+    fixture.write("a", b"now a file");
+    fixture.nas_file("a/f.txt", b"f", 1_700_000_000);
+    fixture.nas_file("a/sub/deep.txt", b"deep", 1_700_000_000);
+
+    let document = fixture.sync(&["--scope-shallow", "a", "--delete", "--allow-empty-source"]);
+    assert_eq!(fixture.nas("a/f.txt"), Some(b"f".to_vec()));
+    assert_eq!(fixture.nas("a/sub/deep.txt"), Some(b"deep".to_vec()));
+    let requests = fixture.server.requests();
+    assert!(touched_paths(&requests, "SYNO.FileStation.Delete.delete").is_empty());
+    assert!(
+        requests
+            .iter()
+            .all(|request| request.operation() != "SYNO.FileStation.Upload.upload")
+    );
+    let text = document.to_string();
+    assert!(text.contains("type-conflict"), "{document}");
+}
+
 /// Two dirty folders in separate subtrees, as the daemon sends them: each is listed, nothing
 /// else is, and both edits land.
 #[test]

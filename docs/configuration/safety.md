@@ -159,7 +159,9 @@ they are on both sides: they are not listed, compared, created, replaced or dele
 verified-pair record beneath them is pruned. The shallow folder itself may be created and is never
 deleted, because what its subfolders hold was not read. With `--delete`, only remote-only files
 directly inside it are deletion candidates. A local file where the NAS holds such a subfolder (or
-the reverse) is the lasting `type-conflict` skip, and a whole-tree run settles it. A path beneath a
+the reverse) is the lasting `type-conflict` skip, and a whole-tree run settles it, as is a shallow
+folder that is a file on the other side; nothing in that folder is deleted. A `--scope-shallow` that
+names a file is that file alone. A path beneath a
 `--scope` is dropped, and `--scope` wins over `--scope-shallow` of the same folder. A path that
 leaves the source (`..`), a DSM-managed name, or more than 1024 paths in all is refused before
 anything runs, and a link where an element should be is refused or never followed as for a single

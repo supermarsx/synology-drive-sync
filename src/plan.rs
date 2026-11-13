@@ -283,10 +283,23 @@ impl Scope {
         if self.is_root() {
             return;
         }
+        // A name both sides hold as different kinds, where the folder was not listed whole: a
+        // shallow element's own path that is a file on one side. Replacing either would decide
+        // about what lies beneath the folder, which nobody listed.
+        let unlisted_clash = |relative: &str, kind: EntryKind| {
+            remote
+                .entries
+                .get(relative)
+                .is_some_and(|entry| entry.kind != kind)
+                && !self.contains(relative, true)
+        };
         let out: BTreeSet<String> = local
             .entries
             .values()
-            .filter(|entry| !self.admits(&entry.relative, entry.kind))
+            .filter(|entry| {
+                !self.admits(&entry.relative, entry.kind)
+                    || unlisted_clash(&entry.relative, entry.kind)
+            })
             .map(|entry| entry.relative.clone())
             .chain(
                 remote
@@ -301,7 +314,6 @@ impl Scope {
             let remote_kind = remote.entries.remove(relative).map(|entry| entry.kind);
             if let (Some(local_kind), Some(remote_kind)) = (local_kind, remote_kind)
                 && local_kind != remote_kind
-                && (self.admits(relative, local_kind) || self.admits(relative, remote_kind))
             {
                 local.skipped.push(SkippedEntry {
                     relative: relative.clone(),
@@ -1158,6 +1170,15 @@ pub fn build_plan(
                 )?;
             }
             (EntryKind::File, EntryKind::Directory) => {
+                // Replacing a folder deletes everything beneath it, so it must have been listed
+                // whole. `Scope::confine` keeps a shallow folder out of here; this is the backstop.
+                if !options.scope.contains(&remote_entry.relative, true) {
+                    return Err(Error::Message(format!(
+                        "scope_unconfined: {:?} is a folder on the NAS this run did not list                          whole ({}); nothing was planned",
+                        remote_entry.relative,
+                        options.scope.describe()
+                    )));
+                }
                 let subtree = remote_subtree(&remote.entries, &remote_entry.relative);
                 if subtree.iter().any(|candidate| {
                     is_protected(candidate, rules, pairs) || shield.covers(&candidate.relative)
@@ -6758,6 +6779,48 @@ mod scoped_deletion_tests {
         let plan = build_plan(&root(), &local, &remote, &rules(), &mirror(scope)).unwrap();
         // Its direct files are this run's; the folder and whatever lies beneath it are not.
         assert_eq!(all_deleted(&plan), ["a/f.txt"]);
+    }
+
+    #[test]
+    fn a_shallow_element_that_is_a_file_here_and_a_folder_on_the_nas_is_left_alone() {
+        let scope = set(&[], &["a"]);
+        let mut local = local(&[("a", EntryKind::File, 1, 1_000)]);
+        let mut remote = remote(&[
+            ("a", EntryKind::Directory, 0, 0),
+            ("a/f.txt", EntryKind::File, 1, 1),
+            ("a/sub", EntryKind::Directory, 0, 0),
+        ]);
+        // Unconfined, the planner refuses to replace a folder it did not list whole.
+        let error =
+            build_plan(&root(), &local, &remote, &rules(), &mirror(scope.clone())).unwrap_err();
+        assert!(
+            matches!(&error, Error::Message(message) if message.starts_with("scope_unconfined:")),
+            "{error:?}"
+        );
+        scope.confine(&mut local, &mut remote);
+        assert_eq!(local.skipped.len(), 1);
+        assert_eq!(local.skipped[0].relative, "a");
+        assert_eq!(local.skipped[0].reason.as_str(), "type-conflict");
+        let plan = build_plan(&root(), &local, &remote, &rules(), &mirror(scope)).unwrap();
+        // Nothing replaced, and the folder's listed file is shielded with it.
+        assert!(all_deleted(&plan).is_empty(), "{:?}", all_deleted(&plan));
+        assert!(plan.uploads.is_empty());
+    }
+
+    #[test]
+    fn a_shallow_element_naming_a_file_is_that_file() {
+        let scope = set(&[], &["a/x.txt"]);
+        assert!(scope.matches("a/x.txt"));
+        assert!(!scope.matches("a/y.txt"));
+        let mut local = local(&[
+            ("a", EntryKind::Directory, 0, 0),
+            ("a/x.txt", EntryKind::File, 1, 1_000),
+        ]);
+        let mut remote = remote(&[("a", EntryKind::Directory, 0, 0)]);
+        scope.confine(&mut local, &mut remote);
+        let plan = build_plan(&root(), &local, &remote, &rules(), &mirror(scope)).unwrap();
+        assert_eq!(plan.uploads.len(), 1);
+        assert_eq!(plan.uploads[0].local.relative, "a/x.txt");
     }
 
     #[test]

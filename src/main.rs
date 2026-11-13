@@ -3044,11 +3044,12 @@ fn prepare_and_run_sync_reporting(
 
         // Before any digest is computed and before anything is planned: a scope that names nothing is
         // not a plan with no work in it.
+        // Asked of what the walks found, before confinement can set an element aside.
+        let absent = require_scope_present(&scope, &local, &remote)?;
+        warn_absent_scope_elements(&settings.output, &absent);
         // A shallow element's child directories leave both inventories before anything is
         // compared: nothing beneath them was listed.
         scope.confine(&mut local, &mut remote);
-        let absent = require_scope_present(&scope, &local, &remote)?;
-        warn_absent_scope_elements(&settings.output, &absent);
         // A scoped walk cannot see a second spelling of the scope on the NAS.
         sync::withhold_scope_spelling_conflicts(&root, &scope, &mut local, &remote, |folder| {
             let listed = client.list_child_names(folder, cancellation)?;
