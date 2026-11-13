@@ -5333,21 +5333,27 @@ export default {
     };
     document.addEventListener("visibilitychange", this.visibilityHandler);
     this.installProfileWindowGuard();
-    let csrfReady = false;
-    try {
-      await this.refreshCsrf();
-      csrfReady = true;
-    } catch (error) {
-      if (this.disposed) return;
+    // The mutation token and the first snapshot are independent reads (the snapshot GET
+    // carries no token), so they go out together: first data waits for the slower of the two
+    // CGI round trips instead of their sum. The snapshot cycle joins this token read rather
+    // than starting a second one, and does not report its failure again: it is reported here,
+    // once, with the authentication wording.
+    const tokenRead = this.refreshCsrf().then(() => null, (error) => {
+      if (this.disposed) return error;
       this.connected = false;
       this.csrfToken = "";
       this.bridgeIssue = this.describeBridgeError(error, "authentication");
       this.connectionLabel = this.bridgeIssue.title;
       this.toast(this.bridgeIssue.title, this.bridgeIssue.message, true);
+      return error;
+    });
+    this.csrfAttempt = { promise: tokenRead, reported: true };
+    try {
+      await this.refreshSnapshot(false);
+      await tokenRead;
+    } finally {
+      this.csrfAttempt = null;
     }
-    if (this.disposed) return;
-    if (csrfReady) await this.refreshSnapshot(false);
-    else this.scheduleSnapshot();
   },
   // The error banner outlives the error that raised it unless something takes it
   // down. A render that throws keeps the previous page on screen, so a later flush
@@ -6612,11 +6618,28 @@ export default {
       let cycle;
       cycle = (async () => {
         let succeeded = false;
+        // The mutation token is read beside the snapshot, not before it: the snapshot GET needs
+        // no token, so a window with none (first open, or recovery after a failure cleared it)
+        // pays one CGI round trip for both instead of two in a row. The window's own start-up
+        // read is joined rather than repeated.
+        let tokenRead = null;
+        if (!this.csrfToken) {
+          tokenRead = this.csrfAttempt || {
+            reported: false,
+            promise: this.refreshCsrf().then(() => null, (error) => error)
+          };
+          this.csrfAttempt = null;
+        }
+        let tokenError = null;
         try {
-          if (!this.csrfToken) await this.refreshCsrf();
+          const snapshotRead = apiGet(this.auth, "snapshot").then((value) => ({ value }), (error) => ({ error }));
+          if (tokenRead) tokenError = await tokenRead.promise;
+          const read = await snapshotRead;
           if (this.disposed || generation !== this.snapshotGeneration || this.snapshotRefreshBlocked) return false;
-          const snapshot = await apiGet(this.auth, "snapshot");
-          if (this.disposed || generation !== this.snapshotGeneration || this.snapshotRefreshBlocked) return false;
+          // Both failed: the token's error leads, as it did when the token was read first. A
+          // token failure the window already reported (start-up) is not reported a second time.
+          if (read.error) throw (tokenError && !tokenRead.reported ? tokenError : read.error);
+          const snapshot = read.value;
           if (snapshot.schema !== SNAPSHOT_SCHEMA) throw new Error("Unsupported DSM API schema");
           // generated_at_epoch is the package clock's reading at generation
           // time and ticks forward on every single read regardless of
@@ -6644,6 +6667,10 @@ export default {
           this.snapshotGeneratedAt = Number(snapshot.generated_at_epoch) > 0 ? Number(snapshot.generated_at_epoch) : 0;
           this.snapshotReceivedAtMs = Date.now();
           this.nowMs = this.snapshotReceivedAtMs;
+          // The snapshot is good and is shown, whatever became of the token. A token read that
+          // failed is raised below through the same failure path it always took, so the
+          // dashboard says so and the next poll reads the token again.
+          if (tokenError) throw tokenError;
           this.snapshotFailureCode = "";
           this.snapshotFailureStatus = 0;
           this.snapshotFailureStreak = 0;
@@ -6671,8 +6698,11 @@ export default {
           this.snapshotFailureStatus = Number(error && error.status) || 0;
           this.staleFreshnessCode = this.snapshotFailureCode;
           this.snapshotFailureStreak = Math.min(Number(this.snapshotFailureStreak) + 1, WIDGET_BACKOFF_RAMP_MS.length + 1);
-          this.bridgeIssue = this.describeBridgeError(error, "status");
-          this.connectionLabel = this.bridgeIssue.title;
+          // A token failure the window reported at start-up keeps that report's wording.
+          if (!(tokenRead && tokenRead.reported && error === tokenError)) {
+            this.bridgeIssue = this.describeBridgeError(error, "status");
+            this.connectionLabel = this.bridgeIssue.title;
+          }
           this.freshness = this.snapshot
             ? retainedDocumentFreshness(this.snapshotReceivedAtMs, this.snapshotFailureCode, Date.now(), this.snapshotFailureStreak)
             : "Status unavailable";
