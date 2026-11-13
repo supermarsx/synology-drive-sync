@@ -467,6 +467,21 @@ made on a helper thread and waited for at most 15 seconds; on expiry the run fai
 `entropy_unavailable`), the run state and the dashboard. The next run asks again. The random source
 itself is unchanged.
 
+### The daemon reuses the DSM session between runs
+
+Under the daemon engine a run hands its DSM session back to the daemon instead of logging out, and the
+next run of the same profile within 10 idle minutes borrows it: no discovery, no login (and no
+one-time code) and no logout, about 2.5 to 3.5 seconds of every run on a DS416. The session travels
+only over an anonymous socket pair on the run's standard input, never in argv, the environment or a
+file, and every kept session is logged out when it has been idle for 10 minutes, when a run does not
+hand it back, and when the service stops. A rewritten password or TOTP file ends the reuse. A session
+DSM refuses costs one fresh login, named `session.borrowed_rejected` in the run's log, and shortens
+the idle TTL (`session_ttl_shortened`). New core log events: `session.borrowed`,
+`session.borrowed_rejected`, `session.handover_unused`, `session.channel_unusable`,
+`session.handback_failed`. New `controller.log` events: `session_lent`, `session_kept`,
+`session_logged_out` and the others listed in [Operations](dsm/operations.md). See
+[DSM session reuse between runs](dsm/security.md#dsm-session-reuse-between-runs).
+
 ## Read this before upgrading
 
 - **Rust 1.90 or newer is needed to build from source** (was 1.88). The verified-pair index uses redb

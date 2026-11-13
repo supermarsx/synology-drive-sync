@@ -443,6 +443,46 @@ evidence.
 Secret replacements travel in a separate private queue file, enter the manager through standard
 input, and are removed after claim. See [Secrets and protected values](secrets.md).
 
+## DSM session reuse between runs
+
+Under the daemon engine a run does not log out of File Station at its end. It hands its DSM session
+back to the daemon, which keeps it for at most **10 minutes of idle time** and lends it to the next run
+of the same profile. That run skips discovery, login (and its one-time code) and logout, which on a
+DS416 is about 2.5 to 3.5 seconds of every run. A run over several profiles (`all`) and the shell
+engine log in and out themselves, as before.
+
+| | Before | With session reuse |
+| --- | --- | --- |
+| Password at rest | `0600` file, package user | unchanged |
+| Who reads the password | the core, every run | the core, every run (it is needed if DSM refuses the lent session) |
+| How long a session lives | the run | the run, then at most 10 idle minutes in the daemon |
+| Where the session is | the core's memory | the daemon's and the core's memory, and an anonymous socket pair between them |
+| Who could take it | the package user or root (`ptrace`, `/proc/<pid>/mem`) | the same: they can already read the password file beside it |
+| DSM side | one login (two with a one-time code) per run | about one login per burst of runs |
+
+The session never travels in an argument list, an environment variable or a file. The daemon writes
+it to one end of a socket pair it creates for the run, and the run's standard input is the other end:
+no filesystem name, readable by the run and the daemon only, and the run hands its session back on the
+same socket. Every copy is zeroized when dropped. Log lines, state records, `controller.state`, the
+status reply and the result and progress records name the profile and what happened, never the
+session (`session_lent`, `session_kept`, `session_logged_out`, and the core's `session.borrowed`).
+The test suite searches every file a daemon and its runs write, the runs' argument lists and
+environments and the daemon's status reply for the session after real runs.
+
+A run uses a lent session only when it was established under the run's own credentials: a digest of
+the URL, the account and the identity of the password and TOTP files (a rewritten password file ends
+the reuse). Otherwise it logs in, names it (`session.handover_unused`), and the daemon logs the
+unused session out. If DSM refuses a lent session, the run logs in once, afresh, and names it
+(`session.borrowed_rejected`); the client's re-authentication bound still applies, so a refused
+session can never become a login loop. The daemon then shortens the idle TTL to half the idle time
+DSM did not honour, never under one minute (`session_ttl_shortened`).
+
+Every kept session is logged out: when its idle TTL passes (`why=ttl_expired`), when a run replaces it,
+when a run that borrowed it does not hand it back (`session_handback_missing`, `why=not_handed_back`)
+and when the service stops (`why=service_stop`). A failed logout is named (`session_logout_failed`)
+and DSM ends the session on its own idle timer. A daemon killed outright (SIGKILL) cannot log out;
+its session then ends at DSM's idle timer.
+
 ## Desktop alert boundary
 
 The package does not acquire DSM's `conf/resource` `sysnotify` worker and does not register

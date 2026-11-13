@@ -183,6 +183,18 @@ pub enum EventCode {
     /// The memory budget could not be checked on this host (not Linux, `/proc` unreadable); the
     /// run went ahead unchecked.
     MemoryBudgetUnchecked,
+    /// The run used the DSM session the package daemon lent it: no discovery, login or logout.
+    SessionBorrowed,
+    /// DSM refused the lent session; the run logged in once, afresh.
+    SessionBorrowedRejected,
+    /// A session was lent and not used (other credentials, unreadable, or an API map this run
+    /// cannot use); the run logged in itself.
+    SessionHandoverUnused,
+    /// `--session-stdin` was given and the channel could not be used; the run logged in and out
+    /// itself.
+    SessionChannelUnusable,
+    /// The run could not hand its session back to the daemon, and logged it out instead.
+    SessionHandbackFailed,
 }
 
 impl EventCode {
@@ -191,7 +203,7 @@ impl EventCode {
     /// Exhaustive by construction: a new variant that is not listed here fails
     /// `every_event_code_has_a_stable_machine_and_human_name`, so no code can ship without a
     /// stable machine name and human message.
-    pub const ALL: [Self; 42] = [
+    pub const ALL: [Self; 47] = [
         Self::RunBuild,
         Self::RunStarted,
         Self::RunCompleted,
@@ -234,6 +246,11 @@ impl EventCode {
         Self::PairIndexStoreFailed,
         Self::TreeTooLargeForMemory,
         Self::MemoryBudgetUnchecked,
+        Self::SessionBorrowed,
+        Self::SessionBorrowedRejected,
+        Self::SessionHandoverUnused,
+        Self::SessionChannelUnusable,
+        Self::SessionHandbackFailed,
     ];
 
     /// The stable machine name, as `docs/observability.schema.json` publishes it.
@@ -281,6 +298,11 @@ impl EventCode {
             Self::PairIndexStoreFailed => "pair_index.store_failed",
             Self::TreeTooLargeForMemory => "memory.tree_too_large",
             Self::MemoryBudgetUnchecked => "memory.budget_unchecked",
+            Self::SessionBorrowed => "session.borrowed",
+            Self::SessionBorrowedRejected => "session.borrowed_rejected",
+            Self::SessionHandoverUnused => "session.handover_unused",
+            Self::SessionChannelUnusable => "session.channel_unusable",
+            Self::SessionHandbackFailed => "session.handback_failed",
         }
     }
 
@@ -341,6 +363,19 @@ impl EventCode {
             }
             Self::MemoryBudgetUnchecked => {
                 "the memory budget could not be checked on this host; the run went ahead unchecked"
+            }
+            Self::SessionBorrowed => "the run used the session the package service lent it",
+            Self::SessionBorrowedRejected => {
+                "DSM refused the lent session; the run logged in once, afresh"
+            }
+            Self::SessionHandoverUnused => {
+                "a lent session could not be used by this run; it logged in itself"
+            }
+            Self::SessionChannelUnusable => {
+                "the session channel could not be used; the run logged in and out itself"
+            }
+            Self::SessionHandbackFailed => {
+                "the session could not be handed back to the package service; it was logged out"
             }
         }
     }

@@ -38,6 +38,11 @@ use crate::path::{RemoteRoot, is_dsm_managed, parent_and_name};
 use crate::plan::{Scope, ScopeDepth};
 use crate::{Error, Result};
 
+mod session_handover;
+pub use session_handover::{
+    HANDBACK_SCHEMA, HANDOVER_SCHEMA, LENT_NOTHING, MAX_HANDOVER_BYTES, SessionHandover,
+};
+
 const DISCOVERY_APIS: &[&str] = &[
     "SYNO.API.Auth",
     "SYNO.FileStation.Info",
@@ -1481,6 +1486,15 @@ struct ResponseFacts {
     server_date: Option<i64>,
 }
 
+/// The APIs a sync or plan run cannot work without, beside `SYNO.API.Auth`: checked against a
+/// discovered map and against a lent one alike.
+const RUN_REQUIRED_APIS: &[(&str, u32)] = &[
+    ("SYNO.FileStation.List", 2),
+    ("SYNO.FileStation.CreateFolder", 2),
+    ("SYNO.FileStation.Upload", 2),
+    ("SYNO.FileStation.CheckPermission", 3),
+];
+
 impl ApiClient {
     pub fn connect(options: &ClientOptions) -> Result<Self> {
         Self::connect_observed(options, None)
@@ -1495,17 +1509,7 @@ impl ApiClient {
         options: &ClientOptions,
         observer: Option<RequestObserver>,
     ) -> Result<Self> {
-        Self::connect_with_requirements(
-            options,
-            &[
-                ("SYNO.FileStation.List", 2),
-                ("SYNO.FileStation.CreateFolder", 2),
-                ("SYNO.FileStation.Upload", 2),
-                ("SYNO.FileStation.CheckPermission", 3),
-            ],
-            None,
-            observer,
-        )
+        Self::connect_with_requirements(options, RUN_REQUIRED_APIS, None, observer)
     }
 
     /// Connect a least-privilege client for authentication tests and the
@@ -1545,6 +1549,26 @@ impl ApiClient {
     fn connect_with_requirements(
         options: &ClientOptions,
         required_apis: &[(&str, u32)],
+        control_deadline: Option<Instant>,
+        observer: Option<RequestObserver>,
+    ) -> Result<Self> {
+        let mut client = Self::undiscovered(options, control_deadline, observer)?;
+        client.apis = client.discover()?;
+        client.validate_requirements(required_apis)?;
+        Ok(client)
+    }
+
+    fn validate_requirements(&self, required_apis: &[(&str, u32)]) -> Result<()> {
+        self.validate_api("SYNO.API.Auth", 3)?;
+        for &(api, version) in required_apis {
+            self.validate_api(api, version)?;
+        }
+        Ok(())
+    }
+
+    /// The transport, built and announced, before any request: no API map, no session.
+    fn undiscovered(
+        options: &ClientOptions,
         control_deadline: Option<Instant>,
         observer: Option<RequestObserver>,
     ) -> Result<Self> {
@@ -1596,7 +1620,7 @@ impl ApiClient {
         // rather than once per request.
         let connection = connection_detail(&base, options);
         let forward_proxy = environment_forward_proxy(&base);
-        let mut client = Self {
+        let client = Self {
             http,
             download_http,
             upload_http,
@@ -1622,11 +1646,6 @@ impl ApiClient {
         // Announced before discovery so the endpoint is named ahead of the first request it
         // explains, which is the order a reader needs.
         client.observe(ApiObservation::Connected(connection));
-        client.apis = client.discover()?;
-        client.validate_api("SYNO.API.Auth", 3)?;
-        for &(api, version) in required_apis {
-            client.validate_api(api, version)?;
-        }
         Ok(client)
     }
 

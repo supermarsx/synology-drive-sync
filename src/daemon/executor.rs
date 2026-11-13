@@ -72,6 +72,10 @@ pub(crate) struct RunSpec {
     /// The runner's pre-core checks (daemon/preflight.rs), run by the
     /// supervisor first; a refusal never starts the core.
     pub(crate) preflight: Option<PreflightStep>,
+    /// The DSM session channel (daemon/session.rs): the core's standard
+    /// input, settled before the run is reported finished. `None`: stdin is
+    /// `/dev/null` and the core logs in and out itself.
+    pub(crate) session: Option<super::session::Lease>,
 }
 
 /// A run's pre-core check: `Err((reason, detail))` refuses it.
@@ -767,6 +771,11 @@ mod process {
             None => None,
         };
         let finished = |exit, ending, tail: Vec<u8>, records, record_error, oom, phase| {
+            // The session comes back (or is ended) before anyone hears the run
+            // finished, so the next run of the profile can borrow it.
+            if let Some(lease) = &spec.session {
+                lease.settle();
+            }
             let mut report = RunReport {
                 exit,
                 ending,
@@ -809,7 +818,10 @@ mod process {
             .args(&spec.args)
             .env_clear()
             .envs(spec.env.iter().map(|(k, v)| (k, v)))
-            .stdin(Stdio::null())
+            .stdin(match &spec.session {
+                Some(lease) => lease.stdin(),
+                None => Stdio::null(),
+            })
             .stdout(Stdio::null())
             .stderr(Stdio::piped());
         let parent = sys::getpid();
@@ -819,7 +831,11 @@ mod process {
             command.pre_exec(move || sys::child_setup(parent, nice));
         }
         let oom_before = oom_kill_count();
-        let mut child = match command.spawn() {
+        let spawned = command.spawn();
+        // The command keeps the child's end of every pipe it was given; the
+        // session channel must see the child's own close, not wait for ours.
+        drop(command);
+        let mut child = match spawned {
             Ok(child) => child,
             Err(error) => {
                 let cause = format!("{}: {error}", spec.program.display());
@@ -1047,6 +1063,7 @@ mod process {
                 timings,
                 audit: None,
                 preflight: None,
+                session: None,
             }
         }
 

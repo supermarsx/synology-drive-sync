@@ -294,6 +294,9 @@ What differs under the daemon, and what the pages below describe for it:
 - Every run publishes `var/run/run.scope` (see [Saves beside a daemon run](#saves-beside-a-daemon-run)).
 - Realtime routines use the daemon's in-process inotify watcher, not `sdsync-dsm-api --watch` (see
   [Realtime mode](routines.md#realtime-mode-and-fallback)).
+- A run hands its DSM session back to the daemon instead of logging out, and the next run of the
+  profile within 10 idle minutes borrows it: no discovery, login or logout (see
+  [DSM session reuse between runs](security.md#dsm-session-reuse-between-runs)).
 
 ### Gates before a daemon run
 
@@ -626,6 +629,11 @@ knowing when reading it:
 | `ctl_peer_gone` / `ctl_peer_unchecked` | `info` / `warn`. A client of a long control request (`wait`, `mutate`, `stop`) closed its connection before the reply, so its slot was freed (`verb=`, `waited_ms=`) / the daemon could not tell whether the client was still there (`verb=`, `cause=`), so that wait cannot notice a hang-up; its deadline still bounds it |
 | `ctl_reply_dropped` / `ctl_socket_option_failed` | `info` / `warn`. A reply could not be written because the client had gone (`code=`, `cause=`) / a socket option could not be set on a connection (`option=write_timeout`, `cause=`), so a reply to that client may block until its deadline. A connection that sent no request (`code=empty_request`) is logged once per episode |
 | `ctl_empty_requests_ended` / `ctl_unread_evicted` / `ctl_unread_eviction_ended` | `info` / `warn` / `info`. Connections that sent no request were counted instead of logged, and none has come for 30 s (`count=`, `over_ms=`) / the control socket had 128 connections waiting to send a request, so the oldest is dropped for each new one and told `ctl_busy` (`path=`, `cause=`; once per episode, so a client that reconnects without a request cannot starve `ping` or `stop`) / that episode ended (`count=`, `over_ms=`). Both ends are written by the next request the socket reads |
+| `session_lent` / `session_kept` / `session_not_kept` | `info`. A run of `profile=` was lent its kept DSM session (`idle_s=`) / handed a session back, now kept (`borrowed=none\|used\|rejected\|ignored`) / handed none back because it ended its own. See [DSM session reuse](security.md#dsm-session-reuse-between-runs) |
+| `session_logged_out` / `session_logout_failed` | `info` / `warn`. The daemon ended a kept session (`profile=`, `why=ttl_expired\|replaced\|unused_by_run\|not_handed_back\|service_stop`) / DSM did not take the logout (`cause=`); DSM then ends it on its own idle timer |
+| `session_handback_missing` | `warn`. A run that was given the session channel handed nothing usable back (`profile=`, `cause=`); a session it was lent is logged out |
+| `session_ttl_shortened` / `session_rejected` | `warn`. DSM refused a lent session that had been idle `idle_s=` seconds; the run logged in once, afresh, and the idle TTL became `ttl_s=` (never under 60) / was already that short |
+| `session_channel_failed` / `session_logout_inline` / `session_notes_dropped` | `warn`. No socket pair could be made for a run (`cause=`; the run logs in itself) / no logout thread could be started, so the logout ran on the control thread / more than 64 session notes arrived between two turns (`count=`) |
 
 Re-levelled from `warn` to `error` because each records a failed write or delivery:
 `activity_append_failed`, `alert_unavailable`, `observability_write_failed` (which now carries the
