@@ -16,8 +16,10 @@ without sending the file to the client. The deletion and server-copy guards are 
 remote data, so they require the complete MD5, IEEE CRC32 and SHA-256 fingerprint, which DSM does not
 compute and the client obtains by streaming the file. That needs download permission, but only for
 the remote-only files a deletion would remove and the files a server-side copy would duplicate, a set
-that is empty when nothing is being deleted or copied. Include that read traffic in bandwidth,
-reverse-proxy timeout, and scheduling estimates for a first mirror run against a populated destination.
+that is empty when nothing is being deleted or copied. A server-side copy is planned only for a moved
+file of 8 MiB or more; a smaller one is uploaded and verified instead, so its old copy is never read.
+Include that read traffic in bandwidth, reverse-proxy timeout, and scheduling estimates for a first
+mirror run against a populated destination.
 
 Content correspondence is stateless. Every run rebuilds it from current local and remote state; no
 persistent path/hash database can become stale.

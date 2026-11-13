@@ -30,7 +30,7 @@ Use a quiescent, exclusively owned local directory containing:
 - a binary file large enough to exercise the real proxy upload path;
 - a nested file and an empty directory;
 - a file that will be changed between two syncs.
-- `move-from/server-copy.bin`, whose bytes are unique in the corpus, for the cross-parent server-copy exercise.
+- `move-from/server-copy.bin`, whose bytes are unique in the corpus and which is at least 8 MiB, for the cross-parent server-copy exercise. A smaller moved file is uploaded instead, because the copy's source read and task cost more than sending it.
 
 Record content hashes outside the source tree. On Unix:
 

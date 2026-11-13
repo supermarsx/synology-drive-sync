@@ -2819,19 +2819,77 @@ fn extensive_level_without_write_test_remains_non_mutating() {
     )));
 }
 
+/// A file just large enough to be server-copied rather than uploaded, and unique in each fixture.
+fn copy_payload() -> Vec<u8> {
+    let mut payload = b"copy-me-on-nas"
+        .repeat(1 + (synology_drive_sync::plan::SERVER_COPY_MIN_BYTES as usize) / 14);
+    payload.truncate(synology_drive_sync::plan::SERVER_COPY_MIN_BYTES as usize);
+    payload
+}
+
 #[test]
-fn unique_cross_parent_rename_uses_verified_server_copy_without_uploading_bytes() {
-    let fixture = TestDir::new("server-copy");
+fn a_small_cross_parent_rename_is_uploaded_without_downloading_its_old_copy() {
+    let fixture = TestDir::new("small-move");
     let source = fixture.child("source");
     fs::create_dir_all(source.join("new")).expect("create renamed source directory");
     let local_file = source.join("new/item.bin");
-    fs::write(&local_file, b"copy-me-on-nas").expect("write server-copy source file");
+    fs::write(&local_file, b"copy-me-on-nas").expect("write moved source file");
     let mtime = modified_seconds(&local_file);
     let password = fixture.write("password", PASSWORD);
     let server = MockFileStation::start();
     server.add_directory("/team/copy");
     server.add_directory("/team/copy/old");
     server.add_file("/team/copy/old/item.bin", b"copy-me-on-nas", mtime);
+
+    let source_text = source.to_str().expect("UTF-8 source path");
+    let password_text = password.to_str().expect("UTF-8 password path");
+    let sync = run(&deferral_sync_arguments(
+        source_text,
+        "/team/copy",
+        server.base_url(),
+        password_text,
+        &[],
+    ));
+    assert_success(&sync);
+    let synced = stdout_json(&sync);
+    assert_eq!(synced["result"]["uploaded"], 1);
+    assert_eq!(synced["result"]["server_copied"], 0);
+    assert_eq!(
+        server.file_contents("/team/copy/new/item.bin"),
+        Some(b"copy-me-on-nas".to_vec())
+    );
+    assert_eq!(
+        server.file_contents("/team/copy/old/item.bin"),
+        Some(b"copy-me-on-nas".to_vec()),
+        "additive mode retains the old remote path"
+    );
+    let operations = server
+        .requests()
+        .iter()
+        .map(|request| request.operation())
+        .collect::<Vec<_>>();
+    assert!(
+        !operations.iter().any(
+            |operation| operation == "SYNO.FileStation.Download.download"
+                || operation == "SYNO.FileStation.CopyMove.start"
+        ),
+        "a small move neither reads its old copy nor copies it: {operations:?}"
+    );
+}
+
+#[test]
+fn unique_cross_parent_rename_uses_verified_server_copy_without_uploading_bytes() {
+    let fixture = TestDir::new("server-copy");
+    let source = fixture.child("source");
+    fs::create_dir_all(source.join("new")).expect("create renamed source directory");
+    let local_file = source.join("new/item.bin");
+    fs::write(&local_file, copy_payload()).expect("write server-copy source file");
+    let mtime = modified_seconds(&local_file);
+    let password = fixture.write("password", PASSWORD);
+    let server = MockFileStation::start();
+    server.add_directory("/team/copy");
+    server.add_directory("/team/copy/old");
+    server.add_file("/team/copy/old/item.bin", &copy_payload(), mtime);
 
     let source_text = source.to_str().expect("UTF-8 source path");
     let password_text = password.to_str().expect("UTF-8 password path");
@@ -2858,7 +2916,10 @@ fn unique_cross_parent_rename_uses_verified_server_copy_without_uploading_bytes(
     assert_eq!(planned["plan"]["summary"]["uploads"], 0);
     assert_eq!(planned["plan"]["summary"]["upload_bytes"], 0);
     assert_eq!(planned["plan"]["summary"]["server_copies"], 1);
-    assert_eq!(planned["plan"]["summary"]["server_copy_fallback_bytes"], 14);
+    assert_eq!(
+        planned["plan"]["summary"]["server_copy_fallback_bytes"],
+        synology_drive_sync::plan::SERVER_COPY_MIN_BYTES
+    );
     assert_eq!(planned["plan"]["summary"]["directories"], 1);
     let copy = &planned["plan"]["actions"]["copies"][0];
     assert_eq!(copy["from_relative"], "old/item.bin");
@@ -2898,11 +2959,11 @@ fn unique_cross_parent_rename_uses_verified_server_copy_without_uploading_bytes(
     assert_eq!(synced["result"]["directories_created"], 1);
     assert_eq!(
         server.file_contents("/team/copy/new/item.bin"),
-        Some(b"copy-me-on-nas".to_vec())
+        Some(copy_payload())
     );
     assert_eq!(
         server.file_contents("/team/copy/old/item.bin"),
-        Some(b"copy-me-on-nas".to_vec()),
+        Some(copy_payload()),
         "additive mode must retain the old remote path"
     );
 
@@ -4738,13 +4799,13 @@ fn a_server_copy_stamped_with_the_copy_time_is_a_warning_not_a_failure() {
     let source = fixture.child("source");
     fs::create_dir_all(source.join("new")).expect("create renamed source directory");
     let local_file = source.join("new/item.bin");
-    fs::write(&local_file, b"copy-me-on-nas").expect("write server-copy source file");
+    fs::write(&local_file, copy_payload()).expect("write server-copy source file");
     let mtime = modified_seconds(&local_file);
     let password = fixture.write("password", PASSWORD);
     let server = MockFileStation::start();
     server.add_directory("/team/copy");
     server.add_directory("/team/copy/old");
-    server.add_file("/team/copy/old/item.bin", b"copy-me-on-nas", mtime);
+    server.add_file("/team/copy/old/item.bin", &copy_payload(), mtime);
     server.stamp_copies_with(mtime + 3_600);
 
     let source_text = source.to_str().expect("UTF-8 source path");
@@ -4762,7 +4823,7 @@ fn a_server_copy_stamped_with_the_copy_time_is_a_warning_not_a_failure() {
     assert_eq!(document["result"]["mtime_not_kept"], 1);
     assert_eq!(
         server.file_contents("/team/copy/new/item.bin"),
-        Some(b"copy-me-on-nas".to_vec())
+        Some(copy_payload())
     );
 }
 
@@ -4774,13 +4835,13 @@ fn a_server_copy_that_finishes_with_an_error_is_uploaded_in_the_same_run() {
     let source = fixture.child("source");
     fs::create_dir_all(source.join("new")).expect("create renamed source directory");
     let local_file = source.join("new/item.bin");
-    fs::write(&local_file, b"copy-me-on-nas").expect("write server-copy source file");
+    fs::write(&local_file, copy_payload()).expect("write server-copy source file");
     let mtime = modified_seconds(&local_file);
     let password = fixture.write("password", PASSWORD);
     let server = MockFileStation::start();
     server.add_directory("/team/copy");
     server.add_directory("/team/copy/old");
-    server.add_file("/team/copy/old/item.bin", b"copy-me-on-nas", mtime);
+    server.add_file("/team/copy/old/item.bin", &copy_payload(), mtime);
     server.fail_next_copy_task();
 
     let source_text = source.to_str().expect("UTF-8 source path");
@@ -4798,7 +4859,7 @@ fn a_server_copy_that_finishes_with_an_error_is_uploaded_in_the_same_run() {
     assert_eq!(document["result"]["recovered"]["server_copy_fallbacks"], 1);
     assert_eq!(
         server.file_contents("/team/copy/new/item.bin"),
-        Some(b"copy-me-on-nas".to_vec())
+        Some(copy_payload())
     );
 
     let second = run(&arguments);

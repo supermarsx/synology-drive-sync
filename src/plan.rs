@@ -125,6 +125,18 @@ impl Scope {
     }
 }
 
+/// The smallest file a server-side copy may replace an upload for.
+///
+/// A copy is planned only on a strong fingerprint of its source, which the client reads by
+/// downloading the remote file, and executing it costs a non-overwriting CopyMove task, its polls
+/// and a live MD5 of the destination. Below this size those requests and the download outweigh
+/// sending the bytes: on a DS416, a 10-file folder move of 2.5 MB is about 13 s as copies and about
+/// 5 s as uploads (perf-design section 7.1). A smaller file is uploaded and verified, which is the
+/// baseline every copy already falls back to, and no remote-only file that small is downloaded to
+/// make it a copy source. Deletion guards are unaffected: they keep their strong fingerprint at
+/// any size.
+pub const SERVER_COPY_MIN_BYTES: u64 = 8 * 1024 * 1024;
+
 #[derive(Clone, Debug)]
 pub struct PlanOptions {
     pub delete: bool,
@@ -385,7 +397,8 @@ impl SyncPlan {
 
 /// Select the minimum remote files whose content is needed to build a content-mode plan.
 /// Same-path equal-size files need a digest for comparison. Remote-only files are considered
-/// only when CopyMove is available and their size/basename can satisfy a supported copy action.
+/// only when CopyMove is available, they are at least [`SERVER_COPY_MIN_BYTES`], and their
+/// size/basename can satisfy a supported copy action.
 pub fn select_remote_content_hashes(
     local: &LocalInventory,
     remote: &RemoteInventory,
@@ -681,7 +694,7 @@ fn strong_candidates(
         BTreeMap::new();
     for entry in local.entries.values() {
         if entry.kind != EntryKind::File
-            || entry.size == 0
+            || entry.size < SERVER_COPY_MIN_BYTES
             || pairs.remote_of(remote, &entry.relative).is_some()
             || resolution.shield.covers(&entry.relative)
         {
@@ -696,7 +709,7 @@ fn strong_candidates(
 
     for entry in remote.entries.values() {
         if entry.kind != EntryKind::File
-            || entry.size == 0
+            || entry.size < SERVER_COPY_MIN_BYTES
             || pairs.local_of(local, &entry.relative).is_some()
             || is_protected(entry, rules, pairs)
             || resolution.shield.covers(&entry.relative)
@@ -1935,6 +1948,10 @@ fn replace_uploads_with_server_copies(
                 "content comparison requires every local MD5/CRC32/SHA-256 fingerprint".to_owned(),
             ));
         }
+        // Checked after the fingerprint so the fail-closed rule above still covers every upload.
+        if upload.local.size < SERVER_COPY_MIN_BYTES {
+            continue;
+        }
         local_by_content
             .entry((
                 upload.local.size,
@@ -1949,7 +1966,7 @@ fn replace_uploads_with_server_copies(
         BTreeMap::new();
     for entry in remote.entries.values() {
         if entry.kind != EntryKind::File
-            || entry.size == 0
+            || entry.size < SERVER_COPY_MIN_BYTES
             || pairs.local_of(local, &entry.relative).is_some()
             || is_protected(entry, rules, pairs)
             || predeleted.contains(entry.relative.as_str())
@@ -2910,6 +2927,9 @@ mod tests {
     use std::path::PathBuf;
 
     use super::*;
+
+    /// A file size a server-side copy is planned for.
+    const COPY: u64 = SERVER_COPY_MIN_BYTES;
 
     fn local(entries: &[(&str, EntryKind, u64, i64)]) -> LocalInventory {
         LocalInventory {
@@ -4181,13 +4201,13 @@ mod tests {
                 local_entries.push((
                     format!("new/photo-{index:07}.jpg"),
                     EntryKind::File,
-                    1000,
+                    SERVER_COPY_MIN_BYTES,
                     1_700_000_000_000,
                 ));
                 remote_entries.push((
                     format!("old/photo-{index:07}.jpg"),
                     EntryKind::File,
-                    1000,
+                    SERVER_COPY_MIN_BYTES,
                     1_700_000_000,
                 ));
             }
@@ -4878,8 +4898,8 @@ mod tests {
 
     #[test]
     fn unique_cross_parent_content_match_becomes_non_destructive_server_copy() {
-        let mut local = local(&[("new/report.bin", EntryKind::File, 4, 3_000)]);
-        let mut remote = remote(&[("old/report.bin", EntryKind::File, 4, 3)]);
+        let mut local = local(&[("new/report.bin", EntryKind::File, COPY, 3_000)]);
+        let mut remote = remote(&[("old/report.bin", EntryKind::File, COPY, 3)]);
         local.entries.get_mut("new/report.bin").unwrap().content_md5 = Some(digest(7));
         remote
             .entries
@@ -4914,15 +4934,51 @@ mod tests {
         assert_eq!(mirror.post_deletes[0].relative, "old/report.bin");
         let guard = mirror.post_deletes[0].destination_guard.as_ref().unwrap();
         assert_eq!(guard.remote_path, "/share/root/new/report.bin");
-        assert_eq!(guard.expected_size, 4);
+        assert_eq!(guard.expected_size, COPY);
         assert_eq!(guard.expected_mtime_seconds, 3);
         assert_eq!(guard.local.relative, "new/report.bin");
     }
 
     #[test]
+    fn a_small_cross_parent_move_is_uploaded_without_reading_its_old_copy() {
+        let small = COPY - 1;
+        let mut local = local(&[("new/report.bin", EntryKind::File, small, 3_000)]);
+        let mut remote = remote(&[("old/report.bin", EntryKind::File, small, 3)]);
+        local.entries.get_mut("new/report.bin").unwrap().content_md5 = Some(digest(7));
+
+        // The remote-only file is not downloaded for a copy it could only make slower.
+        let (comparison, strong) =
+            select_plan_digests(&local, &remote, &rules(&[]), true, false, &[]);
+        assert!(comparison.is_empty());
+        assert!(strong.is_empty());
+
+        // Even with its strong fingerprint in hand, the plan uploads.
+        remote
+            .entries
+            .get_mut("old/report.bin")
+            .unwrap()
+            .content_md5 = Some(digest(7));
+        let plan = build_plan(
+            &RemoteRoot::parse("/share/root").unwrap(),
+            &local,
+            &remote,
+            &rules(&[]),
+            &content_options(false, true),
+        )
+        .unwrap();
+        assert_eq!(plan.uploads.len(), 1);
+        assert_eq!(plan.upload_bytes, small);
+        assert!(plan.copies.is_empty());
+
+        // A mirror still guards the deletion of the old path with a strong fingerprint.
+        let (_, strong) = select_plan_digests(&local, &remote, &rules(&[]), true, true, &[]);
+        assert_eq!(strong, BTreeSet::from(["old/report.bin".to_owned()]));
+    }
+
+    #[test]
     fn server_copy_candidate_with_wrong_mtime_keeps_upload_fallback() {
-        let mut local = local(&[("new/report.bin", EntryKind::File, 4, 3_000)]);
-        let mut remote = remote(&[("old/report.bin", EntryKind::File, 4, 2)]);
+        let mut local = local(&[("new/report.bin", EntryKind::File, COPY, 3_000)]);
+        let mut remote = remote(&[("old/report.bin", EntryKind::File, COPY, 2)]);
         local.entries.get_mut("new/report.bin").unwrap().content_md5 = Some(digest(7));
         remote
             .entries
@@ -4944,8 +5000,8 @@ mod tests {
 
     #[test]
     fn basename_change_keeps_verified_upload_fallback() {
-        let mut local = local(&[("folder/new.bin", EntryKind::File, 4, 3_000)]);
-        let mut remote = remote(&[("folder/old.bin", EntryKind::File, 4, 3)]);
+        let mut local = local(&[("folder/new.bin", EntryKind::File, COPY, 3_000)]);
+        let mut remote = remote(&[("folder/old.bin", EntryKind::File, COPY, 3)]);
         local.entries.get_mut("folder/new.bin").unwrap().content_md5 = Some(digest(4));
         remote
             .entries
@@ -4967,10 +5023,10 @@ mod tests {
 
     #[test]
     fn duplicate_content_matches_keep_verified_upload_fallback() {
-        let mut local = local(&[("new/report.bin", EntryKind::File, 4, 3_000)]);
+        let mut local = local(&[("new/report.bin", EntryKind::File, COPY, 3_000)]);
         let mut remote = remote(&[
-            ("old-a/report.bin", EntryKind::File, 4, 3),
-            ("old-b/report.bin", EntryKind::File, 4, 3),
+            ("old-a/report.bin", EntryKind::File, COPY, 3),
+            ("old-b/report.bin", EntryKind::File, COPY, 3),
         ]);
         local.entries.get_mut("new/report.bin").unwrap().content_md5 = Some(digest(9));
         for entry in remote.entries.values_mut() {
@@ -4991,8 +5047,8 @@ mod tests {
 
     #[test]
     fn same_digest_with_different_size_is_never_reused() {
-        let mut local = local(&[("new/report.bin", EntryKind::File, 5, 3_000)]);
-        let mut remote = remote(&[("old/report.bin", EntryKind::File, 4, 3)]);
+        let mut local = local(&[("new/report.bin", EntryKind::File, COPY + 1, 3_000)]);
+        let mut remote = remote(&[("old/report.bin", EntryKind::File, COPY, 3)]);
         local.entries.get_mut("new/report.bin").unwrap().content_md5 = Some(digest(3));
         remote
             .entries
@@ -5014,8 +5070,8 @@ mod tests {
 
     #[test]
     fn unavailable_copy_api_does_not_require_remote_only_hashes() {
-        let mut local = local(&[("new/report.bin", EntryKind::File, 4, 3_000)]);
-        let remote = remote(&[("old/report.bin", EntryKind::File, 4, 1)]);
+        let mut local = local(&[("new/report.bin", EntryKind::File, COPY, 3_000)]);
+        let remote = remote(&[("old/report.bin", EntryKind::File, COPY, 1)]);
         local.entries.get_mut("new/report.bin").unwrap().content_md5 = Some(digest(4));
 
         let plan = build_plan(
@@ -5033,16 +5089,16 @@ mod tests {
     #[test]
     fn remote_hash_selection_is_minimal_and_protection_aware() {
         let local = local(&[
-            ("same.bin", EntryKind::File, 4, 1_000),
-            ("new/report.bin", EntryKind::File, 4, 1_000),
-            ("ignored.bin", EntryKind::File, 4, 1_000),
+            ("same.bin", EntryKind::File, COPY, 1_000),
+            ("new/report.bin", EntryKind::File, COPY, 1_000),
+            ("ignored.bin", EntryKind::File, COPY, 1_000),
         ]);
         let remote = remote(&[
-            ("same.bin", EntryKind::File, 4, 1),
-            ("old/report.bin", EntryKind::File, 4, 1),
-            ("ignored.bin", EntryKind::File, 4, 1),
+            ("same.bin", EntryKind::File, COPY, 1),
+            ("old/report.bin", EntryKind::File, COPY, 1),
+            ("ignored.bin", EntryKind::File, COPY, 1),
             ("other/report.bin", EntryKind::File, 9, 1),
-            ("@eaDir/report.bin", EntryKind::File, 4, 1),
+            ("@eaDir/report.bin", EntryKind::File, COPY, 1),
         ]);
         let ignore = rules(&["ignored.bin"]);
 
