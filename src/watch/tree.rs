@@ -150,8 +150,13 @@ pub struct TreeWatch {
 /// Every mask bit the tree asks for. `IN_ONLYDIR` and `IN_DONT_FOLLOW` make a directory replaced
 /// by a file or a symbolic link between listing and watching fail instead of being watched;
 /// `IN_EXCL_UNLINK` stops events for files already unlinked from a watched directory.
+///
+/// Deletions are always asked for, like moves, whether or not they are reported: an event set
+/// without them (a routine that may not delete) must still see the ignore file removed, which
+/// changes what is excluded and is reported whatever the set.
 fn watch_mask(events: &EventSet) -> AddWatchFlags {
     let mut mask = AddWatchFlags::IN_CREATE
+        | AddWatchFlags::IN_DELETE
         | AddWatchFlags::IN_MOVED_FROM
         | AddWatchFlags::IN_MOVED_TO
         | AddWatchFlags::IN_DELETE_SELF
@@ -161,9 +166,6 @@ fn watch_mask(events: &EventSet) -> AddWatchFlags {
         | AddWatchFlags::from_bits_retain(libc::IN_EXCL_UNLINK);
     if events.close_write {
         mask |= AddWatchFlags::IN_CLOSE_WRITE;
-    }
-    if events.delete {
-        mask |= AddWatchFlags::IN_DELETE;
     }
     if events.attrib {
         mask |= AddWatchFlags::IN_ATTRIB;
@@ -1001,12 +1003,12 @@ mod tests {
         assert_eq!(kind_of(AddWatchFlags::IN_MODIFY), "modify");
         assert_eq!(kind_of(AddWatchFlags::IN_OPEN), "other");
         let quiet = watch_mask(&EventSet::default());
-        assert!(quiet.contains(AddWatchFlags::IN_CREATE | AddWatchFlags::IN_MOVE));
+        // Deletions are armed even when not reported: the ignore file's removal is news.
+        assert!(quiet.contains(
+            AddWatchFlags::IN_CREATE | AddWatchFlags::IN_MOVE | AddWatchFlags::IN_DELETE
+        ));
         assert!(!quiet.intersects(
-            AddWatchFlags::IN_CLOSE_WRITE
-                | AddWatchFlags::IN_DELETE
-                | AddWatchFlags::IN_ATTRIB
-                | AddWatchFlags::IN_MODIFY
+            AddWatchFlags::IN_CLOSE_WRITE | AddWatchFlags::IN_ATTRIB | AddWatchFlags::IN_MODIFY
         ));
         let all = watch_mask(&EventSet::all());
         assert!(all.contains(

@@ -108,6 +108,28 @@ pub enum Change {
     Overflow,
 }
 
+impl Change {
+    /// Whether this change can only take something away from what a sync uploads: an entry
+    /// deleted from `dir`, or moved out of it. A sync that may not delete has nothing to do for
+    /// one, so a routine with deletion off need not dispatch a run for it (perf-design section 3.1).
+    ///
+    /// Where a moved entry went is its own `moved_to` (or `new_dir`) change, which is never
+    /// removal-only. Neither is the ignore file's removal: it changes what is excluded, so files it
+    /// hid are uploaded now. Neither is an overflow: what was lost is unknown.
+    ///
+    /// A caller that drops a removal still counts its directory as reported, so a floor walk does
+    /// not later take the same removal for a change inotify missed.
+    pub fn only_removes(&self) -> bool {
+        match self {
+            Self::Path { dir, entry, kind } => {
+                matches!(*kind, "delete" | "moved_from")
+                    && !(dir.is_empty() && Filter::is_rules_file(entry))
+            }
+            Self::Overflow => false,
+        }
+    }
+}
+
 /// Why a tree could not be watched, or stopped being watched.
 ///
 /// [`WatchError::reason`] is a `backend_reason` token the controller and the dashboard already
@@ -544,6 +566,33 @@ pub fn join_relative(dir: &str, entry: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_deletions_and_moves_out_only_remove() {
+        let path = |dir: &str, entry: &str, kind: &'static str| Change::Path {
+            dir: dir.to_owned(),
+            entry: entry.to_owned(),
+            kind,
+        };
+        assert!(path("docs", "docs/a.txt", "delete").only_removes());
+        assert!(path("docs", "docs/old", "moved_from").only_removes());
+        assert!(path("", "a.txt", "delete").only_removes());
+        for kind in [
+            "close_write",
+            "create",
+            "moved_to",
+            "attrib",
+            "modify",
+            "new_dir",
+        ] {
+            assert!(!path("docs", "docs/a.txt", kind).only_removes(), "{kind}");
+        }
+        // The ignore file's removal includes what it excluded; one in a subfolder is a plain file.
+        assert!(!path("", DEFAULT_IGNORE_FILE, "delete").only_removes());
+        assert!(!path("", DEFAULT_IGNORE_FILE, "moved_from").only_removes());
+        assert!(path("docs", &format!("docs/{DEFAULT_IGNORE_FILE}"), "delete").only_removes());
+        assert!(!Change::Overflow.only_removes());
+    }
 
     #[test]
     fn budget_is_the_controllers_eighty_percent_less_what_is_held() {

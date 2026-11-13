@@ -458,6 +458,57 @@ fn an_edited_ignore_file_changes_what_is_watched() {
     assert_eq!(tree.watch_count(), 1);
 }
 
+/// What a routine that may not delete arms: no deletions and no moves out reported. A removal
+/// raises nothing, a move inside the tree still reports where the entry went, and the ignore
+/// file's removal is still seen.
+#[test]
+fn an_event_set_without_removals_still_sees_moves_in_and_the_ignore_file_go() {
+    let scratch = Scratch::new("no-removals");
+    let source = scratch.source();
+    fs::create_dir_all(source.join("docs/old")).unwrap();
+    fs::create_dir_all(source.join("build")).unwrap();
+    fs::write(source.join("docs/a.txt"), b"a").unwrap();
+    fs::write(source.join("docs/old/b.txt"), b"b").unwrap();
+    fs::write(source.join(".sdsyncignore"), b"build/\n").unwrap();
+    let events = EventSet {
+        delete: false,
+        moved_from: false,
+        modify: false,
+        ..EventSet::all()
+    };
+    let mut tree = TreeWatch::arm(
+        &source,
+        options(&source, &[], events, LimitPolicy::Unchecked),
+    )
+    .unwrap();
+    assert!(!tree.is_watched("build"));
+
+    fs::remove_file(source.join("docs/a.txt")).unwrap();
+    fs::rename(
+        source.join("docs/old/b.txt"),
+        scratch.outside().join("b.txt"),
+    )
+    .unwrap();
+    let removed = quiet(&mut tree, Duration::from_millis(500));
+    assert!(removed.is_empty(), "{:?}", entries(&removed));
+
+    fs::rename(source.join("docs/old"), source.join("docs/new")).unwrap();
+    let moved = gather(&mut tree, |seen| has(seen, "docs/new", "moved_to"));
+    assert!(has(&moved, "docs/new", "moved_to"), "{:?}", entries(&moved));
+    assert!(moved.iter().all(|change| !change.only_removes()));
+    assert!(tree.is_watched("docs/new"));
+
+    fs::remove_file(source.join(".sdsyncignore")).unwrap();
+    let rules = gather(&mut tree, |seen| has(seen, ".sdsyncignore", "delete"));
+    assert!(
+        has(&rules, ".sdsyncignore", "delete"),
+        "{:?}",
+        entries(&rules)
+    );
+    assert!(rules.iter().all(|change| !change.only_removes()));
+    assert!(tree.is_watched("build"), "the rules no longer exclude it");
+}
+
 #[test]
 fn a_burst_the_kernel_cannot_queue_is_an_overflow_and_the_tree_recovers() {
     let scratch = Scratch::new("overflow");
