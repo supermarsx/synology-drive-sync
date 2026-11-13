@@ -225,6 +225,9 @@ pub(crate) struct Settings {
     pub(crate) observe_grace: Duration,
     /// The child's base environment (already allowlisted).
     pub(crate) child_env: Vec<(std::ffi::OsString, std::ffi::OsString)>,
+    /// How long a run's DSM session is kept for the next run of its profile
+    /// (daemon/session.rs); `None` never keeps one.
+    pub(crate) session_ttl: Option<Duration>,
 }
 
 impl Default for Settings {
@@ -239,6 +242,7 @@ impl Default for Settings {
             full_reconcile_every: Duration::from_secs(24 * 3600),
             observe_grace: Duration::from_secs(30),
             child_env: allowlisted_env(std::env::vars_os()),
+            session_ttl: None,
         }
     }
 }
@@ -414,6 +418,8 @@ pub(crate) struct Control {
     audit: Arc<dyn super::audit::RunAudit>,
     alerts: Arc<dyn super::alerts::Alerts>,
     changes: Option<Box<dyn ChangeSource>>,
+    /// The DSM sessions kept between runs (fix9 P7).
+    sessions: super::session::Sessions,
     next_generation: u64,
     sink: Box<dyn EventSink>,
     writer: StateWriter,
@@ -477,6 +483,7 @@ pub(crate) struct Parts {
 impl Control {
     pub(crate) fn new(parts: Parts, tx: Sender<Msg>) -> io::Result<Self> {
         Ok(Self {
+            sessions: super::session::Sessions::new(parts.settings.session_ttl),
             paths: parts.paths,
             settings: parts.settings,
             launcher: parts.launcher,
@@ -1421,6 +1428,8 @@ impl Control {
         self.start_next(now);
         self.evaluate_routines(now);
         self.observe_routines(now);
+        self.sessions.expire();
+        self.log_session_notes();
         if self
             .last_controller_write
             .is_none_or(|at| at.elapsed() >= Duration::from_secs(30))
@@ -2449,9 +2458,19 @@ impl Control {
             request.id
         ));
         let _ = fs::remove_file(&progress_record);
+        // One profile's run borrows that profile's DSM session; a run over
+        // several logs in and out itself.
+        let session = match profiles.as_slice() {
+            [profile] if request.scope != "all" => self.sessions.lend(profile),
+            _ => None,
+        };
+        let mut args = self.core_args(&request, &profiles, &result_record, &progress_record);
+        if session.is_some() {
+            args.push("--session-stdin".into());
+        }
         let spec = RunSpec {
             program: self.paths.core_binary.clone(),
-            args: self.core_args(&request, &profiles, &result_record, &progress_record),
+            args,
             env: self.settings.child_env.clone(),
             nice: match self.settings.core_nice {
                 Some(nice) => Some(nice),
@@ -2467,6 +2486,7 @@ impl Control {
             progress_record: Some(progress_record),
             timings: self.settings.timings,
             preflight: self.preflight(&request, &profiles),
+            session,
             audit: Some(super::executor::AuditStep {
                 audit: Arc::clone(&self.audit),
                 operation: match request.action {
@@ -3767,12 +3787,22 @@ impl Control {
         }
     }
 
+    /// The session cache's notes, into the controller log.
+    fn log_session_notes(&mut self) {
+        for note in self.sessions.notes() {
+            self.log(note.level, "controller", note.event, note.detail);
+        }
+    }
+
     /// True once everything has stopped and been recorded.
     fn shutdown_complete(&mut self) -> bool {
         let overdue = self.shutdown_deadline.is_some_and(|d| Instant::now() >= d);
         if self.active.is_some() && !overdue {
             return false;
         }
+        // No run is left to borrow a session: end every one kept.
+        self.sessions.close();
+        self.log_session_notes();
         if let Some(active) = self.active.take() {
             // The supervisor did not report within its own bound: record the run
             // as the cancellation it was, naming that it was abandoned.

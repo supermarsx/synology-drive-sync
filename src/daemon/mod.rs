@@ -28,6 +28,7 @@ pub(crate) mod preflight;
 #[cfg(target_os = "linux")]
 pub(crate) mod queue;
 pub(crate) mod routines;
+pub(crate) mod session;
 pub(crate) mod state;
 #[cfg(target_os = "linux")]
 pub(crate) mod sys;
