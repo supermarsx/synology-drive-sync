@@ -23738,23 +23738,26 @@ mod tests {
             );
             return configured;
         }
+        // The core is built into cargo's artifact directory (`target/debug`), which is an
+        // ancestor of the test binary whatever the layout: `target/debug/deps/<exe>` up to cargo
+        // 1.99, `target/debug/build/<package>/<hash>/out/<exe>` from 1.100, which a fixed number
+        // of `parent()` calls took for the artifact directory and so found no core at all.
         let executable = std::env::current_exe().unwrap();
-        let deps = executable.parent().unwrap();
-        let profile_root = deps.parent().unwrap();
-        let workspace_target = profile_root.parent().unwrap();
-        for candidate in [
-            profile_root.join("synology-drive-sync"),
-            workspace_target.join("debug/synology-drive-sync"),
-            workspace_target.join("release/synology-drive-sync"),
-        ] {
-            if candidate.is_file() {
-                return candidate;
+        for directory in executable.ancestors().skip(1) {
+            for candidate in [
+                directory.join("synology-drive-sync"),
+                directory.join("debug/synology-drive-sync"),
+                directory.join("release/synology-drive-sync"),
+            ] {
+                if candidate.is_file() {
+                    return candidate;
+                }
             }
         }
         panic!(
             "the core binary is not built; run the suite with --all-targets or set \
-             SDSYNC_VALIDATOR_BINARY (looked beside {})",
-            profile_root.display()
+             SDSYNC_VALIDATOR_BINARY (looked in every directory above {})",
+            executable.display()
         );
     }
 
