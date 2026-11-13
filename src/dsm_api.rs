@@ -1334,6 +1334,9 @@ enum ReadAction {
     },
     Activity {
         lines: u16,
+        /// The version a previous full answer carried. When it is still the current one the
+        /// answer is `{unchanged: true}` and the feed is not read, rendered or sanitised again.
+        since: Option<String>,
     },
     /// The stored per-profile totals and their combination.
     ///
@@ -2855,8 +2858,14 @@ fn parse_read_action(mut query: BTreeMap<String, String>) -> BridgeResult<ReadAc
         }
         "activity" => {
             let lines = parse_lines(query.remove("lines"))?;
+            let since = query.remove("since");
+            if let Some(since) = &since
+                && !valid_activity_version(since)
+            {
+                return Err(BridgeError::bad_request());
+            }
             require_empty_query(&query)?;
-            ReadAction::Activity { lines }
+            ReadAction::Activity { lines, since }
         }
         "status-rollup" => {
             // No arguments at all: the manager derives the expected profile set
@@ -3490,6 +3499,21 @@ fn valid_client_request_id(value: &str) -> bool {
         && value
             .bytes()
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+/// The longest `version` an Activity answer carries, and so the longest `since` a request may.
+const MAX_ACTIVITY_VERSION_BYTES: usize = 96;
+
+/// An Activity `version`: lower-case hex, `:` or `-`, at most [`MAX_ACTIVITY_VERSION_BYTES`].
+///
+/// The service writes 32 hex digits. The wider charset is the one the dashboard accepts on
+/// either side, so a later service may use separators without a page change.
+fn valid_activity_version(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= MAX_ACTIVITY_VERSION_BYTES
+        && value.bytes().all(|byte| {
+            byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte) || byte == b':' || byte == b'-'
+        })
 }
 
 fn valid_server_job_id(value: &str) -> bool {
@@ -7648,7 +7672,7 @@ fn read_manager_arguments(action: &ReadAction) -> BridgeResult<Vec<OsString>> {
                 source.as_str().into(),
             ]
         }
-        ReadAction::Activity { lines } => vec![
+        ReadAction::Activity { lines, .. } => vec![
             "api".into(),
             "activity".into(),
             "--lines".into(),
@@ -16961,6 +16985,29 @@ fn execute_read_action(
         let body = source_path_document(Path::new("/"), path)?;
         return Ok(CgiResponse::success(body));
     }
+    // The Activity feed's version is taken before it is read, so a feed that grows while it is
+    // read is answered with the older version and the next poll reads it again, never the other
+    // way round. A request that names the current version is answered without reading the feed.
+    let activity_version = match action {
+        ReadAction::Activity { lines, .. } => activity_version(paths, *lines, policy),
+        _ => None,
+    };
+    if let (
+        ReadAction::Activity {
+            since: Some(since), ..
+        },
+        Some(version),
+    ) = (action, &activity_version)
+        && since == version
+    {
+        let body = serde_json::to_vec(&json!({
+            "schema": "sdsync.dsm-activity.v1",
+            "unchanged": true,
+            "version": version,
+        }))
+        .map_err(|_| BridgeError::internal())?;
+        return Ok(CgiResponse::success(body));
+    }
     let forced_to_shell = linux_files::read_lane_forced_to_shell(paths, package_uid)?;
     if forced_to_shell {
         note_read_lane_forced_shell(paths, package_uid, policy);
@@ -16982,9 +17029,39 @@ fn execute_read_action(
         return attach_snapshot_outcomes(response, paths, package_uid);
     }
     if matches!(action, ReadAction::Activity { .. }) {
-        return attach_activity_history(response, paths, package_uid);
+        return attach_activity_history(response, paths, package_uid, activity_version.as_deref());
     }
     Ok(response)
+}
+
+/// The version of the Activity feed a request for `lines` events would be answered with: a
+/// digest of what the feed is built from. The rotation's files (inode, size, modification
+/// time), the line count, and the log levels the feed is filtered by, so a changed policy or a
+/// different window never matches a version taken before it.
+#[cfg(target_os = "linux")]
+fn activity_version(
+    paths: &PackagePaths<'_>,
+    lines: u16,
+    policy: &SecurityPolicyArgs,
+) -> Option<String> {
+    let stamp = linux_files::activity_files_stamp(paths.log_root)?;
+    let levels = security_policy_snapshot_value(policy)["log_levels"].to_string();
+    let mut digest = Sha256::new();
+    digest.update(b"sdsync.activity-version.v1\n");
+    digest.update(lines.to_string().as_bytes());
+    digest.update(b"\n");
+    digest.update(stamp.as_bytes());
+    digest.update(b"\n");
+    digest.update(levels.as_bytes());
+    Some(
+        digest.finalize()[..16]
+            .iter()
+            .fold(String::new(), |mut out, byte| {
+                use std::fmt::Write as _;
+                let _ = write!(out, "{byte:02x}");
+                out
+            }),
+    )
 }
 
 /// Attach `history` to an Activity feed either rung produced: how many rotated files exist
@@ -16996,6 +17073,7 @@ fn attach_activity_history(
     response: CgiResponse,
     paths: &PackagePaths<'_>,
     package_uid: u32,
+    version: Option<&str>,
 ) -> BridgeResult<CgiResponse> {
     if response.status != 200 {
         return Ok(response);
@@ -17016,6 +17094,11 @@ fn attach_activity_history(
         }),
     };
     root.insert("history".to_owned(), history);
+    // Named only when it could be taken. A feed without one is read whole on every poll, which
+    // is what a service that predates the member does too.
+    if let Some(version) = version {
+        root.insert("version".to_owned(), json!(version));
+    }
     let body = serde_json::to_vec(&document).map_err(|_| BridgeError::internal())?;
     Ok(CgiResponse::success(body))
 }
@@ -20970,7 +21053,7 @@ fn run_in_service_read(
 ) -> BridgeResult<CgiResponse> {
     let body = match action {
         ReadAction::StatusRollup => status_rollup_document(paths, policy)?,
-        ReadAction::Activity { lines } => {
+        ReadAction::Activity { lines, .. } => {
             activity_document(paths, package_uid, action, *lines, policy)?
         }
         ReadAction::Snapshot => snapshot_document(paths, package_uid, policy)?,
@@ -24422,7 +24505,13 @@ mod tests {
             // shell's whole contribution was to name the profiles and forward
             // the core's document. `activity` followed, reading four log files
             // and nothing else.
-            (ReadAction::Activity { lines: 10 }, ReadRung::InService),
+            (
+                ReadAction::Activity {
+                    lines: 10,
+                    since: None,
+                },
+                ReadRung::InService,
+            ),
             (ReadAction::StatusRollup, ReadRung::InService),
             (ReadAction::Csrf, ReadRung::NotLadderRouted),
             (
@@ -26157,7 +26246,10 @@ mod tests {
 
         // Fewer than the nine stored records, so both windows do work: each
         // rotation is windowed, and the concatenation is windowed again.
-        let action = ReadAction::Activity { lines: 7 };
+        let action = ReadAction::Activity {
+            lines: 7,
+            since: None,
+        };
         let shell = fixture.run_manager(&["api", "activity", "--lines", "7"]);
         assert!(
             shell.status.success(),
@@ -26198,7 +26290,10 @@ mod tests {
 
         // And a request with no explicit window still agrees, at the manager's
         // own default of one hundred, which keeps every record.
-        let all = ReadAction::Activity { lines: 100 };
+        let all = ReadAction::Activity {
+            lines: 100,
+            since: None,
+        };
         let shell = fixture.run_manager(&["api", "activity", "--lines", "100"]);
         assert!(shell.status.success());
         fixture.hand_over();
@@ -26232,7 +26327,10 @@ mod tests {
         let mut log = record.to_vec();
         log.push(b'\n');
         fixture.write_log("activity.log", &log);
-        let action = ReadAction::Activity { lines: 10 };
+        let action = ReadAction::Activity {
+            lines: 10,
+            since: None,
+        };
         fixture.hand_over();
         let right = activity_document(
             &fixture.paths(),
@@ -26266,7 +26364,10 @@ mod tests {
     fn a_corrupt_or_unsafe_activity_log_is_refused_by_both_rungs() {
         let fixture = TestShellPackageFixture::new("activity-corrupt");
         let policy = SecurityPolicyArgs::default();
-        let action = ReadAction::Activity { lines: 50 };
+        let action = ReadAction::Activity {
+            lines: 50,
+            since: None,
+        };
 
         fixture.write_log("activity.log", b"1700000001|not a valid record at all\n");
         let shell = fixture.run_manager(&["api", "activity", "--lines", "50"]);
@@ -26350,7 +26451,10 @@ mod tests {
     fn an_absent_activity_log_is_an_empty_feed_on_both_rungs() {
         let fixture = TestShellPackageFixture::new("activity-absent");
         let policy = SecurityPolicyArgs::default();
-        let action = ReadAction::Activity { lines: 20 };
+        let action = ReadAction::Activity {
+            lines: 20,
+            since: None,
+        };
         let shell = fixture.run_manager(&["api", "activity", "--lines", "20"]);
         assert!(
             shell.status.success(),
@@ -27393,7 +27497,7 @@ mod tests {
         let feed =
             || CgiResponse::success(br#"{"schema":"sdsync.dsm-activity.v1","events":[]}"#.to_vec());
         let read = |fixture: &TestPackageFixture| -> Value {
-            let attached = attach_activity_history(feed(), &fixture.paths(), uid).unwrap();
+            let attached = attach_activity_history(feed(), &fixture.paths(), uid, None).unwrap();
             serde_json::from_slice(&attached.body).unwrap()
         };
         assert_eq!(
@@ -28009,6 +28113,89 @@ mod tests {
         assert_eq!(run["long_running"], false);
     }
 
+    /// The Activity feed names a `version`, and a request that sends the current one is answered
+    /// `unchanged` without the feed: nothing is read, rendered or sanitised again. Any change
+    /// the feed is built from (a record appended, a rotation, a different line count, a changed
+    /// log level) is a different version, so a stale `since` is answered with the feed.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_activity_feed_is_answered_unchanged_only_for_the_version_it_is_at() {
+        let _serialised = CONTROL_FIXTURE_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let fixture = TestPackageFixture::new("activity-version");
+        let uid = TestPackageFixture::package_uid();
+        let policy = SecurityPolicyArgs::default();
+        // A manager that cannot answer, so an answer from it is unmistakable.
+        fixture.write_manager("printf 'not json'");
+        let log = fixture.log_root.join("activity.log");
+        fixture.write_private(
+            &log,
+            b"1700000001|run.succeeded|alpha|succeeded|sync|info|Run completed
+",
+        );
+        let read = |lines: u16, since: Option<&str>, policy: &SecurityPolicyArgs| -> Value {
+            let action = ReadAction::Activity {
+                lines,
+                since: since.map(str::to_owned),
+            };
+            let response = execute_read_action(&fixture.paths(), &action, policy, uid)
+                .unwrap_or_else(|error| panic!("{action:?}: {error:?}"));
+            serde_json::from_slice(&response.body).unwrap()
+        };
+
+        let full = read(10, None, &policy);
+        assert_eq!(full["events"].as_array().unwrap().len(), 1);
+        let version = full["version"].as_str().unwrap().to_owned();
+        assert!(valid_activity_version(&version), "{version}");
+
+        // The same version: no events, no history, the same version back.
+        let same = read(10, Some(&version), &policy);
+        assert_eq!(
+            same,
+            json!({"schema": "sdsync.dsm-activity.v1", "unchanged": true, "version": version})
+        );
+
+        // A version of another window, or no version at all, is the feed.
+        assert!(read(20, Some(&version), &policy)["events"].is_array());
+        assert!(read(10, Some("0"), &policy)["events"].is_array());
+
+        // A record appended: the old version no longer matches and the new feed names a new one.
+        fixture.write_private(
+            &log,
+            b"1700000001|run.succeeded|alpha|succeeded|sync|info|Run completed\n\
+              1700000002|run.failed|alpha|failed|sync|error|Run failed\n",
+        );
+        let grown = read(10, Some(&version), &policy);
+        assert_eq!(grown["events"].as_array().unwrap().len(), 2);
+        assert_ne!(grown["version"], json!(version));
+
+        // A policy that filters differently is a different feed too.
+        let strict = SecurityPolicyArgs {
+            sync_log_level: PolicyLogLevel::Error,
+            ..SecurityPolicyArgs::default()
+        };
+        let current = grown["version"].as_str().unwrap().to_owned();
+        let filtered = read(10, Some(&current), &strict);
+        assert!(
+            filtered["events"].is_array(),
+            "a changed policy matched an old version"
+        );
+
+        // An unsafe log file is never "unchanged": the read names it.
+        fs::set_permissions(&log, fs::Permissions::from_mode(0o644)).unwrap();
+        let action = ReadAction::Activity {
+            lines: 10,
+            since: Some(current.clone()),
+        };
+        let error = execute_read_action(&fixture.paths(), &action, &policy, uid).unwrap_err();
+        assert_eq!(
+            resolved_error_code(error, None, None),
+            "config_file_unsafe",
+            "an unsafe feed was answered as unchanged"
+        );
+    }
+
     /// ADV-B-5: one record whose free text holds ` request_id=` not followed by a request id
     /// (a file named `meeting request_id=5.txt` in a run's error line) made the whole Activity
     /// feed 503 `package_state_corrupt`. The record is kept, untagged, with its text intact,
@@ -28031,7 +28218,10 @@ mod tests {
         let document = activity_document(
             &fixture.paths(),
             uid,
-            &ReadAction::Activity { lines: 10 },
+            &ReadAction::Activity {
+                lines: 10,
+                since: None,
+            },
             10,
             &policy,
         )
@@ -28059,7 +28249,10 @@ mod tests {
         let document = activity_document(
             &fixture.paths(),
             uid,
-            &ReadAction::Activity { lines: 10 },
+            &ReadAction::Activity {
+                lines: 10,
+                since: None,
+            },
             10,
             &policy,
         )
@@ -36799,7 +36992,10 @@ mod tests {
         let output = br#"{"schema":"sdsync.dsm-activity.v1","has_password":true,"password":"leak","nested":{"token":"leak"},"message":"exact-secret"}"#;
         let sanitized = parse_and_sanitize_manager_json(
             output,
-            &ReadAction::Activity { lines: 10 },
+            &ReadAction::Activity {
+                lines: 10,
+                since: None,
+            },
             Some(b"exact-secret"),
             None,
         )
@@ -36825,7 +37021,10 @@ mod tests {
         let output = br#"{"schema":"sdsync.dsm-activity.v1","tokens":"leak","session_cookies":["a","b"],"api_key":"leak","bearer":"leak","set_cookie":"leak","cookies":{"csrf":true,"session":true},"nested":{"tokens":"leak"}}"#;
         let sanitized = parse_and_sanitize_manager_json(
             output,
-            &ReadAction::Activity { lines: 10 },
+            &ReadAction::Activity {
+                lines: 10,
+                since: None,
+            },
             None,
             None,
         )
