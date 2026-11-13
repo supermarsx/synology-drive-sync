@@ -12,3 +12,4 @@ __pycache__/
 !/.env.*.example
 /.orchestration
 /.claude/worktrees
+/.claude/worktrees
