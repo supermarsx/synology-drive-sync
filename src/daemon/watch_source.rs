@@ -1656,6 +1656,86 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// A delete is reported as its own event (the control thread may drop it),
+    /// still counts as seen by inotify so the floor does not name it as missed,
+    /// and the removal of the source's own ignore file is a change, not a delete.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn deletes_are_forwarded_as_deletes_and_still_covered_for_the_floor() {
+        use super::super::poll::Reading;
+        use synology_drive_sync::watch::Change;
+        let root = temp_tree("deletes");
+        let (recorder, sink) = Recorder::new();
+        let worker = Worker {
+            spec: spec(&root, 9, Some(1)),
+            stop: Arc::new(AtomicBool::new(false)),
+            sink,
+            settings: settings(false),
+            carry: new_carry(),
+            armed: AtomicBool::new(false),
+            slot: real_slot(),
+        };
+        let reading = |pairs: &[(&str, u64)]| Reading {
+            dirs: pairs.iter().map(|(d, h)| ((*d).to_owned(), *h)).collect(),
+            skipped: 0,
+            skip_sample: Vec::new(),
+        };
+        let mut floor = Floor {
+            filter: None,
+            every: Duration::from_secs(60),
+            next: std::time::Instant::now(),
+            baseline: Some(reading(&[("", 1), ("docs", 1)])),
+            reported: std::collections::BTreeSet::new(),
+            overflowed: false,
+            failing: false,
+        };
+        let path = |dir: &str, entry: &str, kind: &'static str| Change::Path {
+            dir: dir.to_owned(),
+            entry: entry.to_owned(),
+            kind,
+        };
+        assert!(worker.forward(
+            vec![
+                path("docs", "docs/lock.tmp", "delete"),
+                path("", ".sdsyncignore", "delete"),
+            ],
+            &mut floor
+        ));
+        let events = recorder.events.lock().unwrap().clone();
+        assert!(
+            events.iter().any(|(_, e)| matches!(
+                e,
+                ChangeEvent::Deleted { dir, .. } if dir == "docs"
+            )),
+            "{events:?}"
+        );
+        // The ignore file going away is a change for the root, never a delete.
+        assert!(
+            events.iter().any(|(_, e)| matches!(
+                e,
+                ChangeEvent::Changed { dir, .. } if dir.is_empty()
+            )),
+            "{events:?}"
+        );
+        assert!(
+            !events.iter().any(|(_, e)| matches!(
+                e,
+                ChangeEvent::Deleted { dir, .. } if dir.is_empty()
+            )),
+            "{events:?}"
+        );
+        // Both directories changed on disk, and both were seen: nothing missed.
+        assert!(floor.compare(&worker, Some(Ok(reading(&[("", 2), ("docs", 2)])))));
+        let missed = recorder
+            .events
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(_, e)| matches!(e, ChangeEvent::Notice { detail, .. } if detail.starts_with("watch_missed_change")));
+        assert!(!missed, "a forwarded delete was named as missed");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     /// Nested mounts are found at arm time (Linux: /dev holds devpts, shm).
     #[cfg(target_os = "linux")]
     #[test]
