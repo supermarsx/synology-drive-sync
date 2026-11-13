@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
@@ -39,6 +39,11 @@ struct FileNode {
     crtime_seconds: i64,
 }
 
+/// Seconds the mock's clock stands from this host's: a NAS whose clock is off, read by its `Date`
+/// header and the change times it stamps alike. Process-wide, so only a test binary of its own
+/// (`tests/reconcile_clock.rs`) moves it; every other binary keeps 0.
+static CLOCK_OFFSET_SECONDS: AtomicI64 = AtomicI64::new(0);
+
 /// The mock's clock, in Unix seconds, as its `Date` header and change times read it.
 fn mock_now_seconds() -> i64 {
     i64::try_from(
@@ -48,6 +53,7 @@ fn mock_now_seconds() -> i64 {
             .as_secs(),
     )
     .expect("seconds fit i64")
+        + CLOCK_OFFSET_SECONDS.load(Ordering::SeqCst)
 }
 
 impl FileNode {
@@ -402,6 +408,13 @@ impl MockFileStation {
             .expect("mock state lock")
             .list_disabled_directories
             .insert(path.to_owned());
+    }
+
+    /// Set the clock of every mock in this process `seconds` from this host's (negative: behind).
+    /// See [`CLOCK_OFFSET_SECONDS`]: a test binary that moves it runs alone.
+    #[allow(dead_code)]
+    pub fn set_process_clock_offset(seconds: i64) {
+        CLOCK_OFFSET_SECONDS.store(seconds, Ordering::SeqCst);
     }
 
     pub fn add_file(&self, path: &str, contents: &[u8], mtime_seconds: i64) {
