@@ -1785,6 +1785,30 @@ mod tests {
                 poll: 3600
             }
         );
+        // A record that names no debounce gets the default (15 s, down from 45);
+        // one that names a value keeps it, whatever it is.
+        let defaulted = routine("enabled=true\nmode=realtime\n").unwrap().unwrap();
+        assert_eq!(
+            defaulted.mode,
+            Mode::Realtime {
+                debounce: 15,
+                poll: 30
+            }
+        );
+        for kept in [45, 90] {
+            let named = routine(&format!(
+                "enabled=true\nmode=realtime\ndebounce_seconds={kept}\n"
+            ))
+            .unwrap()
+            .unwrap();
+            assert_eq!(
+                named.mode,
+                Mode::Realtime {
+                    debounce: kept,
+                    poll: 30
+                }
+            );
+        }
         // First occurrence wins, unknown keys are ignored.
         let first = routine("enabled=true\nmode=daily\nmode=interval\nfull_every_seconds=1\n")
             .unwrap()

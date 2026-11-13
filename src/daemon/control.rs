@@ -354,6 +354,9 @@ impl Convergence {
     /// in flight is answered for nothing (its token no longer matches).
     fn forget(&mut self) {
         self.manifest.clear();
+        if let Gate::Pending { cancel, .. } = &self.gate {
+            cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
         self.gate = Gate::Idle;
     }
 }
@@ -372,10 +375,13 @@ enum Gate {
     },
     /// A check's answer, for the dirty set that had `dirs` and was last touched
     /// at `last_event` when the check began. A different dirty set (an event
-    /// since) makes it stale.
+    /// since) makes it stale, and so does time: a directory that changed
+    /// without an event is only seen by a read, so an answer older than
+    /// [`converged::ANSWER_VALID`] is asked again.
     Done {
         dirs: std::collections::BTreeSet<String>,
         last_event: Option<Instant>,
+        answered: Instant,
         outcome: CheckOutcome,
     },
 }
@@ -2149,24 +2155,30 @@ impl Control {
             Gate::Done {
                 dirs: checked,
                 last_event: at,
+                answered,
                 outcome,
-            } if checked == dirs && at == last_event => match outcome {
-                CheckOutcome::Unchanged => {
-                    entry.dirty = DirtySet::default();
-                    entry.convergence.skipped_runs += 1;
-                    entry.convergence.last_skip_epoch = now_epoch;
-                    entry.convergence.unavailable = None;
-                    GateVerdict::Skipped
+            } if checked == dirs
+                && at == last_event
+                && answered.elapsed() < converged::ANSWER_VALID =>
+            {
+                match outcome {
+                    CheckOutcome::Unchanged => {
+                        entry.dirty = DirtySet::default();
+                        entry.convergence.skipped_runs += 1;
+                        entry.convergence.last_skip_epoch = now_epoch;
+                        entry.convergence.unavailable = None;
+                        GateVerdict::Skipped
+                    }
+                    CheckOutcome::Changed(snapshot) => {
+                        entry.convergence.unavailable = None;
+                        GateVerdict::Dispatch(Some(snapshot))
+                    }
+                    CheckOutcome::Unavailable(cause) => {
+                        unavailable = Some(cause);
+                        GateVerdict::Dispatch(None)
+                    }
                 }
-                CheckOutcome::Changed(snapshot) => {
-                    entry.convergence.unavailable = None;
-                    GateVerdict::Dispatch(Some(snapshot))
-                }
-                CheckOutcome::Unavailable(cause) => {
-                    unavailable = Some(cause);
-                    GateVerdict::Dispatch(None)
-                }
-            },
+            }
             Gate::Pending {
                 token,
                 started,
@@ -2311,6 +2323,7 @@ impl Control {
             entry.convergence.gate = Gate::Done {
                 dirs: dirs.clone(),
                 last_event: *last_event,
+                answered: Instant::now(),
                 outcome,
             };
             self.turn_now = true;

@@ -49,6 +49,11 @@ pub(crate) const MAX_DIRS: usize = 256;
 /// How long one check may take before the dispatch goes ahead without it.
 pub(crate) const CHECK_DEADLINE: Duration = Duration::from_secs(5);
 
+/// How long a check's answer may be acted on. A directory that changed without
+/// an event is only seen by reading it, so an answer that waited (the slot was
+/// busy, a block held the routine) is asked again rather than trusted.
+pub(crate) const ANSWER_VALID: Duration = Duration::from_secs(30);
+
 /// A child whose ctime is this close to the moment its directory was read could
 /// still be rewritten without moving that ctime (kernel timestamps tick, and a
 /// network or FAT-family mount rounds them to two seconds). Such a directory is
