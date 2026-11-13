@@ -1046,6 +1046,17 @@ fn serve_connection(mut stream: TcpStream, state: &Arc<Mutex<ServerState>>, shut
 }
 
 /// Answer one request, and say whether the connection stays open for another.
+/// `SDSYNC_MOCK_LATENCY_MS`, read once: how long every request waits before it is served.
+fn injected_latency() -> Duration {
+    static LATENCY: std::sync::OnceLock<Duration> = std::sync::OnceLock::new();
+    *LATENCY.get_or_init(|| {
+        std::env::var("SDSYNC_MOCK_LATENCY_MS")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .map_or(Duration::ZERO, Duration::from_millis)
+    })
+}
+
 fn handle_connection(
     stream: &mut TcpStream,
     state: &Arc<Mutex<ServerState>>,
@@ -1061,6 +1072,12 @@ fn handle_connection(
         }
         None => return false,
     };
+    // Off unless a timing is being taken: a round trip with a NAS-shaped delay in it, served
+    // outside the state lock so concurrent requests overlap as they would against a real NAS.
+    let latency = injected_latency();
+    if !latency.is_zero() {
+        thread::sleep(latency);
+    }
     let client_closes = headers
         .get("connection")
         .is_some_and(|value| value.eq_ignore_ascii_case("close"));
@@ -1299,11 +1316,12 @@ fn route_request(
             success(json!({"total": total, "shares": shares}))
         }
         ("SYNO.FileStation.List", "getinfo") => {
-            let path = first_json_string(fields.get("path"));
+            let paths = json_strings(fields.get("path"));
+            let path = paths.first().cloned();
             if let Some(index) = state
                 .getinfo_faults
                 .iter()
-                .position(|fault| Some(&fault.path) == path.as_ref())
+                .position(|fault| paths.contains(&fault.path))
             {
                 let fault = state.getinfo_faults.remove(index);
                 if let Some((contents, mtime_seconds)) = fault.change_to {
@@ -1317,6 +1335,18 @@ fn route_request(
                 };
             }
             let real_path = wants_real_path(fields);
+            if paths.len() > 1 {
+                // As DSM answers a call naming several paths: the envelope succeeds and each path
+                // is described, or carries its own `408`, in the order asked.
+                let files: Vec<Value> = paths
+                    .iter()
+                    .map(|path| {
+                        listed_node(state, path, real_path)
+                            .unwrap_or_else(|| json!({"code": 408, "path": path}))
+                    })
+                    .collect();
+                return success(json!({"files": files}));
+            }
             match path.and_then(|path| listed_node(state, &path, real_path)) {
                 Some(node) => success(json!({"files": [node]})),
                 None => api_error(408),
@@ -2307,6 +2337,12 @@ fn hex(value: u8) -> Option<u8> {
 
 fn json_string(value: Option<&String>) -> Option<String> {
     serde_json::from_str::<String>(value?).ok()
+}
+
+fn json_strings(value: Option<&String>) -> Vec<String> {
+    value
+        .and_then(|value| serde_json::from_str::<Vec<String>>(value).ok())
+        .unwrap_or_default()
 }
 
 fn first_json_string(value: Option<&String>) -> Option<String> {
