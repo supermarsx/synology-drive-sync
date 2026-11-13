@@ -275,8 +275,8 @@ test("DSM authentication failures provide code-specific recovery guidance", asyn
       status: 401,
       code: "dsm_authentication_quickconnect_unsupported",
       title: "QuickConnect relay unsupported",
-      guidance: /QuickConnect relay cannot authenticate this third-party package AppWindow/,
-      extra: /LAN address, DDNS, a VPN, or a separately tested DSM custom reverse proxy/
+      guidance: /DSM refused this session through the QuickConnect relay/,
+      extra: /LAN address, DDNS, a VPN, a direct QuickConnect address .*This app does not retry by itself\./
     },
     {
       status: 503,

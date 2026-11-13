@@ -196,6 +196,23 @@ never falls back to the private user service. After such a rejection, only a str
 `dsm_authentication_quickconnect_unsupported`; it cannot change acceptance. Use LAN, DDNS, VPN, or a
 separately tested DSM reverse-proxy/custom-domain route for physical acceptance.
 
+Every package request presents the user's DSM session to DSM, and DSM judges each presentation,
+including the client address it bound the session to. Through a QuickConnect relay,
+authenticate.cgi sees the relay tunnel's address, so DSM may accept the session (when it is bound to
+that address) or refuse it (DSM logs `session/session.cpp ... IP is not the same`); on the field NAS
+(DS416, DSM 7.4.1) a refusal coincided with the user's whole DSM desktop session breaking. The
+package keeps the one attempt, so a relay session DSM accepts keeps working, but a refused
+presentation is never repeated without someone asking for it. After any `dsm_authentication_*` 401
+(`dsm_authentication_quickconnect_unsupported`, `dsm_authentication_rejected`,
+`dsm_authentication_webapi_rejected`), the AppWindow and the desktop card (they share one transport
+module) send no further package request: no timer, visibility change, background read or card poll
+reaches the NAS; each is answered in the page with the same code, and both surfaces stop their
+timers. The app does not retry by itself. Only an explicit action asks again: opening the app or
+selecting Retry. Then exactly one request goes out first and the rest wait for its verdict; the DSM
+token is fetched again with it, because someone who signed in again holds a new session. An accepted
+session resumes the desktop card as well. Each attempt that reaches the NAS still gets its api.log
+and Activity record.
+
 ## Authentication and authorization sequence
 
 Every native AppWindow API request goes through these checks:

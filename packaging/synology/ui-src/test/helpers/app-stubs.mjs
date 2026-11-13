@@ -12,9 +12,16 @@ import {
 import { decodeLogPaths, plainText, visibleText } from "../../src/textSafety.mjs";
 import { clearRenderErrors, patchGuard, uiErrorSerial } from "../../src/uiErrors.mjs";
 import { WIDGET_CLOCK_TICK_MS } from "../../src/widgetModel.mjs";
+import { isDsmAuthenticationRefusal } from "../../src/api.js";
+
+// The DSM authentication gate's state lives in api.js; these harnesses stub the
+// transport, so the gate's controls are inert here and the classifier is real.
+const rearmDsmAuthentication = () => false;
+const onDsmAuthenticationAccepted = () => () => {};
 
 export const APP_MODULE_STUBS = Object.freeze({
   ACTIVITY_SCHEMA, CONTROLLER_TICK_STALE_SECONDS, LOGS_SCHEMA, WIDGET_CLOCK_TICK_MS,
+  isDsmAuthenticationRefusal, onDsmAuthenticationAccepted, rearmDsmAuthentication,
   activityContentKey, activityIsUnchanged, activityVersionOf, causeSentence, clearRenderErrors, decodeLogPaths, errorCause, feedDocumentProblem, feedSignature,
   outcomesUnavailableItem, patchGuard, plainText, runIsActive, runIsStale, runStderrBlock, serviceAttentionItem, spanLabel, staleRunCovers,
   uiErrorSerial, uniqueRowKeys, visibleText

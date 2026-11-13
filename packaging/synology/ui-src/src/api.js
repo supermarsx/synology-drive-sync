@@ -105,6 +105,132 @@ const csrfGenerationByAuth = new WeakMap();
 const csrfFreshnessByAuth = new WeakMap();
 const reconciliationAuthByOwner = new WeakMap();
 
+// A DSM authentication refusal: any `dsm_authentication_*` code the package
+// answers with 401 (today _rejected, _quickconnect_unsupported and
+// _webapi_rejected). After one, this page presents the DSM session to the
+// package again only when someone asks it to. Each package request hands the
+// session to DSM (authenticate.cgi, or the loopback user service), and DSM
+// judges every presentation, including the session's bound client address:
+// through a QuickConnect relay DSM may refuse it ("IP is not the same") and
+// treat the session as suspect. A poll, a timer, a visibility change or a
+// background card repeating a refused presentation can only harm the session
+// it is refused for. After one, every package request from this page
+// (AppWindow and desktop card share this module) is refused here, without a
+// network request, until `rearmDsmAuthentication` -- called only for an
+// explicit action: opening the app, or Retry -- lets exactly one request
+// through to ask again, the rest waiting for its verdict.
+const DSM_AUTHENTICATION_CODE_PREFIX = "dsm_authentication_";
+const dsmAuthenticationGate = {
+  // "open": requests go out. "refused": none do. "probing": one at a time
+  // until a verdict.
+  state: "open",
+  refusal: null,
+  probeInFlight: false,
+  waiters: [],
+  listeners: new Set()
+};
+
+/** Whether `error` is the package naming a DSM authentication refusal (a `dsm_authentication_*` 401). */
+export function isDsmAuthenticationRefusal(error) {
+  return Boolean(error)
+    && Number(error.status) === 401
+    && String(error.code || "").toLowerCase().startsWith(DSM_AUTHENTICATION_CODE_PREFIX);
+}
+
+/** Whether this page is holding its package requests after a DSM authentication refusal. */
+export function dsmAuthenticationRefused() {
+  return dsmAuthenticationGate.state === "refused";
+}
+
+/**
+ * An explicit action (opening the app, Retry) asks DSM once more. The DSM
+ * token is fetched again with it: a person who signed in again holds a new
+ * session, and the old token would only be refused with it. Returns whether
+ * the page had been holding its requests.
+ */
+export function rearmDsmAuthentication() {
+  const gate = dsmAuthenticationGate;
+  if (gate.state !== "refused") return false;
+  gate.state = "probing";
+  gate.refusal = null;
+  cachedDsmToken = "";
+  dsmTokenRetryAfter = 0;
+  return true;
+}
+
+/**
+ * Called once each time an asked-again session is accepted, so a surface that
+ * stopped on the refusal (the desktop card) can resume. Returns the unsubscribe.
+ */
+export function onDsmAuthenticationAccepted(listener) {
+  if (typeof listener !== "function") return () => {};
+  dsmAuthenticationGate.listeners.add(listener);
+  return () => { dsmAuthenticationGate.listeners.delete(listener); };
+}
+
+function wakeDsmAuthenticationWaiters() {
+  dsmAuthenticationGate.waiters.splice(0).forEach((resolve) => resolve());
+}
+
+// Every parsed package answer is a verdict on the session it carried. A
+// trusted refusal closes the gate; anything else ends a probe (DSM did not
+// refuse the session). An answer arriving while the gate is closed -- a
+// request that left before the refusal -- never reopens it: only an explicit
+// action does.
+function noteDsmAuthenticationVerdict(error) {
+  const gate = dsmAuthenticationGate;
+  if (error && error.trustedRejection === true && isDsmAuthenticationRefusal(error)) {
+    gate.state = "refused";
+    gate.refusal = Object.freeze({
+      message: boundedText(error.message, "DSM did not authenticate this session"),
+      code: String(error.code).toLowerCase(),
+      stage: boundedText(error.stage, "")
+    });
+  } else if (gate.state === "probing") {
+    gate.state = "open";
+    gate.listeners.forEach((listener) => {
+      try { listener(); } catch (_error) { /* a listener's failure is its own */ }
+    });
+  }
+  wakeDsmAuthenticationWaiters();
+}
+
+function locallyRefusedRequest() {
+  const refusal = dsmAuthenticationGate.refusal || {
+    message: "DSM did not authenticate this session",
+    code: "dsm_authentication_rejected",
+    stage: ""
+  };
+  const error = new DsmApiError(refusal.message, 401, refusal.code, refusal.stage);
+  error.trustedRejection = true;
+  // Never sent: the page held it after DSM refused the session.
+  error.notSent = true;
+  return error;
+}
+
+// Admission for one package request. Resolves to whether it is the probe that
+// must call `releasePackageRequest` once its answer is parsed (or it failed).
+async function admitPackageRequest() {
+  const gate = dsmAuthenticationGate;
+  while (gate.state !== "open") {
+    if (gate.state === "refused") throw locallyRefusedRequest();
+    if (!gate.probeInFlight) {
+      gate.probeInFlight = true;
+      return true;
+    }
+    await new Promise((resolve) => { gate.waiters.push(resolve); });
+  }
+  return false;
+}
+
+// A probe that ended without a verdict (no answer, a timeout) hands the next
+// waiter its turn; it does not open the gate.
+function releasePackageRequest(probe) {
+  if (!probe) return;
+  dsmAuthenticationGate.probeInFlight = false;
+  wakeDsmAuthenticationWaiters();
+}
+
 function validClientRequestId(value) {
   return typeof value === "string" && CLIENT_REQUEST_ID_PATTERN.test(value) ? value : "";
 }
@@ -570,6 +696,18 @@ function assertNoReturnedSecrets(model) {
 }
 
 async function responseJson(response, allowGoneResult = false, preserveSemanticStatus = false) {
+  let model;
+  try {
+    model = await parseResponseJson(response, allowGoneResult, preserveSemanticStatus);
+  } catch (error) {
+    noteDsmAuthenticationVerdict(error);
+    throw error;
+  }
+  noteDsmAuthenticationVerdict(null);
+  return model;
+}
+
+async function parseResponseJson(response, allowGoneResult, preserveSemanticStatus) {
   if (response.redirected) {
     throw new DsmApiError("DSM authentication redirected the API request", response.status, "authentication_redirect");
   }
@@ -1056,15 +1194,21 @@ async function apiGetWithDsmAuth(
   rememberGeneration = true,
   requestSignal = auth && auth.signal ? auth.signal : undefined
 ) {
-  const response = await fetch(endpoint(action, parameters), {
-    method: "GET",
-    credentials: "same-origin",
-    cache: "no-store",
-    redirect: "error",
-    signal: requestSignal,
-    headers: authenticatedHeaders({ Accept: "application/json" }, dsmAuth)
-  });
-  const model = await responseJson(response, action === "result", true);
+  const probe = await admitPackageRequest();
+  let model;
+  try {
+    const response = await fetch(endpoint(action, parameters), {
+      method: "GET",
+      credentials: "same-origin",
+      cache: "no-store",
+      redirect: "error",
+      signal: requestSignal,
+      headers: authenticatedHeaders({ Accept: "application/json" }, dsmAuth)
+    });
+    model = await responseJson(response, action === "result", true);
+  } finally {
+    releasePackageRequest(probe);
+  }
   if (rememberGeneration && action === "csrf") {
     rememberCsrfGeneration(auth, model, dsmAuth.generation);
   }
@@ -2088,6 +2232,21 @@ export async function apiPost(
   let dispatchAmbiguous = false;
   let dispatchStage = "post_dispatch_observation";
   for (let attempt = 0; attempt < POST_DISPATCH_MAX_ATTEMPTS; attempt += 1) {
+    let probe;
+    try {
+      probe = await admitPackageRequest();
+    } catch (error) {
+      // Held after DSM refused the session. A first attempt was never sent; a
+      // replay's earlier attempt may have been, so its outcome stays unknown.
+      if (attempt === 0 && !dispatchAmbiguous) {
+        error.preAcceptance = true;
+        error.requestId = id;
+        error.trustedRequestId = true;
+        forgetReconciliationAuth(auth, id);
+        throw error;
+      }
+      throw dispatchedOutcomeUnknown(id, action, dispatchStage);
+    }
     const requestAttempt = linkedAbortAttempt(auth && auth.signal);
     let response;
     try {
@@ -2163,6 +2322,7 @@ export async function apiPost(
       }
     } finally {
       requestAttempt.release();
+      releasePackageRequest(probe);
     }
 
     if (queued

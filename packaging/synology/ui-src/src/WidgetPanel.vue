@@ -30,7 +30,7 @@
 
 <script>
 import { ActionIcon } from "./ActionIcon";
-import { SNAPSHOT_SCHEMA, apiGet } from "./api";
+import { SNAPSHOT_SCHEMA, apiGet, isDsmAuthenticationRefusal, onDsmAuthenticationAccepted } from "./api";
 import { patchGuard } from "./uiErrors.mjs";
 import { plainText } from "./textSafety.mjs";
 import {
@@ -59,6 +59,10 @@ export default {
       snapshot: null,
       bridgeIssue: null,
       failures: 0,
+      // DSM refused the session the card presents (api.js). The card stops
+      // asking: it has no button of its own, so it resumes only when the
+      // AppWindow's explicit Retry or reopening gets the session accepted.
+      authRefused: false,
       loading: false,
       activated: false,
       disposed: false,
@@ -138,6 +142,12 @@ export default {
       ? new window.AbortController()
       : null;
     this.auth = { signal: this.abortController ? this.abortController.signal : undefined };
+    this.stopAcceptedListener = onDsmAuthenticationAccepted(() => {
+      if (this.disposed || !this.authRefused) return;
+      this.authRefused = false;
+      this.failures = 0;
+      if (this.activated && !this.documentHidden) this.refresh();
+    });
     this.readPreferences();
     this.mediaQuery = window.matchMedia ? window.matchMedia("(prefers-color-scheme: light)") : null;
     this.systemLight = Boolean(this.mediaQuery && this.mediaQuery.matches);
@@ -167,6 +177,7 @@ export default {
     this.activated = false;
     this.stopTimer();
     this.stopTick();
+    if (this.stopAcceptedListener) this.stopAcceptedListener();
     if (this.abortController) this.abortController.abort();
     document.removeEventListener("visibilitychange", this.visibilityHandler);
     window.removeEventListener("storage", this.storageHandler);
@@ -227,7 +238,7 @@ export default {
     },
     scheduleRefresh() {
       this.stopTimer();
-      if (this.disposed || !this.activated || this.documentHidden) return;
+      if (this.disposed || !this.activated || this.documentHidden || this.authRefused) return;
       const delay = widgetPollDelay({
         active: this.run.active,
         failures: this.failures,
@@ -239,7 +250,7 @@ export default {
       }, delay);
     },
     async refresh() {
-      if (this.disposed || !this.activated || this.documentHidden || this.loading) return;
+      if (this.disposed || !this.activated || this.documentHidden || this.loading || this.authRefused) return;
       this.loading = true;
       try {
         const snapshot = await apiGet(this.auth, "snapshot");
@@ -257,6 +268,7 @@ export default {
         if (this.disposed) return;
         this.bridgeIssue = widgetBridgeIssue(error);
         this.failures += 1;
+        if (isDsmAuthenticationRefusal(error)) this.authRefused = true;
       } finally {
         this.loading = false;
         if (!this.disposed) this.scheduleRefresh();

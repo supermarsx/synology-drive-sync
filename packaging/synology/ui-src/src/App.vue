@@ -713,6 +713,8 @@ import {
   apiGet,
   apiPost,
   csrfTokenStale,
+  isDsmAuthenticationRefusal,
+  rearmDsmAuthentication,
   trustedRequestProgress,
   probeRequestOutcome,
   purgeReconciliationAuth,
@@ -4119,7 +4121,7 @@ function describeBridgeFailure(error, phase = "status") {
   if ((status === 0 || status === 401) && code === "dsm_authentication_quickconnect_unsupported") {
     return issue(
       "QuickConnect relay unsupported",
-      "QuickConnect relay cannot authenticate this third-party package AppWindow. Connect through the NAS LAN address, DDNS, a VPN, or a separately tested DSM custom reverse proxy, then reopen the app from the DSM desktop."
+      "DSM refused this session through the QuickConnect relay, which may not carry it for a third-party package. Connect through the NAS LAN address, DDNS, a VPN, a direct QuickConnect address ([alias].direct.quickconnect.to), or a separately tested DSM custom reverse proxy, then select Retry or reopen the app from the DSM desktop. This app does not retry by itself."
     );
   }
   if (status === 401) {
@@ -5447,6 +5449,9 @@ export default {
     };
     document.addEventListener("visibilitychange", this.visibilityHandler);
     this.installProfileWindowGuard();
+    // Opening the app is an explicit action: after a DSM authentication refusal
+    // earlier in this DSM page, it may ask DSM once more (see api.js).
+    rearmDsmAuthentication();
     // The mutation token and the first snapshot are independent reads (the snapshot GET
     // carries no token), so they go out together: first data waits for the slower of the two
     // CGI round trips instead of their sum. The snapshot cycle joins this token read rather
@@ -6656,6 +6661,11 @@ export default {
       // A window DSM has minimised has no layout box; nobody is reading it, so it
       // looks at the package no faster than the desktop card does.
       const floor = this.windowHidden ? WIDGET_IDLE_POLL_MS : 0;
+      // DSM refused the session this window presents. Asking again on a timer
+      // only repeats a presentation DSM has refused, which over a QuickConnect
+      // relay is the session check DSM fails ("IP is not the same"); Retry or
+      // reopening the app asks again, once.
+      if (isDsmAuthenticationRefusal({ status: this.snapshotFailureStatus, code: this.snapshotFailureCode })) return 0;
       const named = BRIDGE_FAILURE_COPY[this.snapshotFailureCode];
       if (!named) {
         // An unnamed failure keeps the operator's cadence for the first miss. From
@@ -6747,6 +6757,9 @@ export default {
       // Without this a `stop` code would leave the Retry button able to perform
       // one read and never schedule another.
       if (manual) { this.snapshotFailureCode = ""; this.snapshotFailureStreak = 0; }
+      // Retry is an explicit action: after a DSM authentication refusal it may
+      // ask DSM once more (see api.js).
+      if (manual) rearmDsmAuthentication();
       this.snapshotLoading = true;
       const generation = this.snapshotGeneration;
       let cycle;

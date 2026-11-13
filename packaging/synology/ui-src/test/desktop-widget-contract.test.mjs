@@ -451,6 +451,45 @@ test("a stopped package says so on the card instead of spinning", async () => {
   assert.equal(state.reads, settled, "a stopped package must not be polled off-screen");
 });
 
+// The card has no button of its own: after DSM refuses the session it presents,
+// a poll can only present it again, which over a QuickConnect relay is the
+// session check DSM fails. It stops until the AppWindow's explicit action gets
+// the session accepted.
+test("a DSM authentication refusal stops the card until the session is accepted again", async () => {
+  for (const code of ["dsm_authentication_quickconnect_unsupported", "dsm_authentication_rejected", "dsm_authentication_webapi_rejected"]) {
+    const state = environment({ alwaysFail: bridgeError(401, code) });
+    const panelInstance = instantiate(state);
+    await panelInstance.activate();
+    assert.equal(state.reads, 1, code);
+    assert.equal(panelInstance.authRefused, true, code);
+    // Only the clock tick is armed: no poll is scheduled.
+    assert.equal(pending(state).length, 1, code);
+    for (let tick = 0; tick < 10; tick += 1) {
+      // Every armed timer fires (the clock tick), the card is asked to refresh, and the
+      // tab is hidden and shown again.
+      for (const timer of pending(state)) { timer.cleared = true; timer.callback(); }
+      await panelInstance.refresh();
+      state.hidden = true;
+      panelInstance.visibilityHandler();
+      state.hidden = false;
+      panelInstance.visibilityHandler();
+      panelInstance.deactivate();
+      panelInstance.activate();
+      await Promise.resolve();
+    }
+    assert.equal(state.reads, 1, `${code}: the card presented a refused session again`);
+    if (code === "dsm_authentication_quickconnect_unsupported") {
+      assert.equal(panelInstance.headline.title, "QuickConnect relay unsupported");
+    }
+  }
+  // An unnamed 401 keeps its backoff ladder.
+  const state = environment({ alwaysFail: bridgeError(401, "http_401") });
+  const panelInstance = instantiate(state);
+  await panelInstance.activate();
+  assert.equal(panelInstance.authRefused, false);
+  assert.equal(pending(state).length, 2);
+});
+
 test("a bridge failure after a good read keeps the last status until it is clearly not a blip", async () => {
   const healthy = snapshot({
     profiles: [profile("photos")],
