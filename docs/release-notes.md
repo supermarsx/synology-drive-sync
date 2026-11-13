@@ -26,6 +26,20 @@ lists its own commits.
   proved more than 20 s earlier was verified live, and the run named
   `pair-index-plan-clock-unbounded` with advice to check the NAS's time. Only a NAS clock ahead of
   this host's is now refused.
+- **The daemon audits a run without starting five processes.** The audit steps around each run (reconcile, create,
+  begin, execute, complete) now run inside the daemon, each on a helper thread bounded at 30 seconds, instead of as
+  five copies of the bridge. The records and the event log are the same ones. A step that does not return is
+  abandoned and named, and after three such steps no further run is started (`audit_unavailable`). `service_audit`
+  now says `transport=in_process`, or `transport=bridge` (with `service_audit_transport`) when the daemon cannot
+  confirm it is the package's user.
+
+- **A realtime change that changes nothing no longer starts a run, and the default quiet period is 15 seconds.**
+  The debounce of a realtime routine that names none went from 45 to 15 seconds (the ceiling for a tree that
+  never goes quiet is 75 seconds). A routine that names one keeps it. After a sync that converged, the daemon
+  remembers the directories it was run for; when a later change leaves every changed directory exactly as it
+  was (a temporary file created and removed, a rename and back), it logs `routine_run_skipped` and starts
+  nothing. Whole-tree and manual runs are never skipped. See [Routines](dsm/routines.md#realtime-mode-and-fallback).
+
 - **A shell-engine start no longer fails at random with `committed services failed to publish final
   readiness`.** The API service and the controller each read the start lease (`controller.starting`)
   while the lifecycle script commits it by renaming a new file over it. A read that landed in that

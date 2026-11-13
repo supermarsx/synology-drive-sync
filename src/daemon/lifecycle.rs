@@ -809,14 +809,33 @@ pub(crate) fn run_daemon(options: &Options) -> ExitCode {
     // The bridge's audit outbox lives at the package paths only: a daemon
     // pointed at another tree (tests) runs unaudited, and says so.
     let audited = options.var == Path::new(super::super::PACKAGE_VAR);
+    let mut audit_transport = "none";
     let audit: Arc<dyn super::audit::RunAudit> = if audited {
-        Arc::new(super::audit::BridgeAudit {
-            bridge: std::env::current_exe().unwrap_or_else(|_| {
-                PathBuf::from(super::super::PACKAGE_ROOT).join("bin/sdsync-dsm-api")
-            }),
-            env: api_env.clone(),
-            uid,
-        })
+        // The steps run in this process (no process start per step); a daemon
+        // that cannot vouch for its own identity runs them as bridge children,
+        // as it always did, and says why.
+        match super::audit::InProcessAudit::production(uid) {
+            Ok(in_process) => {
+                audit_transport = "in_process";
+                Arc::new(in_process)
+            }
+            Err(cause) => {
+                audit_transport = "bridge";
+                log_or_stderr(
+                    &sink,
+                    Level::Warn,
+                    "service_audit_transport",
+                    format!("transport=bridge cause={cause}"),
+                );
+                Arc::new(super::audit::BridgeAudit {
+                    bridge: std::env::current_exe().unwrap_or_else(|_| {
+                        PathBuf::from(super::super::PACKAGE_ROOT).join("bin/sdsync-dsm-api")
+                    }),
+                    env: api_env.clone(),
+                    uid,
+                })
+            }
+        }
     } else {
         Arc::new(super::audit::NoAudit)
     };
@@ -825,7 +844,7 @@ pub(crate) fn run_daemon(options: &Options) -> ExitCode {
         if audited { Level::Info } else { Level::Warn },
         "service_audit",
         if audited {
-            "runs=audited".to_owned()
+            format!("runs=audited transport={audit_transport}")
         } else {
             format!(
                 "runs=unaudited cause={} is not the package's var ({})",

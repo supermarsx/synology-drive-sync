@@ -246,6 +246,11 @@ fn clock_shape(value: &str) -> bool {
         && b[4].is_ascii_digit()
 }
 
+/// A realtime routine's quiet period when its record names none. The shell
+/// controller's `load_routine_config_runtime` default is the same number; it was
+/// 45 until the speed round, because a run now costs seconds, not a minute.
+pub(crate) const DEFAULT_DEBOUNCE_SECONDS: &str = "15";
+
 /// `load_routine_config_runtime` and the checks `process_routines` makes on it,
 /// in the shell's order. `Ok(None)` is a disabled routine (not a skip).
 pub(crate) fn parse_routine(bytes: Option<&[u8]>) -> Result<Option<Routine>, SkipField> {
@@ -257,7 +262,7 @@ pub(crate) fn parse_routine(bytes: Option<&[u8]>) -> Result<Option<Routine>, Ski
     let weekdays = doc.get_or("weekdays", "1,2,3,4,5,6,7");
     let start = doc.get_or("time_window_start", "00:00");
     let end = doc.get_or("time_window_end", "23:59");
-    let debounce = doc.get_or("debounce_seconds", "45");
+    let debounce = doc.get_or("debounce_seconds", DEFAULT_DEBOUNCE_SECONDS);
     let retries = doc.get_or("retry_count", "5");
     let backoff = doc.get_or("retry_backoff_seconds", "60");
     let exponential = doc.get_or("retry_exponential", "true");
@@ -1780,6 +1785,30 @@ mod tests {
                 poll: 3600
             }
         );
+        // A record that names no debounce gets the default (15 s, down from 45);
+        // one that names a value keeps it, whatever it is.
+        let defaulted = routine("enabled=true\nmode=realtime\n").unwrap().unwrap();
+        assert_eq!(
+            defaulted.mode,
+            Mode::Realtime {
+                debounce: 15,
+                poll: 30
+            }
+        );
+        for kept in [45, 90] {
+            let named = routine(&format!(
+                "enabled=true\nmode=realtime\ndebounce_seconds={kept}\n"
+            ))
+            .unwrap()
+            .unwrap();
+            assert_eq!(
+                named.mode,
+                Mode::Realtime {
+                    debounce: kept,
+                    poll: 30
+                }
+            );
+        }
         // First occurrence wins, unknown keys are ignored.
         let first = routine("enabled=true\nmode=daily\nmode=interval\nfull_every_seconds=1\n")
             .unwrap()

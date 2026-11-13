@@ -13340,13 +13340,30 @@ mod linux_files {
         package_uid: u32,
         transaction: &str,
     ) -> BridgeResult<()> {
+        mark_audit_transaction_executing_owned_by(
+            paths,
+            package_uid,
+            transaction,
+            parent_process_identity()?,
+        )
+    }
+
+    /// [`mark_audit_transaction_executing`] for the process that holds the
+    /// record: its parent when a bridge child makes the call, itself when the
+    /// daemon calls in process.
+    pub(super) fn mark_audit_transaction_executing_owned_by(
+        paths: &AuditOutboxPaths<'_>,
+        package_uid: u32,
+        transaction: &str,
+        owner: (u32, u64, String),
+    ) -> BridgeResult<()> {
         if !valid_audit_transaction(transaction) {
             return Err(BridgeError::bad_request());
         }
         let _lock = open_audit_outbox_lock(paths, package_uid)?;
         recover_audit_outbox_temps(paths, package_uid)?;
         let mut record = read_audit_outbox_record(paths, package_uid, transaction)?;
-        let (owner_pid, owner_start, owner_boot) = parent_process_identity()?;
+        let (owner_pid, owner_start, owner_boot) = owner;
         if record.phase != AuditOutboxPhase::Prepared
             || record.job_id.is_some()
             || record.owner_pid != owner_pid
@@ -14901,6 +14918,27 @@ fn run_runtime_marker_cli(_arguments: &[OsString]) -> BridgeResult<()> {
     Err(BridgeError::unsafe_runtime())
 }
 
+/// A new audit transaction id: the origin and a digest of the owner (process id,
+/// start time, boot id) with a fresh nonce. The bridge child (`create`) and the
+/// daemon's in-process audit both make ids this way.
+#[cfg(target_os = "linux")]
+fn new_audit_transaction_id(origin: &str, owner: &(u32, u64, String)) -> BridgeResult<String> {
+    let (owner_pid, owner_start, owner_boot) = owner;
+    let nonce = linux_files::random_nonce()?;
+    let mut digest = Sha256::new();
+    digest.update(b"sdsync.dsm-audit-transaction.v1\0");
+    digest.update(origin.as_bytes());
+    digest.update(owner_pid.to_be_bytes());
+    digest.update(owner_start.to_be_bytes());
+    digest.update(owner_boot.as_bytes());
+    digest.update(nonce);
+    let transaction = format!("{origin}-{}", hex_encode(&digest.finalize()));
+    if !valid_audit_transaction(&transaction) {
+        return Err(BridgeError::internal());
+    }
+    Ok(transaction)
+}
+
 #[cfg(target_os = "linux")]
 fn run_audit_transaction_cli(arguments: &[OsString]) -> BridgeResult<bool> {
     let identity = linux_runtime::identity_state()?;
@@ -14948,20 +14986,8 @@ fn run_audit_transaction_cli(arguments: &[OsString]) -> BridgeResult<bool> {
             if !valid_audit_origin(&origin) {
                 return Err(BridgeError::bad_request());
             }
-            let (owner_pid, owner_start, owner_boot) = linux_files::parent_process_identity()?;
-            let nonce = linux_files::random_nonce()?;
-            let mut digest = Sha256::new();
-            digest.update(b"sdsync.dsm-audit-transaction.v1\0");
-            digest.update(origin.as_bytes());
-            digest.update(owner_pid.to_be_bytes());
-            digest.update(owner_start.to_be_bytes());
-            digest.update(owner_boot.as_bytes());
-            digest.update(nonce);
-            let transaction = format!("{origin}-{}", hex_encode(&digest.finalize()));
-            if !valid_audit_transaction(&transaction) {
-                return Err(BridgeError::internal());
-            }
-            println!("{transaction}");
+            let owner = linux_files::parent_process_identity()?;
+            println!("{}", new_audit_transaction_id(&origin, &owner)?);
             Ok(false)
         }
         Some("reconcile") if arguments.len() == 1 => {

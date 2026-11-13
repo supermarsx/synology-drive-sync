@@ -20,7 +20,7 @@ where those actors can touch the same target.
 | Interval | `60..2592000` seconds; present and used only in interval mode |
 | Active weekdays | Non-empty unique subset of Monday `1` through Sunday `7`; daily mode only |
 | Window starts / ends | 24-hour `HH:MM`; daily mode only |
-| Realtime debounce | `1..3600` seconds; defaults to `45`; realtime mode only |
+| Realtime debounce | `1..3600` seconds; defaults to `15`; realtime mode only |
 | Fallback poll | `5..3600` seconds; realtime mode only. Under the daemon it is how often the polling fallback reads the tree while the native watch is unavailable (60 seconds if unset) |
 | Retry attempts | `0..5` after a failed whole routine action; defaults to `5` |
 | Retry backoff | `10..300` seconds before the first retry |
@@ -106,7 +106,39 @@ listed as an `info` note (`nested_mounts=N first=… watched_by=poll_floor every
 inotify does not see changes made through them. Separately, an armed realtime routine syncs its whole
 tree once every 24 hours (`routine_full_reconcile`, `info`). A profile held by a [lasting
 block](operations.md#lasting-block-after-an-out-of-memory-kill) is not run by its routine, and each
-held trigger is logged at most once an hour (`routine_suppressed`). See
+held trigger is logged at most once an hour (`routine_suppressed`).
+
+**A realtime run reads only what changed.** Under the daemon, a run started for changed directories is given one scope
+element per directory instead of their common ancestor: a directory in which files changed is read for its direct
+children only (`--scope-shallow`), and a directory that appeared, moved in or was removed is read whole (`--scope`). Edits in
+`2026/03` and `2026/11` therefore read those two folders, not all of `2026`. The run's log line carries them
+(`subscope=2026/03:shallow,2026/11:shallow`). A change at the source root reads the root's direct children only. The polling
+fallback cannot tell which kind of change it saw and reads each changed directory whole.
+
+**A realtime run re-verifies two pairs, not 25.** Under the daemon, a run started for changed directories (including a
+change at the source root, which carries no `--scope`) is started with `--pair-index-canary 2 --reconcile-canary 2`:
+the verified-pair index re-reads two served pairs live in the plan and two in the final reconcile. The whole-tree
+sync (every 24 hours, after an overflow, at start-up, after a rules change), interval and daily routines and manual runs
+keep the core's default of 25. The shell engine runs without the pair index and has no canary.
+
+**Removals are not changes when deletion is off.** A routine that does not allow deletion (`allow_delete=false`, so the run
+is started with `--no-delete`) ignores an inotify delete event: it can only find nothing to do. The events are counted in
+`ctl status` (`ignored_delete_events`) and named (`routine_events_ignored`, the first and then at most hourly). A rename
+still counts, because its new name is something to upload, and so does the removal of the source's own `.sdsyncignore`,
+which re-includes what it excluded. The polling fallback cannot tell a removal from any other change
+and reports them all.
+
+**A change that changes nothing is not run.** Many events leave a directory exactly as the last sync saw it
+(a temporary file created and removed, a file renamed away and back). When the quiet period ends, the daemon
+reads the changed directories (names, sizes, modification and change times and inodes of the entries the sync
+does not exclude) and compares them with what the last sync that converged left. If every one matches, it does
+not start a run: it logs `routine_run_skipped` (`reason=unchanged_since_converged`), counts it in `ctl status`
+(`skipped_runs`, `last_skip_epoch`, `last_skip_reason`) and consumes the change. A sync converges when it exits 0
+with no deferral, skip, incomplete listing or unchecked link folder; anything else, an overflow, a re-armed
+watch or a daemon restart forgets what was remembered, so the next change always runs. A directory with a
+file changed in the last three seconds is never remembered. The whole-tree sync (every 24 hours, after an
+overflow, at start-up) and manual runs are never skipped, and so a change made only to the NAS copy is repaired
+by that daily pass, as before. The shell engine has no per-directory change set and does not skip. See
 [Realtime reports polling](troubleshooting.md#realtime-reports-polling).
 
 **Under the shell engine** DSM ships no
@@ -151,15 +183,15 @@ tree must be treated as changed, so a run is triggered. The watcher keeps about 
 memory at 20,000 directories and about 16 MiB at 100,000. A directory created while watching is added to
 the watch set as it appears. The quiet period is measured from the event file's last write, so each newly observed
 change restarts the debounce and a run cannot begin until the full period has elapsed. The default
-debounce is 45 seconds. Realtime mode has no interval, weekday, window-start, or window-end setting.
+debounce is 15 seconds. Realtime mode has no interval, weekday, window-start, or window-end setting.
 The controller revalidates and consumes one exact native-event generation only after dependency and
 shutdown admission. A concurrent event remains queued for its own complete debounce, and a deferred
 dependency therefore does not discard the pending marker.
 
 A source that never has a quiet moment is not left pending forever: past `debounce_seconds × 4`
 (clamped between `debounce_seconds + 60` and 3600 seconds) the controller dispatches anyway, so
-worst-case staleness under continuous writes is bounded rather than open-ended. At the 45-second
-default that ceiling is 180 seconds. The ceiling is not configurable; the operator already chose the
+worst-case staleness under continuous writes is bounded rather than open-ended. At the 15-second
+default that ceiling is 75 seconds. The ceiling is not configurable; the operator already chose the
 debounce, and it is derived from that one field rather than adding a second number nothing else
 explains.
 

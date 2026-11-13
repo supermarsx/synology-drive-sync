@@ -29,7 +29,7 @@ use std::time::{Duration, UNIX_EPOCH};
 
 use synology_drive_sync::watch::{Filter, WalkSlot, WatchError, profile_excludes};
 
-use super::changes::{ArmSpec, ChangeEvent, ChangeSink, ChangeSource};
+use super::changes::{ArmSpec, ChangeEvent, ChangeSink, ChangeSource, Depth};
 use super::poll::{PollConfig, SharedCarry, new_carry, spawn_poller};
 use super::routines::{Backend, BackendReason, SourceStatus};
 
@@ -184,6 +184,37 @@ struct Worker {
 
 /// Where a walk takes its place under the process-wide walk cap.
 type SlotSource = Arc<dyn Fn() -> Result<WalkSlot, usize> + Send + Sync>;
+
+/// Whether a native change is an inotify delete and nothing else, which a
+/// routine that cannot delete has no work for. The source's own ignore file
+/// being removed is not one: it widens what the sync includes, so the files it
+/// excluded must now upload, whatever the routine may delete.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn delete_only(kind: &str, entry: &str) -> bool {
+    kind == "delete" && !Filter::is_rules_file(entry)
+}
+
+/// The dirty-set element a native change adds: the directory whose direct
+/// children changed (a file saved, created, removed or renamed in it), or the
+/// directory itself, whole, when the change is one that appeared (a created or
+/// moved-in directory: nothing inside it raised an event). A directory that went
+/// away is not known to be one from the event (the entry is gone), so its
+/// parent is read for it, which is where its removal shows.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn element_of(source: &Path, dir: &str, entry: &str, kind: &str) -> (String, Depth) {
+    let appeared = match kind {
+        "new_dir" => true,
+        "create" | "moved_to" => {
+            std::fs::symlink_metadata(source.join(entry)).is_ok_and(|meta| meta.is_dir())
+        }
+        _ => false,
+    };
+    if appeared {
+        (entry.to_owned(), Depth::Recursive)
+    } else {
+        (dir.to_owned(), Depth::Shallow)
+    }
+}
 
 fn real_slot() -> SlotSource {
     Arc::new(synology_drive_sync::watch::walk_slot)
@@ -521,11 +552,21 @@ impl Worker {
         use synology_drive_sync::watch::Change;
         for change in changes {
             let event = match change {
-                Change::Path { dir, .. } => {
+                Change::Path { dir, entry, kind } => {
                     floor.reported(&dir);
-                    ChangeEvent::Changed {
-                        routine: self.spec.routine.clone(),
-                        dir,
+                    let (element, depth) = element_of(&self.spec.source, &dir, &entry, kind);
+                    if delete_only(kind, &entry) {
+                        ChangeEvent::Deleted {
+                            routine: self.spec.routine.clone(),
+                            dir: element,
+                            depth,
+                        }
+                    } else {
+                        ChangeEvent::Changed {
+                            routine: self.spec.routine.clone(),
+                            dir: element,
+                            depth,
+                        }
                     }
                 }
                 Change::Overflow => {
@@ -1023,6 +1064,7 @@ impl Floor {
                         && worker.emit(ChangeEvent::Changed {
                             routine: worker.spec.routine.clone(),
                             dir,
+                            depth: Depth::Recursive,
                         });
                 }
             }
@@ -1260,6 +1302,48 @@ mod tests {
     use super::*;
     use std::sync::Mutex;
     use std::time::Instant;
+
+    #[test]
+    fn a_directory_that_appeared_is_read_whole_and_anything_else_by_its_parent() {
+        let tree = temp_tree("elements");
+        std::fs::create_dir_all(tree.join("a/made")).unwrap();
+        std::fs::write(tree.join("a/file.txt"), "x").unwrap();
+        let shallow = |dir: &str| (dir.to_owned(), Depth::Shallow);
+        // A file in `a`: `a`'s direct children.
+        assert_eq!(
+            element_of(&tree, "a", "a/file.txt", "close_write"),
+            shallow("a")
+        );
+        assert_eq!(element_of(&tree, "a", "a/file.txt", "create"), shallow("a"));
+        assert_eq!(
+            element_of(&tree, "a", "a/file.txt", "moved_to"),
+            shallow("a")
+        );
+        // A directory created or moved in: itself, whole.
+        let whole = ("a/made".to_owned(), Depth::Recursive);
+        assert_eq!(element_of(&tree, "a", "a/made", "create"), whole);
+        assert_eq!(element_of(&tree, "a", "a/made", "moved_to"), whole);
+        assert_eq!(element_of(&tree, "a/made", "a/made", "new_dir"), whole);
+        // An attribute change of a directory is news for its parent only.
+        assert_eq!(element_of(&tree, "a", "a/made", "attrib"), shallow("a"));
+        // Gone: what remains to look at is the parent.
+        assert_eq!(element_of(&tree, "a", "a/gone", "delete"), shallow("a"));
+        assert_eq!(element_of(&tree, "a", "a/gone", "moved_from"), shallow("a"));
+        // The root's own children.
+        assert_eq!(element_of(&tree, "", "top.txt", "create"), shallow(""));
+        let _ = std::fs::remove_dir_all(&tree);
+    }
+
+    #[test]
+    fn only_a_plain_delete_is_delete_only_and_never_the_ignore_file() {
+        assert!(delete_only("delete", "a/lock.tmp"));
+        assert!(delete_only("delete", "top.txt"));
+        // A rename keeps its source's directory marked (copy candidates).
+        assert!(!delete_only("moved_from", "a/b.txt"));
+        assert!(!delete_only("create", "a/b.txt"));
+        // The ignore file going away re-includes what it excluded.
+        assert!(!delete_only("delete", ".sdsyncignore"));
+    }
 
     static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
@@ -1569,6 +1653,86 @@ mod tests {
             .filter(|(_, e)| matches!(e, ChangeEvent::Notice { detail, .. } if detail.starts_with("poll_floor_failed")))
             .count();
         assert_eq!(failures, 1);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A delete is reported as its own event (the control thread may drop it),
+    /// still counts as seen by inotify so the floor does not name it as missed,
+    /// and the removal of the source's own ignore file is a change, not a delete.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn deletes_are_forwarded_as_deletes_and_still_covered_for_the_floor() {
+        use super::super::poll::Reading;
+        use synology_drive_sync::watch::Change;
+        let root = temp_tree("deletes");
+        let (recorder, sink) = Recorder::new();
+        let worker = Worker {
+            spec: spec(&root, 9, Some(1)),
+            stop: Arc::new(AtomicBool::new(false)),
+            sink,
+            settings: settings(false),
+            carry: new_carry(),
+            armed: AtomicBool::new(false),
+            slot: real_slot(),
+        };
+        let reading = |pairs: &[(&str, u64)]| Reading {
+            dirs: pairs.iter().map(|(d, h)| ((*d).to_owned(), *h)).collect(),
+            skipped: 0,
+            skip_sample: Vec::new(),
+        };
+        let mut floor = Floor {
+            filter: None,
+            every: Duration::from_secs(60),
+            next: std::time::Instant::now(),
+            baseline: Some(reading(&[("", 1), ("docs", 1)])),
+            reported: std::collections::BTreeSet::new(),
+            overflowed: false,
+            failing: false,
+        };
+        let path = |dir: &str, entry: &str, kind: &'static str| Change::Path {
+            dir: dir.to_owned(),
+            entry: entry.to_owned(),
+            kind,
+        };
+        assert!(worker.forward(
+            vec![
+                path("docs", "docs/lock.tmp", "delete"),
+                path("", ".sdsyncignore", "delete"),
+            ],
+            &mut floor
+        ));
+        let events = recorder.events.lock().unwrap().clone();
+        assert!(
+            events.iter().any(|(_, e)| matches!(
+                e,
+                ChangeEvent::Deleted { dir, .. } if dir == "docs"
+            )),
+            "{events:?}"
+        );
+        // The ignore file going away is a change for the root, never a delete.
+        assert!(
+            events.iter().any(|(_, e)| matches!(
+                e,
+                ChangeEvent::Changed { dir, .. } if dir.is_empty()
+            )),
+            "{events:?}"
+        );
+        assert!(
+            !events.iter().any(|(_, e)| matches!(
+                e,
+                ChangeEvent::Deleted { dir, .. } if dir.is_empty()
+            )),
+            "{events:?}"
+        );
+        // Both directories changed on disk, and both were seen: nothing missed.
+        assert!(floor.compare(&worker, Some(Ok(reading(&[("", 2), ("docs", 2)])))));
+        let missed = recorder
+            .events
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(_, e)| matches!(e, ChangeEvent::Notice { detail, .. } if detail.starts_with("watch_missed_change")));
+        assert!(!missed, "a forwarded delete was named as missed");
         let _ = std::fs::remove_dir_all(&root);
     }
 

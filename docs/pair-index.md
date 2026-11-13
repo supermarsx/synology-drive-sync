@@ -88,7 +88,7 @@ restore) that keeps size and mtime.
   writeback runs later than that (a stalled disk, a cgroup write limit, a network or FUSE
   filesystem with its own writeback) can leave a page dirty past the window. The canary and
   rolling expiry are what remain for either case.
-- **Cost in realtime mode.** A realtime routine runs after each change (debounce 45 s by default),
+- **Cost in realtime mode.** A realtime routine runs after each change (debounce 15 s by default),
   so the pair it just synced is proven by a run that is, by the rule above, still inside the window
   of the change (the local change time, and the NAS's change time of the copy it just uploaded). A
   pair is stored settled only when a run proves it at least a window (60 s with the kernel
@@ -96,7 +96,7 @@ restore) that keeps size and mtime.
   again: one local read of the file and one File Station `MD5` task (a start and at least one
   status poll) per changed file per run. A file that changes continuously is therefore re-hashed on
   both sides on every run and never served from the index, and a changed file costs one such
-  re-hash for each run that follows within the window (with a 45 s debounce, one or two) before it is
+  re-hash for each run that follows within the window (with a 15 s debounce, up to four on a tree that keeps changing) before it is
   served.
   Every other pair stays served, so the steady cost of an otherwise unchanged share is still the
   listing plus the canary. For a few large files that change often (a database, a mail store, a VM

@@ -303,7 +303,9 @@ What differs under the daemon, and what the pages below describe for it:
 A daemon run applies the same checks as the shell runner before it starts the core, and refuses with
 the same reasons: `policy_*` (the security policy), `password_missing`, `secret_unsafe` and
 `audit_unavailable`. The audit trail is mandatory for a run: the daemon writes the audit record
-before the core starts and settles it when the core ends. A daemon pointed at a tree that is not a
+before the core starts and settles it when the core ends, in the daemon's own process (`transport=in_process`;
+a daemon that cannot confirm it is the package's user runs the same steps as bridge children,
+`transport=bridge`, and names why in `service_audit_transport`). A daemon pointed at a tree that is not a
 package tree has no audit helper; it runs unaudited and says so (`service_audit` in
 `controller.log`, once at start).
 
@@ -467,6 +469,10 @@ codes are:
 | `routine.watch_abandoned` | The controller stopped retrying a native watcher |
 | `routine.unobserved` | Nothing, or not everything, is observing a routine: its backend is blind, its poll floor cannot finish, its poll walk was killed for outliving its budget, the walk cap refused it, a lasting block holds it, scheduling is blocked by a long job, or it is disabled. One row per episode (`warn`; `info` for disabled); the message names the cause and `Logs` the detail. The routine's state record keeps the episode (`observe_state`, `observe_cause`, `observe_since_epoch`), so a restart does not repeat it |
 | `routine.observed` | The episode above ended: something observes the routine again, it was enabled again, or scheduling resumed (`info`) |
+| `routine.skipped` | A realtime change was not run because every changed folder is as the last sync left it (`info`, state `succeeded`); at most one row an hour per routine, with the count skipped since the last row. The log has each one (`routine_run_skipped`) |
+| `routine.skip_check_unavailable` | The unchanged-folder check could not be made, so the change ran as before (`info`, state `unavailable`; the message carries the cause; once per cause) |
+| `routine.converged_forgotten` | A sync did not finish cleanly, so the next change runs even if its folders look unchanged (`info`, state `changed`) |
+| `routine.events_ignored` | A routine that does not delete on the NAS ignores removal events (`info`; first one, then at most hourly, with the running count) |
 | `doctor.succeeded` | Doctor completed successfully |
 | `doctor.failed` | Doctor completed with a nonzero result |
 | `doctor.inventory` | The DSM package retained one bounded private Doctor discovery record |
@@ -596,12 +602,17 @@ knowing when reading it:
 | `routine_clock_unavailable` / `routine_clock_recovered` | The controller could not read the clock (`cause=`; `warn`, once per episode, and nothing is dispatched meanwhile) / it could again (`info`) |
 | `routine_fingerprint_format_changed` | `info`. A realtime routine's stored fingerprint was written by an earlier release (`from=`), so one comparison sync runs and the `to=v3` reading becomes the baseline. Replaces `routine_fingerprint_rebased` |
 | `service_engine` | The engine in force, once per daemon start: `engine=daemon file=absent\|daemon\|shell\|invalid\|unreadable` (`warn` when the file is `shell`, invalid or unreadable, with the path and cause) |
-| `service_audit` | `runs=audited` (`info`), or `runs=unaudited` (`warn`) when the daemon's tree is not the package's `var` |
+| `service_audit` | `runs=audited transport=in_process\|bridge` (`info`), or `runs=unaudited` (`warn`) when the daemon's tree is not the package's `var` |
+| `service_audit_transport` | `warn`, once at start. The daemon could not run its audit steps in its own process and uses bridge children instead (`cause=`) |
 | `run_deferred` | `warn`. A run was not started because `management.lock` was live (`reason=lock_busy`, `scope=`, `cause=`); it is retried and no retry is consumed |
 | `routine_backend` | The change source of a realtime routine changed (`profile=`, `backend=inotify\|polling\|none`, `reason=ok\|watch_limit\|watch_unavailable\|watch_setup_failed`, then the detail; `none` while the process-wide walk cap refuses the arm). `warn` when the reason is not `ok`. One line per cause: later reports of the same backend, reason and cause (the skipped-entries count of a polling tree aside) are counted, and the report that ends the episode carries `suppressed_reports=`, `previous_backend=` and `previous_reason=`; a re-arm that ends one says `episode_ended=rearmed` |
 | `service_layout` | `info`, once per daemon start: `home=` and `var=` as named and `resolved=` as followed. DSM's aliases are followed one level only; the target must be a directory owned by the package user and not writable by group or others, and a refusal names both paths |
 | `routine_full_reconcile` | `info`. An armed realtime routine syncs its whole tree once every 24 hours (`profile=`, `every_seconds=`) |
 | `routine_rearmed` | `info`. A realtime routine's source or exclude list was edited, so its watch was replaced (`profile=`, `source=`) |
+| `routine_events_ignored` | `info`. A realtime routine that does not allow deletion ignored removal events, which can only find nothing to do (`profile=`, `reason=delete_only_no_delete`, `ignored_total=`, `first_dir=`). Logged for the first one and then at most once an hour; `ctl status` carries `ignored_delete_events` |
+| `routine_run_skipped` | `info`. A realtime change was not dispatched because every changed directory is exactly as the last converged run left it (`profile=`, `dirs=`, `reason=unchanged_since_converged`, `converged_dirs=`). The change is consumed; `ctl status` shows `skipped_runs` and `last_skip_epoch`. Never logged for a whole-tree run, a manual run or an overflow |
+| `routine_skip_check_unavailable` | `info`. The check behind `routine_run_skipped` could not be made (`profile=`, `cause=`: an unreadable directory or fragment, a dirty set too large to read, the walk cap), so the change was dispatched as before. Named once per cause |
+| `routine_converged_forgotten` | `info`. A sync that did not converge (failed, partial, cancelled, or with a deferral, skip or incomplete listing) cleared what the routine remembered of its converged directories (`profile=`, `id=`) |
 | `routine_watch_notice` | A named skip or note while watching (`profile=` and the detail): a vanished entry, an unreadable subdirectory (first three paths, with cause), a walk that hit its deadline, `watch_missed_change dirs=N first=… floor_seconds=…` (`warn`: the stat-only floor found a directory that changed without an inotify event, and synced it), `poll_floor_failed cause=…` (a floor reading failed, once), or `nested_mounts=N first=… watched_by=poll_floor every_seconds=…` (`info` at arm: other devices below the source) |
 | `routine_suppressed` | `warn`. A trigger was held by a lasting block (`profile=`, `run=`, `reason=`, `clears_on=run_now_or_settings_change`); at most once an hour per profile |
 | `control_consumer_failed` / `control_consumer_outcome_unknown` | A dashboard job's worker died or passed its lane deadline: the operation was answered `consumer_failed` / left outcome-unknown because it may have committed (see [Named terminal failures](troubleshooting.md#named-terminal-failures)) |

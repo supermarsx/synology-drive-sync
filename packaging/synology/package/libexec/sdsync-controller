@@ -3573,7 +3573,7 @@ load_routine_config_runtime() {
     routine_weekdays=1,2,3,4,5,6,7
     routine_start=00:00
     routine_end=23:59
-    routine_debounce=45
+    routine_debounce=15
     routine_retries=5
     routine_backoff=60
     routine_retry_exponential=true

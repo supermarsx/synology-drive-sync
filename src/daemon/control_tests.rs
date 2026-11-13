@@ -27,6 +27,9 @@ struct World {
     max_running: usize,
     /// A 137 exit reports the cgroup's OOM counter as moved.
     oom_proven: bool,
+    /// An exit-0 run carries the result record of a sync that left nothing
+    /// undone (the daemon's evidence that it converged).
+    converged_record: bool,
 }
 
 struct FakeLauncher {
@@ -75,10 +78,10 @@ impl Launcher for FakeLauncher {
                 }
                 Err(_) => (plan.exit, Ending::Exited),
             };
-            let oom = {
+            let (oom, converged_record) = {
                 let mut world = world.lock().unwrap();
                 world.running -= 1;
-                world.oom_proven && exit == 137
+                (world.oom_proven && exit == 137, world.converged_record)
             };
             sink(ExecEvent::Finished(Box::new(RunReport {
                 exit,
@@ -88,7 +91,22 @@ impl Launcher for FakeLauncher {
                 } else {
                     b"error: fake failure\n".to_vec()
                 },
-                records: Vec::new(),
+                records: if converged_record && exit == 0 {
+                    vec![super::super::executor::JobRecord {
+                        profile: "docs".into(),
+                        status: "ok".into(),
+                        deferred: Some(0),
+                        skipped: Some(0),
+                        facts: super::super::state::ResultFacts {
+                            incomplete_listings: Some(0),
+                            link_guard_unchecked: Some(0),
+                            ..Default::default()
+                        },
+                        ..Default::default()
+                    }]
+                } else {
+                    Vec::new()
+                },
                 record_error: None,
                 oom_proven: oom.then_some(true),
                 memory_note: None,
@@ -801,11 +819,12 @@ fn change(h: &Harness, dir: &str) {
     let _ = h.tx.send(Msg::Change(ChangeEvent::Changed {
         routine: "docs".into(),
         dir: dir.into(),
+        depth: Depth::Shallow,
     }));
 }
 
-/// A realtime change is armed, debounced and dispatched as a scoped run of the
-/// lowest common ancestor.
+/// A realtime change is armed, debounced and dispatched as a scoped run with one
+/// element per changed directory (shallow: its direct children).
 #[test]
 fn a_realtime_change_dispatches_a_scoped_run_after_its_debounce() {
     let h = realtime_harness("scope");
@@ -838,11 +857,18 @@ fn a_realtime_change_dispatches_a_scoped_run_after_its_debounce() {
         .iter()
         .map(|a| a.to_string_lossy().into_owned())
         .collect::<Vec<_>>();
-    assert!(
-        args.windows(2)
-            .any(|w| w[0] == "--scope" && w[1] == "Projects/2026"),
+    // Two folders under one parent are two elements, not their common ancestor.
+    let shallow: Vec<&str> = args
+        .windows(2)
+        .filter(|w| w[0] == "--scope-shallow")
+        .map(|w| w[1].as_str())
+        .collect();
+    assert_eq!(
+        shallow,
+        ["Projects/2026/q3", "Projects/2026/q4"],
         "{args:?}"
     );
+    assert!(!args.iter().any(|a| a == "--scope"), "{args:?}");
     h.wait_for("idle", PATIENT, Harness::idle);
     let state = h.state("routines/docs.state");
     assert!(
@@ -954,7 +980,8 @@ fn failed_partial_busy_cancelled_runs_keep_the_change_pending() {
         .map(|a| a.to_string_lossy().into_owned())
         .collect::<Vec<_>>();
     assert!(
-        args.windows(2).any(|w| w[0] == "--scope" && w[1] == "b"),
+        args.windows(2)
+            .any(|w| w[0] == "--scope-shallow" && w[1] == "b"),
         "{args:?}"
     );
 }
@@ -1423,6 +1450,7 @@ fn an_edited_realtime_source_is_rearmed_and_old_events_are_dropped() {
         ChangeEvent::Changed {
             routine: "docs".into(),
             dir: "old".into(),
+            depth: Depth::Shallow,
         },
     ));
     thread::sleep(Duration::from_millis(1500));
@@ -1432,6 +1460,7 @@ fn an_edited_realtime_source_is_rearmed_and_old_events_are_dropped() {
         ChangeEvent::Changed {
             routine: "docs".into(),
             dir: "new".into(),
+            depth: Depth::Shallow,
         },
     ));
     h.wait_for("the dispatch", PATIENT, |h| h.launched() == 1);
@@ -1441,7 +1470,8 @@ fn an_edited_realtime_source_is_rearmed_and_old_events_are_dropped() {
         .map(|a| a.to_string_lossy().into_owned())
         .collect::<Vec<_>>();
     assert!(
-        args.windows(2).any(|w| w[0] == "--scope" && w[1] == "new"),
+        args.windows(2)
+            .any(|w| w[0] == "--scope-shallow" && w[1] == "new"),
         "{args:?}"
     );
 }
@@ -2677,4 +2707,477 @@ fn a_reading_that_clears_inside_the_grace_is_never_announced() {
     });
     thread::sleep(Duration::from_millis(400));
     assert_eq!(observation_rows(&h, "routine.unobserved", "docs").len(), 1);
+}
+
+// ------------------------------------------------------- P8: converged skips
+
+/// A source with one directory whose files are older than the racy margin, so a
+/// run that converges may record it.
+#[cfg(unix)]
+fn quiet_tree(h: &Harness) -> PathBuf {
+    let source = volume_source(&h.root, "docs");
+    fs::create_dir_all(source.join("a")).unwrap();
+    fs::write(source.join("a/f.txt"), "1").unwrap();
+    thread::sleep(Duration::from_millis(3300));
+    source
+}
+
+#[cfg(unix)]
+fn converged_dirs(h: &Harness) -> u64 {
+    h.ask(Request::Status)["routines"][0]["converged_dirs"]
+        .as_u64()
+        .unwrap()
+}
+
+#[cfg(unix)]
+fn skipped(h: &Harness) -> Value {
+    h.ask(Request::Status)["routines"][0].clone()
+}
+
+/// A change that leaves the directory as the last converged run saw it is not
+/// dispatched: it is logged by name, counted in the status, and its pending
+/// change is consumed. A real edit afterwards runs.
+#[cfg(unix)]
+#[test]
+fn an_unchanged_directory_after_a_converged_run_is_skipped_and_named() {
+    let h = realtime_harness("converged-skip");
+    h.world.lock().unwrap().converged_record = true;
+    h.wait_for("arm", PATIENT, |h| armed_generation(h, "docs").is_some());
+    let source = quiet_tree(&h);
+    change(&h, "a");
+    h.wait_for("the first run", PATIENT, |h| h.launched() == 1);
+    h.wait_for("idle", PATIENT, Harness::idle);
+    assert_eq!(
+        converged_dirs(&h),
+        1,
+        "the converged run recorded its directory"
+    );
+
+    change(&h, "a");
+    h.wait_for("the skip", PATIENT, |h| {
+        h.logs()
+            .iter()
+            .any(|l| l.starts_with("routine_run_skipped "))
+    });
+    let line = h
+        .logs()
+        .into_iter()
+        .find(|l| l.starts_with("routine_run_skipped "))
+        .unwrap();
+    assert!(
+        line.contains("profile=docs")
+            && line.contains("dirs=1")
+            && line.contains("reason=unchanged_since_converged"),
+        "{line}"
+    );
+    assert_eq!(h.launched(), 1, "nothing was dispatched");
+    // The user sees it in Activity, not only in the log.
+    let rows = observation_rows(&h, "routine.skipped", "docs");
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert!(rows[0].2.contains("skipped"), "{rows:?}");
+    let status = skipped(&h);
+    assert_eq!(status["skipped_runs"], 1, "{status}");
+    assert_eq!(status["last_skip_reason"], "unchanged_since_converged");
+    assert_eq!(status["pending_change"], false, "the change was consumed");
+
+    // A real edit is not an unchanged directory.
+    fs::write(source.join("a/f.txt"), "22").unwrap();
+    change(&h, "a");
+    h.wait_for("the second run", PATIENT, |h| h.launched() == 2);
+}
+
+/// A manual run that fails leaves the NAS in a state no digest vouches for: the
+/// record is forgotten, named, and the next change dispatches.
+#[cfg(unix)]
+#[test]
+fn a_run_that_did_not_converge_forgets_what_was_recorded() {
+    let h = realtime_harness("converged-forget");
+    h.world.lock().unwrap().converged_record = true;
+    h.wait_for("arm", PATIENT, |h| armed_generation(h, "docs").is_some());
+    let _source = quiet_tree(&h);
+    change(&h, "a");
+    h.wait_for("the first run", PATIENT, |h| h.launched() == 1);
+    h.wait_for("idle", PATIENT, Harness::idle);
+    assert_eq!(converged_dirs(&h), 1);
+
+    *h.plan.lock().unwrap() = Plan {
+        finish_after: Some(Duration::from_millis(30)),
+        exit: 1,
+        stop_takes: Duration::ZERO,
+    };
+    assert_eq!(h.ask(run("docs"))["ok"], true);
+    h.wait_for("the failed run", PATIENT, |h| h.launched() == 2);
+    h.wait_for("idle", PATIENT, Harness::idle);
+    assert_eq!(converged_dirs(&h), 0);
+    assert_eq!(
+        observation_rows(&h, "routine.converged_forgotten", "docs").len(),
+        1
+    );
+    assert!(
+        h.logs()
+            .iter()
+            .any(|l| l.starts_with("routine_converged_forgotten ") && l.contains("profile=docs")),
+        "{:?}",
+        h.logs()
+    );
+    *h.plan.lock().unwrap() = Plan {
+        finish_after: Some(Duration::from_millis(30)),
+        exit: 0,
+        stop_takes: Duration::ZERO,
+    };
+    change(&h, "a");
+    h.wait_for("the next change dispatches", PATIENT, |h| h.launched() == 3);
+}
+
+/// An overflow loses events: it forgets the record and syncs the whole tree.
+#[cfg(unix)]
+#[test]
+fn an_overflow_forgets_the_record_and_is_never_skipped() {
+    let h = realtime_harness("converged-overflow");
+    h.world.lock().unwrap().converged_record = true;
+    h.wait_for("arm", PATIENT, |h| armed_generation(h, "docs").is_some());
+    let _source = quiet_tree(&h);
+    change(&h, "a");
+    h.wait_for("the first run", PATIENT, |h| h.launched() == 1);
+    h.wait_for("idle", PATIENT, Harness::idle);
+    assert_eq!(converged_dirs(&h), 1);
+    let _ = h.tx.send(Msg::Change(ChangeEvent::Overflow {
+        routine: Some("docs".into()),
+    }));
+    h.wait_for("the whole-tree run", PATIENT, |h| h.launched() == 2);
+    assert_eq!(
+        h.logs()
+            .iter()
+            .filter(|l| l.starts_with("routine_run_skipped "))
+            .count(),
+        0
+    );
+}
+
+/// A directory the check cannot read is not an excuse to skip: the dispatch
+/// goes ahead, and the reason is named once.
+#[cfg(unix)]
+#[test]
+fn a_check_that_cannot_be_made_dispatches_and_says_why() {
+    let h = realtime_harness("converged-unavailable");
+    h.wait_for("arm", PATIENT, |h| armed_generation(h, "docs").is_some());
+    let source = volume_source(&h.root, "docs");
+    fs::create_dir_all(&source).unwrap();
+    std::os::unix::fs::symlink("/", source.join("a")).unwrap();
+    change(&h, "a");
+    h.wait_for("the dispatch", PATIENT, |h| h.launched() == 1);
+    let line = h
+        .logs()
+        .into_iter()
+        .find(|l| l.starts_with("routine_skip_check_unavailable "))
+        .expect("the cause is named");
+    assert!(
+        line.contains("profile=docs") && line.contains("not a directory"),
+        "{line}"
+    );
+    let rows = observation_rows(&h, "routine.skip_check_unavailable", "docs");
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert!(rows[0].2.contains("not a directory"), "{rows:?}");
+}
+
+// ------------------------------------------------------- P3: delete-only events
+
+fn deleted(h: &Harness, dir: &str) {
+    let _ = h.tx.send(Msg::Change(ChangeEvent::Deleted {
+        routine: "docs".into(),
+        dir: dir.into(),
+        depth: Depth::Shallow,
+    }));
+}
+
+/// A routine that cannot delete has no work for a removal: the event is
+/// dropped, counted in the status and named, and a real change still runs.
+#[test]
+fn a_delete_only_event_is_ignored_by_a_routine_that_cannot_delete() {
+    let h = realtime_harness("delete-ignored");
+    h.wait_for("arm", PATIENT, |h| armed_generation(h, "docs").is_some());
+    deleted(&h, "a");
+    deleted(&h, "b");
+    h.wait_for("the first event is named", PATIENT, |h| {
+        h.logs()
+            .iter()
+            .any(|l| l.starts_with("routine_events_ignored "))
+    });
+    let line = h
+        .logs()
+        .into_iter()
+        .find(|l| l.starts_with("routine_events_ignored "))
+        .unwrap();
+    assert!(
+        line.contains("profile=docs")
+            && line.contains("reason=delete_only_no_delete")
+            && line.contains("first_dir=a"),
+        "{line}"
+    );
+    // Past the debounce nothing was dispatched, and nothing is pending.
+    thread::sleep(Duration::from_millis(1600));
+    assert_eq!(h.launched(), 0);
+    let status = h.ask(Request::Status);
+    assert_eq!(status["routines"][0]["pending_change"], false, "{status}");
+    assert_eq!(
+        status["routines"][0]["ignored_delete_events"], 2,
+        "{status}"
+    );
+    // Only the first of a burst is logged.
+    assert_eq!(
+        h.logs()
+            .iter()
+            .filter(|l| l.starts_with("routine_events_ignored "))
+            .count(),
+        1
+    );
+    let rows = observation_rows(&h, "routine.events_ignored", "docs");
+    assert_eq!(rows.len(), 1, "one row, not one per event: {rows:?}");
+    change(&h, "a");
+    h.wait_for("a real change runs", PATIENT, |h| h.launched() == 1);
+}
+
+/// A routine that may delete treats a removal as any other change.
+#[test]
+fn a_delete_event_dispatches_for_a_routine_that_can_delete() {
+    let h = Harness::new("delete-allowed", |home, _| {
+        profile(home, "docs");
+        routine(
+            home,
+            "docs",
+            "enabled=true\nmode=realtime\ndebounce_seconds=1\nallow_delete=true\n",
+        );
+    });
+    h.wait_for("arm", PATIENT, |h| armed_generation(h, "docs").is_some());
+    deleted(&h, "a");
+    h.wait_for("the dispatch", PATIENT, |h| h.launched() == 1);
+    assert!(
+        !h.logs()
+            .iter()
+            .any(|l| l.starts_with("routine_events_ignored ")),
+        "{:?}",
+        h.logs()
+    );
+}
+
+/// A routine edited since the last convergence may make a run do what an
+/// unchanged tree no longer says it would (deletion allowed, say): what was
+/// recorded is forgotten.
+#[cfg(unix)]
+#[test]
+fn an_edited_routine_forgets_what_was_recorded() {
+    let h = realtime_harness("converged-edited");
+    h.world.lock().unwrap().converged_record = true;
+    h.wait_for("arm", PATIENT, |h| armed_generation(h, "docs").is_some());
+    let _source = quiet_tree(&h);
+    change(&h, "a");
+    h.wait_for("the first run", PATIENT, |h| h.launched() == 1);
+    h.wait_for("idle", PATIENT, Harness::idle);
+    assert_eq!(converged_dirs(&h), 1);
+    routine(
+        &h.root.join("home"),
+        "docs",
+        "enabled=true\nmode=realtime\ndebounce_seconds=1\nretry_backoff_seconds=10\nallow_delete=true\n",
+    );
+    let _ = h.ask(Request::Reload);
+    h.wait_for("the record is forgotten", PATIENT, |h| {
+        converged_dirs(h) == 0
+    });
+    change(&h, "a");
+    h.wait_for("the change runs", PATIENT, |h| h.launched() == 2);
+}
+
+// ------------------------------------------------------- canary of a realtime run
+
+fn launched_args(h: &Harness, index: usize) -> Vec<String> {
+    h.world.lock().unwrap().launched[index]
+        .args
+        .iter()
+        .map(|a| a.to_string_lossy().into_owned())
+        .collect()
+}
+
+fn flag_value<'a>(args: &'a [String], flag: &str) -> Option<&'a str> {
+    args.windows(2)
+        .find(|w| w[0] == flag)
+        .map(|w| w[1].as_str())
+}
+
+fn realtime_with_index(label: &str) -> Harness {
+    Harness::tuned(
+        label,
+        |home, _| {
+            profile(home, "docs");
+            routine(
+                home,
+                "docs",
+                "enabled=true\nmode=realtime\ndebounce_seconds=1\nretry_backoff_seconds=10\n",
+            );
+        },
+        |settings| settings.pair_index_dir = Some(PathBuf::from("/var/state/cache/pairs")),
+    )
+}
+
+/// A realtime run for a dirty set draws 2 canaries, including one whose dirty
+/// directory is the source root (no `--scope`, which would draw 25); the
+/// whole-tree mark, a manual run and a routine that is not realtime keep the
+/// default. The flags only ever travel with `--pair-index`.
+#[test]
+fn a_realtime_dirty_set_run_pins_two_canaries_and_nothing_else_does() {
+    let h = realtime_with_index("argv-two");
+    h.wait_for("arm", PATIENT, |h| armed_generation(h, "docs").is_some());
+
+    // The root's direct children: no --scope (the whole tree would draw 25), a
+    // shallow root element, and still 2.
+    change(&h, "");
+    h.wait_for("the root run", PATIENT, |h| h.launched() == 1);
+    let args = launched_args(&h, 0);
+    assert!(!args.iter().any(|a| a == "--scope"), "{args:?}");
+    assert_eq!(flag_value(&args, "--scope-shallow"), Some(""), "{args:?}");
+    assert_eq!(
+        flag_value(&args, "--pair-index-canary"),
+        Some("2"),
+        "{args:?}"
+    );
+    assert_eq!(
+        flag_value(&args, "--reconcile-canary"),
+        Some("2"),
+        "{args:?}"
+    );
+    assert!(args.iter().any(|a| a == "--pair-index"), "{args:?}");
+    h.wait_for("idle", PATIENT, Harness::idle);
+
+    // A directory: scoped, 2.
+    change(&h, "a/b");
+    h.wait_for("the scoped run", PATIENT, |h| h.launched() == 2);
+    let args = launched_args(&h, 1);
+    assert_eq!(
+        flag_value(&args, "--scope-shallow"),
+        Some("a/b"),
+        "{args:?}"
+    );
+    assert!(!args.iter().any(|a| a == "--scope"), "{args:?}");
+    assert_eq!(
+        flag_value(&args, "--pair-index-canary"),
+        Some("2"),
+        "{args:?}"
+    );
+    assert_eq!(
+        flag_value(&args, "--reconcile-canary"),
+        Some("2"),
+        "{args:?}"
+    );
+    h.wait_for("idle", PATIENT, Harness::idle);
+
+    // The whole-tree mark (an overflow): the core's default.
+    let _ = h.tx.send(Msg::Change(ChangeEvent::Overflow {
+        routine: Some("docs".into()),
+    }));
+    h.wait_for("the whole-tree run", PATIENT, |h| h.launched() == 3);
+    let args = launched_args(&h, 2);
+    assert!(
+        !args.iter().any(|a| a.ends_with("-canary")) && !args.iter().any(|a| a == "--scope"),
+        "{args:?}"
+    );
+    h.wait_for("idle", PATIENT, Harness::idle);
+
+    // A manual run: the default too.
+    assert_eq!(h.ask(run("docs"))["ok"], true);
+    h.wait_for("the manual run", PATIENT, |h| h.launched() == 4);
+    let args = launched_args(&h, 3);
+    assert!(!args.iter().any(|a| a.ends_with("-canary")), "{args:?}");
+}
+
+/// Without an index directory there is nothing to draw a canary from, and the
+/// core refuses the flags: none is passed.
+#[test]
+fn no_canary_flags_without_the_pair_index() {
+    let h = realtime_harness("argv-plain");
+    h.wait_for("arm", PATIENT, |h| armed_generation(h, "docs").is_some());
+    change(&h, "a");
+    h.wait_for("the run", PATIENT, |h| h.launched() == 1);
+    let args = launched_args(&h, 0);
+    assert!(!args.iter().any(|a| a.ends_with("-canary")), "{args:?}");
+    assert!(!args.iter().any(|a| a == "--pair-index"), "{args:?}");
+}
+
+// ------------------------------------------------------- scope elements
+
+fn appeared(h: &Harness, dir: &str) {
+    let _ = h.tx.send(Msg::Change(ChangeEvent::Changed {
+        routine: "docs".into(),
+        dir: dir.into(),
+        depth: Depth::Recursive,
+    }));
+}
+
+/// A directory that appeared is read whole (`--scope`), a file saved elsewhere
+/// by its parent's direct children (`--scope-shallow`), and what a recursive
+/// element covers is not sent again.
+#[test]
+fn recursive_and_shallow_elements_are_sent_as_the_core_takes_them() {
+    let h = realtime_harness("elements");
+    h.wait_for("arm", PATIENT, |h| armed_generation(h, "docs").is_some());
+    appeared(&h, "Projects/new");
+    change(&h, "Projects/new/inside");
+    change(&h, "Projects");
+    change(&h, "Other/2026");
+    h.wait_for("the dispatch", PATIENT, |h| h.launched() == 1);
+    let args = launched_args(&h, 0);
+    let after = |flag: &str| -> Vec<&str> {
+        args.windows(2)
+            .filter(|w| w[0] == flag)
+            .map(|w| w[1].as_str())
+            .collect()
+    };
+    assert_eq!(after("--scope"), ["Projects/new"], "{args:?}");
+    assert_eq!(
+        after("--scope-shallow"),
+        ["Other/2026", "Projects"],
+        "{args:?}"
+    );
+    let line = h
+        .logs()
+        .into_iter()
+        .find(|l| l.starts_with("run_started "))
+        .unwrap();
+    assert!(
+        line.contains("subscope=Other/2026:shallow,Projects:shallow,Projects/new"),
+        "{line}"
+    );
+}
+
+/// A recursive root is the whole tree: no scope flags at all.
+#[test]
+fn a_recursive_root_is_the_whole_tree() {
+    let h = realtime_harness("elements-root");
+    h.wait_for("arm", PATIENT, |h| armed_generation(h, "docs").is_some());
+    appeared(&h, "");
+    change(&h, "a");
+    h.wait_for("the dispatch", PATIENT, |h| h.launched() == 1);
+    let args = launched_args(&h, 0);
+    assert!(
+        !args
+            .iter()
+            .any(|a| a == "--scope" || a == "--scope-shallow"),
+        "{args:?}"
+    );
+}
+
+/// A directory that appeared (a recursive element) is never compared with a
+/// manifest of direct children: it dispatches, whatever was recorded.
+#[cfg(unix)]
+#[test]
+fn a_recursive_element_is_never_skipped() {
+    let h = realtime_harness("converged-recursive");
+    h.world.lock().unwrap().converged_record = true;
+    h.wait_for("arm", PATIENT, |h| armed_generation(h, "docs").is_some());
+    let _source = quiet_tree(&h);
+    change(&h, "a");
+    h.wait_for("the first run", PATIENT, |h| h.launched() == 1);
+    h.wait_for("idle", PATIENT, Harness::idle);
+    assert_eq!(converged_dirs(&h), 1);
+    appeared(&h, "a");
+    h.wait_for("the run", PATIENT, |h| h.launched() == 2);
+    assert_eq!(skipped(&h)["skipped_runs"], 0);
 }
