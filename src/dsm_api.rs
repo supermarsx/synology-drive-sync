@@ -92,6 +92,7 @@ const AUDIT_LOG_PATH: &str = "/var/packages/synology-drive-sync/var/log/audit.lo
 const ACTIVITY_LOG_PATH: &str = "/var/packages/synology-drive-sync/var/log/activity.log";
 const API_LOG_PATH: &str = "/var/packages/synology-drive-sync/var/log/api.log";
 const CGI_FAILURE_STATE_PATH: &str = "/var/packages/synology-drive-sync/var/run/cgi-failure.state";
+const CGI_SLOW_STATE_PATH: &str = "/var/packages/synology-drive-sync/var/run/cgi-slow.state";
 const API_SOCKET_PATH: &str = "/var/packages/synology-drive-sync/var/run/api.sock";
 const API_PID_PATH: &str = "/var/packages/synology-drive-sync/var/run/api.pid";
 const API_BOUND_PATH: &str = "/var/packages/synology-drive-sync/var/run/api.bound";
@@ -10140,6 +10141,93 @@ mod linux_files {
         Ok(true)
     }
 
+    /// One `warn` record for a slow CGI request, at most once per `window_seconds` across every
+    /// CGI process, carrying how many slow requests the window held back.
+    ///
+    /// Its own state file, not `cgi-failure.state`: that file's window suppresses every failure
+    /// for thirty seconds after any one, and a slow poll must not be able to hide a failure.
+    /// The same non-blocking lock, so a CGI never waits behind another to report that it was
+    /// slow. `Ok(false)` is "not written": a busy lock, a window still open (the count is kept),
+    /// or a policy that hides warnings.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn record_slow_request_at(
+        log_root: &Path,
+        api_log: &Path,
+        state_path: &Path,
+        package_uid: u32,
+        now: u64,
+        policy: &SecurityPolicyArgs,
+        event: &str,
+        members: &serde_json::Map<String, Value>,
+        window_seconds: u64,
+    ) -> BridgeResult<bool> {
+        if now == 0 {
+            return Err(BridgeError::bad_request());
+        }
+        let state_root = state_path
+            .parent()
+            .ok_or_else(BridgeError::unsafe_runtime)?;
+        validate_private_directory(state_root, package_uid)?;
+        let mut state_options = OpenOptions::new();
+        state_options
+            .read(true)
+            .write(true)
+            .create(true)
+            .mode(0o600)
+            .custom_flags(NOFOLLOW_CLOEXEC);
+        let state = state_options
+            .open(state_path)
+            .map_err(|_| BridgeError::unsafe_runtime())?;
+        let state_metadata = state
+            .metadata()
+            .map_err(|_| BridgeError::unsafe_runtime())?;
+        if !state_metadata.file_type().is_file()
+            || state_metadata.st_uid() != package_uid
+            || state_metadata.st_mode() & 0o7777 != 0o600
+            || state_metadata.st_nlink() != 1
+            || state_metadata.len() > MAX_CGI_FAILURE_STATE_BYTES
+        {
+            return Err(BridgeError::unsafe_runtime());
+        }
+        let Some(mut state) = StateFlock::try_acquire(state)? else {
+            return Ok(false);
+        };
+        let mut previous = String::new();
+        state
+            .file
+            .read_to_string(&mut previous)
+            .map_err(|_| BridgeError::unsafe_runtime())?;
+        // `<epoch>|<held back>`. A state that does not parse is a window that never opened.
+        let (last, held_back) = previous
+            .trim_end()
+            .split_once('|')
+            .and_then(|(epoch, held)| Some((epoch.parse::<u64>().ok()?, held.parse::<u64>().ok()?)))
+            .unwrap_or((0, 0));
+        let write_state = |state: &mut StateFlock, epoch: u64, held: u64| -> BridgeResult<()> {
+            state
+                .file
+                .set_len(0)
+                .map_err(|_| BridgeError::unsafe_runtime())?;
+            state
+                .file
+                .seek(SeekFrom::Start(0))
+                .map_err(|_| BridgeError::unsafe_runtime())?;
+            write_single_record(&state.file, format!("{epoch}|{held}\n").as_bytes())
+        };
+        if last != 0 && now.saturating_sub(last) < window_seconds {
+            write_state(&mut state, last, held_back.saturating_add(1))?;
+            return Ok(false);
+        }
+        let mut members = members.clone();
+        members.insert("repeats".to_owned(), json!(held_back));
+        if !record_bridge_warning_at(log_root, api_log, package_uid, now, policy, event, &members)?
+        {
+            return Ok(false);
+        }
+        write_state(&mut state, now, 0)?;
+        Ok(true)
+    }
+
     #[cfg(test)]
     pub(super) fn state_flock_unlocks_shared_description_at(path: &Path) -> BridgeResult<()> {
         let open = || {
@@ -14706,6 +14794,8 @@ pub(crate) fn main_entry() -> ExitCode {
                     "response_write_timeout",
                 ));
             }
+            // After the answer is out, so saying a request was slow never makes it slower.
+            cgi_watchdog::note_slow(is_get);
             cgi_exit_code(written)
         }
         #[cfg(not(target_os = "linux"))]
@@ -16286,10 +16376,12 @@ fn handle_relay_request_under_policy(
     package_uid: u32,
     loaded_policy: &mut Option<SecurityPolicyArgs>,
 ) -> Result<CgiResponse, CgiFailure> {
+    let started = Instant::now();
     let relay = decode_relay_request(encoded)
         .map_err(|error| CgiFailure::new(CgiFailureStage::BridgeProtocol, error))?;
     let (request, body) = validate_relay_http_request(&relay)
         .map_err(|error| CgiFailure::new(CgiFailureStage::BridgeProtocol, error))?;
+    let request_label = relay_request_label(&request);
     let authentication = match &request {
         ValidatedHttpRequest::Get { authentication, .. }
         | ValidatedHttpRequest::Post { authentication, .. } => authentication,
@@ -16311,6 +16403,7 @@ fn handle_relay_request_under_policy(
         validate_relay_authenticated_session(&relay, authentication, resolved_uid)
             .map_err(|error| CgiFailure::new(CgiFailureStage::Authentication, error))?
     };
+    let authenticated_at = started.elapsed();
     let control_paths = ControlPaths::for_request();
     linux_files::require_open_runtime_admission(&control_paths, package_uid)
         .map_err(|error| CgiFailure::new(CgiFailureStage::ServiceRequest, error))?;
@@ -16320,6 +16413,7 @@ fn handle_relay_request_under_policy(
     // Held by the caller so a failure after this point is recorded under the
     // policy this request already paid to read.
     let policy = &*loaded_policy.insert(policy);
+    let admitted_at = started.elapsed();
     let is_post = matches!(request, ValidatedHttpRequest::Post { .. });
     let rejected_request_id = if is_post {
         rejected_post_request_id(body)
@@ -16339,6 +16433,14 @@ fn handle_relay_request_under_policy(
             policy,
         )
     };
+    note_slow_service_request(
+        package_uid,
+        policy,
+        request_label,
+        started.elapsed(),
+        authenticated_at,
+        admitted_at,
+    );
     if is_post
         && let Err(rejection) = &result
         && let Err(error) = record_rejected_post(
@@ -16361,6 +16463,109 @@ fn handle_relay_request_under_policy(
         );
     }
     result.map_err(|error| CgiFailure::new(CgiFailureStage::ServiceRequest, error))
+}
+
+/// A request this slow is worth a record: the dashboard's own read window is ten seconds, and
+/// a poll that takes a fifth of it is a poll that will time out on a busier NAS.
+#[cfg(target_os = "linux")]
+const SLOW_REQUEST_THRESHOLD: Duration = Duration::from_secs(2);
+
+/// How often a slow-request record may be written, and so how often one stands for the repeats
+/// since the last: a dashboard polling a slow NAS would otherwise write one per poll.
+#[cfg(target_os = "linux")]
+const SLOW_REQUEST_RECORD_WINDOW_SECONDS: u64 = 60;
+
+/// What a relayed request is, in a fixed vocabulary: the read it asks for, or `post`.
+///
+/// A mutation's kind is inside its body and is not parsed until the request is accepted, so a
+/// POST is labelled `post`; the Activity row the mutation writes names the operation.
+#[cfg(target_os = "linux")]
+fn relay_request_label(request: &ValidatedHttpRequest) -> &'static str {
+    match request {
+        ValidatedHttpRequest::Post { .. } => "post",
+        ValidatedHttpRequest::Get { action, .. } => match action {
+            ReadAction::Csrf => "csrf",
+            ReadAction::Snapshot => "snapshot",
+            ReadAction::SourceDirectories { .. } => "source-directories",
+            ReadAction::SourcePath { .. } => "source-path",
+            ReadAction::Logs { .. } => "logs",
+            ReadAction::Activity { .. } => "activity",
+            ReadAction::StatusRollup => "status-rollup",
+            ReadAction::Result { .. } => "result",
+            ReadAction::RequestStatus { .. } => "request-status",
+        },
+    }
+}
+
+/// The service's side of a slow request: how long it spent authenticating, being admitted
+/// (runtime admission and the security policy) and executing, in one `warn` record in api.log.
+///
+/// A result poll is left out: it holds the request open for up to three seconds on purpose.
+/// At most one record a minute, carrying how many it stands for, so that watching it never
+/// costs the NAS more than the slowness it reports. Never an error to the request.
+#[cfg(target_os = "linux")]
+fn note_slow_service_request(
+    package_uid: u32,
+    policy: &SecurityPolicyArgs,
+    label: &'static str,
+    total: Duration,
+    authenticated_at: Duration,
+    admitted_at: Duration,
+) {
+    static LAST_RECORDED: AtomicU64 = AtomicU64::new(0);
+    static SUPPRESSED: AtomicU64 = AtomicU64::new(0);
+    if total < SLOW_REQUEST_THRESHOLD || label == "result" {
+        return;
+    }
+    let Ok(now) = current_epoch() else {
+        return;
+    };
+    let last = LAST_RECORDED.load(AtomicOrdering::Relaxed);
+    if last != 0 && now.saturating_sub(last) < SLOW_REQUEST_RECORD_WINDOW_SECONDS {
+        SUPPRESSED.fetch_add(1, AtomicOrdering::Relaxed);
+        return;
+    }
+    if LAST_RECORDED
+        .compare_exchange(last, now, AtomicOrdering::Relaxed, AtomicOrdering::Relaxed)
+        .is_err()
+    {
+        SUPPRESSED.fetch_add(1, AtomicOrdering::Relaxed);
+        return;
+    }
+    let suppressed = SUPPRESSED.swap(0, AtomicOrdering::Relaxed);
+    let millis = |duration: Duration| u64::try_from(duration.as_millis()).unwrap_or(u64::MAX);
+    let mut members = serde_json::Map::new();
+    members.insert("request".to_owned(), json!(label));
+    members.insert("total_ms".to_owned(), json!(millis(total)));
+    members.insert("auth_ms".to_owned(), json!(millis(authenticated_at)));
+    members.insert(
+        "admission_ms".to_owned(),
+        json!(millis(admitted_at.saturating_sub(authenticated_at))),
+    );
+    members.insert(
+        "handle_ms".to_owned(),
+        json!(millis(total.saturating_sub(admitted_at))),
+    );
+    members.insert("repeats".to_owned(), json!(suppressed));
+    let log_root = Path::new(LOG_ROOT);
+    // `Ok(false)` is a policy that hides warnings: the record was declined on purpose, so the
+    // window stays closed. An error is a log that could not be appended, and that is said.
+    if let Err(error) = linux_files::record_bridge_warning_at(
+        log_root,
+        &log_root.join("api.log"),
+        package_uid,
+        now,
+        policy,
+        "service_slow",
+        &members,
+    ) {
+        LAST_RECORDED.store(last, AtomicOrdering::Relaxed);
+        SUPPRESSED.fetch_add(suppressed, AtomicOrdering::Relaxed);
+        eprintln!(
+            "sdsync-dsm-api: service_slow record not written: {}",
+            resolved_error_code(error, None, None)
+        );
+    }
 }
 
 fn is_https_request(value: Option<&str>) -> bool {
@@ -22319,6 +22524,14 @@ mod cgi_watchdog {
 
     static STAGE: AtomicU8 = AtomicU8::new(0);
     static RESPONDING: AtomicBool = AtomicBool::new(false);
+    /// When this request began, for the time each stage took.
+    static STARTED: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+    /// Milliseconds into the request at which the current stage was entered.
+    static MARK_MS: AtomicU64 = AtomicU64::new(0);
+    /// Milliseconds spent in each stage so far, by index into `STAGES`.
+    static SPENT_MS: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
+    /// The read this request asked for, from the query string.
+    static LABEL: std::sync::OnceLock<&'static str> = std::sync::OnceLock::new();
 
     const STAGES: [CgiFailureStage; 8] = [
         CgiFailureStage::Request,
@@ -22334,7 +22547,112 @@ mod cgi_watchdog {
     /// The stage the request is in, for the watchdog's answer.
     pub(super) fn enter(stage: CgiFailureStage) {
         if let Some(index) = STAGES.iter().position(|candidate| *candidate == stage) {
+            // The time since the last entry belongs to the stage being left.
+            let now = elapsed_ms();
+            let left = usize::from(STAGE.load(AtomicOrdering::Relaxed)).min(STAGES.len() - 1);
+            let since = MARK_MS.swap(now, AtomicOrdering::Relaxed);
+            SPENT_MS[left].fetch_add(now.saturating_sub(since), AtomicOrdering::Relaxed);
             STAGE.store(index as u8, AtomicOrdering::Relaxed);
+        }
+    }
+
+    fn elapsed_ms() -> u64 {
+        u64::try_from(STARTED.get_or_init(Instant::now).elapsed().as_millis()).unwrap_or(u64::MAX)
+    }
+
+    /// The fixed vocabulary a slow-request record names a request by.
+    pub(super) fn label_from_query(query: &str) -> &'static str {
+        const KNOWN: [&str; 9] = [
+            "csrf",
+            "snapshot",
+            "source-directories",
+            "source-path",
+            "logs",
+            "activity",
+            "status-rollup",
+            "result",
+            "request-status",
+        ];
+        query
+            .split('&')
+            .find_map(|pair| pair.strip_prefix("action="))
+            .and_then(|value| KNOWN.iter().copied().find(|known| *known == value))
+            .unwrap_or("unknown")
+    }
+
+    /// Say in api.log, once the response is out, that this request took longer than
+    /// [`SLOW_REQUEST_THRESHOLD`] and where the time went.
+    ///
+    /// The stages are the watchdog's own, so the record names the same places a deadline would:
+    /// `auth_ms` the DSM authentication (zero where the service authenticates, as it does on
+    /// DSM 7), `body_ms` reading the request, `relay_ms` connecting to and waiting for the
+    /// service. The service's share of `relay_ms` is in its own `service_slow` record. A result
+    /// poll is left out: it long-polls on purpose.
+    pub(super) fn note_slow(is_get: bool) {
+        let total = elapsed_ms();
+        let left = usize::from(STAGE.load(AtomicOrdering::Relaxed)).min(STAGES.len() - 1);
+        SPENT_MS[left].fetch_add(
+            total.saturating_sub(MARK_MS.load(AtomicOrdering::Relaxed)),
+            AtomicOrdering::Relaxed,
+        );
+        let label = if is_get {
+            LABEL.get().copied().unwrap_or("unknown")
+        } else {
+            "post"
+        };
+        if total < u64::try_from(SLOW_REQUEST_THRESHOLD.as_millis()).unwrap_or(u64::MAX)
+            || label == "result"
+        {
+            return;
+        }
+        let spent = |stage: CgiFailureStage| {
+            STAGES
+                .iter()
+                .position(|candidate| *candidate == stage)
+                .map_or(0, |index| SPENT_MS[index].load(AtomicOrdering::Relaxed))
+        };
+        let mut members = serde_json::Map::new();
+        members.insert("request".to_owned(), json!(label));
+        members.insert("total_ms".to_owned(), json!(total));
+        members.insert(
+            "identity_ms".to_owned(),
+            json!(spent(CgiFailureStage::Identity)),
+        );
+        members.insert(
+            "auth_ms".to_owned(),
+            json!(spent(CgiFailureStage::Authentication)),
+        );
+        members.insert("body_ms".to_owned(), json!(spent(CgiFailureStage::Request)));
+        members.insert(
+            "relay_ms".to_owned(),
+            json!(
+                spent(CgiFailureStage::BridgeConnect)
+                    + spent(CgiFailureStage::BridgeIo)
+                    + spent(CgiFailureStage::BridgeProtocol)
+            ),
+        );
+        let recorded = linux_runtime::identity_state()
+            .and_then(|identity| validate_cgi_identity(&identity))
+            .and_then(|package_uid| {
+                let now = current_epoch()?;
+                let policy = linux_files::load_security_policy(package_uid)?;
+                linux_files::record_slow_request_at(
+                    Path::new(LOG_ROOT),
+                    Path::new(API_LOG_PATH),
+                    Path::new(CGI_SLOW_STATE_PATH),
+                    package_uid,
+                    now,
+                    &policy,
+                    "cgi_slow",
+                    &members,
+                    SLOW_REQUEST_RECORD_WINDOW_SECONDS,
+                )
+            });
+        if let Err(error) = recorded {
+            eprintln!(
+                "sdsync-dsm-api: cgi_slow ({total} ms, {label}) not recorded: {}",
+                resolved_error_code(error, None, None)
+            );
         }
     }
 
@@ -22371,6 +22689,12 @@ mod cgi_watchdog {
     /// Start the watchdog thread. If it cannot be started the request still runs, and says so
     /// on stderr, which DSM's web server keeps.
     pub(super) fn arm(deadline: Duration, is_get: bool) {
+        STARTED.get_or_init(Instant::now);
+        if is_get {
+            let _ = LABEL.set(label_from_query(
+                &std::env::var("QUERY_STRING").unwrap_or_default(),
+            ));
+        }
         let started = std::thread::Builder::new()
             .name("cgi-watchdog".to_owned())
             .spawn(move || {
@@ -29438,6 +29762,97 @@ mod tests {
         fixture.write_private(&state, b"");
 
         linux_files::state_flock_unlocks_shared_description_at(&state).unwrap();
+    }
+
+    /// A slow request is one record a minute across every CGI process, saying how many it held
+    /// back, in a window of its own: it can neither be suppressed by a failure record nor
+    /// suppress one.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn slow_request_records_are_one_a_minute_and_count_what_they_held_back() {
+        let fixture = TestControlFixture::new("cgi-slow-records");
+        let uid = TestControlFixture::package_uid();
+        let log_root = fixture.root.join("log");
+        let runtime_root = fixture.root.join("run");
+        for directory in [&log_root, &runtime_root] {
+            fs::create_dir(directory).unwrap();
+            fs::set_permissions(directory, fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let api_log = log_root.join("api.log");
+        let state = runtime_root.join("cgi-slow.state");
+        let failure_state = runtime_root.join("cgi-failure.state");
+        let policy = SecurityPolicyArgs::default();
+        let mut members = serde_json::Map::new();
+        members.insert("request".to_owned(), json!("snapshot"));
+        members.insert("total_ms".to_owned(), json!(2500));
+        let record = |now: u64| {
+            linux_files::record_slow_request_at(
+                &log_root, &api_log, &state, uid, now, &policy, "cgi_slow", &members, 60,
+            )
+            .unwrap()
+        };
+        assert!(record(10_000));
+        assert!(!record(10_010));
+        assert!(!record(10_059));
+        // A failure inside the slow window is still recorded: the windows are separate.
+        assert!(
+            linux_files::record_pre_relay_cgi_failure_at(
+                &log_root,
+                &api_log,
+                &failure_state,
+                uid,
+                10_020,
+                "bridge_connect",
+                "service_unavailable",
+                503,
+            )
+            .unwrap()
+        );
+        assert!(record(10_060));
+
+        let lines = fs::read_to_string(&api_log).unwrap();
+        let slow = lines
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .filter(|value| value["event"] == "cgi_slow")
+            .collect::<Vec<_>>();
+        assert_eq!(slow.len(), 2);
+        assert_eq!(slow[0]["repeats"], 0);
+        assert_eq!(
+            slow[1]["repeats"], 2,
+            "the held-back requests were not counted"
+        );
+        assert_eq!(slow[0]["request"], "snapshot");
+        assert_eq!(slow[0]["total_ms"], 2500);
+        assert_eq!(slow[0]["category"], "bridge");
+        assert_eq!(slow[0]["level"], "warn");
+        assert_eq!(
+            lines
+                .lines()
+                .filter(|line| line.contains("cgi_failure"))
+                .count(),
+            1
+        );
+        // A slow record names no path, user or session.
+        for line in lines.lines() {
+            assert!(!line.contains("/var/"), "{line}");
+        }
+    }
+
+    /// The query string names the request by a fixed word, never by what the client wrote.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_slow_request_is_named_from_a_fixed_vocabulary() {
+        use cgi_watchdog::label_from_query;
+        assert_eq!(label_from_query("api=x&action=snapshot"), "snapshot");
+        assert_eq!(
+            label_from_query("action=activity&lines=200&since=ab"),
+            "activity"
+        );
+        assert_eq!(label_from_query("action=status-rollup"), "status-rollup");
+        assert_eq!(label_from_query("action=../../etc/passwd"), "unknown");
+        assert_eq!(label_from_query("lines=200"), "unknown");
+        assert_eq!(label_from_query(""), "unknown");
     }
 
     #[cfg(target_os = "linux")]

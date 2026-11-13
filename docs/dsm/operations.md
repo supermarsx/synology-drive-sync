@@ -690,6 +690,28 @@ Suppression still obeys `bridge_log_level`. A policy set to `error` writes no re
 neither the log nor the coalescing state file, and does not change what the browser is told: the
 503 and its code reach the page either way. A quiet log is not a quiet page.
 
+### Slow dashboard requests
+
+A request that takes more than two seconds is named in `api.log`, under the `bridge` category at
+`warn`, so that "the dashboard is sluggish" can be answered from the NAS rather than guessed at.
+Two records, because two processes see two different parts of the wait:
+
+- `cgi_slow` is written by the CGI after it has sent its answer, so reporting a slow request never
+  makes it slower. It carries `request` (the read it asked for, `post` for a mutation, or `unknown`),
+  `total_ms`, and where the time went: `identity_ms`, `auth_ms` (DSM authentication in the CGI; zero
+  on DSM 7, where the service authenticates), `body_ms` (reading the request) and `relay_ms`
+  (connecting to the service and waiting for its answer).
+- `service_slow` is written by the package service for the part of `relay_ms` it spent: `auth_ms`
+  (the loopback user-service check), `admission_ms` (runtime admission and the security policy) and
+  `handle_ms` (executing the request).
+
+Neither names a path, a user or a session. A result poll is never reported: it holds the request
+open for up to three seconds on purpose. At most one record a minute is written for each kind, and
+`repeats` says how many slow requests that minute held back, so watching the log costs the NAS
+nothing while it is slow. `cgi_slow` keeps its own state file (`var/run/cgi-slow.state`), not
+`cgi-failure.state`, so a slow poll can never suppress a failure record. A record that cannot be
+written is named on the process's stderr, and a `bridge_log_level` above `warn` writes none.
+
 ### Waking the controller after a save
 
 A dashboard save is queued as a file, and the controller is then told to look at the queue with one
