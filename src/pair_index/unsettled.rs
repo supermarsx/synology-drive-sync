@@ -241,13 +241,10 @@ impl UnsettledRecord {
     }
 }
 
+/// A deferral is recorded for a file or a folder; either way, the run looked at it only if it is
+/// where a file of the scope could be ([`Scope::matches`]).
 fn in_scope(relative: &str, scope: &Scope) -> bool {
-    let scope = scope.as_str();
-    scope.is_empty()
-        || relative == scope
-        || relative
-            .strip_prefix(scope)
-            .is_some_and(|rest| rest.starts_with('/'))
+    scope.matches(relative)
 }
 
 fn record_issue(path: &Path, cause: &str) -> IndexIssue {

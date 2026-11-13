@@ -35,7 +35,7 @@ use crate::observability::{
     SessionTransport, ShortToken, UrlScheme,
 };
 use crate::path::{RemoteRoot, is_dsm_managed, parent_and_name};
-use crate::plan::Scope;
+use crate::plan::{Scope, ScopeDepth};
 use crate::{Error, Result};
 
 const DISCOVERY_APIS: &[&str] = &[
@@ -3839,6 +3839,11 @@ impl ApiClient {
     /// trips per inventory on a two-core armv7 — and on the `status` path those entries were charged
     /// against the scan budget, so a large recycle bin could exhaust all 20,000 before the walk
     /// reached any payload and every real file was then reported `missing-remote`.
+    ///
+    /// A scope set is walked one element at a time and the inventories merged: a recursive
+    /// element as above, a shallow one by listing its folder alone. A shallow folder's child
+    /// directories are recorded but never descended; [`Scope::confine`] then keeps them out of
+    /// the plan altogether.
     pub fn remote_inventory_scoped(
         &self,
         root: &RemoteRoot,
@@ -3847,8 +3852,69 @@ impl ApiClient {
         budget: usize,
         cancellation: &CancellationToken,
     ) -> Result<ScopedRemoteInventory> {
+        let mut merged: Option<ScopedRemoteInventory> = None;
+        for element in scope.elements() {
+            let shallow = element.depth == ScopeDepth::Shallow;
+            let walked = self.remote_inventory_element(
+                root,
+                &element.path,
+                shallow,
+                rules,
+                budget,
+                cancellation,
+            )?;
+            merged = Some(match merged {
+                None => walked,
+                Some(mut merged) => {
+                    for (relative, entry) in walked.inventory.entries {
+                        merged.inventory.entries.entry(relative).or_insert(entry);
+                    }
+                    merged.inventory.root_exists &= walked.inventory.root_exists;
+                    merged.complete &= walked.complete;
+                    for directory in walked.incomplete_directories {
+                        if !merged.incomplete_directories.contains(&directory) {
+                            merged.incomplete_directories.push(directory);
+                        }
+                    }
+                    for entry in walked.skipped {
+                        if !merged
+                            .skipped
+                            .iter()
+                            .any(|known| known.remote_path == entry.remote_path)
+                        {
+                            merged.skipped.push(entry);
+                        }
+                    }
+                    // Summed: an ancestor two elements share and DSM gave no real path for is
+                    // counted once per element, an over-count of a warning, never an under-count.
+                    merged.link_guard_unchecked += walked.link_guard_unchecked;
+                    merged.link_checks.files_checked += walked.link_checks.files_checked;
+                    merged.link_checks.folders_checked += walked.link_checks.folders_checked;
+                    merged.link_checks.files_linked += walked.link_checks.files_linked;
+                    merged.link_checks.folders_linked += walked.link_checks.folders_linked;
+                    merged
+                        .vanished_directories
+                        .extend(walked.vanished_directories);
+                    merged
+                }
+            });
+        }
+        Ok(merged.expect("a scope is never empty"))
+    }
+
+    /// [`Self::remote_inventory_scoped`] for one element: `path` and, unless `shallow`,
+    /// everything beneath it.
+    fn remote_inventory_element(
+        &self,
+        root: &RemoteRoot,
+        path: &str,
+        shallow: bool,
+        rules: &IgnoreRules,
+        budget: usize,
+        cancellation: &CancellationToken,
+    ) -> Result<ScopedRemoteInventory> {
         let mut entries = BTreeMap::new();
-        let scope_path = root.join(scope.as_str())?;
+        let scope_path = root.join(path)?;
         // Each folder to list, with the real path DSM reported for it (when it did).
         let mut pending: Vec<(String, Option<String>)> = vec![(scope_path.clone(), None)];
         let mut root_exists = true;
@@ -3902,7 +3968,7 @@ impl ApiClient {
             };
             let is_scope_path = path == scope_path;
             // A scope is allowed to name one file; anything else on the path must be a directory.
-            let scope_names_a_file = is_scope_path && !scope.is_root() && !info.isdir;
+            let scope_names_a_file = is_scope_path && !path.is_empty() && !info.isdir;
             if !info.isdir && !scope_names_a_file {
                 return Err(Error::Message(format!(
                     "remote destination ancestor {path} exists but is not a directory"
@@ -4187,7 +4253,8 @@ impl ApiClient {
                     let protected = mount_point_type.is_some()
                         || is_dsm_managed(&relative)
                         || rules.is_ignored(&relative, item.isdir);
-                    if item.isdir && !protected {
+                    // A shallow element lists its own folder and nothing beneath it.
+                    if item.isdir && !protected && !shallow {
                         if let Some(real) = &real_path {
                             visited_real_paths.insert(walked_real_path_key(real));
                         }

@@ -545,14 +545,27 @@ pub struct SyncBehaviorArgs {
     )]
     pub excludes: Vec<String>,
 
-    /// Restrict the run to one SOURCE-relative file or folder.
+    /// Restrict the run to a SOURCE-relative file or folder (its whole subtree). May be repeated.
     #[arg(
         long = "scope",
         value_name = "PATH",
+        action = ArgAction::Append,
         help_heading = "Sync",
-        long_help = "Restrict the run to one SOURCE-relative path, naming either a folder (its whole subtree) or a single file. The path is relative to SOURCE: it is not absolute and not a pattern. Entries outside the scope are neither compared nor modified.\n\nMirror deletion is restricted to the scope as well: with --delete, only remote-only entries inside the scope are considered, never the rest of the destination. The deletion guards still apply and are evaluated against the scoped counts, so scope-mirroring a folder whose local contents were all removed still requires --allow-empty-source.\n\nBecause only the scope is scanned, the check for paths that differ only by letter case covers the scope alone. A scoped run cannot create a collision outside it, but a clean scoped result is not a whole-tree result.\n\nThis never implies --compare force. Scoping selects what is examined; it does not change how it is compared."
+        long_help = "Restrict the run to one SOURCE-relative path, naming either a folder (its whole subtree) or a single file. The path is relative to SOURCE: it is not absolute and not a pattern. Entries outside the scope are neither compared nor modified.\n\nMirror deletion is restricted to the scope as well: with --delete, only remote-only entries inside the scope are considered, never the rest of the destination. The deletion guards still apply and are evaluated against the scoped counts, so scope-mirroring a folder whose local contents were all removed still requires --allow-empty-source.\n\nBecause only the scope is scanned, the check for paths that differ only by letter case covers the scope alone. A scoped run cannot create a collision outside it, but a clean scoped result is not a whole-tree result.\n\nThis never implies --compare force. Scoping selects what is examined; it does not change how it is compared.
+
+Repeat --scope, or add --scope-shallow, to restrict sync and plan to a set of paths. Paths beneath another --scope are dropped, and a --scope wins over a --scope-shallow of the same folder. status and resync take one --scope only."
     )]
-    pub scope: Option<String>,
+    pub scope: Vec<String>,
+
+    /// Restrict the run to a SOURCE-relative folder's direct children. May be repeated.
+    #[arg(
+        long = "scope-shallow",
+        value_name = "PATH",
+        action = ArgAction::Append,
+        help_heading = "Sync",
+        long_help = "Restrict the run to the files directly inside one SOURCE-relative folder (\"\" or / for the source root); may be repeated, and combined with --scope. Nothing deeper is listed, compared, written or deleted: a subfolder of a shallow folder is left exactly as it is on both sides, never created, replaced or deleted, because its contents are not read. The folder itself may be created, never deleted. With --delete, only remote-only files directly inside the folder are deletion candidates. A run takes at most 1024 --scope and --scope-shallow paths in all. For sync and plan only; the realtime daemon passes it for folders where only files changed."
+    )]
+    pub scope_shallow: Vec<String>,
 
     /// How post-run reconciliation proves content (operator escape hatch, not a profile key).
     ///

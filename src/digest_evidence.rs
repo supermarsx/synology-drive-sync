@@ -47,14 +47,14 @@ pub const DEFAULT_CANARY: usize = 25;
 /// about 3 s of MD5 tasks per run on a DS416 (operator decision 2026-11-12, perf-design §5.2).
 pub const SCOPED_CANARY: usize = 2;
 
-/// The canary a run draws when none was configured: [`SCOPED_CANARY`] under a scope below the
-/// source root, [`DEFAULT_CANARY`] otherwise. A scope that names the root (`""` or `/`) is the
-/// whole tree, as [`crate::plan::Scope::parse`] reads it.
-pub fn default_canary(scope: Option<&str>) -> usize {
-    if scope.is_some_and(|scope| !scope.trim_matches('/').is_empty()) {
-        SCOPED_CANARY
-    } else {
+/// The canary a run draws when none was configured: [`DEFAULT_CANARY`] for the whole tree,
+/// [`SCOPED_CANARY`] for any other scope (a path, or a set of them, recursive or shallow), as
+/// [`crate::plan::Scope::is_root`] tells them apart.
+pub fn default_canary(whole_tree: bool) -> usize {
+    if whole_tree {
         DEFAULT_CANARY
+    } else {
+        SCOPED_CANARY
     }
 }
 
@@ -1006,11 +1006,25 @@ mod tests {
 
     #[test]
     fn a_scoped_run_draws_two_canaries_and_a_whole_tree_run_twenty_five() {
-        assert_eq!(default_canary(None), DEFAULT_CANARY);
-        assert_eq!(default_canary(Some("")), DEFAULT_CANARY);
-        assert_eq!(default_canary(Some("/")), DEFAULT_CANARY);
-        assert_eq!(default_canary(Some("2026")), SCOPED_CANARY);
-        assert_eq!(default_canary(Some("/2026/11/")), SCOPED_CANARY);
+        use crate::plan::Scope;
+        let canary = |recursive: &[&str], shallow: &[&str]| {
+            let owned =
+                |values: &[&str]| values.iter().map(|v| (*v).to_owned()).collect::<Vec<_>>();
+            default_canary(
+                Scope::from_parts(&owned(recursive), &owned(shallow))
+                    .unwrap()
+                    .is_root(),
+            )
+        };
+        assert_eq!(canary(&[], &[]), DEFAULT_CANARY);
+        assert_eq!(canary(&[""], &[]), DEFAULT_CANARY);
+        assert_eq!(canary(&["/"], &[]), DEFAULT_CANARY);
+        // A recursive root swallows every other element: still the whole tree.
+        assert_eq!(canary(&["", "2026"], &["2026/11"]), DEFAULT_CANARY);
+        assert_eq!(canary(&["2026"], &[]), SCOPED_CANARY);
+        assert_eq!(canary(&["/2026/11/"], &[]), SCOPED_CANARY);
+        assert_eq!(canary(&[], &[""]), SCOPED_CANARY);
+        assert_eq!(canary(&["2026/03"], &["2026/11"]), SCOPED_CANARY);
         // A ten-file folder is no longer verified whole.
         let pairs: Vec<VouchedPair> = (0..10_u8)
             .map(|index| VouchedPair {
@@ -1021,7 +1035,7 @@ mod tests {
                 nas_clock: None,
             })
             .collect();
-        let scoped = split_canaries(pairs, default_canary(Some("2026/11")), 7);
+        let scoped = split_canaries(pairs, default_canary(false), 7);
         assert_eq!(scoped.canaries.len(), 2);
         assert_eq!(scoped.served.len(), 8);
     }

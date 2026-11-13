@@ -769,14 +769,15 @@ impl IndexSession {
     /// Write this run's evidence in one transaction and report what it did.
     ///
     /// Removes every key this run touched (unless it was re-proven live afterwards), every key
-    /// whose facts no longer matched, and, for an unscoped run, every key that is no longer a
-    /// local file. `skip` (a breaker trip, a failed run) writes nothing and keeps the old
+    /// whose facts no longer matched, and every key that is no longer a local file where a file of
+    /// `scope` could be ([`crate::plan::Scope::matches`]): the whole tree for an unscoped run, a
+    /// shallow element's direct children only, never a record the run did not walk. `skip` (a breaker trip, a failed run) writes nothing and keeps the old
     /// evidence exactly as it was.
     pub fn commit(
         mut self,
         local: Option<&LocalInventory>,
         touched: Option<&TouchedPaths>,
-        unscoped: bool,
+        scope: &crate::plan::Scope,
     ) -> IndexReport {
         self.report.remote_signal = Some(self.signal);
         if self.signal == RemoteSignal::LocalOnly && self.report.state == IndexState::Warm {
@@ -794,7 +795,7 @@ impl IndexSession {
                 if upserts.contains_key(key) {
                     return;
                 }
-                let stale = unscoped
+                let stale = scope.matches(key)
                     && local.is_some_and(|local| {
                         local
                             .entries
@@ -885,7 +886,7 @@ impl IndexSession {
         mut self,
         local: Option<&LocalInventory>,
         touched: Option<&TouchedPaths>,
-        unscoped: bool,
+        scope: &crate::plan::Scope,
         cause: &str,
     ) -> IndexReport {
         if let Some(touched) = touched {
@@ -911,7 +912,7 @@ impl IndexSession {
                 ),
             ));
         }
-        self.commit(local, touched, unscoped)
+        self.commit(local, touched, scope)
     }
 
     /// The run did not finish its digest pass (a breaker trip, a failed run): nothing is written,

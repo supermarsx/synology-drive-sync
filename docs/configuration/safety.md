@@ -152,6 +152,20 @@ A `--scope` that is, or lies beneath, a NAS link is not skipped but **refused**,
 anything is listed: a scoped run never writes or deletes through a link (see
 [Partial runs, deferrals and skips](../observability.md#partial-runs-deferrals-and-skips)).
 
+`sync` and `plan` take a scope set: `--scope` may be repeated, and `--scope-shallow FOLDER` (also
+repeatable, `/` for the source root) names a folder whose direct files only are in scope. The realtime
+daemon sends one element per folder that changed. A shallow folder's subfolders are left exactly as
+they are on both sides: they are not listed, compared, created, replaced or deleted, and no
+verified-pair record beneath them is pruned. The shallow folder itself may be created and is never
+deleted, because what its subfolders hold was not read. With `--delete`, only remote-only files
+directly inside it are deletion candidates. A local file where the NAS holds such a subfolder (or
+the reverse) is the lasting `type-conflict` skip, and a whole-tree run settles it. A path beneath a
+`--scope` is dropped, and `--scope` wins over `--scope-shallow` of the same folder. A path that
+leaves the source (`..`), a DSM-managed name, or more than 1024 paths in all is refused before
+anything runs, and a link where an element should be is refused or never followed as for a single
+scope. An element that exists on neither side is named (`scope_element_absent`); the run fails with
+`scope_not_found` only when every element is absent. `status` and `resync` take one `--scope`.
+
 A file or folder the NAS refuses by name or permission (DSM codes such as 418, 414, 407 or 105 once the
 session is proven alive) is named and left out, and its siblings continue; see
 [Partial runs, deferrals and skips](../observability.md#partial-runs-deferrals-and-skips). A refusal

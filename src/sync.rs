@@ -3161,53 +3161,63 @@ pub fn withhold_scope_spelling_conflicts(
     if scope.is_root() || !remote.root_exists {
         return Ok(());
     }
-    let mut parent = String::new();
-    for name in scope.as_str().split('/') {
-        let relative = if parent.is_empty() {
-            name.to_owned()
-        } else {
-            format!("{parent}/{name}")
-        };
-        if !remote.entries.contains_key(&relative) {
-            let fold = crate::path::portable_fold(name);
-            let (names, complete) = list_names(&root.join(&parent)?)?;
-            if let Some(other) = names.iter().find(|candidate| {
-                *candidate != name && crate::path::portable_fold(candidate) == fold
-            }) {
-                let other = if parent.is_empty() {
-                    other.clone()
-                } else {
-                    format!("{parent}/{other}")
+    // One listing per parent folder, however many elements of a scope set lead through it.
+    let mut listed: BTreeMap<String, (Vec<String>, bool)> = BTreeMap::new();
+    'elements: for element in scope.elements() {
+        let mut parent = String::new();
+        for name in element.path.split('/').filter(|name| !name.is_empty()) {
+            let relative = if parent.is_empty() {
+                name.to_owned()
+            } else {
+                format!("{parent}/{name}")
+            };
+            if !remote.entries.contains_key(&relative) {
+                let fold = crate::path::portable_fold(name);
+                let (names, complete) = match listed.get(&parent) {
+                    Some(answer) => answer.clone(),
+                    None => {
+                        let answer = list_names(&root.join(&parent)?)?;
+                        listed.insert(parent.clone(), answer.clone());
+                        answer
+                    }
                 };
-                local.withhold(
-                    &relative,
-                    crate::local::SkipReason::RemoteCaseCollision { other },
-                );
-                return Ok(());
+                if let Some(other) = names.iter().find(|candidate| {
+                    *candidate != name && crate::path::portable_fold(candidate) == fold
+                }) {
+                    let other = if parent.is_empty() {
+                        other.clone()
+                    } else {
+                        format!("{parent}/{other}")
+                    };
+                    local.withhold(
+                        &relative,
+                        crate::local::SkipReason::RemoteCaseCollision { other },
+                    );
+                    continue 'elements;
+                }
+                // A listing DSM returned short cannot prove the other spelling absent: the scope
+                // is withheld, by name, rather than created on the strength of it.
+                if !complete {
+                    local.withhold(
+                        &relative,
+                        crate::local::SkipReason::Deferred {
+                            detail: format!(
+                                "{}: the NAS listing of {:?} was incomplete, so a differently                                  spelled {name:?} there cannot be ruled out; nothing was created",
+                                DeferReason::ListingIncomplete,
+                                if parent.is_empty() {
+                                    "."
+                                } else {
+                                    parent.as_str()
+                                }
+                            ),
+                        },
+                    );
+                }
+                // Absent here, so nothing beneath it is on the NAS either.
+                continue 'elements;
             }
-            // A listing DSM returned short cannot prove the other spelling absent: the scope is
-            // withheld, by name, rather than created on the strength of it.
-            if !complete {
-                local.withhold(
-                    &relative,
-                    crate::local::SkipReason::Deferred {
-                        detail: format!(
-                            "{}: the NAS listing of {:?} was incomplete, so a differently spelled \
-                             {name:?} there cannot be ruled out; nothing was created",
-                            DeferReason::ListingIncomplete,
-                            if parent.is_empty() {
-                                "."
-                            } else {
-                                parent.as_str()
-                            }
-                        ),
-                    },
-                );
-            }
-            // Absent here, so nothing beneath it is on the NAS either.
-            return Ok(());
+            parent = relative;
         }
-        parent = relative;
     }
     Ok(())
 }
@@ -4220,7 +4230,7 @@ mod tests {
                 self.batch_scopes
                     .lock()
                     .unwrap()
-                    .push(scope.as_str().to_owned());
+                    .push(scope.label().into_owned());
             }
             Ok(checks
                 .iter()

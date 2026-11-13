@@ -1442,6 +1442,15 @@ fn scan_dir(
                 continue;
             }
         };
+        // A directory in a shallow element's folder is not in scope: never recorded, never
+        // opened. Only a recursive element holds directories, and the walk passes through the
+        // folders leading to an element (`Scope::admits`).
+        if file_type.is_dir()
+            && !context.scope.contains(&relative, true)
+            && !context.scope.is_ancestor_of_scope(&relative)
+        {
+            continue;
+        }
         if rules.is_ignored(&relative, file_type.is_dir()) {
             // Recorded as a single entry and not descended into, so asking for excluded paths
             // cannot turn a bounded scan into an unbounded one.

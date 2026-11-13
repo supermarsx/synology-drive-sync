@@ -12,6 +12,11 @@ lists its own commits.
   downloads the old copy to prove it, then runs a copy task and checks the result, which for small
   files took longer than sending them: a 10-file folder move went from about 40 s to about 18 s at
   the NAS's measured 0.19 s per request. Larger moved files are still copied.
+- **`sync` and `plan` take a scope set.** `--scope` may be repeated and `--scope-shallow FOLDER`
+  names a folder whose direct files only are in scope, so a realtime run can cover the folders that
+  changed and nothing between them. Edits in `2026/03` and `2026/11` used to run over all of `2026`.
+  A shallow folder's subfolders are never listed, written, deleted or pruned from the index. See
+  [Comparison, exclusions, and deletion](configuration/safety.md).
 - **A run scoped below the source root re-verifies 2 pairs as its canary, not 25.** That covers a
   realtime routine's runs over the folders that changed and `--scope`. Whole-tree runs, including
   the daily full pass, still draw 25, and `--pair-index-canary` and `--reconcile-canary` still win.
