@@ -3,6 +3,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
+use std::net::{SocketAddr, ToSocketAddrs};
 use std::num::NonZeroU64;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -11,6 +12,7 @@ use std::thread;
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use reqwest::blocking::{Client as HttpClient, Response};
+use reqwest::dns::{Addrs, Name, Resolve, Resolving};
 use reqwest::header::{COOKIE, HeaderMap, HeaderValue, LOCATION, SET_COOKIE};
 use reqwest::multipart::{Form as AsyncForm, Part as AsyncPart};
 use reqwest::redirect::Policy;
@@ -87,6 +89,16 @@ const COPY_MAX_POLL_INTERVAL: Duration = Duration::from_secs(2);
 /// is the failure worth avoiding here. It is a constant rather than a setting so that nothing a
 /// caller sends can widen it.
 const REMOTE_MD5_CONCURRENCY: usize = 4;
+/// The most MD5 tasks the adaptive lanes ever keep in flight.
+///
+/// The lanes start at [`REMOTE_MD5_CONCURRENCY`] and widen by two, up to this, only while the tasks
+/// finish at their first poll: each digest is then a round trip rather than a read, so a wider
+/// lane buys wall clock and costs the NAS next to nothing. Any task that needs more than two polls,
+/// any failed digest and any retried request narrows them again, and a large file never widens
+/// them. A constant, like the base, so nothing a caller sends can raise it.
+const REMOTE_MD5_MAX_CONCURRENCY: usize = 8;
+/// Finished digests a batch must contribute before the lanes may widen on its evidence.
+const REMOTE_MD5_ADAPT_SAMPLE: usize = 16;
 /// Paths materialised per batch, which is what the concurrency costs in memory.
 ///
 /// The selection is the whole comparison set in the steady state, so materialising all of it would
@@ -252,6 +264,224 @@ pub struct ApiClient {
     counters: Arc<ClientCounters>,
     /// The forward proxy the environment routes this client's requests through, if any.
     forward_proxy: Option<ForwardProxy>,
+    /// Request-floor shortcuts and their counts, shared by every clone of this client.
+    floor: Arc<RequestFloor>,
+}
+
+/// How recent a successful control request must be for [`ApiClient::touch_session`] to skip its
+/// own request: the session was just proven alive by a real one.
+const SESSION_RECENT_ACTIVITY: Duration = Duration::from_secs(60);
+/// How long the ancestors the writable check just read may be handed to the inventory that follows
+/// it. The cache is also single-use; this bound only keeps a forgotten entry from outliving the
+/// moment it described.
+const PREFIX_CACHE_TTL: Duration = Duration::from_secs(10);
+/// How many folders one wave of the remote walk lists at once.
+///
+/// The same bound as [`REMOTE_MD5_CONCURRENCY`], and for the same reason: the remote may be a
+/// two-core armv7 with 1 GB of memory, where every request is a CGI process of its own. Four at a
+/// time takes the walk of a wide tree from one request per folder in sequence to about a quarter
+/// of that, and no further.
+const LIST_LANES: usize = 4;
+
+/// How long one DNS answer is reused. A run is seconds to minutes, so this only bounds a client
+/// that lives for a long operation; the usual end of a pinned answer is a failed connect.
+const DNS_PIN_TTL: Duration = Duration::from_secs(5 * 60);
+
+/// One name resolution per host for all three connection pools of a client.
+///
+/// The control client, the download client and the upload client each look the NAS's name up on
+/// their first connection, and a client built for a run opens all three. This resolver is shared by
+/// them, so the first lookup answers the rest. It resolves with the system resolver exactly as the
+/// default one does (`getaddrinfo`, on the blocking pool); only the repeat is saved.
+///
+/// The answer is not trusted past what it is: TLS still verifies the certificate against the
+/// hostname the URL names, never against an address. A connect that fails ends the pin
+/// ([`Self::forget`]), so the retry looks the name up afresh rather than dialling a dead address
+/// again, and the end is counted.
+#[derive(Debug, Default)]
+struct PinnedResolver {
+    answers: Mutex<HashMap<String, (Instant, Vec<SocketAddr>)>>,
+    lookups: AtomicUsize,
+    reused: AtomicUsize,
+    forgotten: AtomicUsize,
+}
+
+impl PinnedResolver {
+    fn pinned(&self, host: &str) -> Option<Vec<SocketAddr>> {
+        let answers = self.answers.lock().unwrap_or_else(PoisonError::into_inner);
+        let (resolved_at, addresses) = answers.get(host)?;
+        (resolved_at.elapsed() < DNS_PIN_TTL).then(|| addresses.clone())
+    }
+
+    /// Drop every pinned answer, because a connection to one of them just failed.
+    fn forget(&self) {
+        let mut answers = self.answers.lock().unwrap_or_else(PoisonError::into_inner);
+        if !answers.is_empty() {
+            answers.clear();
+            self.forgotten.fetch_add(1, Ordering::AcqRel);
+        }
+    }
+}
+
+/// The handle the three HTTP clients hold; `reqwest` takes the resolver by value.
+struct SharedResolver(Arc<PinnedResolver>);
+
+impl Resolve for SharedResolver {
+    fn resolve(&self, name: Name) -> Resolving {
+        let host = name.as_str().to_owned();
+        if let Some(addresses) = self.0.pinned(&host) {
+            self.0.reused.fetch_add(1, Ordering::AcqRel);
+            return Box::pin(async move { Ok(Box::new(addresses.into_iter()) as Addrs) });
+        }
+        let resolver = Arc::clone(&self.0);
+        Box::pin(async move {
+            let lookup = host.clone();
+            let addresses = tokio::task::spawn_blocking(move || {
+                (lookup.as_str(), 0_u16)
+                    .to_socket_addrs()
+                    .map(Iterator::collect::<Vec<_>>)
+            })
+            .await
+            .map_err(|error| -> Box<dyn std::error::Error + Send + Sync> { Box::new(error) })??;
+            resolver.lookups.fetch_add(1, Ordering::AcqRel);
+            if !addresses.is_empty() {
+                resolver
+                    .answers
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .insert(host, (Instant::now(), addresses.clone()));
+            }
+            Ok(Box::new(addresses.into_iter()) as Addrs)
+        })
+    }
+}
+
+/// The request-floor bookkeeping of a client, shared by every clone of it.
+#[derive(Debug)]
+struct RequestFloor {
+    /// The resolver all three connection pools share.
+    dns: Arc<PinnedResolver>,
+    origin: Instant,
+    /// Milliseconds since `origin`, plus one, of the last control request DSM answered
+    /// successfully. Zero means none yet, which is never "recent".
+    last_ok_ms: AtomicU64,
+    /// Ancestors of the destination, as the writable check read them a moment ago.
+    prefixes: Mutex<Option<CachedPrefixes>>,
+    /// Latched when DSM answered a multi-path `getinfo` in a shape this client does not accept, so
+    /// the serial calls that replaced it are not preceded by a doomed batch every time.
+    batch_getinfo_unusable: AtomicBool,
+    list_lanes: AtomicUsize,
+    /// MD5 lanes in force now, between [`REMOTE_MD5_CONCURRENCY`] and
+    /// [`REMOTE_MD5_MAX_CONCURRENCY`].
+    md5_lanes: AtomicUsize,
+    /// Digests finished since the lanes were last judged, how many of them at the first poll, and
+    /// how many needed more than two.
+    md5_window_done: AtomicUsize,
+    md5_window_first_poll: AtomicUsize,
+    md5_window_slow: AtomicUsize,
+    /// The client's retry count when the lanes were last judged.
+    md5_retries_seen: AtomicUsize,
+    md5_lanes_widened: AtomicUsize,
+    md5_lanes_narrowed: AtomicUsize,
+    touches_skipped: AtomicUsize,
+    getinfo_batches: AtomicUsize,
+    getinfo_requests_saved: AtomicUsize,
+    getinfo_batch_fallbacks: AtomicUsize,
+    prefix_cache_hits: AtomicUsize,
+    list_waves: AtomicUsize,
+    list_parallel_folders: AtomicUsize,
+}
+
+/// The ancestors one `getinfo` read, held for the next inventory.
+#[derive(Debug)]
+struct CachedPrefixes {
+    read_at: Instant,
+    items: Vec<(String, RemoteItem)>,
+}
+
+impl RequestFloor {
+    fn new() -> Self {
+        Self {
+            dns: Arc::new(PinnedResolver::default()),
+            origin: Instant::now(),
+            last_ok_ms: AtomicU64::new(0),
+            prefixes: Mutex::new(None),
+            batch_getinfo_unusable: AtomicBool::new(false),
+            list_lanes: AtomicUsize::new(LIST_LANES),
+            md5_lanes: AtomicUsize::new(REMOTE_MD5_CONCURRENCY),
+            md5_window_done: AtomicUsize::new(0),
+            md5_window_first_poll: AtomicUsize::new(0),
+            md5_window_slow: AtomicUsize::new(0),
+            md5_retries_seen: AtomicUsize::new(0),
+            md5_lanes_widened: AtomicUsize::new(0),
+            md5_lanes_narrowed: AtomicUsize::new(0),
+            touches_skipped: AtomicUsize::new(0),
+            getinfo_batches: AtomicUsize::new(0),
+            getinfo_requests_saved: AtomicUsize::new(0),
+            getinfo_batch_fallbacks: AtomicUsize::new(0),
+            prefix_cache_hits: AtomicUsize::new(0),
+            list_waves: AtomicUsize::new(0),
+            list_parallel_folders: AtomicUsize::new(0),
+        }
+    }
+
+    /// One digest finished after `polls` status requests.
+    fn note_md5_finished(&self, polls: usize) {
+        self.md5_window_done.fetch_add(1, Ordering::AcqRel);
+        if polls <= 1 {
+            self.md5_window_first_poll.fetch_add(1, Ordering::AcqRel);
+        } else if polls > 2 {
+            self.md5_window_slow.fetch_add(1, Ordering::AcqRel);
+        }
+    }
+
+    fn note_success(&self) {
+        let elapsed = u64::try_from(self.origin.elapsed().as_millis()).unwrap_or(u64::MAX - 1);
+        self.last_ok_ms
+            .store(elapsed.saturating_add(1), Ordering::Release);
+    }
+
+    fn recently_answered(&self, within: Duration) -> bool {
+        match self.last_ok_ms.load(Ordering::Acquire) {
+            0 => false,
+            stamp => {
+                let now = u64::try_from(self.origin.elapsed().as_millis()).unwrap_or(u64::MAX);
+                let age = now.saturating_sub(stamp - 1);
+                u128::from(age) < within.as_millis()
+            }
+        }
+    }
+}
+
+/// What the request-floor shortcuts did during a run, so each one is a counted fact rather than
+/// an absence of requests. Every field is a plain count; none of it is DSM content.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize)]
+pub struct RequestFloorCounters {
+    /// Session touches skipped because a real request had just proven the session alive.
+    pub session_touches_skipped: usize,
+    /// Multi-path `getinfo` requests sent.
+    pub getinfo_batches: usize,
+    /// Single-path `getinfo` requests those batches and the ancestor cache replaced.
+    pub getinfo_requests_saved: usize,
+    /// Times DSM's answer to a multi-path `getinfo` was not accepted and the serial calls ran
+    /// instead. Latched after the first: the client does not try again.
+    pub getinfo_batch_fallbacks: usize,
+    /// Inventories that reused the ancestors the writable check had just read.
+    pub ancestor_cache_hits: usize,
+    /// Waves of the remote walk that listed more than one folder at once.
+    pub list_waves_parallel: usize,
+    /// Folders listed inside those waves.
+    pub list_folders_parallel: usize,
+    /// MD5 lanes in force at the end of the run. Four unless the digests were all small and quick.
+    pub md5_lanes: usize,
+    /// Times the MD5 lanes widened, and times they narrowed back.
+    pub md5_lanes_widened: usize,
+    pub md5_lanes_narrowed: usize,
+    /// Name lookups this client made, connections that reused one a pool had already made, and
+    /// times a failed connect ended the reuse so the next attempt looked the name up again.
+    pub dns_lookups: usize,
+    pub dns_reused: usize,
+    pub dns_pins_dropped: usize,
 }
 
 #[derive(Debug, Default)]
@@ -288,7 +518,7 @@ pub struct TransportCounters {
 struct TaskGate {
     in_use: Mutex<usize>,
     released: std::sync::Condvar,
-    capacity: usize,
+    capacity: AtomicUsize,
 }
 
 impl TaskGate {
@@ -296,13 +526,20 @@ impl TaskGate {
         Self {
             in_use: Mutex::new(0),
             released: std::sync::Condvar::new(),
-            capacity: capacity.max(1),
+            capacity: AtomicUsize::new(capacity.max(1)),
         }
+    }
+
+    /// Change how many holders there may be. A waiter notices within one poll interval; holders
+    /// already inside are never evicted by a narrower gate.
+    fn set_capacity(&self, capacity: usize) {
+        self.capacity.store(capacity.max(1), Ordering::Release);
+        self.released.notify_all();
     }
 
     fn acquire(&self, cancellation: &CancellationToken) -> Result<TaskSlot<'_>> {
         let mut in_use = self.in_use.lock().unwrap_or_else(PoisonError::into_inner);
-        while *in_use >= self.capacity {
+        while *in_use >= self.capacity.load(Ordering::Acquire) {
             cancellation.check()?;
             in_use = self
                 .released
@@ -1301,17 +1538,21 @@ impl ApiClient {
         observer: Option<RequestObserver>,
     ) -> Result<Self> {
         let base = normalize_base_url(&options.base_url, options.allow_http)?;
+        let floor = Arc::new(RequestFloor::new());
         let mut builder = crate::blocking_client_builder()?
+            .dns_resolver(Arc::new(SharedResolver(Arc::clone(&floor.dns))))
             .connect_timeout(options.connect_timeout)
             .timeout(control_request_timeout(options.request_timeout))
             .redirect(Policy::none())
             .user_agent(concat!("synology-drive-sync/", env!("SDSYNC_VERSION")));
         let mut download_builder = crate::async_client_builder()?
+            .dns_resolver(Arc::new(SharedResolver(Arc::clone(&floor.dns))))
             .connect_timeout(options.connect_timeout)
             .read_timeout(control_request_timeout(options.request_timeout))
             .redirect(Policy::none())
             .user_agent(concat!("synology-drive-sync/", env!("SDSYNC_VERSION")));
         let mut upload_builder = crate::async_client_builder()?
+            .dns_resolver(Arc::new(SharedResolver(Arc::clone(&floor.dns))))
             .connect_timeout(options.connect_timeout)
             .redirect(Policy::none())
             .user_agent(concat!("synology-drive-sync/", env!("SDSYNC_VERSION")));
@@ -1365,6 +1606,7 @@ impl ApiClient {
             md5_tasks: Arc::new(TaskGate::new(REMOTE_MD5_CONCURRENCY)),
             counters: Arc::new(ClientCounters::default()),
             forward_proxy,
+            floor,
         };
         // Announced before discovery so the endpoint is named ahead of the first request it
         // explains, which is the order a reader needs.
@@ -1506,6 +1748,64 @@ impl ApiClient {
         }
     }
 
+    /// What the request-floor shortcuts did so far. See [`RequestFloorCounters`].
+    pub fn request_floor_counters(&self) -> RequestFloorCounters {
+        let floor = &self.floor;
+        RequestFloorCounters {
+            session_touches_skipped: floor.touches_skipped.load(Ordering::Acquire),
+            getinfo_batches: floor.getinfo_batches.load(Ordering::Acquire),
+            getinfo_requests_saved: floor.getinfo_requests_saved.load(Ordering::Acquire),
+            getinfo_batch_fallbacks: floor.getinfo_batch_fallbacks.load(Ordering::Acquire),
+            ancestor_cache_hits: floor.prefix_cache_hits.load(Ordering::Acquire),
+            list_waves_parallel: floor.list_waves.load(Ordering::Acquire),
+            list_folders_parallel: floor.list_parallel_folders.load(Ordering::Acquire),
+            md5_lanes: floor.md5_lanes.load(Ordering::Acquire),
+            md5_lanes_widened: floor.md5_lanes_widened.load(Ordering::Acquire),
+            md5_lanes_narrowed: floor.md5_lanes_narrowed.load(Ordering::Acquire),
+            dns_lookups: floor.dns.lookups.load(Ordering::Acquire),
+            dns_reused: floor.dns.reused.load(Ordering::Acquire),
+            dns_pins_dropped: floor.dns.forgotten.load(Ordering::Acquire),
+        }
+    }
+
+    /// Judge the MD5 lanes on the digests finished since the last judgement, after a batch.
+    ///
+    /// Widen by two, up to [`REMOTE_MD5_MAX_CONCURRENCY`], when a sample of
+    /// [`REMOTE_MD5_ADAPT_SAMPLE`] digests or more finished with at least half of them at the first
+    /// poll, none of them slow, and nothing failed or was retried: the batch was bound by round
+    /// trips, not by the NAS. Narrow by two, down to [`REMOTE_MD5_CONCURRENCY`], when a tenth of
+    /// them needed more than two polls, a digest failed, or a request was retried: the NAS, or the
+    /// path to it, is the limit. Anything between holds the lanes where they are.
+    fn adapt_md5_lanes(&self, failed_digests: usize) {
+        let floor = &self.floor;
+        let done = floor.md5_window_done.swap(0, Ordering::AcqRel);
+        let first_poll = floor.md5_window_first_poll.swap(0, Ordering::AcqRel);
+        let slow = floor.md5_window_slow.swap(0, Ordering::AcqRel);
+        let retries = self.counters.retries.load(Ordering::Acquire);
+        let retried =
+            retries.saturating_sub(floor.md5_retries_seen.swap(retries, Ordering::AcqRel));
+        let lanes = floor.md5_lanes.load(Ordering::Acquire);
+        let strained = failed_digests > 0 || retried > 0 || slow * 10 > done.max(1);
+        let next = if strained {
+            lanes.saturating_sub(2).max(REMOTE_MD5_CONCURRENCY)
+        } else if done >= REMOTE_MD5_ADAPT_SAMPLE && slow == 0 && first_poll * 2 >= done {
+            (lanes + 2).min(REMOTE_MD5_MAX_CONCURRENCY)
+        } else {
+            lanes
+        };
+        if next == lanes {
+            return;
+        }
+        floor.md5_lanes.store(next, Ordering::Release);
+        self.md5_tasks.set_capacity(next);
+        let counter = if next > lanes {
+            &floor.md5_lanes_widened
+        } else {
+            &floor.md5_lanes_narrowed
+        };
+        counter.fetch_add(1, Ordering::AcqRel);
+    }
+
     fn count_retry(&self) {
         self.counters.retries.fetch_add(1, Ordering::AcqRel);
     }
@@ -1515,7 +1815,16 @@ impl ApiClient {
     ///
     /// Best effort by design: a failed touch is not a failed run. The request that actually needs
     /// the session goes through the same recovery and reports its own error.
+    ///
+    /// Skipped, and counted, when a real request was answered within the last
+    /// [`SESSION_RECENT_ACTIVITY`]: that answer is the proof this touch exists to obtain, and DSM's
+    /// idle timer (minutes) is not what a minute-old session is at risk from. A client that has
+    /// made no request yet (a borrowed session, a fresh login that nothing has used) always touches.
     pub fn touch_session(&self) {
+        if self.floor.recently_answered(SESSION_RECENT_ACTIVITY) {
+            self.floor.touches_skipped.fetch_add(1, Ordering::AcqRel);
+            return;
+        }
         match self.with_session_recovery(|| self.confirm_file_station_session()) {
             Ok(()) | Err(Error::Cancelled) => {}
             // Counted, and visible request by request through the observer.
@@ -1678,6 +1987,7 @@ impl ApiClient {
                 return Ok(deferred);
             }
             let digests = self.remote_content_md5_batch(&batch, failure, cancellation)?;
+            self.adapt_md5_lanes(digests.iter().filter(|digest| digest.is_err()).count());
             for ((relative, _), digest) in batch.iter().zip(digests) {
                 match digest {
                     Ok((digest, started_at_nas)) => {
@@ -1765,7 +2075,11 @@ impl ApiClient {
             }
         };
 
-        let workers = REMOTE_MD5_CONCURRENCY.min(batch.len());
+        let workers = self
+            .floor
+            .md5_lanes
+            .load(Ordering::Acquire)
+            .min(batch.len());
         if workers <= 1 {
             drain();
         } else {
@@ -1861,6 +2175,7 @@ impl ApiClient {
         validate_task_id(&task.taskid, "SYNO.FileStation.MD5.start")?;
 
         let mut poll_interval = REMOTE_MD5_FIRST_POLL_INTERVAL;
+        let mut polls = 0_usize;
         loop {
             if cancellation.is_cancelled() {
                 self.stop_task("SYNO.FileStation.MD5", 2, &task.taskid);
@@ -1872,6 +2187,7 @@ impl ApiClient {
                     operation: "remote MD5 calculation",
                 });
             }
+            polls += 1;
             let request_timeout = self
                 .control_timeout
                 .min(deadline.saturating_duration_since(Instant::now()));
@@ -1900,7 +2216,9 @@ impl ApiClient {
                     operation: "SYNO.FileStation.MD5.status".to_owned(),
                     message: "finished task contained no MD5 digest".to_owned(),
                 })?;
-                return Ok((ContentMd5::parse_hex(&digest)?, started_at_nas));
+                let digest = ContentMd5::parse_hex(&digest)?;
+                self.floor.note_md5_finished(polls);
+                return Ok((digest, started_at_nas));
             }
             // Ramped rather than flat, because this is now on the hot path: one MD5 task per
             // file in the comparison set, issued serially. A flat 100 ms floor would add that
@@ -3024,10 +3342,36 @@ impl ApiClient {
             return (resolution, Err(error));
         }
 
+        let answers = match self.get_info_many(&prefixes) {
+            Ok(answers) => answers,
+            Err(error) => {
+                // One request answered for every component, so a failure of the whole call is
+                // recorded where the serial walk would have met it: at the first.
+                if let Some(first) = prefixes.first() {
+                    resolution.segments.push(PathSegmentProbe {
+                        path: first.clone(),
+                        depth: 1,
+                        exists: false,
+                        is_directory: false,
+                        mount_boundary: false,
+                        dsm_code: error.api_code(),
+                    });
+                }
+                return (resolution, Err(error));
+            }
+        };
+        let mut answers = answers.into_iter();
+        let mut read = Vec::with_capacity(prefixes.len());
         let mut nearest_existing = None;
         for (index, path) in prefixes.into_iter().enumerate() {
             let depth = u8::try_from(index + 1).unwrap_or(u8::MAX);
-            match self.get_info(&path) {
+            let answer = answers.next().unwrap_or_else(|| {
+                Err(Error::InvalidResponse {
+                    operation: "SYNO.FileStation.List.getinfo".to_owned(),
+                    message: format!("no answer was read for {path:?}"),
+                })
+            });
+            match answer {
                 Ok(item) => {
                     let mount_type = item
                         .additional
@@ -3054,6 +3398,7 @@ impl ApiClient {
                     if let Some(mount_type) = mount_type {
                         return (resolution, Err(Error::RemoteMountRoot { path, mount_type }));
                     }
+                    read.push((path.clone(), item));
                     nearest_existing = Some(path);
                 }
                 Err(error) if error.api_code() == Some(408) => {
@@ -3097,6 +3442,8 @@ impl ApiClient {
             }
         }
 
+        // What the walk read is what the inventory about to run would read first.
+        self.remember_prefixes(read);
         let probe_name = permission_probe_name();
         let outcome = self.check_write_permission(root.as_str(), &probe_name);
         (
@@ -3508,9 +3855,18 @@ impl ApiClient {
 
         // Inspect every ancestor before traversing. This also catches a destination below
         // a mounted remote folder, including when the final destination does not exist yet.
-        for path in absolute_prefixes(&scope_path) {
+        let ancestors = absolute_prefixes(&scope_path);
+        cancellation.check()?;
+        let mut answers = self.get_info_prefixes(&ancestors)?.into_iter();
+        for path in ancestors {
             cancellation.check()?;
-            let info = match self.get_info(&path) {
+            let answer = answers.next().unwrap_or_else(|| {
+                Err(Error::InvalidResponse {
+                    operation: "SYNO.FileStation.List.getinfo".to_owned(),
+                    message: format!("no answer was read for {path:?}"),
+                })
+            });
+            let info = match answer {
                 Ok(info) => info,
                 Err(error) if error.api_code() == Some(408) => {
                     // Absent at or above the root means the root itself is missing. Absent below
@@ -3615,199 +3971,217 @@ impl ApiClient {
         let mut vanished_directories = Vec::new();
         // Real paths already walked, so a link back into the tree cannot make the walk unbounded.
         let mut visited_real_paths = ancestor_real_paths;
-        'walk: while let Some((folder, folder_real_path)) = pending.pop() {
+        'walk: while !pending.is_empty() {
             cancellation.check()?;
-            let listing = match self.list_directory(&folder, cancellation) {
-                Ok(listing) => listing,
-                Err(error) if folder == root.as_str() && error.api_code() == Some(408) => {
-                    root_exists = false;
-                    break;
-                }
-                // The scope itself may simply not exist yet; that is an answer, not a failure.
-                Err(error) if folder == scope_path && error.api_code() == Some(408) => break,
-                // Below the scope, every folder was in its parent's listing a moment ago. Gone
-                // now (408) is a folder deleted on the NAS while the walk ran: it clears by
-                // itself, so it is named for a transient deferral rather than failing the run
-                // (ADV3-P-7). Its entry is dropped, and its parent's listing no longer describes
-                // the parent, so nothing there is deleted on the strength of it.
-                Err(error) if folder != scope_path && error.api_code() == Some(408) => {
-                    let relative = root.relative(&folder)?;
-                    entries.remove(&relative);
-                    incomplete_directories.push(parent_relative(&relative).to_owned());
-                    vanished_directories.push(relative);
-                    continue;
-                }
-                // A folder its parent lists but this account may not list (an ACL that denies
-                // it). That is a lasting condition someone has to fix, and it failed every run
-                // and synced nothing (ADV3-P-3). Kept, marked, named and never descended: a
-                // refusal is never absence, so nothing beneath it is uploaded, compared or
-                // deleted, and the folder and its ancestors are kept.
-                Err(error)
-                    if folder != scope_path && self.refuses_listing_to_this_account(&error) =>
-                {
-                    let relative = root.relative(&folder)?;
-                    let (_, name) = parent_and_name(&folder)?;
-                    if let Some(entry) = entries.get_mut(&relative) {
-                        entry.mount_point_type = Some(UNLISTABLE_ENTRY_MOUNT_TYPE.to_owned());
+            // One wave: the folders on top of the stack, listed together, then read in the order a
+            // one-at-a-time walk would have popped them. Only the waiting is concurrent; every
+            // decision below is taken in that fixed order, so the inventory does not depend on
+            // which answer came back first.
+            let width = pending
+                .len()
+                .min(self.floor.list_lanes.load(Ordering::Acquire).max(1));
+            let wave: Vec<(String, Option<String>)> =
+                (0..width).filter_map(|_| pending.pop()).collect();
+            let listings = self.list_wave(&wave, cancellation);
+            for ((folder, folder_real_path), listing) in wave.into_iter().zip(listings) {
+                let listing = match listing {
+                    Ok(listing) => listing,
+                    Err(error) if folder == root.as_str() && error.api_code() == Some(408) => {
+                        root_exists = false;
+                        break 'walk;
                     }
-                    skipped.push(SkippedRemoteEntry {
-                        parent: parent_relative(&relative).to_owned(),
-                        name: name.to_owned(),
-                        remote_path: folder.clone(),
-                        kind: EntryKind::Directory,
-                        reason: RemoteSkipReason::UnlistableFolder,
-                        excluded: is_dsm_managed(&relative) || rules.is_ignored(&relative, true),
-                        cause: format!(
-                            "File Station refused to list it with code {}",
-                            error.api_code().unwrap_or_default()
-                        ),
-                    });
-                    incomplete_directories.push(relative);
-                    continue;
-                }
-                Err(error) => return Err(error),
-            };
-            let folder_relative = root.relative(&folder)?;
-            if !listing.whole {
-                incomplete_directories.push(folder_relative.clone());
-            }
-            if folder_real_path.is_none() {
-                link_guard_unchecked += 1;
-            }
-            let files = listing.items;
-
-            for item in files {
-                cancellation.tick();
-                let (actual_parent, actual_name) = parent_and_name(&item.path)?;
-                if actual_parent != folder || actual_name != item.name {
-                    return Err(Error::InvalidResponse {
-                        operation: "SYNO.FileStation.List.list".to_owned(),
-                        message: format!(
-                            "server returned inconsistent child path {:?} while listing {:?}",
-                            item.path, folder
-                        ),
-                    });
-                }
-                let kind = if item.isdir {
-                    EntryKind::Directory
-                } else {
-                    EntryKind::File
+                    // The scope itself may simply not exist yet; that is an answer, not a failure.
+                    Err(error) if folder == scope_path && error.api_code() == Some(408) => {
+                        break 'walk;
+                    }
+                    // Below the scope, every folder was in its parent's listing a moment ago. Gone
+                    // now (408) is a folder deleted on the NAS while the walk ran: it clears by
+                    // itself, so it is named for a transient deferral rather than failing the run
+                    // (ADV3-P-7). Its entry is dropped, and its parent's listing no longer describes
+                    // the parent, so nothing there is deleted on the strength of it.
+                    Err(error) if folder != scope_path && error.api_code() == Some(408) => {
+                        let relative = root.relative(&folder)?;
+                        entries.remove(&relative);
+                        incomplete_directories.push(parent_relative(&relative).to_owned());
+                        vanished_directories.push(relative);
+                        continue;
+                    }
+                    // A folder its parent lists but this account may not list (an ACL that denies
+                    // it). That is a lasting condition someone has to fix, and it failed every run
+                    // and synced nothing (ADV3-P-3). Kept, marked, named and never descended: a
+                    // refusal is never absence, so nothing beneath it is uploaded, compared or
+                    // deleted, and the folder and its ancestors are kept.
+                    Err(error)
+                        if folder != scope_path && self.refuses_listing_to_this_account(&error) =>
+                    {
+                        let relative = root.relative(&folder)?;
+                        let (_, name) = parent_and_name(&folder)?;
+                        if let Some(entry) = entries.get_mut(&relative) {
+                            entry.mount_point_type = Some(UNLISTABLE_ENTRY_MOUNT_TYPE.to_owned());
+                        }
+                        skipped.push(SkippedRemoteEntry {
+                            parent: parent_relative(&relative).to_owned(),
+                            name: name.to_owned(),
+                            remote_path: folder.clone(),
+                            kind: EntryKind::Directory,
+                            reason: RemoteSkipReason::UnlistableFolder,
+                            excluded: is_dsm_managed(&relative)
+                                || rules.is_ignored(&relative, true),
+                            cause: format!(
+                                "File Station refused to list it with code {}",
+                                error.api_code().unwrap_or_default()
+                            ),
+                        });
+                        incomplete_directories.push(relative);
+                        continue;
+                    }
+                    Err(error) => return Err(error),
                 };
-                let relative = match root.relative(&item.path) {
-                    Ok(relative) => relative,
-                    // A name no path this tool sends can address (a macOS `Icon\r`, a Linux name
-                    // with a newline or a backslash). It used to fail every run with a
-                    // configuration exit that no exclude could cure. It is named and never
-                    // touched; a caller that mutates keeps its folders with
-                    // `sync::protect_skipped_remote_entries`.
-                    Err(Error::UnsafeRemotePath { reason, .. }) => {
-                        let raw = if folder_relative.is_empty() {
-                            item.name.clone()
-                        } else {
-                            format!("{folder_relative}/{}", item.name)
-                        };
-                        let excluded = is_dsm_managed(&raw) || rules.is_ignored(&raw, item.isdir);
+                let folder_relative = root.relative(&folder)?;
+                if !listing.whole {
+                    incomplete_directories.push(folder_relative.clone());
+                }
+                if folder_real_path.is_none() {
+                    link_guard_unchecked += 1;
+                }
+                let files = listing.items;
+
+                for item in files {
+                    cancellation.tick();
+                    let (actual_parent, actual_name) = parent_and_name(&item.path)?;
+                    if actual_parent != folder || actual_name != item.name {
+                        return Err(Error::InvalidResponse {
+                            operation: "SYNO.FileStation.List.list".to_owned(),
+                            message: format!(
+                                "server returned inconsistent child path {:?} while listing {:?}",
+                                item.path, folder
+                            ),
+                        });
+                    }
+                    let kind = if item.isdir {
+                        EntryKind::Directory
+                    } else {
+                        EntryKind::File
+                    };
+                    let relative = match root.relative(&item.path) {
+                        Ok(relative) => relative,
+                        // A name no path this tool sends can address (a macOS `Icon\r`, a Linux name
+                        // with a newline or a backslash). It used to fail every run with a
+                        // configuration exit that no exclude could cure. It is named and never
+                        // touched; a caller that mutates keeps its folders with
+                        // `sync::protect_skipped_remote_entries`.
+                        Err(Error::UnsafeRemotePath { reason, .. }) => {
+                            let raw = if folder_relative.is_empty() {
+                                item.name.clone()
+                            } else {
+                                format!("{folder_relative}/{}", item.name)
+                            };
+                            let excluded =
+                                is_dsm_managed(&raw) || rules.is_ignored(&raw, item.isdir);
+                            skipped.push(SkippedRemoteEntry {
+                                parent: folder_relative.clone(),
+                                name: item.name.clone(),
+                                remote_path: item.path.clone(),
+                                kind,
+                                reason: RemoteSkipReason::UnrepresentableName,
+                                excluded,
+                                cause: reason,
+                            });
+                            continue;
+                        }
+                        Err(error) => return Err(error),
+                    };
+                    if relative.is_empty() {
+                        return Err(Error::InvalidResponse {
+                            operation: "SYNO.FileStation.List.list".to_owned(),
+                            message: "directory listing unexpectedly included its own root"
+                                .to_owned(),
+                        });
+                    }
+                    let additional = item.additional.unwrap_or_default();
+                    let (size, mtime_seconds) =
+                        file_metadata("SYNO.FileStation.List.list", kind, &additional)?;
+                    let (ctime_seconds, crtime_seconds) = remote_change_times(&additional);
+                    let real_path = reported_real_path(&additional);
+                    // A link inside the destination (ADV-R-5): DSM's real path for the entry is not
+                    // its listed path. Descending would walk, and `--delete` would delete, whatever
+                    // the link points at, possibly in another share; a link back up the tree would
+                    // make the walk unbounded. Recorded as a mount boundary, which every planner guard
+                    // already keeps whole, and named.
+                    //
+                    // Fail closed: once DSM has reported a real path for the folder being listed, an
+                    // entry in it whose real path is missing, not absolute, not exactly
+                    // `<folder real path>/<name>`, or already walked is treated as a link. Only a DSM
+                    // that reports no real path for a folder leaves the guard unable to run there;
+                    // `link_guard_unchecked` counts those folders.
+                    let link = link_verdict(
+                        folder_real_path.as_deref(),
+                        &item.name,
+                        real_path.as_deref(),
+                        item.isdir,
+                        &visited_real_paths,
+                    );
+                    let excluded =
+                        is_dsm_managed(&relative) || rules.is_ignored(&relative, item.isdir);
+                    if folder_real_path.is_some() && !excluded {
+                        link_checks.record(item.isdir, link.as_ref().map(|(reason, _)| *reason));
+                    }
+                    let mount_point_type = match &link {
+                        Some(_) => Some(LINKED_ENTRY_MOUNT_TYPE.to_owned()),
+                        None => additional
+                            .mount_point_type
+                            .filter(|value| !value.trim().is_empty()),
+                    };
+                    if let Some((reason, cause)) = link {
                         skipped.push(SkippedRemoteEntry {
                             parent: folder_relative.clone(),
                             name: item.name.clone(),
                             remote_path: item.path.clone(),
                             kind,
-                            reason: RemoteSkipReason::UnrepresentableName,
+                            reason,
                             excluded,
-                            cause: reason,
+                            cause,
                         });
-                        continue;
                     }
-                    Err(error) => return Err(error),
-                };
-                if relative.is_empty() {
-                    return Err(Error::InvalidResponse {
-                        operation: "SYNO.FileStation.List.list".to_owned(),
-                        message: "directory listing unexpectedly included its own root".to_owned(),
-                    });
-                }
-                let additional = item.additional.unwrap_or_default();
-                let (size, mtime_seconds) =
-                    file_metadata("SYNO.FileStation.List.list", kind, &additional)?;
-                let (ctime_seconds, crtime_seconds) = remote_change_times(&additional);
-                let real_path = reported_real_path(&additional);
-                // A link inside the destination (ADV-R-5): DSM's real path for the entry is not
-                // its listed path. Descending would walk, and `--delete` would delete, whatever
-                // the link points at, possibly in another share; a link back up the tree would
-                // make the walk unbounded. Recorded as a mount boundary, which every planner guard
-                // already keeps whole, and named.
-                //
-                // Fail closed: once DSM has reported a real path for the folder being listed, an
-                // entry in it whose real path is missing, not absolute, not exactly
-                // `<folder real path>/<name>`, or already walked is treated as a link. Only a DSM
-                // that reports no real path for a folder leaves the guard unable to run there;
-                // `link_guard_unchecked` counts those folders.
-                let link = link_verdict(
-                    folder_real_path.as_deref(),
-                    &item.name,
-                    real_path.as_deref(),
-                    item.isdir,
-                    &visited_real_paths,
-                );
-                let excluded = is_dsm_managed(&relative) || rules.is_ignored(&relative, item.isdir);
-                if folder_real_path.is_some() && !excluded {
-                    link_checks.record(item.isdir, link.as_ref().map(|(reason, _)| *reason));
-                }
-                let mount_point_type = match &link {
-                    Some(_) => Some(LINKED_ENTRY_MOUNT_TYPE.to_owned()),
-                    None => additional
-                        .mount_point_type
-                        .filter(|value| !value.trim().is_empty()),
-                };
-                if let Some((reason, cause)) = link {
-                    skipped.push(SkippedRemoteEntry {
-                        parent: folder_relative.clone(),
-                        name: item.name.clone(),
+                    let entry = RemoteEntry {
+                        relative: relative.clone(),
                         remote_path: item.path.clone(),
                         kind,
-                        reason,
-                        excluded,
-                        cause,
-                    });
-                }
-                let entry = RemoteEntry {
-                    relative: relative.clone(),
-                    remote_path: item.path.clone(),
-                    kind,
-                    size,
-                    mtime_seconds,
-                    ctime_seconds,
-                    crtime_seconds,
-                    digest_nas_time: None,
-                    mount_point_type: mount_point_type.clone(),
-                    content_md5: None,
-                };
-                // The budget is how many entries may be kept, so the entry that proves the walk
-                // was truncated is the first one that does not fit -- not the last one that did.
-                // Checked before listing the next directory instead, a tree whose last directories
-                // are empty reported itself truncated when it had in fact been walked in full, and
-                // `store_rollup` requires a reader to render an incomplete total as a floor: every
-                // count in the dashboard became "20,000+" for a tree that was exactly 20,000.
-                if entries.len() >= budget {
-                    complete = false;
-                    break 'walk;
-                }
-                if entries.insert(relative.clone(), entry).is_some() {
-                    return Err(Error::InvalidResponse {
-                        operation: "SYNO.FileStation.List.list".to_owned(),
-                        message: format!("server returned duplicate path {relative:?}"),
-                    });
-                }
-                // Recorded above so the entry is still counted and still reported as excluded, and
-                // not traversed: nothing downstream reads anything beneath a protected directory.
-                let protected = mount_point_type.is_some()
-                    || is_dsm_managed(&relative)
-                    || rules.is_ignored(&relative, item.isdir);
-                if item.isdir && !protected {
-                    if let Some(real) = &real_path {
-                        visited_real_paths.insert(walked_real_path_key(real));
+                        size,
+                        mtime_seconds,
+                        ctime_seconds,
+                        crtime_seconds,
+                        digest_nas_time: None,
+                        mount_point_type: mount_point_type.clone(),
+                        content_md5: None,
+                    };
+                    // The budget is how many entries may be kept, so the entry that proves the walk
+                    // was truncated is the first one that does not fit -- not the last one that did.
+                    // Checked before listing the next directory instead, a tree whose last directories
+                    // are empty reported itself truncated when it had in fact been walked in full, and
+                    // `store_rollup` requires a reader to render an incomplete total as a floor: every
+                    // count in the dashboard became "20,000+" for a tree that was exactly 20,000.
+                    if entries.len() >= budget {
+                        complete = false;
+                        break 'walk;
                     }
-                    pending.push((item.path, real_path));
+                    if entries.insert(relative.clone(), entry).is_some() {
+                        return Err(Error::InvalidResponse {
+                            operation: "SYNO.FileStation.List.list".to_owned(),
+                            message: format!("server returned duplicate path {relative:?}"),
+                        });
+                    }
+                    // Recorded above so the entry is still counted and still reported as excluded, and
+                    // not traversed: nothing downstream reads anything beneath a protected directory.
+                    let protected = mount_point_type.is_some()
+                        || is_dsm_managed(&relative)
+                        || rules.is_ignored(&relative, item.isdir);
+                    if item.isdir && !protected {
+                        if let Some(real) = &real_path {
+                            visited_real_paths.insert(walked_real_path_key(real));
+                        }
+                        pending.push((item.path, real_path));
+                    }
                 }
             }
         }
@@ -5115,6 +5489,43 @@ impl ApiClient {
         })
     }
 
+    /// List every folder of one wave of the walk, concurrently when there is more than one, and
+    /// return the answers in the order the folders were given.
+    ///
+    /// Bounded by [`LIST_LANES`] through the wave's width, so no more requests are in flight than a
+    /// two-core NAS was already asked to serve for MD5. Each folder keeps its own retry, session
+    /// recovery and two-pass stability check through [`Self::list_directory`]; a failure belongs to
+    /// the folder it happened in, and the caller reads the answers in order.
+    fn list_wave(
+        &self,
+        wave: &[(String, Option<String>)],
+        cancellation: &CancellationToken,
+    ) -> Vec<Result<DirectoryRead>> {
+        if let [(folder, _)] = wave {
+            return vec![self.list_directory(folder, cancellation)];
+        }
+        self.floor.list_waves.fetch_add(1, Ordering::AcqRel);
+        self.floor
+            .list_parallel_folders
+            .fetch_add(wave.len(), Ordering::AcqRel);
+        thread::scope(|scope| {
+            let lanes: Vec<_> = wave
+                .iter()
+                .map(|(folder, _)| scope.spawn(move || self.list_directory(folder, cancellation)))
+                .collect();
+            lanes
+                .into_iter()
+                .map(|lane| {
+                    lane.join().unwrap_or_else(|_| {
+                        Err(Error::Message(
+                            "a remote listing thread ended unexpectedly".to_owned(),
+                        ))
+                    })
+                })
+                .collect()
+        })
+    }
+
     /// One complete pass over a directory's pages, reported with the evidence needed to judge it.
     fn list_directory_pass(
         &self,
@@ -5180,6 +5591,180 @@ impl ApiClient {
 
     fn get_info(&self, path: &str) -> Result<RemoteItem> {
         self.get_info_with_retry(path, true)
+    }
+
+    /// What `getinfo` says about each of `paths`, in the order given, from as few requests as DSM
+    /// allows: one.
+    ///
+    /// Every entry is exactly the answer [`Self::get_info`] would have given for that path alone,
+    /// including a per-path `408` as `Err`. A caller reads them in order and stops at the first
+    /// `Err`: the serial route stops there too, so its answers may end early. A call for one path, a DSM that already declined the
+    /// multi-path form, and any answer this client cannot match path for path with what it asked
+    /// all take the serial route, which is the behaviour that existed before. The last two are
+    /// counted ([`RequestFloorCounters::getinfo_batch_fallbacks`]) and never repeated, so a DSM
+    /// that does not answer the batch costs one wasted request per client rather than one per
+    /// call. Transport failures and cancellation are not a shape problem and pass through.
+    fn get_info_many(&self, paths: &[String]) -> Result<Vec<Result<RemoteItem>>> {
+        if paths.len() < 2 || self.floor.batch_getinfo_unusable.load(Ordering::Acquire) {
+            return Ok(self.get_info_in_turn(paths));
+        }
+        let parameters = vec![
+            pair("path", json_array(paths.iter().map(String::as_str))?),
+            pair(
+                "additional",
+                json_array(["size", "time", "mount_point_type", "real_path"])?,
+            ),
+        ];
+        let answered =
+            self.call::<GetInfoData>("SYNO.FileStation.List", 2, "getinfo", parameters, true);
+        let data = match answered {
+            Ok(Some(data)) => data,
+            Ok(None) => return self.get_info_many_serially(paths, true),
+            // One envelope-level "not found" for a call that named several paths cannot be
+            // attributed to any one of them, and says nothing against the multi-path form: the
+            // serial calls give every path its own answer, and the next batch is still tried.
+            Err(error) if error.api_code() == Some(408) => {
+                return self.get_info_many_serially(paths, false);
+            }
+            // DSM rejecting the multi-path form outright (an unknown or invalid parameter). The
+            // serial calls give every path its own authoritative answer. Any other DSM refusal (no
+            // permission, a dead session) is about the request, not its shape, and the serial
+            // calls would only repeat it, so it passes through.
+            Err(Error::Api {
+                code: 100 | 101 | 120 | 400 | 401,
+                ..
+            })
+            | Err(Error::InvalidResponse { .. }) => {
+                return self.get_info_many_serially(paths, true);
+            }
+            Err(error) => return Err(error),
+        };
+        // Matched by path, not by position: DSM is not promised to answer in request order. Every
+        // requested path must come back exactly once and nothing else may.
+        let mut wanted: BTreeMap<&str, Option<RemoteItemWire>> =
+            paths.iter().map(|path| (path.as_str(), None)).collect();
+        let mut matched = data.files.len() == paths.len() && wanted.len() == paths.len();
+        if matched {
+            for item in data.files {
+                match wanted.get_mut(item.path.as_str()) {
+                    Some(slot @ None) => *slot = Some(item),
+                    _ => {
+                        matched = false;
+                        break;
+                    }
+                }
+            }
+        }
+        if !matched {
+            return self.get_info_many_serially(paths, true);
+        }
+        self.floor.getinfo_batches.fetch_add(1, Ordering::AcqRel);
+        self.floor
+            .getinfo_requests_saved
+            .fetch_add(paths.len() - 1, Ordering::AcqRel);
+        Ok(paths
+            .iter()
+            .map(|path| {
+                wanted
+                    .remove(path.as_str())
+                    .flatten()
+                    .expect("every requested path was matched")
+                    .into_item("SYNO.FileStation.List", "getinfo")
+            })
+            .collect())
+    }
+
+    /// The serial answer to [`Self::get_info_many`], after the batch was not usable.
+    fn get_info_many_serially(
+        &self,
+        paths: &[String],
+        latch: bool,
+    ) -> Result<Vec<Result<RemoteItem>>> {
+        if latch {
+            self.floor
+                .batch_getinfo_unusable
+                .store(true, Ordering::Release);
+        }
+        self.floor
+            .getinfo_batch_fallbacks
+            .fetch_add(1, Ordering::AcqRel);
+        Ok(self.get_info_in_turn(paths))
+    }
+
+    /// One `getinfo` per path, in order, stopping after the first that fails: every caller walks
+    /// the answers in order and stops there too, so the requests after it would be wasted.
+    fn get_info_in_turn(&self, paths: &[String]) -> Vec<Result<RemoteItem>> {
+        let mut answers = Vec::with_capacity(paths.len());
+        for path in paths {
+            let answer = self.get_info(path);
+            let failed = answer.is_err();
+            answers.push(answer);
+            if failed {
+                break;
+            }
+        }
+        answers
+    }
+
+    /// `getinfo` for each of `paths`, reusing the ancestors the writable check just read.
+    ///
+    /// The cache is taken, not peeked: the next inventory after a writable check may use what that
+    /// check read a moment ago, and no later one may, so the reconciliation pass after execution
+    /// asks DSM again about folders the run may have created. An entry older than
+    /// [`PREFIX_CACHE_TTL`] is not used either.
+    fn get_info_prefixes(&self, paths: &[String]) -> Result<Vec<Result<RemoteItem>>> {
+        let cached = self
+            .floor
+            .prefixes
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take()
+            .filter(|cached| cached.read_at.elapsed() < PREFIX_CACHE_TTL);
+        let mut known: BTreeMap<String, RemoteItem> = cached
+            .map(|cached| cached.items.into_iter().collect())
+            .unwrap_or_default();
+        let missing: Vec<String> = paths
+            .iter()
+            .filter(|path| !known.contains_key(path.as_str()))
+            .cloned()
+            .collect();
+        let reused = paths.len() - missing.len();
+        if reused > 0 {
+            self.floor.prefix_cache_hits.fetch_add(1, Ordering::AcqRel);
+            self.floor
+                .getinfo_requests_saved
+                .fetch_add(reused, Ordering::AcqRel);
+        }
+        let mut fetched = if missing.is_empty() {
+            Vec::new().into_iter()
+        } else {
+            self.get_info_many(&missing)?.into_iter()
+        };
+        let mut answers = Vec::with_capacity(paths.len());
+        for path in paths {
+            let answer = match known.remove(path.as_str()) {
+                Some(item) => Ok(item),
+                // The serial route ended at its first failure; so does this walk.
+                None => match fetched.next() {
+                    Some(answer) => answer,
+                    None => break,
+                },
+            };
+            answers.push(answer);
+        }
+        Ok(answers)
+    }
+
+    /// Keep the ancestors a successful walk just read for the inventory that follows it.
+    fn remember_prefixes(&self, items: Vec<(String, RemoteItem)>) {
+        *self
+            .floor
+            .prefixes
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(CachedPrefixes {
+            read_at: Instant::now(),
+            items,
+        });
     }
 
     fn get_info_with_retry(&self, path: &str, allow_retry: bool) -> Result<RemoteItem> {
@@ -5542,10 +6127,16 @@ impl ApiClient {
                 source,
             })
             .and_then(|response| decode_response_observed(response, api, method, facts));
+        if matches!(&outcome, Err(Error::Http { source, .. }) if source.is_connect()) {
+            self.floor.dns.forget();
+        }
         record.elapsed_ms = duration_millis_saturating(started.elapsed());
         apply_response_facts(&mut record, *facts);
         apply_outcome(&mut record, &outcome, api);
         self.observe(ApiObservation::CallCompleted(record));
+        if outcome.is_ok() {
+            self.floor.note_success();
+        }
         outcome
     }
 
@@ -9464,6 +10055,7 @@ mod tests {
             md5_tasks: Arc::new(TaskGate::new(REMOTE_MD5_CONCURRENCY)),
             counters: Arc::new(ClientCounters::default()),
             forward_proxy: None,
+            floor: Arc::new(RequestFloor::new()),
         }
     }
 
@@ -9806,6 +10398,45 @@ mod tests {
             }]}
         })
         .to_string()
+    }
+
+    /// One `getinfo` answer for several directories, which is how the client now asks for the
+    /// ancestors of a path: one request naming every one of them.
+    fn getinfo_directories(paths: &[&str]) -> String {
+        let files: Vec<serde_json::Value> = paths
+            .iter()
+            .map(|path| {
+                serde_json::json!({
+                    "path": path,
+                    "name": path.rsplit('/').next().unwrap(),
+                    "isdir": true,
+                    "additional": {}
+                })
+            })
+            .collect();
+        serde_json::json!({"success": true, "data": {"files": files}}).to_string()
+    }
+
+    /// The per-entry answer File Station gives for a path that is not there: the envelope
+    /// succeeds and the entry carries `code: 408`.
+    fn getinfo_absent(path: &str) -> String {
+        serde_json::json!({
+            "success": true,
+            "data": {"files": [{"code": 408, "path": path}]}
+        })
+        .to_string()
+    }
+
+    /// One `getinfo` answer made of several single-path answers, in the order given.
+    fn getinfo_combined(answers: &[String]) -> String {
+        let files: Vec<serde_json::Value> = answers
+            .iter()
+            .flat_map(|answer| {
+                let parsed: serde_json::Value = serde_json::from_str(answer).unwrap();
+                parsed["data"]["files"].as_array().unwrap().clone()
+            })
+            .collect();
+        serde_json::json!({"success": true, "data": {"files": files}}).to_string()
     }
 
     fn getinfo_file(path: &str, size: u64, mtime_seconds: Option<i64>) -> String {
@@ -11028,8 +11659,7 @@ mod tests {
         let (url, server) = scripted_server(vec![
             required_discovery(),
             login_response(),
-            getinfo_directory("/share"),
-            getinfo_directory("/share/root"),
+            getinfo_directories(&["/share", "/share/root"]),
             root_listing,
             sub_listing,
         ]);
@@ -11057,7 +11687,7 @@ mod tests {
             inventory.entries["sub/nested.txt"].remote_path,
             "/share/root/sub/nested.txt"
         );
-        assert_eq!(server.join().unwrap().len(), 6);
+        assert_eq!(server.join().unwrap().len(), 5);
     }
 
     #[test]
@@ -11295,8 +11925,7 @@ mod tests {
             let (url, server) = scripted_server(vec![
                 required_discovery(),
                 login_response(),
-                getinfo_directory("/share"),
-                getinfo_directory("/share/root"),
+                getinfo_directories(&["/share", "/share/root"]),
                 listing,
             ]);
             let mut client = connect_test_client(url);
@@ -11313,7 +11942,7 @@ mod tests {
             };
             assert_eq!(operation, "SYNO.FileStation.List.list");
             assert_eq!(message, expected_message);
-            assert_eq!(server.join().unwrap().len(), 5);
+            assert_eq!(server.join().unwrap().len(), 4);
         }
     }
 
@@ -11331,8 +11960,7 @@ mod tests {
         let (url, server) = scripted_server(vec![
             required_discovery(),
             login_response(),
-            getinfo_directory("/share"),
-            getinfo_directory("/share/root"),
+            getinfo_directories(&["/share", "/share/root"]),
             root_listing,
             empty.clone(),
             empty,
@@ -11353,7 +11981,7 @@ mod tests {
                 (EntryKind::Directory, 0, 0)
             );
         }
-        assert_eq!(server.join().unwrap().len(), 7);
+        assert_eq!(server.join().unwrap().len(), 6);
     }
 
     /// The pre-delete re-verify must fail closed on the same absence, including against the
@@ -11496,8 +12124,7 @@ mod tests {
             let (url, server) = scripted_server(vec![
                 required_discovery(),
                 login_response(),
-                getinfo_directory("/share"),
-                getinfo_directory("/share/root"),
+                getinfo_directories(&["/share", "/share/root"]),
                 page.to_string(),
             ]);
             let mut client = connect_test_client(url);
@@ -11510,7 +12137,7 @@ mod tests {
                 ),
                 Err(Error::InvalidResponse { .. })
             ));
-            assert_eq!(server.join().unwrap().len(), 5);
+            assert_eq!(server.join().unwrap().len(), 4);
         }
     }
 
@@ -11530,13 +12157,15 @@ mod tests {
         let responses = vec![
             (StatusCode::OK, required_discovery()),
             (StatusCode::OK, login_response()),
-            (StatusCode::OK, getinfo_directory("/share")),
-            (StatusCode::OK, getinfo_directory("/share/root")),
+            (
+                StatusCode::OK,
+                getinfo_directories(&["/share", "/share/root"]),
+            ),
             (StatusCode::OK, first_page),
         ];
         // Cancel while the first page is being served, exactly as the signal handler would.
         let (url, server) = scripted_server_with_status_hook(responses, move |index| {
-            if index == 4 {
+            if index == 3 {
                 hook_cancellation.cancel();
             }
         });
@@ -11552,7 +12181,7 @@ mod tests {
             Err(Error::Cancelled)
         ));
         // The server script holds no reply for a second page: the client never asked for one.
-        assert_eq!(server.join().unwrap().len(), 5);
+        assert_eq!(server.join().unwrap().len(), 4);
     }
 
     /// Control-request backoff runs deep inside `send_form_with_retry`, where no per-operation
@@ -11632,7 +12261,7 @@ mod tests {
         let (url, server) = scripted_server(vec![
             required_discovery(),
             login_response(),
-            missing.clone(),
+            getinfo_combined(&[getinfo_absent("/share"), getinfo_absent("/share/root")]),
         ]);
         let mut client = connect_test_client(url);
         client.login("alice", "password", None).unwrap();
@@ -11649,7 +12278,10 @@ mod tests {
         let (url, server) = scripted_server(vec![
             required_discovery(),
             login_response(),
-            getinfo_file("/share", 1, None),
+            getinfo_combined(&[
+                getinfo_file("/share", 1, None),
+                getinfo_absent("/share/root"),
+            ]),
         ]);
         let mut client = connect_test_client(url);
         client.login("alice", "password", None).unwrap();
@@ -11669,8 +12301,7 @@ mod tests {
         let (url, server) = scripted_server(vec![
             required_discovery(),
             login_response(),
-            getinfo_directory("/share"),
-            getinfo_directory("/share/root"),
+            getinfo_directories(&["/share", "/share/root"]),
             missing,
         ]);
         let mut client = connect_test_client(url);
@@ -11683,7 +12314,7 @@ mod tests {
             )
             .unwrap();
         assert!(!inventory.root_exists && inventory.entries.is_empty());
-        assert_eq!(server.join().unwrap().len(), 5);
+        assert_eq!(server.join().unwrap().len(), 4);
     }
 
     #[test]
@@ -12299,6 +12930,7 @@ mod tests {
             md5_tasks: Arc::new(TaskGate::new(REMOTE_MD5_CONCURRENCY)),
             counters: Arc::new(ClientCounters::default()),
             forward_proxy: None,
+            floor: Arc::new(RequestFloor::new()),
         };
         assert_eq!(client.max_upload_rate(), None);
 
@@ -12605,10 +13237,8 @@ mod tests {
     fn destination_permission_checks_the_exact_existing_root_without_mutation() {
         let responses = vec![
             required_discovery(),
-            r#"{"success":true,"data":{"sid":"secret-sid","synotoken":"csrf-secret"}}"#
-                .to_owned(),
-            r#"{"success":true,"data":{"files":[{"path":"/share","name":"share","isdir":true,"additional":{}}]}}"#.to_owned(),
-            r#"{"success":true,"data":{"files":[{"path":"/share/restricted","name":"restricted","isdir":true,"additional":{}}]}}"#.to_owned(),
+            r#"{"success":true,"data":{"sid":"secret-sid","synotoken":"csrf-secret"}}"#.to_owned(),
+            getinfo_directories(&["/share", "/share/restricted"]),
             r#"{"success":true}"#.to_owned(),
             r#"{"success":true}"#.to_owned(),
         ];
@@ -12638,13 +13268,13 @@ mod tests {
         client.logout().unwrap();
 
         let requests = server.join().unwrap();
-        assert_eq!(requests.len(), 6);
+        assert_eq!(requests.len(), 5);
         assert!(
             requests.iter().all(|request| {
                 request.request_line == "POST /prefix/webapi/entry.cgi HTTP/1.1"
             })
         );
-        let permission = String::from_utf8_lossy(&requests[4].body);
+        let permission = String::from_utf8_lossy(&requests[3].body);
         assert!(permission.contains("api=SYNO.FileStation.CheckPermission"));
         assert!(permission.contains("version=3"));
         assert!(permission.contains("method=write"));
@@ -12659,7 +13289,11 @@ mod tests {
         let responses = vec![
             required_discovery(),
             r#"{"success":true,"data":{"sid":"secret-sid"}}"#.to_owned(),
-            r#"{"success":true,"data":{"files":[{"path":"/share","name":"share","isdir":true,"additional":{"mount_point_type":"cifs"}}]}}"#.to_owned(),
+            getinfo_combined(&[
+                r#"{"success":true,"data":{"files":[{"path":"/share","name":"share","isdir":true,"additional":{"mount_point_type":"cifs"}}]}}"#.to_owned(),
+                getinfo_absent("/share/nested"),
+                getinfo_absent("/share/nested/destination"),
+            ]),
             r#"{"success":true}"#.to_owned(),
         ];
         let (url, server) = scripted_server(responses);
@@ -12687,9 +13321,11 @@ mod tests {
         let responses = vec![
             required_discovery(),
             r#"{"success":true,"data":{"sid":"secret-sid"}}"#.to_owned(),
-            r#"{"success":true,"data":{"files":[{"path":"/share","name":"share","isdir":true,"additional":{}}]}}"#.to_owned(),
-            r#"{"success":true,"data":{"files":[{"path":"/share/team","name":"team","isdir":true,"additional":{}}]}}"#.to_owned(),
-            r#"{"success":false,"error":{"code":408}}"#.to_owned(),
+            getinfo_combined(&[
+                getinfo_directories(&["/share", "/share/team"]),
+                getinfo_absent("/share/team/new"),
+                getinfo_absent("/share/team/new/deeper"),
+            ]),
             r#"{"success":true}"#.to_owned(),
             r#"{"success":true}"#.to_owned(),
         ];
@@ -12719,20 +13355,21 @@ mod tests {
         client.logout().unwrap();
 
         let requests = server.join().unwrap();
-        assert_eq!(requests.len(), 7);
-        let missing_probe = String::from_utf8_lossy(&requests[4].body);
+        assert_eq!(requests.len(), 5);
+        let missing_probe = String::from_utf8_lossy(&requests[2].body);
         assert!(missing_probe.contains("method=getinfo"));
         assert!(missing_probe.contains("%2Fshare%2Fteam%2Fnew"));
-        let permission = String::from_utf8_lossy(&requests[5].body);
+        let permission = String::from_utf8_lossy(&requests[3].body);
         assert!(permission.contains("api=SYNO.FileStation.CheckPermission"));
         assert!(permission.contains("path=%22%2Fshare%2Fteam%22"));
         assert!(permission.contains("filename=%22new%22"));
         assert!(permission.contains("create_only=true"));
-        assert!(
-            requests
-                .iter()
-                .all(|request| !String::from_utf8_lossy(&request.body).contains("new%2Fdeeper"))
-        );
+        // The ancestors are read in one request, but no write check is ever aimed below the
+        // first missing component.
+        assert!(requests.iter().all(|request| {
+            let body = String::from_utf8_lossy(&request.body);
+            !body.contains("method=write") || !body.contains("new%2Fdeeper")
+        }));
     }
 
     #[test]
@@ -12741,8 +13378,7 @@ mod tests {
         let responses = vec![
             required_discovery(),
             r#"{"success":true,"data":{"sid":"secret-sid"}}"#.to_owned(),
-            r#"{"success":true,"data":{"files":[{"path":"/share","name":"share","isdir":true,"additional":{}}]}}"#.to_owned(),
-            r#"{"success":true,"data":{"files":[{"path":"/share/restricted","name":"restricted","isdir":true,"additional":{}}]}}"#.to_owned(),
+            getinfo_directories(&["/share", "/share/restricted"]),
             serde_json::json!({
                 "success": false,
                 "error": {"code": 105, "errors": {"reflected": reflected_marker}}
@@ -13082,8 +13718,10 @@ mod tests {
             r#"{"success":false,"error":{"code":403,"errors":{"token":"challenge-secret","types":[{"type":"otp"}]}}}"#.to_owned(),
             r#"{"success":true,"data":{"sid":"secret-sid","synotoken":"csrf-secret"}}"#.to_owned(),
             r#"{"success":true,"data":{"shares":[{"path":"/share"}]}}"#.to_owned(),
-            r#"{"success":true,"data":{"files":[{"path":"/share","name":"share","isdir":true,"additional":{}}]}}"#.to_owned(),
-            r#"{"success":true,"data":{"files":[{"path":"/share/root","name":"root","isdir":true,"additional":{"mount_point_type":""}}]}}"#.to_owned(),
+            getinfo_combined(&[
+                getinfo_directory("/share"),
+                r#"{"success":true,"data":{"files":[{"path":"/share/root","name":"root","isdir":true,"additional":{"mount_point_type":""}}]}}"#.to_owned(),
+            ]),
             r#"{"success":true,"data":{"total":2,"offset":0,"files":[{"path":"/share/root/a.txt","name":"a.txt","isdir":false,"additional":{"size":1,"time":{"mtime":1}}}]}}"#.to_owned(),
             r#"{"success":true,"data":{"total":2,"offset":1,"files":[{"path":"/share/root/b.txt","name":"b.txt","isdir":false,"additional":{"size":1,"time":{"mtime":1}}}]}}"#.to_owned(),
             r#"{"success":true}"#.to_owned(),
@@ -13155,7 +13793,7 @@ mod tests {
         fs::remove_file(path).unwrap();
 
         let requests = server.join().unwrap();
-        assert_eq!(requests.len(), 13);
+        assert_eq!(requests.len(), 12);
         assert!(
             requests
                 .iter()
@@ -13176,15 +13814,14 @@ mod tests {
         let get_info = String::from_utf8_lossy(&requests[4].body);
         assert!(get_info.contains("method=getinfo"));
         assert!(get_info.contains("mount_point_type"));
-        let root_info = String::from_utf8_lossy(&requests[5].body);
-        assert!(root_info.contains("%2Fshare%2Froot"));
-        let list = String::from_utf8_lossy(&requests[6].body);
+        assert!(get_info.contains("%2Fshare%2Froot"));
+        let list = String::from_utf8_lossy(&requests[5].body);
         assert!(list.contains("_sid=secret-sid"));
         assert!(list.contains("SynoToken=csrf-secret"));
-        let second_page = String::from_utf8_lossy(&requests[7].body);
+        let second_page = String::from_utf8_lossy(&requests[6].body);
         assert!(second_page.contains("offset=1"));
 
-        let upload = &requests[8];
+        let upload = &requests[7];
         assert!(
             upload
                 .headers
@@ -13202,14 +13839,14 @@ mod tests {
         // Post-upload verification: the destination's size, then File Station's own MD5 of it.
         // Nothing downloads the file back -- see `verify_uploaded_content` for why an MD5 the
         // server computed is the right standard of proof for bytes this process just sent.
-        let size_check = String::from_utf8_lossy(&requests[9].body);
+        let size_check = String::from_utf8_lossy(&requests[8].body);
         assert!(size_check.contains("method=getinfo"));
         assert!(size_check.contains("%2Fshare%2Froot%2Ffolder%2Fupload.bin"));
-        let digest_start = String::from_utf8_lossy(&requests[10].body);
+        let digest_start = String::from_utf8_lossy(&requests[9].body);
         assert!(digest_start.contains("SYNO.FileStation.MD5"));
         assert!(digest_start.contains("method=start"));
         assert!(digest_start.contains("%2Fshare%2Froot%2Ffolder%2Fupload.bin"));
-        let digest_status = String::from_utf8_lossy(&requests[11].body);
+        let digest_status = String::from_utf8_lossy(&requests[10].body);
         assert!(digest_status.contains("method=status"));
         assert!(
             !requests.iter().any(|request| {
@@ -13420,8 +14057,11 @@ mod tests {
         let responses = vec![
             discovery,
             r#"{"success":true,"data":{"sid":"sid"}}"#.to_owned(),
-            r#"{"success":true,"data":{"files":[{"path":"/share","name":"share","isdir":true,"additional":{}}]}}"#.to_owned(),
-            r#"{"success":true,"data":{"files":[{"path":"/share/mounted","name":"mounted","isdir":true,"additional":{"mount_point_type":"cifs"}}]}}"#.to_owned(),
+            getinfo_combined(&[
+                getinfo_directory("/share"),
+                r#"{"success":true,"data":{"files":[{"path":"/share/mounted","name":"mounted","isdir":true,"additional":{"mount_point_type":"cifs"}}]}}"#.to_owned(),
+                getinfo_absent("/share/mounted/child"),
+            ]),
         ];
         let (url, server) = scripted_server(responses);
         let mut client = ApiClient::connect(&ClientOptions {
@@ -13443,7 +14083,7 @@ mod tests {
             )
             .unwrap_err();
         assert!(matches!(error, Error::RemoteMountRoot { .. }));
-        assert_eq!(server.join().unwrap().len(), 4);
+        assert_eq!(server.join().unwrap().len(), 3);
     }
 
     /// Every mapped DSM code must render the exact operator-facing sentence, because that string
@@ -13820,7 +14460,10 @@ mod tests {
         let (url, server) = scripted_server(vec![
             required_discovery(),
             login_response(),
-            getinfo_file("/share", 4, None),
+            getinfo_combined(&[
+                getinfo_file("/share", 4, None),
+                getinfo_absent("/share/root"),
+            ]),
         ]);
         let mut client = connect_test_client(url);
         client.login("alice", "password", None).unwrap();
@@ -13837,7 +14480,7 @@ mod tests {
         let (url, server) = scripted_server(vec![
             required_discovery(),
             login_response(),
-            r#"{"success":false,"error":{"code":408}}"#.to_owned(),
+            getinfo_combined(&[getinfo_absent("/share"), getinfo_absent("/share/root")]),
         ]);
         let mut client = connect_test_client(url);
         client.login("alice", "password", None).unwrap();
@@ -14035,7 +14678,7 @@ mod tests {
             (
                 vec![
                     getinfo_directory("/share"),
-                    getinfo_directory("/share/root"),
+getinfo_directory("/share/root"),
                     getinfo_directory(probe_path),
                 ],
                 5,
@@ -14051,7 +14694,7 @@ mod tests {
             (
                 vec![
                     getinfo_directory("/share"),
-                    getinfo_directory("/share/root"),
+getinfo_directory("/share/root"),
                     r#"{"success":false,"error":{"code":407}}"#.to_owned(),
                 ],
                 5,
@@ -14693,8 +15336,10 @@ mod tests {
         let root = RemoteRoot::parse("/share/root").unwrap();
         let mut responses = upload_preamble();
         responses.extend([
-            (StatusCode::OK, getinfo_directory("/share")),
-            (StatusCode::OK, getinfo_directory("/share/root")),
+            (
+                StatusCode::OK,
+                getinfo_directories(&["/share", "/share/root"]),
+            ),
             (
                 StatusCode::OK,
                 serde_json::json!({
@@ -14733,7 +15378,7 @@ mod tests {
         let requests = server.join().unwrap();
         // Discovery, login, two ancestor `getinfo`s and exactly one `List.list`: no folder below the
         // root was listed at all.
-        assert_eq!(requests.len(), 5);
+        assert_eq!(requests.len(), 4);
         for request in &requests {
             let body = String::from_utf8_lossy(&request.body);
             assert!(
@@ -14771,8 +15416,10 @@ mod tests {
         let root = RemoteRoot::parse("/share/root").unwrap();
         let mut responses = upload_preamble();
         responses.extend([
-            (StatusCode::OK, getinfo_directory("/share")),
-            (StatusCode::OK, getinfo_directory("/share/root")),
+            (
+                StatusCode::OK,
+                getinfo_directories(&["/share", "/share/root"]),
+            ),
             // Two entries, one of them a directory, against a budget of two.
             (
                 StatusCode::OK,
@@ -14810,7 +15457,7 @@ mod tests {
             scoped.complete,
             "a walk that kept every entry it found is not partial"
         );
-        assert_eq!(server.join().unwrap().len(), 6);
+        assert_eq!(server.join().unwrap().len(), 5);
     }
 
     /// One entry more than the budget is truncated, and keeps exactly the budget.
@@ -14819,8 +15466,10 @@ mod tests {
         let root = RemoteRoot::parse("/share/root").unwrap();
         let mut responses = upload_preamble();
         responses.extend([
-            (StatusCode::OK, getinfo_directory("/share")),
-            (StatusCode::OK, getinfo_directory("/share/root")),
+            (
+                StatusCode::OK,
+                getinfo_directories(&["/share", "/share/root"]),
+            ),
             (
                 StatusCode::OK,
                 serde_json::json!({
@@ -14851,7 +15500,7 @@ mod tests {
 
         assert_eq!(scoped.inventory.entries.len(), 2);
         assert!(!scoped.complete);
-        assert_eq!(server.join().unwrap().len(), 5);
+        assert_eq!(server.join().unwrap().len(), 4);
     }
 
     /// A listing that agrees with itself still costs exactly one pass.
@@ -14864,8 +15513,7 @@ mod tests {
         let folder = "/share/root";
         let mut responses = upload_preamble();
         responses.extend([
-            (StatusCode::OK, getinfo_directory("/share")),
-            (StatusCode::OK, getinfo_directory(folder)),
+            (StatusCode::OK, getinfo_directories(&["/share", folder])),
             // Two hidden entries: counted, never returned.
             (StatusCode::OK, list_page(folder, 3, &["a"])),
             (StatusCode::OK, list_page(folder, 3, &[])),
@@ -14886,7 +15534,7 @@ mod tests {
 
         assert_eq!(scoped.inventory.entries.keys().collect::<Vec<_>>(), ["a"]);
         assert_eq!(scoped.incomplete_directories, [String::new()]);
-        assert_eq!(server.join().unwrap().len(), 8);
+        assert_eq!(server.join().unwrap().len(), 7);
     }
 
     /// A short listing whose two passes disagree about *which* entries exist is a directory
@@ -16156,6 +16804,7 @@ mod tests {
             md5_tasks: Arc::new(TaskGate::new(REMOTE_MD5_CONCURRENCY)),
             counters: Arc::new(ClientCounters::default()),
             forward_proxy: None,
+            floor: Arc::new(RequestFloor::new()),
         };
 
         let md5_only = client_for("SYNO.FileStation.MD5");
@@ -16343,8 +16992,7 @@ FplE
         let (url, server) = scripted_server(vec![
             required_discovery(),
             login_response(),
-            getinfo_directory("/share"),
-            getinfo_directory("/share/root"),
+            getinfo_directories(&["/share", "/share/root"]),
             r#"{"success":true}"#.to_owned(),
         ]);
         let mut client = connect_test_client(url);
@@ -16360,7 +17008,7 @@ FplE
             error.to_string(),
             "unexpected response during SYNO.FileStation.List.list: successful response contained no directory data for \"/share/root\""
         );
-        assert_eq!(server.join().unwrap().len(), 5);
+        assert_eq!(server.join().unwrap().len(), 4);
     }
 
     #[test]
@@ -17201,9 +17849,7 @@ FplE
         let (url, server) = scripted_server(vec![
             write_probe_discovery(false),
             login_response(),
-            getinfo_directory("/team"),
-            getinfo_directory("/team/year"),
-            getinfo_directory("/team/year/quarter"),
+            getinfo_directories(&["/team", "/team/year", "/team/year/quarter"]),
             r#"{"success":true}"#.to_owned(),
         ]);
         let mut client = connect_test_client(url);
@@ -17237,9 +17883,10 @@ FplE
         let (url, server) = scripted_server(vec![
             write_probe_discovery(false),
             login_response(),
-            getinfo_directory("/team"),
-            getinfo_directory("/team/year"),
-            r#"{"success":false,"error":{"code":408}}"#.to_owned(),
+            getinfo_combined(&[
+                getinfo_directories(&["/team", "/team/year"]),
+                getinfo_absent("/team/year/quarter"),
+            ]),
             r#"{"success":true}"#.to_owned(),
         ]);
         let mut client = connect_test_client(url);
@@ -17262,7 +17909,11 @@ FplE
         let (url, server) = scripted_server(vec![
             write_probe_discovery(false),
             login_response(),
-            r#"{"success":false,"error":{"code":408}}"#.to_owned(),
+            getinfo_combined(&[
+                getinfo_absent("/team"),
+                getinfo_absent("/team/year"),
+                getinfo_absent("/team/year/quarter"),
+            ]),
         ]);
         let mut client = connect_test_client(url);
         client.login("alice", "password", None).unwrap();
@@ -17290,8 +17941,11 @@ FplE
         let (url, server) = scripted_server(vec![
             write_probe_discovery(false),
             login_response(),
-            getinfo_directory("/team"),
-            mounted,
+            getinfo_combined(&[
+                getinfo_directory("/team"),
+                mounted,
+                getinfo_absent("/team/mounted/child"),
+            ]),
         ]);
         let mut client = connect_test_client(url);
         client.login("alice", "password", None).unwrap();
@@ -17307,7 +17961,11 @@ FplE
         let (url, server) = scripted_server(vec![
             write_probe_discovery(false),
             login_response(),
-            getinfo_file("/team", 12, None),
+            getinfo_combined(&[
+                getinfo_file("/team", 12, None),
+                getinfo_absent("/team/mounted"),
+                getinfo_absent("/team/mounted/child"),
+            ]),
         ]);
         let mut client = connect_test_client(url);
         client.login("alice", "password", None).unwrap();
@@ -17322,8 +17980,12 @@ FplE
         let (url, server) = scripted_server(vec![
             write_probe_discovery(false),
             login_response(),
-            getinfo_directory("/team"),
-            r#"{"success":false,"error":{"code":105}}"#.to_owned(),
+            getinfo_combined(&[
+                getinfo_directory("/team"),
+                serde_json::json!({"success": true, "data": {"files": [{"code": 105, "path": "/team/mounted"}]}})
+                    .to_string(),
+                getinfo_absent("/team/mounted/child"),
+            ]),
         ]);
         let mut client = connect_test_client(url);
         client.login("alice", "password", None).unwrap();
@@ -18177,6 +18839,721 @@ FplE
         assert_eq!(huge.ceiling, Duration::from_secs(1 << 26));
         let short = UploadBounds::for_upload(Duration::from_secs(30), 1024);
         assert_eq!(short.stall, Duration::from_secs(30));
+    }
+
+    // ---- The request floor: skipped touches, batched ancestors, parallel walks, adaptive lanes.
+
+    /// A server that answers each request with `handler(form fields)`, one thread per connection,
+    /// until `stop` is set. The scripted server answers in arrival order, which concurrent clients
+    /// do not have; this one answers by what was asked.
+    struct KeyedServer {
+        url: String,
+        stop: Arc<AtomicBool>,
+        thread: Option<JoinHandle<()>>,
+        peak: Arc<AtomicUsize>,
+        requests: Arc<Mutex<Vec<BTreeMap<String, String>>>>,
+    }
+
+    impl KeyedServer {
+        fn start(
+            delay: Duration,
+            handler: impl Fn(&BTreeMap<String, String>) -> String + Send + Sync + 'static,
+        ) -> Self {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let address = listener.local_addr().unwrap();
+            let stop = Arc::new(AtomicBool::new(false));
+            let peak = Arc::new(AtomicUsize::new(0));
+            let in_flight = Arc::new(AtomicUsize::new(0));
+            let requests = Arc::new(Mutex::new(Vec::new()));
+            let handler = Arc::new(handler);
+            let thread = {
+                let (stop, peak, requests) =
+                    (Arc::clone(&stop), Arc::clone(&peak), Arc::clone(&requests));
+                std::thread::spawn(move || {
+                    let mut workers = Vec::new();
+                    while !stop.load(Ordering::Acquire) {
+                        match listener.accept() {
+                            Ok((mut stream, _)) => {
+                                stream.set_nonblocking(false).unwrap();
+                                let (handler, peak, in_flight, requests) = (
+                                    Arc::clone(&handler),
+                                    Arc::clone(&peak),
+                                    Arc::clone(&in_flight),
+                                    Arc::clone(&requests),
+                                );
+                                workers.push(std::thread::spawn(move || {
+                                    let request = read_scripted_request(&mut stream, 0);
+                                    let now = in_flight.fetch_add(1, Ordering::AcqRel) + 1;
+                                    peak.fetch_max(now, Ordering::AcqRel);
+                                    let body = String::from_utf8_lossy(&request.body).into_owned();
+                                    let fields: BTreeMap<String, String> =
+                                        Url::parse(&format!("http://form.invalid/?{body}"))
+                                            .unwrap()
+                                            .query_pairs()
+                                            .map(|(key, value)| {
+                                                (key.into_owned(), value.into_owned())
+                                            })
+                                            .collect();
+                                    requests.lock().unwrap().push(fields.clone());
+                                    std::thread::sleep(delay);
+                                    let response = handler(&fields);
+                                    in_flight.fetch_sub(1, Ordering::AcqRel);
+                                    write_scripted_response(&mut stream, StatusCode::OK, &response);
+                                }));
+                            }
+                            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                                std::thread::sleep(Duration::from_millis(1));
+                            }
+                            Err(error) => panic!("keyed server accept failed: {error}"),
+                        }
+                    }
+                    for worker in workers {
+                        let _ = worker.join();
+                    }
+                })
+            };
+            Self {
+                url: format!("http://{address}/prefix/"),
+                stop,
+                thread: Some(thread),
+                peak,
+                requests,
+            }
+        }
+
+        fn finish(mut self) -> (usize, Vec<BTreeMap<String, String>>) {
+            self.stop.store(true, Ordering::Release);
+            self.thread.take().unwrap().join().unwrap();
+            let requests = self.requests.lock().unwrap().clone();
+            (self.peak.load(Ordering::Acquire), requests)
+        }
+    }
+
+    fn listing_of(folder: &str, directories: &[&str], files: &[&str]) -> String {
+        let mut entries: Vec<serde_json::Value> = directories
+            .iter()
+            .map(|name| {
+                serde_json::json!({
+                    "path": format!("{folder}/{name}"), "name": name,
+                    "isdir": true, "additional": {}
+                })
+            })
+            .collect();
+        entries.extend(files.iter().map(|name| {
+            serde_json::json!({
+                "path": format!("{folder}/{name}"), "name": name,
+                "isdir": false, "additional": {"size": 1, "time": {"mtime": 1}}
+            })
+        }));
+        serde_json::json!({"success": true, "data": {"total": entries.len(), "files": entries}})
+            .to_string()
+    }
+
+    /// A tree of `/share/root` with `folders` subfolders, each holding `a.txt`, plus the answers
+    /// for discovery, login and the ancestors, served by name.
+    fn wide_tree_server(folders: usize, delay: Duration) -> KeyedServer {
+        let names: Vec<String> = (0..folders).map(|index| format!("f{index:02}")).collect();
+        KeyedServer::start(delay, move |fields| {
+            match (
+                fields.get("api").map(String::as_str),
+                fields.get("method").map(String::as_str),
+            ) {
+                (Some("SYNO.API.Info"), _) => required_discovery(),
+                (Some("SYNO.API.Auth"), _) => login_response(),
+                (Some("SYNO.FileStation.List"), Some("getinfo")) => {
+                    let paths: Vec<String> = serde_json::from_str(&fields["path"]).unwrap();
+                    getinfo_combined(
+                        &paths
+                            .iter()
+                            .map(|path| getinfo_directory(path))
+                            .collect::<Vec<_>>(),
+                    )
+                }
+                (Some("SYNO.FileStation.List"), Some("list")) => {
+                    let folder: String = serde_json::from_str(&fields["folder_path"]).unwrap();
+                    if folder == "/share/root" {
+                        let directories: Vec<&str> = names.iter().map(String::as_str).collect();
+                        listing_of(&folder, &directories, &[])
+                    } else {
+                        listing_of(&folder, &[], &["a.txt"])
+                    }
+                }
+                other => panic!("unexpected request {other:?}"),
+            }
+        })
+    }
+
+    fn lanes_client(url: &str, lanes: usize) -> ApiClient {
+        let mut client = connect_test_client(url.to_owned());
+        client.login("alice", "password", None).unwrap();
+        client.floor.list_lanes.store(lanes, Ordering::Release);
+        client
+    }
+
+    fn walk(client: &ApiClient) -> ScopedRemoteInventory {
+        client
+            .remote_inventory_scoped(
+                &RemoteRoot::parse("/share/root").unwrap(),
+                &Scope::root(),
+                &IgnoreRules::none(),
+                usize::MAX,
+                &CancellationToken::default(),
+            )
+            .unwrap()
+    }
+
+    #[test]
+    fn a_touch_right_after_an_answered_request_is_skipped_and_counted() {
+        let (url, server) = scripted_server(vec![
+            required_discovery(),
+            login_response(),
+            r#"{"success":true,"data":{"total":1,"shares":[{"path":"/share"}]}}"#.to_owned(),
+        ]);
+        let mut client = connect_test_client(url);
+        client.login("alice", "password", None).unwrap();
+
+        // The login was answered a moment ago: nothing is sent.
+        client.touch_session();
+        assert_eq!(client.request_floor_counters().session_touches_skipped, 1);
+
+        // A session nothing has used for longer than the window is touched as before.
+        client.floor.last_ok_ms.store(0, Ordering::Release);
+        client.touch_session();
+        let counters = client.request_floor_counters();
+        assert_eq!(counters.session_touches_skipped, 1);
+        assert_eq!(server.join().unwrap().len(), 3);
+        // The touch itself was an answered request, so the next one is skipped again.
+        client.touch_session();
+        assert_eq!(client.request_floor_counters().session_touches_skipped, 2);
+    }
+
+    #[test]
+    fn the_recent_answer_window_is_a_minute_and_a_failure_never_opens_it() {
+        let floor = RequestFloor::new();
+        assert!(!floor.recently_answered(SESSION_RECENT_ACTIVITY));
+        floor.note_success();
+        assert!(floor.recently_answered(SESSION_RECENT_ACTIVITY));
+        assert!(!floor.recently_answered(Duration::ZERO));
+        assert_eq!(SESSION_RECENT_ACTIVITY, Duration::from_secs(60));
+
+        let (url, server) = scripted_server(vec![
+            required_discovery(),
+            login_response(),
+            r#"{"success":false,"error":{"code":105}}"#.to_owned(),
+        ]);
+        let mut client = connect_test_client(url);
+        client.login("alice", "password", None).unwrap();
+        client.floor.last_ok_ms.store(0, Ordering::Release);
+        assert!(client.confirm_file_station_session().is_err());
+        assert!(
+            !client.floor.recently_answered(SESSION_RECENT_ACTIVITY),
+            "a refused request is no proof the session is alive"
+        );
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn ancestors_are_read_in_one_request_and_the_inventory_reuses_them_once() {
+        let (url, server) = scripted_server(vec![
+            required_discovery(),
+            login_response(),
+            getinfo_directories(&["/share", "/share/root"]),
+            r#"{"success":true}"#.to_owned(),
+            list_page("/share/root", 1, &["a.txt"]),
+            // The reconciliation after execution asks again: the run may have created folders.
+            getinfo_directories(&["/share", "/share/root"]),
+            list_page("/share/root", 1, &["a.txt"]),
+        ]);
+        let mut client = connect_test_client(url);
+        client.login("alice", "password", None).unwrap();
+        let root = RemoteRoot::parse("/share/root").unwrap();
+        client.verify_destination_writable(&root).unwrap();
+        let first = client
+            .remote_inventory(&root, &IgnoreRules::none(), &CancellationToken::default())
+            .unwrap();
+        assert_eq!(first.entries.len(), 1);
+        let counters = client.request_floor_counters();
+        assert_eq!(counters.getinfo_batches, 1);
+        assert_eq!(counters.ancestor_cache_hits, 1);
+        // One batch replaced one request, and the cache replaced two more.
+        assert_eq!(counters.getinfo_requests_saved, 3);
+
+        let second = client
+            .remote_inventory(&root, &IgnoreRules::none(), &CancellationToken::default())
+            .unwrap();
+        assert_eq!(second.entries.len(), 1);
+        let counters = client.request_floor_counters();
+        assert_eq!(counters.ancestor_cache_hits, 1, "the cache is single-use");
+        assert_eq!(counters.getinfo_batches, 2);
+        // discovery, login, getinfo, CheckPermission, list, getinfo, list
+        assert_eq!(server.join().unwrap().len(), 7);
+    }
+
+    #[test]
+    fn a_stale_ancestor_cache_is_not_used() {
+        let (url, server) = scripted_server(vec![
+            required_discovery(),
+            login_response(),
+            getinfo_directories(&["/share", "/share/root"]),
+            r#"{"success":true}"#.to_owned(),
+            getinfo_directories(&["/share", "/share/root"]),
+            list_page("/share/root", 0, &[]),
+        ]);
+        let mut client = connect_test_client(url);
+        client.login("alice", "password", None).unwrap();
+        let root = RemoteRoot::parse("/share/root").unwrap();
+        client.verify_destination_writable(&root).unwrap();
+        // Age the cache past its bound.
+        {
+            let mut cached = client.floor.prefixes.lock().unwrap();
+            let entry = cached.as_mut().unwrap();
+            entry.read_at = Instant::now() - PREFIX_CACHE_TTL - Duration::from_secs(1);
+        }
+        client
+            .remote_inventory(&root, &IgnoreRules::none(), &CancellationToken::default())
+            .unwrap();
+        assert_eq!(client.request_floor_counters().ancestor_cache_hits, 0);
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn a_scope_below_the_destination_asks_only_for_the_components_the_check_did_not_read() {
+        let (url, server) = scripted_server(vec![
+            required_discovery(),
+            login_response(),
+            getinfo_directories(&["/share", "/share/root"]),
+            r#"{"success":true}"#.to_owned(),
+            // Only the two scope components are asked about.
+            getinfo_directories(&["/share/root/2026", "/share/root/2026/11"]),
+            list_page("/share/root/2026/11", 0, &[]),
+        ]);
+        let mut client = connect_test_client(url);
+        client.login("alice", "password", None).unwrap();
+        let root = RemoteRoot::parse("/share/root").unwrap();
+        client.verify_destination_writable(&root).unwrap();
+        let scope = Scope::parse("2026/11").unwrap();
+        let scoped = client
+            .remote_inventory_scoped(
+                &root,
+                &scope,
+                &IgnoreRules::none(),
+                usize::MAX,
+                &CancellationToken::default(),
+            )
+            .unwrap();
+        assert!(scoped.inventory.entries.contains_key("2026"));
+        assert!(scoped.inventory.entries.contains_key("2026/11"));
+        let requests = server.join().unwrap();
+        let last_info = String::from_utf8_lossy(&requests[4].body);
+        assert!(last_info.contains("2026%2F11"));
+        assert!(!last_info.contains("%22%2Fshare%22"), "{last_info}");
+    }
+
+    #[test]
+    fn a_getinfo_answer_in_another_order_is_matched_by_path() {
+        let (url, server) = scripted_server(vec![
+            required_discovery(),
+            login_response(),
+            getinfo_directories(&["/share/root", "/share"]),
+            r#"{"success":true}"#.to_owned(),
+        ]);
+        let mut client = connect_test_client(url);
+        client.login("alice", "password", None).unwrap();
+        let check = client
+            .verify_destination_writable(&RemoteRoot::parse("/share/root").unwrap())
+            .unwrap();
+        assert!(check.destination_exists);
+        assert_eq!(client.request_floor_counters().getinfo_batch_fallbacks, 0);
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn a_dsm_that_rejects_the_multi_path_form_costs_one_request_once_and_is_counted() {
+        let (url, server) = scripted_server(vec![
+            required_discovery(),
+            login_response(),
+            // The batch is refused as a bad parameter.
+            r#"{"success":false,"error":{"code":400}}"#.to_owned(),
+            getinfo_directory("/share"),
+            getinfo_directory("/share/root"),
+            r#"{"success":true}"#.to_owned(),
+            // The second call goes straight to the serial form.
+            getinfo_directory("/share"),
+            getinfo_directory("/share/root"),
+            r#"{"success":true}"#.to_owned(),
+        ]);
+        let mut client = connect_test_client(url);
+        client.login("alice", "password", None).unwrap();
+        let root = RemoteRoot::parse("/share/root").unwrap();
+        client.verify_destination_writable(&root).unwrap();
+        client.verify_destination_writable(&root).unwrap();
+        let counters = client.request_floor_counters();
+        assert_eq!(counters.getinfo_batch_fallbacks, 1);
+        assert_eq!(counters.getinfo_batches, 0);
+        assert_eq!(server.join().unwrap().len(), 9);
+    }
+
+    #[test]
+    fn an_answer_that_does_not_match_the_paths_asked_falls_back_to_the_serial_form() {
+        let (url, server) = scripted_server(vec![
+            required_discovery(),
+            login_response(),
+            // Two paths asked, one entry answered.
+            getinfo_directory("/share"),
+            getinfo_directory("/share"),
+            getinfo_directory("/share/root"),
+            r#"{"success":true}"#.to_owned(),
+        ]);
+        let mut client = connect_test_client(url);
+        client.login("alice", "password", None).unwrap();
+        client
+            .verify_destination_writable(&RemoteRoot::parse("/share/root").unwrap())
+            .unwrap();
+        assert_eq!(client.request_floor_counters().getinfo_batch_fallbacks, 1);
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn a_refusal_that_is_about_the_request_is_not_mistaken_for_a_shape_problem() {
+        let (url, server) = scripted_server(vec![
+            required_discovery(),
+            login_response(),
+            r#"{"success":false,"error":{"code":105}}"#.to_owned(),
+        ]);
+        let mut client = connect_test_client(url);
+        client.login("alice", "password", None).unwrap();
+        let error = client
+            .verify_destination_writable(&RemoteRoot::parse("/share/root").unwrap())
+            .unwrap_err();
+        assert_eq!(error.api_code(), Some(105));
+        assert_eq!(client.request_floor_counters().getinfo_batch_fallbacks, 0);
+        assert_eq!(server.join().unwrap().len(), 3);
+    }
+
+    #[test]
+    fn a_wide_tree_is_listed_in_waves_bounded_by_the_lanes() {
+        let server = wide_tree_server(10, Duration::from_millis(40));
+        let client = lanes_client(&server.url, LIST_LANES);
+        let scanned = walk(&client);
+        assert_eq!(scanned.inventory.entries.len(), 10 + 10);
+        assert!(scanned.complete);
+        let counters = client.request_floor_counters();
+        // Ten folders in waves of four, four and two.
+        assert_eq!(counters.list_waves_parallel, 3);
+        assert_eq!(counters.list_folders_parallel, 10);
+        let (peak, requests) = server.finish();
+        assert!(peak <= LIST_LANES, "{peak} requests were in flight at once");
+        assert!(peak >= 2, "the waves never overlapped ({peak})");
+        let lists = requests
+            .iter()
+            .filter(|fields| fields.get("method").map(String::as_str) == Some("list"))
+            .count();
+        assert_eq!(lists, 11, "the root and each of its folders, once");
+    }
+
+    #[test]
+    fn the_inventory_does_not_depend_on_how_many_lanes_listed_it() {
+        let server = wide_tree_server(9, Duration::from_millis(5));
+        let serial = walk(&lanes_client(&server.url, 1));
+        let parallel = walk(&lanes_client(&server.url, LIST_LANES));
+        server.finish();
+        assert_eq!(
+            serial.inventory.entries.keys().collect::<Vec<_>>(),
+            parallel.inventory.entries.keys().collect::<Vec<_>>()
+        );
+        for (relative, entry) in &serial.inventory.entries {
+            let other = &parallel.inventory.entries[relative];
+            assert_eq!(
+                (
+                    entry.kind,
+                    entry.size,
+                    entry.mtime_seconds,
+                    &entry.remote_path
+                ),
+                (
+                    other.kind,
+                    other.size,
+                    other.mtime_seconds,
+                    &other.remote_path
+                )
+            );
+        }
+        assert_eq!(
+            serial.incomplete_directories,
+            parallel.incomplete_directories
+        );
+        assert_eq!(serial.link_guard_unchecked, parallel.link_guard_unchecked);
+        assert_eq!(serial.complete, parallel.complete);
+    }
+
+    #[test]
+    fn a_folder_that_vanishes_mid_walk_is_handled_the_same_in_a_wave() {
+        let names = ["f0", "f1", "f2", "f3"];
+        let server = KeyedServer::start(Duration::from_millis(5), move |fields| {
+            match (
+                fields.get("api").map(String::as_str),
+                fields.get("method").map(String::as_str),
+            ) {
+                (Some("SYNO.API.Info"), _) => required_discovery(),
+                (Some("SYNO.API.Auth"), _) => login_response(),
+                (Some("SYNO.FileStation.List"), Some("getinfo")) => {
+                    let paths: Vec<String> = serde_json::from_str(&fields["path"]).unwrap();
+                    getinfo_combined(
+                        &paths
+                            .iter()
+                            .map(|path| getinfo_directory(path))
+                            .collect::<Vec<_>>(),
+                    )
+                }
+                (Some("SYNO.FileStation.List"), Some("list")) => {
+                    let folder: String = serde_json::from_str(&fields["folder_path"]).unwrap();
+                    match folder.as_str() {
+                        "/share/root" => listing_of(&folder, &names, &[]),
+                        "/share/root/f2" => r#"{"success":false,"error":{"code":408}}"#.to_owned(),
+                        _ => listing_of(&folder, &[], &["a.txt"]),
+                    }
+                }
+                other => panic!("unexpected request {other:?}"),
+            }
+        });
+        for lanes in [1, LIST_LANES] {
+            let scanned = walk(&lanes_client(&server.url, lanes));
+            assert_eq!(scanned.vanished_directories, ["f2"], "lanes {lanes}");
+            assert_eq!(
+                scanned.incomplete_directories,
+                [String::new()],
+                "lanes {lanes}"
+            );
+            assert!(!scanned.inventory.entries.contains_key("f2"));
+            assert!(scanned.inventory.entries.contains_key("f3/a.txt"));
+        }
+        server.finish();
+    }
+
+    #[test]
+    fn an_error_in_a_wave_is_the_first_one_in_walk_order_and_cancellation_is_honoured() {
+        let server = KeyedServer::start(Duration::from_millis(5), move |fields| {
+            match (
+                fields.get("api").map(String::as_str),
+                fields.get("method").map(String::as_str),
+            ) {
+                (Some("SYNO.API.Info"), _) => required_discovery(),
+                (Some("SYNO.API.Auth"), _) => login_response(),
+                (Some("SYNO.FileStation.List"), Some("getinfo")) => {
+                    let paths: Vec<String> = serde_json::from_str(&fields["path"]).unwrap();
+                    getinfo_combined(
+                        &paths
+                            .iter()
+                            .map(|path| getinfo_directory(path))
+                            .collect::<Vec<_>>(),
+                    )
+                }
+                (Some("SYNO.FileStation.List"), Some("list")) => {
+                    let folder: String = serde_json::from_str(&fields["folder_path"]).unwrap();
+                    match folder.as_str() {
+                        "/share/root" => listing_of(&folder, &["f0", "f1", "f2"], &[]),
+                        // Neither is a "missing folder": each is a refusal that must surface.
+                        "/share/root/f0" => r#"{"success":false,"error":{"code":402}}"#.to_owned(),
+                        "/share/root/f1" => r#"{"success":false,"error":{"code":119}}"#.to_owned(),
+                        _ => listing_of(&folder, &[], &["a.txt"]),
+                    }
+                }
+                other => panic!("unexpected request {other:?}"),
+            }
+        });
+        let client = lanes_client(&server.url, LIST_LANES);
+        let error = client
+            .remote_inventory_scoped(
+                &RemoteRoot::parse("/share/root").unwrap(),
+                &Scope::root(),
+                &IgnoreRules::none(),
+                usize::MAX,
+                &CancellationToken::default(),
+            )
+            .unwrap_err();
+        assert!(error.api_code().is_some(), "{error}");
+
+        let cancelled = CancellationToken::default();
+        cancelled.cancel();
+        assert!(matches!(
+            client.remote_inventory_scoped(
+                &RemoteRoot::parse("/share/root").unwrap(),
+                &Scope::root(),
+                &IgnoreRules::none(),
+                usize::MAX,
+                &cancelled,
+            ),
+            Err(Error::Cancelled)
+        ));
+        server.finish();
+    }
+
+    #[test]
+    fn the_md5_lanes_widen_on_quick_small_digests_and_narrow_on_strain() {
+        let client = connect_test_client(scripted_server(vec![required_discovery()]).0);
+        let judged = |client: &ApiClient, done: usize, first: usize, slow: usize, failed: usize| {
+            client.floor.md5_window_done.store(done, Ordering::Release);
+            client
+                .floor
+                .md5_window_first_poll
+                .store(first, Ordering::Release);
+            client.floor.md5_window_slow.store(slow, Ordering::Release);
+            client.adapt_md5_lanes(failed);
+            client.floor.md5_lanes.load(Ordering::Acquire)
+        };
+        assert_eq!(client.floor.md5_lanes.load(Ordering::Acquire), 4);
+        // Too small a sample to widen on.
+        assert_eq!(judged(&client, 8, 8, 0, 0), 4);
+        // Quick and small: widen by two, up to the ceiling, and no further.
+        assert_eq!(judged(&client, 32, 32, 0, 0), 6);
+        assert_eq!(judged(&client, 32, 32, 0, 0), 8);
+        assert_eq!(judged(&client, 32, 32, 0, 0), 8);
+        // Half at the first poll is still "median at the first poll".
+        assert_eq!(judged(&client, 32, 16, 0, 0), 8);
+        // A tenth of the digests needing more than two polls narrows.
+        assert_eq!(judged(&client, 32, 20, 4, 0), 6);
+        // One failed digest narrows, and the base is the floor.
+        assert_eq!(judged(&client, 32, 32, 0, 1), 4);
+        assert_eq!(judged(&client, 32, 32, 0, 1), 4);
+        // Mostly slow digests never widen the lanes.
+        assert_eq!(judged(&client, 32, 3, 0, 0), 4);
+        let counters = client.request_floor_counters();
+        assert_eq!(counters.md5_lanes, 4);
+        assert_eq!(counters.md5_lanes_widened, 2);
+        assert_eq!(counters.md5_lanes_narrowed, 2);
+    }
+
+    #[test]
+    fn a_retried_request_narrows_the_md5_lanes_and_the_gate_follows_them() {
+        let client = connect_test_client(scripted_server(vec![required_discovery()]).0);
+        client.floor.md5_window_done.store(32, Ordering::Release);
+        client
+            .floor
+            .md5_window_first_poll
+            .store(32, Ordering::Release);
+        client.adapt_md5_lanes(0);
+        assert_eq!(client.floor.md5_lanes.load(Ordering::Acquire), 6);
+        assert_eq!(client.md5_tasks.capacity.load(Ordering::Acquire), 6);
+        client.count_retry();
+        client.floor.md5_window_done.store(32, Ordering::Release);
+        client
+            .floor
+            .md5_window_first_poll
+            .store(32, Ordering::Release);
+        client.adapt_md5_lanes(0);
+        assert_eq!(client.floor.md5_lanes.load(Ordering::Acquire), 4);
+        assert_eq!(client.md5_tasks.capacity.load(Ordering::Acquire), 4);
+        // The retry was judged once; the next quiet batch widens again.
+        client.floor.md5_window_done.store(32, Ordering::Release);
+        client
+            .floor
+            .md5_window_first_poll
+            .store(32, Ordering::Release);
+        client.adapt_md5_lanes(0);
+        assert_eq!(client.floor.md5_lanes.load(Ordering::Acquire), 6);
+    }
+
+    #[test]
+    fn a_digest_counts_its_polls_for_the_lane_judgement() {
+        let floor = RequestFloor::new();
+        floor.note_md5_finished(1);
+        floor.note_md5_finished(2);
+        floor.note_md5_finished(3);
+        floor.note_md5_finished(40);
+        assert_eq!(floor.md5_window_done.load(Ordering::Acquire), 4);
+        assert_eq!(floor.md5_window_first_poll.load(Ordering::Acquire), 1);
+        assert_eq!(floor.md5_window_slow.load(Ordering::Acquire), 2);
+    }
+
+    #[test]
+    fn a_task_gate_widened_while_full_admits_the_waiter() {
+        let gate = Arc::new(TaskGate::new(1));
+        let token = CancellationToken::default();
+        let held = gate.acquire(&token).unwrap();
+        let waiter = {
+            let (gate, token) = (Arc::clone(&gate), token.clone());
+            std::thread::spawn(move || {
+                let _slot = gate.acquire(&token).unwrap();
+            })
+        };
+        std::thread::sleep(Duration::from_millis(60));
+        assert!(!waiter.is_finished());
+        gate.set_capacity(2);
+        waiter.join().unwrap();
+        drop(held);
+    }
+
+    #[test]
+    fn the_pinned_resolver_looks_a_name_up_once_and_forgets_it_after_a_failed_connect() {
+        let resolver = Arc::new(PinnedResolver::default());
+        let shared = SharedResolver(Arc::clone(&resolver));
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let resolve = |name: &str| {
+            let name: Name = name.parse().unwrap();
+            runtime
+                .block_on(shared.resolve(name))
+                .unwrap()
+                .collect::<Vec<_>>()
+        };
+        let first = resolve("localhost");
+        assert!(!first.is_empty());
+        assert_eq!(resolver.lookups.load(Ordering::Acquire), 1);
+        assert_eq!(resolve("localhost"), first);
+        assert_eq!(resolve("localhost"), first);
+        assert_eq!(resolver.lookups.load(Ordering::Acquire), 1);
+        assert_eq!(resolver.reused.load(Ordering::Acquire), 2);
+
+        resolver.forget();
+        assert_eq!(resolver.forgotten.load(Ordering::Acquire), 1);
+        resolve("localhost");
+        assert_eq!(resolver.lookups.load(Ordering::Acquire), 2);
+        // Nothing pinned, nothing to forget, so nothing is counted.
+        let empty = PinnedResolver::default();
+        empty.forget();
+        assert_eq!(empty.forgotten.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn a_pinned_answer_expires() {
+        let resolver = PinnedResolver::default();
+        let address: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        resolver
+            .answers
+            .lock()
+            .unwrap()
+            .insert("nas".to_owned(), (Instant::now(), vec![address]));
+        assert_eq!(resolver.pinned("nas"), Some(vec![address]));
+        resolver.answers.lock().unwrap().insert(
+            "nas".to_owned(),
+            (
+                Instant::now() - DNS_PIN_TTL - Duration::from_secs(1),
+                vec![address],
+            ),
+        );
+        assert_eq!(resolver.pinned("nas"), None);
+        assert_eq!(resolver.pinned("other"), None);
+    }
+
+    #[test]
+    fn every_pool_of_a_client_shares_one_lookup_of_the_name() {
+        let (url, server) = scripted_server(vec![
+            required_discovery(),
+            login_response(),
+            r#"{"success":true,"data":{"total":1,"shares":[{"path":"/share"}]}}"#.to_owned(),
+        ]);
+        let url = url.replace("127.0.0.1", "localhost");
+        let mut client = connect_test_client(url);
+        client.login("alice", "password", None).unwrap();
+        client.confirm_file_station_session().unwrap();
+        server.join().unwrap();
+        let counters = client.request_floor_counters();
+        assert_eq!(counters.dns_lookups, 1);
+        assert!(counters.dns_reused >= 1, "{counters:?}");
+        assert_eq!(counters.dns_pins_dropped, 0);
     }
 }
 

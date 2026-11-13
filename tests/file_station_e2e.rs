@@ -495,8 +495,8 @@ fn authenticated_target_doctor_checks_exact_destination_and_logs_out() {
     // ablation variants, the capability diagnosis bracketed by its two host reads, the
     // destination walk and permission check, the bounded inventory, and logout.
     //
-    // The walk's second `getinfo` is the destination's own, and it establishes that the path
-    // exists, is a directory, and is not a mount boundary. The inventory therefore opens at its
+    // The walk's single `getinfo` names every component of the destination, and it establishes
+    // that the path exists, is a directory, and is not a mount boundary. The inventory therefore opens at its
     // listing rather than repeating that request: a run against a healthy target pays for the
     // destination `getinfo` exactly once. A destination the walk did not resolve keeps the
     // inventory's own `getinfo`, which is what turns an absent path into `absent_root`.
@@ -517,7 +517,6 @@ fn authenticated_target_doctor_checks_exact_destination_and_logs_out() {
             "SYNO.FileStation.BackgroundTask.list",
             "SYNO.FileStation.Info.get",
             "SYNO.FileStation.List.getinfo",
-            "SYNO.FileStation.List.getinfo",
             "SYNO.FileStation.CheckPermission.write",
             "SYNO.FileStation.List.list",
             "SYNO.API.Auth.logout",
@@ -529,8 +528,8 @@ fn authenticated_target_doctor_checks_exact_destination_and_logs_out() {
             .iter()
             .filter(|operation| operation.as_str() == "SYNO.FileStation.List.getinfo")
             .count(),
-        2,
-        "one `getinfo` per path component, and none repeated for the inventory"
+        1,
+        "one `getinfo` naming every path component, and none repeated for the inventory"
     );
     assert_eq!(
         requests[2].fields.get("account").map(String::as_str),
@@ -2075,11 +2074,10 @@ fn additive_plan_then_sync_preserves_folder_parity_and_verifies_every_upload() {
         [
             "SYNO.API.Info.query",
             "SYNO.API.Auth.login",
-            "SYNO.FileStation.List.getinfo",
+            // One `getinfo` names every ancestor, and the inventory that follows the permission
+            // check reuses what it read instead of asking again.
             "SYNO.FileStation.List.getinfo",
             "SYNO.FileStation.CheckPermission.write",
-            "SYNO.FileStation.List.getinfo",
-            "SYNO.FileStation.List.getinfo",
             "SYNO.FileStation.List.list",
             "SYNO.API.Auth.logout",
         ]
@@ -2197,15 +2195,13 @@ fn additive_plan_then_sync_preserves_folder_parity_and_verifies_every_upload() {
         [
             "SYNO.API.Info.query",
             "SYNO.API.Auth.login",
-            "SYNO.FileStation.List.getinfo",
+            // One `getinfo` names every ancestor of the destination, and the inventory reuses it.
             "SYNO.FileStation.List.getinfo",
             "SYNO.FileStation.CheckPermission.write",
-            "SYNO.FileStation.List.getinfo",
-            "SYNO.FileStation.List.getinfo",
             "SYNO.FileStation.List.list",
-            // The session is touched once before the first mutation, so an idle timeout that
-            // expired during hashing is answered by a login rather than by a failed upload.
-            "SYNO.FileStation.List.list_share",
+            // No session touch here: the listing was answered a moment ago, which is the proof a
+            // touch exists to obtain. After a long local phase (hashing for minutes) the touch is
+            // still sent, so an idle timeout is answered by a login rather than a failed upload.
             "SYNO.FileStation.CreateFolder.create",
             "SYNO.FileStation.CreateFolder.create",
             // The destination's precondition, then the upload, then its size, then its digest
@@ -2220,7 +2216,8 @@ fn additive_plan_then_sync_preserves_folder_parity_and_verifies_every_upload() {
             "SYNO.FileStation.List.getinfo",
             "SYNO.FileStation.MD5.start",
             "SYNO.FileStation.MD5.status",
-            "SYNO.FileStation.List.getinfo",
+            // The reconciliation names every ancestor in one request again: the run may have
+            // created folders since the plan pass read them.
             "SYNO.FileStation.List.getinfo",
             "SYNO.FileStation.List.list",
             "SYNO.FileStation.List.list",
@@ -3124,9 +3121,8 @@ allow-http = true
         "SYNO.FileStation.BackgroundTask.list",
         "SYNO.FileStation.Info.get",
         "SYNO.FileStation.List.getinfo",
-        "SYNO.FileStation.List.getinfo",
         "SYNO.FileStation.CheckPermission.write",
-        // No third `getinfo`: the walk already established that the destination exists, is a
+        // No second `getinfo`: the walk already established that the destination exists, is a
         // directory, and is not a mount boundary, so the inventory opens at its listing.
         "SYNO.FileStation.List.list",
         "SYNO.API.Auth.logout",
