@@ -689,6 +689,8 @@ import {
   ACTIVITY_SCHEMA,
   LOGS_SCHEMA,
   activityContentKey,
+  activityIsUnchanged,
+  activityVersionOf,
   feedDocumentProblem,
   feedSignature,
   runStderrBlock,
@@ -4390,7 +4392,7 @@ export default {
       aboutUiDependencies: ABOUT_UI_DEPENDENCIES,
       diagnostic: { title: "Not run in this session", output: "No diagnostic output yet." }, doctorReport: idleDoctorReport(), doctorProgress: emptyDoctorProgress(),
       liveProgress: emptyLiveProgress(),
-      logsPaused: false, logSource: "all", logLines: 200, logState: "Waiting for logs", logOutput: "No log data yet.", logRecords: [], activityEvents: [], activityHistory: null, activitySearch: "",
+      logsPaused: false, logSource: "all", logLines: 200, logState: "Waiting for logs", logOutput: "No log data yet.", logRecords: [], activityEvents: [], activityVersion: "", activityVersionLines: 0, activityHistory: null, activitySearch: "",
       // Why each feed's last read failed, "" while it is healthy. A feed that
       // fails keeps its old rows, so without these a dead feed and an empty one
       // look the same on every tab but Package logs.
@@ -6579,7 +6581,7 @@ export default {
       if (!(delay > 0)) return;
       this.snapshotTimer = window.setTimeout(() => this.refreshSnapshot(false), delay);
     },
-    scheduleLogs() { window.clearTimeout(this.logTimer); this.logTimer = 0; const interval = Number(this.settings.log_refresh); if (interval > 0 && !this.disposed && !document.hidden && this.route === "activity" && !this.logsPaused) this.logTimer = window.setTimeout(() => this.refreshLogs(), logsPollDelay(this, interval)); },
+    scheduleLogs() { window.clearTimeout(this.logTimer); this.logTimer = 0; const interval = Number(this.settings.log_refresh); if (interval > 0 && !this.disposed && !document.hidden && this.route === "activity" && !this.logsPaused) this.logTimer = window.setTimeout(() => this.refreshLogs({ poll: true }), logsPollDelay(this, interval)); },
     async refreshCsrf(options = undefined) { if (this.disposed) return; this.csrfToken = ""; const model = await apiGet(this.auth, "csrf", {}, options); if (this.disposed) return; if (typeof model.csrf_token !== "string" || !model.csrf_token || model.csrf_token.length > 4096) throw new Error("Authenticated bridge did not issue a valid CSRF token"); this.csrfToken = model.csrf_token; },
     async refreshSnapshot(manual, requirePostMutationRead = false) {
       if (this.disposed || document.hidden) return false;
@@ -8125,7 +8127,11 @@ export default {
         ? records.map((record) => `[${record.source}] ${record.text}`).join("\n").slice(0, MAX_RESPONSE_BYTES)
         : "No log data yet.";
     },
-    async refreshLogs() {
+    // `trigger.poll` is true only for the timer's own read, which is the one that may ask the
+    // package "has the feed changed since this version". Every other caller (opening the page,
+    // a filter, Resume, a clear) is a person asking for the feed and gets it whole; so does the
+    // first read after any failure.
+    async refreshLogs(trigger) {
       if (this.disposed || this.logsLoading || this.logsPaused || document.hidden || this.route !== "activity") return;
       this.logsLoading = true;
       const startedAt = Date.now();
@@ -8139,8 +8145,12 @@ export default {
         // one failure discard the other's payload: the package log scan is far
         // more expensive than the activity feed, so a combined wait turned a
         // healthy activity response into an empty Activity list.
+        const sentVersion = trigger && trigger.poll === true
+          && this.activityVersion && this.activityVersionLines === lines && !this.activityFeedError
+          ? this.activityVersion
+          : "";
         const requests = fetchLogs ? [apiGet(this.auth, "logs", { lines, source: this.logSource })] : [];
-        requests.push(apiGet(this.auth, "activity", { lines }));
+        requests.push(apiGet(this.auth, "activity", sentVersion ? { lines, since: sentVersion } : { lines }));
         const settled = await Promise.allSettled(requests);
         const logs = fetchLogs ? settled[0] : null;
         const activity = fetchLogs ? settled[1] : settled[0];
@@ -8168,22 +8178,37 @@ export default {
               : "No log data yet.";
           }
         }
-        const activityProblem = activity.status === "fulfilled"
-          ? feedDocumentProblem(activity.value, ACTIVITY_SCHEMA, "events", "activity")
-          : feedFailureText(activity.reason);
+        // "Nothing changed" keeps the rows and the history note exactly as they are: it is a
+        // confirmation that they are current, not an empty feed.
+        const activityUnchanged = activity.status === "fulfilled" && activityIsUnchanged(activity.value, sentVersion);
+        let activityProblem = "";
+        if (activityUnchanged) activityProblem = "";
+        else if (activity.status !== "fulfilled") activityProblem = feedFailureText(activity.reason);
+        else if (activity.value && activity.value.unchanged === true) {
+          activityProblem = "the activity answer said nothing changed, but this window sent no version to compare";
+        } else activityProblem = feedDocumentProblem(activity.value, ACTIVITY_SCHEMA, "events", "activity");
         this.activityFeedError = activityProblem;
+        if (activityProblem) this.activityVersion = "";
         this.logsLastDurationMs = Date.now() - startedAt;
         this.logsFailureStreak = activityProblem || logsProblem ? Math.min(Number(this.logsFailureStreak) + 1, 6) : 0;
-        if (!activityProblem) {
+        if (activityUnchanged) {
+          this.activityReceivedAtMs = Date.now();
+          probeSnapshotAfterAnswer(this);
+        } else if (!activityProblem) {
           // The cost of normalising, redacting and keying up to 1000 events is paid
           // only when the feed changed: an identical poll keeps the same array, so
           // no computed that reads it is invalidated.
           const signature = feedSignature(activity.value.events);
           if (!signature || signature !== this.activitySignature) {
-            this.activityEvents = activity.value.events;
+            // Frozen like the snapshot: a feed of up to 1000 event objects is data that is replaced
+            // whole, and Vue 2 would otherwise walk every one of them to make it reactive.
+            this.activityEvents = Object.freeze(activity.value.events);
             this.activitySignature = signature;
           }
           this.activityHistory = activity.value.history === undefined ? null : activity.value.history;
+          // A service that names no version (an older one) is read whole every time, as before.
+          this.activityVersion = activityVersionOf(activity.value);
+          this.activityVersionLines = lines;
           this.activityReceivedAtMs = Date.now();
           probeSnapshotAfterAnswer(this);
         }

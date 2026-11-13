@@ -9,6 +9,31 @@
 export const ACTIVITY_SCHEMA = "sdsync.dsm-activity.v1";
 export const LOGS_SCHEMA = "sdsync.dsm-logs.v1";
 
+// The version a full Activity answer carries and an Activity read may send back as `since`
+// (api.js holds the same pattern for the request side; a test keeps the two equal).
+export const ACTIVITY_VERSION_PATTERN = /^[0-9a-f:-]{1,96}$/;
+
+/** The version a full Activity answer names, or "" when it names none the window can use. */
+export function activityVersionOf(document) {
+  const version = document && typeof document === "object" ? document.version : undefined;
+  return typeof version === "string" && ACTIVITY_VERSION_PATTERN.test(version) ? version : "";
+}
+
+/**
+ * Whether an Activity answer is the package saying "nothing changed since the version you
+ * sent". Only the version this window actually sent can be confirmed: an `unchanged` answer to
+ * a read that carried none, or one naming another version, is not a feed and not a confirmation.
+ */
+export function activityIsUnchanged(document, sentVersion) {
+  return Boolean(sentVersion)
+    && Boolean(document)
+    && typeof document === "object"
+    && document.schema === ACTIVITY_SCHEMA
+    && document.unchanged === true
+    && document.version === sentVersion
+    && document.events === undefined;
+}
+
 /**
  * One key per item, guaranteed unique within the list.
  *

@@ -813,6 +813,25 @@ export function csrfTokenStale(auth, csrfToken) {
   return csrfReissueRequired(auth, csrfToken);
 }
 
+// An Activity read may carry the version of the feed the window already holds. The package
+// answers a matching version with a document that says nothing changed, instead of the feed
+// again. The version is opaque to this window; the shape is the package's own (hex digits,
+// colons and hyphens) and is checked here so no other text can ride in a query.
+export const ACTIVITY_VERSION_PATTERN = /^[0-9a-f:-]{1,96}$/;
+
+// The key set a read must carry: the reviewed one, plus `since` on an Activity read that names a
+// version. Every other combination still fails the exact-key check.
+function readArgumentKeys(action, parameters) {
+  const keys = GET_ARGUMENT_KEYS[action];
+  if (action === "activity" && parameters && Object.prototype.hasOwnProperty.call(parameters, "since")) {
+    if (typeof parameters.since !== "string" || !ACTIVITY_VERSION_PATTERN.test(parameters.since)) {
+      throw new Error("Read arguments do not match the reviewed bridge contract");
+    }
+    return [...keys, "since"].sort();
+  }
+  return keys;
+}
+
 function exactKeys(actual, expected, label) {
   const keys = Object.keys(actual || {}).sort();
   if (!expected || keys.length !== expected.length || keys.some((key, index) => key !== expected[index])) {
@@ -1026,7 +1045,7 @@ async function apiGetWithDsmAuth(
 
 export async function apiGet(auth, action, parameters = {}, options = undefined) {
   if (!GET_ACTIONS.includes(action)) throw new Error("Unsupported API read action");
-  exactKeys(parameters, GET_ARGUMENT_KEYS[action], "Read");
+  exactKeys(parameters, readArgumentKeys(action, parameters), "Read");
   const configuredLimits = normalizedRequestLimits(options);
   const limits = configuredLimits || terminalAttemptLimits();
   await ensureDsmToken();

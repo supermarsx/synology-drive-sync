@@ -4,7 +4,7 @@
 // here once instead of in every harness.
 import { causeSentence, errorCause } from "../../src/errorCopy.mjs";
 import {
-  ACTIVITY_SCHEMA, LOGS_SCHEMA, activityContentKey, feedDocumentProblem, feedSignature, runStderrBlock, uniqueRowKeys
+  ACTIVITY_SCHEMA, LOGS_SCHEMA, activityContentKey, activityIsUnchanged, activityVersionOf, feedDocumentProblem, feedSignature, runStderrBlock, uniqueRowKeys
 } from "../../src/feedModel.mjs";
 import {
   CONTROLLER_TICK_STALE_SECONDS, outcomesUnavailableItem, runIsActive, runIsStale, serviceAttentionItem, spanLabel, staleRunCovers
@@ -15,7 +15,7 @@ import { WIDGET_CLOCK_TICK_MS } from "../../src/widgetModel.mjs";
 
 export const APP_MODULE_STUBS = Object.freeze({
   ACTIVITY_SCHEMA, CONTROLLER_TICK_STALE_SECONDS, LOGS_SCHEMA, WIDGET_CLOCK_TICK_MS,
-  activityContentKey, causeSentence, clearRenderErrors, decodeLogPaths, errorCause, feedDocumentProblem, feedSignature,
+  activityContentKey, activityIsUnchanged, activityVersionOf, causeSentence, clearRenderErrors, decodeLogPaths, errorCause, feedDocumentProblem, feedSignature,
   outcomesUnavailableItem, patchGuard, plainText, runIsActive, runIsStale, runStderrBlock, serviceAttentionItem, spanLabel, staleRunCovers,
   uiErrorSerial, uniqueRowKeys, visibleText
 });
