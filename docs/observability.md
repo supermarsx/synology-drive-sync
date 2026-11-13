@@ -146,6 +146,8 @@ reconcile.evidence             reconcile.carry_canary_mismatch
 pair_index.served              pair_index.canary_mismatch      pair_index.unusable
 pair_index.store_failed
 memory.tree_too_large          memory.budget_unchecked
+session.borrowed               session.borrowed_rejected       session.handover_unused
+session.channel_unusable       session.handback_failed
 ```
 
 Every JSON log record has the same seven base fields. `operation_id` and `attempt` are `null` when

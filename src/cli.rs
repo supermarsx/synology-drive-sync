@@ -393,6 +393,14 @@ pub struct GlobalArgs {
     )]
     pub profile: Option<String>,
 
+    /// Borrow the package daemon's DSM session from standard input, and hand it back at the end.
+    ///
+    /// For the package daemon only: standard input must be the anonymous socket it passes, which
+    /// carries the session in and takes it back out. Hidden, and deliberately no `env`: neither
+    /// the session nor the request for one travels in argv or the environment.
+    #[arg(long = "session-stdin", global = true, hide = true)]
+    pub session_stdin: bool,
+
     #[command(flatten)]
     pub output: OutputArgs,
 }

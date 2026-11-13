@@ -147,6 +147,24 @@ fn dispatch(arguments: &cli::Cli) -> Result<ExitCode> {
     // a drained one. Start it now so the wait overlaps the work before the first TLS client,
     // which waits for it with a bound and names `entropy_unavailable` rather than hanging.
     synology_drive_sync::entropy::begin_warmup()?;
+    if arguments.global.session_stdin {
+        // Read once, before any job: the daemon has written and closed its side already.
+        let single_run = match arguments.invocation() {
+            cli::Invocation::Sync {
+                arguments: sync, ..
+            } => !sync.batch.requested(),
+            cli::Invocation::Plan(plan) => !plan.sync.batch.requested(),
+            _ => false,
+        };
+        if single_run {
+            credentials::open_session_channel();
+        } else {
+            eprintln!(
+                "warning: {}: --session-stdin serves one profile's sync or plan; this command logs in and out itself",
+                EventCode::SessionChannelUnusable.as_str()
+            );
+        }
+    }
     let loaded = load_optional_config(&arguments.global)?;
     match arguments.invocation() {
         cli::Invocation::Sync {
@@ -2911,11 +2929,14 @@ fn prepare_and_run_sync_reporting(
         LogEvent::new(EventLogLevel::Info, EventCode::ApiDiscoveryStarted),
     )?;
     cancellation.phase("connect");
-    let mut client = connect_client(
-        &settings.connection.url,
-        &settings.network,
+    // A session the package daemon lent (`--session-stdin`) replaces discovery, login and logout;
+    // the binding makes sure it was established under this run's own credentials.
+    let session_binding = credentials::session_binding(settings);
+    let (mut client, borrowed) = connect_or_resume(
+        settings,
         cancellation,
-        logger.as_ref().map(request_observer),
+        logger.as_ref(),
+        credentials::take_lent_session(session_binding.as_deref()),
     )?;
     warn_forward_proxy(
         &settings.output,
@@ -2937,26 +2958,49 @@ fn prepare_and_run_sync_reporting(
         logger.as_ref(),
         LogEvent::new(EventLogLevel::Info, EventCode::AuthenticationStarted),
     )?;
+    if settings.authentication.password_stdin && credentials::session_channel_claims_stdin() {
+        return Err(Error::Configuration(
+            "--password-stdin cannot be combined with --session-stdin: both read standard input"
+                .to_owned(),
+        ));
+    }
     let mut vault = credentials::VaultSession::new(
         !settings.authentication.no_vault,
         &settings.connection.url,
         &settings.connection.username,
         settings.network.allow_http,
     );
+    // Read even with a lent session: a password file that is gone fails the run here exactly as
+    // before, and a session DSM refuses is replaced with it.
     let password = credentials::read_password_with_file(
         settings.authentication.password_stdin,
         settings.authentication.password_file.as_deref(),
         &mut vault,
     )?;
     cancellation.phase("authenticate");
-    credentials::authenticate_with_sources(
-        &mut client,
-        &settings.connection.username,
-        &password,
-        &mut vault,
-        settings.authentication.totp_secret_file.as_deref(),
-    )?;
-    client = client.with_reauthenticator(reauthenticator(settings, password));
+    match borrowed {
+        Some(lent) => {
+            log_event(
+                logger.as_ref(),
+                LogEvent::new(EventLogLevel::Info, EventCode::SessionBorrowed),
+            )?;
+            client = client.with_reauthenticator(borrowed_reauthenticator(
+                reauthenticator(settings, password),
+                lent,
+                logger.clone(),
+            ));
+        }
+        None => {
+            credentials::authenticate_with_sources(
+                &mut client,
+                &settings.connection.username,
+                &password,
+                &mut vault,
+                settings.authentication.totp_secret_file.as_deref(),
+            )?;
+            client = client.with_reauthenticator(reauthenticator(settings, password));
+        }
+    }
 
     // Opened (and verified) after authentication, because its binding names the File Station
     // host that answers; then closed again until the comparison set is known.
@@ -3421,7 +3465,13 @@ fn prepare_and_run_sync_reporting(
     if let Some(completion) = completion_out.as_mut() {
         completion.transport = client.transport_counters();
     }
-    finish_authenticated_operation(&mut client, operation)
+    finish_run_session(
+        &mut client,
+        session_binding.as_deref(),
+        &client_options(&settings.connection.url, &settings.network),
+        operation,
+        logger.as_ref(),
+    )
 }
 
 /// SC-2: the memory check a run makes after its walk and after its listing.
@@ -3824,6 +3874,113 @@ fn run_plan_options(
 /// expired failed after hours of work, and the next run repeated the hours and failed the same
 /// way. The closure never prints, logs or returns the password; a one-time code is generated
 /// again from the TOTP seed file or the vault exactly as the first login did.
+/// Connect a run's client: with the session the daemon lent, when there is one this run may use,
+/// otherwise by discovery as always. Every way a lent session goes unused is named.
+fn connect_or_resume(
+    settings: &config::ResolvedSync,
+    cancellation: &CancellationToken,
+    logger: Option<&Arc<EventLogger>>,
+    lent: credentials::Lent,
+) -> Result<(ApiClient, Option<Arc<api::SessionHandover>>)> {
+    let unused = |code: EventCode, cause: &str| -> Result<()> {
+        if !settings.output.quiet {
+            eprintln!("warning: {}: {cause}", code.as_str());
+        }
+        log_event(logger, LogEvent::new(EventLogLevel::Warn, code))
+    };
+    match lent {
+        credentials::Lent::Session(handover) => {
+            match ApiClient::resume_observed(
+                &client_options(&settings.connection.url, &settings.network),
+                &handover,
+                logger.map(request_observer),
+            ) {
+                Ok(client) => {
+                    let client = client
+                        .with_max_upload_rate(settings.network.max_rate)
+                        .with_cancellation(cancellation);
+                    return Ok((client, Some(Arc::new(handover))));
+                }
+                Err(error) => {
+                    credentials::note_lent_session_ignored();
+                    unused(
+                        EventCode::SessionHandoverUnused,
+                        &format!("the lent session cannot serve this run ({error}); logging in"),
+                    )?;
+                }
+            }
+        }
+        credentials::Lent::Ignored(cause) => unused(
+            EventCode::SessionHandoverUnused,
+            &format!("the lent session is not used: {cause}; logging in"),
+        )?,
+        credentials::Lent::Unusable(cause) => unused(
+            EventCode::SessionChannelUnusable,
+            &format!("{cause}; this run logs in and out itself"),
+        )?,
+        credentials::Lent::NoChannel | credentials::Lent::Nothing => {}
+    }
+    let client = connect_client(
+        &settings.connection.url,
+        &settings.network,
+        cancellation,
+        logger.map(request_observer),
+    )?;
+    Ok((client, None))
+}
+
+/// The re-authenticator of a run that borrowed its session: the first time DSM refuses the lent
+/// session it is named, and the handback says so; the login itself is the run's own, once, under
+/// the client's re-authentication ledger, so a refused session can never become a login loop.
+fn borrowed_reauthenticator(
+    inner: api::Reauthenticator,
+    lent: Arc<api::SessionHandover>,
+    logger: Option<Arc<EventLogger>>,
+) -> api::Reauthenticator {
+    Arc::new(move |client: &mut ApiClient| {
+        if client.holds_session_of(&lent) && credentials::note_lent_session_rejected() {
+            eprintln!(
+                "warning: {}: DSM refused the session the package service lent this run; logging in once, afresh",
+                EventCode::SessionBorrowedRejected.as_str()
+            );
+            let _ = log_event(
+                logger.as_ref(),
+                LogEvent::new(EventLogLevel::Warn, EventCode::SessionBorrowedRejected),
+            );
+        }
+        inner(client)
+    })
+}
+
+/// End a sync or plan run's session: handed back to the daemon when it lent a channel, otherwise
+/// logged out exactly as [`finish_authenticated_operation`] does. A session DSM itself refused is
+/// never handed back, and a failed handback falls back to the logout, named.
+fn finish_run_session<T>(
+    client: &mut ApiClient,
+    binding: Option<&str>,
+    options: &ClientOptions,
+    operation: Result<T>,
+    logger: Option<&Arc<EventLogger>>,
+) -> Result<T> {
+    let dead = operation
+        .as_ref()
+        .err()
+        .and_then(Error::api_code)
+        .is_some_and(|code| matches!(code, 106 | 107 | 119));
+    let (end, logout) = credentials::hand_back_or_log_out(client, binding, options, dead);
+    if let credentials::SessionEnd::HandbackFailed(cause) = &end {
+        eprintln!(
+            "warning: {}: {cause}; the session was logged out instead",
+            EventCode::SessionHandbackFailed.as_str()
+        );
+        let _ = log_event(
+            logger,
+            LogEvent::new(EventLogLevel::Warn, EventCode::SessionHandbackFailed),
+        );
+    }
+    resolve_logout(operation, logout)
+}
+
 fn reauthenticator(
     settings: &config::ResolvedSync,
     password: Zeroizing<String>,

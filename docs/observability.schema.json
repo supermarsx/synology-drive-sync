@@ -235,7 +235,12 @@
             "pair_index.unusable",
             "pair_index.store_failed",
             "memory.tree_too_large",
-            "memory.budget_unchecked"
+            "memory.budget_unchecked",
+            "session.borrowed",
+            "session.borrowed_rejected",
+            "session.handover_unused",
+            "session.channel_unusable",
+            "session.handback_failed"
           ]
         },
         "operation_id": { "$ref": "#/$defs/nullableNonNegativeInteger" },

@@ -2,14 +2,17 @@ use std::env;
 use std::fs::File;
 use std::io::{self, BufRead, IsTerminal, Read};
 use std::path::Path;
+use std::sync::{Mutex, MutexGuard, PoisonError};
+use std::time::UNIX_EPOCH;
 
-use synology_drive_sync::api::ApiClient;
+use sha2::{Digest, Sha256};
+use synology_drive_sync::api::{ApiClient, ClientOptions, SessionHandover};
 use synology_drive_sync::vault::{CredentialKind, OsVault, generate_totp, parse_totp_secret};
 use synology_drive_sync::{Error, Result};
 use zeroize::Zeroizing;
 
 use crate::cli::{CredentialAction, CredentialsArgs, OTP_ENV, PASSWORD_ENV, RemoveKind};
-use crate::config::{Profile, ResolvedCredentialProfile};
+use crate::config::{Profile, ResolvedCredentialProfile, ResolvedSync};
 
 const MAX_STDIN_SECRET_BYTES: u64 = 4098;
 
@@ -544,6 +547,342 @@ fn secret_from_env(name: &str) -> Result<Option<Zeroizing<String>>> {
             "environment variable {name} is not valid Unicode"
         ))),
     }
+}
+
+// ---------------------------------------------------------------- a session lent by the daemon
+
+/// What became of the session the daemon lent, as the handback's status line names it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg_attr(not(unix), allow(dead_code))]
+pub(crate) enum Borrowed {
+    /// Nothing was lent.
+    None,
+    /// The lent session served the run.
+    Used,
+    /// DSM refused the lent session; the run logged in once, afresh, and owns that session.
+    Rejected,
+    /// Lent but not used: bound to other credentials, unreadable, or not usable by this run.
+    Ignored,
+}
+
+impl Borrowed {
+    #[cfg_attr(not(unix), allow(dead_code))]
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Used => "used",
+            Self::Rejected => "rejected",
+            Self::Ignored => "ignored",
+        }
+    }
+}
+
+/// `--session-stdin`: the socket the daemon passed as standard input, what it lent, and what
+/// became of it. Process-wide, because exactly one run of one profile consumes it.
+struct SessionChannel {
+    #[cfg(unix)]
+    socket: Option<std::os::unix::net::UnixStream>,
+    lent: Option<SessionHandover>,
+    /// Why the lent document was not usable, when it was not.
+    unreadable: Option<String>,
+    borrowed: Borrowed,
+}
+
+static SESSION_CHANNEL: Mutex<Option<SessionChannel>> = Mutex::new(None);
+/// Why `--session-stdin` was given and no channel could be opened.
+static SESSION_CHANNEL_FAILURE: Mutex<Option<String>> = Mutex::new(None);
+
+fn session_channel() -> MutexGuard<'static, Option<SessionChannel>> {
+    SESSION_CHANNEL
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+}
+
+/// Read what the daemon lent on standard input, once, before any job runs. Never fatal: a channel
+/// that cannot be used is kept as the reason, the run logs in and out as it always did, and the
+/// run names it ([`Lent::Unusable`]).
+pub(crate) fn open_session_channel() {
+    match read_session_channel() {
+        Ok(channel) => *session_channel() = Some(channel),
+        Err(cause) => {
+            *SESSION_CHANNEL_FAILURE
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner) = Some(cause);
+        }
+    }
+}
+
+/// Whether this process reads its standard input as the session channel.
+pub(crate) fn session_channel_claims_stdin() -> bool {
+    session_channel().is_some()
+        || SESSION_CHANNEL_FAILURE
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .is_some()
+}
+
+#[cfg(unix)]
+fn read_session_channel() -> std::result::Result<SessionChannel, String> {
+    use std::os::fd::AsFd;
+    use std::os::unix::fs::FileTypeExt;
+    use std::os::unix::net::UnixStream;
+    use std::time::Duration;
+
+    use synology_drive_sync::api::{LENT_NOTHING, MAX_HANDOVER_BYTES};
+
+    let fd = io::stdin()
+        .as_fd()
+        .try_clone_to_owned()
+        .map_err(|error| format!("standard input cannot be duplicated: {error}"))?;
+    let file = File::from(fd);
+    let is_socket = file
+        .metadata()
+        .map(|metadata| metadata.file_type().is_socket())
+        .map_err(|error| format!("standard input cannot be inspected: {error}"))?;
+    if !is_socket {
+        // A pipe or a file could carry a session in but never take one back.
+        return Err("standard input is not a socket, so a session could not be handed back".into());
+    }
+    let mut socket = UnixStream::from(std::os::fd::OwnedFd::from(file));
+    // The daemon writes before the run starts and closes its side, so this read never waits for
+    // it; the bound covers a caller that never closes.
+    socket
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .map_err(|error| format!("the session channel cannot be bounded: {error}"))?;
+    let mut lent = Zeroizing::new(Vec::with_capacity(MAX_HANDOVER_BYTES + 1));
+    (&mut socket)
+        .take(MAX_HANDOVER_BYTES as u64 + 1)
+        .read_to_end(&mut lent)
+        .map_err(|error| format!("the session channel cannot be read: {error}"))?;
+    if lent.is_empty() {
+        return Err("the daemon wrote nothing on the session channel".into());
+    }
+    let mut channel = SessionChannel {
+        socket: Some(socket),
+        lent: None,
+        unreadable: None,
+        borrowed: Borrowed::None,
+    };
+    if lent.as_slice() != LENT_NOTHING {
+        match SessionHandover::decode(&lent) {
+            Ok(handover) => channel.lent = Some(handover),
+            Err(error) => {
+                channel.unreadable = Some(error.to_string());
+                channel.borrowed = Borrowed::Ignored;
+            }
+        }
+    }
+    Ok(channel)
+}
+
+#[cfg(not(unix))]
+fn read_session_channel() -> std::result::Result<SessionChannel, String> {
+    Err("a lent session needs a Unix socket on standard input".into())
+}
+
+/// The binding of a run's credentials: what a lent session must have been established under for
+/// this run to use it. A digest of the URL, the account and the identity (device, inode, size,
+/// modification time) of the password and TOTP files, so a changed secret ends the reuse. A file
+/// that is absent is an identity of its own (the package names a TOTP file whether or not the
+/// account has one), so adding it ends the reuse too. `None` when a secret file cannot be
+/// inspected: nothing is lent then, and the login names the cause.
+pub(crate) fn session_binding(settings: &ResolvedSync) -> Option<String> {
+    fn identity(path: Option<&Path>) -> Option<String> {
+        let Some(path) = path else {
+            return Some("-".to_owned());
+        };
+        let metadata = match std::fs::metadata(path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                return Some("absent".to_owned());
+            }
+            Err(_) => return None,
+        };
+        let modified = metadata
+            .modified()
+            .ok()
+            .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+            .map_or(0, |since| since.as_nanos());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            Some(format!(
+                "{}:{}:{}:{modified}",
+                metadata.dev(),
+                metadata.ino(),
+                metadata.len()
+            ))
+        }
+        #[cfg(not(unix))]
+        {
+            Some(format!("{}:{modified}", metadata.len()))
+        }
+    }
+
+    let authentication = &settings.authentication;
+    let password = identity(authentication.password_file.as_deref())?;
+    let totp = identity(authentication.totp_secret_file.as_deref())?;
+    let mut digest = Sha256::new();
+    for part in [
+        "sdsync.session-binding.v1",
+        settings.connection.url.as_str(),
+        settings.connection.username.as_str(),
+        password.as_str(),
+        totp.as_str(),
+    ] {
+        digest.update(part.as_bytes());
+        digest.update([0]);
+    }
+    Some(
+        digest
+            .finalize()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect(),
+    )
+}
+
+/// What a run may do with the channel.
+pub(crate) enum Lent {
+    /// No `--session-stdin`: log in and out as always.
+    NoChannel,
+    /// `--session-stdin`, and the channel could not be opened, and why: log in and out as always.
+    Unusable(String),
+    /// A channel, nothing lent on it: log in, and hand the session back at the end.
+    Nothing,
+    /// A session this run may use, bound to its own credentials.
+    Session(SessionHandover),
+    /// A session was lent and is not used, and why; the run logs in and hands its own back.
+    Ignored(String),
+}
+
+/// Take the lent session for the one run that may use it. A second caller gets `Nothing`.
+pub(crate) fn take_lent_session(binding: Option<&str>) -> Lent {
+    let mut guard = session_channel();
+    let Some(channel) = guard.as_mut() else {
+        let failure = SESSION_CHANNEL_FAILURE
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take();
+        return failure.map_or(Lent::NoChannel, Lent::Unusable);
+    };
+    if let Some(cause) = channel.unreadable.take() {
+        return Lent::Ignored(cause);
+    }
+    let Some(lent) = channel.lent.take() else {
+        return Lent::Nothing;
+    };
+    match binding {
+        Some(binding) if lent.binding() == binding => {
+            channel.borrowed = Borrowed::Used;
+            Lent::Session(lent)
+        }
+        Some(_) => {
+            channel.borrowed = Borrowed::Ignored;
+            Lent::Ignored("it was established under other credentials or another endpoint".into())
+        }
+        None => {
+            channel.borrowed = Borrowed::Ignored;
+            Lent::Ignored("this run's secret files cannot be inspected".into())
+        }
+    }
+}
+
+/// A lent session that turned out unusable after it was taken (its API map does not serve this
+/// run): the handback says it was not used, so the daemon ends it.
+pub(crate) fn note_lent_session_ignored() {
+    if let Some(channel) = session_channel().as_mut() {
+        channel.borrowed = Borrowed::Ignored;
+    }
+}
+
+/// Record that DSM refused the lent session, so the handback says so and the daemon does not
+/// log out a session DSM already ended. True the first time only, so the caller names it once.
+pub(crate) fn note_lent_session_rejected() -> bool {
+    match session_channel().as_mut() {
+        Some(channel) if channel.borrowed == Borrowed::Used => {
+            channel.borrowed = Borrowed::Rejected;
+            true
+        }
+        _ => false,
+    }
+}
+
+/// How a run's session ended.
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) enum SessionEnd {
+    /// Handed back to the daemon, which now owns it; not logged out.
+    HandedBack,
+    /// No channel, or nothing to hand back: logged out (or attempted) as always.
+    LoggedOut,
+    /// The channel failed; the session was logged out instead, and why the handback failed.
+    HandbackFailed(String),
+}
+
+/// End a run's session: hand it back on the channel when there is one, otherwise log out. A
+/// session DSM refused (`dead`) is never handed back.
+pub(crate) fn hand_back_or_log_out(
+    client: &mut ApiClient,
+    binding: Option<&str>,
+    options: &ClientOptions,
+    dead: bool,
+) -> (SessionEnd, Result<()>) {
+    let mut guard = session_channel();
+    let Some(channel) = guard.as_mut() else {
+        drop(guard);
+        return (SessionEnd::LoggedOut, client.logout());
+    };
+    let handover = match binding {
+        Some(binding) if !dead => client.hand_over_session(binding, options),
+        _ => None,
+    };
+    let written = write_handback(channel, handover.as_ref());
+    drop(guard);
+    match written {
+        Ok(()) if handover.is_some() => {
+            client.forget_session();
+            (SessionEnd::HandedBack, Ok(()))
+        }
+        Ok(()) => (SessionEnd::LoggedOut, client.logout()),
+        Err(cause) => (SessionEnd::HandbackFailed(cause), client.logout()),
+    }
+}
+
+#[cfg(unix)]
+fn write_handback(
+    channel: &mut SessionChannel,
+    handover: Option<&SessionHandover>,
+) -> std::result::Result<(), String> {
+    use std::io::Write;
+    use std::time::Duration;
+
+    use synology_drive_sync::api::HANDBACK_SCHEMA;
+
+    let Some(mut socket) = channel.socket.take() else {
+        return Err("the session channel was already used".into());
+    };
+    let status = format!("{HANDBACK_SCHEMA} {}\n", channel.borrowed.as_str());
+    let encoded = handover
+        .map(SessionHandover::encode)
+        .transpose()
+        .map_err(|error| error.to_string())?;
+    socket
+        .set_write_timeout(Some(Duration::from_secs(5)))
+        .and_then(|()| socket.write_all(status.as_bytes()))
+        .and_then(|()| match &encoded {
+            Some(encoded) => socket.write_all(encoded),
+            None => Ok(()),
+        })
+        .and_then(|()| socket.shutdown(std::net::Shutdown::Write))
+        .map_err(|error| format!("the session could not be handed back: {error}"))
+}
+
+#[cfg(not(unix))]
+fn write_handback(
+    _channel: &mut SessionChannel,
+    _handover: Option<&SessionHandover>,
+) -> std::result::Result<(), String> {
+    Err("a session can only be handed back over a Unix socket".into())
 }
 
 #[cfg(test)]
