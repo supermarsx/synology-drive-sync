@@ -109,7 +109,7 @@ const REASONS = Object.freeze({
   credential_unavailable: ["the stored credential could not be read", "Re-enter the password."],
   config_invalid: ["the configuration is invalid, or two profiles have overlapping destinations and one of them deletes (the detail names the pair)", "Correct it on the Profiles page; profiles whose destinations overlap need separate destinations."],
   https_required: ["the target must use HTTPS", "Change the target to HTTPS."],
-  scope_not_found: ["the named profile does not exist", "Check the profile name."],
+  scope_not_found: ["the profile, or the folder this run was scoped to, was not found (a folder a realtime run was started for can be gone from both sides by the time it runs)", "Check the profile name. For a folder that was removed, nothing is missing: the next change or the daily full pass covers the rest."],
   unclassified: ["the failure has no specific classification", "Review Logs."],
   changed_during_run: ["files changed during the run", "They sync next run."],
   delete_bound: ["deletions were bounded", "The rest is deleted next run."],

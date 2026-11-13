@@ -311,3 +311,14 @@ test("the daemon extractor sees a renamed token in each call shape", () => {
   const lifecycle = daemonReasons("src/daemon/lifecycle.rs", 'detail: format!(\n  "consumer_timeout: {} did not finish",\n  x)');
   assert.ok(lifecycle.has("consumer_timeout"));
 });
+
+// fix9: the daemon scopes a realtime run to the folders that changed, so `scope_not_found` is no
+// longer only a missing profile: a folder made and removed within the quiet period is on neither
+// side when the run starts. The copy must not blame the profile name for that.
+test("scope_not_found names both the profile and the scoped folder, and says nothing is missing", () => {
+  const copy = reasonCopy("scope_not_found");
+  assert.equal(copy.known, true);
+  assert.match(copy.text, /profile/);
+  assert.match(copy.text, /folder this run was scoped to/);
+  assert.match(copy.text, /daily full pass/);
+});
