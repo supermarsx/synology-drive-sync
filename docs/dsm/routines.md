@@ -108,10 +108,17 @@ tree once every 24 hours (`routine_full_reconcile`, `info`). A profile held by a
 block](operations.md#lasting-block-after-an-out-of-memory-kill) is not run by its routine, and each
 held trigger is logged at most once an hour (`routine_suppressed`).
 
+**A realtime run re-verifies two pairs, not 25.** Under the daemon, a run started for changed directories (including a
+change at the source root, which carries no `--scope`) is started with `--pair-index-canary 2 --reconcile-canary 2`:
+the verified-pair index re-reads two served pairs live in the plan and two in the final reconcile. The whole-tree
+sync (every 24 hours, after an overflow, at start-up, after a rules change), interval and daily routines and manual runs
+keep the core's default of 25. The shell engine runs without the pair index and has no canary.
+
 **Removals are not changes when deletion is off.** A routine that does not allow deletion (`allow_delete=false`, so the run
 is started with `--no-delete`) ignores an inotify delete event: it can only find nothing to do. The events are counted in
 `ctl status` (`ignored_delete_events`) and named (`routine_events_ignored`, the first and then at most hourly). A rename
-still counts, because its new name is something to upload. The polling fallback cannot tell a removal from any other change
+still counts, because its new name is something to upload, and so does the removal of the source's own `.sdsyncignore`,
+which re-includes what it excluded. The polling fallback cannot tell a removal from any other change
 and reports them all.
 
 **A change that changes nothing is not run.** Many events leave a directory exactly as the last sync saw it

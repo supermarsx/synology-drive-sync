@@ -417,6 +417,11 @@ impl Blocked {
 /// How often one held trigger is logged.
 const SUPPRESSED_LOG_EVERY: Duration = Duration::from_secs(3600);
 
+/// The pairs a realtime run for a dirty set re-verifies live, for each of the
+/// index canary and the reconcile carry canary (the daily whole-tree pass draws
+/// the core's 25).
+const REALTIME_CANARY: u32 = 2;
+
 /// How often a routine's dropped delete events are logged (they are counted
 /// in `ctl status` meanwhile).
 const IGNORED_LOG_EVERY: Duration = Duration::from_secs(3600);
@@ -2693,6 +2698,22 @@ impl Control {
         if let Some(dir) = &self.settings.pair_index_dir {
             args.push("--pair-index".into());
             args.push(dir.into());
+            // A realtime run for a dirty set re-verifies 2 pairs, wherever the
+            // set's common ancestor is (the root included, which carries no
+            // `--scope` and would otherwise draw 25). The whole-tree marks (the
+            // daily pass, overflow, catch-up, a rules change), interval and
+            // daily routines and manual runs keep the core's default. The flags
+            // require `--pair-index`, so they only ever go with it.
+            if matches!(
+                &request.origin,
+                Origin::Routine { dirty: Some(dirty), .. }
+                    if !dirty.whole_tree && !dirty.is_empty()
+            ) {
+                for flag in ["--pair-index-canary", "--reconcile-canary"] {
+                    args.push(flag.into());
+                    args.push(REALTIME_CANARY.to_string().into());
+                }
+            }
         }
         args
     }

@@ -185,6 +185,15 @@ struct Worker {
 /// Where a walk takes its place under the process-wide walk cap.
 type SlotSource = Arc<dyn Fn() -> Result<WalkSlot, usize> + Send + Sync>;
 
+/// Whether a native change is an inotify delete and nothing else, which a
+/// routine that cannot delete has no work for. The source's own ignore file
+/// being removed is not one: it widens what the sync includes, so the files it
+/// excluded must now upload, whatever the routine may delete.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn delete_only(kind: &str, entry: &str) -> bool {
+    kind == "delete" && !Filter::is_rules_file(entry)
+}
+
 fn real_slot() -> SlotSource {
     Arc::new(synology_drive_sync::watch::walk_slot)
 }
@@ -521,9 +530,9 @@ impl Worker {
         use synology_drive_sync::watch::Change;
         for change in changes {
             let event = match change {
-                Change::Path { dir, kind, .. } => {
+                Change::Path { dir, entry, kind } => {
                     floor.reported(&dir);
-                    if kind == "delete" {
+                    if delete_only(kind, &entry) {
                         ChangeEvent::Deleted {
                             routine: self.spec.routine.clone(),
                             dir,
@@ -1267,6 +1276,17 @@ mod tests {
     use super::*;
     use std::sync::Mutex;
     use std::time::Instant;
+
+    #[test]
+    fn only_a_plain_delete_is_delete_only_and_never_the_ignore_file() {
+        assert!(delete_only("delete", "a/lock.tmp"));
+        assert!(delete_only("delete", "top.txt"));
+        // A rename keeps its source's directory marked (copy candidates).
+        assert!(!delete_only("moved_from", "a/b.txt"));
+        assert!(!delete_only("create", "a/b.txt"));
+        // The ignore file going away re-includes what it excluded.
+        assert!(!delete_only("delete", ".sdsyncignore"));
+    }
 
     static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 

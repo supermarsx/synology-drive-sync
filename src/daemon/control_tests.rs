@@ -2960,3 +2960,110 @@ fn an_edited_routine_forgets_what_was_recorded() {
     change(&h, "a");
     h.wait_for("the change runs", PATIENT, |h| h.launched() == 2);
 }
+
+// ------------------------------------------------------- canary of a realtime run
+
+fn launched_args(h: &Harness, index: usize) -> Vec<String> {
+    h.world.lock().unwrap().launched[index]
+        .args
+        .iter()
+        .map(|a| a.to_string_lossy().into_owned())
+        .collect()
+}
+
+fn flag_value<'a>(args: &'a [String], flag: &str) -> Option<&'a str> {
+    args.windows(2)
+        .find(|w| w[0] == flag)
+        .map(|w| w[1].as_str())
+}
+
+fn realtime_with_index(label: &str) -> Harness {
+    Harness::tuned(
+        label,
+        |home, _| {
+            profile(home, "docs");
+            routine(
+                home,
+                "docs",
+                "enabled=true\nmode=realtime\ndebounce_seconds=1\nretry_backoff_seconds=10\n",
+            );
+        },
+        |settings| settings.pair_index_dir = Some(PathBuf::from("/var/state/cache/pairs")),
+    )
+}
+
+/// A realtime run for a dirty set draws 2 canaries, including one whose dirty
+/// directory is the source root (no `--scope`, which would draw 25); the
+/// whole-tree mark, a manual run and a routine that is not realtime keep the
+/// default. The flags only ever travel with `--pair-index`.
+#[test]
+fn a_realtime_dirty_set_run_pins_two_canaries_and_nothing_else_does() {
+    let h = realtime_with_index("argv-two");
+    h.wait_for("arm", PATIENT, |h| armed_generation(h, "docs").is_some());
+
+    // The root: no --scope, still 2.
+    change(&h, "");
+    h.wait_for("the root run", PATIENT, |h| h.launched() == 1);
+    let args = launched_args(&h, 0);
+    assert!(!args.iter().any(|a| a == "--scope"), "{args:?}");
+    assert_eq!(
+        flag_value(&args, "--pair-index-canary"),
+        Some("2"),
+        "{args:?}"
+    );
+    assert_eq!(
+        flag_value(&args, "--reconcile-canary"),
+        Some("2"),
+        "{args:?}"
+    );
+    assert!(args.iter().any(|a| a == "--pair-index"), "{args:?}");
+    h.wait_for("idle", PATIENT, Harness::idle);
+
+    // A directory: scoped, 2.
+    change(&h, "a/b");
+    h.wait_for("the scoped run", PATIENT, |h| h.launched() == 2);
+    let args = launched_args(&h, 1);
+    assert_eq!(flag_value(&args, "--scope"), Some("a/b"), "{args:?}");
+    assert_eq!(
+        flag_value(&args, "--pair-index-canary"),
+        Some("2"),
+        "{args:?}"
+    );
+    assert_eq!(
+        flag_value(&args, "--reconcile-canary"),
+        Some("2"),
+        "{args:?}"
+    );
+    h.wait_for("idle", PATIENT, Harness::idle);
+
+    // The whole-tree mark (an overflow): the core's default.
+    let _ = h.tx.send(Msg::Change(ChangeEvent::Overflow {
+        routine: Some("docs".into()),
+    }));
+    h.wait_for("the whole-tree run", PATIENT, |h| h.launched() == 3);
+    let args = launched_args(&h, 2);
+    assert!(
+        !args.iter().any(|a| a.ends_with("-canary")) && !args.iter().any(|a| a == "--scope"),
+        "{args:?}"
+    );
+    h.wait_for("idle", PATIENT, Harness::idle);
+
+    // A manual run: the default too.
+    assert_eq!(h.ask(run("docs"))["ok"], true);
+    h.wait_for("the manual run", PATIENT, |h| h.launched() == 4);
+    let args = launched_args(&h, 3);
+    assert!(!args.iter().any(|a| a.ends_with("-canary")), "{args:?}");
+}
+
+/// Without an index directory there is nothing to draw a canary from, and the
+/// core refuses the flags: none is passed.
+#[test]
+fn no_canary_flags_without_the_pair_index() {
+    let h = realtime_harness("argv-plain");
+    h.wait_for("arm", PATIENT, |h| armed_generation(h, "docs").is_some());
+    change(&h, "a");
+    h.wait_for("the run", PATIENT, |h| h.launched() == 1);
+    let args = launched_args(&h, 0);
+    assert!(!args.iter().any(|a| a.ends_with("-canary")), "{args:?}");
+    assert!(!args.iter().any(|a| a == "--pair-index"), "{args:?}");
+}
