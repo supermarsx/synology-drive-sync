@@ -1084,6 +1084,9 @@ pub struct SyncOutcome {
     /// Serialised, so FFI callers see retries, re-logins, keepalive failures and orphaned server
     /// tasks too; skipping it left them the only callers who could not (ADV-R-4).
     recovered: crate::api::TransportCounters,
+    /// What the request-floor shortcuts did during the run; counts only. See
+    /// [`crate::api::RequestFloorCounters`].
+    request_floor: crate::api::RequestFloorCounters,
     /// Root-relative NAS folders whose listing DSM returned incomplete (`""` is the destination
     /// itself). No deletion is made inside them; reported even when none was planned there.
     incomplete_listings: Vec<String>,
@@ -1178,6 +1181,12 @@ impl SyncOutcome {
     /// Retries, re-logins and abandoned server tasks the run recovered from, or could not.
     pub fn recovered(&self) -> crate::api::TransportCounters {
         self.recovered
+    }
+
+    /// What the request-floor shortcuts did: batched `getinfo` requests and the single ones they
+    /// replaced, session touches skipped, parallel listing waves, MD5 lanes and name lookups.
+    pub fn request_floor(&self) -> crate::api::RequestFloorCounters {
+        self.request_floor
     }
 
     /// NAS folders whose listing was incomplete, so nothing in them was deleted. See the field.
@@ -1435,6 +1444,7 @@ impl Engine {
                     execution: None,
                     deferred: sdk_deferred(&deferred),
                     recovered: client.transport_counters(),
+                    request_floor: client.request_floor_counters(),
                     incomplete_listings: incomplete_directories.clone(),
                     link_guard_unchecked,
                     reconciliation: None,
@@ -1568,6 +1578,7 @@ impl Engine {
                 execution: Some(ExecutionSummary::from_report(&report, &client)),
                 deferred: sdk_deferred(&deferred),
                 recovered: client.transport_counters(),
+                request_floor: client.request_floor_counters(),
                 incomplete_listings: incomplete_directories,
                 link_guard_unchecked,
                 reconciliation,

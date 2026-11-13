@@ -347,7 +347,7 @@ the modification times differ, it reports the difference it did observe, `mtime-
 sync result contains `changed`, `uploaded`, `server_copied`, `upload_bytes`,
 `directories_created`, `deleted`, `renamed`, `deletes_skipped`, `kept_deletes_uploaded`, `changed_during_run`,
 `failed`, `outcome`, `deferred`, `mtime_not_kept`, `skipped`, `incomplete_listings`,
-`incomplete_listing_folders`, `recovered`, and `elapsed_ms`; an already-synchronized run uses
+`incomplete_listing_folders`, `recovered`, `request_floor`, and `elapsed_ms`; an already-synchronized run uses
 `"result":{"changed":false}`. [Partial runs, deferrals and skips](#partial-runs-deferrals-and-skips)
 defines the verdict fields. In human output a case-only rename is a `RENAME <from> -> <to>` line of the
 plan, and a sync that made any closes with `N case-only rename(s) were made on the NAS with File Station
@@ -459,6 +459,17 @@ The remaining fields say what the run recovered from, so nothing is silent:
 - `recovered` counts `retries`, `reauthentications`, `reauthentication_failures`,
   `keepalive_failures`, `server_tasks_not_stopped` and `server_copy_fallbacks`. Human output prints a
   `Recovered:` line when any is non-zero.
+- `request_floor` counts what the run's request-saving shortcuts did, so a shortcut that did not
+  engage is visible rather than a quiet absence of requests: `getinfo_batches` (one `getinfo`
+  naming several paths) and `getinfo_requests_saved` (the single ones it replaced),
+  `getinfo_batch_fallbacks` (DSM did not answer the multi-path form, so the serial form ran; also
+  logged as `getinfo.batch_fallback`), `ancestor_cache_hits`, `session_touches_skipped`,
+  `list_waves_parallel` and `list_folders_parallel` (folders listed several at once),
+  `md5_lanes` with `md5_lanes_widened` and `md5_lanes_narrowed`, and `dns_lookups`, `dns_reused`
+  and `dns_pins_dropped` (a failed connect ended the reuse of a looked-up name; also logged as
+  `dns.pin_dropped`). Nothing here is a fault and healthy runs are non-zero, which is why it is not
+  part of `recovered` or the human `Recovered:` line. A run that found nothing to do prints
+  `{"changed":false}` but its `--result-record` line carries the same object as `request_floor`.
 
 The `reason` on `entry.deferred` and `entry.skipped` is the closed event vocabulary, not the result
 token. Deferrals map as follows: `source-changed`, `source-vanished` and `file-keeps-changing` to
@@ -552,7 +563,7 @@ ordered as follows:
 {"schema":"sdsync.plan-action.v1","action":"create-directory","relative":"releases","remote_path":"/team/export/releases","reason":"missing-remote"}
 {"schema":"sdsync.plan-action.v1","action":"copy-remote-content","from_relative":"old/report.bin","from_remote_path":"/team/export/old/report.bin","to_relative":"new/report.bin","to_remote_path":"/team/export/new/report.bin","expected_size":4096,"expected_mtime_seconds":1785769200,"content_md5":"d41d8cd98f00b204e9800998ecf8427e","source_snapshot_guard":{"entry_kind":"file","size":4096,"mtime_seconds":1785769200,"content_md5":"d41d8cd98f00b204e9800998ecf8427e","require_mtime":true},"verified_upload_fallback":"only-before-copy-task-start"}
 {"schema":"sdsync.plan-action.v1","action":"upload","relative":"release.bin","remote_path":"/team/export/release.bin","bytes":5242880,"mtime_ms":1785769200000,"reason":"content-differs"}
-{"schema":"sdsync.output.v1","kind":"completion","result":{"changed":true,"uploaded":1,"server_copied":1,"upload_bytes":5242880,"directories_created":1,"deleted":0,"renamed":0,"deletes_skipped":0,"kept_deletes_uploaded":0,"changed_during_run":0,"failed":false,"outcome":"complete","deferred":[],"link_guard_unchecked":0,"mtime_not_kept":0,"skipped":0,"incomplete_listings":0,"incomplete_listing_folders":[],"recovered":{"retries":0,"reauthentications":0,"reauthentication_failures":0,"keepalive_failures":0,"server_tasks_not_stopped":0,"server_copy_fallbacks":0},"elapsed_ms":8421}}
+{"schema":"sdsync.output.v1","kind":"completion","result":{"changed":true,"uploaded":1,"server_copied":1,"upload_bytes":5242880,"directories_created":1,"deleted":0,"renamed":0,"deletes_skipped":0,"kept_deletes_uploaded":0,"changed_during_run":0,"failed":false,"outcome":"complete","deferred":[],"link_guard_unchecked":0,"mtime_not_kept":0,"skipped":0,"incomplete_listings":0,"incomplete_listing_folders":[],"recovered":{"retries":0,"reauthentications":0,"reauthentication_failures":0,"keepalive_failures":0,"server_tasks_not_stopped":0,"server_copy_fallbacks":0},"request_floor":{"session_touches_skipped":2,"getinfo_batches":1,"getinfo_requests_saved":3,"getinfo_batch_fallbacks":0,"ancestor_cache_hits":1,"list_waves_parallel":1,"list_folders_parallel":4,"md5_lanes":4,"md5_lanes_widened":0,"md5_lanes_narrowed":0,"dns_lookups":1,"dns_reused":2,"dns_pins_dropped":0},"elapsed_ms":8421}}
 ```
 
 A plan-only NDJSON stream ends after its last action. An unchanged sync emits the summary followed

@@ -594,6 +594,10 @@ pub struct SyncPlan {
     /// What the verified-pair index did for this plan's digest pass, when one was asked for.
     /// Not the planner's to know: the caller sets it (`--pair-index`).
     pub pair_index: Option<crate::pair_index::IndexReport>,
+    /// What the request-floor shortcuts did for the run this plan belongs to, when the caller knows
+    /// (the run's own client counts them). Not the planner's to know: the caller sets it, so a run
+    /// with nothing to do, which has no completion, still reports it in its result record.
+    pub request_floor: Option<crate::api::RequestFloorCounters>,
 }
 
 impl SyncPlan {
@@ -615,6 +619,7 @@ impl SyncPlan {
             skipped: Vec::new(),
             link_guard_unchecked: 0,
             pair_index: None,
+            request_floor: None,
         }
     }
 
@@ -1079,6 +1084,7 @@ pub fn build_plan(
         skipped,
         link_guard_unchecked: 0,
         pair_index: None,
+        request_floor: None,
     };
     let pairs = &resolution.pairs;
     let shield = &resolution.shield;
@@ -7010,6 +7016,7 @@ mod resync_ticket_tests {
             skipped: Vec::new(),
             link_guard_unchecked: 0,
             pair_index: None,
+            request_floor: None,
         }
     }
 

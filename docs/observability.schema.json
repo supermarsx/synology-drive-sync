@@ -844,6 +844,7 @@
         "incomplete_listings",
         "incomplete_listing_folders",
         "recovered",
+        "request_floor",
         "elapsed_ms"
       ],
       "properties": {
@@ -924,6 +925,7 @@
             "server_copy_fallbacks": { "description": "Planned server-side copies uploaded instead because DSM refused to start them.", "$ref": "#/$defs/nonNegativeInteger" }
           }
         },
+        "request_floor": { "$ref": "#/$defs/requestFloor" },
         "pair_index": {
           "description": "What the verified-pair index did, or `null` when none was asked for.",
           "oneOf": [{ "type": "null" }, { "$ref": "#/$defs/pairIndex" }]
@@ -1008,6 +1010,41 @@
         }
       }
     },
+    "requestFloor": {
+      "description": "What the run's request-floor shortcuts did, as counts: nothing here is a fault, and healthy runs are non-zero (which is why none of it is in `recovered`). A shortcut that did not engage shows as a zero beside its fallback count.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "session_touches_skipped",
+        "getinfo_batches",
+        "getinfo_requests_saved",
+        "getinfo_batch_fallbacks",
+        "ancestor_cache_hits",
+        "list_waves_parallel",
+        "list_folders_parallel",
+        "md5_lanes",
+        "md5_lanes_widened",
+        "md5_lanes_narrowed",
+        "dns_lookups",
+        "dns_reused",
+        "dns_pins_dropped"
+      ],
+      "properties": {
+        "session_touches_skipped": { "description": "Session keepalive touches skipped because a real request had just proven the session alive.", "$ref": "#/$defs/nonNegativeInteger" },
+        "getinfo_batches": { "description": "Multi-path `getinfo` requests sent.", "$ref": "#/$defs/nonNegativeInteger" },
+        "getinfo_requests_saved": { "description": "Single-path `getinfo` requests those batches and the ancestor cache replaced.", "$ref": "#/$defs/nonNegativeInteger" },
+        "getinfo_batch_fallbacks": { "description": "Times DSM's answer to a multi-path `getinfo` was not accepted and the serial calls ran instead (latched after the first; also logged as `getinfo.batch_fallback`).", "$ref": "#/$defs/nonNegativeInteger" },
+        "ancestor_cache_hits": { "description": "Inventories that reused the ancestors the writable check had just read.", "$ref": "#/$defs/nonNegativeInteger" },
+        "list_waves_parallel": { "description": "Waves of the remote walk that listed more than one folder at once.", "$ref": "#/$defs/nonNegativeInteger" },
+        "list_folders_parallel": { "description": "Folders listed inside those waves.", "$ref": "#/$defs/nonNegativeInteger" },
+        "md5_lanes": { "description": "Server-side MD5 lanes in force at the end of the run: 4, or 8 when the digests were all small and quick.", "$ref": "#/$defs/nonNegativeInteger" },
+        "md5_lanes_widened": { "description": "Times the MD5 lanes widened.", "$ref": "#/$defs/nonNegativeInteger" },
+        "md5_lanes_narrowed": { "description": "Times the MD5 lanes narrowed back after a slow, failed or retried digest.", "$ref": "#/$defs/nonNegativeInteger" },
+        "dns_lookups": { "description": "Name lookups this run made.", "$ref": "#/$defs/nonNegativeInteger" },
+        "dns_reused": { "description": "Connections that reused a name a pool had already looked up.", "$ref": "#/$defs/nonNegativeInteger" },
+        "dns_pins_dropped": { "description": "Times a failed connect ended the reuse so the next attempt looked the name up again (also logged as `dns.pin_dropped`).", "$ref": "#/$defs/nonNegativeInteger" }
+      }
+    },
     "planVerdict": {
       "type": "object",
       "description": "What a plan-only job established: whether anything would change, and every path it left out.",
@@ -1026,6 +1063,10 @@
         "pair_index": {
           "description": "What the verified-pair index did, when the job asked for one (`--pair-index`). Present on a run that found nothing to do, which is the warm run the index exists for.",
           "$ref": "#/$defs/pairIndex"
+        },
+        "request_floor": {
+          "description": "What the request-floor shortcuts did (see `result.request_floor`). Present on a run that found nothing to do, which has no execution result to carry it.",
+          "$ref": "#/$defs/requestFloor"
         },
         "elapsed_ms": { "$ref": "#/$defs/nonNegativeInteger" }
       }

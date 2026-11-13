@@ -113,6 +113,7 @@ A successful result is:
     "execution": null,
     "deferred": [],
     "recovered": { "retries": 0, "reauthentications": 0, "reauthentication_failures": 0, "keepalive_failures": 0, "server_tasks_not_stopped": 0 },
+    "request_floor": { "session_touches_skipped": 0, "getinfo_batches": 1, "getinfo_requests_saved": 2, "getinfo_batch_fallbacks": 0, "ancestor_cache_hits": 1, "list_waves_parallel": 0, "list_folders_parallel": 0, "md5_lanes": 4, "md5_lanes_widened": 0, "md5_lanes_narrowed": 0, "dns_lookups": 1, "dns_reused": 0, "dns_pins_dropped": 0 },
     "incomplete_listings": [],
     "link_guard_unchecked": 0
   }
@@ -121,7 +122,10 @@ A successful result is:
 
 The `outcome` object also carries `deferred` (each path left for a later run, with its kebab-case
 reason and detail), `recovered` (the retries, re-authentications and other recoveries the run absorbed,
-under the same key names as the command-line result) and `incomplete_listings` (NAS folders DSM listed
+under the same key names as the command-line result), `request_floor` (counts of what the run's
+request-saving shortcuts did: batched `getinfo`, skipped session touches, parallel listing waves, MD5
+lanes and name lookups; see [the result fields](../observability.md#partial-runs-deferrals-and-skips))
+and `incomplete_listings` (NAS folders DSM listed
 short). When `execution` is not `null` it holds `deleted`, `created`, `copied`, `uploaded`,
 `uploaded_bytes`, `mtime_not_kept`, `copy_fallbacks`, `deletes_skipped`, `kept_deletes_uploaded` and
 `renamed`. `link_guard_unchecked` (in `outcome` and in `outcome.plan`) counts NAS folders DSM listed

@@ -4440,6 +4440,7 @@ mod tests {
             skipped: Vec::new(),
             link_guard_unchecked: 0,
             pair_index: None,
+            request_floor: None,
         }
     }
 
@@ -6430,6 +6431,7 @@ mod tests {
             skipped: Vec::new(),
             link_guard_unchecked: 0,
             pair_index: None,
+            request_floor: None,
         };
         let mut reported = Vec::new();
         // `execute` (unlike `execute_with`, used by every other test in this module) is the

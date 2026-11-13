@@ -94,6 +94,14 @@ fn a_run_asks_for_its_ancestors_once_and_does_not_touch_a_session_it_just_used()
         );
     }
     let password = fixture.write("password", PASSWORD);
+    let record = fixture.child("record.json");
+    // What the run's result record says about its request floor: a run with nothing to do has
+    // only a plan verdict there, a run that wrote has the execution result.
+    let floor = || -> Value {
+        let line: Value =
+            serde_json::from_str(fs::read_to_string(&record).unwrap().trim()).unwrap();
+        line["result"]["request_floor"].clone()
+    };
     std::thread::sleep(Duration::from_millis(2_200));
     let sync = |label: &str| -> (Value, BTreeMap<String, usize>, Duration) {
         let before = server.requests().len();
@@ -117,6 +125,8 @@ fn a_run_asks_for_its_ancestors_once_and_does_not_touch_a_session_it_just_used()
             "1",
             "--pair-index",
             index.to_str().unwrap(),
+            "--result-record",
+            record.to_str().unwrap(),
         ]);
         let wall = started.elapsed();
         assert_eq!(
@@ -158,6 +168,16 @@ fn a_run_asks_for_its_ancestors_once_and_does_not_touch_a_session_it_just_used()
     );
     assert_eq!(count(&warm, "SYNO.FileStation.List.list_share"), 0);
     assert!(document["plan"]["pair_index"]["served"].as_u64().unwrap() > 0);
+    // The result record of a run with nothing to do says what the shortcuts did, so a latched
+    // fallback or a skipped touch is a named count and not an absence of requests.
+    let warm_floor = floor();
+    assert_eq!(warm_floor["getinfo_batches"], 1, "{warm_floor}");
+    assert_eq!(warm_floor["getinfo_batch_fallbacks"], 0, "{warm_floor}");
+    assert!(
+        warm_floor["getinfo_requests_saved"].as_u64().unwrap() >= 1,
+        "{warm_floor}"
+    );
+    assert_eq!(warm_floor["dns_pins_dropped"], 0, "{warm_floor}");
 
     // Two files missing on the NAS: two uploads. The session was answered a moment before the
     // first mutation, so it is not touched again.
@@ -166,6 +186,16 @@ fn a_run_asks_for_its_ancestors_once_and_does_not_touch_a_session_it_just_used()
     }
     let (document, changed, _) = sync("run 3 (two missing)");
     assert_eq!(document["result"]["uploaded"], 2);
+    // The same counts ride on the execution result, which the printed document carries too.
+    assert_eq!(
+        document["result"]["request_floor"],
+        floor(),
+        "the printed result and the record agree"
+    );
+    assert_eq!(
+        document["result"]["request_floor"]["getinfo_batch_fallbacks"],
+        0
+    );
     assert_eq!(
         count(&changed, "SYNO.FileStation.List.list_share"),
         0,

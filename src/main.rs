@@ -1802,6 +1802,11 @@ struct SyncCompletion {
     skipped: usize,
     /// Retries, re-logins and abandoned server tasks the client recovered from, or could not.
     transport: api::TransportCounters,
+    /// What the request-floor shortcuts did (batched `getinfo`, skipped session touches, parallel
+    /// listing waves, MD5 lanes, the shared name lookup). Every one is a counted fact, so a
+    /// shortcut that did not engage (a latched fallback) reads as such rather than as a quiet
+    /// absence of requests.
+    request_floor: api::RequestFloorCounters,
     /// Remote folders (root-relative, `.` for the root) whose listing returned a different number
     /// of entries than DSM counted. Deletions inside them were withheld.
     incomplete_listings: Vec<String>,
@@ -3466,9 +3471,15 @@ fn prepare_and_run_sync_reporting(
         }
     }
 
+    // A run with nothing to do has a plan and no completion; its result record still says what
+    // the request-floor shortcuts did.
+    if let Some(plan) = plan_out.as_mut() {
+        plan.request_floor = Some(client.request_floor_counters());
+    }
     // Whatever the verdict, the result says what the client recovered from along the way.
     if let Some(completion) = completion_out.as_mut() {
         completion.transport = client.transport_counters();
+        completion.request_floor = client.request_floor_counters();
     }
     finish_run_session(
         &mut client,
@@ -3767,6 +3778,9 @@ fn result_record_result(
             // a supervisor needs to see, and the run state was blind to it without this.
             if let Some(report) = &plan.pair_index {
                 verdict["pair_index"] = run_index::value(report);
+            }
+            if let Some(floor) = &plan.request_floor {
+                verdict["request_floor"] = request_floor_value(floor);
             }
             verdict
         }
@@ -9668,7 +9682,28 @@ fn execution_value(completion: &SyncCompletion, elapsed: Duration) -> Value {
             "server_tasks_not_stopped": completion.transport.server_tasks_not_stopped,
             "server_copy_fallbacks": completion.report.copy_fallbacks,
         },
+        // What the request-floor shortcuts did: counts only, never DSM content. Healthy runs are
+        // non-zero, so none of it is in `recovered` or the human `Recovered:` line.
+        "request_floor": request_floor_value(&completion.request_floor),
         "elapsed_ms": duration_millis(elapsed),
+    })
+}
+
+fn request_floor_value(floor: &api::RequestFloorCounters) -> Value {
+    json!({
+        "session_touches_skipped": floor.session_touches_skipped,
+        "getinfo_batches": floor.getinfo_batches,
+        "getinfo_requests_saved": floor.getinfo_requests_saved,
+        "getinfo_batch_fallbacks": floor.getinfo_batch_fallbacks,
+        "ancestor_cache_hits": floor.ancestor_cache_hits,
+        "list_waves_parallel": floor.list_waves_parallel,
+        "list_folders_parallel": floor.list_folders_parallel,
+        "md5_lanes": floor.md5_lanes,
+        "md5_lanes_widened": floor.md5_lanes_widened,
+        "md5_lanes_narrowed": floor.md5_lanes_narrowed,
+        "dns_lookups": floor.dns_lookups,
+        "dns_reused": floor.dns_reused,
+        "dns_pins_dropped": floor.dns_pins_dropped,
     })
 }
 
@@ -11086,6 +11121,7 @@ mod tests {
             skipped: Vec::new(),
             link_guard_unchecked: 0,
             pair_index: None,
+            request_floor: None,
         }
     }
 
@@ -11374,6 +11410,7 @@ mod tests {
             skipped: Vec::new(),
             link_guard_unchecked: 0,
             pair_index: None,
+            request_floor: None,
         }
     }
 
@@ -12181,6 +12218,7 @@ mod tests {
                 "reconciliation",
                 "recovered",
                 "renamed",
+                "request_floor",
                 "server_copied",
                 "skipped",
                 "upload_bytes",
@@ -13206,6 +13244,7 @@ mod tests {
             mtime_not_kept: 0,
             skipped: 0,
             transport: api::TransportCounters::default(),
+            request_floor: api::RequestFloorCounters::default(),
             incomplete_listings: Vec::new(),
             link_guard_unchecked: 0,
             reconciliation: None,
@@ -13774,6 +13813,7 @@ mod tests {
             mtime_not_kept: 0,
             skipped: 0,
             transport: api::TransportCounters::default(),
+            request_floor: api::RequestFloorCounters::default(),
             incomplete_listings: Vec::new(),
             link_guard_unchecked: 0,
             reconciliation: None,
@@ -13807,6 +13847,7 @@ mod tests {
                 mtime_not_kept: 0,
                 skipped: 0,
                 transport: api::TransportCounters::default(),
+                request_floor: api::RequestFloorCounters::default(),
                 incomplete_listings: Vec::new(),
                 link_guard_unchecked: 0,
                 reconciliation: None,
@@ -13930,6 +13971,7 @@ mod tests {
             mtime_not_kept: 0,
             skipped: 0,
             transport: api::TransportCounters::default(),
+            request_floor: api::RequestFloorCounters::default(),
             incomplete_listings: Vec::new(),
             link_guard_unchecked: 0,
             reconciliation: None,
@@ -15781,6 +15823,7 @@ mod status_command_tests {
             skipped: Vec::new(),
             link_guard_unchecked: 0,
             pair_index: None,
+            request_floor: None,
         }
     }
 
@@ -15885,6 +15928,7 @@ mod resync_output_tests {
             skipped: Vec::new(),
             link_guard_unchecked: 0,
             pair_index: None,
+            request_floor: None,
         }
     }
 
@@ -15993,6 +16037,7 @@ mod resync_output_tests {
             mtime_not_kept: 0,
             skipped: 0,
             transport: api::TransportCounters::default(),
+            request_floor: api::RequestFloorCounters::default(),
             incomplete_listings: Vec::new(),
             link_guard_unchecked: 0,
             reconciliation: None,

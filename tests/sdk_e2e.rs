@@ -527,6 +527,34 @@ fn the_serialised_outcome_carries_what_the_run_recovered_from() {
     ] {
         assert_eq!(document["recovered"][key], 0, "{key}: {document}");
     }
+    // The request-floor counters reach the serialised outcome too: this run's destination
+    // ancestors were read by one batched `getinfo`, and nothing fell back.
+    assert_eq!(
+        outcome.request_floor().getinfo_batch_fallbacks,
+        0,
+        "{document}"
+    );
+    for key in [
+        "session_touches_skipped",
+        "getinfo_batches",
+        "getinfo_requests_saved",
+        "getinfo_batch_fallbacks",
+        "ancestor_cache_hits",
+        "list_waves_parallel",
+        "list_folders_parallel",
+        "md5_lanes",
+        "md5_lanes_widened",
+        "md5_lanes_narrowed",
+        "dns_lookups",
+        "dns_reused",
+        "dns_pins_dropped",
+    ] {
+        assert!(document["request_floor"][key].is_u64(), "{key}: {document}");
+    }
+    assert!(
+        document["request_floor"]["getinfo_batches"].as_u64() >= Some(1),
+        "{document}"
+    );
     for key in [
         "mtime_not_kept",
         "copy_fallbacks",

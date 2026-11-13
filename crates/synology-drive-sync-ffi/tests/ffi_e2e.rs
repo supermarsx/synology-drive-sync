@@ -273,6 +273,11 @@ fn ffi_apply_executes_and_returns_reconciled_json() {
     // ADV-R-4: what the run recovered from, and the parity counters, reach FFI callers too.
     assert_eq!(result["outcome"]["recovered"]["retries"], 0, "{result}");
     assert_eq!(result["outcome"]["recovered"]["reauthentications"], 0);
+    // The request-floor counters ride on the same outcome.
+    assert!(
+        result["outcome"]["request_floor"]["getinfo_batches"].is_u64(),
+        "{result}"
+    );
     assert_eq!(
         result["outcome"]["execution"]["mtime_not_kept"], 0,
         "{result}"
