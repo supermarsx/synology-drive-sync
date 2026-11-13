@@ -1536,6 +1536,15 @@ font-size: 12px;
 line-height: 1.5;
 overflow-wrap: anywhere;
 }
+.sdsync-live-stalled {
+display: grid;
+gap: 6px;
+margin: 10px 0 0;
+}
+.sdsync-live-stalled .sdsync-button,
+.sdsync-live-stalled button {
+justify-self: start;
+}
 .sdsync-page {
 width: 100%;
 max-width: 1180px;
