@@ -5,8 +5,8 @@ use std::process::{Command, Output};
 use std::time::UNIX_EPOCH;
 
 use serde_json::{Value, json};
-use support::TestDir;
 use support::file_station_mock::{CapturedRequest, MockFileStation};
+use support::{TestDir, copy_payload};
 
 const PASSWORD: &[u8] = b"correct horse battery staple\n";
 
@@ -495,8 +495,8 @@ fn authenticated_target_doctor_checks_exact_destination_and_logs_out() {
     // ablation variants, the capability diagnosis bracketed by its two host reads, the
     // destination walk and permission check, the bounded inventory, and logout.
     //
-    // The walk's second `getinfo` is the destination's own, and it establishes that the path
-    // exists, is a directory, and is not a mount boundary. The inventory therefore opens at its
+    // The walk's single `getinfo` names every component of the destination, and it establishes
+    // that the path exists, is a directory, and is not a mount boundary. The inventory therefore opens at its
     // listing rather than repeating that request: a run against a healthy target pays for the
     // destination `getinfo` exactly once. A destination the walk did not resolve keeps the
     // inventory's own `getinfo`, which is what turns an absent path into `absent_root`.
@@ -517,7 +517,6 @@ fn authenticated_target_doctor_checks_exact_destination_and_logs_out() {
             "SYNO.FileStation.BackgroundTask.list",
             "SYNO.FileStation.Info.get",
             "SYNO.FileStation.List.getinfo",
-            "SYNO.FileStation.List.getinfo",
             "SYNO.FileStation.CheckPermission.write",
             "SYNO.FileStation.List.list",
             "SYNO.API.Auth.logout",
@@ -529,8 +528,8 @@ fn authenticated_target_doctor_checks_exact_destination_and_logs_out() {
             .iter()
             .filter(|operation| operation.as_str() == "SYNO.FileStation.List.getinfo")
             .count(),
-        2,
-        "one `getinfo` per path component, and none repeated for the inventory"
+        1,
+        "one `getinfo` naming every path component, and none repeated for the inventory"
     );
     assert_eq!(
         requests[2].fields.get("account").map(String::as_str),
@@ -2075,11 +2074,10 @@ fn additive_plan_then_sync_preserves_folder_parity_and_verifies_every_upload() {
         [
             "SYNO.API.Info.query",
             "SYNO.API.Auth.login",
-            "SYNO.FileStation.List.getinfo",
+            // One `getinfo` names every ancestor, and the inventory that follows the permission
+            // check reuses what it read instead of asking again.
             "SYNO.FileStation.List.getinfo",
             "SYNO.FileStation.CheckPermission.write",
-            "SYNO.FileStation.List.getinfo",
-            "SYNO.FileStation.List.getinfo",
             "SYNO.FileStation.List.list",
             "SYNO.API.Auth.logout",
         ]
@@ -2197,15 +2195,13 @@ fn additive_plan_then_sync_preserves_folder_parity_and_verifies_every_upload() {
         [
             "SYNO.API.Info.query",
             "SYNO.API.Auth.login",
-            "SYNO.FileStation.List.getinfo",
+            // One `getinfo` names every ancestor of the destination, and the inventory reuses it.
             "SYNO.FileStation.List.getinfo",
             "SYNO.FileStation.CheckPermission.write",
-            "SYNO.FileStation.List.getinfo",
-            "SYNO.FileStation.List.getinfo",
             "SYNO.FileStation.List.list",
-            // The session is touched once before the first mutation, so an idle timeout that
-            // expired during hashing is answered by a login rather than by a failed upload.
-            "SYNO.FileStation.List.list_share",
+            // No session touch here: the listing was answered a moment ago, which is the proof a
+            // touch exists to obtain. After a long local phase (hashing for minutes) the touch is
+            // still sent, so an idle timeout is answered by a login rather than a failed upload.
             "SYNO.FileStation.CreateFolder.create",
             "SYNO.FileStation.CreateFolder.create",
             // The destination's precondition, then the upload, then its size, then its digest
@@ -2220,7 +2216,8 @@ fn additive_plan_then_sync_preserves_folder_parity_and_verifies_every_upload() {
             "SYNO.FileStation.List.getinfo",
             "SYNO.FileStation.MD5.start",
             "SYNO.FileStation.MD5.status",
-            "SYNO.FileStation.List.getinfo",
+            // The reconciliation names every ancestor in one request again: the run may have
+            // created folders since the plan pass read them.
             "SYNO.FileStation.List.getinfo",
             "SYNO.FileStation.List.list",
             "SYNO.FileStation.List.list",
@@ -2823,18 +2820,72 @@ fn extensive_level_without_write_test_remains_non_mutating() {
 }
 
 #[test]
-fn unique_cross_parent_rename_uses_verified_server_copy_without_uploading_bytes() {
-    let fixture = TestDir::new("server-copy");
+fn a_small_cross_parent_rename_is_uploaded_without_downloading_its_old_copy() {
+    let fixture = TestDir::new("small-move");
     let source = fixture.child("source");
     fs::create_dir_all(source.join("new")).expect("create renamed source directory");
     let local_file = source.join("new/item.bin");
-    fs::write(&local_file, b"copy-me-on-nas").expect("write server-copy source file");
+    fs::write(&local_file, b"copy-me-on-nas").expect("write moved source file");
     let mtime = modified_seconds(&local_file);
     let password = fixture.write("password", PASSWORD);
     let server = MockFileStation::start();
     server.add_directory("/team/copy");
     server.add_directory("/team/copy/old");
     server.add_file("/team/copy/old/item.bin", b"copy-me-on-nas", mtime);
+
+    let source_text = source.to_str().expect("UTF-8 source path");
+    let password_text = password.to_str().expect("UTF-8 password path");
+    let sync = run(&deferral_sync_arguments(
+        source_text,
+        "/team/copy",
+        server.base_url(),
+        password_text,
+        &[],
+    ));
+    assert_success(&sync);
+    let synced = stdout_json(&sync);
+    assert_eq!(synced["result"]["uploaded"], 1);
+    assert_eq!(synced["result"]["server_copied"], 0);
+    assert_eq!(
+        server.file_contents("/team/copy/new/item.bin"),
+        Some(b"copy-me-on-nas".to_vec())
+    );
+    assert_eq!(
+        server.file_contents("/team/copy/old/item.bin"),
+        Some(b"copy-me-on-nas".to_vec()),
+        "additive mode retains the old remote path"
+    );
+    let operations = server
+        .requests()
+        .iter()
+        .map(|request| request.operation())
+        .collect::<Vec<_>>();
+    assert!(
+        !operations.iter().any(
+            |operation| operation == "SYNO.FileStation.Download.download"
+                || operation == "SYNO.FileStation.CopyMove.start"
+        ),
+        "a small move neither reads its old copy nor copies it: {operations:?}"
+    );
+}
+
+#[test]
+fn unique_cross_parent_rename_uses_verified_server_copy_without_uploading_bytes() {
+    let fixture = TestDir::new("server-copy");
+    let source = fixture.child("source");
+    fs::create_dir_all(source.join("new")).expect("create renamed source directory");
+    let local_file = source.join("new/item.bin");
+    fs::write(&local_file, copy_payload(b"copy-me-on-nas")).expect("write server-copy source file");
+    let mtime = modified_seconds(&local_file);
+    let password = fixture.write("password", PASSWORD);
+    let server = MockFileStation::start();
+    server.add_directory("/team/copy");
+    server.add_directory("/team/copy/old");
+    server.add_file(
+        "/team/copy/old/item.bin",
+        &copy_payload(b"copy-me-on-nas"),
+        mtime,
+    );
 
     let source_text = source.to_str().expect("UTF-8 source path");
     let password_text = password.to_str().expect("UTF-8 password path");
@@ -2861,7 +2912,10 @@ fn unique_cross_parent_rename_uses_verified_server_copy_without_uploading_bytes(
     assert_eq!(planned["plan"]["summary"]["uploads"], 0);
     assert_eq!(planned["plan"]["summary"]["upload_bytes"], 0);
     assert_eq!(planned["plan"]["summary"]["server_copies"], 1);
-    assert_eq!(planned["plan"]["summary"]["server_copy_fallback_bytes"], 14);
+    assert_eq!(
+        planned["plan"]["summary"]["server_copy_fallback_bytes"],
+        synology_drive_sync::plan::SERVER_COPY_MIN_BYTES
+    );
     assert_eq!(planned["plan"]["summary"]["directories"], 1);
     let copy = &planned["plan"]["actions"]["copies"][0];
     assert_eq!(copy["from_relative"], "old/item.bin");
@@ -2901,11 +2955,11 @@ fn unique_cross_parent_rename_uses_verified_server_copy_without_uploading_bytes(
     assert_eq!(synced["result"]["directories_created"], 1);
     assert_eq!(
         server.file_contents("/team/copy/new/item.bin"),
-        Some(b"copy-me-on-nas".to_vec())
+        Some(copy_payload(b"copy-me-on-nas"))
     );
     assert_eq!(
         server.file_contents("/team/copy/old/item.bin"),
-        Some(b"copy-me-on-nas".to_vec()),
+        Some(copy_payload(b"copy-me-on-nas")),
         "additive mode must retain the old remote path"
     );
 
@@ -3124,9 +3178,8 @@ allow-http = true
         "SYNO.FileStation.BackgroundTask.list",
         "SYNO.FileStation.Info.get",
         "SYNO.FileStation.List.getinfo",
-        "SYNO.FileStation.List.getinfo",
         "SYNO.FileStation.CheckPermission.write",
-        // No third `getinfo`: the walk already established that the destination exists, is a
+        // No second `getinfo`: the walk already established that the destination exists, is a
         // directory, and is not a mount boundary, so the inventory opens at its listing.
         "SYNO.FileStation.List.list",
         "SYNO.API.Auth.logout",
@@ -4742,13 +4795,17 @@ fn a_server_copy_stamped_with_the_copy_time_is_a_warning_not_a_failure() {
     let source = fixture.child("source");
     fs::create_dir_all(source.join("new")).expect("create renamed source directory");
     let local_file = source.join("new/item.bin");
-    fs::write(&local_file, b"copy-me-on-nas").expect("write server-copy source file");
+    fs::write(&local_file, copy_payload(b"copy-me-on-nas")).expect("write server-copy source file");
     let mtime = modified_seconds(&local_file);
     let password = fixture.write("password", PASSWORD);
     let server = MockFileStation::start();
     server.add_directory("/team/copy");
     server.add_directory("/team/copy/old");
-    server.add_file("/team/copy/old/item.bin", b"copy-me-on-nas", mtime);
+    server.add_file(
+        "/team/copy/old/item.bin",
+        &copy_payload(b"copy-me-on-nas"),
+        mtime,
+    );
     server.stamp_copies_with(mtime + 3_600);
 
     let source_text = source.to_str().expect("UTF-8 source path");
@@ -4766,7 +4823,7 @@ fn a_server_copy_stamped_with_the_copy_time_is_a_warning_not_a_failure() {
     assert_eq!(document["result"]["mtime_not_kept"], 1);
     assert_eq!(
         server.file_contents("/team/copy/new/item.bin"),
-        Some(b"copy-me-on-nas".to_vec())
+        Some(copy_payload(b"copy-me-on-nas"))
     );
 }
 
@@ -4778,13 +4835,17 @@ fn a_server_copy_that_finishes_with_an_error_is_uploaded_in_the_same_run() {
     let source = fixture.child("source");
     fs::create_dir_all(source.join("new")).expect("create renamed source directory");
     let local_file = source.join("new/item.bin");
-    fs::write(&local_file, b"copy-me-on-nas").expect("write server-copy source file");
+    fs::write(&local_file, copy_payload(b"copy-me-on-nas")).expect("write server-copy source file");
     let mtime = modified_seconds(&local_file);
     let password = fixture.write("password", PASSWORD);
     let server = MockFileStation::start();
     server.add_directory("/team/copy");
     server.add_directory("/team/copy/old");
-    server.add_file("/team/copy/old/item.bin", b"copy-me-on-nas", mtime);
+    server.add_file(
+        "/team/copy/old/item.bin",
+        &copy_payload(b"copy-me-on-nas"),
+        mtime,
+    );
     server.fail_next_copy_task();
 
     let source_text = source.to_str().expect("UTF-8 source path");
@@ -4802,7 +4863,7 @@ fn a_server_copy_that_finishes_with_an_error_is_uploaded_in_the_same_run() {
     assert_eq!(document["result"]["recovered"]["server_copy_fallbacks"], 1);
     assert_eq!(
         server.file_contents("/team/copy/new/item.bin"),
-        Some(b"copy-me-on-nas".to_vec())
+        Some(copy_payload(b"copy-me-on-nas"))
     );
 
     let second = run(&arguments);

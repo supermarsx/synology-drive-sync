@@ -9,8 +9,8 @@ use std::process::{Command, Stdio};
 use std::time::UNIX_EPOCH;
 
 use serde_json::{Value, json};
-use support::TestDir;
 use support::file_station_mock::MockFileStation;
+use support::{TestDir, copy_payload};
 
 const SCHEMA_TEXT: &str = include_str!("../docs/observability.schema.json");
 const DIGEST: &str = "d41d8cd98f00b204e9800998ecf8427e";
@@ -881,7 +881,7 @@ impl Scenario {
         let keep = fixture.write("source/keep.txt", b"keep");
         fixture.write("source/node", b"replacement");
         fixture.write("source/folder/new.txt", b"new");
-        let renamed = fixture.write("source/new/item.bin", b"copy-me-on-nas");
+        let renamed = fixture.write("source/new/item.bin", &copy_payload(b"copy-me-on-nas"));
 
         server.add_directory(remote);
         server.add_file(
@@ -900,7 +900,7 @@ impl Scenario {
         server.add_directory(&format!("{remote}/old"));
         server.add_file(
             &format!("{remote}/old/item.bin"),
-            b"copy-me-on-nas",
+            &copy_payload(b"copy-me-on-nas"),
             modified_seconds(&renamed),
         );
         server.add_directory(&format!("{remote}/stale"));

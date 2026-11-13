@@ -100,7 +100,9 @@ minutes, so re-authentication stopped", so a NAS or proxy that kills sessions fa
 run by name instead of looping; a failed re-login surfaces its own cause (a one-time
 code required, a changed password, a locked account) rather than a generic session error. A keepalive
 touches the session every five minutes during long plan hashing and promotion, and once before the
-first mutation.
+first mutation. A touch is skipped when a request was answered within the last minute: that answer is
+the proof the touch exists to obtain. The skip is counted (`session_touches_skipped`), and a session
+nothing has used yet is always touched.
 
 **The password is therefore held for the whole run.** Before this, a run read the password, logged
 in, and let the value go; an overnight mirror whose session expired failed after hours of work and

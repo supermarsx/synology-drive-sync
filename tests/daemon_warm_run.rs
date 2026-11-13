@@ -306,9 +306,9 @@ fn a_second_unchanged_daemon_run_reads_no_file_on_either_side() {
             "{label}: {} MD5 tasks",
             count(warm, "SYNO.FileStation.MD5.start")
         );
-        // Discovery, login, the destination's write check, a `getinfo` per folder of the
-        // destination path (six for `/home/Drive/alpha`), the index binding's File Station host
-        // and logout: eleven, whatever the tree's size.
+        // Discovery, login, one `getinfo` naming every folder of the destination path (six for
+        // `/home/Drive/alpha`), the destination's write check, the index binding's File Station
+        // host and logout: six, whatever the tree's size or the path's depth.
         let session = warm
             .iter()
             .filter(|request| {
@@ -317,7 +317,7 @@ fn a_second_unchanged_daemon_run_reads_no_file_on_either_side() {
                     && !operation.starts_with("SYNO.FileStation.MD5")
             })
             .count();
-        assert!(session <= 11, "{label}: {session} session requests");
+        assert!(session <= 6, "{label}: {session} session requests");
         assert!(
             warm.len() <= lists + session + 2 * K,
             "{label}: {} requests for {lists} listings",

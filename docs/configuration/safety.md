@@ -16,8 +16,10 @@ without sending the file to the client. The deletion and server-copy guards are 
 remote data, so they require the complete MD5, IEEE CRC32 and SHA-256 fingerprint, which DSM does not
 compute and the client obtains by streaming the file. That needs download permission, but only for
 the remote-only files a deletion would remove and the files a server-side copy would duplicate, a set
-that is empty when nothing is being deleted or copied. Include that read traffic in bandwidth,
-reverse-proxy timeout, and scheduling estimates for a first mirror run against a populated destination.
+that is empty when nothing is being deleted or copied. A server-side copy is planned only for a moved
+file of 8 MiB or more; a smaller one is uploaded and verified instead, so its old copy is never read.
+Include that read traffic in bandwidth, reverse-proxy timeout, and scheduling estimates for a first
+mirror run against a populated destination.
 
 Content correspondence is stateless. Every run rebuilds it from current local and remote state; no
 persistent path/hash database can become stale.
@@ -150,6 +152,22 @@ A `--scope` that is, or lies beneath, a NAS link is not skipped but **refused**,
 anything is listed: a scoped run never writes or deletes through a link (see
 [Partial runs, deferrals and skips](../observability.md#partial-runs-deferrals-and-skips)).
 
+`sync` and `plan` take a scope set: `--scope` may be repeated, and `--scope-shallow FOLDER` (also
+repeatable, `/` for the source root) names a folder whose direct files only are in scope. The realtime
+daemon sends one element per folder that changed. A shallow folder's subfolders are left exactly as
+they are on both sides: they are not listed, compared, created, replaced or deleted, and no
+verified-pair record beneath them is pruned. The shallow folder itself may be created and is never
+deleted, because what its subfolders hold was not read. With `--delete`, only remote-only files
+directly inside it are deletion candidates. A local file where the NAS holds such a subfolder (or
+the reverse) is the lasting `type-conflict` skip, and a whole-tree run settles it, as is a shallow
+folder that is a file on the other side; nothing in that folder is deleted. A `--scope-shallow` that
+names a file is that file alone. A path beneath a
+`--scope` is dropped, and `--scope` wins over `--scope-shallow` of the same folder. A path that
+leaves the source (`..`), a DSM-managed name, or more than 1024 paths in all is refused before
+anything runs, and a link where an element should be is refused or never followed as for a single
+scope. An element that exists on neither side is named (`scope_element_absent`); the run fails with
+`scope_not_found` only when every element is absent. `status` and `resync` take one `--scope`.
+
 A file or folder the NAS refuses by name or permission (DSM codes such as 418, 414, 407 or 105 once the
 session is proven alive) is named and left out, and its siblings continue; see
 [Partial runs, deferrals and skips](../observability.md#partial-runs-deferrals-and-skips). A refusal
@@ -170,11 +188,12 @@ mirror converges within the run rather than waiting for a later one. The counts 
 `deletes_skipped` and `kept_deletes_uploaded`.
 
 Post-run reconciliation rebuilds the plan from live state and requires it to describe no remaining
-work. It re-lists both sides in full, which is what proves nothing else moved, and verifies live every
-pair the run touched (uploaded, copied, created, renamed, deleted or deferred) plus a canary of 25
-untouched pairs. Every other pair whose local size, times, device and inode and whose NAS size and
-times are exactly what the plan pass saw keeps the digests the plan pass proved. A canary that
-disagrees makes the same pass verify every pair live and is named (`reconcile-carry-canary-mismatch`).
+work. It re-lists both sides in full, which is what proves nothing else moved, and verifies live
+every pair the run touched (uploaded, copied, created, renamed, deleted or deferred) plus a canary
+of 25 untouched pairs (2 on a run scoped below the source root with `--scope`). Every other pair
+whose local size, times, device and inode and whose NAS size and times are exactly what the plan
+pass saw keeps the digests the plan pass proved. A canary that disagrees makes the same pass verify
+every pair live and is named (`reconcile-carry-canary-mismatch`).
 What this gives up is a NAS content change during the run that leaves size, mtime and change time all
 unchanged, which a write through the kernel cannot do; when the NAS reports no change time, a
 same-size, same-mtime rewrite by another writer during the run is seen by the next run instead.

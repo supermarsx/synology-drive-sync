@@ -223,6 +223,8 @@
             "directory.created",
             "entry.deleted",
             "retry.scheduled",
+            "getinfo.batch_fallback",
+            "dns.pin_dropped",
             "cancellation.requested",
             "run.partial",
             "entry.skipped",

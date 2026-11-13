@@ -8,6 +8,24 @@ lists its own commits.
 
 ## Unreleased: the daemon is the DSM service engine
 
+- **A moved file under 8 MiB is uploaded instead of copied on the NAS.** A server-side copy first
+  downloads the old copy to prove it, then runs a copy task and checks the result, which for small
+  files took longer than sending them: a 10-file folder move went from about 40 s to about 18 s at
+  the NAS's measured 0.19 s per request. Larger moved files are still copied.
+- **`sync` and `plan` take a scope set.** `--scope` may be repeated and `--scope-shallow FOLDER`
+  names a folder whose direct files only are in scope, so a realtime run can cover the folders that
+  changed and nothing between them. Edits in `2026/03` and `2026/11` used to run over all of `2026`.
+  A shallow folder's subfolders are never listed, written, deleted or pruned from the index. See
+  [Comparison, exclusions, and deletion](configuration/safety.md).
+- **A run scoped below the source root re-verifies 2 pairs as its canary, not 25.** That covers a
+  realtime routine's runs over the folders that changed and `--scope`. Whole-tree runs, including
+  the daily full pass, still draw 25, and `--pair-index-canary` and `--reconcile-canary` still win.
+  A one-file edit in a 10-file folder no longer re-reads every file in it twice.
+- **Reconciliation no longer re-verifies every pair the index served.** The carry compared the NAS
+  clock of the run that had proved each pair with this run's start, so on a warm index every pair
+  proved more than 20 s earlier was verified live, and the run named
+  `pair-index-plan-clock-unbounded` with advice to check the NAS's time. Only a NAS clock ahead of
+  this host's is now refused.
 - **A shell-engine start no longer fails at random with `committed services failed to publish final
   readiness`.** The API service and the controller each read the start lease (`controller.starting`)
   while the lifecycle script commits it by renaming a new file over it. A read that landed in that

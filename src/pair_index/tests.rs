@@ -746,7 +746,7 @@ fn a_canary_disagreement_discards_the_whole_index_and_is_named() {
     );
     session.conclude(&report);
     assert!(session.clear);
-    let report = session.commit(Some(&fresh_local), None, true);
+    let report = session.commit(Some(&fresh_local), None, &crate::plan::Scope::root());
     assert_eq!(report.canary_mismatches, 1);
     let issue = report
         .issues
@@ -779,7 +779,7 @@ fn a_discarded_index_is_rebuilt_from_this_runs_live_evidence() {
         at(OLD),
         at(OLD),
     );
-    let report = session.commit(Some(&local), None, true);
+    let report = session.commit(Some(&local), None, &crate::plan::Scope::root());
     // What the index holds after the commit, for the status `index:` line.
     assert_eq!(report.entries, Some(1));
     let index = shared.borrow();
@@ -845,7 +845,7 @@ fn the_commit_removes_touched_and_stale_pairs_and_keeps_served_evidence_untouche
     assert_eq!(vouched.served.len(), 2);
     let mut touched = TouchedPaths::default();
     touched.insert("uploaded.jpg");
-    let report = session.commit(Some(&local), Some(&touched), true);
+    let report = session.commit(Some(&local), Some(&touched), &crate::plan::Scope::root());
     assert_eq!(report.removed, 2);
     let index = shared.borrow();
     assert_eq!(index.pairs.keys().collect::<Vec<_>>(), vec!["kept.jpg"]);
@@ -863,8 +863,37 @@ fn a_scoped_run_never_sweeps_records_outside_what_it_walked() {
         at(NOW),
     );
     let (local, _) = tree(&[("in/a.jpg", facts(), None)]);
-    session.commit(Some(&local), None, false);
+    session.commit(
+        Some(&local),
+        None,
+        &crate::plan::Scope::parse("in").unwrap(),
+    );
     assert_eq!(shared.borrow().pairs.len(), 2);
+}
+
+/// A shallow element walked its folder's files and nothing beneath: a record there whose file is
+/// gone is pruned, one a level deeper never is, however absent it looks from this run.
+#[test]
+fn a_shallow_scope_prunes_its_direct_children_and_nothing_deeper() {
+    let index = proven(&[
+        ("in/gone.jpg", facts()),
+        ("in/deep/gone.jpg", facts()),
+        ("in/kept.jpg", facts()),
+        ("out/gone.jpg", facts()),
+    ]);
+    let shared = std::rc::Rc::new(std::cell::RefCell::new(index));
+    let session = IndexSession::open(
+        Box::new(SharedIndex(shared.clone())),
+        binding(),
+        options(0),
+        at(NOW),
+    );
+    let (local, _) = tree(&[("in/kept.jpg", facts(), None)]);
+    let scope = crate::plan::Scope::from_parts(&[], &["in".to_owned()]).unwrap();
+    session.commit(Some(&local), None, &scope);
+    let mut left: Vec<String> = shared.borrow().pairs.keys().cloned().collect();
+    left.sort();
+    assert_eq!(left, ["in/deep/gone.jpg", "in/kept.jpg", "out/gone.jpg"]);
 }
 
 /// A store that fails (a full disk) is a named warning, and the previous evidence stays.
@@ -893,7 +922,7 @@ fn a_failed_store_is_named_and_keeps_the_previous_evidence() {
         at(OLD),
         at(OLD),
     );
-    let report = session.commit(Some(&local), None, true);
+    let report = session.commit(Some(&local), None, &crate::plan::Scope::root());
     assert_eq!(report.issues[0].code, "pair-index-store-failed");
     assert_eq!(report.stored, 0);
     assert_eq!(shared.borrow().pairs, before);
@@ -939,7 +968,7 @@ fn an_unreadable_index_serves_nothing_and_writes_nothing() {
         at(OLD),
         at(OLD),
     );
-    let report = session.commit(Some(&local), None, true);
+    let report = session.commit(Some(&local), None, &crate::plan::Scope::root());
     assert_eq!(report.state, IndexState::Unusable);
     assert_eq!(report.issues[0].code, "pair-index-corrupt");
 }
@@ -1145,7 +1174,7 @@ fn evidence_set_aside_mid_read_serves_nothing_and_the_commit_starts_from_empty()
     );
     assert_eq!(session.report.state, IndexState::Cold);
     assert!(session.clear);
-    let report = session.commit(Some(&local), None, true);
+    let report = session.commit(Some(&local), None, &crate::plan::Scope::root());
     assert_eq!(report.state, IndexState::Cold);
     assert_eq!(shared.borrow().commits, 1);
 }

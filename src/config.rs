@@ -347,8 +347,10 @@ pub struct ResolvedSyncBehavior {
     pub compare: CompareArg,
     pub jobs: u8,
     pub excludes: Vec<String>,
-    /// Source-relative restriction naming one folder or file. Command line only.
-    pub scope: Option<String>,
+    /// Source-relative restriction: recursive paths (`--scope`). Command line only.
+    pub scope: Vec<String>,
+    /// Folders whose direct children only are in scope (`--scope-shallow`). Command line only.
+    pub scope_shallow: Vec<String>,
     /// Re-upload every in-scope file without comparing it.
     ///
     /// Set only by the `resync` command, and only for a run whose plan the caller has already
@@ -799,6 +801,11 @@ fn resolve_behavior(
     }
     let mut excludes = profile.excludes.clone();
     excludes.extend(arguments.excludes.iter().cloned());
+    // A set that is not exactly the whole tree draws the scoped canary. An invalid one fails the
+    // run when it is resolved, so its canary never matters.
+    let whole_tree =
+        synology_drive_sync::plan::Scope::from_parts(&arguments.scope, &arguments.scope_shallow)
+            .map_or(true, |scope| scope.is_root());
     Ok(ResolvedSyncBehavior {
         compare: arguments
             .compare
@@ -809,20 +816,21 @@ fn resolve_behavior(
         // Deliberately never read from a profile: a persisted scope would silently sync a subset
         // on every later run, and the omission would be invisible in the output.
         scope: arguments.scope.clone(),
+        scope_shallow: arguments.scope_shallow.clone(),
         // Never resolved from arguments or a profile. `resync` sets it on the settings it has
         // already planned and had confirmed; nothing else can reach it.
         force_resync: false,
         reconcile: arguments.reconcile.unwrap_or_default(),
         reconcile_canary: arguments
             .reconcile_canary
-            .unwrap_or(synology_drive_sync::digest_evidence::DEFAULT_CANARY),
+            .unwrap_or_else(|| synology_drive_sync::digest_evidence::default_canary(whole_tree)),
         memory_budget_mib: arguments.memory_budget,
         pair_index: arguments.pair_index.clone(),
         pair_index_refresh: arguments.pair_index_refresh,
         pair_index_max_age_days: arguments.pair_index_max_age.unwrap_or(30),
         pair_index_canary: arguments
             .pair_index_canary
-            .unwrap_or(synology_drive_sync::digest_evidence::DEFAULT_CANARY),
+            .unwrap_or_else(|| synology_drive_sync::digest_evidence::default_canary(whole_tree)),
         pair_index_cache_mib: arguments.pair_index_cache_mib.unwrap_or(8),
     })
 }
@@ -2272,7 +2280,8 @@ mod scope_and_force_tests {
             compare: None,
             jobs: None,
             excludes: Vec::new(),
-            scope: None,
+            scope: Vec::new(),
+            scope_shallow: Vec::new(),
             reconcile: None,
             reconcile_canary: None,
             memory_budget: None,
@@ -2289,18 +2298,18 @@ mod scope_and_force_tests {
         let resolved = resolve_behavior(
             &Profile::default(),
             &SyncBehaviorArgs {
-                scope: Some("docs/q3".to_owned()),
+                scope: vec!["docs/q3".to_owned()],
                 ..behavior_args()
             },
         )
         .unwrap();
-        assert_eq!(resolved.scope.as_deref(), Some("docs/q3"));
+        assert_eq!(resolved.scope, ["docs/q3"]);
     }
 
     #[test]
     fn a_scope_defaults_to_absent_so_a_run_covers_the_whole_tree() {
         let resolved = resolve_behavior(&Profile::default(), &behavior_args()).unwrap();
-        assert_eq!(resolved.scope, None);
+        assert!(resolved.scope.is_empty() && resolved.scope_shallow.is_empty());
     }
 
     #[test]

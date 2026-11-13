@@ -2005,7 +2005,7 @@ fn run_resync(
     settings.safety.delete = false;
     settings.behavior.force_resync = true;
 
-    let scope = resolved_scope(&settings)?;
+    let scope = resolved_single_scope(&settings, "resync")?;
     let cancellation = attach_progress_record(install_cancellation_handler()?, record, "resync");
     let plan_only = arguments.confirm.is_none();
 
@@ -2182,7 +2182,7 @@ fn resync_value(
     json!({
         "schema": "sdsync.resync.v1",
         "kind": if ticket.is_some() { "plan" } else { "completion" },
-        "scope": scope.as_str(),
+        "scope": scope.label(),
         "confirmed": completion.is_some(),
         "stale_ticket": stale,
         "ticket": ticket,
@@ -2219,7 +2219,7 @@ fn run_status(
         attach_progress_record(install_cancellation_handler()?, record, "sync-status");
     warn_for_insecure_network(&settings.network, &settings.output);
 
-    let scope = resolved_scope(&settings)?;
+    let scope = resolved_single_scope(&settings, "sync-status")?;
     let root = RemoteRoot::parse(&settings.remote)?;
     let rules = IgnoreRules::build(&settings.source, &settings.behavior.excludes)?;
     let compare = compare_mode(settings.behavior.compare);
@@ -3044,7 +3044,12 @@ fn prepare_and_run_sync_reporting(
 
         // Before any digest is computed and before anything is planned: a scope that names nothing is
         // not a plan with no work in it.
-        require_scope_present(&scope, &local, &remote)?;
+        // Asked of what the walks found, before confinement can set an element aside.
+        let absent = require_scope_present(&scope, &local, &remote)?;
+        warn_absent_scope_elements(&settings.output, &absent);
+        // A shallow element's child directories leave both inventories before anything is
+        // compared: nothing beneath them was listed.
+        scope.confine(&mut local, &mut remote);
         // A scoped walk cannot see a second spelling of the scope on the NAS.
         sync::withhold_scope_spelling_conflicts(&root, &scope, &mut local, &remote, |folder| {
             let listed = client.list_child_names(folder, cancellation)?;
@@ -3133,7 +3138,7 @@ fn prepare_and_run_sync_reporting(
             warn_deferred(&settings.output, &deferred);
             // A plan's digests are live evidence: storing them warms the next run.
             if let Some(session) = index_session.take() {
-                index_report = Some(session.commit(Some(&local), None, scope.is_root()));
+                index_report = Some(session.commit(Some(&local), None, &scope));
             }
             return Ok(());
         }
@@ -3167,7 +3172,7 @@ fn prepare_and_run_sync_reporting(
             // that one verifies work that actually happened, which is the case it exists for.
             cancellation.check()?;
             if let Some(session) = index_session.take() {
-                index_report = Some(session.commit(Some(&local), None, scope.is_root()));
+                index_report = Some(session.commit(Some(&local), None, &scope));
             }
             let issues = count_keeps_changing(
                 unsettled_path.as_deref(),
@@ -3370,7 +3375,7 @@ fn prepare_and_run_sync_reporting(
         completion.add_deferred(verdict.deferred);
         cancellation.check()?;
         if let Some(session) = index_session.take() {
-            index_report = Some(session.commit(Some(&local), Some(&touched), scope.is_root()));
+            index_report = Some(session.commit(Some(&local), Some(&touched), &scope));
         }
         let issues = count_keeps_changing(
             unsettled_path.as_deref(),
@@ -3398,7 +3403,7 @@ fn prepare_and_run_sync_reporting(
                 session.commit_after_failure(
                     Some(&local),
                     touched.as_ref(),
-                    scope.is_root(),
+                    &scope,
                     EventReason::of(error).as_str(),
                 )
             }
@@ -3996,6 +4001,8 @@ fn build_reconciliation_plan(
     // The same shape check as the run's own walk: a reconciliation built on misread real paths
     // would excuse or blame the wrong entries (G-3).
     sync::check_link_boundaries(&remote, &scanned.link_checks)?;
+    // Confined exactly as the plan pass was: reconciliation must judge the same set.
+    run_options.scope.confine(&mut local, &mut remote);
     cancellation.check()?;
     // The run's own digest pass and per-path deferral. Deliberately no promotion: a
     // reconciliation plan is only ever inspected by `ensure_reconciled` and is never executed, so
@@ -8000,6 +8007,17 @@ fn observation_event(observation: ApiObservation) -> LogEvent {
             };
             LogEvent::new(level, code).call(call)
         }
+        // Named once each, at the level a user running at the default sees. Neither carries a
+        // host or a WebAPI path, which no record below DEBUG may (docs/observability.md): the
+        // first names the refused call by API, method and DSM code, the second names the class of
+        // the failure. The endpoint is in the DEBUG connection record of the same run.
+        ApiObservation::GetinfoBatchFallback(call) => {
+            LogEvent::new(EventLogLevel::Info, EventCode::GetinfoBatchFallback).call(call)
+        }
+        ApiObservation::DnsPinDropped => {
+            LogEvent::new(EventLogLevel::Info, EventCode::DnsPinDropped)
+                .reason(EventReason::Network)
+        }
     }
 }
 
@@ -8864,7 +8882,7 @@ fn write_plan_scope_notice<W: Write>(
         writeln!(
             writer,
             "Scoped to {:?}: entries outside it were neither compared nor modified, and the check for paths differing only by letter case covered this scope alone.",
-            scope.as_str()
+            scope.label()
         )
         .map_err(output_error)?;
     }
@@ -9252,7 +9270,7 @@ fn write_status_human_to<W: Write>(
     let target = if scope.is_root() {
         "the whole tree".to_owned()
     } else {
-        format!("{:?}", scope.as_str())
+        format!("{:?}", scope.label())
     };
     let stats = &page.stats;
     let qualifier = if stats.complete { "" } else { " at least" };
@@ -10681,27 +10699,61 @@ fn warn_for_insecure_network(network: &config::ResolvedNetwork, output: &config:
 ///
 /// Deliberately not called from `build_reconciliation_plan`. That pass is built after execution and
 /// is only ever asked whether it is empty; it must not be able to refuse.
+///
+/// A scope set is refused only when every element names nothing. An element absent on both sides
+/// is normal for a realtime run (the folder that changed was deleted on both since): it is
+/// returned, so the run names it, and the rest of the set syncs.
 fn require_scope_present(
     scope: &plan::Scope,
     local: &local::LocalInventory,
     remote: &api::RemoteInventory,
-) -> Result<()> {
-    if scope.is_root()
-        || local.entries.contains_key(scope.as_str())
-        || remote.entries.contains_key(scope.as_str())
-    {
-        Ok(())
-    } else {
-        Err(Error::ScopeNotFound(scope.as_str().to_owned()))
+) -> Result<Vec<String>> {
+    if scope.is_root() {
+        return Ok(Vec::new());
+    }
+    let absent: Vec<String> = scope
+        .elements()
+        .iter()
+        .map(|element| element.path.as_str())
+        .filter(|path| {
+            !path.is_empty()
+                && !local.entries.contains_key(*path)
+                && !remote.entries.contains_key(*path)
+        })
+        .map(str::to_owned)
+        .collect();
+    if absent.len() == scope.elements().len() {
+        return Err(Error::ScopeNotFound(scope.label().into_owned()));
+    }
+    Ok(absent)
+}
+
+/// Name, once each, the elements of a scope set that are on neither side.
+fn warn_absent_scope_elements(output: &config::ResolvedOutput, absent: &[String]) {
+    if output.quiet {
+        return;
+    }
+    for path in absent {
+        eprintln!("note: scope_element_absent: {path:?} is on neither side; nothing to sync there");
     }
 }
 
 /// The scope a run is restricted to, or the whole tree when none was given.
 fn resolved_scope(settings: &config::ResolvedSync) -> Result<plan::Scope> {
-    match settings.behavior.scope.as_deref() {
-        Some(value) => plan::Scope::parse(value),
-        None => Ok(plan::Scope::root()),
+    plan::Scope::from_parts(&settings.behavior.scope, &settings.behavior.scope_shallow)
+}
+
+/// [`resolved_scope`] for a command that takes one path (`status`, `resync`): a scope set is
+/// refused by name rather than read as its first element.
+fn resolved_single_scope(settings: &config::ResolvedSync, command: &str) -> Result<plan::Scope> {
+    let scope = resolved_scope(settings)?;
+    if scope.single().is_none() {
+        return Err(Error::Configuration(format!(
+            "{command} takes one --scope path, not a set ({}); --scope-shallow and a repeated              --scope are for sync and plan",
+            scope.describe()
+        )));
     }
+    Ok(scope)
 }
 
 /// The comparison a run actually plans with.
@@ -10818,6 +10870,38 @@ mod tests {
     use synology_drive_sync::api::{DiscoveredApi, SessionChannels};
 
     use super::*;
+
+    /// The two request-floor changes are named once each at `info`, with a reason and with no
+    /// host or WebAPI path, which nothing below `debug` may carry.
+    #[test]
+    fn the_request_floor_observations_become_named_info_lines_without_host_or_path() {
+        use synology_drive_sync::observability::{
+            ApiCallDetail, BoundedText, RequestOutcome, RequestTransport,
+        };
+
+        let mut call = ApiCallDetail::started(
+            "SYNO.FileStation.List",
+            "getinfo",
+            2,
+            BoundedText::sanitized(""),
+            RequestTransport::Form,
+        );
+        call.outcome = RequestOutcome::DsmError;
+        call.dsm_code = Some(400);
+        let fallback = observation_event(ApiObservation::GetinfoBatchFallback(call));
+        assert_eq!(fallback.code, EventCode::GetinfoBatchFallback);
+        assert_eq!(fallback.level, EventLogLevel::Info);
+        let recorded = fallback.call.expect("the refused call rides on the event");
+        assert_eq!(recorded.dsm_code, Some(400));
+        assert_eq!(recorded.route.as_str(), "");
+        assert!(fallback.connection.is_none() && fallback.path.is_none());
+
+        let dropped = observation_event(ApiObservation::DnsPinDropped);
+        assert_eq!(dropped.code, EventCode::DnsPinDropped);
+        assert_eq!(dropped.level, EventLogLevel::Info);
+        assert_eq!(dropped.reason, Some(EventReason::Network));
+        assert!(dropped.connection.is_none() && dropped.call.is_none() && dropped.path.is_none());
+    }
 
     fn json_object_keys(value: &Value) -> BTreeSet<&str> {
         value
@@ -10996,7 +11080,8 @@ mod tests {
                 compare: cli::CompareArg::Content,
                 jobs: 2,
                 excludes: Vec::new(),
-                scope: None,
+                scope: Vec::new(),
+                scope_shallow: Vec::new(),
                 force_resync: false,
                 reconcile: cli::ReconcileArg::Carry,
                 reconcile_canary: synology_drive_sync::digest_evidence::DEFAULT_CANARY,
@@ -14225,7 +14310,7 @@ mod tests {
         assert!(options.delete);
         assert!(options.server_copy);
         assert_eq!(options.compare, CompareMode::Metadata);
-        assert_eq!(options.scope.as_str(), "docs");
+        assert_eq!(options.scope.single(), Some("docs"));
 
         // A run that was not deleting does not start now.
         settings.safety.delete = false;
@@ -15226,7 +15311,8 @@ mod status_command_tests {
                 compare: cli::CompareArg::Content,
                 jobs: 2,
                 excludes: Vec::new(),
-                scope: None,
+                scope: Vec::new(),
+                scope_shallow: Vec::new(),
                 force_resync: false,
                 reconcile: cli::ReconcileArg::Carry,
                 reconcile_canary: synology_drive_sync::digest_evidence::DEFAULT_CANARY,
@@ -15315,14 +15401,14 @@ mod status_command_tests {
     #[test]
     fn a_configured_scope_is_parsed_and_normalized() {
         let mut settings = sync_settings();
-        settings.behavior.scope = Some("/docs/q3/".to_owned());
-        assert_eq!(resolved_scope(&settings).unwrap().as_str(), "docs/q3");
+        settings.behavior.scope = vec!["/docs/q3/".to_owned()];
+        assert_eq!(resolved_scope(&settings).unwrap().single(), Some("docs/q3"));
     }
 
     #[test]
     fn an_unsafe_scope_is_rejected_before_any_scan() {
         let mut settings = sync_settings();
-        settings.behavior.scope = Some("../escape".to_owned());
+        settings.behavior.scope = vec!["../escape".to_owned()];
         assert!(resolved_scope(&settings).is_err());
     }
 

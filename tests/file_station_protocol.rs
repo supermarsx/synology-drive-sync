@@ -15,8 +15,8 @@ use std::process::{Command, Output};
 use std::time::Duration;
 
 use serde_json::Value;
-use support::TestDir;
 use support::file_station_mock::MockFileStation;
+use support::{TestDir, copy_payload};
 use synology_drive_sync::api::{
     ApiClient, ClientOptions, LINKED_ENTRY_MOUNT_TYPE, RemoteSkipReason,
 };
@@ -700,7 +700,7 @@ fn a_transient_502_on_post_copy_verification_is_retried() {
     let source = directory.child("source");
     fs::create_dir_all(source.join("new")).unwrap();
     let local = source.join("new/item.bin");
-    fs::write(&local, b"copy-me-on-nas").unwrap();
+    fs::write(&local, copy_payload(b"copy-me-on-nas")).unwrap();
     let mtime = fs::metadata(&local)
         .unwrap()
         .modified()
@@ -717,7 +717,11 @@ fn a_transient_502_on_post_copy_verification_is_retried() {
     let server = MockFileStation::start();
     server.add_directory("/team/p2c");
     server.add_directory("/team/p2c/old");
-    server.add_file("/team/p2c/old/item.bin", b"copy-me-on-nas", mtime);
+    server.add_file(
+        "/team/p2c/old/item.bin",
+        &copy_payload(b"copy-me-on-nas"),
+        mtime,
+    );
     server.fail_http_after_operation(
         "SYNO.FileStation.CopyMove.status",
         "SYNO.FileStation.List.getinfo",
@@ -746,7 +750,9 @@ fn a_transient_502_on_post_copy_verification_is_retried() {
     assert_eq!(count(&server, "SYNO.FileStation.CopyMove.start"), 1);
     assert_eq!(
         text(&server, "/team/p2c/new/item.bin").as_deref(),
-        Some("copy-me-on-nas")
+        String::from_utf8(copy_payload(b"copy-me-on-nas"))
+            .ok()
+            .as_deref()
     );
     assert_eq!(server.pending_faults(), 0, "the fault was reached");
     let document = result_document(&output);

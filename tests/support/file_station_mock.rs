@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
@@ -39,6 +39,11 @@ struct FileNode {
     crtime_seconds: i64,
 }
 
+/// Seconds the mock's clock stands from this host's: a NAS whose clock is off, read by its `Date`
+/// header and the change times it stamps alike. Process-wide, so only a test binary of its own
+/// (`tests/reconcile_clock.rs`) moves it; every other binary keeps 0.
+static CLOCK_OFFSET_SECONDS: AtomicI64 = AtomicI64::new(0);
+
 /// The mock's clock, in Unix seconds, as its `Date` header and change times read it.
 fn mock_now_seconds() -> i64 {
     i64::try_from(
@@ -48,6 +53,7 @@ fn mock_now_seconds() -> i64 {
             .as_secs(),
     )
     .expect("seconds fit i64")
+        + CLOCK_OFFSET_SECONDS.load(Ordering::SeqCst)
 }
 
 impl FileNode {
@@ -402,6 +408,13 @@ impl MockFileStation {
             .expect("mock state lock")
             .list_disabled_directories
             .insert(path.to_owned());
+    }
+
+    /// Set the clock of every mock in this process `seconds` from this host's (negative: behind).
+    /// See [`CLOCK_OFFSET_SECONDS`]: a test binary that moves it runs alone.
+    #[allow(dead_code)]
+    pub fn set_process_clock_offset(seconds: i64) {
+        CLOCK_OFFSET_SECONDS.store(seconds, Ordering::SeqCst);
     }
 
     pub fn add_file(&self, path: &str, contents: &[u8], mtime_seconds: i64) {
@@ -1046,6 +1059,17 @@ fn serve_connection(mut stream: TcpStream, state: &Arc<Mutex<ServerState>>, shut
 }
 
 /// Answer one request, and say whether the connection stays open for another.
+/// `SDSYNC_MOCK_LATENCY_MS`, read once: how long every request waits before it is served.
+fn injected_latency() -> Duration {
+    static LATENCY: std::sync::OnceLock<Duration> = std::sync::OnceLock::new();
+    *LATENCY.get_or_init(|| {
+        std::env::var("SDSYNC_MOCK_LATENCY_MS")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .map_or(Duration::ZERO, Duration::from_millis)
+    })
+}
+
 fn handle_connection(
     stream: &mut TcpStream,
     state: &Arc<Mutex<ServerState>>,
@@ -1061,6 +1085,12 @@ fn handle_connection(
         }
         None => return false,
     };
+    // Off unless a timing is being taken: a round trip with a NAS-shaped delay in it, served
+    // outside the state lock so concurrent requests overlap as they would against a real NAS.
+    let latency = injected_latency();
+    if !latency.is_zero() {
+        thread::sleep(latency);
+    }
     let client_closes = headers
         .get("connection")
         .is_some_and(|value| value.eq_ignore_ascii_case("close"));
@@ -1299,11 +1329,12 @@ fn route_request(
             success(json!({"total": total, "shares": shares}))
         }
         ("SYNO.FileStation.List", "getinfo") => {
-            let path = first_json_string(fields.get("path"));
+            let paths = json_strings(fields.get("path"));
+            let path = paths.first().cloned();
             if let Some(index) = state
                 .getinfo_faults
                 .iter()
-                .position(|fault| Some(&fault.path) == path.as_ref())
+                .position(|fault| paths.contains(&fault.path))
             {
                 let fault = state.getinfo_faults.remove(index);
                 if let Some((contents, mtime_seconds)) = fault.change_to {
@@ -1317,6 +1348,18 @@ fn route_request(
                 };
             }
             let real_path = wants_real_path(fields);
+            if paths.len() > 1 {
+                // As DSM answers a call naming several paths: the envelope succeeds and each path
+                // is described, or carries its own `408`, in the order asked.
+                let files: Vec<Value> = paths
+                    .iter()
+                    .map(|path| {
+                        listed_node(state, path, real_path)
+                            .unwrap_or_else(|| json!({"code": 408, "path": path}))
+                    })
+                    .collect();
+                return success(json!({"files": files}));
+            }
             match path.and_then(|path| listed_node(state, &path, real_path)) {
                 Some(node) => success(json!({"files": [node]})),
                 None => api_error(408),
@@ -2307,6 +2350,12 @@ fn hex(value: u8) -> Option<u8> {
 
 fn json_string(value: Option<&String>) -> Option<String> {
     serde_json::from_str::<String>(value?).ok()
+}
+
+fn json_strings(value: Option<&String>) -> Vec<String> {
+    value
+        .and_then(|value| serde_json::from_str::<Vec<String>>(value).ok())
+        .unwrap_or_default()
 }
 
 fn first_json_string(value: Option<&String>) -> Option<String> {

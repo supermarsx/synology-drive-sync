@@ -38,7 +38,32 @@ impl CompareMode {
     }
 }
 
-/// A source-relative restriction naming either one directory subtree or one single file.
+/// The most elements a scope set may hold: the daemon's dirty-directory cap, past which it syncs
+/// the whole tree instead.
+pub const MAX_SCOPE_ELEMENTS: usize = 1024;
+
+/// How deep one element of a [`Scope`] reaches.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub enum ScopeDepth {
+    /// The folder's direct children only (`--scope-shallow`). A child *directory* is not in scope:
+    /// its contents are never listed, so nothing may be decided about it, not even whether to
+    /// delete or replace it. Neither is the folder itself, for the same reason: it is walked and
+    /// listed like an ancestor, and may be created, never deleted.
+    Shallow,
+    /// The path and everything beneath it (`--scope`).
+    Recursive,
+}
+
+/// One element of a [`Scope`]: a source-relative path and how deep it reaches.
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct ScopeElement {
+    pub path: String,
+    pub depth: ScopeDepth,
+}
+
+/// A source-relative restriction: a set of folders or files, each either a whole subtree or one
+/// folder's direct children (perf-design section 2). A single recursive element is the original
+/// scope: one directory subtree, or one single file.
 ///
 /// The same prefix predicate covers both: a file's relative path simply has no descendants. This
 /// is what makes "resync exactly this file" expressible, which pointing the source and destination
@@ -46,84 +71,308 @@ impl CompareMode {
 ///
 /// Deliberately not a glob. A pattern language here would inherit the fragility that rules out
 /// building a UI action on gitignore negation.
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub struct Scope(String);
+///
+/// Normalised on construction, so two spellings of one set compare equal: elements are sorted, a
+/// path at or beneath a recursive element is dropped (recursive wins), duplicates collapse, and a
+/// recursive root is the whole tree. Never empty.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Scope(Vec<ScopeElement>);
+
+impl Default for Scope {
+    fn default() -> Self {
+        Self::root()
+    }
+}
+
+/// Whether `relative` is `path` or lies beneath it, `/`-delimited (`""` holds everything).
+fn within(path: &str, relative: &str) -> bool {
+    path.is_empty()
+        || relative == path
+        || relative
+            .strip_prefix(path)
+            .is_some_and(|rest| rest.starts_with('/'))
+}
+
+/// Whether `relative` is a strict ancestor of `path` (`""` is an ancestor of every other path).
+fn strictly_above(relative: &str, path: &str) -> bool {
+    if path.is_empty() || relative == path {
+        return false;
+    }
+    relative.is_empty()
+        || path
+            .strip_prefix(relative)
+            .is_some_and(|rest| rest.starts_with('/'))
+}
+
+/// The parent of a relative path (`""` for a top-level name).
+fn parent_of(relative: &str) -> &str {
+    relative.rsplit_once('/').map_or("", |(parent, _)| parent)
+}
 
 impl Scope {
     /// The unrestricted scope: the whole tree.
     pub fn root() -> Self {
-        Self(String::new())
+        Self(vec![ScopeElement {
+            path: String::new(),
+            depth: ScopeDepth::Recursive,
+        }])
     }
 
-    /// Normalize and validate a caller-supplied scope.
-    ///
-    /// Accepts the same shape as any other relative path in this codebase, so a scope can never
-    /// name something the planner would refuse to map. Surrounding slashes are trimmed for
-    /// convenience; everything else that `validate_relative` rejects is rejected here.
+    /// Normalize and validate one caller-supplied recursive scope.
     pub fn parse(value: &str) -> Result<Self> {
-        let trimmed = value.trim_matches('/');
-        if trimmed.is_empty() {
+        Self::from_parts(&[value.to_owned()], &[])
+    }
+
+    /// The set `--scope` (recursive) and `--scope-shallow` name, validated and normalised. Both
+    /// empty is the whole tree.
+    pub fn from_parts(recursive: &[String], shallow: &[String]) -> Result<Self> {
+        let count = recursive.len().saturating_add(shallow.len());
+        if count > MAX_SCOPE_ELEMENTS {
+            return Err(Error::Configuration(format!(
+                "a run takes at most {MAX_SCOPE_ELEMENTS} --scope and --scope-shallow paths, not \
+                 {count}; sync the whole tree instead"
+            )));
+        }
+        if count == 0 {
             return Ok(Self::root());
         }
-        if trimmed.contains('\\') {
-            return Err(Error::Configuration(format!(
-                "scope {value:?} must use forward slashes, not backslashes"
-            )));
+        let mut elements = Vec::with_capacity(count);
+        for (values, depth) in [
+            (recursive, ScopeDepth::Recursive),
+            (shallow, ScopeDepth::Shallow),
+        ] {
+            for value in values {
+                elements.push(ScopeElement {
+                    path: validated_scope_path(value)?,
+                    depth,
+                });
+            }
         }
-        validate_relative(trimmed)?;
-        if trimmed.split('/').any(|part| part == "." || part == "..") {
-            return Err(Error::Configuration(format!(
-                "scope {value:?} must not contain . or .. components"
-            )));
-        }
-        if is_dsm_managed(trimmed) {
-            return Err(Error::Configuration(format!(
-                "scope {value:?} names a DSM-managed directory, which is never synchronized"
-            )));
-        }
-        Ok(Self(trimmed.to_owned()))
+        Ok(Self::normalised(elements))
     }
 
-    pub fn as_str(&self) -> &str {
+    fn normalised(mut elements: Vec<ScopeElement>) -> Self {
+        elements.sort();
+        elements.dedup();
+        let recursive: Vec<String> = elements
+            .iter()
+            .filter(|element| element.depth == ScopeDepth::Recursive)
+            .map(|element| element.path.clone())
+            .collect();
+        if recursive.iter().any(String::is_empty) {
+            return Self::root();
+        }
+        elements.retain(|element| {
+            !recursive.iter().any(|path| {
+                within(path, &element.path)
+                    && !(element.depth == ScopeDepth::Recursive && *path == element.path)
+            })
+        });
+        Self(elements)
+    }
+
+    /// The set's elements, sorted.
+    pub fn elements(&self) -> &[ScopeElement] {
         &self.0
     }
 
-    pub fn is_root(&self) -> bool {
-        self.0.is_empty()
+    /// The one recursive path this scope is, when it is exactly one (`""` for the root). The
+    /// commands that take a single scope (`status`, `resync`) refuse anything else.
+    pub fn single(&self) -> Option<&str> {
+        match self.0.as_slice() {
+            [
+                ScopeElement {
+                    path,
+                    depth: ScopeDepth::Recursive,
+                },
+            ] => Some(path),
+            _ => None,
+        }
     }
 
-    /// Whether `relative` is the scope itself or lies beneath it.
+    /// The scope as one line for output: `docs`, or `2026/03 (shallow), 2026/11`.
+    pub fn describe(&self) -> String {
+        self.0
+            .iter()
+            .map(|element| match element.depth {
+                ScopeDepth::Recursive if element.path.is_empty() => "/".to_owned(),
+                ScopeDepth::Recursive => element.path.clone(),
+                ScopeDepth::Shallow if element.path.is_empty() => "/ (shallow)".to_owned(),
+                ScopeDepth::Shallow => format!("{} (shallow)", element.path),
+            })
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+
+    /// The single path where there is one (`""` for the root, so existing records and tickets
+    /// keep their spelling), and [`Self::describe`] otherwise.
+    pub fn label(&self) -> Cow<'_, str> {
+        match self.single() {
+            Some(path) => Cow::Borrowed(path),
+            None => Cow::Owned(self.describe()),
+        }
+    }
+
+    pub fn is_root(&self) -> bool {
+        self.single() == Some("")
+    }
+
+    /// Whether a *file* at `relative` is in scope: beneath a recursive element, or a direct child
+    /// of a shallow one (or the shallow element itself, when it names a file). Status listings and
+    /// the index's prune ask this; a decision about a directory asks [`Self::contains`].
     ///
     /// The comparison is `/`-delimited, so a scope of `docs` matches `docs/a` but never `docsets`.
     pub fn matches(&self, relative: &str) -> bool {
-        if self.is_root() {
-            return true;
-        }
-        if relative == self.0 {
-            return true;
-        }
-        relative
-            .strip_prefix(&self.0)
-            .is_some_and(|rest| rest.starts_with('/'))
+        self.0.iter().any(|element| match element.depth {
+            ScopeDepth::Recursive => within(&element.path, relative),
+            ScopeDepth::Shallow => {
+                relative == element.path
+                    || (!relative.is_empty() && parent_of(relative) == element.path)
+            }
+        })
     }
 
-    /// Whether `relative` is a strict ancestor directory of the scope.
+    /// Whether an entry of this kind at `relative` is in scope: may be compared, written,
+    /// replaced or deleted. A file is in scope by [`Self::matches`]. A directory only beneath a
+    /// recursive element: a shallow element's child directories and the shallow folder itself
+    /// were never listed below their first level, so nothing about them is in this run's hands.
+    pub fn contains(&self, relative: &str, is_dir: bool) -> bool {
+        if !is_dir {
+            return self.matches(relative);
+        }
+        self.0.iter().any(|element| {
+            element.depth == ScopeDepth::Recursive && within(&element.path, relative)
+        })
+    }
+
+    /// Whether `relative` is a directory the walks pass through without it being in scope: a
+    /// strict ancestor of an element, or a shallow element's own folder.
     ///
     /// Ancestors are walked and inventoried so a scoped plan can still create the parent
-    /// directories a scoped upload needs, but they are not themselves in scope and never appear
-    /// in a status listing.
+    /// directories a scoped upload needs, but they are not themselves in scope, are never
+    /// deleted, and never appear in a status listing.
     pub fn is_ancestor_of_scope(&self, relative: &str) -> bool {
+        self.0.iter().any(|element| {
+            strictly_above(relative, &element.path)
+                || (element.depth == ScopeDepth::Shallow && relative == element.path)
+        })
+    }
+
+    /// Whether an entry of this kind at `relative` may be in an inventory a plan of this scope is
+    /// built from: in scope by its kind, or a directory the walks pass through.
+    pub fn admits(&self, relative: &str, kind: EntryKind) -> bool {
+        relative.is_empty()
+            || self.contains(relative, kind == EntryKind::Directory)
+            || (kind == EntryKind::Directory && self.is_ancestor_of_scope(relative))
+    }
+
+    /// Keep in both inventories only what this scope admits ([`Self::admits`]). A name either
+    /// side holds as something the scope does not admit leaves both, so a shallow folder's child
+    /// directory is never deleted, replaced or written over by a file of the same name: its
+    /// contents were never listed. A no-op for the whole tree.
+    ///
+    /// A name that is in scope on one side only because the other side holds it as a folder (a
+    /// local file where the NAS has a subfolder of a shallow folder, or the reverse) is not
+    /// silently dropped: it is recorded as a skipped `type-conflict`, as a run without `--delete`
+    /// records any such conflict, and a whole-tree run settles it.
+    ///
+    /// Called on every pair of inventories a scoped plan is built from, the plan pass's and
+    /// reconciliation's alike, before anything is compared. [`build_plan`] refuses an inventory
+    /// this was not applied to.
+    pub fn confine(&self, local: &mut LocalInventory, remote: &mut RemoteInventory) {
         if self.is_root() {
-            return false;
+            return;
         }
-        if relative.is_empty() {
-            return true;
+        // A name both sides hold as different kinds, where the folder was not listed whole: a
+        // shallow element's own path that is a file on one side. Replacing either would decide
+        // about what lies beneath the folder, which nobody listed.
+        let unlisted_clash = |relative: &str, kind: EntryKind| {
+            remote
+                .entries
+                .get(relative)
+                .is_some_and(|entry| entry.kind != kind)
+                && !self.contains(relative, true)
+        };
+        let out: BTreeSet<String> = local
+            .entries
+            .values()
+            .filter(|entry| {
+                !self.admits(&entry.relative, entry.kind)
+                    || unlisted_clash(&entry.relative, entry.kind)
+            })
+            .map(|entry| entry.relative.clone())
+            .chain(
+                remote
+                    .entries
+                    .values()
+                    .filter(|entry| !self.admits(&entry.relative, entry.kind))
+                    .map(|entry| entry.relative.clone()),
+            )
+            .collect();
+        for relative in &out {
+            let local_kind = local.entries.remove(relative).map(|entry| entry.kind);
+            let remote_kind = remote.entries.remove(relative).map(|entry| entry.kind);
+            if let (Some(local_kind), Some(remote_kind)) = (local_kind, remote_kind)
+                && local_kind != remote_kind
+            {
+                local.skipped.push(SkippedEntry {
+                    relative: relative.clone(),
+                    reason: SkipReason::TypeConflict {
+                        detail: format!(
+                            "the source holds a {} and the NAS a {} here, inside a folder this                              run reads shallow ({}); the folder's contents were not read, so                              neither is replaced, and a whole-tree run settles it",
+                            local_kind.as_str(),
+                            remote_kind.as_str(),
+                            self.describe()
+                        ),
+                    },
+                });
+            }
         }
-        self.0
-            .strip_prefix(relative)
-            .is_some_and(|rest| rest.starts_with('/'))
     }
 }
+
+/// One caller-supplied scope path, normalised and validated.
+///
+/// Accepts the same shape as any other relative path in this codebase, so a scope can never
+/// name something the planner would refuse to map. Surrounding slashes are trimmed for
+/// convenience; everything else that `validate_relative` rejects is rejected here. A path that
+/// leaves the source (`..`) is refused here; one that leaves it through a link is never followed
+/// by either walk (the local walk skips links, the remote one refuses them by name).
+fn validated_scope_path(value: &str) -> Result<String> {
+    let trimmed = value.trim_matches('/');
+    if trimmed.is_empty() {
+        return Ok(String::new());
+    }
+    if trimmed.contains('\\') {
+        return Err(Error::Configuration(format!(
+            "scope {value:?} must use forward slashes, not backslashes"
+        )));
+    }
+    validate_relative(trimmed)?;
+    if trimmed.split('/').any(|part| part == "." || part == "..") {
+        return Err(Error::Configuration(format!(
+            "scope {value:?} must not contain . or .. components"
+        )));
+    }
+    if is_dsm_managed(trimmed) {
+        return Err(Error::Configuration(format!(
+            "scope {value:?} names a DSM-managed directory, which is never synchronized"
+        )));
+    }
+    Ok(trimmed.to_owned())
+}
+
+/// The smallest file a server-side copy may replace an upload for.
+///
+/// A copy is planned only on a strong fingerprint of its source, which the client reads by
+/// downloading the remote file, and executing it costs a non-overwriting CopyMove task, its polls
+/// and a live MD5 of the destination. Below this size those requests and the download outweigh
+/// sending the bytes: on a DS416, a 10-file folder move of 2.5 MB is about 13 s as copies and about
+/// 5 s as uploads (perf-design section 7.1). A smaller file is uploaded and verified, which is the
+/// baseline every copy already falls back to, and no remote-only file that small is downloaded to
+/// make it a copy source. Deletion guards are unaffected: they keep their strong fingerprint at
+/// any size.
+pub const SERVER_COPY_MIN_BYTES: u64 = 8 * 1024 * 1024;
 
 #[derive(Clone, Debug)]
 pub struct PlanOptions {
@@ -385,7 +634,8 @@ impl SyncPlan {
 
 /// Select the minimum remote files whose content is needed to build a content-mode plan.
 /// Same-path equal-size files need a digest for comparison. Remote-only files are considered
-/// only when CopyMove is available and their size/basename can satisfy a supported copy action.
+/// only when CopyMove is available, they are at least [`SERVER_COPY_MIN_BYTES`], and their
+/// size/basename can satisfy a supported copy action.
 pub fn select_remote_content_hashes(
     local: &LocalInventory,
     remote: &RemoteInventory,
@@ -681,7 +931,7 @@ fn strong_candidates(
         BTreeMap::new();
     for entry in local.entries.values() {
         if entry.kind != EntryKind::File
-            || entry.size == 0
+            || entry.size < SERVER_COPY_MIN_BYTES
             || pairs.remote_of(remote, &entry.relative).is_some()
             || resolution.shield.covers(&entry.relative)
         {
@@ -696,7 +946,7 @@ fn strong_candidates(
 
     for entry in remote.entries.values() {
         if entry.kind != EntryKind::File
-            || entry.size == 0
+            || entry.size < SERVER_COPY_MIN_BYTES
             || pairs.local_of(local, &entry.relative).is_some()
             || is_protected(entry, rules, pairs)
             || resolution.shield.covers(&entry.relative)
@@ -803,6 +1053,7 @@ pub fn build_plan(
     rules: &IgnoreRules,
     options: &PlanOptions,
 ) -> Result<SyncPlan> {
+    require_confined(&options.scope, local, remote)?;
     // The selected destination prefix is part of every Synology Drive-visible path. Validate the
     // complete mapping even for entries that may ultimately compare as unchanged. A path that is
     // only too long once the destination is prepended used to fail the whole plan, so one deep
@@ -919,6 +1170,15 @@ pub fn build_plan(
                 )?;
             }
             (EntryKind::File, EntryKind::Directory) => {
+                // Replacing a folder deletes everything beneath it, so it must have been listed
+                // whole. `Scope::confine` keeps a shallow folder out of here; this is the backstop.
+                if !options.scope.contains(&remote_entry.relative, true) {
+                    return Err(Error::Message(format!(
+                        "scope_unconfined: {:?} is a folder on the NAS this run did not list                          whole ({}); nothing was planned",
+                        remote_entry.relative,
+                        options.scope.describe()
+                    )));
+                }
                 let subtree = remote_subtree(&remote.entries, &remote_entry.relative);
                 if subtree.iter().any(|candidate| {
                     is_protected(candidate, rules, pairs) || shield.covers(&candidate.relative)
@@ -955,12 +1215,15 @@ pub fn build_plan(
     // Deepest first: each rename names its parent by the spelling the parent still has, because
     // the parent's own rename runs after it.
     for (local_spelling, remote_spelling) in &resolution.renames {
-        if !options.scope.matches(local_spelling) {
-            continue;
-        }
         let Some(remote_entry) = remote.entries.get(remote_spelling) else {
             continue;
         };
+        if !options
+            .scope
+            .contains(local_spelling, remote_entry.kind == EntryKind::Directory)
+        {
+            continue;
+        }
         // Renamed only when nothing beneath the old spelling is excluded, DSM-managed, mounted or
         // shielded: a rename would move those too, and they are not this run's to move. The
         // content still syncs into the spelling the NAS has, and the rename is named as not
@@ -1028,7 +1291,11 @@ pub fn build_plan(
     // removes it. It used to be a collision that froze both spellings: every later edit was
     // silently never uploaded.
     for (old, kept) in &resolution.leftovers {
-        if !options.scope.matches(old) {
+        let is_dir = remote
+            .entries
+            .get(old)
+            .is_some_and(|entry| entry.kind == EntryKind::Directory);
+        if !options.scope.contains(old, is_dir) {
             continue;
         }
         plan.skipped.push(SkippedEntry {
@@ -1051,8 +1318,12 @@ pub fn build_plan(
             {
                 continue;
             }
-            // Never propose deleting something the run was told not to look at.
-            if !options.scope.matches(&entry.relative) {
+            // Never propose deleting something the run was told not to look at, nor a directory
+            // whose contents it did not list (a shallow element's folder and its subfolders).
+            if !options
+                .scope
+                .contains(&entry.relative, entry.kind == EntryKind::Directory)
+            {
                 continue;
             }
             if is_protected(entry, rules, pairs) {
@@ -1903,6 +2174,38 @@ fn compare_files(
     }
 }
 
+/// Fail closed on an inventory [`Scope::confine`] was not applied to. Every local entry is
+/// something the plan may write, and a remote entry at the same path is something it may replace:
+/// each must be in scope by its kind or be a folder the walks pass through. For a shallow
+/// folder's child directory that would be a replacement of whatever lies beneath it, which nobody
+/// listed. A remote-only entry outside the scope is left to the deletion gate, which skips it by
+/// its kind ([`Scope::contains`]).
+fn require_confined(scope: &Scope, local: &LocalInventory, remote: &RemoteInventory) -> Result<()> {
+    if scope.is_root() {
+        return Ok(());
+    }
+    let unconfined = local
+        .entries
+        .values()
+        .map(|entry| (entry.relative.as_str(), entry.kind))
+        .chain(
+            remote
+                .entries
+                .values()
+                .filter(|entry| local.entries.contains_key(&entry.relative))
+                .map(|entry| (entry.relative.as_str(), entry.kind)),
+        )
+        .find(|(relative, kind)| !scope.admits(relative, *kind));
+    match unconfined {
+        Some((relative, kind)) => Err(Error::Message(format!(
+            "scope_unconfined: {relative:?} ({}) reached the planner outside the scope {};              nothing was planned",
+            kind.as_str(),
+            scope.describe()
+        ))),
+        None => Ok(()),
+    }
+}
+
 fn replace_uploads_with_server_copies(
     plan: &mut SyncPlan,
     local: &LocalInventory,
@@ -1935,6 +2238,10 @@ fn replace_uploads_with_server_copies(
                 "content comparison requires every local MD5/CRC32/SHA-256 fingerprint".to_owned(),
             ));
         }
+        // Checked after the fingerprint so the fail-closed rule above still covers every upload.
+        if upload.local.size < SERVER_COPY_MIN_BYTES {
+            continue;
+        }
         local_by_content
             .entry((
                 upload.local.size,
@@ -1949,7 +2256,7 @@ fn replace_uploads_with_server_copies(
         BTreeMap::new();
     for entry in remote.entries.values() {
         if entry.kind != EntryKind::File
-            || entry.size == 0
+            || entry.size < SERVER_COPY_MIN_BYTES
             || pairs.local_of(local, &entry.relative).is_some()
             || is_protected(entry, rules, pairs)
             || predeleted.contains(entry.relative.as_str())
@@ -2668,7 +2975,7 @@ pub fn build_status_page(
     }
 
     Ok(StatusPage {
-        scope: query.scope.as_str().to_owned(),
+        scope: query.scope.label().into_owned(),
         entries,
         limit,
         truncated: next_cursor.is_some(),
@@ -2735,7 +3042,7 @@ pub fn resync_ticket(
     canonical.push('\n');
     canonical.push_str(target.remote_root);
     canonical.push('\n');
-    canonical.push_str(scope.as_str());
+    canonical.push_str(&scope.label());
     canonical.push('\n');
     canonical.push_str(match compare {
         CompareMode::Content => "content",
@@ -2910,6 +3217,9 @@ mod tests {
     use std::path::PathBuf;
 
     use super::*;
+
+    /// A file size a server-side copy is planned for.
+    const COPY: u64 = SERVER_COPY_MIN_BYTES;
 
     fn local(entries: &[(&str, EntryKind, u64, i64)]) -> LocalInventory {
         LocalInventory {
@@ -4181,13 +4491,13 @@ mod tests {
                 local_entries.push((
                     format!("new/photo-{index:07}.jpg"),
                     EntryKind::File,
-                    1000,
+                    SERVER_COPY_MIN_BYTES,
                     1_700_000_000_000,
                 ));
                 remote_entries.push((
                     format!("old/photo-{index:07}.jpg"),
                     EntryKind::File,
-                    1000,
+                    SERVER_COPY_MIN_BYTES,
                     1_700_000_000,
                 ));
             }
@@ -4878,8 +5188,8 @@ mod tests {
 
     #[test]
     fn unique_cross_parent_content_match_becomes_non_destructive_server_copy() {
-        let mut local = local(&[("new/report.bin", EntryKind::File, 4, 3_000)]);
-        let mut remote = remote(&[("old/report.bin", EntryKind::File, 4, 3)]);
+        let mut local = local(&[("new/report.bin", EntryKind::File, COPY, 3_000)]);
+        let mut remote = remote(&[("old/report.bin", EntryKind::File, COPY, 3)]);
         local.entries.get_mut("new/report.bin").unwrap().content_md5 = Some(digest(7));
         remote
             .entries
@@ -4914,15 +5224,51 @@ mod tests {
         assert_eq!(mirror.post_deletes[0].relative, "old/report.bin");
         let guard = mirror.post_deletes[0].destination_guard.as_ref().unwrap();
         assert_eq!(guard.remote_path, "/share/root/new/report.bin");
-        assert_eq!(guard.expected_size, 4);
+        assert_eq!(guard.expected_size, COPY);
         assert_eq!(guard.expected_mtime_seconds, 3);
         assert_eq!(guard.local.relative, "new/report.bin");
     }
 
     #[test]
+    fn a_small_cross_parent_move_is_uploaded_without_reading_its_old_copy() {
+        let small = COPY - 1;
+        let mut local = local(&[("new/report.bin", EntryKind::File, small, 3_000)]);
+        let mut remote = remote(&[("old/report.bin", EntryKind::File, small, 3)]);
+        local.entries.get_mut("new/report.bin").unwrap().content_md5 = Some(digest(7));
+
+        // The remote-only file is not downloaded for a copy it could only make slower.
+        let (comparison, strong) =
+            select_plan_digests(&local, &remote, &rules(&[]), true, false, &[]);
+        assert!(comparison.is_empty());
+        assert!(strong.is_empty());
+
+        // Even with its strong fingerprint in hand, the plan uploads.
+        remote
+            .entries
+            .get_mut("old/report.bin")
+            .unwrap()
+            .content_md5 = Some(digest(7));
+        let plan = build_plan(
+            &RemoteRoot::parse("/share/root").unwrap(),
+            &local,
+            &remote,
+            &rules(&[]),
+            &content_options(false, true),
+        )
+        .unwrap();
+        assert_eq!(plan.uploads.len(), 1);
+        assert_eq!(plan.upload_bytes, small);
+        assert!(plan.copies.is_empty());
+
+        // A mirror still guards the deletion of the old path with a strong fingerprint.
+        let (_, strong) = select_plan_digests(&local, &remote, &rules(&[]), true, true, &[]);
+        assert_eq!(strong, BTreeSet::from(["old/report.bin".to_owned()]));
+    }
+
+    #[test]
     fn server_copy_candidate_with_wrong_mtime_keeps_upload_fallback() {
-        let mut local = local(&[("new/report.bin", EntryKind::File, 4, 3_000)]);
-        let mut remote = remote(&[("old/report.bin", EntryKind::File, 4, 2)]);
+        let mut local = local(&[("new/report.bin", EntryKind::File, COPY, 3_000)]);
+        let mut remote = remote(&[("old/report.bin", EntryKind::File, COPY, 2)]);
         local.entries.get_mut("new/report.bin").unwrap().content_md5 = Some(digest(7));
         remote
             .entries
@@ -4944,8 +5290,8 @@ mod tests {
 
     #[test]
     fn basename_change_keeps_verified_upload_fallback() {
-        let mut local = local(&[("folder/new.bin", EntryKind::File, 4, 3_000)]);
-        let mut remote = remote(&[("folder/old.bin", EntryKind::File, 4, 3)]);
+        let mut local = local(&[("folder/new.bin", EntryKind::File, COPY, 3_000)]);
+        let mut remote = remote(&[("folder/old.bin", EntryKind::File, COPY, 3)]);
         local.entries.get_mut("folder/new.bin").unwrap().content_md5 = Some(digest(4));
         remote
             .entries
@@ -4967,10 +5313,10 @@ mod tests {
 
     #[test]
     fn duplicate_content_matches_keep_verified_upload_fallback() {
-        let mut local = local(&[("new/report.bin", EntryKind::File, 4, 3_000)]);
+        let mut local = local(&[("new/report.bin", EntryKind::File, COPY, 3_000)]);
         let mut remote = remote(&[
-            ("old-a/report.bin", EntryKind::File, 4, 3),
-            ("old-b/report.bin", EntryKind::File, 4, 3),
+            ("old-a/report.bin", EntryKind::File, COPY, 3),
+            ("old-b/report.bin", EntryKind::File, COPY, 3),
         ]);
         local.entries.get_mut("new/report.bin").unwrap().content_md5 = Some(digest(9));
         for entry in remote.entries.values_mut() {
@@ -4991,8 +5337,8 @@ mod tests {
 
     #[test]
     fn same_digest_with_different_size_is_never_reused() {
-        let mut local = local(&[("new/report.bin", EntryKind::File, 5, 3_000)]);
-        let mut remote = remote(&[("old/report.bin", EntryKind::File, 4, 3)]);
+        let mut local = local(&[("new/report.bin", EntryKind::File, COPY + 1, 3_000)]);
+        let mut remote = remote(&[("old/report.bin", EntryKind::File, COPY, 3)]);
         local.entries.get_mut("new/report.bin").unwrap().content_md5 = Some(digest(3));
         remote
             .entries
@@ -5014,8 +5360,8 @@ mod tests {
 
     #[test]
     fn unavailable_copy_api_does_not_require_remote_only_hashes() {
-        let mut local = local(&[("new/report.bin", EntryKind::File, 4, 3_000)]);
-        let remote = remote(&[("old/report.bin", EntryKind::File, 4, 1)]);
+        let mut local = local(&[("new/report.bin", EntryKind::File, COPY, 3_000)]);
+        let remote = remote(&[("old/report.bin", EntryKind::File, COPY, 1)]);
         local.entries.get_mut("new/report.bin").unwrap().content_md5 = Some(digest(4));
 
         let plan = build_plan(
@@ -5033,16 +5379,16 @@ mod tests {
     #[test]
     fn remote_hash_selection_is_minimal_and_protection_aware() {
         let local = local(&[
-            ("same.bin", EntryKind::File, 4, 1_000),
-            ("new/report.bin", EntryKind::File, 4, 1_000),
-            ("ignored.bin", EntryKind::File, 4, 1_000),
+            ("same.bin", EntryKind::File, COPY, 1_000),
+            ("new/report.bin", EntryKind::File, COPY, 1_000),
+            ("ignored.bin", EntryKind::File, COPY, 1_000),
         ]);
         let remote = remote(&[
-            ("same.bin", EntryKind::File, 4, 1),
-            ("old/report.bin", EntryKind::File, 4, 1),
-            ("ignored.bin", EntryKind::File, 4, 1),
+            ("same.bin", EntryKind::File, COPY, 1),
+            ("old/report.bin", EntryKind::File, COPY, 1),
+            ("ignored.bin", EntryKind::File, COPY, 1),
             ("other/report.bin", EntryKind::File, 9, 1),
-            ("@eaDir/report.bin", EntryKind::File, 4, 1),
+            ("@eaDir/report.bin", EntryKind::File, COPY, 1),
         ]);
         let ignore = rules(&["ignored.bin"]);
 
@@ -5354,10 +5700,10 @@ mod status_tests {
     fn scope_parse_normalizes_surrounding_slashes_and_accepts_the_empty_root() {
         assert!(Scope::parse("").unwrap().is_root());
         assert!(Scope::parse("/").unwrap().is_root());
-        assert_eq!(Scope::parse("docs").unwrap().as_str(), "docs");
-        assert_eq!(Scope::parse("/docs/").unwrap().as_str(), "docs");
+        assert_eq!(Scope::parse("docs").unwrap().single().unwrap(), "docs");
+        assert_eq!(Scope::parse("/docs/").unwrap().single().unwrap(), "docs");
         assert_eq!(
-            Scope::parse("docs/q3/a.txt").unwrap().as_str(),
+            Scope::parse("docs/q3/a.txt").unwrap().single().unwrap(),
             "docs/q3/a.txt"
         );
     }
@@ -6248,6 +6594,272 @@ mod scoped_deletion_tests {
             .collect()
     }
 
+    fn set(recursive: &[&str], shallow: &[&str]) -> Scope {
+        let owned = |values: &[&str]| {
+            values
+                .iter()
+                .map(|value| (*value).to_owned())
+                .collect::<Vec<_>>()
+        };
+        Scope::from_parts(&owned(recursive), &owned(shallow)).unwrap()
+    }
+
+    fn all_deleted(plan: &SyncPlan) -> Vec<&str> {
+        plan.pre_deletes
+            .iter()
+            .chain(&plan.post_deletes)
+            .map(|action| action.relative.as_str())
+            .collect()
+    }
+
+    #[test]
+    fn a_scope_set_is_normalised_so_recursive_wins_and_nested_elements_go() {
+        let scope = set(
+            &["2026", "2026/03", "b/"],
+            &["2026", "2026/11", "a", "a", "b/c", "a/d"],
+        );
+        let elements: Vec<(&str, ScopeDepth)> = scope
+            .elements()
+            .iter()
+            .map(|element| (element.path.as_str(), element.depth))
+            .collect();
+        assert_eq!(
+            elements,
+            [
+                ("2026", ScopeDepth::Recursive),
+                ("a", ScopeDepth::Shallow),
+                ("a/d", ScopeDepth::Shallow),
+                ("b", ScopeDepth::Recursive),
+            ]
+        );
+        // Order does not matter.
+        assert_eq!(
+            scope,
+            set(&["b", "2026"], &["a/d", "a", "2026/11", "2026", "b/c"])
+        );
+        // A recursive root is the whole tree, whatever else is named.
+        assert!(set(&["", "x"], &["y"]).is_root());
+        assert!(!set(&[], &[""]).is_root());
+        assert_eq!(set(&["x"], &[]).single(), Some("x"));
+        assert_eq!(set(&["x"], &["y"]).single(), None);
+        assert_eq!(set(&["x"], &["y"]).describe(), "x, y (shallow)");
+    }
+
+    #[test]
+    fn a_scope_set_refuses_escapes_by_name_and_caps_its_size() {
+        let cases: [(&[&str], &[&str]); 5] = [
+            (&["../escape"], &[]),
+            (&[], &["docs/../.."]),
+            (&["ok"], &["a\\b"]),
+            (&[], &["@eaDir"]),
+            (&[], &["./here"]),
+        ];
+        for (recursive, shallow) in cases {
+            let owned = |values: &[&str]| {
+                values
+                    .iter()
+                    .map(|value| (*value).to_owned())
+                    .collect::<Vec<_>>()
+            };
+            let error = Scope::from_parts(&owned(recursive), &owned(shallow)).unwrap_err();
+            assert!(
+                matches!(
+                    error,
+                    Error::Configuration(_) | Error::UnsafeRemotePath { .. }
+                ),
+                "{recursive:?} {shallow:?}: {error:?}"
+            );
+        }
+        let many: Vec<String> = (0..=MAX_SCOPE_ELEMENTS).map(|n| format!("d{n}")).collect();
+        let error = Scope::from_parts(&[], &many).unwrap_err();
+        assert!(
+            matches!(&error, Error::Configuration(message) if message.contains("at most 1024")),
+            "{error:?}"
+        );
+    }
+
+    #[test]
+    fn a_shallow_element_holds_its_files_and_no_directory_at_all() {
+        let scope = set(&["x/deep"], &["a"]);
+        assert!(scope.matches("a/f.txt"));
+        assert!(scope.contains("a/f.txt", false));
+        // A child directory: path-level a child, but never in scope as a directory.
+        assert!(!scope.contains("a/sub", true));
+        assert!(!scope.admits("a/sub", EntryKind::Directory));
+        // Nothing deeper, of either kind.
+        assert!(!scope.matches("a/sub/f.txt"));
+        assert!(!scope.contains("a/sub/f.txt", false));
+        // The shallow folder itself is walked like an ancestor, never in scope as a directory.
+        assert!(!scope.contains("a", true));
+        assert!(scope.is_ancestor_of_scope("a"));
+        assert!(scope.admits("a", EntryKind::Directory));
+        // A recursive element is whole; its ancestors are passed through.
+        assert!(scope.contains("x/deep/y/z", true));
+        assert!(scope.is_ancestor_of_scope("x"));
+        assert!(!scope.contains("x", true));
+        assert!(!scope.matches("x/other.txt"));
+        // The shallow root: the source root's files only.
+        let root_files = set(&[], &[""]);
+        assert!(root_files.matches("top.txt"));
+        assert!(!root_files.contains("top", true));
+        assert!(!root_files.matches("top/f.txt"));
+    }
+
+    #[test]
+    fn confining_drops_a_shallow_folders_subfolders_from_both_sides() {
+        let scope = set(&["a/keep"], &["a"]);
+        let mut local = local(&[
+            ("a", EntryKind::Directory, 0, 0),
+            ("a/f.txt", EntryKind::File, 1, 1_000),
+            ("a/sub", EntryKind::Directory, 0, 0),
+            // A file locally where the NAS has a folder: neither side is planned.
+            ("a/clash", EntryKind::File, 1, 1_000),
+            ("a/keep", EntryKind::Directory, 0, 0),
+            ("a/keep/deep", EntryKind::Directory, 0, 0),
+            ("a/keep/deep/g.txt", EntryKind::File, 1, 1_000),
+        ]);
+        let mut remote = remote(&[
+            ("a", EntryKind::Directory, 0, 0),
+            ("a/f.txt", EntryKind::File, 1, 1),
+            ("a/sub", EntryKind::Directory, 0, 0),
+            ("a/clash", EntryKind::Directory, 0, 0),
+            ("a/gone", EntryKind::Directory, 0, 0),
+            ("a/keep", EntryKind::Directory, 0, 0),
+        ]);
+        scope.confine(&mut local, &mut remote);
+        let names = |keys: Vec<&String>| keys.into_iter().cloned().collect::<Vec<_>>();
+        assert_eq!(
+            names(local.entries.keys().collect()),
+            ["a", "a/f.txt", "a/keep", "a/keep/deep", "a/keep/deep/g.txt"]
+        );
+        assert_eq!(
+            names(remote.entries.keys().collect()),
+            ["a", "a/f.txt", "a/keep"]
+        );
+        // The file that met an unlisted folder is named, not dropped in silence.
+        assert_eq!(local.skipped.len(), 1, "{:?}", local.skipped);
+        assert_eq!(local.skipped[0].relative, "a/clash");
+        assert_eq!(local.skipped[0].reason.as_str(), "type-conflict");
+    }
+
+    #[test]
+    fn a_shallow_mirror_deletes_direct_child_files_and_nothing_deeper() {
+        let scope = set(&[], &["a"]);
+        let mut local = local(&[
+            ("a", EntryKind::Directory, 0, 0),
+            ("a/keep.txt", EntryKind::File, 1, 1_000),
+        ]);
+        let mut remote = remote(&[
+            ("a", EntryKind::Directory, 0, 0),
+            ("a/keep.txt", EntryKind::File, 1, 1),
+            ("a/stale.txt", EntryKind::File, 1, 1),
+            // Listed as entries of `a`, contents never read.
+            ("a/sub", EntryKind::Directory, 0, 0),
+            ("a/sub/deep.txt", EntryKind::File, 1, 1),
+        ]);
+        // Even handed the subfolder unconfined, the deletion gate does not take it.
+        let unconfined =
+            build_plan(&root(), &local, &remote, &rules(), &mirror(scope.clone())).unwrap();
+        assert_eq!(all_deleted(&unconfined), ["a/stale.txt"]);
+        scope.confine(&mut local, &mut remote);
+        let plan = build_plan(&root(), &local, &remote, &rules(), &mirror(scope)).unwrap();
+        assert_eq!(all_deleted(&plan), ["a/stale.txt"]);
+    }
+
+    #[test]
+    fn a_shallow_folder_gone_locally_is_never_deleted_on_the_nas() {
+        let scope = set(&[], &["a"]);
+        let mut local = local(&[]);
+        let mut remote = remote(&[
+            ("a", EntryKind::Directory, 0, 0),
+            ("a/f.txt", EntryKind::File, 1, 1),
+            ("a/sub", EntryKind::Directory, 0, 0),
+        ]);
+        scope.confine(&mut local, &mut remote);
+        let plan = build_plan(&root(), &local, &remote, &rules(), &mirror(scope)).unwrap();
+        // Its direct files are this run's; the folder and whatever lies beneath it are not.
+        assert_eq!(all_deleted(&plan), ["a/f.txt"]);
+    }
+
+    #[test]
+    fn a_shallow_element_that_is_a_file_here_and_a_folder_on_the_nas_is_left_alone() {
+        let scope = set(&[], &["a"]);
+        let mut local = local(&[("a", EntryKind::File, 1, 1_000)]);
+        let mut remote = remote(&[
+            ("a", EntryKind::Directory, 0, 0),
+            ("a/f.txt", EntryKind::File, 1, 1),
+            ("a/sub", EntryKind::Directory, 0, 0),
+        ]);
+        // Unconfined, the planner refuses to replace a folder it did not list whole.
+        let error =
+            build_plan(&root(), &local, &remote, &rules(), &mirror(scope.clone())).unwrap_err();
+        assert!(
+            matches!(&error, Error::Message(message) if message.starts_with("scope_unconfined:")),
+            "{error:?}"
+        );
+        scope.confine(&mut local, &mut remote);
+        assert_eq!(local.skipped.len(), 1);
+        assert_eq!(local.skipped[0].relative, "a");
+        assert_eq!(local.skipped[0].reason.as_str(), "type-conflict");
+        let plan = build_plan(&root(), &local, &remote, &rules(), &mirror(scope)).unwrap();
+        // Nothing replaced, and the folder's listed file is shielded with it.
+        assert!(all_deleted(&plan).is_empty(), "{:?}", all_deleted(&plan));
+        assert!(plan.uploads.is_empty());
+    }
+
+    #[test]
+    fn a_shallow_element_naming_a_file_is_that_file() {
+        let scope = set(&[], &["a/x.txt"]);
+        assert!(scope.matches("a/x.txt"));
+        assert!(!scope.matches("a/y.txt"));
+        let mut local = local(&[
+            ("a", EntryKind::Directory, 0, 0),
+            ("a/x.txt", EntryKind::File, 1, 1_000),
+        ]);
+        let mut remote = remote(&[("a", EntryKind::Directory, 0, 0)]);
+        scope.confine(&mut local, &mut remote);
+        let plan = build_plan(&root(), &local, &remote, &rules(), &mirror(scope)).unwrap();
+        assert_eq!(plan.uploads.len(), 1);
+        assert_eq!(plan.uploads[0].local.relative, "a/x.txt");
+    }
+
+    #[test]
+    fn the_planner_refuses_a_shallow_subfolder_it_could_replace() {
+        let scope = set(&[], &["a"]);
+        // A local file where the NAS has an unlisted folder: replacing it would delete whatever
+        // the folder holds. Unconfined, the planner refuses the whole plan by name.
+        let local_file = local(&[
+            ("a", EntryKind::Directory, 0, 0),
+            ("a/clash", EntryKind::File, 1, 1_000),
+        ]);
+        let remote = remote(&[
+            ("a", EntryKind::Directory, 0, 0),
+            ("a/clash", EntryKind::Directory, 0, 0),
+        ]);
+        let error = build_plan(
+            &root(),
+            &local_file,
+            &remote,
+            &rules(),
+            &mirror(scope.clone()),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(&error, Error::Message(message) if message.starts_with("scope_unconfined:")),
+            "{error:?}"
+        );
+        // A local subfolder is refused the same way: nothing beneath it was walked.
+        let local_dir = local(&[
+            ("a", EntryKind::Directory, 0, 0),
+            ("a/sub", EntryKind::Directory, 0, 0),
+        ]);
+        let error = build_plan(&root(), &local_dir, &remote, &rules(), &mirror(scope)).unwrap_err();
+        assert!(
+            matches!(&error, Error::Message(message) if message.contains("a/sub")),
+            "{error:?}"
+        );
+    }
+
     #[test]
     fn a_scoped_mirror_never_deletes_the_ancestors_that_lead_to_its_scope() {
         // A scoped remote inventory carries the directories between the root and the scope so a
@@ -6541,7 +7153,7 @@ mod resync_ticket_tests {
         // because a v1 ticket makes a claim about the destination it never covered.
         let plan = plan_of(vec![upload("a.txt", 10)]);
         let mut canonical = String::from("sdsync.resync-ticket.v1\n");
-        canonical.push_str(Scope::root().as_str());
+        canonical.push_str(&Scope::root().label());
         canonical.push('\n');
         canonical.push_str("force\n");
         canonical.push_str(&plan.upload_bytes.to_string());
@@ -6578,7 +7190,7 @@ mod resync_ticket_tests {
         canonical.push('\n');
         canonical.push_str(TARGET.remote_root);
         canonical.push('\n');
-        canonical.push_str(Scope::root().as_str());
+        canonical.push_str(&Scope::root().label());
         canonical.push('\n');
         canonical.push_str("force\n");
         canonical.push_str(&plan.upload_bytes.to_string());

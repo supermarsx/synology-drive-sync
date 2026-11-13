@@ -32,8 +32,31 @@ use crate::local::{EntryKind, LocalEntry, LocalInventory};
 use crate::plan::SyncPlan;
 use crate::sync::DeferredPath;
 
-/// Pairs re-verified live per run out of those a source could vouch for.
+/// Pairs re-verified live per run out of those a source could vouch for, on a run over the whole
+/// tree.
 pub const DEFAULT_CANARY: usize = 25;
+
+/// The same, on a run scoped below the source root (`--scope`: a realtime routine's changed
+/// folders, or an operator's subtree).
+///
+/// The canary exists to catch a source that is wrong in a way facts cannot show (a write path that
+/// moves no fact, an index bug). Such an error is systematic, so it shows on any sample, and the
+/// whole-tree runs (the daily full pass every realtime routine gets, interval and manual runs,
+/// overflow and catch-up) still draw [`DEFAULT_CANARY`]. A scoped run drawing 25 instead verified
+/// every pair of a folder of 25 files or fewer live, twice when it wrote (plan pass and carry),
+/// about 3 s of MD5 tasks per run on a DS416 (operator decision 2026-11-12, perf-design §5.2).
+pub const SCOPED_CANARY: usize = 2;
+
+/// The canary a run draws when none was configured: [`DEFAULT_CANARY`] for the whole tree,
+/// [`SCOPED_CANARY`] for any other scope (a path, or a set of them, recursive or shallow), as
+/// [`crate::plan::Scope::is_root`] tells them apart.
+pub fn default_canary(whole_tree: bool) -> usize {
+    if whole_tree {
+        DEFAULT_CANARY
+    } else {
+        SCOPED_CANARY
+    }
+}
 
 /// How many hex digits of a digest a report names: enough to tell two digests apart by eye,
 /// never the whole value.
@@ -451,8 +474,8 @@ impl PlanCarry<'_> {
 
     /// Whether the plan's digests of this pair were taken while a write could still hide from
     /// its facts: locally a change time within the window of the run's start (no later than the
-    /// read), on the NAS one within the window of the plan's own `MD5.start` clock, or no such
-    /// clock at all.
+    /// read), on the NAS one within the window of the clock of the `MD5.start` that proved it (the
+    /// plan's own, or the earlier run's for a pair the index served), or no such clock at all.
     fn racy_at_plan(&self, local: &LocalEntry, remote: &RemoteEntry) -> bool {
         if self.racy.unbounded {
             return true;
@@ -464,7 +487,7 @@ impl PlanCarry<'_> {
         let local_racy = local.times.ctime_ns > read_ns.saturating_sub(self.racy.local_ns);
         let remote_racy = match (remote.ctime_seconds, remote.digest_nas_time) {
             (Some(ctime), Some(clock)) => {
-                if self.nas_clock_is_bounded(clock, read_ns) {
+                if self.nas_clock_is_bounded(clock) {
                     ctime > clock.saturating_sub(self.racy.remote_seconds)
                 } else {
                     self.clock_unbounded.set(self.clock_unbounded.get() + 1);
@@ -476,27 +499,31 @@ impl PlanCarry<'_> {
         local_racy || remote_racy
     }
 
-    /// Whether this host's clock bounds the NAS clock the plan's `MD5.start` reported (the D3
-    /// guard of [`crate::pair_index::PairIndex`]'s harvest, applied to the carry). The `Date`
-    /// header can be a proxy's or a NAS with the wrong time, and a clock hours ahead made every
-    /// change time look settled. Every `MD5.start` of the plan pass ran after `read_started` and
-    /// before now (the carry is judged after the plan pass), so a clock more than
-    /// [`crate::pair_index::NAS_CLOCK_TOLERANCE_SECONDS`] outside that interval is not one the
-    /// window can be judged by, and the pair is verified live. The upper bound is looser than
-    /// the index's, which knows when its pass ended; a skewed clock is therefore caught when it is
-    /// wrong by more than the time since the plan pass began, plus the tolerance. The demotion is
-    /// visible as a lower `served` count in the result's `reconciliation` object.
-    fn nas_clock_is_bounded(&self, clock: i64, read_ns: i64) -> bool {
+    /// Whether this host's clock bounds the NAS clock a plan digest carries (the D3 guard of
+    /// [`crate::pair_index::PairIndex`]'s harvest, applied to the carry). The `Date` header can be
+    /// a proxy's or a NAS with the wrong time, and a clock hours ahead made every change time look
+    /// settled. Every clock a pair can carry was read no later than now (the carry is judged
+    /// after the plan pass), so one more than [`crate::pair_index::NAS_CLOCK_TOLERANCE_SECONDS`]
+    /// ahead of now is not one the window can be judged by, and the pair is verified live. The
+    /// demotion is visible as a lower `served` count in the result's `reconciliation` object.
+    ///
+    /// A clock behind is judged as it is. The racy rule asks whether the change time is within the
+    /// window of the clock, so an earlier clock only ever makes a pair racier: it can withhold a
+    /// carry, never grant one the true clock would refuse. That is also the clock of every pair
+    /// the index served, which is the `MD5.start` of the run that proved it, possibly days ago,
+    /// already bounded by that run's harvest (a pair proven by a clock it did not bound is stored
+    /// racy and never served). A lower bound at this run's start used to verify every such pair
+    /// live in reconciliation, named as `pair-index-plan-clock-unbounded` with advice to check the
+    /// NAS's time, on every writing run of a warm index.
+    fn nas_clock_is_bounded(&self, clock: i64) -> bool {
         let tolerance = crate::pair_index::NAS_CLOCK_TOLERANCE_SECONDS;
-        let earliest = (read_ns / 1_000_000_000).saturating_sub(tolerance);
         // A host clock before 1970 bounds nothing: the pair is verified live.
         let Ok(since_epoch) = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
         else {
             return false;
         };
         let now = i64::try_from(since_epoch.as_secs()).unwrap_or(i64::MAX);
-        let latest = now.saturating_add(tolerance);
-        earliest <= clock && clock <= latest
+        clock <= now.saturating_add(tolerance)
     }
 }
 
@@ -809,12 +836,13 @@ mod tests {
         assert!(vouched.served.is_empty());
     }
 
-    /// N-I4 (the D3 guard, for the carry): a NAS clock the host's clock does not bound cannot show
-    /// whether a NAS change time was settled when the plan read it, so the pair is verified live.
-    /// The `Date` header can be a proxy's or a NAS with the wrong time; a clock hours ahead made
-    /// every change time look settled.
+    /// N-I4 (the D3 guard, for the carry): a NAS clock ahead of the host's cannot show whether a
+    /// NAS change time was settled when the plan read it, so the pair is verified live. The `Date`
+    /// header can be a proxy's or a NAS with the wrong time; a clock hours ahead made every change
+    /// time look settled. A clock behind is judged as it is: it only makes a pair racier, and it
+    /// is what every pair the index served carries (the clock of the run that proved it).
     #[test]
-    fn a_pair_whose_plan_clock_the_host_does_not_bound_is_never_carried() {
+    fn a_pair_whose_plan_clock_is_ahead_of_the_host_is_never_carried() {
         use crate::pair_index::NAS_CLOCK_TOLERANCE_SECONDS as TOLERANCE;
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -828,6 +856,7 @@ mod tests {
             ("barely-behind", 10, 20, Some(A)),
             ("ahead", 10, 20, Some(A)),
             ("barely-ahead", 10, 20, Some(A)),
+            ("behind-racy", 10, 20, Some(A)),
         ]);
         for (name, clock) in [
             ("in-bounds", now),
@@ -835,6 +864,8 @@ mod tests {
             ("barely-behind", now - 5 - TOLERANCE),
             ("ahead", now + 3_600),
             ("barely-ahead", now + TOLERANCE),
+            // Behind enough that the change time (20) is within the window of it: still racy.
+            ("behind-racy", 21),
         ] {
             plan_remote.entries.get_mut(name).unwrap().digest_nas_time = Some(clock);
         }
@@ -844,6 +875,7 @@ mod tests {
             ("barely-behind", 10, 20, None),
             ("ahead", 10, 20, None),
             ("barely-ahead", 10, 20, None),
+            ("behind-racy", 10, 20, None),
         ]);
         let comparison: BTreeSet<String> = fresh_remote.entries.keys().cloned().collect();
         let mut carry = PlanCarry {
@@ -867,11 +899,11 @@ mod tests {
         carried.sort_unstable();
         assert_eq!(
             carried,
-            vec!["barely-ahead", "barely-behind", "in-bounds"],
-            "a clock more than {TOLERANCE} s outside the pass is not one to judge by"
+            vec!["barely-ahead", "barely-behind", "behind", "in-bounds"],
+            "a clock more than {TOLERANCE} s ahead is not one to judge by"
         );
-        // The two it could not judge are counted, so the run can name them.
-        assert_eq!(carry.plan_clock_unbounded(), 2);
+        // The one it could not judge is counted, so the run can name it.
+        assert_eq!(carry.plan_clock_unbounded(), 1);
     }
 
     #[test]
@@ -970,6 +1002,42 @@ mod tests {
         assert!(all.served.is_empty());
         let none = split_canaries(pairs, 0, 9);
         assert!(none.canaries.is_empty());
+    }
+
+    #[test]
+    fn a_scoped_run_draws_two_canaries_and_a_whole_tree_run_twenty_five() {
+        use crate::plan::Scope;
+        let canary = |recursive: &[&str], shallow: &[&str]| {
+            let owned =
+                |values: &[&str]| values.iter().map(|v| (*v).to_owned()).collect::<Vec<_>>();
+            default_canary(
+                Scope::from_parts(&owned(recursive), &owned(shallow))
+                    .unwrap()
+                    .is_root(),
+            )
+        };
+        assert_eq!(canary(&[], &[]), DEFAULT_CANARY);
+        assert_eq!(canary(&[""], &[]), DEFAULT_CANARY);
+        assert_eq!(canary(&["/"], &[]), DEFAULT_CANARY);
+        // A recursive root swallows every other element: still the whole tree.
+        assert_eq!(canary(&["", "2026"], &["2026/11"]), DEFAULT_CANARY);
+        assert_eq!(canary(&["2026"], &[]), SCOPED_CANARY);
+        assert_eq!(canary(&["/2026/11/"], &[]), SCOPED_CANARY);
+        assert_eq!(canary(&[], &[""]), SCOPED_CANARY);
+        assert_eq!(canary(&["2026/03"], &["2026/11"]), SCOPED_CANARY);
+        // A ten-file folder is no longer verified whole.
+        let pairs: Vec<VouchedPair> = (0..10_u8)
+            .map(|index| VouchedPair {
+                local: format!("2026/11/{index}"),
+                remote: format!("2026/11/{index}"),
+                md5: [index; 16],
+                remote_too: true,
+                nas_clock: None,
+            })
+            .collect();
+        let scoped = split_canaries(pairs, default_canary(false), 7);
+        assert_eq!(scoped.canaries.len(), 2);
+        assert_eq!(scoped.served.len(), 8);
     }
 
     #[test]

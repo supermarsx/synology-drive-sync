@@ -158,10 +158,10 @@ fn no_change_and_two_change_runs_cost_about_the_listing() {
     let lists = count(&warm, "SYNO.FileStation.List.list");
     assert_eq!(lists, FOLDERS + 1, "one listing per folder");
     assert!(count(&warm, "SYNO.FileStation.MD5.start") <= K);
-    // Besides the listings and the canary's start and status: API discovery, login, the
-    // destination's write check and four `getinfo` of the root, File Station's host for the
-    // index binding, and logout -- nine, whatever the tree's size.
-    let session = 9;
+    // Besides the listings and the canary's start and status: API discovery, login, one
+    // `getinfo` naming every ancestor of the root, the destination's write check, File Station's
+    // host for the index binding, and logout -- six, whatever the tree's size.
+    let session = 6;
     assert!(
         warm.len() <= lists + session + 2 * K,
         "{} requests for {lists} listings",

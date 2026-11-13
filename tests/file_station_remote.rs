@@ -13,8 +13,8 @@ use std::process::{Command, Output};
 use std::time::{Duration, UNIX_EPOCH};
 
 use serde_json::Value;
-use support::TestDir;
 use support::file_station_mock::MockFileStation;
+use support::{TestDir, copy_payload};
 use synology_drive_sync::Error;
 use synology_drive_sync::api::{
     ApiClient, ClientOptions, LINKED_ENTRY_MOUNT_TYPE, RemoteSkipReason,
@@ -669,14 +669,18 @@ fn a_copy_dsm_fails_with_an_envelope_code_is_uploaded_instead_and_not_stopped() 
     let source = fixture.child("source");
     fs::create_dir_all(source.join("new")).unwrap();
     let local_file = source.join("new/item.bin");
-    fs::write(&local_file, b"copy-me-on-nas").unwrap();
+    fs::write(&local_file, copy_payload(b"copy-me-on-nas")).unwrap();
     fs::write(source.join("other.txt"), b"other").unwrap();
     let mtime = modified_ms(&local_file).div_euclid(1000);
     let password = fixture.write("password", format!("{PASSWORD}\n").as_bytes());
     let server = MockFileStation::start();
     server.add_directory("/team/copy");
     server.add_directory("/team/copy/old");
-    server.add_file("/team/copy/old/item.bin", b"copy-me-on-nas", mtime);
+    server.add_file(
+        "/team/copy/old/item.bin",
+        &copy_payload(b"copy-me-on-nas"),
+        mtime,
+    );
     server.fail_next_copy_status_with_envelope(1002);
     let arguments = sync_arguments(
         source.to_str().unwrap(),
@@ -703,7 +707,7 @@ fn a_copy_dsm_fails_with_an_envelope_code_is_uploaded_instead_and_not_stopped() 
     assert_eq!(output.status.code(), Some(0), "{}", describe(&output));
     assert_eq!(
         server.file_contents("/team/copy/new/item.bin"),
-        Some(b"copy-me-on-nas".to_vec()),
+        Some(copy_payload(b"copy-me-on-nas")),
         "uploaded via the fallback: {}",
         describe(&output)
     );
@@ -729,13 +733,17 @@ fn a_session_expiry_at_copy_start_is_recovered() {
     let source = fixture.child("source");
     fs::create_dir_all(source.join("new")).unwrap();
     let local_file = source.join("new/item.bin");
-    fs::write(&local_file, b"copy-me-on-nas").unwrap();
+    fs::write(&local_file, copy_payload(b"copy-me-on-nas")).unwrap();
     let mtime = modified_ms(&local_file).div_euclid(1000);
     let password = fixture.write("password", format!("{PASSWORD}\n").as_bytes());
     let server = MockFileStation::start();
     server.add_directory("/team/copy");
     server.add_directory("/team/copy/old");
-    server.add_file("/team/copy/old/item.bin", b"copy-me-on-nas", mtime);
+    server.add_file(
+        "/team/copy/old/item.bin",
+        &copy_payload(b"copy-me-on-nas"),
+        mtime,
+    );
     server.expire_session_on("SYNO.FileStation.CopyMove.start");
     let arguments = sync_arguments(
         source.to_str().unwrap(),
