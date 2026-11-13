@@ -17882,7 +17882,7 @@ fn render_routine(
     let weekdays = kv("weekdays", "1,2,3,4,5,6,7")?;
     let start = kv("time_window_start", "00:00")?;
     let end = kv("time_window_end", "23:59")?;
-    let debounce = kv("debounce_seconds", "45")?;
+    let debounce = kv("debounce_seconds", "15")?;
     let retries = kv("retry_count", "5")?;
     let mut backoff = kv("retry_backoff_seconds", "60")?;
     let exponential = manager_kv_optional(configuration, "retry_exponential", "true")?;

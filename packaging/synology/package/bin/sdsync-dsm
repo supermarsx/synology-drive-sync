@@ -1683,7 +1683,7 @@ configure_routine() {
     routine_profile= routine_enabled=true routine_action=sync routine_mode=interval
     routine_interval=3600 routine_weekdays=1,2,3,4,5,6,7
     routine_window_start=00:00 routine_window_end=23:59
-    routine_debounce=45 routine_retries=5 routine_backoff=60 routine_retry_exponential=true routine_poll=30
+    routine_debounce=15 routine_retries=5 routine_backoff=60 routine_retry_exponential=true routine_poll=30
     routine_allow_delete=false routine_max_total=100 routine_dependencies=
     while [ "$#" -gt 0 ]; do
         case $1 in
