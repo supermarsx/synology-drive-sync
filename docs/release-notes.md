@@ -8,6 +8,13 @@ lists its own commits.
 
 ## Unreleased: the daemon is the DSM service engine
 
+- **The daemon audits a run without starting five processes.** The audit steps around each run (reconcile, create,
+  begin, execute, complete) now run inside the daemon, each on a helper thread bounded at 30 seconds, instead of as
+  five copies of the bridge. The records and the event log are the same ones. A step that does not return is
+  abandoned and named, and after three such steps no further run is started (`audit_unavailable`). `service_audit`
+  now says `transport=in_process`, or `transport=bridge` (with `service_audit_transport`) when the daemon cannot
+  confirm it is the package's user.
+
 - **A realtime change that changes nothing no longer starts a run, and the default quiet period is 15 seconds.**
   The debounce of a realtime routine that names none went from 45 to 15 seconds (the ceiling for a tree that
   never goes quiet is 75 seconds). A routine that names one keeps it. After a sync that converged, the daemon
