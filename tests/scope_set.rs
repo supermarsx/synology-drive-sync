@@ -369,7 +369,10 @@ fn a_shallow_folder_that_is_a_link_in_the_source_is_never_followed() {
         "the scope names nothing it may read"
     );
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("scope \"lnk\" does not exist"), "{stderr}");
+    assert!(
+        stderr.contains("scope \"lnk (shallow)\" does not exist"),
+        "{stderr}"
+    );
     assert_eq!(fixture.nas("lnk/secret.txt"), None);
     assert!(
         fixture
