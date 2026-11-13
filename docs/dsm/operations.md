@@ -690,6 +690,21 @@ Suppression still obeys `bridge_log_level`. A policy set to `error` writes no re
 neither the log nor the coalescing state file, and does not change what the browser is told: the
 503 and its code reach the page either way. A quiet log is not a quiet page.
 
+### Waking the controller after a save
+
+A dashboard save is queued as a file, and the controller is then told to look at the queue with one
+`SIGUSR2`. The service sends that signal itself, after the same proof the manager used to make
+(`controller.pid`, `controller.ready` and the live `controller.lock` naming one pid, start tick and
+boot id, and a last check of `/proc` immediately before the signal). It no longer starts the shell
+manager for it, which was an estimated second and a half of every save's answer on a DS416. No PID file
+and a process that has exited are the ordinary "not running": the queue is read when the controller
+starts. The daemon engine publishes no `controller.pid`, so under it nothing is signalled and its
+queue consumer, which looks at the queue every 250 ms, picks the job up. A controller that is alive
+but cannot be proven to be the package's is never signalled; that writes the `controller_wake_failed`
+failure record, and a `warn` record `controller_wake_failed` naming the `cause` (`pid_file_unsafe`,
+`pid_probe_failed`, `identity_untrusted`, `identity_changed` or `signal_failed`), at most once every
+five minutes. The save itself is unaffected: it was accepted, and the controller's own polling finds it.
+
 ### Forcing dashboard reads through the shell manager
 
 Dashboard reads, the Logs view included, are answered inside the package service, from the package's

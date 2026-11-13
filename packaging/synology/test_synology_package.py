@@ -20619,18 +20619,17 @@ fi
         wake_function_start = rust_source.index("fn wake_controller_after_enqueue() {")
         wake_function_end = rust_source.index("\n}\n", wake_function_start) + 2
         rust_wake_function = rust_source[wake_function_start:wake_function_end]
-        # A failed wake is recorded rather than discarded (bridge S-9), but it
-        # still never turns accepted work into an error: both branches end in
-        # a return without propagating anything.
+        # The wake is the service's own (no manager fork: that was about 1.5 s of
+        # every save on an armv7). A failed wake is recorded rather than discarded
+        # (bridge S-9), but it still never turns accepted work into an error: the
+        # refusal is handed to the recorder and nothing propagates.
+        self.assertIn("linux_files::signal_controller_for_queue(", rust_wake_function)
         self.assertIn(
-            'let Ok(mut command) = manager_command(&["api".into(), "controller-wake".into()], false) else {\n'
-            "        record_controller_wake_failure();\n"
-            "        return;\n"
-            "    };",
+            "record_controller_wake_failure(&paths, package_uid, refusal);",
             rust_wake_function,
         )
-        self.assertIn("match capture_bounded_command(", rust_wake_function)
-        self.assertIn("_ => record_controller_wake_failure(),", rust_wake_function)
+        self.assertNotIn("manager_command(", rust_wake_function)
+        self.assertNotIn("capture_bounded_command(", rust_wake_function)
         enqueue_start = rust_source.index(
             "            let enqueue_outcome = linux_files::enqueue("
         )

@@ -263,8 +263,6 @@ const CGI_POST_DEADLINE: Duration = Duration::from_secs(40);
 const CGI_RESPONSE_WRITE_TIMEOUT: Duration = Duration::from_secs(2);
 #[cfg(target_os = "linux")]
 const READ_MANAGER_TIMEOUT: Duration = Duration::from_secs(20);
-#[cfg(target_os = "linux")]
-const CONTROLLER_WAKE_TIMEOUT: Duration = Duration::from_secs(2);
 // These bound the consumer process that executes a queued interactive job, not
 // an API worker: `execute_connection_mutation` is reachable only from
 // `run_consumer`, which the controller starts as a separate `--consume-job`
@@ -9266,10 +9264,9 @@ where
 /// Build a manager invocation against the installed manager.
 ///
 /// Every mutation-side caller uses this form. It keeps no path parameter on
-/// purpose: the installed manager is the only one a queued mutation, a
-/// controller wake or an audit record may ever run, and a cross-layer test in
-/// the packaging suite reads this call's exact text out of
-/// `wake_controller_after_enqueue` to prove the wake still goes through it.
+/// purpose: the installed manager is the only one a queued mutation or an
+/// audit record may ever run. (The controller wake no longer forks it: see
+/// `wake_controller_after_enqueue`.)
 #[cfg(target_os = "linux")]
 fn manager_command(arguments: &[OsString], has_secret_input: bool) -> BridgeResult<Command> {
     manager_command_at(Path::new(MANAGER_PATH), arguments, has_secret_input)
@@ -9341,24 +9338,42 @@ fn wake_controller_after_enqueue() {
     // duplicate dispatch. The controller's bounded polling fallback remains, so a
     // failure here costs latency, not work -- but it is recorded, because a wake path
     // that never works would otherwise only ever look like a slow dashboard.
-    let Ok(mut command) = manager_command(&["api".into(), "controller-wake".into()], false) else {
-        record_controller_wake_failure();
-        return;
-    };
-    match capture_bounded_command(&mut command, 1024, 1024, CONTROLLER_WAKE_TIMEOUT, None) {
-        Ok(output) if output.status_success => {}
-        _ => record_controller_wake_failure(),
-    }
-}
-
-/// One coalesced api.log record for a controller wake that did not happen.
-///
-/// Never an error to the caller: the request it follows was already accepted.
-#[cfg(target_os = "linux")]
-fn record_controller_wake_failure() {
+    //
+    // Done in this process. It used to run `sdsync-dsm api controller-wake`, which parses
+    // 557 KB of shell on an armv7 to read a pid file and send one signal, about 1.5 s of every
+    // save's answer. The proof is the same one (`controller_persisted_identity_status`) and
+    // the manager's own `controller-wake` stays, for an operator and for the shell rung's tests.
+    // The daemon engine publishes no `controller.pid`, so under it this is the ordinary "not
+    // running": its queue consumer polls `var/control` on its own tick.
     // SAFETY: geteuid has no pointer arguments or preconditions. The service runs as the
     // package user, which every check before the enqueue has already verified.
     let package_uid = unsafe { libc::geteuid() };
+    let paths = PackagePaths::production();
+    if let Err(refusal) = linux_files::signal_controller_for_queue(
+        paths.controller,
+        &paths.run_dir.join("controller.pid"),
+        &paths.run_dir.join("controller.ready"),
+        &paths.run_dir.join("controller.lock"),
+        package_uid,
+    ) {
+        record_controller_wake_failure(&paths, package_uid, refusal);
+    }
+}
+
+/// One coalesced api.log record for a controller wake that did not happen, and the cause once
+/// per five minutes.
+///
+/// Never an error to the caller: the request it follows was already accepted. The coalesced
+/// record is keyed by stage and code, so it cannot say why; the cause is its own `warn` record,
+/// bounded to one per five minutes so a controller that is broken for a day does not write one
+/// per save.
+#[cfg(target_os = "linux")]
+fn record_controller_wake_failure(
+    paths: &PackagePaths<'_>,
+    package_uid: u32,
+    refusal: linux_files::QueueWakeRefusal,
+) {
+    static LAST_NOTED: AtomicU64 = AtomicU64::new(0);
     record_in_service_failure(
         package_uid,
         None,
@@ -9368,6 +9383,53 @@ fn record_controller_wake_failure() {
             "controller_wake_failed",
         ),
     );
+    let Ok(now) = current_epoch() else {
+        return;
+    };
+    let last = LAST_NOTED.load(AtomicOrdering::Relaxed);
+    if last != 0 && now.saturating_sub(last) < 300 {
+        return;
+    }
+    if LAST_NOTED
+        .compare_exchange(last, now, AtomicOrdering::Relaxed, AtomicOrdering::Relaxed)
+        .is_err()
+    {
+        return;
+    }
+    let mut members = serde_json::Map::new();
+    members.insert("cause".to_owned(), json!(refusal.as_str()));
+    members.insert("file".to_owned(), json!("controller.pid"));
+    if !record_service_warning(paths, package_uid, "controller_wake_failed", &members) {
+        LAST_NOTED.store(last, AtomicOrdering::Relaxed);
+        eprintln!(
+            "sdsync-dsm-api: controller_wake_failed cause={} file=controller.pid",
+            refusal.as_str()
+        );
+    }
+}
+
+/// One `warn` record in api.log under the security policy, loaded for it. Whether it was written.
+#[cfg(target_os = "linux")]
+fn record_service_warning(
+    paths: &PackagePaths<'_>,
+    package_uid: u32,
+    event: &str,
+    members: &serde_json::Map<String, Value>,
+) -> bool {
+    let Ok(now) = current_epoch() else {
+        return false;
+    };
+    linux_files::load_security_policy(package_uid).and_then(|policy| {
+        linux_files::record_bridge_warning_at(
+            paths.log_root,
+            &paths.log_root.join("api.log"),
+            package_uid,
+            now,
+            &policy,
+            event,
+            members,
+        )
+    }) == Ok(true)
 }
 
 /// The reasons a rejected mutation's audit record may name.
@@ -11220,29 +11282,54 @@ mod linux_files {
         package_uid: u32,
         expected_pid: u32,
     ) -> BridgeResult<bool> {
+        trusted_controller_identity(
+            controller,
+            pid_file,
+            ready_file,
+            lock,
+            package_uid,
+            expected_pid,
+        )
+        .map(|identity| identity.is_some())
+    }
+
+    /// `controller_identity_is_trusted`, returning the identity the chain agreed on.
+    ///
+    /// The queue wake signals exactly this tuple, so it is the one the signal's last
+    /// check (`validate_live_process_identity`) must be run against rather than a
+    /// second reading of the files.
+    pub(super) fn trusted_controller_identity(
+        controller: &Path,
+        pid_file: &Path,
+        ready_file: &Path,
+        lock: &Path,
+        package_uid: u32,
+        expected_pid: u32,
+    ) -> BridgeResult<Option<ProcessIdentity>> {
         let Ok(executable) = fs::symlink_metadata(controller) else {
-            return Ok(false);
+            return Ok(None);
         };
         if !executable.file_type().is_file()
             || executable.st_uid() != package_uid
             || executable.st_mode() & 0o7777 != 0o755
             || executable.st_nlink() != 1
         {
-            return Ok(false);
+            return Ok(None);
         }
+        let mut agreed = None;
         for _ in 0..2 {
             // A contract failure anywhere in this chain means not trusted, which
             // is what any non-zero return from the manager's own check means to
             // `api_snapshot`. The hard error for an unsafe PID file is raised by
             // the caller, which reads it before asking this question.
             let Some(pid) = controller_pid_file_value(pid_file, package_uid).unwrap_or(None) else {
-                return Ok(false);
+                return Ok(None);
             };
             let Some(ready) = read_published_identity(ready_file, package_uid, true)? else {
-                return Ok(false);
+                return Ok(None);
             };
             let Some(owner) = private_process_lock_owner(lock, package_uid)? else {
-                return Ok(false);
+                return Ok(None);
             };
             if pid != ready.pid
                 || owner.pid != pid
@@ -11250,10 +11337,115 @@ mod linux_files {
                 || owner.boot != ready.boot
                 || pid != expected_pid
             {
-                return Ok(false);
+                return Ok(None);
+            }
+            agreed = Some(ready);
+        }
+        Ok(agreed)
+    }
+
+    /// Why a queue wake could not be delivered: the named cause that goes in api.log.
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub(super) enum QueueWakeRefusal {
+        /// `controller.pid` exists but is not a package-owned single-line private file.
+        PidFileUnsafe,
+        /// The liveness probe of the named pid failed for a reason other than "no such process".
+        PidProbeFailed,
+        /// The pid is alive but the PID file, readiness record and lock do not agree on it.
+        IdentityUntrusted,
+        /// The process the chain named is no longer that process.
+        IdentityChanged,
+        /// `kill` refused (not ESRCH, which is a controller that just exited).
+        SignalFailed,
+    }
+
+    impl QueueWakeRefusal {
+        pub(super) const fn as_str(self) -> &'static str {
+            match self {
+                Self::PidFileUnsafe => "pid_file_unsafe",
+                Self::PidProbeFailed => "pid_probe_failed",
+                Self::IdentityUntrusted => "identity_untrusted",
+                Self::IdentityChanged => "identity_changed",
+                Self::SignalFailed => "signal_failed",
             }
         }
-        Ok(true)
+    }
+
+    /// `wake_controller_for_queue`: interrupt a running controller's idle sleep with `SIGUSR2`.
+    ///
+    /// No PID file and a pid that is not alive are the ordinary "not running" (`Ok(false)`),
+    /// exactly as in the manager: the queue is read when the controller next starts. A
+    /// controller that is alive but cannot be proven to be the package's is never signalled.
+    /// The proof is the same chain the snapshot uses, and the tuple it agrees on is checked
+    /// against `/proc` once more immediately before the signal, which is where the manager's
+    /// own second reading of the chain stood.
+    pub(super) fn signal_controller_for_queue(
+        controller: &Path,
+        pid_file: &Path,
+        ready_file: &Path,
+        lock: &Path,
+        package_uid: u32,
+    ) -> Result<bool, QueueWakeRefusal> {
+        let pid = match controller_pid_file_value(pid_file, package_uid) {
+            Ok(None) => return Ok(false),
+            Ok(Some(pid)) => pid,
+            Err(_) => return Err(QueueWakeRefusal::PidFileUnsafe),
+        };
+        match pid_is_live(pid) {
+            Ok(true) => {}
+            Ok(false) => return Ok(false),
+            Err(_) => return Err(QueueWakeRefusal::PidProbeFailed),
+        }
+        let identity =
+            trusted_controller_identity(controller, pid_file, ready_file, lock, package_uid, pid)
+                .map_err(|_| QueueWakeRefusal::IdentityUntrusted)?
+                .ok_or(QueueWakeRefusal::IdentityUntrusted)?;
+        validate_live_process_identity(identity.pid, identity.start, &identity.boot, package_uid)
+            .map_err(|_| QueueWakeRefusal::IdentityChanged)?;
+        // SAFETY: kill takes no pointers. The pid is the controller the chain above just proved
+        // to be the package's own, by pid, start tick, boot id and owner.
+        if unsafe { libc::kill(identity.pid as libc::pid_t, libc::SIGUSR2) } == 0 {
+            return Ok(true);
+        }
+        match io::Error::last_os_error().raw_os_error() {
+            Some(libc::ESRCH) => Ok(false),
+            _ => Err(QueueWakeRefusal::SignalFailed),
+        }
+    }
+
+    /// What identifies the bytes the Activity feed is built from: for each file in the rotation
+    /// its inode, size, times, mode, owner and link count, or `-` where it is absent.
+    ///
+    /// The change time, mode, owner and links are in it so that a file that became unsafe
+    /// (the reason a read refuses it) is never read as "unchanged".
+    ///
+    /// `None` when any of them cannot be examined, which is never a "same as before": the read
+    /// that follows is the one that names the file and the check that failed.
+    pub(super) fn activity_files_stamp(log_root: &Path) -> Option<String> {
+        let mut stamp = String::new();
+        for path in rotating_log_paths(&log_root.join("activity.log"), 3) {
+            match fs::symlink_metadata(&path) {
+                Ok(metadata) => {
+                    use std::fmt::Write as _;
+                    let _ = write!(
+                        stamp,
+                        "{:x}.{:x}.{:x}.{:x}.{:x}.{:x}.{:o}.{:x}.{:x};",
+                        metadata.st_ino(),
+                        metadata.st_size(),
+                        metadata.st_mtime(),
+                        metadata.st_mtime_nsec(),
+                        metadata.st_ctime(),
+                        metadata.st_ctime_nsec(),
+                        metadata.st_mode(),
+                        metadata.st_uid(),
+                        metadata.st_nlink()
+                    );
+                }
+                Err(error) if error.kind() == io::ErrorKind::NotFound => stamp.push_str("-;"),
+                Err(_) => return None,
+            }
+        }
+        Some(stamp)
     }
 
     fn rotating_log_paths(base: &Path, keep: usize) -> Vec<PathBuf> {
@@ -25152,6 +25344,110 @@ mod tests {
         let stopped = assert_snapshot_parity(&fixture);
         assert_eq!(stopped["service"]["state"], "stopped");
         assert_eq!(stopped["service"]["pid"], 0);
+    }
+
+    /// The queue wake is the service's own signal, and it goes only to a controller the whole
+    /// chain proves: the PID file, the readiness record and the live lock agreeing on pid, start
+    /// tick and boot id. Every other state is either the ordinary "not running" (no signal, no
+    /// failure) or a named refusal, and a process that is not the controller is left running.
+    /// `SIGUSR2` is fatal to the stand-in (`sleep`), so a delivered signal is visible as its exit.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_queue_wake_signals_only_a_controller_the_whole_chain_proves() {
+        use std::os::unix::process::ExitStatusExt;
+
+        let fixture = TestShellPackageFixture::new("queue-wake");
+        let paths = fixture.paths();
+        let uid = fixture.package_uid();
+        let pid_file = fixture.run_dir.join("controller.pid");
+        let ready_file = fixture.run_dir.join("controller.ready");
+        let lock = fixture.run_dir.join("controller.lock");
+        let wake = || {
+            linux_files::signal_controller_for_queue(
+                paths.controller,
+                &pid_file,
+                &ready_file,
+                &lock,
+                uid,
+            )
+        };
+
+        // Nothing published: not running, which is not a failure.
+        assert_eq!(wake(), Ok(false));
+
+        // A pid file that is not the one-line private file the manager writes is refused by
+        // name, not read as "not running".
+        let mut live = fixture.spawn_long_lived();
+        let live_pid = live.id();
+        fixture.write_config(
+            &pid_file,
+            &format!(
+                "{live_pid}
+{live_pid}
+"
+            ),
+        );
+        assert_eq!(wake(), Err(linux_files::QueueWakeRefusal::PidFileUnsafe));
+
+        // Alive, named by the PID file, but with no identity behind it: never signalled.
+        fixture.write_config(
+            &pid_file,
+            &format!(
+                "{live_pid}
+"
+            ),
+        );
+        assert_eq!(
+            wake(),
+            Err(linux_files::QueueWakeRefusal::IdentityUntrusted)
+        );
+        assert!(
+            live.try_wait().unwrap().is_none(),
+            "an unproven pid was signalled"
+        );
+
+        // A readiness record whose start tick is not this process's: still not the controller.
+        let start = linux_files::process_start(live_pid).unwrap();
+        let boot = fs::read_to_string("/proc/sys/kernel/random/boot_id")
+            .unwrap()
+            .trim()
+            .to_owned();
+        let identity = format!(
+            "{live_pid}
+{start}
+{boot}
+"
+        );
+        fs::create_dir_all(&lock).unwrap();
+        fs::set_permissions(&lock, fs::Permissions::from_mode(0o700)).unwrap();
+        fixture.write_config(&lock.join("pid"), &identity);
+        fixture.write_config(
+            &ready_file,
+            &format!(
+                "{live_pid}
+{}
+{boot}
+",
+                start + 1
+            ),
+        );
+        assert_eq!(
+            wake(),
+            Err(linux_files::QueueWakeRefusal::IdentityUntrusted)
+        );
+        assert!(
+            live.try_wait().unwrap().is_none(),
+            "a mismatched start tick was signalled"
+        );
+
+        // The full identity: the wake is delivered.
+        fixture.write_config(&ready_file, &identity);
+        assert_eq!(wake(), Ok(true));
+        let status = live.wait().unwrap();
+        assert_eq!(status.signal(), Some(libc::SIGUSR2));
+
+        // The same records for a process that has since exited are the ordinary "not running".
+        assert_eq!(wake(), Ok(false));
     }
 
     /// S3-3: a daemon killed outright (`kill -9`) cannot clear the `degraded=` block it left in
