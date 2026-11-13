@@ -52,9 +52,10 @@ restore) that keeps size and mtime.
   server-side copy can use it (both need a full fingerprint read from the bytes), and a pair that
   differed is never stored. The worst a wrong record can do is skip an upload of a pair whose every
   fact held.
-- **The canary.** Every run re-verifies `--pair-index-canary` stored pairs live (default 25). If one
-  disagrees, the whole index is discarded, every pair is verified live in the same run, and the
-  disagreement is named (`pair-index-canary-mismatch`, with the path and digest prefixes).
+- **The canary.** Every run re-verifies `--pair-index-canary` stored pairs live (default 25, or 2 on
+  a run scoped below the source root with `--scope`). If one disagrees, the whole index is
+  discarded, every pair is verified live in the same run, and the disagreement is named
+  (`pair-index-canary-mismatch`, with the path and digest prefixes).
 - **Rolling expiry.** Evidence older than `--pair-index-max-age` days (default 30) is re-verified,
   spread across the second half of that window rather than all at once.
 - **Racy evidence is never served.** A pair observed within the racy window of its last change, on
@@ -202,13 +203,13 @@ sync with `--pair-index /var/packages/synology-drive-sync/var/state/cache/pairs`
 ## Reconciliation
 
 Independently of the index, post-run reconciliation re-lists both sides in full and verifies live
-only the pairs the run touched, plus a canary of 25 untouched pairs. Every other pair whose facts
-did not move keeps the digests the plan pass proved, provided the NAS listing carries a change
-time for it and neither side's change time was within the racy window of the read that produced
-the digest (the run's start locally, the `MD5.start` clock on the NAS: this run's, or for a pair
-the index served, the clock of the run that proved it), and that clock was not more than 20 s
-ahead of this host's clock (a clock ahead cannot judge the window, as for the index above; one
-behind only makes a pair racier and is judged as it is); otherwise it is verified live. That demotion is not a separate warning: it
-shows as a lower carried count in the `reconciliation` object. The result's `reconciliation` object says how
-many pairs were carried and verified live. `--reconcile full` (hidden, command line only) restores
-the exhaustive pass.
+only the pairs the run touched, plus a canary of 25 untouched pairs (2 on a run scoped below the
+source root). Every other pair whose facts did not move keeps the digests the plan pass proved,
+provided the NAS listing carries a change time for it and neither side's change time was within the
+racy window of the read that produced the digest (the run's start locally, the `MD5.start` clock on
+the NAS: this run's, or for a pair the index served, the clock of the run that proved it), and that
+clock was not more than 20 s ahead of this host's clock (a clock ahead cannot judge the window, as
+for the index above; one behind only makes a pair racier and is judged as it is); otherwise it is
+verified live. That demotion is not a separate warning: it shows as a lower carried count in the
+`reconciliation` object. The result's `reconciliation` object says how many pairs were carried and
+verified live. `--reconcile full` (hidden, command line only) restores the exhaustive pass.

@@ -172,11 +172,12 @@ mirror converges within the run rather than waiting for a later one. The counts 
 `deletes_skipped` and `kept_deletes_uploaded`.
 
 Post-run reconciliation rebuilds the plan from live state and requires it to describe no remaining
-work. It re-lists both sides in full, which is what proves nothing else moved, and verifies live every
-pair the run touched (uploaded, copied, created, renamed, deleted or deferred) plus a canary of 25
-untouched pairs. Every other pair whose local size, times, device and inode and whose NAS size and
-times are exactly what the plan pass saw keeps the digests the plan pass proved. A canary that
-disagrees makes the same pass verify every pair live and is named (`reconcile-carry-canary-mismatch`).
+work. It re-lists both sides in full, which is what proves nothing else moved, and verifies live
+every pair the run touched (uploaded, copied, created, renamed, deleted or deferred) plus a canary
+of 25 untouched pairs (2 on a run scoped below the source root with `--scope`). Every other pair
+whose local size, times, device and inode and whose NAS size and times are exactly what the plan
+pass saw keeps the digests the plan pass proved. A canary that disagrees makes the same pass verify
+every pair live and is named (`reconcile-carry-canary-mismatch`).
 What this gives up is a NAS content change during the run that leaves size, mtime and change time all
 unchanged, which a write through the kernel cannot do; when the NAS reports no change time, a
 same-size, same-mtime rewrite by another writer during the run is seen by the next run instead.

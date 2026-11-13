@@ -562,7 +562,7 @@ pub struct SyncBehaviorArgs {
     #[arg(long, value_enum, hide = true, help_heading = "Sync")]
     pub reconcile: Option<ReconcileArg>,
 
-    /// Untouched pairs reconciliation re-verifies live as a canary (default 25).
+    /// Untouched pairs reconciliation re-verifies live as a canary (default 25; 2 under --scope).
     #[arg(long, value_name = "N", hide = true, help_heading = "Sync")]
     pub reconcile_canary: Option<usize>,
 
@@ -591,7 +591,7 @@ pub struct SyncBehaviorArgs {
     #[arg(long, value_name = "DAYS", requires = "pair_index", value_parser = clap::value_parser!(u32).range(1..=3650), help_heading = "Sync")]
     pub pair_index_max_age: Option<u32>,
 
-    /// Stored pairs re-verified live every run as a canary (default 25).
+    /// Stored pairs re-verified live every run as a canary (default 25; 2 under --scope).
     #[arg(long, value_name = "N", requires = "pair_index", help_heading = "Sync")]
     pub pair_index_canary: Option<usize>,
 

@@ -813,16 +813,16 @@ fn resolve_behavior(
         // already planned and had confirmed; nothing else can reach it.
         force_resync: false,
         reconcile: arguments.reconcile.unwrap_or_default(),
-        reconcile_canary: arguments
-            .reconcile_canary
-            .unwrap_or(synology_drive_sync::digest_evidence::DEFAULT_CANARY),
+        reconcile_canary: arguments.reconcile_canary.unwrap_or_else(|| {
+            synology_drive_sync::digest_evidence::default_canary(arguments.scope.as_deref())
+        }),
         memory_budget_mib: arguments.memory_budget,
         pair_index: arguments.pair_index.clone(),
         pair_index_refresh: arguments.pair_index_refresh,
         pair_index_max_age_days: arguments.pair_index_max_age.unwrap_or(30),
-        pair_index_canary: arguments
-            .pair_index_canary
-            .unwrap_or(synology_drive_sync::digest_evidence::DEFAULT_CANARY),
+        pair_index_canary: arguments.pair_index_canary.unwrap_or_else(|| {
+            synology_drive_sync::digest_evidence::default_canary(arguments.scope.as_deref())
+        }),
         pair_index_cache_mib: arguments.pair_index_cache_mib.unwrap_or(8),
     })
 }
