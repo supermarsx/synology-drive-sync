@@ -550,8 +550,8 @@ impl IndexSession {
         self.report.issues.push(issue);
     }
 
-    /// The run's carry did not serve `count` pairs because the NAS clock of the plan pass was not
-    /// one this host's clock bounds (`pair-index-plan-clock-unbounded`, information): they were
+    /// The run's carry did not serve `count` pairs because the NAS clock that proved them stood
+    /// ahead of this host's clock (`pair-index-plan-clock-unbounded`, information): they were
     /// verified live. Nothing is named for zero.
     pub fn note_plan_clock_unbounded(&mut self, count: usize) {
         if count == 0 {
@@ -562,7 +562,7 @@ impl IndexSession {
             &self.binding.remote,
             format!(
                 "{count} {} not carried from the plan pass: the NAS clock (the Date header of \
-                 its MD5.start) stood more than {NAS_CLOCK_TOLERANCE_SECONDS} s outside this \
+                 its MD5.start) stood more than {NAS_CLOCK_TOLERANCE_SECONDS} s ahead of this \
                  host's clock, so it cannot show whether a NAS change time was settled; they \
                  were verified live. Check the time settings of the NAS, and of any proxy in \
                  front of it",
