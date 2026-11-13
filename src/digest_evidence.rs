@@ -32,8 +32,31 @@ use crate::local::{EntryKind, LocalEntry, LocalInventory};
 use crate::plan::SyncPlan;
 use crate::sync::DeferredPath;
 
-/// Pairs re-verified live per run out of those a source could vouch for.
+/// Pairs re-verified live per run out of those a source could vouch for, on a run over the whole
+/// tree.
 pub const DEFAULT_CANARY: usize = 25;
+
+/// The same, on a run scoped below the source root (`--scope`: a realtime routine's changed
+/// folders, or an operator's subtree).
+///
+/// The canary exists to catch a source that is wrong in a way facts cannot show (a write path that
+/// moves no fact, an index bug). Such an error is systematic, so it shows on any sample, and the
+/// whole-tree runs (the daily full pass every realtime routine gets, interval and manual runs,
+/// overflow and catch-up) still draw [`DEFAULT_CANARY`]. A scoped run drawing 25 instead verified
+/// every pair of a folder of 25 files or fewer live, twice when it wrote (plan pass and carry),
+/// about 3 s of MD5 tasks per run on a DS416 (operator decision 2026-11-12, perf-design §5.2).
+pub const SCOPED_CANARY: usize = 2;
+
+/// The canary a run draws when none was configured: [`SCOPED_CANARY`] under a scope below the
+/// source root, [`DEFAULT_CANARY`] otherwise. A scope that names the root (`""` or `/`) is the
+/// whole tree, as [`crate::plan::Scope::parse`] reads it.
+pub fn default_canary(scope: Option<&str>) -> usize {
+    if scope.is_some_and(|scope| !scope.trim_matches('/').is_empty()) {
+        SCOPED_CANARY
+    } else {
+        DEFAULT_CANARY
+    }
+}
 
 /// How many hex digits of a digest a report names: enough to tell two digests apart by eye,
 /// never the whole value.
@@ -970,6 +993,28 @@ mod tests {
         assert!(all.served.is_empty());
         let none = split_canaries(pairs, 0, 9);
         assert!(none.canaries.is_empty());
+    }
+
+    #[test]
+    fn a_scoped_run_draws_two_canaries_and_a_whole_tree_run_twenty_five() {
+        assert_eq!(default_canary(None), DEFAULT_CANARY);
+        assert_eq!(default_canary(Some("")), DEFAULT_CANARY);
+        assert_eq!(default_canary(Some("/")), DEFAULT_CANARY);
+        assert_eq!(default_canary(Some("2026")), SCOPED_CANARY);
+        assert_eq!(default_canary(Some("/2026/11/")), SCOPED_CANARY);
+        // A ten-file folder is no longer verified whole.
+        let pairs: Vec<VouchedPair> = (0..10_u8)
+            .map(|index| VouchedPair {
+                local: format!("2026/11/{index}"),
+                remote: format!("2026/11/{index}"),
+                md5: [index; 16],
+                remote_too: true,
+                nas_clock: None,
+            })
+            .collect();
+        let scoped = split_canaries(pairs, default_canary(Some("2026/11")), 7);
+        assert_eq!(scoped.canaries.len(), 2);
+        assert_eq!(scoped.served.len(), 8);
     }
 
     #[test]
