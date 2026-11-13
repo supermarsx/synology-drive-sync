@@ -340,6 +340,7 @@
             <article class="sdsync-panel sdsync-rollup" aria-labelledby="sdsync-rollup-title">
               <div class="sdsync-panel-heading"><div><p class="sdsync-eyebrow">Stored totals</p><h3 id="sdsync-rollup-title">Sync summary</h3></div><div class="sdsync-evidence-heading-actions"><span class="sdsync-freshness">{{ statusRollupFreshness }}</span><v-button type="border" display="icon-text" aria-label="Re-read the stored totals" tooltip="Re-read what the last check recorded. This walks no folder and contacts no destination." :disabled="statusRollupLoading" :aria-busy="statusRollupLoading ? 'true' : 'false'" @click="refreshStatusRollup"><template #icon><action-icon :class="{ 'sdsync-is-spinning': statusRollupLoading }" name="refresh" /></template>Refresh</v-button></div></div>
               <p class="sdsync-field-note">Read back from what the last check recorded, so it opens straight away: no folder is walked and the destination is not contacted. Check one scope below when you need a live per-file comparison.</p>
+              <p v-if="statusRollupError" class="sdsync-field-note" role="status">The totals could not be re-read, so the last ones read are shown. {{ statusRollupError }}</p>
               <p v-if="!statusRollup.loaded || (!statusRollup.total && !statusRollup.profiles.length)" class="sdsync-empty">{{ statusRollupMessage }}</p>
               <template v-else>
                 <dl v-if="statusRollupCards.length" class="sdsync-sync-stats sdsync-rollup-stats" aria-label="Combined stored totals">
@@ -1362,6 +1363,28 @@ function queuedFailureGuidance(error) {
 // What the running operation last told us it was doing. One slot rather than
 // one per surface, because the package runs one queued operation at a time and
 // the AppWindow blocks the others while it does.
+// The cause a thrown value carries, as the one bounded line a toast can show: its name and
+// message, which is what the browser or DSM said and the only thing that tells a clipboard
+// refusal from a missing launcher. A value that is not an Error is shown as the text it is.
+function thrownCause(error) {
+  const name = plainText(error && error.name ? error.name : "Error", 40);
+  const message = plainText(error && error.message ? error.message : String(error), 160);
+  return `${name}: ${message}`;
+}
+
+// What `failureKey` recorded, as a sentence: the toast that has no attention item to quote
+// still says which failure it announces. The key's parts are the package's own fields.
+function failureKeyCause(key) {
+  const [kind, subject, epoch, exitCode, reason] = String(key || "").split(":");
+  const named = (value) => plainText(value || "", 80);
+  if (kind === "run") {
+    return `Run of ${named(subject) || "unknown scope"}${Number(epoch) > 0 ? ` at ${formatDate(Number(epoch))}` : ""}${named(exitCode) ? `, exit ${named(exitCode)}` : ""}${named(reason) ? `, reason ${named(reason)}` : ""}.`;
+  }
+  if (kind === "aggregate") return `Aggregate run${Number(subject) > 0 ? ` finished ${formatDate(Number(subject))}` : ""}${named(epoch) ? `, reason ${named(epoch)}` : ""}.`;
+  if (kind === "profile") return `Profile ${named(subject) || "unknown"}${Number(epoch) > 0 ? ` at ${formatDate(Number(epoch))}` : ""}${named(exitCode) ? `, reason ${named(exitCode)}` : ""}.`;
+  return "";
+}
+
 // How long a status page this window already fetched may be shown again without walking both trees.
 // The walk is the cost (the package keeps no index of it), and a page the person went back to is
 // the same comparison they were just looking at, labelled with how old it is. A run that finishes
@@ -4422,7 +4445,7 @@ export default {
       pathBrowser: emptyPathBrowser(),
       routineEditorOpen: false, routineForm: emptyRoutine(), doctorForm: { scope: "all", level: "standard", write_test: false, write_confirm: false },
       syncStatusForm: { profile: "", scope: "", filter: "", state: "attention", limit: SYNC_PAGE_SIZE_DEFAULT, include_excluded: false },
-      statusRollup: emptyStatusRollup(), statusRollupLoading: false, statusRollupMessage: ROLLUP_IDLE_MESSAGE,
+      statusRollup: emptyStatusRollup(), statusRollupError: "", statusRollupReceivedAtMs: 0, statusRollupLoading: false, statusRollupMessage: ROLLUP_IDLE_MESSAGE,
       syncStatusResult: emptySyncStatusPage(), syncStatusPhase: "idle", syncStatusMessage: SYNC_STATUS_IDLE_MESSAGE,
       syncStatusBusy: false, syncStatusCursors: [], syncStatusPageNumber: 0, syncStatusCheckedAtMs: 0, syncStatusFromMemory: false,
       resyncForm: { scope: "" }, resyncPlan: emptyResyncPlan(), resyncPhase: "idle", resyncMessage: "", resyncBusy: false,
@@ -4770,8 +4793,16 @@ export default {
       const degraded = cacheHealthNote(this.outcomes);
       const suffix = degraded ? ` · ${degraded}` : "";
       if (!this.statusRollup.loaded) return "Not read yet" + suffix;
-      if (!this.statusRollup.observedAtEpoch) return "Never observed" + suffix;
-      return `Oldest evidence ${describeEvidenceAge(this.statusRollup.observedAtEpoch, this.packageNowSeconds)}${suffix}`;
+      const retained = this.statusRollupError ? ` · totals as read ${this.statusRollupReadAge}` : "";
+      if (!this.statusRollup.observedAtEpoch) return "Never observed" + retained + suffix;
+      return `Oldest evidence ${describeEvidenceAge(this.statusRollup.observedAtEpoch, this.packageNowSeconds)}${retained}${suffix}`;
+    },
+    // How long ago this window last read the totals, on the browser's own clock: the age of a
+    // read this window made, which the package's clock cannot say.
+    statusRollupReadAge() {
+      const received = Math.floor(numberOr(this.statusRollupReceivedAtMs, 0) / 1000);
+      const now = Math.floor(numberOr(this.nowMs, Date.now()) / 1000);
+      return received > 0 ? describeEvidenceAge(received, now) : "earlier";
     },
     statusRollupTotalNote() {
       const rollup = this.statusRollup;
@@ -5959,13 +5990,13 @@ export default {
       /* global SYNO */
       const launch = typeof SYNO !== "undefined" && SYNO.SDS && SYNO.SDS.AppLaunch;
       if (typeof launch !== "function") {
-        this.toast("DSM Help unavailable", "Open DSM Help and select Synology Drive Sync.", true);
+        this.toast("DSM Help unavailable", "DSM's help launcher (SYNO.SDS.AppLaunch) is not available in this window. Open DSM Help and select Synology Drive Sync.", true);
         return;
       }
       try {
         launch(HELP_APPLICATION, { app: APP_CLASS, content: HELP_CONTENT[this.route] || HELP_CONTENT.overview }, false);
-      } catch (_error) {
-        this.toast("DSM Help unavailable", "Open DSM Help and select Synology Drive Sync.", true);
+      } catch (error) {
+        this.toast("DSM Help unavailable", `DSM refused to open its help (${thrownCause(error)}). Open DSM Help and select Synology Drive Sync.`, true);
       }
     },
     navigate(route) {
@@ -7870,16 +7901,22 @@ export default {
         const model = await apiGet(this.auth, "status-rollup");
         if (this.disposed) return;
         const rollup = normalizedStatusRollup(model);
+        if (!rollup.loaded) {
+          // A document that is not the totals is a failed read like any other: the totals this
+          // window already holds stay on screen, with the reason beside them.
+          this.statusRollupFailed(UNREADABLE_RESPONSE);
+          return;
+        }
         this.statusRollup = rollup;
-        if (!rollup.loaded) this.statusRollupMessage = UNREADABLE_RESPONSE;
-        else if (!rollup.total && !rollup.profiles.length) this.statusRollupMessage = ROLLUP_IDLE_MESSAGE;
+        this.statusRollupError = "";
+        this.statusRollupReceivedAtMs = Date.now();
+        if (!rollup.total && !rollup.profiles.length) this.statusRollupMessage = ROLLUP_IDLE_MESSAGE;
       } catch (error) {
         if (this.disposed) return;
-        this.statusRollup = emptyStatusRollup();
-        this.statusRollupMessage = boundedText(
+        this.statusRollupFailed(boundedText(
           this.describeBridgeError(error, "status").message,
           "The stored totals could not be read."
-        );
+        ));
       } finally {
         if (!this.disposed) this.statusRollupLoading = false;
       }
@@ -8157,8 +8194,8 @@ export default {
         await this.writeTroubleshootingClipboard(text);
         this.toast(`${subject} copied`, "Known DSM session and credential field shapes were redacted. Review the bounded text before sharing.");
         return true;
-      } catch (_error) {
-        this.toast("Copy failed", "DSM or the browser denied clipboard access. Select the visible evidence and copy it manually.", true);
+      } catch (error) {
+        this.toast("Copy failed", `DSM or the browser denied clipboard access (${thrownCause(error)}). Select the visible evidence and copy it manually.`, true);
         return false;
       }
     },
@@ -8326,7 +8363,7 @@ export default {
           if (!problem) {
             logsOk = true;
             const records = this.logRecordsFrom(logs.value);
-            this.logRecords = records;
+            this.logRecords = Object.freeze(records);
             this.logsReceivedAtMs = Date.now();
             this.logOutput = records.length
               ? records.map((record) => `[${record.source}] ${record.text}`).join("\n").slice(0, MAX_RESPONSE_BYTES)
@@ -8622,7 +8659,7 @@ export default {
       if (!key || key === this.lastOutcomeFailureKey) return;
       this.lastOutcomeFailureKey = key;
       const item = this.attentionItems.find((candidate) => candidate.level === "fail");
-      this.toast(item ? item.title : "A sync failed", item ? item.detail : "Open Activity for details.", true);
+      this.toast(item ? item.title : "A sync failed", item ? item.detail : guidanceText(failureKeyCause(key), "No attention item describes it. Open Activity for details."), true);
     },
     playCue() { try { const AudioContext = window.AudioContext || window.webkitAudioContext; if (!AudioContext) return; const context = new AudioContext(); const oscillator = context.createOscillator(); const gain = context.createGain(); oscillator.frequency.value = 440; gain.gain.setValueAtTime(0.0001, context.currentTime); gain.gain.exponentialRampToValueAtTime(0.08, context.currentTime + 0.02); gain.gain.exponentialRampToValueAtTime(0.0001, context.currentTime + 0.18); oscillator.connect(gain); gain.connect(context.destination); oscillator.start(); oscillator.stop(context.currentTime + 0.2); oscillator.addEventListener("ended", () => context.close(), { once: true }); } catch (_error) { /* Best-effort local signal only. */ } },
     confirmationElement(reference) {
