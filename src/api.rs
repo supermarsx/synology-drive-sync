@@ -313,13 +313,16 @@ impl PinnedResolver {
         (resolved_at.elapsed() < DNS_PIN_TTL).then(|| addresses.clone())
     }
 
-    /// Drop every pinned answer, because a connection to one of them just failed.
-    fn forget(&self) {
+    /// Drop every pinned answer, because a connection to one of them just failed. True when
+    /// there was something to drop.
+    fn forget(&self) -> bool {
         let mut answers = self.answers.lock().unwrap_or_else(PoisonError::into_inner);
-        if !answers.is_empty() {
-            answers.clear();
-            self.forgotten.fetch_add(1, Ordering::AcqRel);
+        if answers.is_empty() {
+            return false;
         }
+        answers.clear();
+        self.forgotten.fetch_add(1, Ordering::AcqRel);
+        true
     }
 }
 
@@ -1329,6 +1332,14 @@ pub enum ApiObservation {
     CallStarted(ApiCallDetail),
     /// A request finished, successfully or not.
     CallCompleted(ApiCallDetail),
+    /// DSM did not answer a multi-path `getinfo` in a shape this client accepts, so the serial
+    /// form runs for the rest of the client's life. Carries the call that was refused, with the
+    /// DSM code or the decode outcome that settled it. Once per client.
+    GetinfoBatchFallback(ApiCallDetail),
+    /// A connect failed and the name pinned from an earlier lookup was dropped, so the next
+    /// attempt resolves it afresh. Once per drop. Carries nothing: the endpoint is the
+    /// `Connected` observation's, which a default-level log never shows.
+    DnsPinDropped,
 }
 
 /// Receives one record per HTTP round trip this client makes.
@@ -5619,23 +5630,33 @@ impl ApiClient {
             self.call::<GetInfoData>("SYNO.FileStation.List", 2, "getinfo", parameters, true);
         let data = match answered {
             Ok(Some(data)) => data,
-            Ok(None) => return self.get_info_many_serially(paths, true),
+            Ok(None) => {
+                return self.get_info_many_serially(
+                    paths,
+                    Some(Error::InvalidResponse {
+                        operation: "SYNO.FileStation.List.getinfo".to_owned(),
+                        message: "successful response contained no path information".to_owned(),
+                    }),
+                );
+            }
             // One envelope-level "not found" for a call that named several paths cannot be
             // attributed to any one of them, and says nothing against the multi-path form: the
             // serial calls give every path its own answer, and the next batch is still tried.
             Err(error) if error.api_code() == Some(408) => {
-                return self.get_info_many_serially(paths, false);
+                return self.get_info_many_serially(paths, None);
             }
             // DSM rejecting the multi-path form outright (an unknown or invalid parameter). The
             // serial calls give every path its own authoritative answer. Any other DSM refusal (no
             // permission, a dead session) is about the request, not its shape, and the serial
             // calls would only repeat it, so it passes through.
-            Err(Error::Api {
-                code: 100 | 101 | 120 | 400 | 401,
-                ..
-            })
-            | Err(Error::InvalidResponse { .. }) => {
-                return self.get_info_many_serially(paths, true);
+            Err(
+                error @ (Error::Api {
+                    code: 100 | 101 | 120 | 400 | 401,
+                    ..
+                }
+                | Error::InvalidResponse { .. }),
+            ) => {
+                return self.get_info_many_serially(paths, Some(error));
             }
             Err(error) => return Err(error),
         };
@@ -5656,7 +5677,16 @@ impl ApiClient {
             }
         }
         if !matched {
-            return self.get_info_many_serially(paths, true);
+            return self.get_info_many_serially(
+                paths,
+                Some(Error::InvalidResponse {
+                    operation: "SYNO.FileStation.List.getinfo".to_owned(),
+                    message: format!(
+                        "the answer did not name each of the {} paths asked, once",
+                        paths.len()
+                    ),
+                }),
+            );
         }
         self.floor.getinfo_batches.fetch_add(1, Ordering::AcqRel);
         self.floor
@@ -5675,15 +5705,33 @@ impl ApiClient {
     }
 
     /// The serial answer to [`Self::get_info_many`], after the batch was not usable.
+    ///
+    /// `refusal` is why the batch was not usable, or `None` when it merely could not be told apart
+    /// per path (an envelope-level "not found"), which says nothing against the form. A refusal
+    /// latches the serial form and is named once, through the observer, with the call that was
+    /// refused and the DSM code or decode outcome that settled it.
     fn get_info_many_serially(
         &self,
         paths: &[String],
-        latch: bool,
+        refusal: Option<Error>,
     ) -> Result<Vec<Result<RemoteItem>>> {
-        if latch {
-            self.floor
+        if let Some(error) = refusal
+            && !self
+                .floor
                 .batch_getinfo_unusable
-                .store(true, Ordering::Release);
+                .swap(true, Ordering::AcqRel)
+        {
+            // The route stays empty: a default-level log carries no WebAPI path, and the call is
+            // named by its API, method and the code that refused it.
+            let mut record = ApiCallDetail::started(
+                "SYNO.FileStation.List",
+                "getinfo",
+                2,
+                BoundedText::sanitized(""),
+                RequestTransport::Form,
+            );
+            apply_outcome::<()>(&mut record, &Err(error), "SYNO.FileStation.List");
+            self.observe(ApiObservation::GetinfoBatchFallback(record));
         }
         self.floor
             .getinfo_batch_fallbacks
@@ -6127,8 +6175,10 @@ impl ApiClient {
                 source,
             })
             .and_then(|response| decode_response_observed(response, api, method, facts));
-        if matches!(&outcome, Err(Error::Http { source, .. }) if source.is_connect()) {
-            self.floor.dns.forget();
+        if matches!(&outcome, Err(Error::Http { source, .. }) if source.is_connect())
+            && self.floor.dns.forget()
+        {
+            self.observe(ApiObservation::DnsPinDropped);
         }
         record.elapsed_ms = duration_millis_saturating(started.elapsed());
         apply_response_facts(&mut record, *facts);
@@ -19229,6 +19279,143 @@ FplE
         assert_eq!(error.api_code(), Some(105));
         assert_eq!(client.request_floor_counters().getinfo_batch_fallbacks, 0);
         assert_eq!(server.join().unwrap().len(), 3);
+    }
+
+    fn observed_client(url: String) -> (ApiClient, Arc<Mutex<Vec<ApiObservation>>>) {
+        let seen: Arc<Mutex<Vec<ApiObservation>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&seen);
+        let observer: RequestObserver = Arc::new(move |observation| {
+            if let Ok(mut sink) = sink.lock() {
+                sink.push(observation);
+            }
+        });
+        let client = ApiClient::connect_observed(
+            &ClientOptions {
+                base_url: url,
+                allow_http: true,
+                accept_invalid_certs: false,
+                ca_certificate: None,
+                connect_timeout: Duration::from_secs(2),
+                request_timeout: Duration::from_secs(5),
+                retries: 0,
+            },
+            Some(observer),
+        )
+        .unwrap();
+        (client, seen)
+    }
+
+    fn fallbacks(seen: &Mutex<Vec<ApiObservation>>) -> Vec<ApiCallDetail> {
+        seen.lock()
+            .unwrap()
+            .iter()
+            .filter_map(|observation| match observation {
+                ApiObservation::GetinfoBatchFallback(call) => Some(*call),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_latched_getinfo_fallback_is_named_once_with_the_code_that_refused_it() {
+        let (url, server) = scripted_server(vec![
+            required_discovery(),
+            login_response(),
+            r#"{"success":false,"error":{"code":400}}"#.to_owned(),
+            getinfo_directory("/share"),
+            getinfo_directory("/share/root"),
+            r#"{"success":true}"#.to_owned(),
+            // The second walk never tries the batch again.
+            getinfo_directory("/share"),
+            getinfo_directory("/share/root"),
+            r#"{"success":true}"#.to_owned(),
+        ]);
+        let (mut client, seen) = observed_client(url);
+        client.login("alice", "password", None).unwrap();
+        let root = RemoteRoot::parse("/share/root").unwrap();
+        client.verify_destination_writable(&root).unwrap();
+        client.verify_destination_writable(&root).unwrap();
+        server.join().unwrap();
+        let named = fallbacks(&seen);
+        assert_eq!(named.len(), 1, "once per latch, never per request");
+        let call = named[0];
+        assert_eq!(call.api, "SYNO.FileStation.List");
+        assert_eq!(call.method, "getinfo");
+        assert_eq!(call.outcome, RequestOutcome::DsmError);
+        assert_eq!(call.dsm_code, Some(400));
+        assert_eq!(call.route.as_str(), "", "no WebAPI path below debug");
+    }
+
+    #[test]
+    fn a_getinfo_answer_of_the_wrong_shape_is_named_as_a_decode_outcome() {
+        let (url, server) = scripted_server(vec![
+            required_discovery(),
+            login_response(),
+            // Two paths asked, one entry answered.
+            getinfo_directory("/share"),
+            getinfo_directory("/share"),
+            getinfo_directory("/share/root"),
+            r#"{"success":true}"#.to_owned(),
+        ]);
+        let (mut client, seen) = observed_client(url);
+        client.login("alice", "password", None).unwrap();
+        client
+            .verify_destination_writable(&RemoteRoot::parse("/share/root").unwrap())
+            .unwrap();
+        server.join().unwrap();
+        let named = fallbacks(&seen);
+        assert_eq!(named.len(), 1);
+        assert_eq!(named[0].outcome, RequestOutcome::Decode);
+        assert_eq!(named[0].dsm_code, None);
+    }
+
+    #[test]
+    fn an_envelope_level_not_found_is_not_named_and_does_not_latch() {
+        let (url, server) = scripted_server(vec![
+            required_discovery(),
+            login_response(),
+            r#"{"success":false,"error":{"code":408}}"#.to_owned(),
+            getinfo_absent("/share"),
+        ]);
+        let (mut client, seen) = observed_client(url);
+        client.login("alice", "password", None).unwrap();
+        // The serial answer follows the batch; the second path is never asked after the first
+        // is absent.
+        let answers = client
+            .get_info_many(&["/share".to_owned(), "/share/root".to_owned()])
+            .unwrap();
+        assert_eq!(answers.len(), 1);
+        assert_eq!(answers[0].as_ref().unwrap_err().api_code(), Some(408));
+        server.join().unwrap();
+        assert!(fallbacks(&seen).is_empty());
+        assert!(!client.floor.batch_getinfo_unusable.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn a_dropped_dns_pin_is_named_once_per_drop_and_only_when_something_was_pinned() {
+        let (url, server) = scripted_server(vec![required_discovery(), login_response()]);
+        let url = url.replace("127.0.0.1", "localhost");
+        let (mut client, seen) = observed_client(url);
+        client.login("alice", "password", None).unwrap();
+        server.join().unwrap();
+        let dropped = |seen: &Mutex<Vec<ApiObservation>>| {
+            seen.lock()
+                .unwrap()
+                .iter()
+                .filter(|observation| matches!(observation, ApiObservation::DnsPinDropped))
+                .count()
+        };
+        assert_eq!(dropped(&seen), 0);
+        // The server is gone: the next connect is refused, which ends the pin and says so.
+        assert!(client.confirm_file_station_session().is_err());
+        assert_eq!(dropped(&seen), 1);
+        // The lookup that followed pinned the name again, so a second refusal is a second drop.
+        assert!(client.confirm_file_station_session().is_err());
+        assert_eq!(dropped(&seen), 2);
+        // With nothing pinned there is nothing to drop and nothing to name.
+        assert!(!client.floor.dns.forget());
+        assert_eq!(client.request_floor_counters().dns_pins_dropped, 2);
+        assert_eq!(dropped(&seen), 2);
     }
 
     #[test]

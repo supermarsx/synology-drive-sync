@@ -148,6 +148,11 @@ pub enum EventCode {
     DirectoryCreated,
     EntryDeleted,
     RetryScheduled,
+    /// DSM did not answer a multi-path `getinfo` in a shape this client accepts; the serial form
+    /// runs instead, for the rest of the client's life. Carries the refused call.
+    GetinfoBatchFallback,
+    /// A connect failed, so the name resolved earlier is looked up again. Carries the connection.
+    DnsPinDropped,
     CancellationRequested,
     /// A run finished without error but left entries for the next run.
     RunPartial,
@@ -186,7 +191,7 @@ impl EventCode {
     /// Exhaustive by construction: a new variant that is not listed here fails
     /// `every_event_code_has_a_stable_machine_and_human_name`, so no code can ship without a
     /// stable machine name and human message.
-    pub const ALL: [Self; 40] = [
+    pub const ALL: [Self; 42] = [
         Self::RunBuild,
         Self::RunStarted,
         Self::RunCompleted,
@@ -214,6 +219,8 @@ impl EventCode {
         Self::DirectoryCreated,
         Self::EntryDeleted,
         Self::RetryScheduled,
+        Self::GetinfoBatchFallback,
+        Self::DnsPinDropped,
         Self::CancellationRequested,
         Self::RunPartial,
         Self::EntrySkipped,
@@ -259,6 +266,8 @@ impl EventCode {
             Self::DirectoryCreated => "directory.created",
             Self::EntryDeleted => "entry.deleted",
             Self::RetryScheduled => "retry.scheduled",
+            Self::GetinfoBatchFallback => "getinfo.batch_fallback",
+            Self::DnsPinDropped => "dns.pin_dropped",
             Self::CancellationRequested => "cancellation.requested",
             Self::RunPartial => "run.partial",
             Self::EntrySkipped => "entry.skipped",
@@ -306,6 +315,10 @@ impl EventCode {
             Self::DirectoryCreated => "directory created",
             Self::EntryDeleted => "entry deleted",
             Self::RetryScheduled => "retry scheduled",
+            Self::GetinfoBatchFallback => {
+                "DSM did not accept the multi-path getinfo; the serial form runs"
+            }
+            Self::DnsPinDropped => "a connect failed, so the pinned name is looked up again",
             Self::CancellationRequested => "cancellation requested",
             Self::RunPartial => "sync run completed with entries left for the next run",
             Self::EntrySkipped => "entry skipped",

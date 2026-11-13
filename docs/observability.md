@@ -140,6 +140,7 @@ upload.started                 upload.attempt_started          upload.progress
 upload.completed               upload.failed
 directory.created              entry.deleted
 retry.scheduled                cancellation.requested
+getinfo.batch_fallback         dns.pin_dropped
 run.partial                    entry.skipped                   entry.deferred
 result_record.failed
 reconcile.evidence             reconcile.carry_canary_mismatch
@@ -160,8 +161,8 @@ not have them, so every record listed before this release renders byte for byte 
 | `build` | `run.build` | Name, version, target triple, cargo profile, and commit. |
 | `connection` | `connection.established` | Scheme, host, port, base path, redirect policy, certificate policy. |
 | `session` | `session.established` | SID length, whether a token was issued, the requested login format, and whether the server set a cookie. |
-| `call` | `api_call.*`, `retry.scheduled` | One HTTP round trip: see below. |
-| `reason` | `run.failed`, `run.partial`, `upload.failed`, `entry.skipped`, `entry.deferred`, `result_record.failed` | The class of the failure, skip or deferral: one token from the closed list below. Never error text. |
+| `call` | `api_call.*`, `retry.scheduled`, `getinfo.batch_fallback` | One HTTP round trip: see below. |
+| `reason` | `dns.pin_dropped`, `run.failed`, `run.partial`, `upload.failed`, `entry.skipped`, `entry.deferred`, `result_record.failed` | The class of the failure, skip or deferral: one token from the closed list below. Never error text. |
 | `profile` | records attributable to one profile | The profile name (`[A-Za-z0-9_-]`). Every record of a profile's sync or plan job carries it, including the transport's `api_call.*` and `retry.scheduled`. |
 | `path` | `upload.failed`, `entry.skipped`, `entry.deferred`, `result_record.failed`, and `run.failed` when the failure concerns one entry | Relative path of the entry concerned, percent-encoded so it stays one safe token and decodes exactly: every byte outside `A-Z a-z 0-9 . - _ / : ,` (non-ASCII, space and `%` included) is written `%XX`. Cut at 255 characters with a trailing `~`, which never splits an escape. Never on authentication or connection records. |
 
@@ -269,6 +270,12 @@ Specifically:
   the deserializer named, the deserializer's own description of what it wanted, and the JSON
   **type** it found. serde's own message is not forwarded, because `invalid type: string "…"`
   quotes the value it rejected.
+
+Two `info` records name a change in how the run talks to the NAS, once each and never per request.
+`getinfo.batch_fallback` says DSM did not accept the one-request `getinfo` that names every ancestor
+of the destination (the `call` member gives the DSM code or the decode outcome), so the serial form
+ran for the rest of the run. `dns.pin_dropped` says a connect failed and the name looked up earlier
+in the run is looked up again (`reason` is `network`). Neither carries a host or a WebAPI path.
 
 > **`--log-level debug` with `--remote-log-url` discloses the NAS hostname.** The
 > `connection.established` record contains the endpoint host and port, and `api_call.*` records

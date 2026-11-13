@@ -8000,6 +8000,17 @@ fn observation_event(observation: ApiObservation) -> LogEvent {
             };
             LogEvent::new(level, code).call(call)
         }
+        // Named once each, at the level a user running at the default sees. Neither carries a
+        // host or a WebAPI path, which no record below DEBUG may (docs/observability.md): the
+        // first names the refused call by API, method and DSM code, the second names the class of
+        // the failure. The endpoint is in the DEBUG connection record of the same run.
+        ApiObservation::GetinfoBatchFallback(call) => {
+            LogEvent::new(EventLogLevel::Info, EventCode::GetinfoBatchFallback).call(call)
+        }
+        ApiObservation::DnsPinDropped => {
+            LogEvent::new(EventLogLevel::Info, EventCode::DnsPinDropped)
+                .reason(EventReason::Network)
+        }
     }
 }
 
@@ -10818,6 +10829,38 @@ mod tests {
     use synology_drive_sync::api::{DiscoveredApi, SessionChannels};
 
     use super::*;
+
+    /// The two request-floor changes are named once each at `info`, with a reason and with no
+    /// host or WebAPI path, which nothing below `debug` may carry.
+    #[test]
+    fn the_request_floor_observations_become_named_info_lines_without_host_or_path() {
+        use synology_drive_sync::observability::{
+            ApiCallDetail, BoundedText, RequestOutcome, RequestTransport,
+        };
+
+        let mut call = ApiCallDetail::started(
+            "SYNO.FileStation.List",
+            "getinfo",
+            2,
+            BoundedText::sanitized(""),
+            RequestTransport::Form,
+        );
+        call.outcome = RequestOutcome::DsmError;
+        call.dsm_code = Some(400);
+        let fallback = observation_event(ApiObservation::GetinfoBatchFallback(call));
+        assert_eq!(fallback.code, EventCode::GetinfoBatchFallback);
+        assert_eq!(fallback.level, EventLogLevel::Info);
+        let recorded = fallback.call.expect("the refused call rides on the event");
+        assert_eq!(recorded.dsm_code, Some(400));
+        assert_eq!(recorded.route.as_str(), "");
+        assert!(fallback.connection.is_none() && fallback.path.is_none());
+
+        let dropped = observation_event(ApiObservation::DnsPinDropped);
+        assert_eq!(dropped.code, EventCode::DnsPinDropped);
+        assert_eq!(dropped.level, EventLogLevel::Info);
+        assert_eq!(dropped.reason, Some(EventReason::Network));
+        assert!(dropped.connection.is_none() && dropped.call.is_none() && dropped.path.is_none());
+    }
 
     fn json_object_keys(value: &Value) -> BTreeSet<&str> {
         value
