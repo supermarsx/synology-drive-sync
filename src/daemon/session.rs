@@ -249,15 +249,58 @@ impl Sessions {
         }
     }
 
-    /// The service is stopping: end every kept session now, on this thread, one bounded logout
-    /// each, so none outlives the daemon.
+    /// The service is stopping: end every kept session now, all at once, and return when they are
+    /// ended or [`LOGOUT_TIMEOUT`] has passed, so an unanswering NAS cannot stretch the stop by a
+    /// logout per profile. One still unanswered at the bound is named.
     pub(crate) fn close(&self) {
         let Some(core) = &self.core else {
             return;
         };
         let held = std::mem::take(&mut core.lock().held);
+        let (done, ended) = std::sync::mpsc::channel();
+        let mut pending = Vec::new();
         for (profile, held) in held {
-            core.log_out_now(&profile, &held.handover, "service_stop");
+            let worker = {
+                let core = core.clone();
+                let profile = profile.clone();
+                let done = done.clone();
+                move || {
+                    core.log_out_now(&profile, &held.handover, "service_stop");
+                    let _ = done.send(profile);
+                }
+            };
+            match std::thread::Builder::new()
+                .name("sdsyncd-logout".into())
+                .spawn(worker)
+            {
+                Ok(_) => pending.push(profile),
+                Err(error) => core.lock().note(
+                    Level::Warn,
+                    "session_logout_failed",
+                    format!(
+                        "profile={profile} why=service_stop cause=no logout thread could be started: {error}; DSM ends the session on its own idle timer"
+                    ),
+                ),
+            }
+        }
+        drop(done);
+        let deadline = Instant::now() + LOGOUT_TIMEOUT + Duration::from_secs(1);
+        while !pending.is_empty() {
+            let left = deadline.saturating_duration_since(Instant::now());
+            match ended.recv_timeout(left) {
+                Ok(profile) => pending.retain(|name| *name != profile),
+                Err(_) => break,
+            }
+        }
+        for profile in pending {
+            core.lock().note(
+                Level::Warn,
+                "session_logout_failed",
+                format!(
+                    "profile={profile} why=service_stop cause=DSM did not answer within {} s; DSM ends the session on its own idle timer",
+                    LOGOUT_TIMEOUT.as_secs()
+                ),
+            );
         }
     }
 

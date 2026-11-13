@@ -301,8 +301,11 @@ fn every_run_borrows_one_login_and_the_stop_logs_it_out() {
             "{event}: {log}"
         );
     }
-    // The search is live: a file that does hold the SID is found.
-    let canary = daemon.p("var/state/canary");
+    // The search is live: a file that does hold the SID is found. Named by its real path: `var` is
+    // a DSM-shaped alias, and the search does not follow links into the tree it already walks.
+    let canary = fs::canonicalize(daemon.p("var/state"))
+        .unwrap()
+        .join("canary");
     fs::write(&canary, format!("sid={}-0", SECRETS[0])).unwrap();
     let (_, leaks) = daemon.secret_leaks();
     assert_eq!(
