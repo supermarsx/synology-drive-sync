@@ -274,7 +274,7 @@ Allowed authenticated GET actions are:
 | `csrf` | none beyond `action` |
 | `snapshot` | none beyond `action` |
 | `logs` | `lines=1..1000`, optional fixed source `all`, `api`, `doctor`, `controller`, `scheduler`, `sync`, or `audit` |
-| `activity` | `lines=1..1000` |
+| `activity` | `lines=1..1000`, optional `since=` (1 to 96 characters of `0-9a-f:-`: the `version` a previous full answer named) |
 | `result` | one 48-character lowercase hexadecimal server job ID |
 
 The API parser accepts a bounded token from `X-SYNO-TOKEN` or the legacy `SynoToken` query field and

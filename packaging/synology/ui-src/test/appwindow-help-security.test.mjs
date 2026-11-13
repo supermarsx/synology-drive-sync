@@ -464,7 +464,12 @@ test("routine editor emits only mode-relevant timing fields with bounded retry p
   assert.equal((app.match(/v-if="routineForm\.mode === 'daily'"[^>]*label="Window (?:starts|ends)"/g) || []).length, 2);
   assert.equal((app.match(/v-if="routineForm\.mode === 'realtime'"[^>]*label="(?:Realtime debounce|Fallback poll) \(seconds\)"/g) || []).length, 2);
   assert.match(app, /<fieldset v-if="routineForm\.mode === 'daily'" class="sdsync-weekday-fieldset"/);
-  assert.match(app, /debounce_seconds: 45/);
+  // The realtime debounce defaults to 15 s for a new routine, a routine record that names none, and a
+  // draft whose field is not a whole number. A value the person saved (45, 90) is shown and sent as it is.
+  assert.match(app, /debounce_seconds: 15,/);
+  assert.match(app, /numberOr\(routine\.debounce_seconds, 15\)/);
+  assert.match(app, /this\.integer\(this\.routineForm\.debounce_seconds, 15\)/);
+  assert.doesNotMatch(app, /debounce_seconds: 45/);
   assert.match(app, /between\(payload\.debounce_seconds, 1, 3600\)/);
   assert.match(app, /retry_count: 5/);
   assert.match(app, /retry_exponential: true/);

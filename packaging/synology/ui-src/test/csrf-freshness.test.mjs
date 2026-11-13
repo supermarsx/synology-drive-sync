@@ -234,5 +234,12 @@ test("a tab that becomes visible again drops a stale token before it refreshes",
   const refresh = visible.indexOf("this.refreshSnapshot(false);");
   assert.ok(drop > 0, "the visible branch must check the token");
   assert.ok(refresh > drop, "the snapshot refresh, which fetches a missing token first, must follow");
-  assert.match(appSource, /if \(!this\.csrfToken\) await this\.refreshCsrf\(\);/);
+  // A window with no token reads it beside the snapshot, not before it: the snapshot GET needs no
+  // token, so the two share one round trip instead of two in a row (the start-up read is joined).
+  assert.match(appSource, /if \(!this\.csrfToken\) \{\s*tokenRead = this\.csrfAttempt \|\| \{/);
+  assert.ok(
+    appSource.indexOf('const snapshotRead = apiGet(this.auth, "snapshot")') < appSource.indexOf("if (tokenRead) tokenError = await tokenRead.promise;"),
+    "the snapshot read must be in flight before the token read is awaited"
+  );
+  assert.doesNotMatch(appSource, /if \(!this\.csrfToken\) await this\.refreshCsrf\(\);/);
 });

@@ -92,6 +92,7 @@ const AUDIT_LOG_PATH: &str = "/var/packages/synology-drive-sync/var/log/audit.lo
 const ACTIVITY_LOG_PATH: &str = "/var/packages/synology-drive-sync/var/log/activity.log";
 const API_LOG_PATH: &str = "/var/packages/synology-drive-sync/var/log/api.log";
 const CGI_FAILURE_STATE_PATH: &str = "/var/packages/synology-drive-sync/var/run/cgi-failure.state";
+const CGI_SLOW_STATE_PATH: &str = "/var/packages/synology-drive-sync/var/run/cgi-slow.state";
 const API_SOCKET_PATH: &str = "/var/packages/synology-drive-sync/var/run/api.sock";
 const API_PID_PATH: &str = "/var/packages/synology-drive-sync/var/run/api.pid";
 const API_BOUND_PATH: &str = "/var/packages/synology-drive-sync/var/run/api.bound";
@@ -263,8 +264,6 @@ const CGI_POST_DEADLINE: Duration = Duration::from_secs(40);
 const CGI_RESPONSE_WRITE_TIMEOUT: Duration = Duration::from_secs(2);
 #[cfg(target_os = "linux")]
 const READ_MANAGER_TIMEOUT: Duration = Duration::from_secs(20);
-#[cfg(target_os = "linux")]
-const CONTROLLER_WAKE_TIMEOUT: Duration = Duration::from_secs(2);
 // These bound the consumer process that executes a queued interactive job, not
 // an API worker: `execute_connection_mutation` is reachable only from
 // `run_consumer`, which the controller starts as a separate `--consume-job`
@@ -1336,6 +1335,9 @@ enum ReadAction {
     },
     Activity {
         lines: u16,
+        /// The version a previous full answer carried. When it is still the current one the
+        /// answer is `{unchanged: true}` and the feed is not read, rendered or sanitised again.
+        since: Option<String>,
     },
     /// The stored per-profile totals and their combination.
     ///
@@ -2857,8 +2859,14 @@ fn parse_read_action(mut query: BTreeMap<String, String>) -> BridgeResult<ReadAc
         }
         "activity" => {
             let lines = parse_lines(query.remove("lines"))?;
+            let since = query.remove("since");
+            if let Some(since) = &since
+                && !valid_activity_version(since)
+            {
+                return Err(BridgeError::bad_request());
+            }
             require_empty_query(&query)?;
-            ReadAction::Activity { lines }
+            ReadAction::Activity { lines, since }
         }
         "status-rollup" => {
             // No arguments at all: the manager derives the expected profile set
@@ -3492,6 +3500,21 @@ fn valid_client_request_id(value: &str) -> bool {
         && value
             .bytes()
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+/// The longest `version` an Activity answer carries, and so the longest `since` a request may.
+const MAX_ACTIVITY_VERSION_BYTES: usize = 96;
+
+/// An Activity `version`: lower-case hex, `:` or `-`, at most [`MAX_ACTIVITY_VERSION_BYTES`].
+///
+/// The service writes 32 hex digits. The wider charset is the one the dashboard accepts on
+/// either side, so a later service may use separators without a page change.
+fn valid_activity_version(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= MAX_ACTIVITY_VERSION_BYTES
+        && value.bytes().all(|byte| {
+            byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte) || byte == b':' || byte == b'-'
+        })
 }
 
 fn valid_server_job_id(value: &str) -> bool {
@@ -7650,7 +7673,7 @@ fn read_manager_arguments(action: &ReadAction) -> BridgeResult<Vec<OsString>> {
                 source.as_str().into(),
             ]
         }
-        ReadAction::Activity { lines } => vec![
+        ReadAction::Activity { lines, .. } => vec![
             "api".into(),
             "activity".into(),
             "--lines".into(),
@@ -9266,10 +9289,9 @@ where
 /// Build a manager invocation against the installed manager.
 ///
 /// Every mutation-side caller uses this form. It keeps no path parameter on
-/// purpose: the installed manager is the only one a queued mutation, a
-/// controller wake or an audit record may ever run, and a cross-layer test in
-/// the packaging suite reads this call's exact text out of
-/// `wake_controller_after_enqueue` to prove the wake still goes through it.
+/// purpose: the installed manager is the only one a queued mutation or an
+/// audit record may ever run. (The controller wake no longer forks it: see
+/// `wake_controller_after_enqueue`.)
 #[cfg(target_os = "linux")]
 fn manager_command(arguments: &[OsString], has_secret_input: bool) -> BridgeResult<Command> {
     manager_command_at(Path::new(MANAGER_PATH), arguments, has_secret_input)
@@ -9341,24 +9363,42 @@ fn wake_controller_after_enqueue() {
     // duplicate dispatch. The controller's bounded polling fallback remains, so a
     // failure here costs latency, not work -- but it is recorded, because a wake path
     // that never works would otherwise only ever look like a slow dashboard.
-    let Ok(mut command) = manager_command(&["api".into(), "controller-wake".into()], false) else {
-        record_controller_wake_failure();
-        return;
-    };
-    match capture_bounded_command(&mut command, 1024, 1024, CONTROLLER_WAKE_TIMEOUT, None) {
-        Ok(output) if output.status_success => {}
-        _ => record_controller_wake_failure(),
-    }
-}
-
-/// One coalesced api.log record for a controller wake that did not happen.
-///
-/// Never an error to the caller: the request it follows was already accepted.
-#[cfg(target_os = "linux")]
-fn record_controller_wake_failure() {
+    //
+    // Done in this process. It used to run `sdsync-dsm api controller-wake`, which parses
+    // 557 KB of shell on an armv7 to read a pid file and send one signal, about 1.5 s of every
+    // save's answer. The proof is the same one (`controller_persisted_identity_status`) and
+    // the manager's own `controller-wake` stays, for an operator and for the shell rung's tests.
+    // The daemon engine publishes no `controller.pid`, so under it this is the ordinary "not
+    // running": its queue consumer polls `var/control` on its own tick.
     // SAFETY: geteuid has no pointer arguments or preconditions. The service runs as the
     // package user, which every check before the enqueue has already verified.
     let package_uid = unsafe { libc::geteuid() };
+    let paths = PackagePaths::production();
+    if let Err(refusal) = linux_files::signal_controller_for_queue(
+        paths.controller,
+        &paths.run_dir.join("controller.pid"),
+        &paths.run_dir.join("controller.ready"),
+        &paths.run_dir.join("controller.lock"),
+        package_uid,
+    ) {
+        record_controller_wake_failure(&paths, package_uid, refusal);
+    }
+}
+
+/// One coalesced api.log record for a controller wake that did not happen, and the cause once
+/// per five minutes.
+///
+/// Never an error to the caller: the request it follows was already accepted. The coalesced
+/// record is keyed by stage and code, so it cannot say why; the cause is its own `warn` record,
+/// bounded to one per five minutes so a controller that is broken for a day does not write one
+/// per save.
+#[cfg(target_os = "linux")]
+fn record_controller_wake_failure(
+    paths: &PackagePaths<'_>,
+    package_uid: u32,
+    refusal: linux_files::QueueWakeRefusal,
+) {
+    static LAST_NOTED: AtomicU64 = AtomicU64::new(0);
     record_in_service_failure(
         package_uid,
         None,
@@ -9368,6 +9408,53 @@ fn record_controller_wake_failure() {
             "controller_wake_failed",
         ),
     );
+    let Ok(now) = current_epoch() else {
+        return;
+    };
+    let last = LAST_NOTED.load(AtomicOrdering::Relaxed);
+    if last != 0 && now.saturating_sub(last) < 300 {
+        return;
+    }
+    if LAST_NOTED
+        .compare_exchange(last, now, AtomicOrdering::Relaxed, AtomicOrdering::Relaxed)
+        .is_err()
+    {
+        return;
+    }
+    let mut members = serde_json::Map::new();
+    members.insert("cause".to_owned(), json!(refusal.as_str()));
+    members.insert("file".to_owned(), json!("controller.pid"));
+    if !record_service_warning(paths, package_uid, "controller_wake_failed", &members) {
+        LAST_NOTED.store(last, AtomicOrdering::Relaxed);
+        eprintln!(
+            "sdsync-dsm-api: controller_wake_failed cause={} file=controller.pid",
+            refusal.as_str()
+        );
+    }
+}
+
+/// One `warn` record in api.log under the security policy, loaded for it. Whether it was written.
+#[cfg(target_os = "linux")]
+fn record_service_warning(
+    paths: &PackagePaths<'_>,
+    package_uid: u32,
+    event: &str,
+    members: &serde_json::Map<String, Value>,
+) -> bool {
+    let Ok(now) = current_epoch() else {
+        return false;
+    };
+    linux_files::load_security_policy(package_uid).and_then(|policy| {
+        linux_files::record_bridge_warning_at(
+            paths.log_root,
+            &paths.log_root.join("api.log"),
+            package_uid,
+            now,
+            &policy,
+            event,
+            members,
+        )
+    }) == Ok(true)
 }
 
 /// The reasons a rejected mutation's audit record may name.
@@ -10051,6 +10138,93 @@ mod linux_files {
             .seek(SeekFrom::Start(0))
             .map_err(|_| BridgeError::unsafe_runtime())?;
         write_single_record(&state.file, state_record.as_bytes())?;
+        Ok(true)
+    }
+
+    /// One `warn` record for a slow CGI request, at most once per `window_seconds` across every
+    /// CGI process, carrying how many slow requests the window held back.
+    ///
+    /// Its own state file, not `cgi-failure.state`: that file's window suppresses every failure
+    /// for thirty seconds after any one, and a slow poll must not be able to hide a failure.
+    /// The same non-blocking lock, so a CGI never waits behind another to report that it was
+    /// slow. `Ok(false)` is "not written": a busy lock, a window still open (the count is kept),
+    /// or a policy that hides warnings.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn record_slow_request_at(
+        log_root: &Path,
+        api_log: &Path,
+        state_path: &Path,
+        package_uid: u32,
+        now: u64,
+        policy: &SecurityPolicyArgs,
+        event: &str,
+        members: &serde_json::Map<String, Value>,
+        window_seconds: u64,
+    ) -> BridgeResult<bool> {
+        if now == 0 {
+            return Err(BridgeError::bad_request());
+        }
+        let state_root = state_path
+            .parent()
+            .ok_or_else(BridgeError::unsafe_runtime)?;
+        validate_private_directory(state_root, package_uid)?;
+        let mut state_options = OpenOptions::new();
+        state_options
+            .read(true)
+            .write(true)
+            .create(true)
+            .mode(0o600)
+            .custom_flags(NOFOLLOW_CLOEXEC);
+        let state = state_options
+            .open(state_path)
+            .map_err(|_| BridgeError::unsafe_runtime())?;
+        let state_metadata = state
+            .metadata()
+            .map_err(|_| BridgeError::unsafe_runtime())?;
+        if !state_metadata.file_type().is_file()
+            || state_metadata.st_uid() != package_uid
+            || state_metadata.st_mode() & 0o7777 != 0o600
+            || state_metadata.st_nlink() != 1
+            || state_metadata.len() > MAX_CGI_FAILURE_STATE_BYTES
+        {
+            return Err(BridgeError::unsafe_runtime());
+        }
+        let Some(mut state) = StateFlock::try_acquire(state)? else {
+            return Ok(false);
+        };
+        let mut previous = String::new();
+        state
+            .file
+            .read_to_string(&mut previous)
+            .map_err(|_| BridgeError::unsafe_runtime())?;
+        // `<epoch>|<held back>`. A state that does not parse is a window that never opened.
+        let (last, held_back) = previous
+            .trim_end()
+            .split_once('|')
+            .and_then(|(epoch, held)| Some((epoch.parse::<u64>().ok()?, held.parse::<u64>().ok()?)))
+            .unwrap_or((0, 0));
+        let write_state = |state: &mut StateFlock, epoch: u64, held: u64| -> BridgeResult<()> {
+            state
+                .file
+                .set_len(0)
+                .map_err(|_| BridgeError::unsafe_runtime())?;
+            state
+                .file
+                .seek(SeekFrom::Start(0))
+                .map_err(|_| BridgeError::unsafe_runtime())?;
+            write_single_record(&state.file, format!("{epoch}|{held}\n").as_bytes())
+        };
+        if last != 0 && now.saturating_sub(last) < window_seconds {
+            write_state(&mut state, last, held_back.saturating_add(1))?;
+            return Ok(false);
+        }
+        let mut members = members.clone();
+        members.insert("repeats".to_owned(), json!(held_back));
+        if !record_bridge_warning_at(log_root, api_log, package_uid, now, policy, event, &members)?
+        {
+            return Ok(false);
+        }
+        write_state(&mut state, now, 0)?;
         Ok(true)
     }
 
@@ -11220,29 +11394,54 @@ mod linux_files {
         package_uid: u32,
         expected_pid: u32,
     ) -> BridgeResult<bool> {
+        trusted_controller_identity(
+            controller,
+            pid_file,
+            ready_file,
+            lock,
+            package_uid,
+            expected_pid,
+        )
+        .map(|identity| identity.is_some())
+    }
+
+    /// `controller_identity_is_trusted`, returning the identity the chain agreed on.
+    ///
+    /// The queue wake signals exactly this tuple, so it is the one the signal's last
+    /// check (`validate_live_process_identity`) must be run against rather than a
+    /// second reading of the files.
+    pub(super) fn trusted_controller_identity(
+        controller: &Path,
+        pid_file: &Path,
+        ready_file: &Path,
+        lock: &Path,
+        package_uid: u32,
+        expected_pid: u32,
+    ) -> BridgeResult<Option<ProcessIdentity>> {
         let Ok(executable) = fs::symlink_metadata(controller) else {
-            return Ok(false);
+            return Ok(None);
         };
         if !executable.file_type().is_file()
             || executable.st_uid() != package_uid
             || executable.st_mode() & 0o7777 != 0o755
             || executable.st_nlink() != 1
         {
-            return Ok(false);
+            return Ok(None);
         }
+        let mut agreed = None;
         for _ in 0..2 {
             // A contract failure anywhere in this chain means not trusted, which
             // is what any non-zero return from the manager's own check means to
             // `api_snapshot`. The hard error for an unsafe PID file is raised by
             // the caller, which reads it before asking this question.
             let Some(pid) = controller_pid_file_value(pid_file, package_uid).unwrap_or(None) else {
-                return Ok(false);
+                return Ok(None);
             };
             let Some(ready) = read_published_identity(ready_file, package_uid, true)? else {
-                return Ok(false);
+                return Ok(None);
             };
             let Some(owner) = private_process_lock_owner(lock, package_uid)? else {
-                return Ok(false);
+                return Ok(None);
             };
             if pid != ready.pid
                 || owner.pid != pid
@@ -11250,10 +11449,115 @@ mod linux_files {
                 || owner.boot != ready.boot
                 || pid != expected_pid
             {
-                return Ok(false);
+                return Ok(None);
+            }
+            agreed = Some(ready);
+        }
+        Ok(agreed)
+    }
+
+    /// Why a queue wake could not be delivered: the named cause that goes in api.log.
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub(super) enum QueueWakeRefusal {
+        /// `controller.pid` exists but is not a package-owned single-line private file.
+        PidFileUnsafe,
+        /// The liveness probe of the named pid failed for a reason other than "no such process".
+        PidProbeFailed,
+        /// The pid is alive but the PID file, readiness record and lock do not agree on it.
+        IdentityUntrusted,
+        /// The process the chain named is no longer that process.
+        IdentityChanged,
+        /// `kill` refused (not ESRCH, which is a controller that just exited).
+        SignalFailed,
+    }
+
+    impl QueueWakeRefusal {
+        pub(super) const fn as_str(self) -> &'static str {
+            match self {
+                Self::PidFileUnsafe => "pid_file_unsafe",
+                Self::PidProbeFailed => "pid_probe_failed",
+                Self::IdentityUntrusted => "identity_untrusted",
+                Self::IdentityChanged => "identity_changed",
+                Self::SignalFailed => "signal_failed",
             }
         }
-        Ok(true)
+    }
+
+    /// `wake_controller_for_queue`: interrupt a running controller's idle sleep with `SIGUSR2`.
+    ///
+    /// No PID file and a pid that is not alive are the ordinary "not running" (`Ok(false)`),
+    /// exactly as in the manager: the queue is read when the controller next starts. A
+    /// controller that is alive but cannot be proven to be the package's is never signalled.
+    /// The proof is the same chain the snapshot uses, and the tuple it agrees on is checked
+    /// against `/proc` once more immediately before the signal, which is where the manager's
+    /// own second reading of the chain stood.
+    pub(super) fn signal_controller_for_queue(
+        controller: &Path,
+        pid_file: &Path,
+        ready_file: &Path,
+        lock: &Path,
+        package_uid: u32,
+    ) -> Result<bool, QueueWakeRefusal> {
+        let pid = match controller_pid_file_value(pid_file, package_uid) {
+            Ok(None) => return Ok(false),
+            Ok(Some(pid)) => pid,
+            Err(_) => return Err(QueueWakeRefusal::PidFileUnsafe),
+        };
+        match pid_is_live(pid) {
+            Ok(true) => {}
+            Ok(false) => return Ok(false),
+            Err(_) => return Err(QueueWakeRefusal::PidProbeFailed),
+        }
+        let identity =
+            trusted_controller_identity(controller, pid_file, ready_file, lock, package_uid, pid)
+                .map_err(|_| QueueWakeRefusal::IdentityUntrusted)?
+                .ok_or(QueueWakeRefusal::IdentityUntrusted)?;
+        validate_live_process_identity(identity.pid, identity.start, &identity.boot, package_uid)
+            .map_err(|_| QueueWakeRefusal::IdentityChanged)?;
+        // SAFETY: kill takes no pointers. The pid is the controller the chain above just proved
+        // to be the package's own, by pid, start tick, boot id and owner.
+        if unsafe { libc::kill(identity.pid as libc::pid_t, libc::SIGUSR2) } == 0 {
+            return Ok(true);
+        }
+        match io::Error::last_os_error().raw_os_error() {
+            Some(libc::ESRCH) => Ok(false),
+            _ => Err(QueueWakeRefusal::SignalFailed),
+        }
+    }
+
+    /// What identifies the bytes the Activity feed is built from: for each file in the rotation
+    /// its inode, size, times, mode, owner and link count, or `-` where it is absent.
+    ///
+    /// The change time, mode, owner and links are in it so that a file that became unsafe
+    /// (the reason a read refuses it) is never read as "unchanged".
+    ///
+    /// `None` when any of them cannot be examined, which is never a "same as before": the read
+    /// that follows is the one that names the file and the check that failed.
+    pub(super) fn activity_files_stamp(log_root: &Path) -> Option<String> {
+        let mut stamp = String::new();
+        for path in rotating_log_paths(&log_root.join("activity.log"), 3) {
+            match fs::symlink_metadata(&path) {
+                Ok(metadata) => {
+                    use std::fmt::Write as _;
+                    let _ = write!(
+                        stamp,
+                        "{:x}.{:x}.{:x}.{:x}.{:x}.{:x}.{:o}.{:x}.{:x};",
+                        metadata.st_ino(),
+                        metadata.st_size(),
+                        metadata.st_mtime(),
+                        metadata.st_mtime_nsec(),
+                        metadata.st_ctime(),
+                        metadata.st_ctime_nsec(),
+                        metadata.st_mode(),
+                        metadata.st_uid(),
+                        metadata.st_nlink()
+                    );
+                }
+                Err(error) if error.kind() == io::ErrorKind::NotFound => stamp.push_str("-;"),
+                Err(_) => return None,
+            }
+        }
+        Some(stamp)
     }
 
     fn rotating_log_paths(base: &Path, keep: usize) -> Vec<PathBuf> {
@@ -14507,6 +14811,8 @@ pub(crate) fn main_entry() -> ExitCode {
                     "response_write_timeout",
                 ));
             }
+            // After the answer is out, so saying a request was slow never makes it slower.
+            cgi_watchdog::note_slow(is_get);
             cgi_exit_code(written)
         }
         #[cfg(not(target_os = "linux"))]
@@ -16096,10 +16402,12 @@ fn handle_relay_request_under_policy(
     package_uid: u32,
     loaded_policy: &mut Option<SecurityPolicyArgs>,
 ) -> Result<CgiResponse, CgiFailure> {
+    let started = Instant::now();
     let relay = decode_relay_request(encoded)
         .map_err(|error| CgiFailure::new(CgiFailureStage::BridgeProtocol, error))?;
     let (request, body) = validate_relay_http_request(&relay)
         .map_err(|error| CgiFailure::new(CgiFailureStage::BridgeProtocol, error))?;
+    let request_label = relay_request_label(&request);
     let authentication = match &request {
         ValidatedHttpRequest::Get { authentication, .. }
         | ValidatedHttpRequest::Post { authentication, .. } => authentication,
@@ -16121,6 +16429,7 @@ fn handle_relay_request_under_policy(
         validate_relay_authenticated_session(&relay, authentication, resolved_uid)
             .map_err(|error| CgiFailure::new(CgiFailureStage::Authentication, error))?
     };
+    let authenticated_at = started.elapsed();
     let control_paths = ControlPaths::for_request();
     linux_files::require_open_runtime_admission(&control_paths, package_uid)
         .map_err(|error| CgiFailure::new(CgiFailureStage::ServiceRequest, error))?;
@@ -16130,6 +16439,7 @@ fn handle_relay_request_under_policy(
     // Held by the caller so a failure after this point is recorded under the
     // policy this request already paid to read.
     let policy = &*loaded_policy.insert(policy);
+    let admitted_at = started.elapsed();
     let is_post = matches!(request, ValidatedHttpRequest::Post { .. });
     let rejected_request_id = if is_post {
         rejected_post_request_id(body)
@@ -16149,6 +16459,14 @@ fn handle_relay_request_under_policy(
             policy,
         )
     };
+    note_slow_service_request(
+        package_uid,
+        policy,
+        request_label,
+        started.elapsed(),
+        authenticated_at,
+        admitted_at,
+    );
     if is_post
         && let Err(rejection) = &result
         && let Err(error) = record_rejected_post(
@@ -16171,6 +16489,109 @@ fn handle_relay_request_under_policy(
         );
     }
     result.map_err(|error| CgiFailure::new(CgiFailureStage::ServiceRequest, error))
+}
+
+/// A request this slow is worth a record: the dashboard's own read window is ten seconds, and
+/// a poll that takes a fifth of it is a poll that will time out on a busier NAS.
+#[cfg(target_os = "linux")]
+const SLOW_REQUEST_THRESHOLD: Duration = Duration::from_secs(2);
+
+/// How often a slow-request record may be written, and so how often one stands for the repeats
+/// since the last: a dashboard polling a slow NAS would otherwise write one per poll.
+#[cfg(target_os = "linux")]
+const SLOW_REQUEST_RECORD_WINDOW_SECONDS: u64 = 60;
+
+/// What a relayed request is, in a fixed vocabulary: the read it asks for, or `post`.
+///
+/// A mutation's kind is inside its body and is not parsed until the request is accepted, so a
+/// POST is labelled `post`; the Activity row the mutation writes names the operation.
+#[cfg(target_os = "linux")]
+fn relay_request_label(request: &ValidatedHttpRequest) -> &'static str {
+    match request {
+        ValidatedHttpRequest::Post { .. } => "post",
+        ValidatedHttpRequest::Get { action, .. } => match action {
+            ReadAction::Csrf => "csrf",
+            ReadAction::Snapshot => "snapshot",
+            ReadAction::SourceDirectories { .. } => "source-directories",
+            ReadAction::SourcePath { .. } => "source-path",
+            ReadAction::Logs { .. } => "logs",
+            ReadAction::Activity { .. } => "activity",
+            ReadAction::StatusRollup => "status-rollup",
+            ReadAction::Result { .. } => "result",
+            ReadAction::RequestStatus { .. } => "request-status",
+        },
+    }
+}
+
+/// The service's side of a slow request: how long it spent authenticating, being admitted
+/// (runtime admission and the security policy) and executing, in one `warn` record in api.log.
+///
+/// A result poll is left out: it holds the request open for up to three seconds on purpose.
+/// At most one record a minute, carrying how many it stands for, so that watching it never
+/// costs the NAS more than the slowness it reports. Never an error to the request.
+#[cfg(target_os = "linux")]
+fn note_slow_service_request(
+    package_uid: u32,
+    policy: &SecurityPolicyArgs,
+    label: &'static str,
+    total: Duration,
+    authenticated_at: Duration,
+    admitted_at: Duration,
+) {
+    static LAST_RECORDED: AtomicU64 = AtomicU64::new(0);
+    static SUPPRESSED: AtomicU64 = AtomicU64::new(0);
+    if total < SLOW_REQUEST_THRESHOLD || label == "result" {
+        return;
+    }
+    let Ok(now) = current_epoch() else {
+        return;
+    };
+    let last = LAST_RECORDED.load(AtomicOrdering::Relaxed);
+    if last != 0 && now.saturating_sub(last) < SLOW_REQUEST_RECORD_WINDOW_SECONDS {
+        SUPPRESSED.fetch_add(1, AtomicOrdering::Relaxed);
+        return;
+    }
+    if LAST_RECORDED
+        .compare_exchange(last, now, AtomicOrdering::Relaxed, AtomicOrdering::Relaxed)
+        .is_err()
+    {
+        SUPPRESSED.fetch_add(1, AtomicOrdering::Relaxed);
+        return;
+    }
+    let suppressed = SUPPRESSED.swap(0, AtomicOrdering::Relaxed);
+    let millis = |duration: Duration| u64::try_from(duration.as_millis()).unwrap_or(u64::MAX);
+    let mut members = serde_json::Map::new();
+    members.insert("request".to_owned(), json!(label));
+    members.insert("total_ms".to_owned(), json!(millis(total)));
+    members.insert("auth_ms".to_owned(), json!(millis(authenticated_at)));
+    members.insert(
+        "admission_ms".to_owned(),
+        json!(millis(admitted_at.saturating_sub(authenticated_at))),
+    );
+    members.insert(
+        "handle_ms".to_owned(),
+        json!(millis(total.saturating_sub(admitted_at))),
+    );
+    members.insert("repeats".to_owned(), json!(suppressed));
+    let log_root = Path::new(LOG_ROOT);
+    // `Ok(false)` is a policy that hides warnings: the record was declined on purpose, so the
+    // window stays closed. An error is a log that could not be appended, and that is said.
+    if let Err(error) = linux_files::record_bridge_warning_at(
+        log_root,
+        &log_root.join("api.log"),
+        package_uid,
+        now,
+        policy,
+        "service_slow",
+        &members,
+    ) {
+        LAST_RECORDED.store(last, AtomicOrdering::Relaxed);
+        SUPPRESSED.fetch_add(suppressed, AtomicOrdering::Relaxed);
+        eprintln!(
+            "sdsync-dsm-api: service_slow record not written: {}",
+            resolved_error_code(error, None, None)
+        );
+    }
 }
 
 fn is_https_request(value: Option<&str>) -> bool {
@@ -16567,6 +16988,56 @@ fn execute_result_action_after_wait(
     queued_expired_response(job_id)
 }
 
+/// How often one job's result poll may start an audit reconcile.
+#[cfg(target_os = "linux")]
+const AUDIT_RECONCILE_POLL_INTERVAL: Duration = Duration::from_secs(15);
+
+/// The jobs a result poll reconciled the audit for recently, and when.
+///
+/// Bounded: entries older than the interval are dropped on every admission, and a table that
+/// still outgrows its cap (more than 512 distinct jobs inside fifteen seconds) is cleared, which
+/// costs at most one extra reconcile per job and never a missed one.
+#[cfg(target_os = "linux")]
+#[derive(Default)]
+struct AuditReconcileGate {
+    last: BTreeMap<String, Instant>,
+}
+
+#[cfg(target_os = "linux")]
+impl AuditReconcileGate {
+    const MAX_JOBS: usize = 512;
+
+    fn admit(&mut self, job_id: &str, now: Instant, interval: Duration) -> bool {
+        self.last
+            .retain(|_, at| now.saturating_duration_since(*at) < interval);
+        if self.last.contains_key(job_id) {
+            return false;
+        }
+        if self.last.len() >= Self::MAX_JOBS {
+            self.last.clear();
+        }
+        self.last.insert(job_id.to_owned(), now);
+        true
+    }
+}
+
+#[cfg(target_os = "linux")]
+static AUDIT_RECONCILE_GATE: Mutex<AuditReconcileGate> = Mutex::new(AuditReconcileGate {
+    last: BTreeMap::new(),
+});
+
+/// Whether this result poll may reconcile the audit for `job_id` now.
+///
+/// A poisoned table admits: the gate exists to save forks, not to stop the reconcile that
+/// finishes a record.
+#[cfg(target_os = "linux")]
+fn audit_reconcile_admitted(job_id: &str) -> bool {
+    match AUDIT_RECONCILE_GATE.lock() {
+        Ok(mut gate) => gate.admit(job_id, Instant::now(), AUDIT_RECONCILE_POLL_INTERVAL),
+        Err(_) => true,
+    }
+}
+
 #[cfg(target_os = "linux")]
 fn completed_result_response(
     paths: &ControlPaths<'_>,
@@ -16589,11 +17060,16 @@ fn completed_result_response(
     if response.completed_at_epoch > now.saturating_add(CLOCK_SKEW_SECONDS) {
         return Err(BridgeError::new(ErrorKind::Unavailable));
     }
-    if response.audit_pending {
+    if response.audit_pending && audit_reconcile_admitted(job_id) {
         // Polling is also a bounded reconciliation opportunity, but an audit
         // sink outage must never hide or delete a known terminal result. The
         // controller provides autonomous retry; GET keeps serving the truthful
         // result with audit_pending until the durable record is confirmed.
+        // One attempt per job per fifteen seconds: each attempt forks the manager (1.7 s on an
+        // armv7, up to 20 s when the sink is down), the browser abandons a read at 10 s and
+        // polls again, and without the gate every abandoned read left another fork behind.
+        // A poll inside the window is answered from the stored result at once, still saying
+        // `audit_pending: true`, which is what the dashboard shows beside the result.
         let audit_paths = paths.audit_outbox();
         if linux_files::reconcile_audit_transactions(&audit_paths, package_uid, record_audit_event)
             .is_ok()
@@ -16740,6 +17216,29 @@ fn execute_read_action(
         let body = source_path_document(Path::new("/"), path)?;
         return Ok(CgiResponse::success(body));
     }
+    // The Activity feed's version is taken before it is read, so a feed that grows while it is
+    // read is answered with the older version and the next poll reads it again, never the other
+    // way round. A request that names the current version is answered without reading the feed.
+    let activity_version = match action {
+        ReadAction::Activity { lines, .. } => activity_version(paths, *lines, policy),
+        _ => None,
+    };
+    if let (
+        ReadAction::Activity {
+            since: Some(since), ..
+        },
+        Some(version),
+    ) = (action, &activity_version)
+        && since == version
+    {
+        let body = serde_json::to_vec(&json!({
+            "schema": "sdsync.dsm-activity.v1",
+            "unchanged": true,
+            "version": version,
+        }))
+        .map_err(|_| BridgeError::internal())?;
+        return Ok(CgiResponse::success(body));
+    }
     let forced_to_shell = linux_files::read_lane_forced_to_shell(paths, package_uid)?;
     if forced_to_shell {
         note_read_lane_forced_shell(paths, package_uid, policy);
@@ -16761,9 +17260,39 @@ fn execute_read_action(
         return attach_snapshot_outcomes(response, paths, package_uid);
     }
     if matches!(action, ReadAction::Activity { .. }) {
-        return attach_activity_history(response, paths, package_uid);
+        return attach_activity_history(response, paths, package_uid, activity_version.as_deref());
     }
     Ok(response)
+}
+
+/// The version of the Activity feed a request for `lines` events would be answered with: a
+/// digest of what the feed is built from. The rotation's files (inode, size, modification
+/// time), the line count, and the log levels the feed is filtered by, so a changed policy or a
+/// different window never matches a version taken before it.
+#[cfg(target_os = "linux")]
+fn activity_version(
+    paths: &PackagePaths<'_>,
+    lines: u16,
+    policy: &SecurityPolicyArgs,
+) -> Option<String> {
+    let stamp = linux_files::activity_files_stamp(paths.log_root)?;
+    let levels = security_policy_snapshot_value(policy)["log_levels"].to_string();
+    let mut digest = Sha256::new();
+    digest.update(b"sdsync.activity-version.v1\n");
+    digest.update(lines.to_string().as_bytes());
+    digest.update(b"\n");
+    digest.update(stamp.as_bytes());
+    digest.update(b"\n");
+    digest.update(levels.as_bytes());
+    Some(
+        digest.finalize()[..16]
+            .iter()
+            .fold(String::new(), |mut out, byte| {
+                use std::fmt::Write as _;
+                let _ = write!(out, "{byte:02x}");
+                out
+            }),
+    )
 }
 
 /// Attach `history` to an Activity feed either rung produced: how many rotated files exist
@@ -16775,6 +17304,7 @@ fn attach_activity_history(
     response: CgiResponse,
     paths: &PackagePaths<'_>,
     package_uid: u32,
+    version: Option<&str>,
 ) -> BridgeResult<CgiResponse> {
     if response.status != 200 {
         return Ok(response);
@@ -16795,6 +17325,11 @@ fn attach_activity_history(
         }),
     };
     root.insert("history".to_owned(), history);
+    // Named only when it could be taken. A feed without one is read whole on every poll, which
+    // is what a service that predates the member does too.
+    if let Some(version) = version {
+        root.insert("version".to_owned(), json!(version));
+    }
     let body = serde_json::to_vec(&document).map_err(|_| BridgeError::internal())?;
     Ok(CgiResponse::success(body))
 }
@@ -17908,7 +18443,7 @@ fn render_routine(
     let weekdays = kv("weekdays", "1,2,3,4,5,6,7")?;
     let start = kv("time_window_start", "00:00")?;
     let end = kv("time_window_end", "23:59")?;
-    let debounce = kv("debounce_seconds", "45")?;
+    let debounce = kv("debounce_seconds", "15")?;
     let retries = kv("retry_count", "5")?;
     let mut backoff = kv("retry_backoff_seconds", "60")?;
     let exponential = manager_kv_optional(configuration, "retry_exponential", "true")?;
@@ -20749,7 +21284,7 @@ fn run_in_service_read(
 ) -> BridgeResult<CgiResponse> {
     let body = match action {
         ReadAction::StatusRollup => status_rollup_document(paths, policy)?,
-        ReadAction::Activity { lines } => {
+        ReadAction::Activity { lines, .. } => {
             activity_document(paths, package_uid, action, *lines, policy)?
         }
         ReadAction::Snapshot => snapshot_document(paths, package_uid, policy)?,
@@ -22015,6 +22550,14 @@ mod cgi_watchdog {
 
     static STAGE: AtomicU8 = AtomicU8::new(0);
     static RESPONDING: AtomicBool = AtomicBool::new(false);
+    /// When this request began, for the time each stage took.
+    static STARTED: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+    /// Milliseconds into the request at which the current stage was entered.
+    static MARK_MS: AtomicU64 = AtomicU64::new(0);
+    /// Milliseconds spent in each stage so far, by index into `STAGES`.
+    static SPENT_MS: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
+    /// The read this request asked for, from the query string.
+    static LABEL: std::sync::OnceLock<&'static str> = std::sync::OnceLock::new();
 
     const STAGES: [CgiFailureStage; 8] = [
         CgiFailureStage::Request,
@@ -22030,7 +22573,112 @@ mod cgi_watchdog {
     /// The stage the request is in, for the watchdog's answer.
     pub(super) fn enter(stage: CgiFailureStage) {
         if let Some(index) = STAGES.iter().position(|candidate| *candidate == stage) {
+            // The time since the last entry belongs to the stage being left.
+            let now = elapsed_ms();
+            let left = usize::from(STAGE.load(AtomicOrdering::Relaxed)).min(STAGES.len() - 1);
+            let since = MARK_MS.swap(now, AtomicOrdering::Relaxed);
+            SPENT_MS[left].fetch_add(now.saturating_sub(since), AtomicOrdering::Relaxed);
             STAGE.store(index as u8, AtomicOrdering::Relaxed);
+        }
+    }
+
+    fn elapsed_ms() -> u64 {
+        u64::try_from(STARTED.get_or_init(Instant::now).elapsed().as_millis()).unwrap_or(u64::MAX)
+    }
+
+    /// The fixed vocabulary a slow-request record names a request by.
+    pub(super) fn label_from_query(query: &str) -> &'static str {
+        const KNOWN: [&str; 9] = [
+            "csrf",
+            "snapshot",
+            "source-directories",
+            "source-path",
+            "logs",
+            "activity",
+            "status-rollup",
+            "result",
+            "request-status",
+        ];
+        query
+            .split('&')
+            .find_map(|pair| pair.strip_prefix("action="))
+            .and_then(|value| KNOWN.iter().copied().find(|known| *known == value))
+            .unwrap_or("unknown")
+    }
+
+    /// Say in api.log, once the response is out, that this request took longer than
+    /// [`SLOW_REQUEST_THRESHOLD`] and where the time went.
+    ///
+    /// The stages are the watchdog's own, so the record names the same places a deadline would:
+    /// `auth_ms` the DSM authentication (zero where the service authenticates, as it does on
+    /// DSM 7), `body_ms` reading the request, `relay_ms` connecting to and waiting for the
+    /// service. The service's share of `relay_ms` is in its own `service_slow` record. A result
+    /// poll is left out: it long-polls on purpose.
+    pub(super) fn note_slow(is_get: bool) {
+        let total = elapsed_ms();
+        let left = usize::from(STAGE.load(AtomicOrdering::Relaxed)).min(STAGES.len() - 1);
+        SPENT_MS[left].fetch_add(
+            total.saturating_sub(MARK_MS.load(AtomicOrdering::Relaxed)),
+            AtomicOrdering::Relaxed,
+        );
+        let label = if is_get {
+            LABEL.get().copied().unwrap_or("unknown")
+        } else {
+            "post"
+        };
+        if total < u64::try_from(SLOW_REQUEST_THRESHOLD.as_millis()).unwrap_or(u64::MAX)
+            || label == "result"
+        {
+            return;
+        }
+        let spent = |stage: CgiFailureStage| {
+            STAGES
+                .iter()
+                .position(|candidate| *candidate == stage)
+                .map_or(0, |index| SPENT_MS[index].load(AtomicOrdering::Relaxed))
+        };
+        let mut members = serde_json::Map::new();
+        members.insert("request".to_owned(), json!(label));
+        members.insert("total_ms".to_owned(), json!(total));
+        members.insert(
+            "identity_ms".to_owned(),
+            json!(spent(CgiFailureStage::Identity)),
+        );
+        members.insert(
+            "auth_ms".to_owned(),
+            json!(spent(CgiFailureStage::Authentication)),
+        );
+        members.insert("body_ms".to_owned(), json!(spent(CgiFailureStage::Request)));
+        members.insert(
+            "relay_ms".to_owned(),
+            json!(
+                spent(CgiFailureStage::BridgeConnect)
+                    + spent(CgiFailureStage::BridgeIo)
+                    + spent(CgiFailureStage::BridgeProtocol)
+            ),
+        );
+        let recorded = linux_runtime::identity_state()
+            .and_then(|identity| validate_cgi_identity(&identity))
+            .and_then(|package_uid| {
+                let now = current_epoch()?;
+                let policy = linux_files::load_security_policy(package_uid)?;
+                linux_files::record_slow_request_at(
+                    Path::new(LOG_ROOT),
+                    Path::new(API_LOG_PATH),
+                    Path::new(CGI_SLOW_STATE_PATH),
+                    package_uid,
+                    now,
+                    &policy,
+                    "cgi_slow",
+                    &members,
+                    SLOW_REQUEST_RECORD_WINDOW_SECONDS,
+                )
+            });
+        if let Err(error) = recorded {
+            eprintln!(
+                "sdsync-dsm-api: cgi_slow ({total} ms, {label}) not recorded: {}",
+                resolved_error_code(error, None, None)
+            );
         }
     }
 
@@ -22067,6 +22715,12 @@ mod cgi_watchdog {
     /// Start the watchdog thread. If it cannot be started the request still runs, and says so
     /// on stderr, which DSM's web server keeps.
     pub(super) fn arm(deadline: Duration, is_get: bool) {
+        STARTED.get_or_init(Instant::now);
+        if is_get {
+            let _ = LABEL.set(label_from_query(
+                &std::env::var("QUERY_STRING").unwrap_or_default(),
+            ));
+        }
         let started = std::thread::Builder::new()
             .name("cgi-watchdog".to_owned())
             .spawn(move || {
@@ -24201,7 +24855,13 @@ mod tests {
             // shell's whole contribution was to name the profiles and forward
             // the core's document. `activity` followed, reading four log files
             // and nothing else.
-            (ReadAction::Activity { lines: 10 }, ReadRung::InService),
+            (
+                ReadAction::Activity {
+                    lines: 10,
+                    since: None,
+                },
+                ReadRung::InService,
+            ),
             (ReadAction::StatusRollup, ReadRung::InService),
             (ReadAction::Csrf, ReadRung::NotLadderRouted),
             (
@@ -25180,6 +25840,133 @@ mod tests {
         assert_eq!(stopped["service"]["pid"], 0);
     }
 
+    /// A result poll reconciles one job's audit at most once per interval, however often the
+    /// browser asks, and a different job is never held back by it.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_result_poll_reconciles_one_jobs_audit_once_per_interval() {
+        let interval = Duration::from_secs(15);
+        let start = Instant::now();
+        let mut gate = AuditReconcileGate::default();
+        assert!(gate.admit("job-a", start, interval));
+        assert!(!gate.admit("job-a", start + Duration::from_secs(3), interval));
+        assert!(!gate.admit("job-a", start + Duration::from_secs(14), interval));
+        assert!(gate.admit("job-b", start + Duration::from_secs(14), interval));
+        assert!(gate.admit("job-a", start + Duration::from_secs(15), interval));
+        assert_eq!(gate.last.len(), 2, "an expired entry was kept");
+        // The table never grows without bound: past its cap it is cleared, which admits.
+        let mut crowded = AuditReconcileGate::default();
+        for index in 0..AuditReconcileGate::MAX_JOBS {
+            assert!(crowded.admit(&format!("job-{index}"), start, interval));
+        }
+        assert!(crowded.admit("job-new", start, interval));
+        assert!(crowded.last.len() <= AuditReconcileGate::MAX_JOBS);
+    }
+
+    /// The queue wake is the service's own signal, and it goes only to a controller the whole
+    /// chain proves: the PID file, the readiness record and the live lock agreeing on pid, start
+    /// tick and boot id. Every other state is either the ordinary "not running" (no signal, no
+    /// failure) or a named refusal, and a process that is not the controller is left running.
+    /// `SIGUSR2` is fatal to the stand-in (`sleep`), so a delivered signal is visible as its exit.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_queue_wake_signals_only_a_controller_the_whole_chain_proves() {
+        use std::os::unix::process::ExitStatusExt;
+
+        let fixture = TestShellPackageFixture::new("queue-wake");
+        let paths = fixture.paths();
+        let uid = fixture.package_uid();
+        let pid_file = fixture.run_dir.join("controller.pid");
+        let ready_file = fixture.run_dir.join("controller.ready");
+        let lock = fixture.run_dir.join("controller.lock");
+        let wake = || {
+            linux_files::signal_controller_for_queue(
+                paths.controller,
+                &pid_file,
+                &ready_file,
+                &lock,
+                uid,
+            )
+        };
+
+        // Nothing published: not running, which is not a failure.
+        assert_eq!(wake(), Ok(false));
+
+        // A pid file that is not the one-line private file the manager writes is refused by
+        // name, not read as "not running".
+        let mut live = fixture.spawn_long_lived();
+        let live_pid = live.id();
+        fixture.write_config(
+            &pid_file,
+            &format!(
+                "{live_pid}
+{live_pid}
+"
+            ),
+        );
+        assert_eq!(wake(), Err(linux_files::QueueWakeRefusal::PidFileUnsafe));
+
+        // Alive, named by the PID file, but with no identity behind it: never signalled.
+        fixture.write_config(
+            &pid_file,
+            &format!(
+                "{live_pid}
+"
+            ),
+        );
+        assert_eq!(
+            wake(),
+            Err(linux_files::QueueWakeRefusal::IdentityUntrusted)
+        );
+        assert!(
+            live.try_wait().unwrap().is_none(),
+            "an unproven pid was signalled"
+        );
+
+        // A readiness record whose start tick is not this process's: still not the controller.
+        let start = linux_files::process_start(live_pid).unwrap();
+        let boot = fs::read_to_string("/proc/sys/kernel/random/boot_id")
+            .unwrap()
+            .trim()
+            .to_owned();
+        let identity = format!(
+            "{live_pid}
+{start}
+{boot}
+"
+        );
+        fs::create_dir_all(&lock).unwrap();
+        fs::set_permissions(&lock, fs::Permissions::from_mode(0o700)).unwrap();
+        fixture.write_config(&lock.join("pid"), &identity);
+        fixture.write_config(
+            &ready_file,
+            &format!(
+                "{live_pid}
+{}
+{boot}
+",
+                start + 1
+            ),
+        );
+        assert_eq!(
+            wake(),
+            Err(linux_files::QueueWakeRefusal::IdentityUntrusted)
+        );
+        assert!(
+            live.try_wait().unwrap().is_none(),
+            "a mismatched start tick was signalled"
+        );
+
+        // The full identity: the wake is delivered.
+        fixture.write_config(&ready_file, &identity);
+        assert_eq!(wake(), Ok(true));
+        let status = live.wait().unwrap();
+        assert_eq!(status.signal(), Some(libc::SIGUSR2));
+
+        // The same records for a process that has since exited are the ordinary "not running".
+        assert_eq!(wake(), Ok(false));
+    }
+
     /// S3-3: a daemon killed outright (`kill -9`) cannot clear the `degraded=` block it left in
     /// controller.state, which still says `state=running`. The block is the daemon's own claim,
     /// so it is served only while the service is live (the daemon's `daemon.ready` names a
@@ -25809,7 +26596,10 @@ mod tests {
 
         // Fewer than the nine stored records, so both windows do work: each
         // rotation is windowed, and the concatenation is windowed again.
-        let action = ReadAction::Activity { lines: 7 };
+        let action = ReadAction::Activity {
+            lines: 7,
+            since: None,
+        };
         let shell = fixture.run_manager(&["api", "activity", "--lines", "7"]);
         assert!(
             shell.status.success(),
@@ -25850,7 +26640,10 @@ mod tests {
 
         // And a request with no explicit window still agrees, at the manager's
         // own default of one hundred, which keeps every record.
-        let all = ReadAction::Activity { lines: 100 };
+        let all = ReadAction::Activity {
+            lines: 100,
+            since: None,
+        };
         let shell = fixture.run_manager(&["api", "activity", "--lines", "100"]);
         assert!(shell.status.success());
         fixture.hand_over();
@@ -25884,7 +26677,10 @@ mod tests {
         let mut log = record.to_vec();
         log.push(b'\n');
         fixture.write_log("activity.log", &log);
-        let action = ReadAction::Activity { lines: 10 };
+        let action = ReadAction::Activity {
+            lines: 10,
+            since: None,
+        };
         fixture.hand_over();
         let right = activity_document(
             &fixture.paths(),
@@ -25918,7 +26714,10 @@ mod tests {
     fn a_corrupt_or_unsafe_activity_log_is_refused_by_both_rungs() {
         let fixture = TestShellPackageFixture::new("activity-corrupt");
         let policy = SecurityPolicyArgs::default();
-        let action = ReadAction::Activity { lines: 50 };
+        let action = ReadAction::Activity {
+            lines: 50,
+            since: None,
+        };
 
         fixture.write_log("activity.log", b"1700000001|not a valid record at all\n");
         let shell = fixture.run_manager(&["api", "activity", "--lines", "50"]);
@@ -26002,7 +26801,10 @@ mod tests {
     fn an_absent_activity_log_is_an_empty_feed_on_both_rungs() {
         let fixture = TestShellPackageFixture::new("activity-absent");
         let policy = SecurityPolicyArgs::default();
-        let action = ReadAction::Activity { lines: 20 };
+        let action = ReadAction::Activity {
+            lines: 20,
+            since: None,
+        };
         let shell = fixture.run_manager(&["api", "activity", "--lines", "20"]);
         assert!(
             shell.status.success(),
@@ -27045,7 +27847,7 @@ mod tests {
         let feed =
             || CgiResponse::success(br#"{"schema":"sdsync.dsm-activity.v1","events":[]}"#.to_vec());
         let read = |fixture: &TestPackageFixture| -> Value {
-            let attached = attach_activity_history(feed(), &fixture.paths(), uid).unwrap();
+            let attached = attach_activity_history(feed(), &fixture.paths(), uid, None).unwrap();
             serde_json::from_slice(&attached.body).unwrap()
         };
         assert_eq!(
@@ -27661,6 +28463,89 @@ mod tests {
         assert_eq!(run["long_running"], false);
     }
 
+    /// The Activity feed names a `version`, and a request that sends the current one is answered
+    /// `unchanged` without the feed: nothing is read, rendered or sanitised again. Any change
+    /// the feed is built from (a record appended, a rotation, a different line count, a changed
+    /// log level) is a different version, so a stale `since` is answered with the feed.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_activity_feed_is_answered_unchanged_only_for_the_version_it_is_at() {
+        let _serialised = CONTROL_FIXTURE_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let fixture = TestPackageFixture::new("activity-version");
+        let uid = TestPackageFixture::package_uid();
+        let policy = SecurityPolicyArgs::default();
+        // A manager that cannot answer, so an answer from it is unmistakable.
+        fixture.write_manager("printf 'not json'");
+        let log = fixture.log_root.join("activity.log");
+        fixture.write_private(
+            &log,
+            b"1700000001|run.succeeded|alpha|succeeded|sync|info|Run completed
+",
+        );
+        let read = |lines: u16, since: Option<&str>, policy: &SecurityPolicyArgs| -> Value {
+            let action = ReadAction::Activity {
+                lines,
+                since: since.map(str::to_owned),
+            };
+            let response = execute_read_action(&fixture.paths(), &action, policy, uid)
+                .unwrap_or_else(|error| panic!("{action:?}: {error:?}"));
+            serde_json::from_slice(&response.body).unwrap()
+        };
+
+        let full = read(10, None, &policy);
+        assert_eq!(full["events"].as_array().unwrap().len(), 1);
+        let version = full["version"].as_str().unwrap().to_owned();
+        assert!(valid_activity_version(&version), "{version}");
+
+        // The same version: no events, no history, the same version back.
+        let same = read(10, Some(&version), &policy);
+        assert_eq!(
+            same,
+            json!({"schema": "sdsync.dsm-activity.v1", "unchanged": true, "version": version})
+        );
+
+        // A version of another window, or no version at all, is the feed.
+        assert!(read(20, Some(&version), &policy)["events"].is_array());
+        assert!(read(10, Some("0"), &policy)["events"].is_array());
+
+        // A record appended: the old version no longer matches and the new feed names a new one.
+        fixture.write_private(
+            &log,
+            b"1700000001|run.succeeded|alpha|succeeded|sync|info|Run completed\n\
+              1700000002|run.failed|alpha|failed|sync|error|Run failed\n",
+        );
+        let grown = read(10, Some(&version), &policy);
+        assert_eq!(grown["events"].as_array().unwrap().len(), 2);
+        assert_ne!(grown["version"], json!(version));
+
+        // A policy that filters differently is a different feed too.
+        let strict = SecurityPolicyArgs {
+            sync_log_level: PolicyLogLevel::Error,
+            ..SecurityPolicyArgs::default()
+        };
+        let current = grown["version"].as_str().unwrap().to_owned();
+        let filtered = read(10, Some(&current), &strict);
+        assert!(
+            filtered["events"].is_array(),
+            "a changed policy matched an old version"
+        );
+
+        // An unsafe log file is never "unchanged": the read names it.
+        fs::set_permissions(&log, fs::Permissions::from_mode(0o644)).unwrap();
+        let action = ReadAction::Activity {
+            lines: 10,
+            since: Some(current.clone()),
+        };
+        let error = execute_read_action(&fixture.paths(), &action, &policy, uid).unwrap_err();
+        assert_eq!(
+            resolved_error_code(error, None, None),
+            "config_file_unsafe",
+            "an unsafe feed was answered as unchanged"
+        );
+    }
+
     /// ADV-B-5: one record whose free text holds ` request_id=` not followed by a request id
     /// (a file named `meeting request_id=5.txt` in a run's error line) made the whole Activity
     /// feed 503 `package_state_corrupt`. The record is kept, untagged, with its text intact,
@@ -27683,7 +28568,10 @@ mod tests {
         let document = activity_document(
             &fixture.paths(),
             uid,
-            &ReadAction::Activity { lines: 10 },
+            &ReadAction::Activity {
+                lines: 10,
+                since: None,
+            },
             10,
             &policy,
         )
@@ -27711,7 +28599,10 @@ mod tests {
         let document = activity_document(
             &fixture.paths(),
             uid,
-            &ReadAction::Activity { lines: 10 },
+            &ReadAction::Activity {
+                lines: 10,
+                since: None,
+            },
             10,
             &policy,
         )
@@ -28897,6 +29788,97 @@ mod tests {
         fixture.write_private(&state, b"");
 
         linux_files::state_flock_unlocks_shared_description_at(&state).unwrap();
+    }
+
+    /// A slow request is one record a minute across every CGI process, saying how many it held
+    /// back, in a window of its own: it can neither be suppressed by a failure record nor
+    /// suppress one.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn slow_request_records_are_one_a_minute_and_count_what_they_held_back() {
+        let fixture = TestControlFixture::new("cgi-slow-records");
+        let uid = TestControlFixture::package_uid();
+        let log_root = fixture.root.join("log");
+        let runtime_root = fixture.root.join("run");
+        for directory in [&log_root, &runtime_root] {
+            fs::create_dir(directory).unwrap();
+            fs::set_permissions(directory, fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let api_log = log_root.join("api.log");
+        let state = runtime_root.join("cgi-slow.state");
+        let failure_state = runtime_root.join("cgi-failure.state");
+        let policy = SecurityPolicyArgs::default();
+        let mut members = serde_json::Map::new();
+        members.insert("request".to_owned(), json!("snapshot"));
+        members.insert("total_ms".to_owned(), json!(2500));
+        let record = |now: u64| {
+            linux_files::record_slow_request_at(
+                &log_root, &api_log, &state, uid, now, &policy, "cgi_slow", &members, 60,
+            )
+            .unwrap()
+        };
+        assert!(record(10_000));
+        assert!(!record(10_010));
+        assert!(!record(10_059));
+        // A failure inside the slow window is still recorded: the windows are separate.
+        assert!(
+            linux_files::record_pre_relay_cgi_failure_at(
+                &log_root,
+                &api_log,
+                &failure_state,
+                uid,
+                10_020,
+                "bridge_connect",
+                "service_unavailable",
+                503,
+            )
+            .unwrap()
+        );
+        assert!(record(10_060));
+
+        let lines = fs::read_to_string(&api_log).unwrap();
+        let slow = lines
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .filter(|value| value["event"] == "cgi_slow")
+            .collect::<Vec<_>>();
+        assert_eq!(slow.len(), 2);
+        assert_eq!(slow[0]["repeats"], 0);
+        assert_eq!(
+            slow[1]["repeats"], 2,
+            "the held-back requests were not counted"
+        );
+        assert_eq!(slow[0]["request"], "snapshot");
+        assert_eq!(slow[0]["total_ms"], 2500);
+        assert_eq!(slow[0]["category"], "bridge");
+        assert_eq!(slow[0]["level"], "warn");
+        assert_eq!(
+            lines
+                .lines()
+                .filter(|line| line.contains("cgi_failure"))
+                .count(),
+            1
+        );
+        // A slow record names no path, user or session.
+        for line in lines.lines() {
+            assert!(!line.contains("/var/"), "{line}");
+        }
+    }
+
+    /// The query string names the request by a fixed word, never by what the client wrote.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_slow_request_is_named_from_a_fixed_vocabulary() {
+        use cgi_watchdog::label_from_query;
+        assert_eq!(label_from_query("api=x&action=snapshot"), "snapshot");
+        assert_eq!(
+            label_from_query("action=activity&lines=200&since=ab"),
+            "activity"
+        );
+        assert_eq!(label_from_query("action=status-rollup"), "status-rollup");
+        assert_eq!(label_from_query("action=../../etc/passwd"), "unknown");
+        assert_eq!(label_from_query("lines=200"), "unknown");
+        assert_eq!(label_from_query(""), "unknown");
     }
 
     #[cfg(target_os = "linux")]
@@ -36451,7 +37433,10 @@ mod tests {
         let output = br#"{"schema":"sdsync.dsm-activity.v1","has_password":true,"password":"leak","nested":{"token":"leak"},"message":"exact-secret"}"#;
         let sanitized = parse_and_sanitize_manager_json(
             output,
-            &ReadAction::Activity { lines: 10 },
+            &ReadAction::Activity {
+                lines: 10,
+                since: None,
+            },
             Some(b"exact-secret"),
             None,
         )
@@ -36477,7 +37462,10 @@ mod tests {
         let output = br#"{"schema":"sdsync.dsm-activity.v1","tokens":"leak","session_cookies":["a","b"],"api_key":"leak","bearer":"leak","set_cookie":"leak","cookies":{"csrf":true,"session":true},"nested":{"tokens":"leak"}}"#;
         let sanitized = parse_and_sanitize_manager_json(
             output,
-            &ReadAction::Activity { lines: 10 },
+            &ReadAction::Activity {
+                lines: 10,
+                since: None,
+            },
             None,
             None,
         )

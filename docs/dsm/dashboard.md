@@ -380,7 +380,12 @@ modification time, may exercise same-target copy, and removes the probe.
 Use it only in a prepared non-critical existing destination.
 
 The API initially queues the action, then the page polls its sanitized terminal result before
-reporting the Doctor verdict. Pending Doctor observations have no overall client deadline. An
+reporting the Doctor verdict. Pending Doctor observations have no overall client deadline, but they
+do not run unwatched: while the browser tab is hidden the result is asked for every 15 seconds
+instead of every few seconds (showing the tab ends the wait at once), and after ten minutes with no
+progress published the page says so and offers **Stop waiting**. Stopping the wait frees the form and
+ends that one observation; it cancels nothing, the NAS may still run the job, and the result is
+recorded in Activity when it ends. The same holds for the sync status walk and Resync. An
 `expired_or_missing` result, an invalid result document, or five consecutive result-observation
 failures yields outcome-unknown; inspect Activity and refreshed cached health evidence to determine
 what completed. Only the Run/Doctor operation scope is then paused in that AppWindow. Profile,
@@ -419,7 +424,11 @@ logs tab is open and not paused: the event tabs poll only the Activity feed, sin
 render a log read's result. The next log read waits at least three times as long as the last one took,
 rests at the 60-second cadence in a minimised window, and ramps like the status poll after two
 consecutive failures. Opening the Package
-logs tab fetches logs immediately rather than waiting for the next poll tick. Refresh intervals are
+logs tab fetches logs immediately rather than waiting for the next poll tick. Each full Activity
+answer names its version; the timer's next read sends it back, and an unchanged feed is answered
+with a one-line "unchanged" document, so an idle NAS neither re-reads nor re-sends the same events
+every few seconds (opening the page, a filter, Resume and any read after a failure always fetch the
+whole feed). Refresh intervals are
 controlled in Settings. **Manual only** cancels the corresponding background timer while retaining
 the explicit Refresh or Activity-page reload action. Full event and retention details are in
 [Health, activity, logs, and notifications](operations.md).

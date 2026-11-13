@@ -709,6 +709,51 @@ Suppression still obeys `bridge_log_level`. A policy set to `error` writes no re
 neither the log nor the coalescing state file, and does not change what the browser is told: the
 503 and its code reach the page either way. A quiet log is not a quiet page.
 
+### Slow dashboard requests
+
+A request that takes more than two seconds is named in `api.log`, under the `bridge` category at
+`warn`, so that "the dashboard is sluggish" can be answered from the NAS rather than guessed at.
+Two records, because two processes see two different parts of the wait:
+
+- `cgi_slow` is written by the CGI after it has sent its answer, so reporting a slow request never
+  makes it slower. It carries `request` (the read it asked for, `post` for a mutation, or `unknown`),
+  `total_ms`, and where the time went: `identity_ms`, `auth_ms` (DSM authentication in the CGI; zero
+  on DSM 7, where the service authenticates), `body_ms` (reading the request) and `relay_ms`
+  (connecting to the service and waiting for its answer).
+- `service_slow` is written by the package service for the part of `relay_ms` it spent: `auth_ms`
+  (the loopback user-service check), `admission_ms` (runtime admission and the security policy) and
+  `handle_ms` (executing the request).
+
+Neither names a path, a user or a session. A result poll is never reported: it holds the request
+open for up to three seconds on purpose. At most one record a minute is written for each kind, and
+`repeats` says how many slow requests that minute held back, so watching the log costs the NAS
+nothing while it is slow. `cgi_slow` keeps its own state file (`var/run/cgi-slow.state`), not
+`cgi-failure.state`, so a slow poll can never suppress a failure record. A record that cannot be
+written is named on the process's stderr, and a `bridge_log_level` above `warn` writes none.
+
+### Waking the controller after a save
+
+A dashboard save is queued as a file, and the controller is then told to look at the queue with one
+`SIGUSR2`. The service sends that signal itself, after the same proof the manager used to make
+(`controller.pid`, `controller.ready` and the live `controller.lock` naming one pid, start tick and
+boot id, and a last check of `/proc` immediately before the signal). It no longer starts the shell
+manager for it, which was an estimated second and a half of every save's answer on a DS416. No PID file
+and a process that has exited are the ordinary "not running": the queue is read when the controller
+starts. The daemon engine publishes no `controller.pid`, so under it nothing is signalled and its
+queue consumer, which looks at the queue every 250 ms, picks the job up. A controller that is alive
+but cannot be proven to be the package's is never signalled; that writes the `controller_wake_failed`
+failure record, and a `warn` record `controller_wake_failed` naming the `cause` (`pid_file_unsafe`,
+`pid_probe_failed`, `identity_untrusted`, `identity_changed` or `signal_failed`), at most once every
+five minutes. The save itself is unaffected: it was accepted, and the controller's own polling finds it.
+
+### Reconciling the audit while polling a result
+
+A queued job whose terminal audit record is still pending is reconciled by the result poll, which
+forks the manager (about 1.7 s on a DS416, up to 20 s when the audit sink is down). A job is
+reconciled by a poll at most once every fifteen seconds; a poll inside the window is answered from
+the stored result at once, still saying `audit_pending`, and the controller's own retry finishes the
+record. Before, each abandoned browser read left another manager fork behind it.
+
 ### Forcing dashboard reads through the shell manager
 
 Dashboard reads, the Logs view included, are answered inside the package service, from the package's

@@ -340,6 +340,7 @@
             <article class="sdsync-panel sdsync-rollup" aria-labelledby="sdsync-rollup-title">
               <div class="sdsync-panel-heading"><div><p class="sdsync-eyebrow">Stored totals</p><h3 id="sdsync-rollup-title">Sync summary</h3></div><div class="sdsync-evidence-heading-actions"><span class="sdsync-freshness">{{ statusRollupFreshness }}</span><v-button type="border" display="icon-text" aria-label="Re-read the stored totals" tooltip="Re-read what the last check recorded. This walks no folder and contacts no destination." :disabled="statusRollupLoading" :aria-busy="statusRollupLoading ? 'true' : 'false'" @click="refreshStatusRollup"><template #icon><action-icon :class="{ 'sdsync-is-spinning': statusRollupLoading }" name="refresh" /></template>Refresh</v-button></div></div>
               <p class="sdsync-field-note">Read back from what the last check recorded, so it opens straight away: no folder is walked and the destination is not contacted. Check one scope below when you need a live per-file comparison.</p>
+              <p v-if="statusRollupError" class="sdsync-field-note" role="status">The totals could not be re-read, so the last ones read are shown. {{ statusRollupError }}</p>
               <p v-if="!statusRollup.loaded || (!statusRollup.total && !statusRollup.profiles.length)" class="sdsync-empty">{{ statusRollupMessage }}</p>
               <template v-else>
                 <dl v-if="statusRollupCards.length" class="sdsync-sync-stats sdsync-rollup-stats" aria-label="Combined stored totals">
@@ -366,8 +367,9 @@
             </v-form>
 
             <article class="sdsync-panel sdsync-sync-results" aria-live="polite" aria-labelledby="sdsync-sync-title">
-              <div class="sdsync-panel-heading"><div><p class="sdsync-eyebrow">{{ syncStatusResult.loaded ? syncStatusResult.profile : 'Nothing loaded' }}</p><h3 id="sdsync-sync-title">{{ syncStatusResult.loaded ? syncStatusQueryLabel : 'Sync state' }}</h3></div><span v-if="syncStatusResult.loaded" class="sdsync-freshness">Compared by {{ syncStatusResult.compare }}</span></div>
+              <div class="sdsync-panel-heading"><div><p class="sdsync-eyebrow">{{ syncStatusResult.loaded ? syncStatusResult.profile : 'Nothing loaded' }}</p><h3 id="sdsync-sync-title">{{ syncStatusResult.loaded ? syncStatusQueryLabel : 'Sync state' }}</h3></div><span v-if="syncStatusResult.loaded" class="sdsync-freshness">Compared by {{ syncStatusResult.compare }}<template v-if="syncStatusCheckedLabel"> · {{ syncStatusCheckedLabel }}</template></span></div>
               <p v-if="syncStatusBusy && liveProgressDetail" class="sdsync-live-progress" role="status" aria-live="polite">{{ liveProgressDetail }}</p>
+              <div v-if="syncStatusBusy && liveProgressStalled" class="sdsync-warning sdsync-live-stalled" role="status" aria-live="polite"><strong>No progress for 10 minutes</strong><span>{{ liveProgressStalledText }}</span><v-button suffix="grey" display="icon-text" tooltip="Stop watching this operation and free the form. Nothing is cancelled on the NAS." @click="detachLiveOperation">Stop waiting</v-button></div>
               <p v-if="!syncStatusResult.loaded" class="sdsync-empty">{{ syncStatusMessage }}</p>
               <template v-else>
                 <dl class="sdsync-sync-stats" aria-label="Whole-scope totals">
@@ -412,6 +414,7 @@
               </div>
               <p v-if="resyncMessage" :class="['sdsync-field-note', { 'is-error': resyncFailed }]">{{ resyncMessage }}</p>
               <p v-if="resyncBusy && liveProgressDetail" class="sdsync-live-progress" role="status" aria-live="polite">{{ liveProgressDetail }}</p>
+              <div v-if="resyncBusy && liveProgressStalled" class="sdsync-warning sdsync-live-stalled" role="status" aria-live="polite"><strong>No progress for 10 minutes</strong><span>{{ liveProgressStalledText }}</span><v-button suffix="grey" display="icon-text" tooltip="Stop watching this operation and free the form. Nothing is cancelled on the NAS." @click="detachLiveOperation">Stop waiting</v-button></div>
               <div v-if="resyncPlan.overwrites || resyncPhase === 'confirmed'" class="sdsync-resync-plan">
                 <dl class="sdsync-definition-grid">
                   <div><dt>Scope</dt><dd>{{ resyncScopeLabel }}</dd></div>
@@ -443,6 +446,7 @@
                 <div v-if="doctorProgress.active" class="sdsync-doctor-progress" role="status" aria-live="polite" aria-label="Target Doctor progress">
                   <div class="sdsync-doctor-progress-heading"><action-icon class="sdsync-is-spinning" name="refresh" :size="20" /><span><strong>Doctor is running</strong><small>Keep this AppWindow open while terminal evidence is collected.</small></span></div>
                   <p v-if="liveProgressDetail" class="sdsync-live-progress">{{ liveProgressDetail }}</p>
+                  <div v-if="doctorProgress.active && liveProgressStalled" class="sdsync-warning sdsync-live-stalled" role="status" aria-live="polite"><strong>No progress for 10 minutes</strong><span>{{ liveProgressStalledText }}</span><v-button suffix="grey" display="icon-text" tooltip="Stop watching this operation and free the form. Nothing is cancelled on the NAS." @click="detachLiveOperation">Stop waiting</v-button></div>
                   <div class="sdsync-doctor-progress-track" aria-hidden="true"><span /></div>
                   <ol><li v-for="stage in doctorProgressStages" :key="stage.id" :class="'is-' + stage.state"><span class="sdsync-doctor-state-dot" />{{ stage.label }}<small>{{ doctorStatusLabel(stage.state) }}</small></li></ol>
                 </div>
@@ -689,6 +693,8 @@ import {
   ACTIVITY_SCHEMA,
   LOGS_SCHEMA,
   activityContentKey,
+  activityIsUnchanged,
+  activityVersionOf,
   feedDocumentProblem,
   feedSignature,
   runStderrBlock,
@@ -1357,9 +1363,67 @@ function queuedFailureGuidance(error) {
 // What the running operation last told us it was doing. One slot rather than
 // one per surface, because the package runs one queued operation at a time and
 // the AppWindow blocks the others while it does.
-function emptyLiveProgress() {
-  return { active: false, operation: "", progress: null };
+// The cause a thrown value carries, as the one bounded line a toast can show: its name and
+// message, which is what the browser or DSM said and the only thing that tells a clipboard
+// refusal from a missing launcher. A value that is not an Error is shown as the text it is.
+function thrownCause(error) {
+  const name = plainText(error && error.name ? error.name : "Error", 40);
+  const message = plainText(error && error.message ? error.message : String(error), 160);
+  return `${name}: ${message}`;
 }
+
+// What `failureKey` recorded, as a sentence: the toast that has no attention item to quote
+// still says which failure it announces. The key's parts are the package's own fields.
+function failureKeyCause(key) {
+  const [kind, subject, epoch, exitCode, reason] = String(key || "").split(":");
+  const named = (value) => plainText(value || "", 80);
+  if (kind === "run") {
+    return `Run of ${named(subject) || "unknown scope"}${Number(epoch) > 0 ? ` at ${formatDate(Number(epoch))}` : ""}${named(exitCode) ? `, exit ${named(exitCode)}` : ""}${named(reason) ? `, reason ${named(reason)}` : ""}.`;
+  }
+  if (kind === "aggregate") return `Aggregate run${Number(subject) > 0 ? ` finished ${formatDate(Number(subject))}` : ""}${named(epoch) ? `, reason ${named(epoch)}` : ""}.`;
+  if (kind === "profile") return `Profile ${named(subject) || "unknown"}${Number(epoch) > 0 ? ` at ${formatDate(Number(epoch))}` : ""}${named(exitCode) ? `, reason ${named(exitCode)}` : ""}.`;
+  return "";
+}
+
+// How long a status page this window already fetched may be shown again without walking both trees.
+// The walk is the cost (the package keeps no index of it), and a page the person went back to is
+// the same comparison they were just looking at, labelled with how old it is. A run that finishes
+// in between, a re-upload, or any change to the query ends it sooner.
+const SYNC_STATUS_PAGE_TTL_MS = 5 * 60 * 1000;
+const SYNC_STATUS_PAGE_CACHE_LIMIT = 40;
+
+// One page's identity: every field of the query that produced it and the cursor it started from.
+function syncStatusPageKey(profile, query, limit, cursor) {
+  return JSON.stringify([profile, query.scope, query.filter, query.state, limit, query.includeExcluded === true, cursor]);
+}
+
+// The cache is plain data kept off Vue's reactivity (pages are frozen and replaced whole).
+function syncStatusPages(component) {
+  if (!(component.syncStatusPageCache instanceof Map)) component.syncStatusPageCache = new Map();
+  return component.syncStatusPageCache;
+}
+
+// The pages fetched for one profile, or for all of them. Dropped when the profile goes, when a
+// re-upload or run changes what they compared, and when the person changes the query.
+function dropSyncStatusPages(component, profile = "") {
+  const pages = syncStatusPages(component);
+  if (!profile) {
+    pages.clear();
+    return;
+  }
+  for (const [key, entry] of pages) if (entry.profile === profile) pages.delete(key);
+}
+
+function emptyLiveProgress() {
+  return { active: false, operation: "", progress: null, startedAtMs: 0 };
+}
+
+// How long an operation may be watched with no phase ever published before the window says so and
+// offers to stop waiting. A running Doctor or status walk publishes phases; ten minutes of silence
+// means it has not started (a long queue, a stopped controller) or publishes nothing, and either
+// way the person is owed the choice rather than a spinner that only the server's 24-hour job
+// expiry can end.
+const LIVE_PROGRESS_STALL_MS = 10 * 60 * 1000;
 
 // The observer a queued operation hands to its result poll. Every pending read
 // publishes here, so a slow operation can say what it is doing while it runs
@@ -1376,14 +1440,22 @@ function emptyLiveProgress() {
 // more bindings on whatever context is driving it.
 function openProgressSink(component, operation) {
   const name = boundedText(operation, "");
-  component.liveProgress = { active: true, operation: name, progress: null };
-  return (progress) => {
+  const startedAtMs = Date.now();
+  component.liveProgress = { active: true, operation: name, progress: null, startedAtMs };
+  // The person may stop waiting for this one operation. The signal rides on the observer: api.js
+  // reads `detachSignal` off it and ends that operation's result poll alone.
+  const detach = typeof AbortController === "function" ? new AbortController() : null;
+  component.liveProgressDetach = detach;
+  const sink = (progress) => {
     if (component.disposed) return;
-    component.liveProgress = { active: true, operation: name, progress: progress || null };
+    component.liveProgress = { active: true, operation: name, progress: progress || null, startedAtMs };
   };
+  sink.detachSignal = detach ? detach.signal : undefined;
+  return sink;
 }
 
 function closeProgressSink(component) {
+  component.liveProgressDetach = null;
   if (!component.disposed) component.liveProgress = emptyLiveProgress();
 }
 
@@ -2035,7 +2107,7 @@ function emptyPathBrowser() {
 }
 
 function emptyRoutine(profile = "") {
-  return { profile, enabled: false, action: "sync", mode: "interval", interval_seconds: 3600, weekdays: [1, 2, 3, 4, 5, 6, 7], time_window_start: "00:00", time_window_end: "23:59", debounce_seconds: 45, poll_seconds: 30, retry_count: 5, retry_backoff_seconds: 60, retry_exponential: true, allow_delete: false, max_total_delete: 100, depends_on: [] };
+  return { profile, enabled: false, action: "sync", mode: "interval", interval_seconds: 3600, weekdays: [1, 2, 3, 4, 5, 6, 7], time_window_start: "00:00", time_window_end: "23:59", debounce_seconds: 15, poll_seconds: 30, retry_count: 5, retry_backoff_seconds: 60, retry_exponential: true, allow_delete: false, max_total_delete: 100, depends_on: [] };
 }
 // The nine values a realtime routine's `backend_reason` may carry (absent
 // reads as `ok`, matching the manager and core readers). Six of them mean the
@@ -4373,9 +4445,9 @@ export default {
       pathBrowser: emptyPathBrowser(),
       routineEditorOpen: false, routineForm: emptyRoutine(), doctorForm: { scope: "all", level: "standard", write_test: false, write_confirm: false },
       syncStatusForm: { profile: "", scope: "", filter: "", state: "attention", limit: SYNC_PAGE_SIZE_DEFAULT, include_excluded: false },
-      statusRollup: emptyStatusRollup(), statusRollupLoading: false, statusRollupMessage: ROLLUP_IDLE_MESSAGE,
+      statusRollup: emptyStatusRollup(), statusRollupError: "", statusRollupReceivedAtMs: 0, statusRollupLoading: false, statusRollupMessage: ROLLUP_IDLE_MESSAGE,
       syncStatusResult: emptySyncStatusPage(), syncStatusPhase: "idle", syncStatusMessage: SYNC_STATUS_IDLE_MESSAGE,
-      syncStatusBusy: false, syncStatusCursors: [], syncStatusPageNumber: 0,
+      syncStatusBusy: false, syncStatusCursors: [], syncStatusPageNumber: 0, syncStatusCheckedAtMs: 0, syncStatusFromMemory: false,
       resyncForm: { scope: "" }, resyncPlan: emptyResyncPlan(), resyncPhase: "idle", resyncMessage: "", resyncBusy: false,
       alertForm: { enabled: false, on_success: false, on_failure: true, failure_threshold: 1, cooldown_seconds: 3600 },
       notificationTabs: [
@@ -4390,7 +4462,7 @@ export default {
       aboutUiDependencies: ABOUT_UI_DEPENDENCIES,
       diagnostic: { title: "Not run in this session", output: "No diagnostic output yet." }, doctorReport: idleDoctorReport(), doctorProgress: emptyDoctorProgress(),
       liveProgress: emptyLiveProgress(),
-      logsPaused: false, logSource: "all", logLines: 200, logState: "Waiting for logs", logOutput: "No log data yet.", logRecords: [], activityEvents: [], activityHistory: null, activitySearch: "",
+      logsPaused: false, logSource: "all", logLines: 200, logState: "Waiting for logs", logOutput: "No log data yet.", logRecords: [], activityEvents: [], activityVersion: "", activityVersionLines: 0, activityHistory: null, activitySearch: "",
       // Why each feed's last read failed, "" while it is healthy. A feed that
       // fails keeps its old rows, so without these a dead feed and an empty one
       // look the same on every tab but Package logs.
@@ -4721,8 +4793,16 @@ export default {
       const degraded = cacheHealthNote(this.outcomes);
       const suffix = degraded ? ` · ${degraded}` : "";
       if (!this.statusRollup.loaded) return "Not read yet" + suffix;
-      if (!this.statusRollup.observedAtEpoch) return "Never observed" + suffix;
-      return `Oldest evidence ${describeEvidenceAge(this.statusRollup.observedAtEpoch, this.packageNowSeconds)}${suffix}`;
+      const retained = this.statusRollupError ? ` · totals as read ${this.statusRollupReadAge}` : "";
+      if (!this.statusRollup.observedAtEpoch) return "Never observed" + retained + suffix;
+      return `Oldest evidence ${describeEvidenceAge(this.statusRollup.observedAtEpoch, this.packageNowSeconds)}${retained}${suffix}`;
+    },
+    // How long ago this window last read the totals, on the browser's own clock: the age of a
+    // read this window made, which the package's clock cannot say.
+    statusRollupReadAge() {
+      const received = Math.floor(numberOr(this.statusRollupReceivedAtMs, 0) / 1000);
+      const now = Math.floor(numberOr(this.nowMs, Date.now()) / 1000);
+      return received > 0 ? describeEvidenceAge(received, now) : "earlier";
     },
     statusRollupTotalNote() {
       const rollup = this.statusRollup;
@@ -4780,6 +4860,27 @@ export default {
       if (!query) return "";
       const search = query.filter ? ` · matching "${query.filter}"` : "";
       return `${SYNC_STATE_LABELS[query.state] || query.state} in ${query.scope || "the whole source tree"}${search}`;
+    },
+    // What the stored status pages were compared against. A run that starts or finishes, or any
+    // profile's outcome moving, changes it; a page fetched under another stamp is not shown again.
+    syncStatusEvidenceStamp() {
+      const outcomes = this.outcomes;
+      if (!outcomes || !outcomes.run) return "none";
+      const profiles = Array.isArray(outcomes.profiles) ? outcomes.profiles : [];
+      return [
+        outcomes.run.outcome, outcomes.run.startedEpoch, outcomes.run.finishedEpoch,
+        ...profiles.map((entry) => `${entry.profile}=${entry.finishedEpoch || 0}/${entry.outcomeEpoch || 0}`)
+      ].join("|");
+    },
+    // When the page on screen was compared, on this window's clock: the age of a walk this window
+    // waited for. A page shown again from memory says so.
+    syncStatusCheckedLabel() {
+      const checked = Math.floor(numberOr(this.syncStatusCheckedAtMs, 0) / 1000);
+      if (checked <= 0) return "";
+      const age = describeEvidenceAge(checked, Math.floor(numberOr(this.nowMs, Date.now()) / 1000));
+      return this.syncStatusFromMemory
+        ? `Checked ${age}, shown from this window's memory (no new check). Select Check status to compare again.`
+        : `Checked ${age}`;
     },
     syncStatusHasPrevious() { return this.syncStatusCursors.length > 1; },
     syncStatusHasNext() { return this.syncStatusResult.truncated && Boolean(this.syncStatusResult.nextCursor); },
@@ -5114,6 +5215,19 @@ export default {
     // What the running operation last said it was doing, or -- when it has
     // published nothing -- why it has not started. Progress wins whenever there
     // is progress: a job reporting phases is plainly not waiting for one.
+    // An operation watched for ten minutes with no phase published, and a way out of it.
+    liveProgressStalled() {
+      const live = this.liveProgress;
+      if (!live || !live.active || live.progress || !(live.startedAtMs > 0)) return false;
+      return numberOr(this.nowMs, Date.now()) - live.startedAtMs >= LIVE_PROGRESS_STALL_MS;
+    },
+    liveProgressStalledText() {
+      return guidanceText(
+        "The package has reported no progress on this for 10 minutes.",
+        this.queuedWaitDetail.text,
+        "Stopping the wait cancels nothing: the NAS may still run it, and its result is recorded in Activity when it ends."
+      );
+    },
     liveProgressDetail() {
       if (!this.liveProgress.active) return "";
       const published = progressSentence(this.liveProgress.progress, this.controllerLiveness.packageEpoch);
@@ -5333,21 +5447,27 @@ export default {
     };
     document.addEventListener("visibilitychange", this.visibilityHandler);
     this.installProfileWindowGuard();
-    let csrfReady = false;
-    try {
-      await this.refreshCsrf();
-      csrfReady = true;
-    } catch (error) {
-      if (this.disposed) return;
+    // The mutation token and the first snapshot are independent reads (the snapshot GET
+    // carries no token), so they go out together: first data waits for the slower of the two
+    // CGI round trips instead of their sum. The snapshot cycle joins this token read rather
+    // than starting a second one, and does not report its failure again: it is reported here,
+    // once, with the authentication wording.
+    const tokenRead = this.refreshCsrf().then(() => null, (error) => {
+      if (this.disposed) return error;
       this.connected = false;
       this.csrfToken = "";
       this.bridgeIssue = this.describeBridgeError(error, "authentication");
       this.connectionLabel = this.bridgeIssue.title;
       this.toast(this.bridgeIssue.title, this.bridgeIssue.message, true);
+      return error;
+    });
+    this.csrfAttempt = { promise: tokenRead, reported: true };
+    try {
+      await this.refreshSnapshot(false);
+      await tokenRead;
+    } finally {
+      this.csrfAttempt = null;
     }
-    if (this.disposed) return;
-    if (csrfReady) await this.refreshSnapshot(false);
-    else this.scheduleSnapshot();
   },
   // The error banner outlives the error that raised it unless something takes it
   // down. A render that throws keeps the previous page on screen, so a later flush
@@ -5853,17 +5973,30 @@ export default {
       this.refreshAutosaveStatus();
     },
     describeBridgeError(error, phase = "status") { return describeBridgeFailure(error, phase); },
+    // Stop watching the operation in flight. Nothing is cancelled on the NAS; the poll ends, the
+    // form is freed, and the operation's own catch says so (reportMutationError, `detached`).
+    detachLiveOperation() {
+      const controller = this.liveProgressDetach;
+      if (controller && typeof controller.abort === "function") {
+        controller.abort();
+        return;
+      }
+      // Not silent: the button was offered, so a window that cannot honour it says why.
+      if (this.liveProgress && this.liveProgress.active) {
+        this.toast("Cannot stop waiting", "This browser gave the window no way to stop watching one request. Close and reopen the AppWindow to stop; the NAS job is not cancelled either way.", true);
+      }
+    },
     openDsmHelp() {
       /* global SYNO */
       const launch = typeof SYNO !== "undefined" && SYNO.SDS && SYNO.SDS.AppLaunch;
       if (typeof launch !== "function") {
-        this.toast("DSM Help unavailable", "Open DSM Help and select Synology Drive Sync.", true);
+        this.toast("DSM Help unavailable", "DSM's help launcher (SYNO.SDS.AppLaunch) is not available in this window. Open DSM Help and select Synology Drive Sync.", true);
         return;
       }
       try {
         launch(HELP_APPLICATION, { app: APP_CLASS, content: HELP_CONTENT[this.route] || HELP_CONTENT.overview }, false);
-      } catch (_error) {
-        this.toast("DSM Help unavailable", "Open DSM Help and select Synology Drive Sync.", true);
+      } catch (error) {
+        this.toast("DSM Help unavailable", `DSM refused to open its help (${thrownCause(error)}). Open DSM Help and select Synology Drive Sync.`, true);
       }
     },
     navigate(route) {
@@ -5971,6 +6104,13 @@ export default {
         correlation ? `${correlation} ${detail}` : detail,
         defaultMessage
       ).slice(0, MUTATION_MESSAGE_LIMIT);
+      // The person stopped waiting. Neither a failure nor an unknown outcome: no incident, no lock,
+      // and no error toast. The error's own text says what is true -- nothing was cancelled.
+      if (error && error.detached === true) {
+        const stopped = withCorrelation(observed, fallback);
+        this.toast("Stopped waiting", stopped, false);
+        return { unknown: false, inspection: false, detached: true, message: stopped, requestId, jobId };
+      }
       // Accepted and still on the queue. Handled here rather than only in
       // `autosaveFailed` because every manual caller that passes bounded
       // observation limits reaches this function too, and without a branch of
@@ -6573,7 +6713,7 @@ export default {
       if (!(delay > 0)) return;
       this.snapshotTimer = window.setTimeout(() => this.refreshSnapshot(false), delay);
     },
-    scheduleLogs() { window.clearTimeout(this.logTimer); this.logTimer = 0; const interval = Number(this.settings.log_refresh); if (interval > 0 && !this.disposed && !document.hidden && this.route === "activity" && !this.logsPaused) this.logTimer = window.setTimeout(() => this.refreshLogs(), logsPollDelay(this, interval)); },
+    scheduleLogs() { window.clearTimeout(this.logTimer); this.logTimer = 0; const interval = Number(this.settings.log_refresh); if (interval > 0 && !this.disposed && !document.hidden && this.route === "activity" && !this.logsPaused) this.logTimer = window.setTimeout(() => this.refreshLogs({ poll: true }), logsPollDelay(this, interval)); },
     async refreshCsrf(options = undefined) { if (this.disposed) return; this.csrfToken = ""; const model = await apiGet(this.auth, "csrf", {}, options); if (this.disposed) return; if (typeof model.csrf_token !== "string" || !model.csrf_token || model.csrf_token.length > 4096) throw new Error("Authenticated bridge did not issue a valid CSRF token"); this.csrfToken = model.csrf_token; },
     async refreshSnapshot(manual, requirePostMutationRead = false) {
       if (this.disposed || document.hidden) return false;
@@ -6612,11 +6752,28 @@ export default {
       let cycle;
       cycle = (async () => {
         let succeeded = false;
+        // The mutation token is read beside the snapshot, not before it: the snapshot GET needs
+        // no token, so a window with none (first open, or recovery after a failure cleared it)
+        // pays one CGI round trip for both instead of two in a row. The window's own start-up
+        // read is joined rather than repeated.
+        let tokenRead = null;
+        if (!this.csrfToken) {
+          tokenRead = this.csrfAttempt || {
+            reported: false,
+            promise: this.refreshCsrf().then(() => null, (error) => error)
+          };
+          this.csrfAttempt = null;
+        }
+        let tokenError = null;
         try {
-          if (!this.csrfToken) await this.refreshCsrf();
+          const snapshotRead = apiGet(this.auth, "snapshot").then((value) => ({ value }), (error) => ({ error }));
+          if (tokenRead) tokenError = await tokenRead.promise;
+          const read = await snapshotRead;
           if (this.disposed || generation !== this.snapshotGeneration || this.snapshotRefreshBlocked) return false;
-          const snapshot = await apiGet(this.auth, "snapshot");
-          if (this.disposed || generation !== this.snapshotGeneration || this.snapshotRefreshBlocked) return false;
+          // Both failed: the token's error leads, as it did when the token was read first. A
+          // token failure the window already reported (start-up) is not reported a second time.
+          if (read.error) throw (tokenError && !tokenRead.reported ? tokenError : read.error);
+          const snapshot = read.value;
           if (snapshot.schema !== SNAPSHOT_SCHEMA) throw new Error("Unsupported DSM API schema");
           // generated_at_epoch is the package clock's reading at generation
           // time and ticks forward on every single read regardless of
@@ -6644,6 +6801,10 @@ export default {
           this.snapshotGeneratedAt = Number(snapshot.generated_at_epoch) > 0 ? Number(snapshot.generated_at_epoch) : 0;
           this.snapshotReceivedAtMs = Date.now();
           this.nowMs = this.snapshotReceivedAtMs;
+          // The snapshot is good and is shown, whatever became of the token. A token read that
+          // failed is raised below through the same failure path it always took, so the
+          // dashboard says so and the next poll reads the token again.
+          if (tokenError) throw tokenError;
           this.snapshotFailureCode = "";
           this.snapshotFailureStatus = 0;
           this.snapshotFailureStreak = 0;
@@ -6671,8 +6832,11 @@ export default {
           this.snapshotFailureStatus = Number(error && error.status) || 0;
           this.staleFreshnessCode = this.snapshotFailureCode;
           this.snapshotFailureStreak = Math.min(Number(this.snapshotFailureStreak) + 1, WIDGET_BACKOFF_RAMP_MS.length + 1);
-          this.bridgeIssue = this.describeBridgeError(error, "status");
-          this.connectionLabel = this.bridgeIssue.title;
+          // A token failure the window reported at start-up keeps that report's wording.
+          if (!(tokenRead && tokenRead.reported && error === tokenError)) {
+            this.bridgeIssue = this.describeBridgeError(error, "status");
+            this.connectionLabel = this.bridgeIssue.title;
+          }
           this.freshness = this.snapshot
             ? retainedDocumentFreshness(this.snapshotReceivedAtMs, this.snapshotFailureCode, Date.now(), this.snapshotFailureStreak)
             : "Status unavailable";
@@ -7457,6 +7621,7 @@ export default {
       try {
         await apiPost(this.auth, this.csrfToken, ACTIONS.removeProfile, { name });
         if (this.disposed) return;
+        dropSyncStatusPages(this, name);
         this.clearAutosaveFailure("profile");
         this.toast("Profile deleted", `The controller removed ${name} and its stored credentials.`);
         this.closeProfile({ refresh: false });
@@ -7469,7 +7634,7 @@ export default {
         if (!this.disposed) this.operationBusy = false;
       }
     },
-    loadRoutine(profileName) { const profile = typeof profileName === "string" ? profileName : this.routineForm.profile; const routine = this.routines.find((item) => String(item.profile) === String(profile)); this.routineForm = routine ? { profile, enabled: routine.enabled === true, action: routine.action || "sync", mode: routine.mode || "interval", interval_seconds: numberOr(routine.interval_seconds, 3600), weekdays: Array.isArray(routine.weekdays) ? routine.weekdays.map(Number) : String(routine.weekdays || "1,2,3,4,5,6,7").split(",").map(Number), time_window_start: routine.time_window_start || routine.window_start || "00:00", time_window_end: routine.time_window_end || routine.window_end || "23:59", debounce_seconds: numberOr(routine.debounce_seconds, 45), poll_seconds: numberOr(routine.poll_seconds, 30), retry_count: numberOr(routine.retry_count, 5), retry_backoff_seconds: numberOr(routine.retry_backoff_seconds, 60), retry_exponential: routine.retry_exponential !== false, allow_delete: routine.allow_delete === true, max_total_delete: numberOr(routine.max_total_delete, 100), depends_on: arrayOf(routine.depends_on).map(String) } : emptyRoutine(profile); this.hydrateAutosave("routine", this.routinePayload(), false); if (this.autosaveCoordinator) this.autosaveCoordinator.setScopeBlocked("routine", this.autosaveFailureScopes.routine || !routine); },
+    loadRoutine(profileName) { const profile = typeof profileName === "string" ? profileName : this.routineForm.profile; const routine = this.routines.find((item) => String(item.profile) === String(profile)); this.routineForm = routine ? { profile, enabled: routine.enabled === true, action: routine.action || "sync", mode: routine.mode || "interval", interval_seconds: numberOr(routine.interval_seconds, 3600), weekdays: Array.isArray(routine.weekdays) ? routine.weekdays.map(Number) : String(routine.weekdays || "1,2,3,4,5,6,7").split(",").map(Number), time_window_start: routine.time_window_start || routine.window_start || "00:00", time_window_end: routine.time_window_end || routine.window_end || "23:59", debounce_seconds: numberOr(routine.debounce_seconds, 15), poll_seconds: numberOr(routine.poll_seconds, 30), retry_count: numberOr(routine.retry_count, 5), retry_backoff_seconds: numberOr(routine.retry_backoff_seconds, 60), retry_exponential: routine.retry_exponential !== false, allow_delete: routine.allow_delete === true, max_total_delete: numberOr(routine.max_total_delete, 100), depends_on: arrayOf(routine.depends_on).map(String) } : emptyRoutine(profile); this.hydrateAutosave("routine", this.routinePayload(), false); if (this.autosaveCoordinator) this.autosaveCoordinator.setScopeBlocked("routine", this.autosaveFailureScopes.routine || !routine); },
     openRoutine(profile = "") { if (this.operationBusy || (!profile && !this.canChangeRoutines)) return; this.routineEditorOpen = true; this.loadRoutine(profile); },
     closeRoutine() { this.cancelAutosave("routine"); this.routineEditorOpen = false; this.routineForm = emptyRoutine(); },
     // A realtime routine reports next_run_epoch=0 by design -- it has no
@@ -7495,7 +7660,7 @@ export default {
       const payload = { profile: this.routineForm.profile, enabled: this.routineForm.enabled === true, action: this.routineForm.action, mode: this.routineForm.mode, retry_count: this.integer(this.routineForm.retry_count, 5), retry_backoff_seconds: this.integer(this.routineForm.retry_backoff_seconds, 60), retry_exponential: this.routineForm.retry_exponential !== false, allow_delete: this.routineForm.allow_delete === true, max_total_delete: this.integer(this.routineForm.max_total_delete, 100), depends_on: this.routineForm.depends_on.map(String) };
       if (payload.mode === "interval") payload.interval_seconds = this.integer(this.routineForm.interval_seconds, 3600);
       else if (payload.mode === "daily") Object.assign(payload, { weekdays: this.routineForm.weekdays.map(Number), time_window_start: this.routineForm.time_window_start, time_window_end: this.routineForm.time_window_end });
-      else if (payload.mode === "realtime") Object.assign(payload, { debounce_seconds: this.integer(this.routineForm.debounce_seconds, 45), poll_seconds: this.integer(this.routineForm.poll_seconds, 30) });
+      else if (payload.mode === "realtime") Object.assign(payload, { debounce_seconds: this.integer(this.routineForm.debounce_seconds, 15), poll_seconds: this.integer(this.routineForm.poll_seconds, 30) });
       return payload;
     },
     async saveRoutine(event) {
@@ -7641,10 +7806,10 @@ export default {
             doctorStartedEpoch
           );
           this.diagnostic = {
-            title: report.unknown ? "Doctor outcome unknown" : "Doctor failed",
+            title: report.detached ? "Doctor not awaited" : report.unknown ? "Doctor outcome unknown" : "Doctor failed",
             output: doctorDisplayOutput(this.doctorReport, error.resultOutput || report.message)
           };
-          this.doctorProgress = { active: false, phase: report.unknown ? "unknown" : "failed", level: doctorLevel, started_epoch: doctorStartedEpoch };
+          this.doctorProgress = { active: false, phase: report.detached || report.unknown ? "unknown" : "failed", level: doctorLevel, started_epoch: doctorStartedEpoch };
         }
       } finally {
         if (!this.disposed) {
@@ -7696,6 +7861,9 @@ export default {
       if (field.resets) this.onSyncProfileChanged();
     },
     resetSyncStatus(message) {
+      dropSyncStatusPages(this);
+      this.syncStatusCheckedAtMs = 0;
+      this.syncStatusFromMemory = false;
       this.syncStatusResult = emptySyncStatusPage();
       this.syncStatusCursors = [];
       this.syncStatusPageNumber = 0;
@@ -7706,6 +7874,7 @@ export default {
     // discards it rather than leaving rows on screen under a heading that no
     // longer describes them.
     onSyncQueryChanged() {
+      dropSyncStatusPages(this);
       if (this.syncStatusResult.loaded || this.syncStatusPhase === "failed") {
         this.resetSyncStatus("Query changed. Check status again to reload.");
       }
@@ -7732,21 +7901,45 @@ export default {
         const model = await apiGet(this.auth, "status-rollup");
         if (this.disposed) return;
         const rollup = normalizedStatusRollup(model);
+        if (!rollup.loaded) {
+          // A document that is not the totals is a failed read like any other: the totals this
+          // window already holds stay on screen, with the reason beside them.
+          this.statusRollupFailed(UNREADABLE_RESPONSE);
+          return;
+        }
         this.statusRollup = rollup;
-        if (!rollup.loaded) this.statusRollupMessage = UNREADABLE_RESPONSE;
-        else if (!rollup.total && !rollup.profiles.length) this.statusRollupMessage = ROLLUP_IDLE_MESSAGE;
+        this.statusRollupError = "";
+        this.statusRollupReceivedAtMs = Date.now();
+        if (!rollup.total && !rollup.profiles.length) this.statusRollupMessage = ROLLUP_IDLE_MESSAGE;
       } catch (error) {
         if (this.disposed) return;
-        this.statusRollup = emptyStatusRollup();
-        this.statusRollupMessage = boundedText(
+        this.statusRollupFailed(boundedText(
           this.describeBridgeError(error, "status").message,
           "The stored totals could not be read."
-        );
+        ));
       } finally {
         if (!this.disposed) this.statusRollupLoading = false;
       }
     },
-    async loadSyncStatus(cursor, pageNumber) {
+    // The totals last read survive a failed re-read, as the snapshot and the feeds do: blanking
+    // them on one transient error would erase the only answer this page had. The failure is said
+    // beside them, with its cause and how old they are; with nothing read yet it is the page's
+    // own message.
+    statusRollupFailed(cause) {
+      const message = boundedText(cause, "The stored totals could not be read.");
+      if (this.statusRollup.loaded) {
+        this.statusRollupError = message;
+        return;
+      }
+      this.statusRollup = emptyStatusRollup();
+      this.statusRollupError = "";
+      this.statusRollupMessage = message;
+    },
+    // `fresh` is the person asking for a new comparison (Check status): it walks, and the pages
+    // remembered from earlier checks are forgotten. Next and Previous reuse a page this window
+    // fetched under the same query while it is under five minutes old and nothing it compared
+    // against has changed; any page not in memory is a walk, as before.
+    async loadSyncStatus(cursor, pageNumber, options = undefined) {
       if (!this.syncStatusReady || this.disposed) return;
       const profile = boundedText(this.syncStatusForm.profile, "");
       const requested = Number(this.syncStatusForm.limit);
@@ -7759,6 +7952,26 @@ export default {
         scope: boundedText(this.syncStatusForm.scope, "").trim(),
         includeExcluded: this.syncStatusForm.include_excluded === true
       };
+      const pages = syncStatusPages(this);
+      const key = syncStatusPageKey(profile, query, limit, from);
+      const stamp = this.syncStatusEvidenceStamp;
+      if (options && options.fresh === true) pages.clear();
+      const remembered = pages.get(key);
+      if (remembered) {
+        if (Date.now() - remembered.completedAtMs < SYNC_STATUS_PAGE_TTL_MS && remembered.stamp === stamp) {
+          this.syncStatusResult = remembered.page;
+          this.syncStatusPageNumber = page;
+          this.syncStatusCursors = this.syncStatusCursors.slice(0, page - 1).concat(from);
+          this.syncStatusCheckedAtMs = remembered.completedAtMs;
+          this.syncStatusFromMemory = true;
+          this.syncStatusPhase = "ready";
+          this.syncStatusMessage = remembered.page.entries.length
+            ? ""
+            : "No entry matches this state and search. The totals still cover the whole scope.";
+          return;
+        }
+        pages.delete(key);
+      }
       this.syncStatusBusy = true;
       this.syncStatusPhase = "loading";
       this.syncStatusMessage = "Comparing both sides for this scope. The NAS is only read; a large scope takes a while.";
@@ -7778,7 +7991,14 @@ export default {
         if (this.disposed) return;
         const document = bridgeDocument(result, "sdsync.status.v1");
         if (!document) throw new Error(UNREADABLE_RESPONSE);
-        this.syncStatusResult = Object.assign(syncStatusPage(document, profile), { query });
+        // Frozen: a page is data replaced whole, and Vue 2 would otherwise walk up to 200 rows.
+        const loadedPage = Object.freeze(Object.assign(syncStatusPage(document, profile), { query }));
+        this.syncStatusResult = loadedPage;
+        const completedAtMs = Date.now();
+        this.syncStatusCheckedAtMs = completedAtMs;
+        this.syncStatusFromMemory = false;
+        pages.set(key, { page: loadedPage, completedAtMs, stamp, profile });
+        while (pages.size > SYNC_STATUS_PAGE_CACHE_LIMIT) pages.delete(pages.keys().next().value);
         this.syncStatusPageNumber = page;
         // One cursor per page already visited, so Previous can return to an
         // exact position instead of re-walking from the start.
@@ -7802,7 +8022,9 @@ export default {
         this.syncStatusResult = emptySyncStatusPage();
         this.syncStatusCursors = [];
         this.syncStatusPageNumber = 0;
-        this.syncStatusPhase = "failed";
+        this.syncStatusCheckedAtMs = 0;
+        this.syncStatusFromMemory = false;
+        this.syncStatusPhase = report.detached ? "idle" : "failed";
         this.syncStatusMessage = report.message;
       } finally {
         if (!this.disposed) {
@@ -7813,7 +8035,7 @@ export default {
     },
     checkSyncStatus(event) {
       if (event && event.preventDefault) event.preventDefault();
-      return this.loadSyncStatus("", 1);
+      return this.loadSyncStatus("", 1, { fresh: true });
     },
     syncStatusNextPage() {
       if (!this.syncStatusHasNext) return undefined;
@@ -7853,6 +8075,8 @@ export default {
         if (plan.confirmed) {
           this.resyncPhase = "confirmed";
           this.resyncMessage = `Re-uploaded ${plan.overwrites} file${plan.overwrites === 1 ? "" : "s"} to ${profile}.`;
+          // What the remembered pages compared is no longer what is on the destination.
+          dropSyncStatusPages(this, profile);
           this.toast("Re-upload complete", this.resyncMessage);
           await this.refreshSnapshot(false, true);
           return;
@@ -7878,7 +8102,7 @@ export default {
           "The package rejected the re-upload."
         );
         recordIsolatedIncident(this, "operations", "Resync", error, report, { subject: scope || profile });
-        this.resyncPhase = report.unknown ? "unknown" : "failed";
+        this.resyncPhase = report.detached ? "idle" : report.unknown ? "unknown" : "failed";
         this.resyncMessage = report.message;
       } finally {
         if (!this.disposed) {
@@ -7970,8 +8194,8 @@ export default {
         await this.writeTroubleshootingClipboard(text);
         this.toast(`${subject} copied`, "Known DSM session and credential field shapes were redacted. Review the bounded text before sharing.");
         return true;
-      } catch (_error) {
-        this.toast("Copy failed", "DSM or the browser denied clipboard access. Select the visible evidence and copy it manually.", true);
+      } catch (error) {
+        this.toast("Copy failed", `DSM or the browser denied clipboard access (${thrownCause(error)}). Select the visible evidence and copy it manually.`, true);
         return false;
       }
     },
@@ -8095,7 +8319,11 @@ export default {
         ? records.map((record) => `[${record.source}] ${record.text}`).join("\n").slice(0, MAX_RESPONSE_BYTES)
         : "No log data yet.";
     },
-    async refreshLogs() {
+    // `trigger.poll` is true only for the timer's own read, which is the one that may ask the
+    // package "has the feed changed since this version". Every other caller (opening the page,
+    // a filter, Resume, a clear) is a person asking for the feed and gets it whole; so does the
+    // first read after any failure.
+    async refreshLogs(trigger) {
       if (this.disposed || this.logsLoading || this.logsPaused || document.hidden || this.route !== "activity") return;
       this.logsLoading = true;
       const startedAt = Date.now();
@@ -8109,8 +8337,12 @@ export default {
         // one failure discard the other's payload: the package log scan is far
         // more expensive than the activity feed, so a combined wait turned a
         // healthy activity response into an empty Activity list.
+        const sentVersion = trigger && trigger.poll === true
+          && this.activityVersion && this.activityVersionLines === lines && !this.activityFeedError
+          ? this.activityVersion
+          : "";
         const requests = fetchLogs ? [apiGet(this.auth, "logs", { lines, source: this.logSource })] : [];
-        requests.push(apiGet(this.auth, "activity", { lines }));
+        requests.push(apiGet(this.auth, "activity", sentVersion ? { lines, since: sentVersion } : { lines }));
         const settled = await Promise.allSettled(requests);
         const logs = fetchLogs ? settled[0] : null;
         const activity = fetchLogs ? settled[1] : settled[0];
@@ -8131,29 +8363,44 @@ export default {
           if (!problem) {
             logsOk = true;
             const records = this.logRecordsFrom(logs.value);
-            this.logRecords = records;
+            this.logRecords = Object.freeze(records);
             this.logsReceivedAtMs = Date.now();
             this.logOutput = records.length
               ? records.map((record) => `[${record.source}] ${record.text}`).join("\n").slice(0, MAX_RESPONSE_BYTES)
               : "No log data yet.";
           }
         }
-        const activityProblem = activity.status === "fulfilled"
-          ? feedDocumentProblem(activity.value, ACTIVITY_SCHEMA, "events", "activity")
-          : feedFailureText(activity.reason);
+        // "Nothing changed" keeps the rows and the history note exactly as they are: it is a
+        // confirmation that they are current, not an empty feed.
+        const activityUnchanged = activity.status === "fulfilled" && activityIsUnchanged(activity.value, sentVersion);
+        let activityProblem = "";
+        if (activityUnchanged) activityProblem = "";
+        else if (activity.status !== "fulfilled") activityProblem = feedFailureText(activity.reason);
+        else if (activity.value && activity.value.unchanged === true) {
+          activityProblem = "the activity answer said nothing changed, but this window sent no version to compare";
+        } else activityProblem = feedDocumentProblem(activity.value, ACTIVITY_SCHEMA, "events", "activity");
         this.activityFeedError = activityProblem;
+        if (activityProblem) this.activityVersion = "";
         this.logsLastDurationMs = Date.now() - startedAt;
         this.logsFailureStreak = activityProblem || logsProblem ? Math.min(Number(this.logsFailureStreak) + 1, 6) : 0;
-        if (!activityProblem) {
+        if (activityUnchanged) {
+          this.activityReceivedAtMs = Date.now();
+          probeSnapshotAfterAnswer(this);
+        } else if (!activityProblem) {
           // The cost of normalising, redacting and keying up to 1000 events is paid
           // only when the feed changed: an identical poll keeps the same array, so
           // no computed that reads it is invalidated.
           const signature = feedSignature(activity.value.events);
           if (!signature || signature !== this.activitySignature) {
-            this.activityEvents = activity.value.events;
+            // Frozen like the snapshot: a feed of up to 1000 event objects is data that is replaced
+            // whole, and Vue 2 would otherwise walk every one of them to make it reactive.
+            this.activityEvents = Object.freeze(activity.value.events);
             this.activitySignature = signature;
           }
           this.activityHistory = activity.value.history === undefined ? null : activity.value.history;
+          // A service that names no version (an older one) is read whole every time, as before.
+          this.activityVersion = activityVersionOf(activity.value);
+          this.activityVersionLines = lines;
           this.activityReceivedAtMs = Date.now();
           probeSnapshotAfterAnswer(this);
         }
@@ -8412,7 +8659,7 @@ export default {
       if (!key || key === this.lastOutcomeFailureKey) return;
       this.lastOutcomeFailureKey = key;
       const item = this.attentionItems.find((candidate) => candidate.level === "fail");
-      this.toast(item ? item.title : "A sync failed", item ? item.detail : "Open Activity for details.", true);
+      this.toast(item ? item.title : "A sync failed", item ? item.detail : guidanceText(failureKeyCause(key), "No attention item describes it. Open Activity for details."), true);
     },
     playCue() { try { const AudioContext = window.AudioContext || window.webkitAudioContext; if (!AudioContext) return; const context = new AudioContext(); const oscillator = context.createOscillator(); const gain = context.createGain(); oscillator.frequency.value = 440; gain.gain.setValueAtTime(0.0001, context.currentTime); gain.gain.exponentialRampToValueAtTime(0.08, context.currentTime + 0.02); gain.gain.exponentialRampToValueAtTime(0.0001, context.currentTime + 0.18); oscillator.connect(gain); gain.connect(context.destination); oscillator.start(); oscillator.stop(context.currentTime + 0.2); oscillator.addEventListener("ended", () => context.close(), { once: true }); } catch (_error) { /* Best-effort local signal only. */ } },
     confirmationElement(reference) {

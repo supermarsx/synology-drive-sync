@@ -209,7 +209,8 @@ test("failed initial CSRF bootstrap is reported once before the scheduled retry"
       refreshCsrf(...args) { return component.methods.refreshCsrf.apply(this, args); },
       describeBridgeError(...args) { return component.methods.describeBridgeError.apply(this, args); },
       toast(title, message, error = false) { this.toasts.push({ title, message, error }); },
-      async refreshSnapshot() { snapshotReads += 1; },
+      // The real cycle always re-arms the poll when it ends, whatever it found.
+      async refreshSnapshot() { snapshotReads += 1; this.scheduleSnapshot(); },
       scheduleSnapshot() { scheduledRetries += 1; },
       stopTimers() {}
     };
@@ -219,8 +220,9 @@ test("failed initial CSRF bootstrap is reported once before the scheduled retry"
     await component.mounted.call(context);
 
     assert.equal(csrfReads, 1, "mount must not immediately repeat a rejected CSRF request");
-    assert.equal(snapshotReads, 0, "snapshot bootstrap must wait for a valid CSRF token");
+    assert.equal(snapshotReads, 1, "the snapshot GET needs no token, so a rejected token read does not hold it back");
     assert.equal(scheduledRetries, 1, "the normal bounded refresh cadence owns the retry");
+    assert.equal(context.csrfAttempt, null, "the start-up token read is handed over once and then forgotten");
     assert.equal(context.bridgeIssue.title, "DSM request metadata rejected");
     assert.equal(context.toasts.length, 1);
     context.csrfToken = "csrf-cookie-only";
