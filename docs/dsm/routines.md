@@ -20,7 +20,7 @@ where those actors can touch the same target.
 | Interval | `60..2592000` seconds; present and used only in interval mode |
 | Active weekdays | Non-empty unique subset of Monday `1` through Sunday `7`; daily mode only |
 | Window starts / ends | 24-hour `HH:MM`; daily mode only |
-| Realtime debounce | `1..3600` seconds; defaults to `45`; realtime mode only |
+| Realtime debounce | `1..3600` seconds; defaults to `15`; realtime mode only |
 | Fallback poll | `5..3600` seconds; realtime mode only. Under the daemon it is how often the polling fallback reads the tree while the native watch is unavailable (60 seconds if unset) |
 | Retry attempts | `0..5` after a failed whole routine action; defaults to `5` |
 | Retry backoff | `10..300` seconds before the first retry |
@@ -151,15 +151,15 @@ tree must be treated as changed, so a run is triggered. The watcher keeps about 
 memory at 20,000 directories and about 16 MiB at 100,000. A directory created while watching is added to
 the watch set as it appears. The quiet period is measured from the event file's last write, so each newly observed
 change restarts the debounce and a run cannot begin until the full period has elapsed. The default
-debounce is 45 seconds. Realtime mode has no interval, weekday, window-start, or window-end setting.
+debounce is 15 seconds. Realtime mode has no interval, weekday, window-start, or window-end setting.
 The controller revalidates and consumes one exact native-event generation only after dependency and
 shutdown admission. A concurrent event remains queued for its own complete debounce, and a deferred
 dependency therefore does not discard the pending marker.
 
 A source that never has a quiet moment is not left pending forever: past `debounce_seconds × 4`
 (clamped between `debounce_seconds + 60` and 3600 seconds) the controller dispatches anyway, so
-worst-case staleness under continuous writes is bounded rather than open-ended. At the 45-second
-default that ceiling is 180 seconds. The ceiling is not configurable; the operator already chose the
+worst-case staleness under continuous writes is bounded rather than open-ended. At the 15-second
+default that ceiling is 75 seconds. The ceiling is not configurable; the operator already chose the
 debounce, and it is derived from that one field rather than adding a second number nothing else
 explains.
 
