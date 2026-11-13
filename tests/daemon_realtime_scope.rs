@@ -124,8 +124,8 @@ impl Daemon {
                  for argument in \"$@\"; do [ \"$previous\" = --result-record ] && record=$argument; previous=$argument; done\n\
                  {CORE} \"$@\"\n\
                  rc=$?\n\
+                 [ -n \"$record\" ] && [ -f \"$record\" ] && printf 'record: %s\\n' \"$(cat \"$record\")\" >> {log}\n\
                  printf 'exit: %s\\n' \"$rc\" >> {log}\n\
-                 [ -n \"$record\" ] && [ -f \"$record\" ] && {{ printf 'record: ' >> {log}; cat \"$record\" >> {log}; }}\n\
                  exit $rc",
                 log = log.display()
             ),
