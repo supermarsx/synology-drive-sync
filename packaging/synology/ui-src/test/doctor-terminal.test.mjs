@@ -47,7 +47,7 @@ test("Doctor awaits terminal bridge evidence while plan and run remain queued", 
   assert.match(source, /this\.diagnostic = \{ title: "Doctor completed", output: operationMessage \}/);
   assert.match(source, /result\.output \|\| result\.message/);
   assert.match(source, /error\.resultOutput \|\| report\.message/);
-  assert.match(source, /title: report\.unknown \? "Doctor outcome unknown" : "Doctor failed"/);
+  assert.match(source, /title: report\.detached \? "Doctor not awaited" : report\.unknown \? "Doctor outcome unknown" : "Doctor failed"/);
   assert.match(source, /quickPlan\(\).*executeOperation\("plan"/);
   assert.match(source, /executeOperation\("run"/);
 });
@@ -292,7 +292,7 @@ test("unbounded polling bounds each attempt and gives up on a time-based ceiling
   assert.match(apiSource, /const result = await awaitQueuedResult\([\s\S]*?id,[\s\S]*?action,[\s\S]*?limits,[\s\S]*?boundedObservationLimits[\s\S]*?\)/);
   assert.match(apiSource, /pollJobResult\([\s\S]*?requestId,[\s\S]*?limits,[\s\S]*?observation,[\s\S]*?operation[\s\S]*?\)[\s\S]*?limits\.resultObservationTimeoutMs/);
   assert.match(apiSource, /observation\.expired = true;[\s\S]*?observation\.cancelCurrent\(\)/);
-  assert.match(apiSource, /if \(auth && auth\.signal && auth\.signal\.aborted\) throw error/);
+  assert.match(apiSource, /if \(observeSignal && observeSignal\.aborted\) throw error/);
   assert.doesNotMatch(source, /waitForNewProfile|secret handoff deadline/);
   assert.match(makefile, /^\.PHONY: all native-build clean install packageinstall$/m);
   assert.match(makefile, /^all: native-build style\.css$/m);

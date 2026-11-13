@@ -2327,7 +2327,7 @@ assert.equal(
         with self.assertRaisesRegex(validate_spk.ValidationError, "retry pending and transport"):
             validate_build(
                 api=source["api"].replace(
-                    b"await delay(retryInterval, auth && auth.signal, limits, observation);",
+                    b"await delay(retryInterval, observeSignal, limits, observation);",
                     b"await Promise.resolve();",
                     1,
                 )

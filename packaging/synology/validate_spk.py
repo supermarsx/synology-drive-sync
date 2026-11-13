@@ -906,7 +906,7 @@ def validate_native_api_source(payload: bytes) -> None:
     poll_source = source[poll_start:poll_end]
     for marker in (
         "pollIntervalMs = RESULT_POLL_INTERVAL_MS",
-        "const attempt = linkedAbortAttempt(auth && auth.signal);",
+        "const attempt = linkedAbortAttempt(observeSignal);",
         '"result",\n          { job_id: jobId },',
         "attempt.signal",
         "attempt.abort",
@@ -917,7 +917,7 @@ def validate_native_api_source(payload: bytes) -> None:
         "queuedObservationTimeout(",
         "let consecutiveObservationFailures = 0;",
         "for (;;)",
-        "if (auth && auth.signal && auth.signal.aborted) throw error;",
+        "if (observeSignal && observeSignal.aborted) throw error;",
         "consecutiveObservationFailures += 1;",
         "if (!observation && observationLostForTooLong)",
         "consecutiveObservationFailures >= RESULT_OBSERVATION_MIN_FAILURES",
@@ -949,10 +949,14 @@ def validate_native_api_source(payload: bytes) -> None:
         )
     if (
         poll_source.count(
-            "await delay(retryInterval, auth && auth.signal, limits, observation);"
+            "await delay(retryInterval, observeSignal, limits, observation);"
         ) != 1
         or poll_source.count(
-            "await delay(pendingInterval, auth && auth.signal, limits, observation);"
+            "await delay(pendingInterval, observeSignal, limits, observation);"
+        ) != 1
+        # A hidden tab asks every fifteen seconds instead (the wait ends when the tab is shown).
+        or poll_source.count(
+            "await hiddenAwareDelay(Math.max(pendingInterval, HIDDEN_RESULT_POLL_INTERVAL_MS), observeSignal, limits);"
         ) != 1
     ):
         raise ValidationError(

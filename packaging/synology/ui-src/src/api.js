@@ -53,6 +53,11 @@ const CSRF_REISSUE_MARGIN_SECONDS = 30;
 // just after the first poll paid the full long-operation interval for it.
 const RESULT_POLL_RAMP_MS = Object.freeze([150, 300, 600, 1200, 2000]);
 const RESULT_POLL_INTERVAL_MS = RESULT_POLL_RAMP_MS[RESULT_POLL_RAMP_MS.length - 1];
+// A terminal operation (Doctor, a status walk, a re-upload) watched from a tab nobody is looking at
+// asks for its result this often instead of on the ramp above. Each ask is a CGI process on the
+// NAS and a long operation lasts minutes, so a hidden tab was costing a request every few seconds
+// to update a page that is not on screen. Showing the tab again ends the wait at once.
+export const HIDDEN_RESULT_POLL_INTERVAL_MS = 15000;
 // How long observation may go on failing before the outcome is declared unknown.
 //
 // This is a duration and not an attempt count, and the distinction is the whole
@@ -205,6 +210,29 @@ export class QueuedOutcomeUnknownError extends Error {
     this.stage = boundedText(stage, "result_observation").slice(0, 128);
     this.outcomeUnknown = true;
     this.accepted = true;
+  }
+}
+
+/**
+ * The person stopped waiting for a queued operation's result.
+ *
+ * Not an outcome-unknown and not a failure: nothing was cancelled. The job was accepted and may
+ * still run on the NAS, and its result is recorded in Activity when it ends. It carries the job's
+ * identity so the window can say so, and no `outcomeUnknown`, so it locks nothing.
+ */
+export class ObservationDetachedError extends Error {
+  constructor(jobId, requestId = "", operation = "") {
+    super("This window stopped waiting for the result. The NAS was not told to cancel it and may still run it; its result is recorded in Activity when it ends.");
+    this.name = "ObservationDetachedError";
+    this.jobId = validJobId(jobId);
+    this.requestId = validClientRequestId(requestId);
+    this.trustedJobId = Boolean(this.jobId);
+    this.trustedRequestId = Boolean(this.requestId);
+    this.operation = typeof operation === "string" && ARGUMENT_KEYS[operation] ? operation : "";
+    this.stage = "observation_detached";
+    this.detached = true;
+    this.accepted = true;
+    this.outcomeUnknown = false;
   }
 }
 
@@ -1119,6 +1147,38 @@ function delay(milliseconds, signal, limits = null, cancellation = null) {
   });
 }
 
+function documentIsHidden() {
+  return typeof document === "object" && document !== null && document.hidden === true;
+}
+
+// A wait between two result reads that ends early when the tab is shown again, so slowing the
+// cadence for a hidden tab never makes the person wait for it once they look.
+function hiddenAwareDelay(milliseconds, signal, limits) {
+  return new Promise((resolve, reject) => {
+    if (signal && signal.aborted) {
+      reject(new Error("DSM UI request was cancelled"));
+      return;
+    }
+    const setTimer = limits ? limits.setTimer : (callback, delayMs) => window.setTimeout(callback, delayMs);
+    const clearTimer = limits ? limits.clearTimer : (value) => window.clearTimeout(value);
+    let settled = false;
+    let timer;
+    const finish = (settle) => {
+      if (settled) return;
+      settled = true;
+      clearTimer(timer);
+      document.removeEventListener("visibilitychange", onShown);
+      if (signal) signal.removeEventListener("abort", onAbort);
+      settle();
+    };
+    const onShown = () => { if (!documentIsHidden()) finish(resolve); };
+    const onAbort = () => finish(() => reject(new Error("DSM UI request was cancelled")));
+    timer = setTimer(() => finish(resolve), milliseconds);
+    document.addEventListener("visibilitychange", onShown);
+    if (signal) signal.addEventListener("abort", onAbort, { once: true });
+  });
+}
+
 async function pollJobResult(
   auth,
   jobId,
@@ -1135,21 +1195,61 @@ async function pollJobResult(
   const interval = Number.isFinite(Number(pollIntervalMs)) && Number(pollIntervalMs) >= 0
     ? Number(pollIntervalMs)
     : RESULT_POLL_INTERVAL_MS;
-  let pendingResultReads = 0;
-  let consecutiveObservationFailures = 0;
-  let firstObservationFailureAt = 0;
   // Read the clock through the same injection point the timers use. The observation
   // ceiling is a duration, so a test that controls setTimeout but not the clock would
   // advance timers past a deadline that never moves -- two clocks disagreeing, and the
   // ceiling silently untestable. Production passes neither and gets Date.now.
   const readClock = limits && typeof limits.now === "function" ? limits.now : () => Date.now();
+  // The person can stop watching one operation without ending the window's other requests: the
+  // observer they were handed may carry a signal, and aborting it ends this poll alone.
+  const detach = limits && limits.detachSignal ? limits.detachSignal : null;
+  const watched = detach ? linkedAbortAttempt(auth && auth.signal) : null;
+  const onDetach = watched ? () => watched.abort() : null;
+  if (detach) {
+    if (detach.aborted) watched.abort();
+    else detach.addEventListener("abort", onDetach, { once: true });
+  }
+  const observeSignal = watched ? watched.signal : auth && auth.signal;
+  const detached = () => Boolean(detach && detach.aborted && !(auth && auth.signal && auth.signal.aborted));
+  try {
+    return await pollJobResultUntilDone(
+      auth, jobId, dsmAuth, interval, requestId, limits, observation, expectedOperation,
+      observeSignal, readClock, detached
+    );
+  } catch (error) {
+    // The detach aborted whatever read or wait was in flight; what that threw is not the story.
+    if (detached()) throw new ObservationDetachedError(jobId, requestId, expectedOperation);
+    throw error;
+  } finally {
+    if (detach) detach.removeEventListener("abort", onDetach);
+    if (watched) watched.release();
+  }
+}
+
+async function pollJobResultUntilDone(
+  auth,
+  jobId,
+  dsmAuth,
+  interval,
+  requestId,
+  limits,
+  observation,
+  expectedOperation,
+  observeSignal,
+  readClock,
+  detached
+) {
+  let pendingResultReads = 0;
+  let consecutiveObservationFailures = 0;
+  let firstObservationFailureAt = 0;
   for (;;) {
+    if (detached()) throw new ObservationDetachedError(jobId, requestId, expectedOperation);
     if (observation && observation.expired) {
       throw observationDeadlineError(observation, jobId, requestId, expectedOperation);
     }
     let status;
     try {
-      const attempt = linkedAbortAttempt(auth && auth.signal);
+      const attempt = linkedAbortAttempt(observeSignal);
       try {
         const request = apiGetWithDsmAuth(
           auth,
@@ -1178,7 +1278,7 @@ async function pollJobResult(
         attempt.release();
       }
     } catch (error) {
-      if (auth && auth.signal && auth.signal.aborted) throw error;
+      if (observeSignal && observeSignal.aborted) throw error;
       if (observation && observation.expired) {
         throw observationDeadlineError(observation, jobId, requestId, expectedOperation);
       }
@@ -1228,7 +1328,7 @@ async function pollJobResult(
             Math.min(consecutiveObservationFailures - 1, RESULT_POLL_RAMP_MS.length - 1)
           ]
         );
-      await delay(retryInterval, auth && auth.signal, limits, observation);
+      await delay(retryInterval, observeSignal, limits, observation);
       continue;
     }
     if (observation && observation.expired) {
@@ -1275,7 +1375,13 @@ async function pollJobResult(
         ? RESULT_POLL_RAMP_MS[Math.min(pendingResultReads, RESULT_POLL_RAMP_MS.length - 1)]
         : interval;
       pendingResultReads += 1;
-      await delay(pendingInterval, auth && auth.signal, limits, observation);
+      // Only an unbounded (terminal) observation slows down for a hidden tab: a bounded one is an
+      // autosave with its own short ceiling, and a hidden tab does not autosave.
+      if (!observation && documentIsHidden()) {
+        await hiddenAwareDelay(Math.max(pendingInterval, HIDDEN_RESULT_POLL_INTERVAL_MS), observeSignal, limits);
+      } else {
+        await delay(pendingInterval, observeSignal, limits, observation);
+      }
       continue;
     }
     if (status.state === "expired_or_missing") {
@@ -1951,6 +2057,10 @@ export async function apiPost(
   // -- Doctor and the status walk -- which have no observation object to hang
   // it on and are exactly the operations slow enough to need it.
   limits.onProgress = onProgress;
+  // An observer may carry the means to stop watching this one operation (see openProgressSink in
+  // App.vue). It rides on the observer for the same reason the observer rides on the limits: this
+  // object is the one thing every poll of every job already holds.
+  limits.detachSignal = onProgress && onProgress.detachSignal ? onProgress.detachSignal : null;
 
   await ensureDsmToken();
   const requestDsmAuth = dsmAuthSnapshot();

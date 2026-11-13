@@ -380,7 +380,12 @@ modification time, may exercise same-target copy, and removes the probe.
 Use it only in a prepared non-critical existing destination.
 
 The API initially queues the action, then the page polls its sanitized terminal result before
-reporting the Doctor verdict. Pending Doctor observations have no overall client deadline. An
+reporting the Doctor verdict. Pending Doctor observations have no overall client deadline, but they
+do not run unwatched: while the browser tab is hidden the result is asked for every 15 seconds
+instead of every few seconds (showing the tab ends the wait at once), and after ten minutes with no
+progress published the page says so and offers **Stop waiting**. Stopping the wait frees the form and
+ends that one observation; it cancels nothing, the NAS may still run the job, and the result is
+recorded in Activity when it ends. The same holds for the sync status walk and Resync. An
 `expired_or_missing` result, an invalid result document, or five consecutive result-observation
 failures yields outcome-unknown; inspect Activity and refreshed cached health evidence to determine
 what completed. Only the Run/Doctor operation scope is then paused in that AppWindow. Profile,

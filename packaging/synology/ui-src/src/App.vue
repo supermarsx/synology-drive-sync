@@ -368,6 +368,7 @@
             <article class="sdsync-panel sdsync-sync-results" aria-live="polite" aria-labelledby="sdsync-sync-title">
               <div class="sdsync-panel-heading"><div><p class="sdsync-eyebrow">{{ syncStatusResult.loaded ? syncStatusResult.profile : 'Nothing loaded' }}</p><h3 id="sdsync-sync-title">{{ syncStatusResult.loaded ? syncStatusQueryLabel : 'Sync state' }}</h3></div><span v-if="syncStatusResult.loaded" class="sdsync-freshness">Compared by {{ syncStatusResult.compare }}</span></div>
               <p v-if="syncStatusBusy && liveProgressDetail" class="sdsync-live-progress" role="status" aria-live="polite">{{ liveProgressDetail }}</p>
+              <div v-if="syncStatusBusy && liveProgressStalled" class="sdsync-warning sdsync-live-stalled" role="status" aria-live="polite"><strong>No progress for 10 minutes</strong><span>{{ liveProgressStalledText }}</span><v-button suffix="grey" display="icon-text" tooltip="Stop watching this operation and free the form. Nothing is cancelled on the NAS." @click="detachLiveOperation">Stop waiting</v-button></div>
               <p v-if="!syncStatusResult.loaded" class="sdsync-empty">{{ syncStatusMessage }}</p>
               <template v-else>
                 <dl class="sdsync-sync-stats" aria-label="Whole-scope totals">
@@ -412,6 +413,7 @@
               </div>
               <p v-if="resyncMessage" :class="['sdsync-field-note', { 'is-error': resyncFailed }]">{{ resyncMessage }}</p>
               <p v-if="resyncBusy && liveProgressDetail" class="sdsync-live-progress" role="status" aria-live="polite">{{ liveProgressDetail }}</p>
+              <div v-if="resyncBusy && liveProgressStalled" class="sdsync-warning sdsync-live-stalled" role="status" aria-live="polite"><strong>No progress for 10 minutes</strong><span>{{ liveProgressStalledText }}</span><v-button suffix="grey" display="icon-text" tooltip="Stop watching this operation and free the form. Nothing is cancelled on the NAS." @click="detachLiveOperation">Stop waiting</v-button></div>
               <div v-if="resyncPlan.overwrites || resyncPhase === 'confirmed'" class="sdsync-resync-plan">
                 <dl class="sdsync-definition-grid">
                   <div><dt>Scope</dt><dd>{{ resyncScopeLabel }}</dd></div>
@@ -443,6 +445,7 @@
                 <div v-if="doctorProgress.active" class="sdsync-doctor-progress" role="status" aria-live="polite" aria-label="Target Doctor progress">
                   <div class="sdsync-doctor-progress-heading"><action-icon class="sdsync-is-spinning" name="refresh" :size="20" /><span><strong>Doctor is running</strong><small>Keep this AppWindow open while terminal evidence is collected.</small></span></div>
                   <p v-if="liveProgressDetail" class="sdsync-live-progress">{{ liveProgressDetail }}</p>
+                  <div v-if="doctorProgress.active && liveProgressStalled" class="sdsync-warning sdsync-live-stalled" role="status" aria-live="polite"><strong>No progress for 10 minutes</strong><span>{{ liveProgressStalledText }}</span><v-button suffix="grey" display="icon-text" tooltip="Stop watching this operation and free the form. Nothing is cancelled on the NAS." @click="detachLiveOperation">Stop waiting</v-button></div>
                   <div class="sdsync-doctor-progress-track" aria-hidden="true"><span /></div>
                   <ol><li v-for="stage in doctorProgressStages" :key="stage.id" :class="'is-' + stage.state"><span class="sdsync-doctor-state-dot" />{{ stage.label }}<small>{{ doctorStatusLabel(stage.state) }}</small></li></ol>
                 </div>
@@ -1360,8 +1363,15 @@ function queuedFailureGuidance(error) {
 // one per surface, because the package runs one queued operation at a time and
 // the AppWindow blocks the others while it does.
 function emptyLiveProgress() {
-  return { active: false, operation: "", progress: null };
+  return { active: false, operation: "", progress: null, startedAtMs: 0 };
 }
+
+// How long an operation may be watched with no phase ever published before the window says so and
+// offers to stop waiting. A running Doctor or status walk publishes phases; ten minutes of silence
+// means it has not started (a long queue, a stopped controller) or publishes nothing, and either
+// way the person is owed the choice rather than a spinner that only the server's 24-hour job
+// expiry can end.
+const LIVE_PROGRESS_STALL_MS = 10 * 60 * 1000;
 
 // The observer a queued operation hands to its result poll. Every pending read
 // publishes here, so a slow operation can say what it is doing while it runs
@@ -1378,14 +1388,22 @@ function emptyLiveProgress() {
 // more bindings on whatever context is driving it.
 function openProgressSink(component, operation) {
   const name = boundedText(operation, "");
-  component.liveProgress = { active: true, operation: name, progress: null };
-  return (progress) => {
+  const startedAtMs = Date.now();
+  component.liveProgress = { active: true, operation: name, progress: null, startedAtMs };
+  // The person may stop waiting for this one operation. The signal rides on the observer: api.js
+  // reads `detachSignal` off it and ends that operation's result poll alone.
+  const detach = typeof AbortController === "function" ? new AbortController() : null;
+  component.liveProgressDetach = detach;
+  const sink = (progress) => {
     if (component.disposed) return;
-    component.liveProgress = { active: true, operation: name, progress: progress || null };
+    component.liveProgress = { active: true, operation: name, progress: progress || null, startedAtMs };
   };
+  sink.detachSignal = detach ? detach.signal : undefined;
+  return sink;
 }
 
 function closeProgressSink(component) {
+  component.liveProgressDetach = null;
   if (!component.disposed) component.liveProgress = emptyLiveProgress();
 }
 
@@ -5116,6 +5134,19 @@ export default {
     // What the running operation last said it was doing, or -- when it has
     // published nothing -- why it has not started. Progress wins whenever there
     // is progress: a job reporting phases is plainly not waiting for one.
+    // An operation watched for ten minutes with no phase published, and a way out of it.
+    liveProgressStalled() {
+      const live = this.liveProgress;
+      if (!live || !live.active || live.progress || !(live.startedAtMs > 0)) return false;
+      return numberOr(this.nowMs, Date.now()) - live.startedAtMs >= LIVE_PROGRESS_STALL_MS;
+    },
+    liveProgressStalledText() {
+      return guidanceText(
+        "The package has reported no progress on this for 10 minutes.",
+        this.queuedWaitDetail.text,
+        "Stopping the wait cancels nothing: the NAS may still run it, and its result is recorded in Activity when it ends."
+      );
+    },
     liveProgressDetail() {
       if (!this.liveProgress.active) return "";
       const published = progressSentence(this.liveProgress.progress, this.controllerLiveness.packageEpoch);
@@ -5861,6 +5892,19 @@ export default {
       this.refreshAutosaveStatus();
     },
     describeBridgeError(error, phase = "status") { return describeBridgeFailure(error, phase); },
+    // Stop watching the operation in flight. Nothing is cancelled on the NAS; the poll ends, the
+    // form is freed, and the operation's own catch says so (reportMutationError, `detached`).
+    detachLiveOperation() {
+      const controller = this.liveProgressDetach;
+      if (controller && typeof controller.abort === "function") {
+        controller.abort();
+        return;
+      }
+      // Not silent: the button was offered, so a window that cannot honour it says why.
+      if (this.liveProgress && this.liveProgress.active) {
+        this.toast("Cannot stop waiting", "This browser gave the window no way to stop watching one request. Close and reopen the AppWindow to stop; the NAS job is not cancelled either way.", true);
+      }
+    },
     openDsmHelp() {
       /* global SYNO */
       const launch = typeof SYNO !== "undefined" && SYNO.SDS && SYNO.SDS.AppLaunch;
@@ -5979,6 +6023,13 @@ export default {
         correlation ? `${correlation} ${detail}` : detail,
         defaultMessage
       ).slice(0, MUTATION_MESSAGE_LIMIT);
+      // The person stopped waiting. Neither a failure nor an unknown outcome: no incident, no lock,
+      // and no error toast. The error's own text says what is true -- nothing was cancelled.
+      if (error && error.detached === true) {
+        const stopped = withCorrelation(observed, fallback);
+        this.toast("Stopped waiting", stopped, false);
+        return { unknown: false, inspection: false, detached: true, message: stopped, requestId, jobId };
+      }
       // Accepted and still on the queue. Handled here rather than only in
       // `autosaveFailed` because every manual caller that passes bounded
       // observation limits reaches this function too, and without a branch of
@@ -7673,10 +7724,10 @@ export default {
             doctorStartedEpoch
           );
           this.diagnostic = {
-            title: report.unknown ? "Doctor outcome unknown" : "Doctor failed",
+            title: report.detached ? "Doctor not awaited" : report.unknown ? "Doctor outcome unknown" : "Doctor failed",
             output: doctorDisplayOutput(this.doctorReport, error.resultOutput || report.message)
           };
-          this.doctorProgress = { active: false, phase: report.unknown ? "unknown" : "failed", level: doctorLevel, started_epoch: doctorStartedEpoch };
+          this.doctorProgress = { active: false, phase: report.detached || report.unknown ? "unknown" : "failed", level: doctorLevel, started_epoch: doctorStartedEpoch };
         }
       } finally {
         if (!this.disposed) {
@@ -7834,7 +7885,9 @@ export default {
         this.syncStatusResult = emptySyncStatusPage();
         this.syncStatusCursors = [];
         this.syncStatusPageNumber = 0;
-        this.syncStatusPhase = "failed";
+        this.syncStatusCheckedAtMs = 0;
+        this.syncStatusFromMemory = false;
+        this.syncStatusPhase = report.detached ? "idle" : "failed";
         this.syncStatusMessage = report.message;
       } finally {
         if (!this.disposed) {
@@ -7910,7 +7963,7 @@ export default {
           "The package rejected the re-upload."
         );
         recordIsolatedIncident(this, "operations", "Resync", error, report, { subject: scope || profile });
-        this.resyncPhase = report.unknown ? "unknown" : "failed";
+        this.resyncPhase = report.detached ? "idle" : report.unknown ? "unknown" : "failed";
         this.resyncMessage = report.message;
       } finally {
         if (!this.disposed) {
