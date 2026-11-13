@@ -102,6 +102,9 @@ pub enum Change {
         dir: String,
         entry: String,
         kind: &'static str,
+        /// Whether `entry` is a directory, as the kernel said (`IN_ISDIR`): a folder created, moved
+        /// or deleted marks its whole subtree, a file only its folder's direct children.
+        is_dir: bool,
     },
     /// The kernel dropped events (`IN_Q_OVERFLOW`): the whole tree has to be treated as changed.
     /// The watch set has already been re-walked when this is reported.
@@ -121,7 +124,9 @@ impl Change {
     /// not later take the same removal for a change inotify missed.
     pub fn only_removes(&self) -> bool {
         match self {
-            Self::Path { dir, entry, kind } => {
+            Self::Path {
+                dir, entry, kind, ..
+            } => {
                 matches!(*kind, "delete" | "moved_from")
                     && !(dir.is_empty() && Filter::is_rules_file(entry))
             }
@@ -573,6 +578,7 @@ mod tests {
             dir: dir.to_owned(),
             entry: entry.to_owned(),
             kind,
+            is_dir: false,
         };
         assert!(path("docs", "docs/a.txt", "delete").only_removes());
         assert!(path("docs", "docs/old", "moved_from").only_removes());

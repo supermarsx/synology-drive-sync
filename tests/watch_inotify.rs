@@ -145,6 +145,11 @@ fn a_created_file_is_reported_with_its_directory() {
         change,
         Change::Path { dir, entry, .. } if dir == "docs" && entry == "docs/report.txt"
     )));
+    // A file: its folder's direct children, not a subtree.
+    assert!(changes.iter().all(|change| !matches!(
+        change,
+        Change::Path { entry, is_dir: true, .. } if entry == "docs/report.txt"
+    )));
 }
 
 #[test]
@@ -306,6 +311,11 @@ fn rm_rf_of_a_subtree_is_reported_and_releases_its_watches() {
     fs::remove_dir_all(source.join("gone")).unwrap();
     let changes = gather(&mut tree, |seen| has(seen, "gone", "delete"));
     assert!(has(&changes, "gone", "delete"), "{:?}", entries(&changes));
+    // A directory removed: the kernel's IN_ISDIR reaches the change, so its subtree is marked.
+    assert!(changes.iter().any(|change| matches!(
+        change,
+        Change::Path { entry, kind: "delete", is_dir: true, .. } if entry == "gone"
+    )));
     let deadline = Instant::now() + Duration::from_secs(15);
     while tree.watch_count() != 1 && Instant::now() < deadline {
         tree.wait(Duration::from_millis(50)).unwrap();

@@ -498,6 +498,7 @@ impl TreeWatch {
                         dir: parent.to_owned(),
                         entry: dir,
                         kind: "attrib",
+                        is_dir: true,
                     });
                 }
                 continue;
@@ -507,7 +508,12 @@ impl TreeWatch {
             let kind = kind_of(mask);
             if dir.is_empty() && Filter::is_rules_file(&entry) {
                 rules_changed = true;
-                changes.push(Change::Path { dir, entry, kind });
+                changes.push(Change::Path {
+                    dir,
+                    entry,
+                    kind,
+                    is_dir,
+                });
                 continue;
             }
             if self.filter.excludes(&entry, is_dir) {
@@ -544,7 +550,12 @@ impl TreeWatch {
                 }
             }
             if self.events.reports(kind) {
-                changes.push(Change::Path { dir, entry, kind });
+                changes.push(Change::Path {
+                    dir,
+                    entry,
+                    kind,
+                    is_dir,
+                });
             }
         }
         // Moved out of the tree (or to an excluded name): the directory lives on elsewhere and
@@ -575,6 +586,7 @@ impl TreeWatch {
                         dir: dir.clone(),
                         entry: dir,
                         kind: "new_dir",
+                        is_dir: true,
                     });
                 }
             }
