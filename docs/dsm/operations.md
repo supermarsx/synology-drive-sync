@@ -705,6 +705,14 @@ failure record, and a `warn` record `controller_wake_failed` naming the `cause` 
 `pid_probe_failed`, `identity_untrusted`, `identity_changed` or `signal_failed`), at most once every
 five minutes. The save itself is unaffected: it was accepted, and the controller's own polling finds it.
 
+### Reconciling the audit while polling a result
+
+A queued job whose terminal audit record is still pending is reconciled by the result poll, which
+forks the manager (about 1.7 s on a DS416, up to 20 s when the audit sink is down). A job is
+reconciled by a poll at most once every fifteen seconds; a poll inside the window is answered from
+the stored result at once, still saying `audit_pending`, and the controller's own retry finishes the
+record. Before, each abandoned browser read left another manager fork behind it.
+
 ### Forcing dashboard reads through the shell manager
 
 Dashboard reads, the Logs view included, are answered inside the package service, from the package's

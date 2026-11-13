@@ -16733,6 +16733,56 @@ fn execute_result_action_after_wait(
     queued_expired_response(job_id)
 }
 
+/// How often one job's result poll may start an audit reconcile.
+#[cfg(target_os = "linux")]
+const AUDIT_RECONCILE_POLL_INTERVAL: Duration = Duration::from_secs(15);
+
+/// The jobs a result poll reconciled the audit for recently, and when.
+///
+/// Bounded: entries older than the interval are dropped on every admission, and a table that
+/// still outgrows its cap (more than 512 distinct jobs inside fifteen seconds) is cleared, which
+/// costs at most one extra reconcile per job and never a missed one.
+#[cfg(target_os = "linux")]
+#[derive(Default)]
+struct AuditReconcileGate {
+    last: BTreeMap<String, Instant>,
+}
+
+#[cfg(target_os = "linux")]
+impl AuditReconcileGate {
+    const MAX_JOBS: usize = 512;
+
+    fn admit(&mut self, job_id: &str, now: Instant, interval: Duration) -> bool {
+        self.last
+            .retain(|_, at| now.saturating_duration_since(*at) < interval);
+        if self.last.contains_key(job_id) {
+            return false;
+        }
+        if self.last.len() >= Self::MAX_JOBS {
+            self.last.clear();
+        }
+        self.last.insert(job_id.to_owned(), now);
+        true
+    }
+}
+
+#[cfg(target_os = "linux")]
+static AUDIT_RECONCILE_GATE: Mutex<AuditReconcileGate> = Mutex::new(AuditReconcileGate {
+    last: BTreeMap::new(),
+});
+
+/// Whether this result poll may reconcile the audit for `job_id` now.
+///
+/// A poisoned table admits: the gate exists to save forks, not to stop the reconcile that
+/// finishes a record.
+#[cfg(target_os = "linux")]
+fn audit_reconcile_admitted(job_id: &str) -> bool {
+    match AUDIT_RECONCILE_GATE.lock() {
+        Ok(mut gate) => gate.admit(job_id, Instant::now(), AUDIT_RECONCILE_POLL_INTERVAL),
+        Err(_) => true,
+    }
+}
+
 #[cfg(target_os = "linux")]
 fn completed_result_response(
     paths: &ControlPaths<'_>,
@@ -16755,11 +16805,16 @@ fn completed_result_response(
     if response.completed_at_epoch > now.saturating_add(CLOCK_SKEW_SECONDS) {
         return Err(BridgeError::new(ErrorKind::Unavailable));
     }
-    if response.audit_pending {
+    if response.audit_pending && audit_reconcile_admitted(job_id) {
         // Polling is also a bounded reconciliation opportunity, but an audit
         // sink outage must never hide or delete a known terminal result. The
         // controller provides autonomous retry; GET keeps serving the truthful
         // result with audit_pending until the durable record is confirmed.
+        // One attempt per job per fifteen seconds: each attempt forks the manager (1.7 s on an
+        // armv7, up to 20 s when the sink is down), the browser abandons a read at 10 s and
+        // polls again, and without the gate every abandoned read left another fork behind.
+        // A poll inside the window is answered from the stored result at once, still saying
+        // `audit_pending: true`, which is what the dashboard shows beside the result.
         let audit_paths = paths.audit_outbox();
         if linux_files::reconcile_audit_transactions(&audit_paths, package_uid, record_audit_event)
             .is_ok()
@@ -25344,6 +25399,29 @@ mod tests {
         let stopped = assert_snapshot_parity(&fixture);
         assert_eq!(stopped["service"]["state"], "stopped");
         assert_eq!(stopped["service"]["pid"], 0);
+    }
+
+    /// A result poll reconciles one job's audit at most once per interval, however often the
+    /// browser asks, and a different job is never held back by it.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_result_poll_reconciles_one_jobs_audit_once_per_interval() {
+        let interval = Duration::from_secs(15);
+        let start = Instant::now();
+        let mut gate = AuditReconcileGate::default();
+        assert!(gate.admit("job-a", start, interval));
+        assert!(!gate.admit("job-a", start + Duration::from_secs(3), interval));
+        assert!(!gate.admit("job-a", start + Duration::from_secs(14), interval));
+        assert!(gate.admit("job-b", start + Duration::from_secs(14), interval));
+        assert!(gate.admit("job-a", start + Duration::from_secs(15), interval));
+        assert_eq!(gate.last.len(), 2, "an expired entry was kept");
+        // The table never grows without bound: past its cap it is cleared, which admits.
+        let mut crowded = AuditReconcileGate::default();
+        for index in 0..AuditReconcileGate::MAX_JOBS {
+            assert!(crowded.admit(&format!("job-{index}"), start, interval));
+        }
+        assert!(crowded.admit("job-new", start, interval));
+        assert!(crowded.last.len() <= AuditReconcileGate::MAX_JOBS);
     }
 
     /// The queue wake is the service's own signal, and it goes only to a controller the whole
