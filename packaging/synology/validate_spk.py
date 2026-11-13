@@ -1797,11 +1797,13 @@ def validate_native_widget_source(
         raise ValidationError("native DSM widget adapter must stop polling before it is destroyed")
 
     for marker in (
-        'import { SNAPSHOT_SCHEMA, apiGet } from "./api";',
+        'import { SNAPSHOT_SCHEMA, apiGet, isDsmAuthenticationRefusal, onDsmAuthenticationAccepted } from "./api";',
         'const snapshot = await apiGet(this.auth, "snapshot");',
         'if (snapshot.schema !== SNAPSHOT_SCHEMA) throw new Error("Unsupported DSM API schema");',
-        "if (this.disposed || !this.activated || this.documentHidden || this.loading) return;",
-        "if (this.disposed || !this.activated || this.documentHidden) return;",
+        "if (this.disposed || !this.activated || this.documentHidden || this.loading || this.authRefused) return;",
+        "if (this.disposed || !this.activated || this.documentHidden || this.authRefused) return;",
+        # After DSM refuses the session the card stops: a poll would present it again.
+        "if (isDsmAuthenticationRefusal(error)) this.authRefused = true;",
         "this.documentHidden = Boolean(document.hidden);",
         'document.addEventListener("visibilitychange", this.visibilityHandler);',
         'document.removeEventListener("visibilitychange", this.visibilityHandler);',

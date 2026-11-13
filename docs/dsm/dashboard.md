@@ -84,7 +84,8 @@ session:
   same stored preference, so raising that setting also slows the widget;
 - consecutive failures back the interval off to a five-minute floor, and one successful read clears
   the backoff. A failure the package did not name (the request never completed, or an HTTP 401, 429 or
-  5xx without a package code) ramps the same way from the second consecutive failure;
+  5xx without a package code) ramps the same way from the second consecutive failure. A DSM
+  authentication refusal the package names stops the card instead (see below);
 - a DSM window that has been minimised (its element reports no layout box) rests at the 60-second
   cadence and resumes at once when it is restored. This is a heuristic: if DSM hides a window another
   way, nothing slows, which costs load but not correctness; The card keeps displaying the last snapshot it did retrieve and marks itself
@@ -181,7 +182,15 @@ whether the window keeps asking:
   unreadable security policy, a corrupt transition marker, an unset clock — is not retried at all.
   The header says automatic refresh has stopped, and **Retry** re-arms it once the package is
   repaired. Polling through a fault that waiting cannot fix only buries the operator's own repair
-  under identical failures.
+  under identical failures;
+- a **DSM session that DSM refused** (any `dsm_authentication_*` 401: `dsm_authentication_rejected`,
+  `dsm_authentication_webapi_rejected`, `dsm_authentication_quickconnect_unsupported`) is not asked
+  about again by anything automatic, in the AppWindow or on the desktop card: no timer, visibility
+  change or background read. Each request would present the refused session to DSM once more, and
+  DSM's session check is exactly what failed (through a QuickConnect relay DSM may refuse it). The
+  page answers further requests itself without touching the NAS, and the app does not retry by
+  itself. Opening the app or selecting **Retry** sends one request; the card resumes when that one
+  is accepted.
 
 The Activity feed draws the newest 200 rows that match its filter and says "N older events not shown"
 with a **Show older** button that draws 200 more (the heading still counts the whole filtered list,

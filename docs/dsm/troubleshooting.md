@@ -182,6 +182,15 @@ codes are:
 - `dsm_authentication_webapi_forbidden` with status 403: the typed response contained
   `is_admin=false`, or the returned account failed the independent NSS/administrator check.
 
+After any of these 401 codes the AppWindow and the desktop card stop asking: the app does not retry
+by itself. Further requests from that DSM page are answered in the page with the same code and never
+reach the NAS, so a refused DSM session is not presented to DSM again by a timer, a visibility change
+or the card (see [security](security.md)). Sign in again or change the route, then select **Retry**
+or reopen the app; that sends one request, and the rest follow only if DSM accepts it. Through a
+QuickConnect relay DSM may refuse the session: a 401 together with `IP is not the same` lines in
+`/var/log/messages` means DSM judged the session from the relay tunnel's address rather than the one
+it bound the session to. Use LAN, DDNS, VPN, or `[alias].direct.quickconnect.to`.
+
 Collect the helper chain and package-UID execute result with read-only checks:
 
 ```bash
