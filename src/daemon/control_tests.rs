@@ -1308,12 +1308,17 @@ fn run_now_beside_a_due_routine_runs_twice_for_an_observer_that_looks_late() {
     assert_eq!(h.ask(run("alpha"))["ok"], true);
     // Looking late: both runs have started and finished by now.
     thread::sleep(Duration::from_millis(600));
-    h.wait_for("the first run", PATIENT, |h| h.launched() >= 1);
+    // Wait for the routine's own run by its count, not by idleness: between the end of the
+    // requested run and the controller turn that dispatches the released routine there is a
+    // moment at which nothing runs and nothing is queued, and an observer that samples `idle`
+    // inside it (a loaded CI runner: `left: 1, right: 2` on Rust 1.90) saw one run and called the
+    // routine's missing.
+    h.wait_for("the routine it released", PATIENT, |h| h.launched() >= 2);
     h.wait_for("idle", PATIENT, Harness::idle);
     assert_eq!(
         h.launched(),
         2,
-        "Run now, then the routine it released: {:?}",
+        "Run now, then the routine it released, and nothing after: {:?}",
         h.logs()
     );
     assert!(!h.var.join("state/lasting/alpha.state").exists());
