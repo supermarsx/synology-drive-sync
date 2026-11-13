@@ -218,26 +218,27 @@ fn read_dir_facts(root: &Path, filter: &Filter, relative: &str) -> Result<Option
             .map_err(|error| format!("the clock is before 1970: {error}"))?;
         i128::try_from(after.as_nanos()).unwrap_or(i128::MAX)
     };
+    // Named by the directory's path under the source, not its absolute path: the Activity row
+    // keeps only the first 110 characters of a cause, and an absolute path on some hosts (a long
+    // temporary directory, a deep volume) used up all of them before the reason.
+    let shown = if relative.is_empty() { "." } else { relative };
     match std::fs::symlink_metadata(&path) {
         Ok(meta) if meta.is_dir() => {}
         Ok(_) => {
-            return Err(format!(
-                "{}: not a directory (or a symlink)",
-                path.display()
-            ));
+            return Err(format!("{}: not a directory (or a symlink)", shown));
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(format!("{}: {error}", path.display())),
+        Err(error) => return Err(format!("{shown}: {error}")),
     }
     let listing = match std::fs::read_dir(&path) {
         Ok(listing) => listing,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(format!("{}: {error}", path.display())),
+        Err(error) => return Err(format!("{shown}: {error}")),
     };
     let mut children: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
     let mut racy = false;
     for item in listing {
-        let entry = item.map_err(|error| format!("{}: {error}", path.display()))?;
+        let entry = item.map_err(|error| format!("{shown}: {error}"))?;
         let name = entry.file_name();
         let child_path = entry.path();
         let meta = std::fs::symlink_metadata(&child_path)

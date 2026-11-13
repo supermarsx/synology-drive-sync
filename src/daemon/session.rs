@@ -416,6 +416,10 @@ impl Lease {
             // Written before the child exists, so it must fit the socket's buffer (a handover
             // is a few KiB of a buffer of hundreds); bounded, so it never stalls the run if not.
             ours.set_write_timeout(Some(Duration::from_secs(2)))?;
+            // Bounds the handback's read too. Set here, before the write side is shut: macOS
+            // refuses a socket option on a socket that has been shut down (EINVAL), which made
+            // every handback there read as "the channel cannot be bounded".
+            ours.set_read_timeout(Some(HANDBACK_WAIT))?;
             match &state.lent {
                 Some(lent) => {
                     let encoded = lent.encode().map_err(std::io::Error::other)?;
@@ -598,9 +602,7 @@ fn read_handback(socket: &mut std::os::unix::net::UnixStream) -> Result<Handback
     use zeroize::Zeroizing;
 
     const STATUS_BYTES: usize = 128;
-    socket
-        .set_read_timeout(Some(HANDBACK_WAIT))
-        .map_err(|error| format!("the channel cannot be bounded: {error}"))?;
+    // The read is bounded by the timeout `open` set on this end.
     let limit = STATUS_BYTES + MAX_HANDOVER_BYTES;
     let mut bytes = Zeroizing::new(Vec::with_capacity(limit + 1));
     let cut = match socket.take(limit as u64 + 1).read_to_end(&mut bytes) {
