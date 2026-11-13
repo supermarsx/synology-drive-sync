@@ -7912,7 +7912,7 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
         snapshot, payload = self.api("snapshot")
         self.assertEqual(snapshot.returncode, 0, snapshot.stderr)
         model = next(item for item in payload["routines"] if item["profile"] == "defaults")
-        self.assertEqual(model["debounce_seconds"], 45)
+        self.assertEqual(model["debounce_seconds"], 15)
         self.assertEqual(model["retry_count"], 5)
         self.assertTrue(model["retry_exponential"])
         for irrelevant in ("interval_seconds", "weekdays", "time_window_start", "time_window_end"):
