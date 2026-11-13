@@ -1,5 +1,6 @@
-//! fix8 R7b: the office lock and temporary files excluded by default are neither uploaded nor,
-//! under `--delete`, deleted from the NAS: a copy already there stays.
+//! fix8 R7b: the office lock and temporary files, and the OS thumbnail and folder metadata files,
+//! excluded by default are neither uploaded nor, under `--delete`, deleted from the NAS: a copy
+//! already there stays.
 
 #[allow(dead_code)]
 mod support;
@@ -26,6 +27,9 @@ fn office_lock_files_are_not_uploaded_and_their_nas_copies_are_never_deleted() {
         "~WRL0001.tmp",
         "orders.laccdb",
         "orders.ldb",
+        "~$report.odt",
+        "Thumbs.db",
+        ".DS_Store",
     ] {
         fs::write(source.join(name), b"lock").expect("write lock file");
     }
@@ -37,6 +41,8 @@ fn office_lock_files_are_not_uploaded_and_their_nas_copies_are_never_deleted() {
         "~DF1A2B.TMP",
         "stock.LACCDB",
         "legacy.ldb",
+        "~$old.docx",
+        "ehthumbs.db",
     ];
     for name in stale {
         server.add_file(&format!("{ROOT}/{name}"), b"stale lock", 1_700_000_000);
@@ -94,6 +100,9 @@ fn office_lock_files_are_not_uploaded_and_their_nas_copies_are_never_deleted() {
         "~WRL0001.tmp",
         "orders.laccdb",
         "orders.ldb",
+        "~$report.odt",
+        "Thumbs.db",
+        ".DS_Store",
     ] {
         assert_eq!(
             server.file_contents(&format!("{ROOT}/{name}")),
