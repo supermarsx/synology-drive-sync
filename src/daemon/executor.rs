@@ -1381,19 +1381,19 @@ mod process {
         /// A child that keeps doing I/O is never called stalled.
         #[test]
         fn a_busy_child_is_not_stalled() {
-            // The child writes every 30 ms for about 3 s, twice the kill window, so a stall check
-            // that failed to count its I/O would kill it. The window itself was 400 ms; a child
-            // this small can wait that long for a CPU on a runner busy with 500 other tests (one
-            // failure of 1 in a full 1.99.1 run, none in 3 others), which is scheduling, not a
-            // stall the check should call a stall.
+            // The child writes every 30 ms for about 7 s, longer than the kill window, so a stall
+            // check that failed to count its I/O would kill it. Each turn of its loop starts
+            // `head` and `sleep`, programs a loaded runner has to read from a busy disk: 400 ms,
+            // then 1.5 s, was spent waiting for one of them in a full run now and then (the
+            // child waiting, not the check miscounting), so the window is 6 s.
             let mut timings = fast();
-            timings.stall_warn = Duration::from_millis(750);
-            timings.stall_kill = Duration::from_millis(1500);
+            timings.stall_warn = Duration::from_secs(3);
+            timings.stall_kill = Duration::from_secs(6);
             let (_handle, events) = run(sh(
-                "i=0; while [ $i -lt 100 ]; do head -c 4096 /dev/zero > /dev/null; sleep 0.03; i=$((i+1)); done",
+                "i=0; while [ $i -lt 230 ]; do head -c 4096 /dev/zero > /dev/null; sleep 0.03; i=$((i+1)); done",
                 timings,
             ));
-            let (report, seen) = finish(&events, Duration::from_secs(20));
+            let (report, seen) = finish(&events, Duration::from_secs(40));
             assert_eq!(report.ending, Ending::Exited, "{seen:?}");
             assert_eq!(report.exit, 0);
         }

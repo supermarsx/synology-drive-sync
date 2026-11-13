@@ -1857,8 +1857,12 @@ exit 64
     /// answered and the lane runs the next job.
     #[test]
     fn an_unkillable_consumer_frees_its_slot_by_name() {
+        // The deadline has to outlast the stubborn consumer's own start (a shell, then `perl`,
+        // which must have ignored TERM and recorded its pid): at 500 ms a loaded runner, or one
+        // whose disk was busy loading those programs, sometimes ended it by TERM before it got
+        // there, and the consumer was killed for its deadline instead of outliving KILL.
         let settings = QueueSettings {
-            serialized_deadline: Duration::from_millis(500),
+            serialized_deadline: Duration::from_secs(3),
             reap_bound: Duration::from_millis(500),
             ..fast()
         };
