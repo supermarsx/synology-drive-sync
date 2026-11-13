@@ -106,7 +106,19 @@ listed as an `info` note (`nested_mounts=N first=… watched_by=poll_floor every
 inotify does not see changes made through them. Separately, an armed realtime routine syncs its whole
 tree once every 24 hours (`routine_full_reconcile`, `info`). A profile held by a [lasting
 block](operations.md#lasting-block-after-an-out-of-memory-kill) is not run by its routine, and each
-held trigger is logged at most once an hour (`routine_suppressed`). See
+held trigger is logged at most once an hour (`routine_suppressed`).
+
+**A change that changes nothing is not run.** Many events leave a directory exactly as the last sync saw it
+(a temporary file created and removed, a file renamed away and back). When the quiet period ends, the daemon
+reads the changed directories (names, sizes, modification and change times and inodes of the entries the sync
+does not exclude) and compares them with what the last sync that converged left. If every one matches, it does
+not start a run: it logs `routine_run_skipped` (`reason=unchanged_since_converged`), counts it in `ctl status`
+(`skipped_runs`, `last_skip_epoch`, `last_skip_reason`) and consumes the change. A sync converges when it exits 0
+with no deferral, skip, incomplete listing or unchecked link folder; anything else, an overflow, a re-armed
+watch or a daemon restart forgets what was remembered, so the next change always runs. A directory with a
+file changed in the last three seconds is never remembered. The whole-tree sync (every 24 hours, after an
+overflow, at start-up) and manual runs are never skipped, and so a change made only to the NAS copy is repaired
+by that daily pass, as before. The shell engine has no per-directory change set and does not skip. See
 [Realtime reports polling](troubleshooting.md#realtime-reports-polling).
 
 **Under the shell engine** DSM ships no

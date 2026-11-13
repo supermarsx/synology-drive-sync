@@ -27,6 +27,9 @@ struct World {
     max_running: usize,
     /// A 137 exit reports the cgroup's OOM counter as moved.
     oom_proven: bool,
+    /// An exit-0 run carries the result record of a sync that left nothing
+    /// undone (the daemon's evidence that it converged).
+    converged_record: bool,
 }
 
 struct FakeLauncher {
@@ -75,10 +78,10 @@ impl Launcher for FakeLauncher {
                 }
                 Err(_) => (plan.exit, Ending::Exited),
             };
-            let oom = {
+            let (oom, converged_record) = {
                 let mut world = world.lock().unwrap();
                 world.running -= 1;
-                world.oom_proven && exit == 137
+                (world.oom_proven && exit == 137, world.converged_record)
             };
             sink(ExecEvent::Finished(Box::new(RunReport {
                 exit,
@@ -88,7 +91,22 @@ impl Launcher for FakeLauncher {
                 } else {
                     b"error: fake failure\n".to_vec()
                 },
-                records: Vec::new(),
+                records: if converged_record && exit == 0 {
+                    vec![super::super::executor::JobRecord {
+                        profile: "docs".into(),
+                        status: "ok".into(),
+                        deferred: Some(0),
+                        skipped: Some(0),
+                        facts: super::super::state::ResultFacts {
+                            incomplete_listings: Some(0),
+                            link_guard_unchecked: Some(0),
+                            ..Default::default()
+                        },
+                        ..Default::default()
+                    }]
+                } else {
+                    Vec::new()
+                },
                 record_error: None,
                 oom_proven: oom.then_some(true),
                 memory_note: None,
@@ -2677,4 +2695,164 @@ fn a_reading_that_clears_inside_the_grace_is_never_announced() {
     });
     thread::sleep(Duration::from_millis(400));
     assert_eq!(observation_rows(&h, "routine.unobserved", "docs").len(), 1);
+}
+
+// ------------------------------------------------------- P8: converged skips
+
+/// A source with one directory whose files are older than the racy margin, so a
+/// run that converges may record it.
+#[cfg(unix)]
+fn quiet_tree(h: &Harness) -> PathBuf {
+    let source = volume_source(&h.root, "docs");
+    fs::create_dir_all(source.join("a")).unwrap();
+    fs::write(source.join("a/f.txt"), "1").unwrap();
+    thread::sleep(Duration::from_millis(3300));
+    source
+}
+
+#[cfg(unix)]
+fn converged_dirs(h: &Harness) -> u64 {
+    h.ask(Request::Status)["routines"][0]["converged_dirs"]
+        .as_u64()
+        .unwrap()
+}
+
+#[cfg(unix)]
+fn skipped(h: &Harness) -> Value {
+    h.ask(Request::Status)["routines"][0].clone()
+}
+
+/// A change that leaves the directory as the last converged run saw it is not
+/// dispatched: it is logged by name, counted in the status, and its pending
+/// change is consumed. A real edit afterwards runs.
+#[cfg(unix)]
+#[test]
+fn an_unchanged_directory_after_a_converged_run_is_skipped_and_named() {
+    let h = realtime_harness("converged-skip");
+    h.world.lock().unwrap().converged_record = true;
+    h.wait_for("arm", PATIENT, |h| armed_generation(h, "docs").is_some());
+    let source = quiet_tree(&h);
+    change(&h, "a");
+    h.wait_for("the first run", PATIENT, |h| h.launched() == 1);
+    h.wait_for("idle", PATIENT, Harness::idle);
+    assert_eq!(
+        converged_dirs(&h),
+        1,
+        "the converged run recorded its directory"
+    );
+
+    change(&h, "a");
+    h.wait_for("the skip", PATIENT, |h| {
+        h.logs()
+            .iter()
+            .any(|l| l.starts_with("routine_run_skipped "))
+    });
+    let line = h
+        .logs()
+        .into_iter()
+        .find(|l| l.starts_with("routine_run_skipped "))
+        .unwrap();
+    assert!(
+        line.contains("profile=docs")
+            && line.contains("dirs=1")
+            && line.contains("reason=unchanged_since_converged"),
+        "{line}"
+    );
+    assert_eq!(h.launched(), 1, "nothing was dispatched");
+    let status = skipped(&h);
+    assert_eq!(status["skipped_runs"], 1, "{status}");
+    assert_eq!(status["last_skip_reason"], "unchanged_since_converged");
+    assert_eq!(status["pending_change"], false, "the change was consumed");
+
+    // A real edit is not an unchanged directory.
+    fs::write(source.join("a/f.txt"), "22").unwrap();
+    change(&h, "a");
+    h.wait_for("the second run", PATIENT, |h| h.launched() == 2);
+}
+
+/// A manual run that fails leaves the NAS in a state no digest vouches for: the
+/// record is forgotten, named, and the next change dispatches.
+#[cfg(unix)]
+#[test]
+fn a_run_that_did_not_converge_forgets_what_was_recorded() {
+    let h = realtime_harness("converged-forget");
+    h.world.lock().unwrap().converged_record = true;
+    h.wait_for("arm", PATIENT, |h| armed_generation(h, "docs").is_some());
+    let _source = quiet_tree(&h);
+    change(&h, "a");
+    h.wait_for("the first run", PATIENT, |h| h.launched() == 1);
+    h.wait_for("idle", PATIENT, Harness::idle);
+    assert_eq!(converged_dirs(&h), 1);
+
+    *h.plan.lock().unwrap() = Plan {
+        finish_after: Some(Duration::from_millis(30)),
+        exit: 1,
+        stop_takes: Duration::ZERO,
+    };
+    assert_eq!(h.ask(run("docs"))["ok"], true);
+    h.wait_for("the failed run", PATIENT, |h| h.launched() == 2);
+    h.wait_for("idle", PATIENT, Harness::idle);
+    assert_eq!(converged_dirs(&h), 0);
+    assert!(
+        h.logs()
+            .iter()
+            .any(|l| l.starts_with("routine_converged_forgotten ") && l.contains("profile=docs")),
+        "{:?}",
+        h.logs()
+    );
+    *h.plan.lock().unwrap() = Plan {
+        finish_after: Some(Duration::from_millis(30)),
+        exit: 0,
+        stop_takes: Duration::ZERO,
+    };
+    change(&h, "a");
+    h.wait_for("the next change dispatches", PATIENT, |h| h.launched() == 3);
+}
+
+/// An overflow loses events: it forgets the record and syncs the whole tree.
+#[cfg(unix)]
+#[test]
+fn an_overflow_forgets_the_record_and_is_never_skipped() {
+    let h = realtime_harness("converged-overflow");
+    h.world.lock().unwrap().converged_record = true;
+    h.wait_for("arm", PATIENT, |h| armed_generation(h, "docs").is_some());
+    let _source = quiet_tree(&h);
+    change(&h, "a");
+    h.wait_for("the first run", PATIENT, |h| h.launched() == 1);
+    h.wait_for("idle", PATIENT, Harness::idle);
+    assert_eq!(converged_dirs(&h), 1);
+    let _ = h.tx.send(Msg::Change(ChangeEvent::Overflow {
+        routine: Some("docs".into()),
+    }));
+    h.wait_for("the whole-tree run", PATIENT, |h| h.launched() == 2);
+    assert_eq!(
+        h.logs()
+            .iter()
+            .filter(|l| l.starts_with("routine_run_skipped "))
+            .count(),
+        0
+    );
+}
+
+/// A directory the check cannot read is not an excuse to skip: the dispatch
+/// goes ahead, and the reason is named once.
+#[cfg(unix)]
+#[test]
+fn a_check_that_cannot_be_made_dispatches_and_says_why() {
+    let h = realtime_harness("converged-unavailable");
+    h.wait_for("arm", PATIENT, |h| armed_generation(h, "docs").is_some());
+    let source = volume_source(&h.root, "docs");
+    fs::create_dir_all(&source).unwrap();
+    std::os::unix::fs::symlink("/", source.join("a")).unwrap();
+    change(&h, "a");
+    h.wait_for("the dispatch", PATIENT, |h| h.launched() == 1);
+    let line = h
+        .logs()
+        .into_iter()
+        .find(|l| l.starts_with("routine_skip_check_unavailable "))
+        .expect("the cause is named");
+    assert!(
+        line.contains("profile=docs") && line.contains("not a directory"),
+        "{line}"
+    );
 }

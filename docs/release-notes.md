@@ -8,6 +8,13 @@ lists its own commits.
 
 ## Unreleased: the daemon is the DSM service engine
 
+- **A realtime change that changes nothing no longer starts a run, and the default quiet period is 15 seconds.**
+  The debounce of a realtime routine that names none went from 45 to 15 seconds (the ceiling for a tree that
+  never goes quiet is 75 seconds). A routine that names one keeps it. After a sync that converged, the daemon
+  remembers the directories it was run for; when a later change leaves every changed directory exactly as it
+  was (a temporary file created and removed, a rename and back), it logs `routine_run_skipped` and starts
+  nothing. Whole-tree and manual runs are never skipped. See [Routines](dsm/routines.md#realtime-mode-and-fallback).
+
 - **A shell-engine start no longer fails at random with `committed services failed to publish final
   readiness`.** The API service and the controller each read the start lease (`controller.starting`)
   while the lifecycle script commits it by renaming a new file over it. A read that landed in that

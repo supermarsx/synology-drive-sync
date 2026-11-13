@@ -16,6 +16,7 @@ pub(crate) mod api_server;
 pub(crate) mod audit;
 pub(crate) mod changes;
 pub(crate) mod control;
+pub(crate) mod converged;
 #[cfg(target_os = "linux")]
 pub(crate) mod ctl;
 pub(crate) mod events;

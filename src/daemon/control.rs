@@ -37,6 +37,7 @@ use super::changes::{
     Admit, ArmSpec, BackendReports, ChangeEvent, ChangeSink, ChangeSource, ChangeSourceFactory,
     DirtySet, bound_detail,
 };
+use super::converged::{self, CheckJob, Outcome as CheckOutcome};
 use super::events::{ActivityRow, EventSink, LogEvent};
 use super::executor::{
     ExecEvent, RunReport, RunSpec, StopCause, Timings, Verdict as RunVerdict, allowlisted_env,
@@ -147,6 +148,14 @@ pub(crate) enum Msg {
     /// The dashboard queue's audit reconcile has failed past its bound
     /// (`Some`), or recovered (`None`): published in controller.state (H2).
     AuditHealth(Option<ControllerDegraded>),
+    /// A converged-directories check finished (P8): the routine, the arming it
+    /// was started under, its token, and what it found.
+    Checked {
+        routine: String,
+        generation: u64,
+        token: u64,
+        outcome: CheckOutcome,
+    },
     /// An untagged change event (tests drive the control thread with these).
     #[cfg(test)]
     Change(ChangeEvent),
@@ -251,6 +260,9 @@ enum Origin {
         name: String,
         window_day: Option<String>,
         dirty: Option<DirtySet>,
+        /// The dirty directories as they were read just before dispatch: what
+        /// the manifest records if this run converges.
+        snapshot: Option<converged::Snapshot>,
     },
     Aggregate,
     Requested,
@@ -312,6 +324,57 @@ struct Entry {
     /// The reading that differs from the announced one, and since when: it is
     /// announced once it has held for `Settings::observe_grace`.
     observe_pending: Option<(Observe, String, Instant)>,
+    /// What the last converged runs left (daemon/converged.rs).
+    convergence: Convergence,
+}
+
+/// P8: a realtime routine's converged-directories record and the check that
+/// decides whether a dispatch is needed at all.
+#[derive(Default)]
+struct Convergence {
+    manifest: converged::Manifest,
+    gate: Gate,
+    /// The next check's token: a result of an earlier one is dropped.
+    next_token: u64,
+    /// Dispatches skipped as unchanged, and the last one.
+    skipped_runs: u64,
+    last_skip_epoch: u64,
+    /// The cause of the last check that could not be made, named once per
+    /// episode (cleared when a check is made again).
+    unavailable: Option<String>,
+}
+
+#[derive(Default)]
+enum Gate {
+    #[default]
+    Idle,
+    /// A check is reading the dirty directories on its own thread.
+    Pending {
+        token: u64,
+        started: Instant,
+        cancel: Arc<std::sync::atomic::AtomicBool>,
+        dirs: std::collections::BTreeSet<String>,
+        last_event: Option<Instant>,
+    },
+    /// A check's answer, for the dirty set that had `dirs` and was last touched
+    /// at `last_event` when the check began. A different dirty set (an event
+    /// since) makes it stale.
+    Done {
+        dirs: std::collections::BTreeSet<String>,
+        last_event: Option<Instant>,
+        outcome: CheckOutcome,
+    },
+}
+
+/// What the gate decided about a due realtime dispatch.
+enum GateVerdict {
+    /// Dispatch now, with this snapshot to record if the run converges.
+    Dispatch(Option<converged::Snapshot>),
+    /// A check is in flight; the routine stays due and is looked at again when
+    /// it answers.
+    Wait,
+    /// Nothing changed since the last converged run: the change was consumed.
+    Skipped,
 }
 
 /// Why a profile's automatic runs are held (daemon/lasting.rs).
@@ -926,6 +989,12 @@ impl Control {
                 {
                     wake = wake.min(at.saturating_duration_since(instant_now));
                 }
+                if let Gate::Pending { started, .. } = &entry.convergence.gate {
+                    wake = wake.min(
+                        (*started + converged::CHECK_DEADLINE)
+                            .saturating_duration_since(instant_now),
+                    );
+                }
             }
         }
         wake.max(Duration::from_millis(10))
@@ -957,6 +1026,12 @@ impl Control {
                 }
             }
             Msg::AuditHealth(degraded) => self.audit_health(degraded),
+            Msg::Checked {
+                routine,
+                generation,
+                token,
+                outcome,
+            } => self.checked(&routine, generation, token, outcome),
             #[cfg(test)]
             Msg::Change(event) => self.change(event),
         }
@@ -1294,6 +1369,7 @@ impl Control {
                 trigger_seen: None,
                 armed_at: None,
                 observe_pending: None,
+                convergence: Convergence::default(),
             });
             entry.state = state;
             let realtime =
@@ -1353,6 +1429,7 @@ impl Control {
                         }
                         entry.armed = Some(wanted);
                         entry.armed_at = Some(Instant::now());
+                        entry.convergence = Convergence::default();
                         entry.floor_failing = false;
                         entry.backend_detail = None;
                         self.end_backend_episode(&name, &mut entry);
@@ -1363,6 +1440,7 @@ impl Control {
                         }
                         entry.armed = None;
                         entry.armed_at = None;
+                        entry.convergence = Convergence::default();
                         entry.floor_failing = false;
                         entry.backend_detail = None;
                         self.end_backend_episode(&name, &mut entry);
@@ -1956,6 +2034,19 @@ impl Control {
                 // routine is evaluated again once it frees (I-1).
                 continue;
             }
+            // P8: a realtime dispatch that cannot change anything is skipped,
+            // named; one that might is dispatched with the directories it read
+            // before the core starts. Nothing is committed while it waits.
+            let mut snapshot = None;
+            if matches!(verdict, Verdict::Dispatch(_))
+                && matches!(routine.mode, Mode::Realtime { .. })
+                && routine.action == Action::Sync
+            {
+                match self.convergence_gate(&name, now) {
+                    GateVerdict::Dispatch(taken) => snapshot = taken,
+                    GateVerdict::Wait | GateVerdict::Skipped => continue,
+                }
+            }
             if let Some(entry) = self.routines.get_mut(&name) {
                 entry.state = Ok(state);
             }
@@ -1987,6 +2078,7 @@ impl Control {
                             name: name.clone(),
                             window_day: dispatch.window_day,
                             dirty,
+                            snapshot,
                         },
                         action: routine.action,
                         scope: name.clone(),
@@ -1997,6 +2089,241 @@ impl Control {
                     self.start(request, now);
                 }
                 Verdict::Idle | Verdict::ClockUnavailable => {}
+            }
+        }
+    }
+
+    /// P8: whether a due realtime dispatch has anything to do.
+    ///
+    /// The dirty directories are read on their own thread and compared with
+    /// what the last converged runs left (daemon/converged.rs). Every answer is
+    /// named: a skip is logged and counted in `ctl status`, a check that could
+    /// not be made is named once per cause and the dispatch goes ahead as it
+    /// always did.
+    fn convergence_gate(&mut self, name: &str, now_epoch: u64) -> GateVerdict {
+        // Change times are read on Unix only; elsewhere nothing can be proven
+        // unchanged, which is not worth a thread per dispatch to say.
+        if !cfg!(unix) {
+            return GateVerdict::Dispatch(None);
+        }
+        let tx = self.tx.clone();
+        let Some(entry) = self.routines.get_mut(name) else {
+            return GateVerdict::Dispatch(None);
+        };
+        let Some(armed) = entry.armed.clone() else {
+            return GateVerdict::Dispatch(None);
+        };
+        if entry.dirty.whole_tree || entry.dirty.dirs.is_empty() {
+            entry.convergence.gate = Gate::Idle;
+            return GateVerdict::Dispatch(None);
+        }
+        let dirs = entry.dirty.dirs.clone();
+        let last_event = entry.dirty.last_event;
+        let mut unavailable: Option<String> = None;
+        let verdict = match std::mem::take(&mut entry.convergence.gate) {
+            Gate::Done {
+                dirs: checked,
+                last_event: at,
+                outcome,
+            } if checked == dirs && at == last_event => match outcome {
+                CheckOutcome::Unchanged => {
+                    entry.dirty = DirtySet::default();
+                    entry.convergence.skipped_runs += 1;
+                    entry.convergence.last_skip_epoch = now_epoch;
+                    entry.convergence.unavailable = None;
+                    GateVerdict::Skipped
+                }
+                CheckOutcome::Changed(snapshot) => {
+                    entry.convergence.unavailable = None;
+                    GateVerdict::Dispatch(Some(snapshot))
+                }
+                CheckOutcome::Unavailable(cause) => {
+                    unavailable = Some(cause);
+                    GateVerdict::Dispatch(None)
+                }
+            },
+            Gate::Pending {
+                token,
+                started,
+                cancel,
+                dirs: checking,
+                last_event: at,
+            } => {
+                if started.elapsed() >= converged::CHECK_DEADLINE {
+                    cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+                    unavailable = Some(format!(
+                        "the check did not answer within {} s",
+                        converged::CHECK_DEADLINE.as_secs()
+                    ));
+                    GateVerdict::Dispatch(None)
+                } else {
+                    entry.convergence.gate = Gate::Pending {
+                        token,
+                        started,
+                        cancel,
+                        dirs: checking,
+                        last_event: at,
+                    };
+                    GateVerdict::Wait
+                }
+            }
+            // Idle, or an answer for a dirty set that has since changed.
+            _ => {
+                if dirs.len() > converged::MAX_DIRS {
+                    unavailable = Some(format!(
+                        "{} dirty directories, more than the {} a check reads",
+                        dirs.len(),
+                        converged::MAX_DIRS
+                    ));
+                    GateVerdict::Dispatch(None)
+                } else {
+                    match synology_drive_sync::watch::walk_slot() {
+                        Err(live) => {
+                            unavailable = Some(synology_drive_sync::watch::walk_cap_refusal(live));
+                            GateVerdict::Dispatch(None)
+                        }
+                        Ok(slot) => {
+                            entry.convergence.next_token += 1;
+                            let token = entry.convergence.next_token;
+                            let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+                            let job = CheckJob {
+                                source: armed.source.clone(),
+                                fragment: armed.fragment.clone(),
+                                dirs: dirs.clone(),
+                                manifest: entry.convergence.manifest.clone(),
+                            };
+                            let routine = name.to_owned();
+                            let generation = armed.generation;
+                            let flag = Arc::clone(&cancel);
+                            let spawned = thread::Builder::new()
+                                .name("sdsyncd-skip-check".to_owned())
+                                .spawn(move || {
+                                    let _slot = slot;
+                                    let outcome = converged::check(&job, &flag);
+                                    let _ = tx.send(Msg::Checked {
+                                        routine,
+                                        generation,
+                                        token,
+                                        outcome,
+                                    });
+                                });
+                            match spawned {
+                                Ok(_) => {
+                                    entry.convergence.gate = Gate::Pending {
+                                        token,
+                                        started: Instant::now(),
+                                        cancel,
+                                        dirs: dirs.clone(),
+                                        last_event,
+                                    };
+                                    GateVerdict::Wait
+                                }
+                                Err(error) => {
+                                    unavailable =
+                                        Some(format!("the check thread could not start: {error}"));
+                                    GateVerdict::Dispatch(None)
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        };
+        let mut named = None;
+        if let Some(cause) = unavailable
+            && entry.convergence.unavailable.as_deref() != Some(cause.as_str())
+        {
+            entry.convergence.unavailable = Some(cause.clone());
+            named = Some(cause);
+        }
+        let manifest_dirs = entry.convergence.manifest.len();
+        if let Some(cause) = named {
+            self.log(
+                Level::Info,
+                "scheduler",
+                "routine_skip_check_unavailable",
+                format!(
+                    "profile={name} cause={} action=dispatching_as_before",
+                    sanitize_detail(&cause, 200)
+                ),
+            );
+        }
+        if matches!(verdict, GateVerdict::Skipped) {
+            self.log(
+                Level::Info,
+                "scheduler",
+                "routine_run_skipped",
+                format!(
+                    "profile={name} dirs={} reason={SKIP_UNCHANGED} converged_dirs={manifest_dirs}",
+                    dirs.len()
+                ),
+            );
+        }
+        verdict
+    }
+
+    /// A check answered: kept for the dispatch to use if it is still the
+    /// answer to the question (the arming and token are the ones in flight).
+    fn checked(&mut self, routine: &str, generation: u64, token: u64, outcome: CheckOutcome) {
+        let Some(entry) = self.routines.get_mut(routine) else {
+            return;
+        };
+        if entry
+            .armed
+            .as_ref()
+            .is_none_or(|a| a.generation != generation)
+        {
+            return;
+        }
+        if let Gate::Pending {
+            token: pending,
+            dirs,
+            last_event,
+            ..
+        } = &entry.convergence.gate
+            && *pending == token
+        {
+            entry.convergence.gate = Gate::Done {
+                dirs: dirs.clone(),
+                last_event: *last_event,
+                outcome,
+            };
+            self.turn_now = true;
+        }
+    }
+
+    /// What a finished sync run leaves in the manifests of the profiles it
+    /// covered: a run that converged records the directories it was dispatched
+    /// for (read before it began); one that did not forgets everything, since
+    /// what it left on the NAS is not known to match any digest.
+    fn note_convergence(&mut self, request: &RunRequest, profiles: &[String], converged: bool) {
+        for profile in profiles {
+            let Some(entry) = self.routines.get_mut(profile) else {
+                continue;
+            };
+            if !converged {
+                if !entry.convergence.manifest.is_empty() {
+                    entry.convergence.manifest.clear();
+                    self.log(
+                        Level::Info,
+                        "scheduler",
+                        "routine_converged_forgotten",
+                        format!(
+                            "profile={profile} id={} cause=the run did not converge",
+                            request.id
+                        ),
+                    );
+                }
+                continue;
+            }
+            if let Origin::Routine {
+                name,
+                snapshot: Some(snapshot),
+                ..
+            } = &request.origin
+                && name == profile
+            {
+                entry.convergence.manifest.record(snapshot);
             }
         }
     }
@@ -2941,11 +3268,15 @@ impl Control {
             "detail": verdict.detail,
         }));
 
+        if sync {
+            self.note_convergence(&request, &active.profiles, run_converged(&report, &verdict));
+        }
         match &request.origin {
             Origin::Routine {
                 name,
                 window_day,
                 dirty,
+                ..
             } => {
                 self.finish_routine(
                     name,
@@ -3222,6 +3553,8 @@ impl Control {
                 for (name, entry) in &mut self.routines {
                     if routine.as_ref().is_none_or(|r| r == name) && entry.armed.is_some() {
                         entry.dirty.mark_whole_tree(now);
+                        // Events were lost: what the manifest says is unproven.
+                        entry.convergence.manifest.clear();
                         entry.trigger_seen = Some(wall);
                     }
                 }
@@ -3618,6 +3951,10 @@ impl Control {
                     "last_trigger_epoch": state.map(|s| s.last_trigger),
                     "last_run_epoch": state.map(|s| s.last_run),
                     "pending_change": !e.dirty.is_empty(),
+                    "converged_dirs": e.convergence.manifest.len(),
+                    "skipped_runs": e.convergence.skipped_runs,
+                    "last_skip_epoch": e.convergence.last_skip_epoch,
+                    "last_skip_reason": (e.convergence.skipped_runs > 0).then_some(SKIP_UNCHANGED),
                     "mode": e.routine.as_ref().ok().and_then(|r| r.as_ref()).map(|r| r.mode.as_str()),
                 })
             })
@@ -3874,6 +4211,26 @@ fn push_degraded(sinks: &mut Vec<&'static str>, sink: &'static str) {
     if !sinks.contains(&sink) {
         sinks.push(sink);
     }
+}
+
+/// The reason a skipped dispatch gives.
+const SKIP_UNCHANGED: &str = "unchanged_since_converged";
+
+/// A sync run that left nothing undone: it exited 0 on its own, succeeded, and
+/// its result record counts no deferral, skip, incomplete listing or unchecked
+/// link folder. A count the record does not carry is not zero.
+fn run_converged(report: &RunReport, verdict: &RunVerdict) -> bool {
+    report.exit == 0
+        && matches!(report.ending, super::executor::Ending::Exited)
+        && !verdict.cancelled
+        && verdict.outcome == RunOutcome::Succeeded
+        && !report.records.is_empty()
+        && report.records.iter().all(|record| {
+            record.deferred == Some(0)
+                && record.skipped == Some(0)
+                && record.facts.incomplete_listings == Some(0)
+                && record.facts.link_guard_unchecked == Some(0)
+        })
 }
 
 fn sum_counts(report: &RunReport) -> (Option<u64>, Option<u64>) {
