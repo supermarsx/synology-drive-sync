@@ -366,7 +366,7 @@
             </v-form>
 
             <article class="sdsync-panel sdsync-sync-results" aria-live="polite" aria-labelledby="sdsync-sync-title">
-              <div class="sdsync-panel-heading"><div><p class="sdsync-eyebrow">{{ syncStatusResult.loaded ? syncStatusResult.profile : 'Nothing loaded' }}</p><h3 id="sdsync-sync-title">{{ syncStatusResult.loaded ? syncStatusQueryLabel : 'Sync state' }}</h3></div><span v-if="syncStatusResult.loaded" class="sdsync-freshness">Compared by {{ syncStatusResult.compare }}</span></div>
+              <div class="sdsync-panel-heading"><div><p class="sdsync-eyebrow">{{ syncStatusResult.loaded ? syncStatusResult.profile : 'Nothing loaded' }}</p><h3 id="sdsync-sync-title">{{ syncStatusResult.loaded ? syncStatusQueryLabel : 'Sync state' }}</h3></div><span v-if="syncStatusResult.loaded" class="sdsync-freshness">Compared by {{ syncStatusResult.compare }}<template v-if="syncStatusCheckedLabel"> · {{ syncStatusCheckedLabel }}</template></span></div>
               <p v-if="syncStatusBusy && liveProgressDetail" class="sdsync-live-progress" role="status" aria-live="polite">{{ liveProgressDetail }}</p>
               <div v-if="syncStatusBusy && liveProgressStalled" class="sdsync-warning sdsync-live-stalled" role="status" aria-live="polite"><strong>No progress for 10 minutes</strong><span>{{ liveProgressStalledText }}</span><v-button suffix="grey" display="icon-text" tooltip="Stop watching this operation and free the form. Nothing is cancelled on the NAS." @click="detachLiveOperation">Stop waiting</v-button></div>
               <p v-if="!syncStatusResult.loaded" class="sdsync-empty">{{ syncStatusMessage }}</p>
@@ -1362,6 +1362,35 @@ function queuedFailureGuidance(error) {
 // What the running operation last told us it was doing. One slot rather than
 // one per surface, because the package runs one queued operation at a time and
 // the AppWindow blocks the others while it does.
+// How long a status page this window already fetched may be shown again without walking both trees.
+// The walk is the cost (the package keeps no index of it), and a page the person went back to is
+// the same comparison they were just looking at, labelled with how old it is. A run that finishes
+// in between, a re-upload, or any change to the query ends it sooner.
+const SYNC_STATUS_PAGE_TTL_MS = 5 * 60 * 1000;
+const SYNC_STATUS_PAGE_CACHE_LIMIT = 40;
+
+// One page's identity: every field of the query that produced it and the cursor it started from.
+function syncStatusPageKey(profile, query, limit, cursor) {
+  return JSON.stringify([profile, query.scope, query.filter, query.state, limit, query.includeExcluded === true, cursor]);
+}
+
+// The cache is plain data kept off Vue's reactivity (pages are frozen and replaced whole).
+function syncStatusPages(component) {
+  if (!(component.syncStatusPageCache instanceof Map)) component.syncStatusPageCache = new Map();
+  return component.syncStatusPageCache;
+}
+
+// The pages fetched for one profile, or for all of them. Dropped when the profile goes, when a
+// re-upload or run changes what they compared, and when the person changes the query.
+function dropSyncStatusPages(component, profile = "") {
+  const pages = syncStatusPages(component);
+  if (!profile) {
+    pages.clear();
+    return;
+  }
+  for (const [key, entry] of pages) if (entry.profile === profile) pages.delete(key);
+}
+
 function emptyLiveProgress() {
   return { active: false, operation: "", progress: null, startedAtMs: 0 };
 }
@@ -4395,7 +4424,7 @@ export default {
       syncStatusForm: { profile: "", scope: "", filter: "", state: "attention", limit: SYNC_PAGE_SIZE_DEFAULT, include_excluded: false },
       statusRollup: emptyStatusRollup(), statusRollupLoading: false, statusRollupMessage: ROLLUP_IDLE_MESSAGE,
       syncStatusResult: emptySyncStatusPage(), syncStatusPhase: "idle", syncStatusMessage: SYNC_STATUS_IDLE_MESSAGE,
-      syncStatusBusy: false, syncStatusCursors: [], syncStatusPageNumber: 0,
+      syncStatusBusy: false, syncStatusCursors: [], syncStatusPageNumber: 0, syncStatusCheckedAtMs: 0, syncStatusFromMemory: false,
       resyncForm: { scope: "" }, resyncPlan: emptyResyncPlan(), resyncPhase: "idle", resyncMessage: "", resyncBusy: false,
       alertForm: { enabled: false, on_success: false, on_failure: true, failure_threshold: 1, cooldown_seconds: 3600 },
       notificationTabs: [
@@ -4800,6 +4829,27 @@ export default {
       if (!query) return "";
       const search = query.filter ? ` · matching "${query.filter}"` : "";
       return `${SYNC_STATE_LABELS[query.state] || query.state} in ${query.scope || "the whole source tree"}${search}`;
+    },
+    // What the stored status pages were compared against. A run that starts or finishes, or any
+    // profile's outcome moving, changes it; a page fetched under another stamp is not shown again.
+    syncStatusEvidenceStamp() {
+      const outcomes = this.outcomes;
+      if (!outcomes || !outcomes.run) return "none";
+      const profiles = Array.isArray(outcomes.profiles) ? outcomes.profiles : [];
+      return [
+        outcomes.run.outcome, outcomes.run.startedEpoch, outcomes.run.finishedEpoch,
+        ...profiles.map((entry) => `${entry.profile}=${entry.finishedEpoch || 0}/${entry.outcomeEpoch || 0}`)
+      ].join("|");
+    },
+    // When the page on screen was compared, on this window's clock: the age of a walk this window
+    // waited for. A page shown again from memory says so.
+    syncStatusCheckedLabel() {
+      const checked = Math.floor(numberOr(this.syncStatusCheckedAtMs, 0) / 1000);
+      if (checked <= 0) return "";
+      const age = describeEvidenceAge(checked, Math.floor(numberOr(this.nowMs, Date.now()) / 1000));
+      return this.syncStatusFromMemory
+        ? `Checked ${age}, shown from this window's memory (no new check). Select Check status to compare again.`
+        : `Checked ${age}`;
     },
     syncStatusHasPrevious() { return this.syncStatusCursors.length > 1; },
     syncStatusHasNext() { return this.syncStatusResult.truncated && Boolean(this.syncStatusResult.nextCursor); },
@@ -7540,6 +7590,7 @@ export default {
       try {
         await apiPost(this.auth, this.csrfToken, ACTIONS.removeProfile, { name });
         if (this.disposed) return;
+        dropSyncStatusPages(this, name);
         this.clearAutosaveFailure("profile");
         this.toast("Profile deleted", `The controller removed ${name} and its stored credentials.`);
         this.closeProfile({ refresh: false });
@@ -7779,6 +7830,9 @@ export default {
       if (field.resets) this.onSyncProfileChanged();
     },
     resetSyncStatus(message) {
+      dropSyncStatusPages(this);
+      this.syncStatusCheckedAtMs = 0;
+      this.syncStatusFromMemory = false;
       this.syncStatusResult = emptySyncStatusPage();
       this.syncStatusCursors = [];
       this.syncStatusPageNumber = 0;
@@ -7789,6 +7843,7 @@ export default {
     // discards it rather than leaving rows on screen under a heading that no
     // longer describes them.
     onSyncQueryChanged() {
+      dropSyncStatusPages(this);
       if (this.syncStatusResult.loaded || this.syncStatusPhase === "failed") {
         this.resetSyncStatus("Query changed. Check status again to reload.");
       }
@@ -7829,7 +7884,25 @@ export default {
         if (!this.disposed) this.statusRollupLoading = false;
       }
     },
-    async loadSyncStatus(cursor, pageNumber) {
+    // The totals last read survive a failed re-read, as the snapshot and the feeds do: blanking
+    // them on one transient error would erase the only answer this page had. The failure is said
+    // beside them, with its cause and how old they are; with nothing read yet it is the page's
+    // own message.
+    statusRollupFailed(cause) {
+      const message = boundedText(cause, "The stored totals could not be read.");
+      if (this.statusRollup.loaded) {
+        this.statusRollupError = message;
+        return;
+      }
+      this.statusRollup = emptyStatusRollup();
+      this.statusRollupError = "";
+      this.statusRollupMessage = message;
+    },
+    // `fresh` is the person asking for a new comparison (Check status): it walks, and the pages
+    // remembered from earlier checks are forgotten. Next and Previous reuse a page this window
+    // fetched under the same query while it is under five minutes old and nothing it compared
+    // against has changed; any page not in memory is a walk, as before.
+    async loadSyncStatus(cursor, pageNumber, options = undefined) {
       if (!this.syncStatusReady || this.disposed) return;
       const profile = boundedText(this.syncStatusForm.profile, "");
       const requested = Number(this.syncStatusForm.limit);
@@ -7842,6 +7915,26 @@ export default {
         scope: boundedText(this.syncStatusForm.scope, "").trim(),
         includeExcluded: this.syncStatusForm.include_excluded === true
       };
+      const pages = syncStatusPages(this);
+      const key = syncStatusPageKey(profile, query, limit, from);
+      const stamp = this.syncStatusEvidenceStamp;
+      if (options && options.fresh === true) pages.clear();
+      const remembered = pages.get(key);
+      if (remembered) {
+        if (Date.now() - remembered.completedAtMs < SYNC_STATUS_PAGE_TTL_MS && remembered.stamp === stamp) {
+          this.syncStatusResult = remembered.page;
+          this.syncStatusPageNumber = page;
+          this.syncStatusCursors = this.syncStatusCursors.slice(0, page - 1).concat(from);
+          this.syncStatusCheckedAtMs = remembered.completedAtMs;
+          this.syncStatusFromMemory = true;
+          this.syncStatusPhase = "ready";
+          this.syncStatusMessage = remembered.page.entries.length
+            ? ""
+            : "No entry matches this state and search. The totals still cover the whole scope.";
+          return;
+        }
+        pages.delete(key);
+      }
       this.syncStatusBusy = true;
       this.syncStatusPhase = "loading";
       this.syncStatusMessage = "Comparing both sides for this scope. The NAS is only read; a large scope takes a while.";
@@ -7861,7 +7954,14 @@ export default {
         if (this.disposed) return;
         const document = bridgeDocument(result, "sdsync.status.v1");
         if (!document) throw new Error(UNREADABLE_RESPONSE);
-        this.syncStatusResult = Object.assign(syncStatusPage(document, profile), { query });
+        // Frozen: a page is data replaced whole, and Vue 2 would otherwise walk up to 200 rows.
+        const loadedPage = Object.freeze(Object.assign(syncStatusPage(document, profile), { query }));
+        this.syncStatusResult = loadedPage;
+        const completedAtMs = Date.now();
+        this.syncStatusCheckedAtMs = completedAtMs;
+        this.syncStatusFromMemory = false;
+        pages.set(key, { page: loadedPage, completedAtMs, stamp, profile });
+        while (pages.size > SYNC_STATUS_PAGE_CACHE_LIMIT) pages.delete(pages.keys().next().value);
         this.syncStatusPageNumber = page;
         // One cursor per page already visited, so Previous can return to an
         // exact position instead of re-walking from the start.
@@ -7898,7 +7998,7 @@ export default {
     },
     checkSyncStatus(event) {
       if (event && event.preventDefault) event.preventDefault();
-      return this.loadSyncStatus("", 1);
+      return this.loadSyncStatus("", 1, { fresh: true });
     },
     syncStatusNextPage() {
       if (!this.syncStatusHasNext) return undefined;
@@ -7938,6 +8038,8 @@ export default {
         if (plan.confirmed) {
           this.resyncPhase = "confirmed";
           this.resyncMessage = `Re-uploaded ${plan.overwrites} file${plan.overwrites === 1 ? "" : "s"} to ${profile}.`;
+          // What the remembered pages compared is no longer what is on the destination.
+          dropSyncStatusPages(this, profile);
           this.toast("Re-upload complete", this.resyncMessage);
           await this.refreshSnapshot(false, true);
           return;
