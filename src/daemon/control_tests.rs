@@ -819,11 +819,12 @@ fn change(h: &Harness, dir: &str) {
     let _ = h.tx.send(Msg::Change(ChangeEvent::Changed {
         routine: "docs".into(),
         dir: dir.into(),
+        depth: Depth::Shallow,
     }));
 }
 
-/// A realtime change is armed, debounced and dispatched as a scoped run of the
-/// lowest common ancestor.
+/// A realtime change is armed, debounced and dispatched as a scoped run with one
+/// element per changed directory (shallow: its direct children).
 #[test]
 fn a_realtime_change_dispatches_a_scoped_run_after_its_debounce() {
     let h = realtime_harness("scope");
@@ -856,11 +857,18 @@ fn a_realtime_change_dispatches_a_scoped_run_after_its_debounce() {
         .iter()
         .map(|a| a.to_string_lossy().into_owned())
         .collect::<Vec<_>>();
-    assert!(
-        args.windows(2)
-            .any(|w| w[0] == "--scope" && w[1] == "Projects/2026"),
+    // Two folders under one parent are two elements, not their common ancestor.
+    let shallow: Vec<&str> = args
+        .windows(2)
+        .filter(|w| w[0] == "--scope-shallow")
+        .map(|w| w[1].as_str())
+        .collect();
+    assert_eq!(
+        shallow,
+        ["Projects/2026/q3", "Projects/2026/q4"],
         "{args:?}"
     );
+    assert!(!args.iter().any(|a| a == "--scope"), "{args:?}");
     h.wait_for("idle", PATIENT, Harness::idle);
     let state = h.state("routines/docs.state");
     assert!(
@@ -972,7 +980,8 @@ fn failed_partial_busy_cancelled_runs_keep_the_change_pending() {
         .map(|a| a.to_string_lossy().into_owned())
         .collect::<Vec<_>>();
     assert!(
-        args.windows(2).any(|w| w[0] == "--scope" && w[1] == "b"),
+        args.windows(2)
+            .any(|w| w[0] == "--scope-shallow" && w[1] == "b"),
         "{args:?}"
     );
 }
@@ -1441,6 +1450,7 @@ fn an_edited_realtime_source_is_rearmed_and_old_events_are_dropped() {
         ChangeEvent::Changed {
             routine: "docs".into(),
             dir: "old".into(),
+            depth: Depth::Shallow,
         },
     ));
     thread::sleep(Duration::from_millis(1500));
@@ -1450,6 +1460,7 @@ fn an_edited_realtime_source_is_rearmed_and_old_events_are_dropped() {
         ChangeEvent::Changed {
             routine: "docs".into(),
             dir: "new".into(),
+            depth: Depth::Shallow,
         },
     ));
     h.wait_for("the dispatch", PATIENT, |h| h.launched() == 1);
@@ -1459,7 +1470,8 @@ fn an_edited_realtime_source_is_rearmed_and_old_events_are_dropped() {
         .map(|a| a.to_string_lossy().into_owned())
         .collect::<Vec<_>>();
     assert!(
-        args.windows(2).any(|w| w[0] == "--scope" && w[1] == "new"),
+        args.windows(2)
+            .any(|w| w[0] == "--scope-shallow" && w[1] == "new"),
         "{args:?}"
     );
 }
@@ -2863,6 +2875,7 @@ fn deleted(h: &Harness, dir: &str) {
     let _ = h.tx.send(Msg::Change(ChangeEvent::Deleted {
         routine: "docs".into(),
         dir: dir.into(),
+        depth: Depth::Shallow,
     }));
 }
 
@@ -3001,11 +3014,13 @@ fn a_realtime_dirty_set_run_pins_two_canaries_and_nothing_else_does() {
     let h = realtime_with_index("argv-two");
     h.wait_for("arm", PATIENT, |h| armed_generation(h, "docs").is_some());
 
-    // The root: no --scope, still 2.
+    // The root's direct children: no --scope (the whole tree would draw 25), a
+    // shallow root element, and still 2.
     change(&h, "");
     h.wait_for("the root run", PATIENT, |h| h.launched() == 1);
     let args = launched_args(&h, 0);
     assert!(!args.iter().any(|a| a == "--scope"), "{args:?}");
+    assert_eq!(flag_value(&args, "--scope-shallow"), Some(""), "{args:?}");
     assert_eq!(
         flag_value(&args, "--pair-index-canary"),
         Some("2"),
@@ -3023,7 +3038,12 @@ fn a_realtime_dirty_set_run_pins_two_canaries_and_nothing_else_does() {
     change(&h, "a/b");
     h.wait_for("the scoped run", PATIENT, |h| h.launched() == 2);
     let args = launched_args(&h, 1);
-    assert_eq!(flag_value(&args, "--scope"), Some("a/b"), "{args:?}");
+    assert_eq!(
+        flag_value(&args, "--scope-shallow"),
+        Some("a/b"),
+        "{args:?}"
+    );
+    assert!(!args.iter().any(|a| a == "--scope"), "{args:?}");
     assert_eq!(
         flag_value(&args, "--pair-index-canary"),
         Some("2"),
@@ -3066,4 +3086,85 @@ fn no_canary_flags_without_the_pair_index() {
     let args = launched_args(&h, 0);
     assert!(!args.iter().any(|a| a.ends_with("-canary")), "{args:?}");
     assert!(!args.iter().any(|a| a == "--pair-index"), "{args:?}");
+}
+
+// ------------------------------------------------------- scope elements
+
+fn appeared(h: &Harness, dir: &str) {
+    let _ = h.tx.send(Msg::Change(ChangeEvent::Changed {
+        routine: "docs".into(),
+        dir: dir.into(),
+        depth: Depth::Recursive,
+    }));
+}
+
+/// A directory that appeared is read whole (`--scope`), a file saved elsewhere
+/// by its parent's direct children (`--scope-shallow`), and what a recursive
+/// element covers is not sent again.
+#[test]
+fn recursive_and_shallow_elements_are_sent_as_the_core_takes_them() {
+    let h = realtime_harness("elements");
+    h.wait_for("arm", PATIENT, |h| armed_generation(h, "docs").is_some());
+    appeared(&h, "Projects/new");
+    change(&h, "Projects/new/inside");
+    change(&h, "Projects");
+    change(&h, "Other/2026");
+    h.wait_for("the dispatch", PATIENT, |h| h.launched() == 1);
+    let args = launched_args(&h, 0);
+    let after = |flag: &str| -> Vec<&str> {
+        args.windows(2)
+            .filter(|w| w[0] == flag)
+            .map(|w| w[1].as_str())
+            .collect()
+    };
+    assert_eq!(after("--scope"), ["Projects/new"], "{args:?}");
+    assert_eq!(
+        after("--scope-shallow"),
+        ["Other/2026", "Projects"],
+        "{args:?}"
+    );
+    let line = h
+        .logs()
+        .into_iter()
+        .find(|l| l.starts_with("run_started "))
+        .unwrap();
+    assert!(
+        line.contains("subscope=Other/2026:shallow,Projects:shallow,Projects/new"),
+        "{line}"
+    );
+}
+
+/// A recursive root is the whole tree: no scope flags at all.
+#[test]
+fn a_recursive_root_is_the_whole_tree() {
+    let h = realtime_harness("elements-root");
+    h.wait_for("arm", PATIENT, |h| armed_generation(h, "docs").is_some());
+    appeared(&h, "");
+    change(&h, "a");
+    h.wait_for("the dispatch", PATIENT, |h| h.launched() == 1);
+    let args = launched_args(&h, 0);
+    assert!(
+        !args
+            .iter()
+            .any(|a| a == "--scope" || a == "--scope-shallow"),
+        "{args:?}"
+    );
+}
+
+/// A directory that appeared (a recursive element) is never compared with a
+/// manifest of direct children: it dispatches, whatever was recorded.
+#[cfg(unix)]
+#[test]
+fn a_recursive_element_is_never_skipped() {
+    let h = realtime_harness("converged-recursive");
+    h.world.lock().unwrap().converged_record = true;
+    h.wait_for("arm", PATIENT, |h| armed_generation(h, "docs").is_some());
+    let _source = quiet_tree(&h);
+    change(&h, "a");
+    h.wait_for("the first run", PATIENT, |h| h.launched() == 1);
+    h.wait_for("idle", PATIENT, Harness::idle);
+    assert_eq!(converged_dirs(&h), 1);
+    appeared(&h, "a");
+    h.wait_for("the run", PATIENT, |h| h.launched() == 2);
+    assert_eq!(skipped(&h)["skipped_runs"], 0);
 }

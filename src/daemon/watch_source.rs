@@ -29,7 +29,7 @@ use std::time::{Duration, UNIX_EPOCH};
 
 use synology_drive_sync::watch::{Filter, WalkSlot, WatchError, profile_excludes};
 
-use super::changes::{ArmSpec, ChangeEvent, ChangeSink, ChangeSource};
+use super::changes::{ArmSpec, ChangeEvent, ChangeSink, ChangeSource, Depth};
 use super::poll::{PollConfig, SharedCarry, new_carry, spawn_poller};
 use super::routines::{Backend, BackendReason, SourceStatus};
 
@@ -192,6 +192,28 @@ type SlotSource = Arc<dyn Fn() -> Result<WalkSlot, usize> + Send + Sync>;
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 fn delete_only(kind: &str, entry: &str) -> bool {
     kind == "delete" && !Filter::is_rules_file(entry)
+}
+
+/// The dirty-set element a native change adds: the directory whose direct
+/// children changed (a file saved, created, removed or renamed in it), or the
+/// directory itself, whole, when the change is one that appeared (a created or
+/// moved-in directory: nothing inside it raised an event). A directory that went
+/// away is not known to be one from the event (the entry is gone), so its
+/// parent is read for it, which is where its removal shows.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn element_of(source: &Path, dir: &str, entry: &str, kind: &str) -> (String, Depth) {
+    let appeared = match kind {
+        "new_dir" => true,
+        "create" | "moved_to" => {
+            std::fs::symlink_metadata(source.join(entry)).is_ok_and(|meta| meta.is_dir())
+        }
+        _ => false,
+    };
+    if appeared {
+        (entry.to_owned(), Depth::Recursive)
+    } else {
+        (dir.to_owned(), Depth::Shallow)
+    }
 }
 
 fn real_slot() -> SlotSource {
@@ -532,15 +554,18 @@ impl Worker {
             let event = match change {
                 Change::Path { dir, entry, kind } => {
                     floor.reported(&dir);
+                    let (element, depth) = element_of(&self.spec.source, &dir, &entry, kind);
                     if delete_only(kind, &entry) {
                         ChangeEvent::Deleted {
                             routine: self.spec.routine.clone(),
-                            dir,
+                            dir: element,
+                            depth,
                         }
                     } else {
                         ChangeEvent::Changed {
                             routine: self.spec.routine.clone(),
-                            dir,
+                            dir: element,
+                            depth,
                         }
                     }
                 }
@@ -1039,6 +1064,7 @@ impl Floor {
                         && worker.emit(ChangeEvent::Changed {
                             routine: worker.spec.routine.clone(),
                             dir,
+                            depth: Depth::Recursive,
                         });
                 }
             }
@@ -1276,6 +1302,37 @@ mod tests {
     use super::*;
     use std::sync::Mutex;
     use std::time::Instant;
+
+    #[test]
+    fn a_directory_that_appeared_is_read_whole_and_anything_else_by_its_parent() {
+        let tree = temp_tree("elements");
+        std::fs::create_dir_all(tree.join("a/made")).unwrap();
+        std::fs::write(tree.join("a/file.txt"), "x").unwrap();
+        let shallow = |dir: &str| (dir.to_owned(), Depth::Shallow);
+        // A file in `a`: `a`'s direct children.
+        assert_eq!(
+            element_of(&tree, "a", "a/file.txt", "close_write"),
+            shallow("a")
+        );
+        assert_eq!(element_of(&tree, "a", "a/file.txt", "create"), shallow("a"));
+        assert_eq!(
+            element_of(&tree, "a", "a/file.txt", "moved_to"),
+            shallow("a")
+        );
+        // A directory created or moved in: itself, whole.
+        let whole = ("a/made".to_owned(), Depth::Recursive);
+        assert_eq!(element_of(&tree, "a", "a/made", "create"), whole);
+        assert_eq!(element_of(&tree, "a", "a/made", "moved_to"), whole);
+        assert_eq!(element_of(&tree, "a/made", "a/made", "new_dir"), whole);
+        // An attribute change of a directory is news for its parent only.
+        assert_eq!(element_of(&tree, "a", "a/made", "attrib"), shallow("a"));
+        // Gone: what remains to look at is the parent.
+        assert_eq!(element_of(&tree, "a", "a/gone", "delete"), shallow("a"));
+        assert_eq!(element_of(&tree, "a", "a/gone", "moved_from"), shallow("a"));
+        // The root's own children.
+        assert_eq!(element_of(&tree, "", "top.txt", "create"), shallow(""));
+        let _ = std::fs::remove_dir_all(&tree);
+    }
 
     #[test]
     fn only_a_plain_delete_is_delete_only_and_never_the_ignore_file() {

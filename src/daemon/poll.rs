@@ -42,7 +42,7 @@ use std::time::{Duration, Instant};
 
 use synology_drive_sync::watch::Filter;
 
-use super::changes::{ChangeEvent, DIRTY_CAP};
+use super::changes::{ChangeEvent, DIRTY_CAP, Depth};
 use super::routines::{Backend, BackendReason, SourceStatus};
 
 /// How many skipped entries a reading names.
@@ -742,9 +742,13 @@ impl Poller {
                     });
                 }
                 dirs.into_iter().all(|dir| {
+                    // A reading names the directories whose listing differs and
+                    // cannot say which is new: each is read whole, as the
+                    // lowest common ancestor always was.
                     self.send(ChangeEvent::Changed {
                         routine: self.routine.clone(),
                         dir,
+                        depth: Depth::Recursive,
                     })
                 })
             }
@@ -1304,7 +1308,8 @@ mod tests {
             harness.next(),
             ChangeEvent::Changed {
                 routine: "r".to_owned(),
-                dir: "a".to_owned()
+                dir: "a".to_owned(),
+                depth: Depth::Recursive
             }
         );
         harness.quiet(Duration::from_millis(450));

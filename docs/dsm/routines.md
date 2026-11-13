@@ -108,6 +108,13 @@ tree once every 24 hours (`routine_full_reconcile`, `info`). A profile held by a
 block](operations.md#lasting-block-after-an-out-of-memory-kill) is not run by its routine, and each
 held trigger is logged at most once an hour (`routine_suppressed`).
 
+**A realtime run reads only what changed.** Under the daemon, a run started for changed directories is given one scope
+element per directory instead of their common ancestor: a directory in which files changed is read for its direct
+children only (`--scope-shallow`), and a directory that appeared, moved in or was removed is read whole (`--scope`). Edits in
+`2026/03` and `2026/11` therefore read those two folders, not all of `2026`. The run's log line carries them
+(`subscope=2026/03:shallow,2026/11:shallow`). A change at the source root reads the root's direct children only. The polling
+fallback cannot tell which kind of change it saw and reads each changed directory whole.
+
 **A realtime run re-verifies two pairs, not 25.** Under the daemon, a run started for changed directories (including a
 change at the source root, which carries no `--scope`) is started with `--pair-index-canary 2 --reconcile-canary 2`:
 the verified-pair index re-reads two served pairs live in the plan and two in the final reconcile. The whole-tree

@@ -14,7 +14,7 @@
 
 #![forbid(unsafe_code)]
 
-use std::collections::BTreeSet;
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
@@ -23,13 +23,24 @@ use super::routines::{Backend, BackendReason, SourceStatus};
 /// What a change source reports. Delivered to the control thread as a message.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum ChangeEvent {
-    /// Something changed in `dir`, relative to the routine's source (`""` is the root).
-    Changed { routine: String, dir: String },
+    /// Something changed in `dir`, relative to the routine's source (`""` is the
+    /// root): its direct children (`Shallow`) or everything below it
+    /// (`Recursive`, for a directory that appeared or moved, whose contents
+    /// raised no events).
+    Changed {
+        routine: String,
+        dir: String,
+        depth: Depth,
+    },
     /// An entry was removed from `dir` (an inotify delete, and nothing else).
     /// A routine that cannot delete on the NAS has no work for it: the control
     /// thread drops it, counted and named, instead of running a sync that can
     /// only find nothing to do. Any other routine treats it as `Changed`.
-    Deleted { routine: String, dir: String },
+    Deleted {
+        routine: String,
+        dir: String,
+        depth: Depth,
+    },
     /// The kernel queue overflowed: events were lost. `None` means every routine.
     Overflow { routine: Option<String> },
     /// The routine's backend as the source now runs it, with the existing
@@ -115,10 +126,52 @@ pub(crate) fn ceiling(debounce: Duration) -> Duration {
         .min(Duration::from_secs(3600))
 }
 
+/// How much of a directory a change makes the run read: only its direct
+/// children (a file saved in it), or everything below it (a directory created,
+/// moved in or removed, whose contents produced no event of their own).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum Depth {
+    Shallow,
+    Recursive,
+}
+
+/// One element of the scope a realtime run is given: a source-relative path
+/// (`""` is the root) and how deep the run reads it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ScopeElem {
+    pub(crate) path: String,
+    pub(crate) depth: Depth,
+}
+
+impl ScopeElem {
+    /// `path` or `path:shallow`, for logs.
+    pub(crate) fn label(&self) -> String {
+        let path = if self.path.is_empty() {
+            "/"
+        } else {
+            &self.path
+        };
+        match self.depth {
+            Depth::Recursive => path.to_owned(),
+            Depth::Shallow => format!("{path}:shallow"),
+        }
+    }
+}
+
+/// Whether `ancestor` is a proper ancestor directory of `path`.
+fn is_ancestor(ancestor: &str, path: &str) -> bool {
+    if ancestor.is_empty() {
+        !path.is_empty()
+    } else {
+        path.strip_prefix(ancestor)
+            .is_some_and(|rest| rest.starts_with('/'))
+    }
+}
+
 /// The pending change of one realtime routine.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct DirtySet {
-    pub(crate) dirs: BTreeSet<String>,
+    pub(crate) dirs: BTreeMap<String, Depth>,
     pub(crate) whole_tree: bool,
     pub(crate) first_seen: Option<Instant>,
     pub(crate) last_event: Option<Instant>,
@@ -129,9 +182,16 @@ impl DirtySet {
         !self.whole_tree && self.dirs.is_empty()
     }
 
-    pub(crate) fn mark(&mut self, dir: &str, now: Instant) {
+    /// `dir` changed: its direct children ([`Depth::Shallow`]) or everything
+    /// below it ([`Depth::Recursive`]). A directory marked both ways keeps the
+    /// deeper.
+    pub(crate) fn mark(&mut self, dir: &str, depth: Depth, now: Instant) {
         if !self.whole_tree {
-            self.dirs.insert(dir.trim_matches('/').to_owned());
+            let slot = self
+                .dirs
+                .entry(dir.trim_matches('/').to_owned())
+                .or_insert(depth);
+            *slot = (*slot).max(depth);
             if self.dirs.len() > DIRTY_CAP {
                 self.dirs.clear();
                 self.whole_tree = true;
@@ -169,28 +229,27 @@ impl DirtySet {
         }
     }
 
-    /// The scope to sync: `None` for the whole tree, else the lowest common
-    /// ancestor of the dirty directories (`None` too when that is the root).
-    pub(crate) fn scope(&self) -> Option<String> {
-        if self.whole_tree || self.dirs.is_empty() {
-            return None;
+    /// The scope to sync as a set of elements, empty for the whole tree: every
+    /// dirty directory at its depth, without the ones a recursive element
+    /// already covers. A recursive root is the whole tree.
+    pub(crate) fn scope_set(&self) -> Vec<ScopeElem> {
+        if self.whole_tree || self.dirs.is_empty() || self.dirs.get("") == Some(&Depth::Recursive) {
+            return Vec::new();
         }
-        let mut common: Option<Vec<&str>> = None;
-        for dir in &self.dirs {
-            let parts: Vec<&str> = dir.split('/').filter(|p| !p.is_empty()).collect();
-            common = Some(match common {
-                None => parts,
-                Some(prefix) => prefix
-                    .iter()
-                    .zip(&parts)
-                    .take_while(|(a, b)| a == b)
-                    .map(|(a, _)| *a)
-                    .collect(),
-            });
-        }
-        common
-            .filter(|parts| !parts.is_empty())
-            .map(|parts| parts.join("/"))
+        let recursive: Vec<&str> = self
+            .dirs
+            .iter()
+            .filter(|(_, depth)| **depth == Depth::Recursive)
+            .map(|(path, _)| path.as_str())
+            .collect();
+        self.dirs
+            .iter()
+            .filter(|(path, _)| !recursive.iter().any(|r| is_ancestor(r, path)))
+            .map(|(path, depth)| ScopeElem {
+                path: path.clone(),
+                depth: *depth,
+            })
+            .collect()
     }
 
     /// I-3: a dispatched change that did not succeed comes back. The merged set
@@ -203,7 +262,10 @@ impl DirtySet {
             self.dirs.clear();
             self.whole_tree = true;
         } else if !self.whole_tree {
-            self.dirs.extend(other.dirs);
+            for (dir, depth) in other.dirs {
+                let slot = self.dirs.entry(dir).or_insert(depth);
+                *slot = (*slot).max(depth);
+            }
             if self.dirs.len() > DIRTY_CAP {
                 self.dirs.clear();
                 self.whole_tree = true;
@@ -354,32 +416,91 @@ mod tests {
         let debounce = Duration::from_secs(10);
         let mut set = DirtySet::default();
         assert!(!set.due(t0, debounce));
-        set.mark("a/b", t0);
+        set.mark("a/b", Depth::Shallow, t0);
         assert!(!set.due(t0 + Duration::from_secs(9), debounce));
         assert!(set.due(t0 + Duration::from_secs(10), debounce));
         // Events keep arriving every 5 s: only the ceiling (70 s) fires.
         let mut busy = DirtySet::default();
         for n in 0..20 {
-            busy.mark("a", t0 + Duration::from_secs(n * 5));
+            busy.mark("a", Depth::Shallow, t0 + Duration::from_secs(n * 5));
             let now = t0 + Duration::from_secs(n * 5 + 1);
             assert_eq!(busy.due(now, debounce), n * 5 + 1 >= 70, "at {}", n * 5 + 1);
         }
         assert_eq!(set.due_at(debounce), Some(t0 + Duration::from_secs(10)));
     }
 
+    fn elems(set: &DirtySet) -> Vec<String> {
+        set.scope_set().iter().map(ScopeElem::label).collect()
+    }
+
     #[test]
-    fn the_scope_is_the_lowest_common_ancestor() {
+    fn the_scope_is_each_dirty_directory_at_its_depth() {
         let now = Instant::now();
         let mut set = DirtySet::default();
-        set.mark("Projects/2026/q4", now);
-        assert_eq!(set.scope().as_deref(), Some("Projects/2026/q4"));
-        set.mark("Projects/2026/q3/deep", now);
-        assert_eq!(set.scope().as_deref(), Some("Projects/2026"));
-        set.mark("Other", now);
-        assert_eq!(set.scope(), None, "the root is a full run");
+        set.mark("Projects/2026/q4", Depth::Shallow, now);
+        assert_eq!(elems(&set), ["Projects/2026/q4:shallow"]);
+        set.mark("Projects/2026/q3", Depth::Shallow, now);
+        set.mark("Other", Depth::Shallow, now);
+        assert_eq!(
+            elems(&set),
+            [
+                "Other:shallow",
+                "Projects/2026/q3:shallow",
+                "Projects/2026/q4:shallow"
+            ],
+            "two folders in different months stay two elements"
+        );
+        // A file changed at the root is the root's direct children.
+        set.mark("", Depth::Shallow, now);
+        assert_eq!(elems(&set)[0], "/:shallow");
+    }
+
+    #[test]
+    fn a_recursive_element_covers_what_is_below_it_and_deeper_wins() {
+        let now = Instant::now();
+        let mut set = DirtySet::default();
+        set.mark("a", Depth::Shallow, now);
+        set.mark("a/b", Depth::Shallow, now);
+        set.mark("a/b/c", Depth::Recursive, now);
+        set.mark("ab", Depth::Shallow, now);
+        assert_eq!(
+            elems(&set),
+            ["a:shallow", "a/b:shallow", "a/b/c", "ab:shallow"]
+        );
+        set.mark("a", Depth::Recursive, now);
+        assert_eq!(
+            elems(&set),
+            ["a", "ab:shallow"],
+            "a prefix is not an ancestor"
+        );
+        set.mark("a", Depth::Shallow, now);
+        assert_eq!(
+            elems(&set),
+            ["a", "ab:shallow"],
+            "shallow never weakens recursive"
+        );
+        let mut rooted = DirtySet::default();
+        rooted.mark("x", Depth::Shallow, now);
+        rooted.mark("", Depth::Recursive, now);
+        assert!(
+            rooted.scope_set().is_empty(),
+            "a recursive root is the whole tree"
+        );
         let mut whole = DirtySet::default();
         whole.mark_whole_tree(now);
-        assert_eq!(whole.scope(), None);
+        assert!(whole.scope_set().is_empty());
+        assert!(DirtySet::default().scope_set().is_empty());
+    }
+
+    #[test]
+    fn a_failed_dispatch_keeps_the_deeper_mark_when_it_merges_back() {
+        let t0 = Instant::now();
+        let mut dispatched = DirtySet::default();
+        dispatched.mark("a", Depth::Recursive, t0);
+        let mut live = DirtySet::default();
+        live.mark("a", Depth::Shallow, t0);
+        live.merge(dispatched);
+        assert_eq!(live.dirs.get("a"), Some(&Depth::Recursive));
     }
 
     #[test]
@@ -387,7 +508,7 @@ mod tests {
         let now = Instant::now();
         let mut set = DirtySet::default();
         for n in 0..=DIRTY_CAP {
-            set.mark(&format!("d{n}"), now);
+            set.mark(&format!("d{n}"), Depth::Shallow, now);
         }
         assert!(set.whole_tree && set.dirs.is_empty());
     }
@@ -472,9 +593,9 @@ mod tests {
     fn a_failed_dispatch_merges_back_and_keeps_its_age() {
         let t0 = Instant::now();
         let mut dispatched = DirtySet::default();
-        dispatched.mark("a", t0);
+        dispatched.mark("a", Depth::Shallow, t0);
         let mut live = DirtySet::default();
-        live.mark("b", t0 + Duration::from_secs(5));
+        live.mark("b", Depth::Shallow, t0 + Duration::from_secs(5));
         live.merge(dispatched);
         assert_eq!(live.dirs.len(), 2);
         assert_eq!(live.first_seen, Some(t0));

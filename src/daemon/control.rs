@@ -35,7 +35,7 @@ use serde_json::{Value, json};
 
 use super::changes::{
     Admit, ArmSpec, BackendReports, ChangeEvent, ChangeSink, ChangeSource, ChangeSourceFactory,
-    DirtySet, bound_detail,
+    Depth, DirtySet, ScopeElem, bound_detail,
 };
 use super::converged::{self, CheckJob, Outcome as CheckOutcome};
 use super::events::{ActivityRow, EventSink, LogEvent};
@@ -277,8 +277,10 @@ struct RunRequest {
     scope: String,
     allow_delete: bool,
     max_total_delete: Option<u64>,
-    /// A realtime routine's lowest common ancestor (`--scope`).
-    subscope: Option<String>,
+    /// A realtime routine's dirty directories (`--scope` for a recursive one,
+    /// `--scope-shallow` for one whose direct children only changed); empty is
+    /// the whole tree.
+    scopes: Vec<ScopeElem>,
 }
 
 struct Active {
@@ -1619,7 +1621,7 @@ impl Control {
                 scope: "all".into(),
                 allow_delete: self.schedule.allow_delete,
                 max_total_delete: Some(self.schedule.max_total_delete),
-                subscope: None,
+                scopes: Vec::new(),
             });
         }
     }
@@ -2095,17 +2097,17 @@ impl Control {
                         // nothing on disk would say it ran (shell: `break`).
                         return;
                     }
-                    let (dirty, subscope) = match routine.mode {
+                    let (dirty, scopes) = match routine.mode {
                         Mode::Realtime { .. } => {
                             let dirty = self
                                 .routines
                                 .get_mut(&name)
                                 .map(|e| std::mem::take(&mut e.dirty))
                                 .unwrap_or_default();
-                            let scope = dirty.scope();
-                            (Some(dirty), scope)
+                            let scopes = dirty.scope_set();
+                            (Some(dirty), scopes)
                         }
-                        _ => (None, None),
+                        _ => (None, Vec::new()),
                     };
                     let id = self.take_id();
                     let request = RunRequest {
@@ -2120,7 +2122,7 @@ impl Control {
                         scope: name.clone(),
                         allow_delete: routine.allow_delete,
                         max_total_delete: None,
-                        subscope,
+                        scopes,
                     };
                     self.start(request, now);
                 }
@@ -2153,7 +2155,14 @@ impl Control {
             entry.convergence.gate = Gate::Idle;
             return GateVerdict::Dispatch(None);
         }
-        let dirs = entry.dirty.dirs.clone();
+        // Only a set of directories whose direct children changed can be
+        // compared with a manifest; one with a recursive element (something
+        // appeared or moved) is dispatched as always.
+        if entry.dirty.dirs.values().any(|d| *d == Depth::Recursive) {
+            entry.convergence.gate = Gate::Idle;
+            return GateVerdict::Dispatch(None);
+        }
+        let dirs: std::collections::BTreeSet<String> = entry.dirty.dirs.keys().cloned().collect();
         let last_event = entry.dirty.last_event;
         let mut unavailable: Option<String> = None;
         let verdict = match std::mem::take(&mut entry.convergence.gate) {
@@ -2691,16 +2700,22 @@ impl Control {
         if !request.allow_delete {
             args.push("--no-delete".into());
         }
-        if let Some(scope) = &request.subscope {
-            args.push("--scope".into());
-            args.push(scope.into());
+        for element in &request.scopes {
+            args.push(
+                match element.depth {
+                    Depth::Recursive => "--scope",
+                    Depth::Shallow => "--scope-shallow",
+                }
+                .into(),
+            );
+            args.push((&element.path).into());
         }
         if let Some(dir) = &self.settings.pair_index_dir {
             args.push("--pair-index".into());
             args.push(dir.into());
-            // A realtime run for a dirty set re-verifies 2 pairs, wherever the
-            // set's common ancestor is (the root included, which carries no
-            // `--scope` and would otherwise draw 25). The whole-tree marks (the
+            // A realtime run for a dirty set re-verifies 2 pairs, wherever its
+            // directories are (a change at the root carries no `--scope` and
+            // would otherwise draw 25). The whole-tree marks (the
             // daily pass, overflow, catch-up, a rules change), interval and
             // daily routines and manual runs keep the core's default. The flags
             // require `--pair-index`, so they only ever go with it.
@@ -2886,11 +2901,7 @@ impl Control {
                 request.scope,
                 request.allow_delete,
                 origin_word(&request.origin),
-                request
-                    .subscope
-                    .as_deref()
-                    .map(|s| format!(" subscope={s}"))
-                    .unwrap_or_default()
+                scope_note(&request.scopes)
             ),
         );
         let id = request.id;
@@ -3602,13 +3613,21 @@ impl Control {
             entry.backend_detail = (!detail.is_empty()).then_some(detail);
         }
         match event {
-            ChangeEvent::Changed { routine, dir } => {
+            ChangeEvent::Changed {
+                routine,
+                dir,
+                depth,
+            } => {
                 if let Some(entry) = self.routines.get_mut(&routine) {
-                    entry.dirty.mark(&dir, now);
+                    entry.dirty.mark(&dir, depth, now);
                     entry.trigger_seen = Some(wall);
                 }
             }
-            ChangeEvent::Deleted { routine, dir } => {
+            ChangeEvent::Deleted {
+                routine,
+                dir,
+                depth,
+            } => {
                 let mut named = None;
                 if let Some(entry) = self.routines.get_mut(&routine) {
                     // The core is started with `--no-delete` when the routine does
@@ -3624,7 +3643,7 @@ impl Control {
                             named = Some(entry.ignored_deletes);
                         }
                     } else {
-                        entry.dirty.mark(&dir, now);
+                        entry.dirty.mark(&dir, depth, now);
                         entry.trigger_seen = Some(wall);
                     }
                 }
@@ -3851,7 +3870,7 @@ impl Control {
             scope,
             allow_delete,
             max_total_delete: max_total_delete.or(Some(self.schedule.max_total_delete)),
-            subscope: None,
+            scopes: Vec::new(),
         });
         self.turn_now = true;
         json!({
@@ -4011,7 +4030,7 @@ impl Control {
                 "id": a.request.id, "scope": a.request.scope, "action": a.request.action.as_str(),
                 "origin": origin_word(&a.request.origin), "pid": a.pid,
                 "started_epoch": a.started_epoch, "running_seconds": a.started.elapsed().as_secs(),
-                "subscope": a.request.subscope, "stopping": a.stop.map(|c| format!("{c:?}").to_lowercase()),
+                "subscope": scope_note(&a.request.scopes).trim_start_matches(" subscope="), "stopping": a.stop.map(|c| format!("{c:?}").to_lowercase()),
                 "stall": a.stall, "heartbeat_source": a.heartbeat_source,
             })
         });
@@ -4303,6 +4322,21 @@ fn push_degraded(sinks: &mut Vec<&'static str>, sink: &'static str) {
     if !sinks.contains(&sink) {
         sinks.push(sink);
     }
+}
+
+/// ` subscope=a,b/c:shallow` for a run's log line, empty for the whole tree.
+fn scope_note(scopes: &[ScopeElem]) -> String {
+    if scopes.is_empty() {
+        return String::new();
+    }
+    format!(
+        " subscope={}",
+        scopes
+            .iter()
+            .map(ScopeElem::label)
+            .collect::<Vec<_>>()
+            .join(",")
+    )
 }
 
 /// The reason a skipped dispatch gives.
