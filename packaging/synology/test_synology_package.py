@@ -28001,6 +28001,10 @@ fi
         # recognisable by its clock read, still comes every five seconds.
         environment, fake_bin, _ = self.f3_realtime_world("d35", inotify=False)
         walk_started = self.root / "d35-walk-started"
+        # The trace counts the controller's looks, so it starts once `lifecycle start` has
+        # returned: that script polls for readiness with `date` and `sleep` of its own, and
+        # when it is still polling as the first walk begins those calls are not the controller's.
+        trace_on = self.root / "d35-trace-on"
         trace = self.root / "d35-trace"
         real_find = shutil.which("find")
         self.assertIsNotNone(real_find)
@@ -28015,13 +28019,17 @@ fi
         date_path = fake_bin / "date"
         date_text = date_path.read_text(encoding="utf-8")
         date_path.write_text(
-            date_text.replace('  +%s) ', f'  +%s) [ ! -e "{walk_started}" ] || printf "clock\\n" >> "{trace}"; ', 1),
+            date_text.replace(
+                '  +%s) ',
+                f'  +%s) [ ! -e "{walk_started}" ] || [ ! -e "{trace_on}" ] || printf "clock\\n" >> "{trace}"; ',
+                1,
+            ),
             encoding="utf-8",
         )
         nap = fake_bin / "sleep"
         nap.write_text(
             "#!/bin/sh\n"
-            f'[ ! -e "{walk_started}" ] || printf "nap %s\\n" "$1" >> "{trace}"\n'
+            f'[ ! -e "{walk_started}" ] || [ ! -e "{trace_on}" ] || printf "nap %s\\n" "$1" >> "{trace}"\n'
             "case ${1:-} in 1) exec /bin/sleep 1 ;; *) exec /bin/sleep 0.03 ;; esac\n",
             encoding="utf-8",
         )
@@ -28033,7 +28041,9 @@ fi
         started = self.shell(self.lifecycle, "start", extra_environment=environment, timeout=15)
         self.assertEqual(started.returncode, 0, started.stdout + started.stderr)
         self.wait_for_path(walk_started, "the poll walk never started", timeout=20)
+        trace_on.write_text("", encoding="utf-8")
         time.sleep(10)
+        self.assertTrue(trace.exists(), "the controller made no look while the walk was in flight")
         events = trace.read_text(encoding="utf-8").splitlines()
         naps = [line for line in events if line == "nap 1"]
         turns = sum(1 for index, line in enumerate(events) if line == "clock" and (index == 0 or events[index - 1] != "clock"))
