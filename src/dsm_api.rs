@@ -31119,6 +31119,11 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn helper_capture_bounds_input_output_and_stderr_without_leaking() {
+        // Every call here either succeeds or is refused by a size bound, never by the clock, so
+        // the deadline is only a guard against a hang. 32 shell spawns on a runner shared with
+        // other builds have taken more than the 2 s this once was (one failure in a full run, then
+        // 5 of 5 alone); a hang is still caught, 10 s later.
+        const HELPER_BUDGET: Duration = Duration::from_secs(10);
         let secret = Zeroizing::new(b"bounded-input".to_vec());
         for _ in 0..32 {
             let mut command = Command::new("/bin/sh");
@@ -31126,14 +31131,9 @@ mod tests {
                 "-c",
                 "IFS= read -r value; printf '%s' \"$value\"; printf 'discarded' >&2",
             ]);
-            let output = capture_bounded_command(
-                &mut command,
-                64,
-                64,
-                Duration::from_secs(2),
-                Some(&secret),
-            )
-            .unwrap();
+            let output =
+                capture_bounded_command(&mut command, 64, 64, HELPER_BUDGET, Some(&secret))
+                    .unwrap();
             assert!(output.status_success);
             assert_eq!(&output.stdout[..], b"bounded-input");
         }
@@ -31145,7 +31145,7 @@ mod tests {
                 &mut rejected_input,
                 64,
                 64,
-                Duration::from_secs(2),
+                HELPER_BUDGET,
                 Some(&oversized_input),
             )
             .is_err()
@@ -31154,12 +31154,10 @@ mod tests {
         for script in ["printf 123456789", "printf 123456789 >&2"] {
             let mut overflowing = Command::new("/bin/sh");
             overflowing.args(["-c", script]);
-            let error =
-                match capture_bounded_command(&mut overflowing, 8, 8, Duration::from_secs(2), None)
-                {
-                    Err(error) => error,
-                    Ok(_) => panic!("oversized helper output was accepted"),
-                };
+            let error = match capture_bounded_command(&mut overflowing, 8, 8, HELPER_BUDGET, None) {
+                Err(error) => error,
+                Ok(_) => panic!("oversized helper output was accepted"),
+            };
             assert_eq!(error.kind, ErrorKind::Unavailable);
         }
     }
