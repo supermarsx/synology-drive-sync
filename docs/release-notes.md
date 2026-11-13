@@ -12,6 +12,16 @@ lists its own commits.
   downloads the old copy to prove it, then runs a copy task and checks the result, which for small
   files took longer than sending them: a 10-file folder move went from about 40 s to about 18 s at
   the NAS's measured 0.19 s per request. Larger moved files are still copied.
+- **The run's result says what its request-saving shortcuts did.** `result.request_floor` (and the
+  same object in a result record, including the record of a run that found nothing to do, and in
+  the SDK and FFI outcome) counts batched `getinfo` requests and the single ones they replaced,
+  session touches skipped, parallel listing waves, MD5 lanes and name lookups, so a shortcut that
+  did not engage (`getinfo_batch_fallbacks`, `dns_pins_dropped`) is a named count and not a quiet
+  absence of requests. See [Result fields](observability.md).
+- **A folder made and removed inside a realtime routine's quiet period starts no failing run.** A
+  routine that cannot delete used to drop the removal and then run for a folder that was on neither
+  side, which ended as `scope_not_found` and was retried. A removed folder is now forgotten for such a
+  routine; one that may delete keeps the folder and its parent as scope elements.
 - **`sync` and `plan` take a scope set.** `--scope` may be repeated and `--scope-shallow FOLDER`
   names a folder whose direct files only are in scope, so a realtime run can cover the folders that
   changed and nothing between them. Edits in `2026/03` and `2026/11` used to run over all of `2026`.
