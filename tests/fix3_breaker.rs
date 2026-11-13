@@ -9,8 +9,8 @@ use std::path::PathBuf;
 use std::process::{Command, Output};
 
 use serde_json::Value;
-use support::TestDir;
 use support::file_station_mock::MockFileStation;
+use support::{TestDir, copy_payload};
 
 const PASSWORD: &[u8] = b"correct horse battery staple\n";
 const CREATE: &str = "SYNO.FileStation.CreateFolder.create";
@@ -318,11 +318,11 @@ fn refused_copy_fallbacks_count_towards_the_breaker() {
     server.add_directory("/team/bk3");
     server.add_directory("/team/bk3/old");
     for name in ["a", "b", "c", "d"] {
-        let body = format!("content of {name} moved on the NAS");
-        let local = fixture.write(&format!("new/{name}.bin"), body.as_bytes());
+        let body = copy_payload(format!("content of {name} moved on the NAS").as_bytes());
+        let local = fixture.write(&format!("new/{name}.bin"), &body);
         server.add_file(
             &format!("/team/bk3/old/{name}.bin"),
-            body.as_bytes(),
+            &body,
             mtime_seconds(&local),
         );
     }
@@ -401,13 +401,13 @@ fn lasting_refusals_on_a_synced_share_stay_amber_on_every_run() {
 
 fn moved_file_fixture(label: &str, destination: &str) -> Fixture {
     let fixture = Fixture::new(label);
-    let local = fixture.write("new/item.bin", b"copy-me-on-nas");
+    let local = fixture.write("new/item.bin", &copy_payload(b"copy-me-on-nas"));
     let server = &fixture.server;
     server.add_directory(destination);
     server.add_directory(&format!("{destination}/old"));
     server.add_file(
         &format!("{destination}/old/item.bin"),
-        b"copy-me-on-nas",
+        &copy_payload(b"copy-me-on-nas"),
         mtime_seconds(&local),
     );
     fixture
@@ -423,7 +423,9 @@ fn a_deterministically_failing_server_copy_is_uploaded_in_the_same_run() {
     assert_eq!(first.status.code(), Some(0), "{}", describe(&first));
     assert_eq!(
         fixture.text("/team/re4/new/item.bin").as_deref(),
-        Some("copy-me-on-nas")
+        String::from_utf8(copy_payload(b"copy-me-on-nas"))
+            .ok()
+            .as_deref()
     );
     assert_eq!(
         json(&first)["result"]["recovered"]["server_copy_fallbacks"],
@@ -467,7 +469,9 @@ fn a_failed_copy_that_left_a_partial_file_converges_in_one_more_run() {
     assert_eq!(second.status.code(), Some(0), "{}", describe(&second));
     assert_eq!(
         fixture.text("/team/partial/new/item.bin").as_deref(),
-        Some("copy-me-on-nas")
+        String::from_utf8(copy_payload(b"copy-me-on-nas"))
+            .ok()
+            .as_deref()
     );
 }
 

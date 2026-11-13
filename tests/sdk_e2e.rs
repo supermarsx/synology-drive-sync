@@ -5,8 +5,8 @@ mod support;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
-use support::TestDir;
 use support::file_station_mock::MockFileStation;
+use support::{TestDir, copy_payload};
 use synology_drive_sync::cancel::CancellationToken;
 use synology_drive_sync::sdk::{
     Comparison, DeferredReason, DeletionPolicy, Engine, ErrorCode, EventControl, MutationEvent,
@@ -598,7 +598,7 @@ fn a_copy_fallback_is_counted_in_the_sdk_outcome() {
     server.add_directory("/team/sdk");
     server.add_directory("/team/sdk/old");
     let source = TestDir::new("sdk-copy-fallback");
-    let local = source.write("new/item.bin", b"copy-me-on-nas");
+    let local = source.write("new/item.bin", &copy_payload(b"copy-me-on-nas"));
     let mtime = std::fs::metadata(&local)
         .unwrap()
         .modified()
@@ -606,7 +606,11 @@ fn a_copy_fallback_is_counted_in_the_sdk_outcome() {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_secs() as i64;
-    server.add_file("/team/sdk/old/item.bin", b"copy-me-on-nas", mtime);
+    server.add_file(
+        "/team/sdk/old/item.bin",
+        &copy_payload(b"copy-me-on-nas"),
+        mtime,
+    );
     server.fail_next_api_operation("SYNO.FileStation.CopyMove.start", 407);
     let request = SyncRequest::builder(server.base_url(), "e2e-user", source.path(), "/team/sdk")
         .allow_http(true)
@@ -620,7 +624,7 @@ fn a_copy_fallback_is_counted_in_the_sdk_outcome() {
     assert_eq!(execution.copy_fallbacks(), 1, "{execution:?}");
     assert_eq!(
         server.file_contents("/team/sdk/new/item.bin"),
-        Some(b"copy-me-on-nas".to_vec())
+        Some(copy_payload(b"copy-me-on-nas"))
     );
 }
 

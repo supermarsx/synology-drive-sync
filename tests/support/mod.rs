@@ -8,6 +8,17 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 static TEST_DIR_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
+/// `seed` repeated to exactly [`synology_drive_sync::plan::SERVER_COPY_MIN_BYTES`], the smallest
+/// moved file a plan server-copies. A smaller fixture takes the verified upload instead and never
+/// reaches the copy path it means to test.
+pub fn copy_payload(seed: &[u8]) -> Vec<u8> {
+    let size = usize::try_from(synology_drive_sync::plan::SERVER_COPY_MIN_BYTES)
+        .expect("the copy threshold fits usize");
+    let mut payload = seed.repeat(size / seed.len() + 1);
+    payload.truncate(size);
+    payload
+}
+
 pub struct TestDir(PathBuf);
 
 impl TestDir {
