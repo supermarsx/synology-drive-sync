@@ -559,19 +559,33 @@ impl Worker {
                 } => {
                     floor.reported(&dir);
                     let (element, depth) = element_of(&dir, &entry, kind, is_dir);
-                    if delete_only(kind, &entry) {
-                        ChangeEvent::Deleted {
-                            routine: self.spec.routine.clone(),
-                            dir: element,
-                            depth,
+                    let removal = delete_only(kind, &entry);
+                    let make = |dir: String, depth: Depth| {
+                        if removal {
+                            ChangeEvent::Deleted {
+                                routine: self.spec.routine.clone(),
+                                dir,
+                                depth,
+                            }
+                        } else {
+                            ChangeEvent::Changed {
+                                routine: self.spec.routine.clone(),
+                                dir,
+                                depth,
+                            }
                         }
-                    } else {
-                        ChangeEvent::Changed {
-                            routine: self.spec.routine.clone(),
-                            dir: element,
-                            depth,
-                        }
+                    };
+                    // A directory that went is read whole, and its parent's direct children
+                    // too: the parent still exists when the removed folder is gone from both
+                    // sides, so a run for a folder made and removed within the debounce is not
+                    // a scope that names nothing.
+                    if is_dir
+                        && matches!(kind, "delete" | "moved_from")
+                        && !self.emit(make(dir.clone(), Depth::Shallow))
+                    {
+                        return false;
                     }
+                    make(element, depth)
                 }
                 Change::Overflow => {
                     floor.overflowed();
@@ -1712,11 +1726,19 @@ mod tests {
             &mut floor
         ));
         let events = recorder.events.lock().unwrap().clone();
-        // A directory that went is read whole, so its subtree is removed rather than left behind.
+        // A directory that went is read whole, so its subtree is removed rather than left behind,
+        // and its parent's direct children too, so the set still names a folder that exists.
         assert!(
             events.iter().any(|(_, e)| matches!(
                 e,
                 ChangeEvent::Deleted { dir, depth: Depth::Recursive, .. } if dir == "docs/gone"
+            )),
+            "{events:?}"
+        );
+        assert!(
+            events.iter().any(|(_, e)| matches!(
+                e,
+                ChangeEvent::Deleted { dir, depth: Depth::Shallow, .. } if dir == "docs"
             )),
             "{events:?}"
         );
