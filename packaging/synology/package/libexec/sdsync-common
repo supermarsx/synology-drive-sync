@@ -3195,6 +3195,7 @@ append_activity() {
     case $activity_code in
         run.started|run.succeeded|run.failed|run.deferred|run.cancelled|routine.deferred|routine.retry_scheduled|\
         routine.retries_exhausted|routine.watch_abandoned|routine.unobserved|routine.observed|\
+        routine.skipped|routine.skip_check_unavailable|routine.converged_forgotten|routine.events_ignored|\
         doctor.succeeded|doctor.failed|doctor.inventory|configuration.changed|notification.unavailable|\
         audit.requested|audit.succeeded|audit.failed|audit.outcome_unknown|\
         module.requested|module.succeeded|module.failed|module.outcome_unknown|\

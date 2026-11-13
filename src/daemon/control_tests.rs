@@ -2771,6 +2771,10 @@ fn an_unchanged_directory_after_a_converged_run_is_skipped_and_named() {
         "{line}"
     );
     assert_eq!(h.launched(), 1, "nothing was dispatched");
+    // The user sees it in Activity, not only in the log.
+    let rows = observation_rows(&h, "routine.skipped", "docs");
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert!(rows[0].2.contains("skipped"), "{rows:?}");
     let status = skipped(&h);
     assert_eq!(status["skipped_runs"], 1, "{status}");
     assert_eq!(status["last_skip_reason"], "unchanged_since_converged");
@@ -2805,6 +2809,10 @@ fn a_run_that_did_not_converge_forgets_what_was_recorded() {
     h.wait_for("the failed run", PATIENT, |h| h.launched() == 2);
     h.wait_for("idle", PATIENT, Harness::idle);
     assert_eq!(converged_dirs(&h), 0);
+    assert_eq!(
+        observation_rows(&h, "routine.converged_forgotten", "docs").len(),
+        1
+    );
     assert!(
         h.logs()
             .iter()
@@ -2867,6 +2875,9 @@ fn a_check_that_cannot_be_made_dispatches_and_says_why() {
         line.contains("profile=docs") && line.contains("not a directory"),
         "{line}"
     );
+    let rows = observation_rows(&h, "routine.skip_check_unavailable", "docs");
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert!(rows[0].2.contains("not a directory"), "{rows:?}");
 }
 
 // ------------------------------------------------------- P3: delete-only events
@@ -2920,6 +2931,8 @@ fn a_delete_only_event_is_ignored_by_a_routine_that_cannot_delete() {
             .count(),
         1
     );
+    let rows = observation_rows(&h, "routine.events_ignored", "docs");
+    assert_eq!(rows.len(), 1, "one row, not one per event: {rows:?}");
     change(&h, "a");
     h.wait_for("a real change runs", PATIENT, |h| h.launched() == 1);
 }

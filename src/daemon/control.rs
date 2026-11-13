@@ -345,6 +345,10 @@ struct Convergence {
     /// Dispatches skipped as unchanged, and the last one.
     skipped_runs: u64,
     last_skip_epoch: u64,
+    /// When the last Activity row for a skip was written, and the skips since:
+    /// one row an hour per routine, carrying the count.
+    skip_row_at: Option<Instant>,
+    skipped_since_row: u64,
     /// The cause of the last check that could not be made, named once per
     /// episode (cleared when a check is made again).
     unavailable: Option<String>,
@@ -427,6 +431,10 @@ const REALTIME_CANARY: u32 = 2;
 /// How often a routine's dropped delete events are logged (they are counted
 /// in `ctl status` meanwhile).
 const IGNORED_LOG_EVERY: Duration = Duration::from_secs(3600);
+
+/// How often a routine's skipped dispatches get an Activity row (the log has
+/// each one).
+const SKIP_ROW_EVERY: Duration = Duration::from_secs(3600);
 
 /// An armed realtime routine whose watcher has not reported a backend after
 /// this long is not being observed (arming reports within its own bounded
@@ -2288,6 +2296,7 @@ impl Control {
             named = Some(cause);
         }
         let manifest_dirs = entry.convergence.manifest.len();
+        let named_cause = named.clone();
         if let Some(cause) = named {
             self.log(
                 Level::Info,
@@ -2299,7 +2308,21 @@ impl Control {
                 ),
             );
         }
+        if let Some(cause) = &named_cause {
+            self.activity(
+                "routine.skip_check_unavailable",
+                name,
+                "unavailable",
+                "routines",
+                Level::Info,
+                format!(
+                    "Realtime change dispatched without the unchanged-folder check: {}",
+                    sanitize_detail(cause, 110)
+                ),
+            );
+        }
         if matches!(verdict, GateVerdict::Skipped) {
+            self.skip_note(name, dirs.len());
             self.log(
                 Level::Info,
                 "scheduler",
@@ -2311,6 +2334,35 @@ impl Control {
             );
         }
         verdict
+    }
+
+    /// One Activity row an hour per routine for dispatches skipped as unchanged,
+    /// with how many were skipped since the last row (the log has every one).
+    fn skip_note(&mut self, name: &str, dirs: usize) {
+        let now = Instant::now();
+        let Some(entry) = self.routines.get_mut(name) else {
+            return;
+        };
+        let convergence = &mut entry.convergence;
+        convergence.skipped_since_row += 1;
+        if convergence
+            .skip_row_at
+            .is_some_and(|at| now.duration_since(at) < SKIP_ROW_EVERY)
+        {
+            return;
+        }
+        convergence.skip_row_at = Some(now);
+        let count = std::mem::take(&mut convergence.skipped_since_row);
+        self.activity(
+            "routine.skipped",
+            name,
+            "succeeded",
+            "routines",
+            Level::Info,
+            format!(
+                "Realtime change skipped: {dirs} changed folder(s) are as the last sync left them                  ({count} skipped since the last note)"
+            ),
+        );
     }
 
     /// A check answered: kept for the dispatch to use if it is still the
@@ -2364,6 +2416,15 @@ impl Control {
                             "profile={profile} id={} cause=the run did not converge",
                             request.id
                         ),
+                    );
+                    self.activity(
+                        "routine.converged_forgotten",
+                        profile,
+                        "changed",
+                        "routines",
+                        Level::Info,
+                        "The run did not finish cleanly: the next change runs even if its folders look unchanged"
+                            .into(),
                     );
                 }
                 continue;
@@ -3648,6 +3709,16 @@ impl Control {
                     }
                 }
                 if let Some(total) = named {
+                    self.activity(
+                        "routine.events_ignored",
+                        &routine,
+                        "succeeded",
+                        "routines",
+                        Level::Info,
+                        format!(
+                            "Removals are ignored: this routine does not delete on the NAS ({total} so far)"
+                        ),
+                    );
                     self.log(
                         Level::Info,
                         "scheduler",

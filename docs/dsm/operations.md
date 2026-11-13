@@ -466,6 +466,10 @@ codes are:
 | `routine.watch_abandoned` | The controller stopped retrying a native watcher |
 | `routine.unobserved` | Nothing, or not everything, is observing a routine: its backend is blind, its poll floor cannot finish, its poll walk was killed for outliving its budget, the walk cap refused it, a lasting block holds it, scheduling is blocked by a long job, or it is disabled. One row per episode (`warn`; `info` for disabled); the message names the cause and `Logs` the detail. The routine's state record keeps the episode (`observe_state`, `observe_cause`, `observe_since_epoch`), so a restart does not repeat it |
 | `routine.observed` | The episode above ended: something observes the routine again, it was enabled again, or scheduling resumed (`info`) |
+| `routine.skipped` | A realtime change was not run because every changed folder is as the last sync left it (`info`, state `succeeded`); at most one row an hour per routine, with the count skipped since the last row. The log has each one (`routine_run_skipped`) |
+| `routine.skip_check_unavailable` | The unchanged-folder check could not be made, so the change ran as before (`info`, state `unavailable`; the message carries the cause; once per cause) |
+| `routine.converged_forgotten` | A sync did not finish cleanly, so the next change runs even if its folders look unchanged (`info`, state `changed`) |
+| `routine.events_ignored` | A routine that does not delete on the NAS ignores removal events (`info`; first one, then at most hourly, with the running count) |
 | `doctor.succeeded` | Doctor completed successfully |
 | `doctor.failed` | Doctor completed with a nonzero result |
 | `doctor.inventory` | The DSM package retained one bounded private Doctor discovery record |
