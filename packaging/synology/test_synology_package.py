@@ -23297,6 +23297,98 @@ fi
                 result = self.shell(probe, str(cmdline(name, arguments)))
                 self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
 
+    def test_daemon_parent_argv_is_exactly_the_daemon_mode_and_only_audit_event_takes_it(self) -> None:
+        """fix11: the sync daemon may reach `api audit-event`, by argv[1] alone.
+
+        26.65's daemon writes its runs' audit events in process, as the manager's
+        child; the manager accepted that endpoint only from the bridge, so every
+        run on DSM was refused audit_unavailable. The daemon is the same
+        executable, so the exe-identity half is unchanged; its mode is
+        `--daemon` exactly, followed by its own options. The live-parent half
+        (daemon accepted, other endpoints refused, another uid refused) runs
+        under the real daemon in tests/daemon_audit_event.rs.
+        """
+        probe = self.root / "daemon-parent-argv-probe"
+        probe.write_text(
+            "#!/bin/sh\n"
+            "set -eu\n"
+            '. "$SYNOPKG_PKGDEST/libexec/sdsync-common"\n'
+            'internal_daemon_parent_argv_authorized "$1"\n',
+            encoding="utf-8",
+        )
+        probe.chmod(0o755)
+        if os.getuid() == 0:
+            os.chown(probe, self.drop_uid, self.drop_gid)
+
+        bridge = str(self.fhs / "target/bin/sdsync-dsm-api")
+        home, var = str(self.fhs / "home"), str(self.fhs / "var")
+        accepted = {
+            "daemon-as-supervised": [bridge, "--daemon", "--home", home, "--var", var],
+            "daemon-with-timings": [
+                bridge, "--daemon", "--home", home, "--var", var,
+                "--stall-warn-seconds", "600", "--serve-api",
+            ],
+            "daemon-bare": [bridge, "--daemon"],
+        }
+        rejected = {
+            "no-mode": [bridge],
+            "daemon-later": [bridge, "--ctl", "--daemon"],
+            "daemon-prefix": [bridge, "--daemon-lock-probe", "/x"],
+            "daemon-case": [bridge, "--Daemon"],
+            "daemon-padded": [bridge, "--daemon ", "--home", home],
+            "launcher": [bridge, "--launch-daemon", "--home", home],
+            "supervisor": [bridge, "--supervise", "--home", home],
+            "bridge-mode": [bridge, "--serve"],
+            "interpreter-then-daemon": ["/bin/sh", bridge, "--daemon"],
+        }
+
+        def cmdline(name: str, arguments: list[str]) -> Path:
+            path = self.root / f"daemon-parent-{name}.cmdline"
+            path.write_bytes(b"\0".join(argument.encode("utf-8") for argument in arguments) + b"\0")
+            path.chmod(0o600)
+            if os.getuid() == 0:
+                os.chown(path, self.drop_uid, self.drop_gid)
+            return path
+
+        for name, arguments in accepted.items():
+            with self.subTest(name=name):
+                result = self.shell(probe, str(cmdline(name, arguments)))
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        for name, arguments in rejected.items():
+            with self.subTest(name=name):
+                result = self.shell(probe, str(cmdline(name, arguments)))
+                self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        missing = self.shell(probe, str(self.root / "no-such.cmdline"))
+        self.assertEqual(missing.returncode, 77, missing.stdout + missing.stderr)
+
+        # Only audit-event consults the daemon check; audit-rejected and
+        # controller-wake stay bridge-only.
+        manager = self.manager.read_text(encoding="utf-8")
+        start = manager.index("        audit-event|audit-rejected|controller-wake)\n")
+        end = manager.index("            ;;\n", start)
+        gate = manager[start:end]
+        self.assertEqual(manager.count("require_internal_daemon_audit_parent"), 1)
+        self.assertIn('if [ "$api_operation" = audit-event ]; then\n', gate)
+        self.assertIn(
+            "require_internal_api_bridge_parent || require_internal_daemon_audit_parent \\\n"
+            '                    || api_error forbidden "private bridge endpoint" 77\n'
+            "            else\n"
+            '                require_internal_api_bridge_parent || api_error forbidden "private bridge endpoint" 77\n',
+            gate,
+        )
+        # And a stranger is still refused at audit-event.
+        forged = self.shell(
+            self.manager, "api", "audit-event", "--operation", "run", "--state", "requested",
+            "--profile", "all",
+            extra_environment={
+                "SDSYNC_DSM_AUDIT_ACTOR": "package-scheduler",
+                "SDSYNC_DSM_AUDIT_ORIGIN": "scheduler",
+                "SDSYNC_DSM_AUDIT_TRANSACTION": "scheduler-" + "a" * 64,
+            },
+        )
+        self.assertEqual(forged.returncode, 77, forged.stdout + forged.stderr)
+        self.assertIn("private bridge endpoint", forged.stdout + forged.stderr)
+
     def test_physical_package_destination_accepts_framework_controller_exec_alias(self) -> None:
         framework_controller = self.fhs / "target/libexec/sdsync-controller"
         physical_controller = self.real_target / "libexec/sdsync-controller"

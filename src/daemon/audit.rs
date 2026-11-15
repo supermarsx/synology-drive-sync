@@ -9,7 +9,10 @@
 //! [`InProcessAudit`] calls the same functions on a bounded helper thread of the
 //! daemon, which saves five process starts per run on a small NAS;
 //! [`BridgeAudit`] runs them as bounded children and is what the daemon falls
-//! back to when it cannot vouch for its own identity. Either way the daemon is
+//! back to when it cannot vouch for its own identity, or ([`FallbackAudit`])
+//! once the package manager refuses it as a caller of `api audit-event` -- the
+//! endpoint that writes the events, which accepted only the bridge until
+//! fix11 and so refused every run on 26.65. Either way the daemon is
 //! the outbox record's owner, and a daemon that dies mid-run leaves a record the
 //! next reconciliation completes as `outcome_unknown`, never as success.
 
@@ -50,6 +53,13 @@ pub(crate) trait RunAudit: Send + Sync {
     fn execute(&self, transaction: &str) -> Result<(), String>;
     /// `state`: `succeeded`, `failed` or `outcome_unknown`.
     fn complete(&self, transaction: &str, state: &str) -> Result<(), String>;
+    /// Why this transport cannot work here at all, once that is known (the
+    /// manager refused this process as a caller): [`FallbackAudit`] then hands
+    /// every later step to the bridge. `None` for a transport that works or
+    /// fails step by step.
+    fn transport_refused(&self) -> Option<String> {
+        None
+    }
 }
 
 /// An audit that records nothing (tests that are not about the audit).
@@ -78,6 +88,117 @@ pub(crate) const AUDIT_STEP_DEADLINE: Duration = Duration::from_secs(30);
 pub(crate) use bridge::BridgeAudit;
 #[cfg(target_os = "linux")]
 pub(crate) use in_process::InProcessAudit;
+
+/// The in-process audit, and the bridge children it hands over to for the rest
+/// of the service's life once the manager refuses the daemon as a caller of its
+/// private `api audit-event` endpoint (26.65 on DSM: every run was refused
+/// `audit_unavailable`, because the manager accepted only the bridge). Runs stay
+/// audited either way: the step that met the refusal is done again through the
+/// bridge, and the switch is announced once, by name.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(crate) struct FallbackAudit {
+    primary: std::sync::Arc<dyn RunAudit>,
+    fallback: std::sync::Arc<dyn RunAudit>,
+    switched: std::sync::atomic::AtomicBool,
+    /// Called once, at the switch, with the refusal and the step it met.
+    announce: Announce,
+}
+
+/// [`FallbackAudit`]'s announcement of its switch: `(cause, step)`.
+pub(crate) type Announce = Box<dyn Fn(&str, &str) + Send + Sync>;
+
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+impl FallbackAudit {
+    pub(crate) fn new(
+        primary: std::sync::Arc<dyn RunAudit>,
+        fallback: std::sync::Arc<dyn RunAudit>,
+        announce: Announce,
+    ) -> Self {
+        Self {
+            primary,
+            fallback,
+            switched: std::sync::atomic::AtomicBool::new(false),
+            announce,
+        }
+    }
+
+    fn on_fallback(&self) -> bool {
+        self.switched.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// The primary failed with `error`: `Some(cause)` when that was the
+    /// transport's refusal, and the switch is made (announced only by the
+    /// caller that made it).
+    fn switch_after(&self, step: &str, error: &str) -> Option<String> {
+        let cause = self.primary.transport_refused()?;
+        if !self
+            .switched
+            .swap(true, std::sync::atomic::Ordering::SeqCst)
+        {
+            (self.announce)(&cause, &format!("{step}: {error}"));
+        }
+        Some(cause)
+    }
+}
+
+impl RunAudit for FallbackAudit {
+    fn reconcile(&self) -> Result<(), String> {
+        if self.on_fallback() {
+            return self.fallback.reconcile();
+        }
+        match self.primary.reconcile() {
+            Err(error) if self.switch_after("reconcile", &error).is_some() => self
+                .fallback
+                .reconcile()
+                .map_err(|again| format!("{error}; through the bridge too: {again}")),
+            other => other,
+        }
+    }
+
+    fn begin(&self, operation: &str, scope: &str, origin: AuditOrigin) -> Result<String, String> {
+        if self.on_fallback() {
+            return self.fallback.begin(operation, scope, origin);
+        }
+        match self.primary.begin(operation, scope, origin) {
+            Err(error) if self.switch_after("begin", &error).is_some() => {
+                // The refused begin left its record terminal (failed) in the
+                // outbox; the bridge writes its events and retires it first.
+                self.fallback
+                    .reconcile()
+                    .and_then(|()| self.fallback.begin(operation, scope, origin))
+                    .map_err(|again| format!("{error}; through the bridge too: {again}"))
+            }
+            other => other,
+        }
+    }
+
+    fn execute(&self, transaction: &str) -> Result<(), String> {
+        if self.on_fallback() {
+            return self.fallback.execute(transaction);
+        }
+        match self.primary.execute(transaction) {
+            Err(error) if self.switch_after("execute", &error).is_some() => self
+                .fallback
+                .execute(transaction)
+                .map_err(|again| format!("{error}; through the bridge too: {again}")),
+            other => other,
+        }
+    }
+
+    fn complete(&self, transaction: &str, state: &str) -> Result<(), String> {
+        if self.on_fallback() {
+            return self.fallback.complete(transaction, state);
+        }
+        match self.primary.complete(transaction, state) {
+            // The record is terminal and durable; the bridge writes its events.
+            Err(error) if self.switch_after("complete", &error).is_some() => self
+                .fallback
+                .complete(transaction, state)
+                .map_err(|again| format!("{error}; through the bridge too: {again}")),
+            other => other,
+        }
+    }
+}
 
 #[cfg(target_os = "linux")]
 mod bridge {
@@ -219,14 +340,15 @@ mod bridge {
 /// when the audit is built).
 #[cfg(target_os = "linux")]
 mod in_process {
-    use std::sync::Arc;
     use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
     use std::sync::mpsc::{self, RecvTimeoutError};
+    use std::sync::{Arc, Mutex};
     use std::thread;
 
     use crate::dsm_api::{
-        AuditOutboxPaths, AuditOutboxPhase, AuditOutboxRecord, BridgeResult, linux_files,
-        linux_runtime, new_audit_transaction_id, record_audit_event, validate_package_identity,
+        AuditOutboxPaths, AuditOutboxPhase, AuditOutboxRecord, BridgeError, BridgeResult,
+        ErrorKind, MANAGER_PATH, linux_files, linux_runtime, new_audit_transaction_id,
+        record_audit_event_named, validate_package_identity,
     };
 
     use super::{AUDIT_STEP_DEADLINE, AuditOrigin, RunAudit};
@@ -246,22 +368,95 @@ mod in_process {
         append: Appender,
         /// Steps abandoned after their deadline that have not returned yet.
         stuck: Arc<AtomicUsize>,
+        /// Set once the manager refused this process as a caller of its
+        /// private audit endpoint: why (see `transport_refused`).
+        refused: Arc<Mutex<Option<String>>>,
+    }
+
+    /// The manager's code for "this process is not a caller I accept".
+    const CALLER_REFUSED: &str = "audit_event_caller_refused";
+
+    /// A bridge error as one line: its kind, its code, and what the code means
+    /// where the daemon knows (`code=none` says the failing site named none).
+    pub(crate) fn describe(error: &BridgeError) -> String {
+        let kind = match error.kind {
+            ErrorKind::BadRequest => "bad_request",
+            ErrorKind::Unauthorized => "unauthorized",
+            ErrorKind::Forbidden => "forbidden",
+            ErrorKind::CsrfRejected => "csrf_rejected",
+            ErrorKind::MethodNotAllowed => "method_not_allowed",
+            ErrorKind::UnsupportedMediaType => "unsupported_media_type",
+            ErrorKind::PayloadTooLarge => "payload_too_large",
+            ErrorKind::Conflict => "conflict",
+            ErrorKind::UnsafeRuntime => "unsafe_runtime",
+            ErrorKind::Unavailable => "unavailable",
+            ErrorKind::Internal => "internal",
+        };
+        let meaning = match error.code {
+            Some(CALLER_REFUSED) => {
+                " (the package manager refused this process as a caller of its private api audit-event endpoint)"
+            }
+            Some("audit_event_not_written") => {
+                " (the package manager could not write audit.log or activity.log)"
+            }
+            Some("audit_event_unsafe_state") => {
+                " (the package manager found its private state unsafe)"
+            }
+            Some("audit_event_invalid") => " (the package manager refused the event as invalid)",
+            Some("audit_event_failed") => " (the package manager failed without naming why)",
+            Some("manager_spawn_failed") => " (the package manager could not be started)",
+            _ => "",
+        };
+        let manager = if error
+            .code
+            .is_some_and(|code| code.starts_with("audit_event_") || code == "manager_spawn_failed")
+        {
+            format!(" manager={MANAGER_PATH}")
+        } else {
+            String::new()
+        };
+        format!(
+            "kind={kind} code={}{manager}{meaning}",
+            error.code.unwrap_or("none")
+        )
+    }
+
+    /// `append`, noting a refusal of the caller in `refused`.
+    fn noting_refusal(append: Appender, refused: Arc<Mutex<Option<String>>>) -> Appender {
+        Arc::new(move |record, state| {
+            let result = append(record, state);
+            if let Err(error) = &result
+                && error.code == Some(CALLER_REFUSED)
+                && let Ok(mut slot) = refused.lock()
+                && slot.is_none()
+            {
+                *slot = Some(describe(error));
+            }
+            result
+        })
     }
 
     impl InProcessAudit {
         /// The package's audit outbox, written as the package user. `Err` names
         /// why this process is not fit to do it (the daemon then runs the bridge).
         pub(crate) fn production(actor_uid: u32) -> Result<Self, String> {
-            let identity = linux_runtime::identity_state()
-                .map_err(|error| format!("the daemon's identity could not be read: {error:?}"))?;
-            let package_uid = validate_package_identity(&identity)
-                .map_err(|error| format!("the daemon is not the package's user: {error:?}"))?;
+            let identity = linux_runtime::identity_state().map_err(|error| {
+                format!(
+                    "the daemon's identity could not be read: {}",
+                    describe(&error)
+                )
+            })?;
+            let package_uid = validate_package_identity(&identity).map_err(|error| {
+                format!("the daemon is not the package's user: {}", describe(&error))
+            })?;
+            let refused = Arc::new(Mutex::new(None));
             Ok(Self {
                 paths: AuditOutboxPaths::production(),
                 package_uid,
                 actor_uid,
-                append: Arc::new(record_audit_event),
+                append: noting_refusal(Arc::new(record_audit_event_named), Arc::clone(&refused)),
                 stuck: Arc::new(AtomicUsize::new(0)),
+                refused,
             })
         }
 
@@ -271,12 +466,14 @@ mod in_process {
             package_uid: u32,
             append: Appender,
         ) -> Self {
+            let refused = Arc::new(Mutex::new(None));
             Self {
                 paths,
                 package_uid,
                 actor_uid: package_uid.max(1),
-                append,
+                append: noting_refusal(append, Arc::clone(&refused)),
                 stuck: Arc::new(AtomicUsize::new(0)),
+                refused,
             }
         }
 
@@ -344,13 +541,17 @@ mod in_process {
             };
             match answer {
                 Some(Ok(value)) => Ok(value),
-                Some(Err(error)) => Err(format!("audit {name} failed: {error:?}")),
+                Some(Err(error)) => Err(format!("audit {name} failed: {}", describe(&error))),
                 None => Err(format!("audit {name} ended without an answer")),
             }
         }
     }
 
     impl RunAudit for InProcessAudit {
+        fn transport_refused(&self) -> Option<String> {
+            self.refused.lock().ok().and_then(|slot| slot.clone())
+        }
+
         fn reconcile(&self) -> Result<(), String> {
             let (paths, uid, append) = (self.paths, self.package_uid, Arc::clone(&self.append));
             self.step("reconcile", move || {
@@ -633,5 +834,399 @@ mod in_process {
             }
             audit.reconcile().unwrap();
         }
+
+        /// What the 26.65 manager answered the daemon: not a caller it accepts.
+        fn caller_refused(calls: Arc<AtomicUsize>) -> Appender {
+            Arc::new(move |_, _| {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Err(BridgeError::unavailable_because(CALLER_REFUSED))
+            })
+        }
+
+        fn record_json(outbox: &Outbox, name: &str) -> serde_json::Value {
+            serde_json::from_slice(&std::fs::read(outbox.paths.directory.join(name)).unwrap())
+                .unwrap()
+        }
+
+        /// fix11, the field failure: the manager refuses the daemon's events.
+        /// The begin fails naming the code and the manager (not `code: None`),
+        /// the transport reports itself refused, and the record left behind is
+        /// the one found on the NAS: terminal `failed`, owned by the live
+        /// daemon, no client request id. With the same manager every
+        /// reconciliation fails on it (the 30 s loop); once the manager takes
+        /// the daemon's events it is written as requested + failed and retired.
+        #[test]
+        fn a_refused_caller_is_named_and_its_record_is_reconciled_once_events_are_taken() {
+            let outbox = Outbox::new("refused-caller");
+            let calls = Arc::new(AtomicUsize::new(0));
+            let audit =
+                InProcessAudit::with(outbox.paths, outbox.uid, caller_refused(Arc::clone(&calls)));
+            assert_eq!(audit.transport_refused(), None);
+            let error = audit
+                .begin("run", "checkoffice_nas", AuditOrigin::Scheduler)
+                .unwrap_err();
+            assert!(
+                error.starts_with("audit begin failed: kind=unavailable code=audit_event_caller_refused manager=/var/packages/synology-drive-sync/target/bin/sdsync-dsm (the package manager refused this process as a caller"),
+                "{error}"
+            );
+            assert!(
+                audit
+                    .transport_refused()
+                    .is_some_and(|cause| cause.contains("code=audit_event_caller_refused")),
+                "{:?}",
+                audit.transport_refused()
+            );
+            let names = outbox.events();
+            assert_eq!(names.len(), 1, "{names:?}");
+            let left = record_json(&outbox, &names[0]);
+            assert_eq!(left["phase"], "failed");
+            assert_eq!(left["operation"], "run");
+            assert_eq!(left["profile"], "checkoffice_nas");
+            assert_eq!(left["actor"], "package-scheduler");
+            assert_eq!(left["origin"], "scheduler");
+            assert_eq!(left["owner_pid"], std::process::id());
+            assert!(left["job_id"].is_null());
+            assert!(left.get("client_request_id").is_none(), "{left}");
+            let error = audit.reconcile().unwrap_err();
+            assert!(
+                error.contains(
+                    "audit reconcile failed: kind=unavailable code=audit_event_caller_refused"
+                ),
+                "{error}"
+            );
+            assert_eq!(outbox.events(), names, "kept for the next reconciliation");
+            let (append, seen) = recording();
+            let fixed = InProcessAudit::with(outbox.paths, outbox.uid, append);
+            fixed.reconcile().unwrap();
+            assert!(outbox.events().is_empty(), "{:?}", outbox.events());
+            assert_eq!(
+                *seen.lock().unwrap(),
+                [
+                    "run checkoffice_nas requested",
+                    "run checkoffice_nas failed"
+                ]
+            );
+        }
+
+        /// The boot id the kernel gives this boot, as an owner records it.
+        fn boot_id() -> String {
+            std::fs::read_to_string("/proc/sys/kernel/random/boot_id")
+                .unwrap()
+                .trim()
+                .to_owned()
+        }
+
+        /// A pid that names no live process: a child that has been reaped.
+        fn dead_pid() -> u32 {
+            let mut child = std::process::Command::new("true").spawn().unwrap();
+            let pid = child.id();
+            child.wait().unwrap();
+            pid
+        }
+
+        /// Write the outbox record found on the NAS after 26.65's first run,
+        /// byte for byte in shape, with `phase` and the owner given.
+        fn plant_nas_record(outbox: &Outbox, phase: &str, owner: (u32, u64, &str)) -> String {
+            let transaction = format!(
+                "scheduler-f16d{}",
+                "0123456789abcdef".repeat(4)[..60].to_owned()
+            );
+            let text = format!(
+                "{{\"schema\":\"sdsync.dsm-audit-outbox.v1\",\"transaction\":\"{transaction}\",\
+                 \"operation\":\"run\",\"profile\":\"checkoffice_nas\",\"actor\":\"package-scheduler\",\
+                 \"actor_uid\":190227,\"origin\":\"scheduler\",\"job_id\":null,\"owner_pid\":{},\
+                 \"owner_start\":{},\"owner_boot\":\"{}\",\"phase\":\"{phase}\"}}",
+                owner.0, owner.1, owner.2
+            );
+            let path = outbox.paths.directory.join(format!("{transaction}.event"));
+            std::fs::write(&path, text).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+            transaction
+        }
+
+        /// fix11, the upgrade: the record 26.65 left (terminal `failed`) is
+        /// reconciled by the fixed daemon whether its owner is the daemon that
+        /// is still running or the one the package restart ended, and a record
+        /// still `prepared` is completed as failed once its owner is gone but
+        /// left alone while it lives.
+        #[test]
+        fn the_record_left_on_the_nas_is_reconciled_with_a_live_or_a_dead_owner() {
+            let boot = boot_id();
+            let live = linux_files::current_process_identity().unwrap();
+            let dead = dead_pid();
+            for (label, phase, owner, retired) in [
+                (
+                    "failed-live",
+                    "failed",
+                    (live.0, live.1, boot.as_str()),
+                    true,
+                ),
+                (
+                    "failed-dead",
+                    "failed",
+                    (dead, 36_524_948, boot.as_str()),
+                    true,
+                ),
+                (
+                    "prepared-dead",
+                    "prepared",
+                    (dead, 36_524_948, boot.as_str()),
+                    true,
+                ),
+                (
+                    "prepared-live",
+                    "prepared",
+                    (live.0, live.1, boot.as_str()),
+                    false,
+                ),
+            ] {
+                let outbox = Outbox::new(label);
+                let transaction = plant_nas_record(&outbox, phase, owner);
+                let (append, seen) = recording();
+                let audit = InProcessAudit::with(outbox.paths, outbox.uid, append);
+                audit.reconcile().unwrap_or_else(|e| panic!("{label}: {e}"));
+                if retired {
+                    assert!(outbox.events().is_empty(), "{label}: {:?}", outbox.events());
+                    assert_eq!(
+                        *seen.lock().unwrap(),
+                        [
+                            "run checkoffice_nas requested",
+                            "run checkoffice_nas failed"
+                        ],
+                        "{label}"
+                    );
+                } else {
+                    assert_eq!(outbox.events(), [format!("{transaction}.event")], "{label}");
+                    assert!(seen.lock().unwrap().is_empty(), "{label}");
+                }
+            }
+        }
+
+        /// fix11, the fallback over a real outbox: the in-process transport is
+        /// refused at its first begin; the run is begun through the other
+        /// transport (here an in-process audit whose events are taken, standing
+        /// in for the bridge children), which first retires the refused begin's
+        /// record. Every later step goes there directly, the refused transport
+        /// is not asked again, and the switch is announced once.
+        #[test]
+        fn a_refused_in_process_audit_hands_the_run_to_the_bridge_once() {
+            let outbox = Outbox::new("fallback");
+            let refusals = Arc::new(AtomicUsize::new(0));
+            let primary: Arc<dyn RunAudit> = Arc::new(InProcessAudit::with(
+                outbox.paths,
+                outbox.uid,
+                caller_refused(Arc::clone(&refusals)),
+            ));
+            let (append, seen) = recording();
+            let bridge: Arc<dyn RunAudit> =
+                Arc::new(InProcessAudit::with(outbox.paths, outbox.uid, append));
+            let announced = Arc::new(Mutex::new(Vec::new()));
+            let audit = super::super::FallbackAudit::new(primary, bridge, {
+                let announced = Arc::clone(&announced);
+                Box::new(move |cause, step| {
+                    announced.lock().unwrap().push(format!("{cause} | {step}"));
+                })
+            });
+            // Nothing in the outbox: the reconcile writes no event and is not refused.
+            audit.reconcile().unwrap();
+            assert_eq!(refusals.load(Ordering::SeqCst), 0);
+            let transaction = audit.begin("run", "docs", AuditOrigin::Scheduler).unwrap();
+            let refused_so_far = refusals.load(Ordering::SeqCst);
+            assert!(refused_so_far > 0);
+            assert_eq!(outbox.events(), [format!("{transaction}.event")]);
+            audit.execute(&transaction).unwrap();
+            audit.complete(&transaction, "succeeded").unwrap();
+            assert!(outbox.events().is_empty(), "{:?}", outbox.events());
+            // A second run never meets the refused transport.
+            audit.reconcile().unwrap();
+            let second = audit.begin("run", "docs", AuditOrigin::Scheduler).unwrap();
+            audit.execute(&second).unwrap();
+            audit.complete(&second, "failed").unwrap();
+            assert_eq!(refusals.load(Ordering::SeqCst), refused_so_far);
+            assert_eq!(
+                *seen.lock().unwrap(),
+                [
+                    // The refused begin's record, retired by the bridge.
+                    "run docs requested",
+                    "run docs failed",
+                    "run docs requested",
+                    "run docs requested",
+                    "run docs succeeded",
+                    "run docs requested",
+                    "run docs requested",
+                    "run docs failed",
+                ]
+            );
+            let announced = announced.lock().unwrap();
+            assert_eq!(announced.len(), 1, "{announced:?}");
+            assert!(
+                announced[0].contains("code=audit_event_caller_refused")
+                    && announced[0].contains("begin: audit begin failed"),
+                "{announced:?}"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod fallback_tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+
+    use super::*;
+
+    /// A transport whose every step fails with `error`; `refused` is what it
+    /// reports as its transport refusal.
+    struct Failing {
+        error: &'static str,
+        refused: Option<&'static str>,
+        calls: AtomicUsize,
+    }
+
+    impl RunAudit for Failing {
+        fn reconcile(&self) -> Result<(), String> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Err(self.error.into())
+        }
+        fn begin(&self, _: &str, _: &str, _: AuditOrigin) -> Result<String, String> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Err(self.error.into())
+        }
+        fn execute(&self, _: &str) -> Result<(), String> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Err(self.error.into())
+        }
+        fn complete(&self, _: &str, _: &str) -> Result<(), String> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Err(self.error.into())
+        }
+        fn transport_refused(&self) -> Option<String> {
+            self.refused.map(str::to_owned)
+        }
+    }
+
+    /// Records the steps it is asked for.
+    #[derive(Default)]
+    struct Recording(Mutex<Vec<String>>);
+
+    impl RunAudit for Recording {
+        fn reconcile(&self) -> Result<(), String> {
+            self.0.lock().unwrap().push("reconcile".into());
+            Ok(())
+        }
+        fn begin(&self, operation: &str, scope: &str, _: AuditOrigin) -> Result<String, String> {
+            self.0
+                .lock()
+                .unwrap()
+                .push(format!("begin {operation} {scope}"));
+            Ok("tx".into())
+        }
+        fn execute(&self, transaction: &str) -> Result<(), String> {
+            self.0
+                .lock()
+                .unwrap()
+                .push(format!("execute {transaction}"));
+            Ok(())
+        }
+        fn complete(&self, transaction: &str, state: &str) -> Result<(), String> {
+            self.0
+                .lock()
+                .unwrap()
+                .push(format!("complete {transaction} {state}"));
+            Ok(())
+        }
+    }
+
+    fn counted(
+        primary: Arc<dyn RunAudit>,
+        bridge: Arc<dyn RunAudit>,
+    ) -> (FallbackAudit, Arc<AtomicUsize>) {
+        let announced = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&announced);
+        let audit = FallbackAudit::new(
+            primary,
+            bridge,
+            Box::new(move |_, _| {
+                counter.fetch_add(1, Ordering::SeqCst);
+            }),
+        );
+        (audit, announced)
+    }
+
+    /// A failure that is not the transport's refusal (the outbox unsafe, the
+    /// log full) is the run's answer: it is returned as it is and nothing
+    /// switches, so a real audit failure is never papered over by a retry.
+    #[test]
+    fn a_failure_that_is_not_a_refusal_is_returned_and_does_not_switch() {
+        let primary = Arc::new(Failing {
+            error: "audit reconcile failed: kind=unsafe_runtime code=none",
+            refused: None,
+            calls: AtomicUsize::new(0),
+        });
+        let bridge = Arc::new(Recording::default());
+        let (audit, announced) = counted(primary.clone(), bridge.clone());
+        for _ in 0..2 {
+            assert_eq!(
+                audit.reconcile().unwrap_err(),
+                "audit reconcile failed: kind=unsafe_runtime code=none"
+            );
+            assert!(audit.begin("run", "docs", AuditOrigin::Scheduler).is_err());
+        }
+        assert_eq!(primary.calls.load(Ordering::SeqCst), 4);
+        assert!(bridge.0.lock().unwrap().is_empty());
+        assert_eq!(announced.load(Ordering::SeqCst), 0);
+    }
+
+    /// A refusal met at any step switches every later step, once and for good;
+    /// the step that met it is done again through the bridge.
+    #[test]
+    fn a_refusal_at_complete_finishes_the_run_through_the_bridge() {
+        let primary = Arc::new(Failing {
+            error: "audit complete: the event could not be written yet",
+            refused: Some("code=audit_event_caller_refused"),
+            calls: AtomicUsize::new(0),
+        });
+        let bridge = Arc::new(Recording::default());
+        let (audit, announced) = counted(primary.clone(), bridge.clone());
+        audit.complete("tx", "succeeded").unwrap();
+        audit.reconcile().unwrap();
+        audit.begin("plan", "all", AuditOrigin::Manager).unwrap();
+        audit.execute("tx").unwrap();
+        assert_eq!(primary.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            *bridge.0.lock().unwrap(),
+            [
+                "complete tx succeeded",
+                "reconcile",
+                "begin plan all",
+                "execute tx"
+            ]
+        );
+        assert_eq!(announced.load(Ordering::SeqCst), 1);
+    }
+
+    /// The bridge failing too is named with both causes.
+    #[test]
+    fn a_bridge_that_fails_too_is_named_with_both_causes() {
+        let primary = Arc::new(Failing {
+            error: "audit begin failed: kind=unavailable code=audit_event_caller_refused",
+            refused: Some("code=audit_event_caller_refused"),
+            calls: AtomicUsize::new(0),
+        });
+        let bridge = Arc::new(Failing {
+            error: "--audit-transaction reconcile exited 73",
+            refused: None,
+            calls: AtomicUsize::new(0),
+        });
+        let (audit, announced) = counted(primary, bridge);
+        let error = audit
+            .begin("run", "docs", AuditOrigin::Scheduler)
+            .unwrap_err();
+        assert_eq!(
+            error,
+            "audit begin failed: kind=unavailable code=audit_event_caller_refused; through the \
+             bridge too: --audit-transaction reconcile exited 73"
+        );
+        assert_eq!(announced.load(Ordering::SeqCst), 1);
     }
 }

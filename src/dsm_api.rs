@@ -6834,6 +6834,8 @@ mod linux_runtime {
 
 struct CapturedOutput {
     status_success: bool,
+    /// The exit status, `None` when a signal ended the child.
+    exit_code: Option<i32>,
     stdout: Zeroizing<Vec<u8>>,
     /// The manager's stderr. Only the queued mutation path keeps it, bounded to
     /// `MAX_QUEUED_STDERR_BYTES`; `stderr_bytes` counts everything it wrote.
@@ -7156,6 +7158,7 @@ mod linux_process {
         fn into_output(self, status: ExitStatus, stdout: Zeroizing<Vec<u8>>) -> CapturedOutput {
             CapturedOutput {
                 status_success: status.success(),
+                exit_code: status.code(),
                 stdout,
                 stderr: self.kept,
                 stderr_bytes: self.total,
@@ -7268,6 +7271,7 @@ mod linux_process {
     ) -> BridgeResult<CapturedOutput> {
         Ok(CapturedOutput {
             status_success: status.success(),
+            exit_code: status.code(),
             stdout,
             stderr: Zeroizing::new(Vec::new()),
             stderr_bytes: 0,
@@ -9768,6 +9772,26 @@ fn valid_boot_id(value: &str) -> bool {
 
 #[cfg(target_os = "linux")]
 fn record_audit_event(record: &AuditOutboxRecord, state: &str) -> BridgeResult<()> {
+    // The bridge's callers render this error to the dashboard, whose code
+    // vocabulary does not name the manager's refusals: a refusal keeps the
+    // bare `Unavailable` it always had, and every other error is unchanged.
+    // The daemon, which logs the cause, calls `record_audit_event_named`.
+    record_audit_event_named(record, state).map_err(|error| {
+        if error
+            .code
+            .is_some_and(|code| code.starts_with("audit_event_"))
+        {
+            BridgeError::new(ErrorKind::Unavailable)
+        } else {
+            error
+        }
+    })
+}
+
+/// The manager's `api audit-event` for one record and state, every failure
+/// coded by its cause (`audit_event_*`, see [`audit_event_failure_code`]).
+#[cfg(target_os = "linux")]
+fn record_audit_event_named(record: &AuditOutboxRecord, state: &str) -> BridgeResult<()> {
     validate_audit_outbox_record(record)?;
     if !matches!(
         state,
@@ -9775,23 +9799,9 @@ fn record_audit_event(record: &AuditOutboxRecord, state: &str) -> BridgeResult<(
     ) {
         return Err(BridgeError::new(ErrorKind::Forbidden));
     }
-    let arguments = [
-        "api".into(),
-        "audit-event".into(),
-        "--operation".into(),
-        record.operation.clone().into(),
-        "--state".into(),
-        state.into(),
-        "--profile".into(),
-        record.profile.clone().into(),
-    ];
-    let mut command = manager_command(&arguments, false)?;
-    command.env("SDSYNC_DSM_AUDIT_ACTOR", &record.actor);
-    command.env("SDSYNC_DSM_AUDIT_ACTOR_UID", record.actor_uid.to_string());
-    command.env("SDSYNC_DSM_AUDIT_ORIGIN", &record.origin);
-    command.env("SDSYNC_DSM_AUDIT_TRANSACTION", &record.transaction);
-    if let Some(client_request_id) = record.client_request_id.as_deref() {
-        command.env("SDSYNC_DSM_CLIENT_REQUEST_ID", client_request_id);
+    let mut command = manager_command(&audit_event_arguments(record, state), false)?;
+    for (name, value) in audit_event_environment(record) {
+        command.env(name, value);
     }
     let output = capture_bounded_command(
         &mut command,
@@ -9803,7 +9813,63 @@ fn record_audit_event(record: &AuditOutboxRecord, state: &str) -> BridgeResult<(
     if output.status_success {
         Ok(())
     } else {
-        Err(BridgeError::new(ErrorKind::Unavailable))
+        Err(BridgeError::unavailable_because(audit_event_failure_code(
+            &output.stdout,
+            output.exit_code,
+        )))
+    }
+}
+
+/// The manager's argv for an audit event (after the manager's own path).
+#[cfg(target_os = "linux")]
+fn audit_event_arguments(record: &AuditOutboxRecord, state: &str) -> Vec<OsString> {
+    vec![
+        "api".into(),
+        "audit-event".into(),
+        "--operation".into(),
+        record.operation.clone().into(),
+        "--state".into(),
+        state.into(),
+        "--profile".into(),
+        record.profile.clone().into(),
+    ]
+}
+
+/// The attribution an audit event carries to the manager, beside
+/// `manager_command_environment`.
+#[cfg(target_os = "linux")]
+fn audit_event_environment(record: &AuditOutboxRecord) -> Vec<(&'static str, String)> {
+    let mut environment = vec![
+        ("SDSYNC_DSM_AUDIT_ACTOR", record.actor.clone()),
+        ("SDSYNC_DSM_AUDIT_ACTOR_UID", record.actor_uid.to_string()),
+        ("SDSYNC_DSM_AUDIT_ORIGIN", record.origin.clone()),
+        ("SDSYNC_DSM_AUDIT_TRANSACTION", record.transaction.clone()),
+    ];
+    if let Some(client_request_id) = record.client_request_id.as_deref() {
+        environment.push(("SDSYNC_DSM_CLIENT_REQUEST_ID", client_request_id.to_owned()));
+    }
+    environment
+}
+
+/// Why the manager refused an audit event, from the `code` of its
+/// `sdsync.dsm-result.v1` refusal, else from its exit status.
+#[cfg(target_os = "linux")]
+fn audit_event_failure_code(stdout: &[u8], exit_code: Option<i32>) -> &'static str {
+    let named = serde_json::from_slice::<Value>(stdout)
+        .ok()
+        .and_then(|value| value.get("code").and_then(Value::as_str).map(str::to_owned));
+    match (named.as_deref(), exit_code) {
+        // `require_internal_api_bridge_parent` (and, for the daemon,
+        // `require_internal_daemon_audit_parent`): this process is not a
+        // caller the manager accepts for its private endpoint.
+        (Some("forbidden" | "bridge_required"), _) | (None, Some(77)) => {
+            "audit_event_caller_refused"
+        }
+        // `append_audit_event` failed: audit.log or activity.log not written.
+        (Some("audit_unavailable"), _) => "audit_event_not_written",
+        (Some("unsafe_state"), _) | (None, Some(73)) => "audit_event_unsafe_state",
+        (Some("invalid_request"), _) | (None, Some(64)) => "audit_event_invalid",
+        _ => "audit_event_failed",
     }
 }
 
@@ -37889,6 +37955,111 @@ mod tests {
             .is_err()
         );
         assert_eq!(failed, [0_u8; 32]);
+    }
+
+    /// fix11: the manager's refusal of an audit event is named by its own
+    /// `code` (stdout `sdsync.dsm-result.v1`), else by its exit status, never
+    /// left as a bare `Unavailable` for the daemon to log.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn an_audit_event_refusal_is_named_by_the_managers_code_or_exit() {
+        let refusal = |code: &str| {
+            format!(
+                "{{\"schema\":\"sdsync.dsm-result.v1\",\"ok\":false,\"code\":\"{code}\",\"message\":\"m\"}}\n"
+            )
+            .into_bytes()
+        };
+        for (stdout, exit, named) in [
+            (refusal("forbidden"), Some(77), "audit_event_caller_refused"),
+            (Vec::new(), Some(77), "audit_event_caller_refused"),
+            (
+                refusal("audit_unavailable"),
+                Some(73),
+                "audit_event_not_written",
+            ),
+            (
+                refusal("unsafe_state"),
+                Some(73),
+                "audit_event_unsafe_state",
+            ),
+            (Vec::new(), Some(73), "audit_event_unsafe_state"),
+            (refusal("invalid_request"), Some(64), "audit_event_invalid"),
+            (b"not json".to_vec(), Some(1), "audit_event_failed"),
+            (Vec::new(), None, "audit_event_failed"),
+        ] {
+            assert_eq!(audit_event_failure_code(&stdout, exit), named, "{exit:?}");
+        }
+        // Every code is a valid envelope code.
+        for code in [
+            "audit_event_caller_refused",
+            "audit_event_not_written",
+            "audit_event_unsafe_state",
+            "audit_event_invalid",
+            "audit_event_failed",
+        ] {
+            assert!(code.len() <= 64 && code.bytes().all(|b| b.is_ascii_lowercase() || b == b'_'));
+        }
+    }
+
+    /// fix11: what `record_audit_event` hands the manager is exactly what
+    /// tests/daemon_audit_event.rs replays from under a real daemon.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_audit_event_invocation_is_the_one_the_daemon_e2e_replays() {
+        let record = AuditOutboxRecord {
+            schema: "sdsync.dsm-audit-outbox.v1".into(),
+            transaction: format!("scheduler-{}", "a".repeat(64)),
+            operation: "run".into(),
+            profile: "alpha".into(),
+            actor: "package-scheduler".into(),
+            actor_uid: 1000,
+            origin: "scheduler".into(),
+            client_request_id: None,
+            job_id: None,
+            owner_pid: 2,
+            owner_start: 1,
+            owner_boot: "00000000-0000-0000-0000-000000000000".into(),
+            phase: AuditOutboxPhase::Prepared,
+        };
+        assert_eq!(
+            audit_event_arguments(&record, "requested"),
+            [
+                "api",
+                "audit-event",
+                "--operation",
+                "run",
+                "--state",
+                "requested",
+                "--profile",
+                "alpha"
+            ]
+            .map(OsString::from)
+        );
+        assert_eq!(
+            audit_event_environment(&record),
+            [
+                ("SDSYNC_DSM_AUDIT_ACTOR", "package-scheduler".to_owned()),
+                ("SDSYNC_DSM_AUDIT_ACTOR_UID", "1000".to_owned()),
+                ("SDSYNC_DSM_AUDIT_ORIGIN", "scheduler".to_owned()),
+                ("SDSYNC_DSM_AUDIT_TRANSACTION", record.transaction.clone()),
+            ]
+        );
+        let environment: Vec<String> = manager_command_environment()
+            .into_iter()
+            .map(|(name, _)| name.into_string().unwrap())
+            .collect();
+        assert_eq!(
+            environment,
+            [
+                "PATH",
+                "LANG",
+                "LC_ALL",
+                "HOME",
+                "SYNOPKG_PKGDEST",
+                "SYNOPKG_PKGHOME",
+                "SYNOPKG_PKGVAR"
+            ]
+        );
     }
 
     #[test]

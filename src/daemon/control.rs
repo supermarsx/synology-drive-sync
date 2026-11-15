@@ -558,6 +558,9 @@ pub(crate) struct Control {
     unreadable: BTreeMap<PathBuf, Unreadable>,
     /// The service's degradation, published in controller.state (H2).
     audit_degraded: Option<ControllerDegraded>,
+    /// Runs refused `audit_unavailable` since the last run whose audit opened:
+    /// automatic retries back off on it, and it is published while it lasts.
+    run_audit_refusals: Option<AuditRefusals>,
     last_controller_write: Option<Instant>,
     wall_unavailable: bool,
     turn_now: bool,
@@ -628,6 +631,7 @@ impl Control {
             lasting_reported: HashSet::new(),
             unreadable: BTreeMap::new(),
             audit_degraded: None,
+            run_audit_refusals: None,
             last_controller_write: None,
             wall_unavailable: false,
             turn_now: true,
@@ -1222,6 +1226,10 @@ impl Control {
         };
         let active = self.active.as_ref().and_then(|a| a.pid).unwrap_or(0);
         let updated = (self.wall)().unwrap_or(0);
+        let run_degraded = self
+            .run_audit_refusals
+            .as_ref()
+            .map(AuditRefusals::degraded);
         let path = self.paths.state_dir.join("controller.state");
         let _ = self.write_state(
             &path,
@@ -1231,8 +1239,12 @@ impl Control {
                 next,
                 active,
                 updated,
-                // A stopped service publishes no degradation of its own.
-                self.audit_degraded.as_ref().filter(|_| running),
+                // A stopped service publishes no degradation of its own. The
+                // queue's (dashboard jobs refused) names more than the runs'.
+                self.audit_degraded
+                    .as_ref()
+                    .or(run_degraded.as_ref())
+                    .filter(|_| running),
             ),
         );
         self.last_controller_write = Some(Instant::now());
@@ -3227,6 +3239,13 @@ impl Control {
             .max(active.started_epoch);
         let request = active.request.clone();
         let sync = request.action == Action::Sync;
+        // An automatic run refused again inside an open audit_unavailable
+        // episode changes no state anyone acts on: it is logged and recorded
+        // in run.state, but writes no Activity row and feeds no alert (2,664
+        // rows in 22 h on 26.65). The episode's start and end are each named
+        // once; a run someone asked for is always answered in Activity.
+        let repeated_refusal = self.note_run_audit(&report, &verdict, finished)
+            && !matches!(request.origin, Origin::Requested);
 
         // Per-profile records first; run.state last, so a reader that waits for
         // it sees every other record in place.
@@ -3302,13 +3321,15 @@ impl Control {
                 sanitize_detail(&verdict.detail, 160)
             )
         };
-        if !self.activity(code, &request.scope, state, "sync", level, message) {
+        if !repeated_refusal && !self.activity(code, &request.scope, state, "sync", level, message)
+        {
             push_degraded(&mut active.degraded, "activity");
         }
         // The failure counter, Log Center and the desktop notification, as the
         // runner fed them: a sync that succeeded or failed; a cancelled or
         // partial one reaches none of them.
-        if sync && !verdict.cancelled && verdict.outcome != RunOutcome::Partial {
+        if sync && !repeated_refusal && !verdict.cancelled && verdict.outcome != RunOutcome::Partial
+        {
             self.alerts.run_result(
                 &request.scope,
                 verdict.outcome == RunOutcome::Failed,
@@ -3465,6 +3486,81 @@ impl Control {
         self.turn_now = true;
     }
 
+    /// Follow the audit_unavailable episode of runs: a refused run opens it
+    /// (named once, published as `degraded=audit_unavailable`) or extends it;
+    /// a run whose audit opened ends it (named once). `true` when this run
+    /// only repeated a refusal of an open episode.
+    fn note_run_audit(&mut self, report: &RunReport, verdict: &RunVerdict, finished: u64) -> bool {
+        use super::executor::Ending;
+        match &report.ending {
+            Ending::Refused {
+                reason: "audit_unavailable",
+                cause,
+            } => {
+                let cause = sanitize_detail(cause, 160);
+                let repeated = match self.run_audit_refusals.as_mut() {
+                    Some(open) => {
+                        open.count = open.count.saturating_add(1);
+                        open.cause = cause;
+                        true
+                    }
+                    None => {
+                        self.run_audit_refusals = Some(AuditRefusals {
+                            count: 1,
+                            since: finished,
+                            cause,
+                        });
+                        false
+                    }
+                };
+                if let Some(open) = self.run_audit_refusals.clone()
+                    && (!repeated || open.count.is_power_of_two())
+                {
+                    // The start, then each doubling: a bounded number of lines.
+                    self.log(
+                        Level::Error,
+                        "scheduler",
+                        "run_audit_unavailable",
+                        format!(
+                            "refused={} since={} retry_seconds={} cause={}",
+                            open.count,
+                            open.since,
+                            open.retry_seconds(),
+                            open.cause
+                        ),
+                    );
+                }
+                // controller.state is rewritten as the run's end is recorded.
+                repeated
+            }
+            // The core was started (or its start was attempted) only after its
+            // audit opened: the audit works again.
+            Ending::Exited
+            | Ending::Stalled { .. }
+            | Ending::Unkillable { .. }
+            | Ending::SpawnFailed { .. } => {
+                if let Some(closed) = self.run_audit_refusals.take() {
+                    self.log(
+                        Level::Info,
+                        "scheduler",
+                        "run_audit_recovered",
+                        format!(
+                            "refused={} since={} failing_seconds={} outcome={}",
+                            closed.count,
+                            closed.since,
+                            finished.saturating_sub(closed.since),
+                            verdict.outcome.as_str()
+                        ),
+                    );
+                }
+                false
+            }
+            // A refusal for another reason, or a stop before the start, says
+            // nothing about the audit either way.
+            Ending::Refused { .. } | Ending::Stopped { .. } => false,
+        }
+    }
+
     fn finish_routine(
         &mut self,
         name: &str,
@@ -3485,6 +3581,10 @@ impl Control {
             self.read_or_default(&alerts, "the default alert cooldown")
                 .as_deref(),
         );
+        let refusal_retry = match &self.run_audit_refusals {
+            Some(refusals) if verdict.reason == "audit_unavailable" => refusals.retry_seconds(),
+            _ => routines::RETRY_FLOOR_SECONDS,
+        };
         let Some(entry) = self.routines.get_mut(name) else {
             self.log(
                 Level::Warn,
@@ -3510,11 +3610,12 @@ impl Control {
         | super::executor::Ending::Refused { .. } = report.ending
         {
             // Nothing ran: recorded, consumes no retry, tried again after the
-            // floor (the shell's admission_failed).
+            // floor (the shell's admission_failed) -- or, while runs are refused
+            // audit_unavailable, after the service-wide backoff.
             state.state = RoutineRunState::Failed;
             state.last_reason = verdict.reason.clone();
             state.last_exit = -1;
-            state.next_run = finished + routines::RETRY_FLOOR_SECONDS;
+            state.next_run = finished + refusal_retry;
             let snapshot = state.clone();
             let path = self.routine_state_path(name);
             if self.write_state(&path, snapshot.render()).is_err() {
@@ -4423,6 +4524,47 @@ fn origin_word(origin: &Origin) -> &'static str {
 
 fn static_operation(action: Action) -> &'static str {
     action.as_str()
+}
+
+/// Runs refused `audit_unavailable` in a row, service-wide: the audit is the
+/// package's, not a profile's, so every routine's retry backs off on it.
+#[derive(Clone, Debug)]
+struct AuditRefusals {
+    count: u32,
+    /// When the first refusal of the episode finished (epoch seconds).
+    since: u64,
+    /// The last refusal's cause.
+    cause: String,
+}
+
+/// The longest wait between automatic retries of a run refused
+/// `audit_unavailable`: a fix (or a restart) is picked up within it, and a
+/// lasting outage costs 48 refused runs a day instead of 2,880.
+const AUDIT_REFUSAL_RETRY_MAX_SECONDS: u64 = 1800;
+
+impl AuditRefusals {
+    /// 30 s, doubled with each refusal of the episode, at most 30 min.
+    fn retry_seconds(&self) -> u64 {
+        routines::RETRY_FLOOR_SECONDS
+            .saturating_mul(1 << self.count.saturating_sub(1).min(16))
+            .min(AUDIT_REFUSAL_RETRY_MAX_SECONDS)
+    }
+
+    fn degraded(&self) -> ControllerDegraded {
+        ControllerDegraded {
+            reason: "audit_unavailable",
+            since: self.since,
+            cause: sanitize_detail(
+                &format!(
+                    "{} runs refused: {}; automatic runs retry within {} s",
+                    self.count,
+                    self.cause,
+                    self.retry_seconds()
+                ),
+                DEGRADED_CAUSE_MAX,
+            ),
+        }
+    }
 }
 
 fn push_degraded(sinks: &mut Vec<&'static str>, sink: &'static str) {

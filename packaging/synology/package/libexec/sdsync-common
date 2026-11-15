@@ -406,7 +406,25 @@ internal_api_bridge_parent_argv_authorized() {
         '
 }
 
-require_internal_api_bridge_parent() {
+# The sync daemon is the same executable as the bridge, run as the package user
+# with the mode `--daemon` as argv[1] and its own options after it. It writes the
+# audit events of its runs in process (src/daemon/audit.rs, InProcessAudit), so
+# it may reach `api audit-event` -- and nothing else private: audit-rejected and
+# controller-wake stay bridge-only. Only argv[1] decides; `--daemon` later in
+# argv, or a mode that merely starts with it, is never authorization.
+internal_daemon_parent_argv_authorized() {
+    internal_cmdline=$1
+    [ -r "$internal_cmdline" ] || return 77
+    tr '\000' '\n' 2>/dev/null < "$internal_cmdline" |
+        awk '
+            NR == 2 { mode = $0 }
+            END { exit (NR >= 2 && mode == "--daemon") ? 0 : 1 }
+        '
+}
+
+# The caller's parent is the package's own bridge executable, live, under the
+# package uid. Sets internal_parent for the argv check that follows.
+require_internal_bridge_executable_parent() {
     internal_parent=${PPID:-0}
     pid_matches_command "$internal_parent" "$api_bridge" || return 77
     [ -f "$api_bridge" ] && [ ! -L "$api_bridge" ] || return 73
@@ -418,7 +436,16 @@ require_internal_api_bridge_parent() {
         *) return 73 ;;
     esac
     [ "$parent_bridge_identity" = "$expected_bridge_identity" ] || return 77
+}
+
+require_internal_api_bridge_parent() {
+    require_internal_bridge_executable_parent || return $?
     internal_api_bridge_parent_argv_authorized "/proc/$internal_parent/cmdline" || return 77
+}
+
+require_internal_daemon_audit_parent() {
+    require_internal_bridge_executable_parent || return $?
+    internal_daemon_parent_argv_authorized "/proc/$internal_parent/cmdline" || return 77
 }
 
 require_verified_controller_parent() {
