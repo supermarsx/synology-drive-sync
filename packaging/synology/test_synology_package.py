@@ -1020,7 +1020,7 @@ class BuilderTests(unittest.TestCase):
         for marker in (
             b"vue-loader 15.11.1",
             b"Copyright (c) 2015-present Yuxi (Evan) You",
-            b"webpack 5.110.3",
+            b"webpack 5.112.2",
             b"Copyright JS Foundation and other contributors",
             b"DSM supplies the global Vue runtime",
         ):
