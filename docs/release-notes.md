@@ -8,6 +8,16 @@ lists its own commits.
 
 ## Unreleased: the daemon is the DSM service engine
 
+- **Runs are audited again on DSM (26.65 refused every run `audit_unavailable`).** The daemon writes
+  its runs' audit events through the package manager, which accepted that endpoint only from the
+  bridge, so on a NAS every run was refused in 0 s and its routine retried it every 30 seconds for
+  good. The manager now accepts the daemon for `api audit-event` (and nothing else private); if it
+  refuses the daemon all the same, the daemon audits through bridge children instead and says so
+  once (`service_audit_transport`). The record a refused run left in the audit outbox is written and
+  retired by the first reconciliation after the upgrade. A refusal now names its cause
+  (`code=audit_event_caller_refused manager=…`), not `code: None`, and runs refused
+  `audit_unavailable` back off from 30 seconds to at most 30 minutes, with one Activity row and one
+  alert for the episode and `degraded=audit_unavailable` in `controller.state` while it lasts.
 - **A moved file under 8 MiB is uploaded instead of copied on the NAS.** A server-side copy first
   downloads the old copy to prove it, then runs a copy task and checks the result, which for small
   files took longer than sending them: a 10-file folder move went from about 40 s to about 18 s at

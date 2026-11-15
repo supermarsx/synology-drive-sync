@@ -305,9 +305,24 @@ the same reasons: `policy_*` (the security policy), `password_missing`, `secret_
 `audit_unavailable`. The audit trail is mandatory for a run: the daemon writes the audit record
 before the core starts and settles it when the core ends, in the daemon's own process (`transport=in_process`;
 a daemon that cannot confirm it is the package's user runs the same steps as bridge children,
-`transport=bridge`, and names why in `service_audit_transport`). A daemon pointed at a tree that is not a
+`transport=bridge`, and names why in `service_audit_transport`). The audit events themselves are
+written by the package manager's private `api audit-event` endpoint, which accepts two callers: the
+bridge, and the daemon (the same executable with `--daemon` as its mode, under the package's user).
+If the manager refuses the daemon all the same (`code=audit_event_caller_refused`), the daemon does
+that step again through bridge children and keeps them for the rest of its life, named once in
+`service_audit_transport` (`transport=bridge from=in_process cause= step=`): a run is never started
+unaudited, and never refused for the transport alone. A daemon pointed at a tree that is not a
 package tree has no audit helper; it runs unaudited and says so (`service_audit` in
 `controller.log`, once at start).
+
+A run refused `audit_unavailable` is retried by its routine after 30 seconds, then after 60, 120 and
+so on, doubling up to 30 minutes for as long as runs keep being refused (the audit is the package's,
+so the backoff is shared by every routine; a restart of the package starts it again at 30 seconds).
+Every refusal is recorded in `run.state` and the routine's state (`last_reason=audit_unavailable`,
+`next_run_epoch=`), and while it lasts `controller.state` carries `degraded=audit_unavailable` (the
+dashboard shows it in amber). The first refusal is one `run.failed` Activity row and one alert; a
+routine's repeated refusals add neither, until a run gets past its audit again (`run_audit_recovered`).
+A run you start yourself is always answered with its own Activity row.
 
 ### Failure alerts under the daemon
 
@@ -603,7 +618,8 @@ knowing when reading it:
 | `routine_fingerprint_format_changed` | `info`. A realtime routine's stored fingerprint was written by an earlier release (`from=`), so one comparison sync runs and the `to=v3` reading becomes the baseline. Replaces `routine_fingerprint_rebased` |
 | `service_engine` | The engine in force, once per daemon start: `engine=daemon file=absent\|daemon\|shell\|invalid\|unreadable` (`warn` when the file is `shell`, invalid or unreadable, with the path and cause) |
 | `service_audit` | `runs=audited transport=in_process\|bridge` (`info`), or `runs=unaudited` (`warn`) when the daemon's tree is not the package's `var` |
-| `service_audit_transport` | `warn`, once at start. The daemon could not run its audit steps in its own process and uses bridge children instead (`cause=`) |
+| `service_audit_transport` | `warn`, at most once per service life. At start: the daemon could not run its audit steps in its own process and uses bridge children instead (`cause=`). Later (`from=in_process`): the package manager refused the daemon's audit event (`cause=` names the code and the manager, `step=` the audit step that met it); that step and every later one go through bridge children |
+| `run_audit_unavailable` / `run_audit_recovered` | `error` / `info`, scheduler. Runs are refused `audit_unavailable` (`refused=` how many so far, `since=`, `retry_seconds=` the routine retry it now waits, `cause=`): named at the first refusal and again each time the count doubles, not on every retry / a run got past its audit again (`refused=`, `failing_seconds=`, `outcome=`); `controller.state` carries `degraded=audit_unavailable` in between |
 | `run_deferred` | `warn`. A run was not started because `management.lock` was live (`reason=lock_busy`, `scope=`, `cause=`); it is retried and no retry is consumed |
 | `routine_backend` | The change source of a realtime routine changed (`profile=`, `backend=inotify\|polling\|none`, `reason=ok\|watch_limit\|watch_unavailable\|watch_setup_failed`, then the detail; `none` while the process-wide walk cap refuses the arm). `warn` when the reason is not `ok`. One line per cause: later reports of the same backend, reason and cause (the skipped-entries count of a polling tree aside) are counted, and the report that ends the episode carries `suppressed_reports=`, `previous_backend=` and `previous_reason=`; a re-arm that ends one says `episode_ended=rearmed` |
 | `service_layout` | `info`, once per daemon start: `home=` and `var=` as named and `resolved=` as followed. DSM's aliases are followed one level only; the target must be a directory owned by the package user and not writable by group or others, and a refusal names both paths |
