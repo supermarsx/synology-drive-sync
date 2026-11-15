@@ -12,15 +12,15 @@
     "test": "node --test --test-concurrency=1 test/*.test.mjs"
   },
   "devDependencies": {
-    "@babel/core": "8.0.1",
-    "@babel/preset-env": "8.0.2",
+    "@babel/core": "8.0.9",
+    "@babel/preset-env": "8.0.7",
     "babel-loader": "10.1.1",
     "css-loader": "7.1.5",
     "mini-css-extract-plugin": "2.10.2",
     "vue": "2.7.16",
     "vue-loader": "15.11.1",
     "vue-template-compiler": "2.7.16",
-    "webpack": "5.110.3",
+    "webpack": "5.112.2",
     "webpack-cli": "7.2.3"
   }
 }

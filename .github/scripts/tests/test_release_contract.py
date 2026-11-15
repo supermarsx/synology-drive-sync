@@ -541,7 +541,7 @@ class WorkflowWiringTests(unittest.TestCase):
         )
         self.assertIn(
             "FROM debian:bookworm-slim@sha256:"
-            "88200866dfff7ea7f5cbcb6ec7c8a701889efe6fe859fe64d6990e4b07ea4171 AS runtime",
+            "3783cc01769c7b2b1b83a5c5ad96c815348e28ed7da68e2e3687004faa906251 AS runtime",
             dockerfile,
         )
         for instruction in re.findall(r"^FROM\s+([^\s]+)", dockerfile, re.MULTILINE):
@@ -566,19 +566,19 @@ class WorkflowWiringTests(unittest.TestCase):
             path.read_text(encoding="utf-8") for path in workflow_paths
         )
         expected_actions = {
-            "Swatinem/rust-cache": "6323deb102c322ba6fcbdcafc7e3dddab59af2b6",
+            "Swatinem/rust-cache": "d1527c8f67ef9af357290475d4af4b0fab8f12e0",
             "actions/attest": "1e69f48acb82d1966a394da916b4c1698aa569d6",
             "actions/checkout": "3d3c42e5aac5ba805825da76410c181273ba90b1",
             "actions/configure-pages": "45bfe0192ca1faeb007ade9deae92b16b8254a0d",
             "actions/deploy-pages": "368f82528645a54fb793d4d04e342629a3f51346",
-            "actions/download-artifact": "3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c",
-            "actions/setup-node": "820762786026740c76f36085b0efc47a31fe5020",
+            "actions/download-artifact": "9000827ccba6bdab643e8b6fd33ac0654aef8333",
+            "actions/setup-node": "949feb2413d6458794dcd2491c4babbbce0c15c1",
             "actions/upload-artifact": "043fb46d1a93c77aae656e7c1c64a875d1fc6a0a",
             "actions/upload-pages-artifact": "fc324d3547104276b827a68afc52ff2a11cc49c9",
             "dtolnay/rust-toolchain": "4360b52568e2003a75bf9bc1d59f33a8e3fc893c",
             "lycheeverse/lychee-action": "e7477775783ea5526144ba13e8db5eec57747ce8",
-            "pnpm/action-setup": "0977fd99725f1db4007ccb2928dbb4e90d06cc86",
-            "taiki-e/install-action": "0758d235715de2f3551eacc980d9ae8fce9342c3",
+            "pnpm/action-setup": "ea17c68df8912ef543352723c149a84f56e3d413",
+            "taiki-e/install-action": "86f7a0ffb25f40114606501a311ebcfaf882ea32",
         }
         uses_values = re.findall(
             r"^\s*(?:-\s+)?uses:\s+([^#\s]+)(?:\s+#.*)?$",
@@ -746,7 +746,7 @@ class WorkflowWiringTests(unittest.TestCase):
         }
         zig_installer = "run: bash .github/scripts/install-zig.sh"
         installer_action = (
-            "taiki-e/install-action@0758d235715de2f3551eacc980d9ae8fce9342c3"
+            "taiki-e/install-action@86f7a0ffb25f40114606501a311ebcfaf882ea32"
         )
         qemu_image = (
             "docker.io/tonistiigi/binfmt:qemu-v10.2.3@sha256:"
