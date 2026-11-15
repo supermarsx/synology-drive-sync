@@ -5265,7 +5265,14 @@ api_command() {
             # These bounded operations are internal package interfaces. The
             # package UID owns their private state and is therefore the integrity
             # boundary; normal public CLI entrypoints still discard attribution.
-            require_internal_api_bridge_parent || api_error forbidden "private bridge endpoint" 77
+            # The sync daemon (the same executable, `--daemon`) writes its runs'
+            # audit events in process and may reach audit-event, nothing else.
+            if [ "$api_operation" = audit-event ]; then
+                require_internal_api_bridge_parent || require_internal_daemon_audit_parent \
+                    || api_error forbidden "private bridge endpoint" 77
+            else
+                require_internal_api_bridge_parent || api_error forbidden "private bridge endpoint" 77
+            fi
             ;;
         *)
             # Public/API mutation entry never trusts caller-reserved context.
