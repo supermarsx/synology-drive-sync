@@ -30,6 +30,9 @@ struct World {
     /// An exit-0 run carries the result record of a sync that left nothing
     /// undone (the daemon's evidence that it converged).
     converged_record: bool,
+    /// Every run is refused `audit_unavailable` with this cause before its
+    /// core starts, as the executor refuses a run whose audit cannot open.
+    refuse_audit: Option<String>,
 }
 
 struct FakeLauncher {
@@ -55,13 +58,36 @@ impl Launcher for FakeLauncher {
         sink: Box<dyn Fn(ExecEvent) + Send>,
     ) -> io::Result<Box<dyn RunControl>> {
         let plan = *self.plan.lock().unwrap();
-        {
+        let refused = {
             let mut world = self.world.lock().unwrap();
             world.launched.push(spec);
+            world.refuse_audit.clone()
+        };
+        let (stop, requests) = mpsc::channel();
+        if let Some(cause) = refused {
+            thread::spawn(move || {
+                sink(ExecEvent::Finished(Box::new(RunReport {
+                    exit: -1,
+                    ending: Ending::Refused {
+                        reason: "audit_unavailable",
+                        cause,
+                    },
+                    stderr_tail: Vec::new(),
+                    records: Vec::new(),
+                    record_error: None,
+                    oom_proven: None,
+                    memory_note: None,
+                    audit_error: None,
+                    last_phase: None,
+                })));
+            });
+            return Ok(Box::new(FakeControl { stop }));
+        }
+        {
+            let mut world = self.world.lock().unwrap();
             world.running += 1;
             world.max_running = world.max_running.max(world.running);
         }
-        let (stop, requests) = mpsc::channel();
         let world = Arc::clone(&self.world);
         let grace = self.grace;
         thread::spawn(move || {
@@ -3265,4 +3291,163 @@ fn a_recursive_element_is_never_skipped() {
     appeared(&h, "a");
     h.wait_for("the run", PATIENT, |h| h.launched() == 2);
     assert_eq!(skipped(&h)["skipped_runs"], 0);
+}
+
+/// fix11: a run refused `audit_unavailable` (26.65 on DSM: the manager refused
+/// the daemon's audit events) is not a hot loop. The routine's retry backs off,
+/// 30 s doubling to at most 30 min; the episode is published in controller.state
+/// as `degraded=audit_unavailable` and named in run.state and the routine's
+/// state on every refusal, but writes one Activity row and one alert at its
+/// start, not one per retry (2,664 rows in 22 h). A run someone asks for is
+/// always answered in Activity. The first run whose audit opens ends it, named.
+#[test]
+fn a_run_refused_audit_unavailable_backs_off_and_is_named_once_per_change() {
+    let cause = "the run's audit could not be opened: audit begin failed: kind=unavailable \
+                 code=audit_event_caller_refused";
+    let h = Harness::new("audit-refused", due_alpha);
+    h.world.lock().unwrap().refuse_audit = Some(cause.into());
+    let routine_state = |h: &Harness| h.state("routines/alpha.state");
+    let failed_rows = |h: &Harness| {
+        h.sink
+            .rows
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|r| r.code == "run.failed")
+            .count()
+    };
+    let finished = |h: &Harness, n: usize| {
+        h.launched() >= n
+            && h.idle()
+            && h.logs()
+                .iter()
+                .any(|l| l.starts_with(&format!("run_finished id={n} ")))
+    };
+    let refusals = |h: &Harness, n: usize| {
+        finished(h, n) && routine_state(h).contains("last_reason=audit_unavailable\n")
+    };
+    h.wait_for("the first refusal", PATIENT, |h| refusals(h, 1));
+    let state = routine_state(&h);
+    assert!(state.contains("state=failed\n"), "{state}");
+    assert!(
+        state.contains(&format!("next_run_epoch={}\n", T0 + 30)),
+        "{state}"
+    );
+    let run_state = h.state("run.state");
+    assert!(
+        run_state.contains("reason=audit_unavailable\n"),
+        "{run_state}"
+    );
+    assert!(
+        run_state.contains("code=audit_event_caller_refused"),
+        "{run_state}"
+    );
+    h.wait_for("the episode published", PATIENT, |h| {
+        h.state("controller.state")
+            .contains("degraded=audit_unavailable\n")
+    });
+    let controller = h.state("controller.state");
+    assert!(
+        controller.contains(&format!("degraded_since={T0}\n"))
+            && controller.contains("degraded_cause=1 runs refused: ")
+            && controller.contains("retry within 30 s"),
+        "{controller}"
+    );
+    assert_eq!(failed_rows(&h), 1);
+
+    // Retried after 30 s, then 60, then 120: each refusal recorded, none in Activity.
+    let mut due = T0 + 30;
+    for (n, wait) in [(2_usize, 60_u64), (3, 120), (4, 240)] {
+        h.advance(due - h.wall.load(Ordering::SeqCst));
+        h.wait_for("the next refusal", PATIENT, |h| refusals(h, n));
+        due += wait;
+        let state = routine_state(&h);
+        assert!(
+            state.contains(&format!("next_run_epoch={due}\n")),
+            "{n}: {state}"
+        );
+        // Not due a second earlier.
+        h.advance(due - 1 - h.wall.load(Ordering::SeqCst));
+        thread::sleep(Duration::from_millis(200));
+        assert_eq!(h.launched(), n, "retried before its backoff");
+    }
+    assert_eq!(failed_rows(&h), 1, "one Activity row for the episode");
+    assert_eq!(
+        h.alerts
+            .calls
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|c| c.starts_with("result alpha failed=true"))
+            .count(),
+        1,
+        "one alert for the episode"
+    );
+    let named: Vec<String> = h
+        .logs()
+        .into_iter()
+        .filter(|l| l.starts_with("run_audit_unavailable "))
+        .collect();
+    // The start and each doubling (refusals 1, 2 and 4), not every refusal.
+    assert_eq!(named.len(), 3, "{named:#?}");
+    assert!(
+        named[0].starts_with("run_audit_unavailable refused=1 "),
+        "{named:#?}"
+    );
+    assert!(named[2].contains("refused=4 ") && named[2].contains("retry_seconds=240"));
+    assert!(
+        h.state("controller.state")
+            .contains("degraded_cause=4 runs refused: "),
+        "{}",
+        h.state("controller.state")
+    );
+
+    // Asked for, a refused run is answered in Activity.
+    assert_eq!(h.ask(run("alpha"))["ok"], true);
+    h.wait_for("the requested refusal", PATIENT, |h| refusals(h, 5));
+    assert_eq!(failed_rows(&h), 2);
+
+    // The audit works again: the next run ends the episode, by name.
+    h.world.lock().unwrap().refuse_audit = None;
+    h.advance(due - h.wall.load(Ordering::SeqCst));
+    h.wait_for("the run that opens its audit", PATIENT, |h| {
+        finished(h, 6) && h.state("run.state").contains("state=succeeded\n")
+    });
+    h.wait_for("the episode cleared", PATIENT, |h| {
+        !h.state("controller.state").contains("degraded")
+    });
+    assert!(
+        h.logs()
+            .iter()
+            .any(|l| l.starts_with("run_audit_recovered refused=5 ")),
+        "{:?}",
+        h.logs()
+    );
+    assert!(
+        h.sink
+            .rows
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|r| r.code == "run.succeeded"),
+        "the recovery is a state change, and Activity shows it"
+    );
+}
+
+/// The audit_unavailable retry: 30 s doubled per refusal, never past 30 min,
+/// never overflowing however long the outage.
+#[test]
+fn the_audit_refusal_retry_doubles_to_a_ceiling() {
+    let at = |count| {
+        AuditRefusals {
+            count,
+            since: T0,
+            cause: String::new(),
+        }
+        .retry_seconds()
+    };
+    assert_eq!(
+        [at(1), at(2), at(3), at(6), at(7), at(40), at(u32::MAX)],
+        [30, 60, 120, 960, 1800, 1800, 1800]
+    );
 }
