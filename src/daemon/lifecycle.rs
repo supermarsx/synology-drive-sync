@@ -813,11 +813,36 @@ pub(crate) fn run_daemon(options: &Options) -> ExitCode {
     let audit: Arc<dyn super::audit::RunAudit> = if audited {
         // The steps run in this process (no process start per step); a daemon
         // that cannot vouch for its own identity runs them as bridge children,
-        // as it always did, and says why.
+        // as it always did, and says why. So does one whose manager refuses it
+        // as a caller of `api audit-event` (a manager older than this daemon):
+        // from that step on, for the rest of this service's life.
+        let bridge = Arc::new(super::audit::BridgeAudit {
+            bridge: std::env::current_exe().unwrap_or_else(|_| {
+                PathBuf::from(super::super::PACKAGE_ROOT).join("bin/sdsync-dsm-api")
+            }),
+            env: api_env.clone(),
+            uid,
+        });
         match super::audit::InProcessAudit::production(uid) {
             Ok(in_process) => {
                 audit_transport = "in_process";
-                Arc::new(in_process)
+                let switch_sink = FileSink::new(&log_root);
+                Arc::new(super::audit::FallbackAudit::new(
+                    Arc::new(in_process),
+                    bridge,
+                    Box::new(move |cause, step| {
+                        log_or_stderr(
+                            &switch_sink,
+                            Level::Warn,
+                            "service_audit_transport",
+                            format!(
+                                "transport=bridge from=in_process cause={} step={}",
+                                sanitize_detail(cause, 240),
+                                sanitize_detail(step, 240)
+                            ),
+                        );
+                    }),
+                ))
             }
             Err(cause) => {
                 audit_transport = "bridge";
@@ -827,13 +852,7 @@ pub(crate) fn run_daemon(options: &Options) -> ExitCode {
                     "service_audit_transport",
                     format!("transport=bridge cause={cause}"),
                 );
-                Arc::new(super::audit::BridgeAudit {
-                    bridge: std::env::current_exe().unwrap_or_else(|_| {
-                        PathBuf::from(super::super::PACKAGE_ROOT).join("bin/sdsync-dsm-api")
-                    }),
-                    env: api_env.clone(),
-                    uid,
-                })
+                bridge
             }
         }
     } else {
