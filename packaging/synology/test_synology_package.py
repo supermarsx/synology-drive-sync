@@ -10935,7 +10935,10 @@ if len(sys.argv) == 4 and sys.argv[1] == "--consume-job":
     def _watcher_before_exec(self) -> int:
         """The watcher's pid once its pid file exists, still before its exec."""
         pid_path = self.real_var / "run/watch-watch.pid"
-        deadline = time.monotonic() + 15
+        # 60 s, not 15: on a loaded host (the 26.66 gate's bash shard 1, three runs in four) the
+        # pid file took longer than 15 s to appear. Waiting longer costs nothing when it appears,
+        # and a watcher that never spawns still fails here by name.
+        deadline = time.monotonic() + 60
         while time.monotonic() < deadline:
             try:
                 pid = int(pid_path.read_text(encoding="utf-8").strip())
