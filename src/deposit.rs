@@ -1432,7 +1432,8 @@ pub fn end(context: Option<std::sync::Arc<DepositContext>>, report: &mut Deposit
     }
 }
 
-/// [`recover`] against the File Station client: what a run calls before it lists the NAS.
+/// The journal recovery (`recover`) against the File Station client: what a run calls before it
+/// lists the NAS.
 pub fn recover_with(
     client: &crate::api::ApiClient,
     root: &RemoteRoot,
