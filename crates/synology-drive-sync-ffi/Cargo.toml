@@ -1,12 +1,28 @@
 [package]
 name = "synology-drive-sync-ffi"
-version = "0.1.0"
+# Stamped together with the root crate; see the comment on the root manifest's `version`.
+version = "0.26.66"
 edition = "2024"
 rust-version = "1.90"
-description = "Stable C ABI for the synology-drive-sync synchronous SDK"
+description = "Stable C ABI for the synology-drive-sync Rust SDK: push a local folder to a Synology NAS over the File Station API from C, C++ or any language with a C FFI. JSON in, JSON out."
 license = "MIT"
+readme = "crates-io.md"
 repository = "https://github.com/supermarsx/synology-drive-sync"
-publish = false
+homepage = "https://supermarsx.github.io/synology-drive-sync/ffi/index.html"
+documentation = "https://docs.rs/synology-drive-sync-ffi"
+keywords = ["synology", "nas", "ffi", "c-api", "file-station"]
+categories = ["api-bindings", "filesystem", "network-programming"]
+# The integration test shares a support module with the root crate's tests through a relative
+# `#[path]`, so it cannot be built from a registry download and is not packaged.
+include = [
+    "/crates-io.md",
+    "/include/sdsync.h",
+    "/license.md",
+    "/src/**",
+]
+
+[package.metadata.docs.rs]
+targets = ["x86_64-unknown-linux-gnu"]
 
 [lib]
 name = "sdsync"
@@ -15,7 +31,9 @@ crate-type = ["rlib", "cdylib"]
 [dependencies]
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
-synology-drive-sync = { path = "../.." }
+# Published after the root crate, at exactly the version it was stamped with; the path keeps
+# workspace builds on the checkout.
+synology-drive-sync = { version = "=0.26.66", path = "../.." }
 zeroize = "1.9.0"
 
 [dev-dependencies]

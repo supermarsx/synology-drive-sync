@@ -7,8 +7,10 @@ individual low-level File Station calls.
 
 > [!NOTE]
 > Use a C SDK asset from a release that lists the SDK in its release notes. Older releases do not
-> gain DLL/shared-library artifacts retroactively. The Cargo package for the FFI crate is an internal
-> workspace package and is not published to crates.io.
+> gain DLL/shared-library artifacts retroactively. The FFI crate is also published to crates.io as
+> [`synology-drive-sync-ffi`](https://crates.io/crates/synology-drive-sync-ffi) (version `0.YY.N` for
+> calendar release `YY.N`) for builds from source; the checksummed archives remain the supported way to
+> obtain the shared library.
 
 ## Contract at a glance
 

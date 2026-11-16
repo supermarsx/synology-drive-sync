@@ -2,12 +2,15 @@
 
 The Cargo package contains both the `synology-drive-sync` executable and a Rust library target
 imported as `synology_drive_sync`. Calendar releases publish the version-matched source bundle
-`synology-drive-sync-YY.N-rust-sdk.tar.gz`, and Rust applications can pin the same release tag
-directly from Git.
+`synology-drive-sync-YY.N-rust-sdk.tar.gz`. The same release is published to
+[crates.io](https://crates.io/crates/synology-drive-sync) as version `0.YY.N`, and Rust applications
+can alternatively pin the release tag directly from Git.
 
 > [!CAUTION]
-> The Cargo package remains pre-1.0. Pin an exact calendar tag, review SDK changes before upgrading,
-> and enter through the high-level `sdk::Engine` instead of composing low-level mutation methods.
+> The Cargo package remains pre-1.0 and is numbered by calendar release, so Cargo treats every
+> `0.26.x` as compatible even when a release changes the SDK. Pin an exact version
+> (`=0.YY.N`) or calendar tag, review SDK changes before upgrading, and enter through the high-level
+> `sdk::Engine` instead of composing low-level mutation methods.
 
 ## Supported embedding surface
 

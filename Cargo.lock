@@ -1951,7 +1951,7 @@ dependencies = [
 
 [[package]]
 name = "synology-drive-sync"
-version = "0.1.0"
+version = "0.26.66"
 dependencies = [
  "apple-native-keyring-store",
  "bytes",
@@ -1987,7 +1987,7 @@ dependencies = [
 
 [[package]]
 name = "synology-drive-sync-ffi"
-version = "0.1.0"
+version = "0.26.66"
 dependencies = [
  "md-5",
  "serde",

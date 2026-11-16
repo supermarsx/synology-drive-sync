@@ -1,15 +1,84 @@
-//! Stable JSON-over-C ABI for `synology-drive-sync`.
+//! Stable C ABI for [`synology-drive-sync`](https://docs.rs/synology-drive-sync): a one-way file
+//! deposit to a Synology NAS over the DSM File Station API, callable from C, C++ and any language
+//! with a C FFI.
+//!
+//! The library builds as `libsdsync.so` (Linux), `libsdsync.dylib` (macOS) and `sdsync.dll`
+//! (Windows), plus the Rust `rlib` this documentation describes. It wraps the same safe
+//! synchronous `sdk::Engine` workflow the Rust SDK exposes: one blocking call scans the source,
+//! plans, lets the host approve the plan, transfers, verifies and returns a JSON result. The
+//! source folder is opened read-only, remote-only entries are kept unless a bounded deletion
+//! policy is requested, and nothing is changed unless the host's plan callback returns
+//! `SDSYNC_PLAN_APPLY`.
 //!
 //! The ABI deliberately exchanges versioned UTF-8 JSON instead of Rust data
 //! layouts. Secrets are supplied through a caller callback into library-owned
 //! zeroizing buffers, and every returned byte buffer has one matching free
 //! function.
+//!
+//! # The C header
+//!
+//! The C declarations are in `include/sdsync.h`, shipped in this package and in the repository.
+//! Include it rather than copying declarations. Every symbol carries a `_v1` suffix; check
+//! `sdsync_abi_version_v1() == SDSYNC_ABI_VERSION_V1` before using any of them. A future
+//! incompatible contract gets a new suffix, never a silent change to `_v1`.
+//!
+//! # Calling it
+//!
+//! The exported functions are ordinary Rust items as well, so they can be exercised from Rust.
+//! A request that fails validation never reaches the network, which makes it a self-contained
+//! example of the ownership rule: every run, including a failed one, hands back one result
+//! handle that must be freed exactly once.
+//!
+//! ```
+//! use std::ptr;
+//! use sdsync::{
+//!     SDSYNC_ABI_VERSION_V1, SDSYNC_STATUS_INVALID_ARGUMENT, SDSYNC_STATUS_OK,
+//!     sdsync_abi_version_v1, sdsync_result_bytes_v1, sdsync_result_free_v1, sdsync_run_v1,
+//! };
+//!
+//! assert_eq!(sdsync_abi_version_v1(), SDSYNC_ABI_VERSION_V1);
+//!
+//! let request = b"{}"; // not a valid `sdsync.request.v1` document
+//! let mut result = ptr::null_mut();
+//! // SAFETY: `request` is readable for its length, no callbacks or cancellation handle are
+//! // supplied, and `result` is writable storage for one pointer.
+//! let status = unsafe {
+//!     sdsync_run_v1(request.as_ptr(), request.len() as u64, ptr::null(), ptr::null(), &mut result)
+//! };
+//! assert_eq!(status, SDSYNC_STATUS_INVALID_ARGUMENT);
+//!
+//! let (mut data, mut length) = (ptr::null(), 0u64);
+//! // SAFETY: `result` is the live handle `sdsync_run_v1` just returned.
+//! assert_eq!(unsafe { sdsync_result_bytes_v1(result, &mut data, &mut length) }, SDSYNC_STATUS_OK);
+//! // SAFETY: the view is valid until the result is freed below.
+//! let json = unsafe { std::slice::from_raw_parts(data, length as usize) };
+//! assert!(std::str::from_utf8(json).unwrap().contains("sdsync.ffi-result.v1"));
+//! // SAFETY: freed exactly once, after the last use of `json`.
+//! unsafe { sdsync_result_free_v1(result) };
+//! ```
+//!
+//! # Building
+//!
+//! The crate must be built with `panic = "unwind"` so a Rust panic is contained at the ABI
+//! boundary instead of aborting the host process; a `panic = "abort"` build fails to compile on
+//! purpose. That is Cargo's default for both the dev and release profiles. In the repository
+//! workspace, whose CLI release profile aborts, use `--profile ffi-release`.
+//!
+//! # Feature flags
+//!
+//! None.
+//!
+//! # Trademarks
+//!
+//! Synology, DSM, File Station and QuickConnect are trademarks of Synology Inc. This is an
+//! independent open-source project; it is not affiliated with, endorsed by or supported by
+//! Synology.
 
 #![deny(unsafe_op_in_unsafe_fn)]
 
 #[cfg(panic = "abort")]
 compile_error!(
-    "synology-drive-sync-ffi requires panic=unwind for ABI containment; build it with `cargo build -p synology-drive-sync-ffi --profile ffi-release`"
+    "synology-drive-sync-ffi requires panic=unwind for ABI containment (Cargo's default); in the repository workspace, build it with `cargo build -p synology-drive-sync-ffi --profile ffi-release`"
 );
 
 use std::cell::RefCell;

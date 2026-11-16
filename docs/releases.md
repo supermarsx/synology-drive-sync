@@ -121,6 +121,27 @@ Rust applications can alternatively pin the same release tag directly:
 synology-drive-sync = { git = "https://github.com/supermarsx/synology-drive-sync", tag = "YY.N" }
 ```
 
+### crates.io packages
+
+Each calendar release also publishes two crates to [crates.io](https://crates.io): the
+`synology-drive-sync` Rust library and command-line program (`cargo install synology-drive-sync`),
+and `synology-drive-sync-ffi`, the C ABI crate. Calendar release `YY.N` becomes crate version
+`0.YY.N` (26.66 is `0.26.66`; 27.1 will be `0.27.1`). The calendar number is allocated after a commit
+lands on `main`, so the release workflow stamps `0.YY.N` into both manifests and `Cargo.lock` in its
+own checkout (`.github/scripts/crate-version.py stamp`) and publishes from there; the version committed
+in `Cargo.toml` is only the last number stamped by hand, and CI checks that every place naming it
+agrees. Publication follows the GitHub Release, uses crates.io Trusted Publishing (a short-lived
+OpenID Connect token, no stored secret), uploads the library first, waits until it is indexed, and
+then uploads the FFI crate. A re-run skips any crate whose version is already published. The crates.io
+package of the library does not contain `tests/`, `packaging/`, the dashboard or the documentation site.
+
+Maintainer setup, once per crate: crates.io cannot create a crate through Trusted Publishing, so the
+first version of each crate is uploaded by hand (`synology-drive-sync` first, then
+`synology-drive-sync-ffi`). Afterwards, on each crate's **Settings > Trusted Publishing** page, add a
+GitHub publisher with repository owner `supermarsx`, repository `synology-drive-sync`, workflow
+filename `release.yml` and environment `crates-io`. The release workflow's `publish-crates` job then
+needs no stored token.
+
 The C SDK is published for every native OS/architecture pair:
 
 | OS | Architecture | Release asset |
