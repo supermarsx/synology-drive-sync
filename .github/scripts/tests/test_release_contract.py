@@ -535,8 +535,8 @@ class WorkflowWiringTests(unittest.TestCase):
     def test_release_container_bases_are_current_and_immutable(self):
         dockerfile = (REPOSITORY_ROOT / "Dockerfile").read_text(encoding="utf-8")
         self.assertIn(
-            "FROM rust:1.90-bookworm@sha256:"
-            "3914072ca0c3b8aad871db9169a651ccfce30cf58303e5d6f2db16d1d8a7e58f AS builder",
+            "FROM rust:1.100-bookworm@sha256:"
+            "ade39a710ef85f3506cffcfec3e8a24ba090badef1dff2fb798f71d878833fea AS builder",
             dockerfile,
         )
         self.assertIn(
@@ -828,6 +828,45 @@ class WorkflowWiringTests(unittest.TestCase):
             zig_script,
         )
 
+    def test_pinned_rust_toolchain_is_the_msrv_everywhere(self):
+        manifest = tomllib.loads(
+            (REPOSITORY_ROOT / "Cargo.toml").read_text(encoding="utf-8")
+        )
+        msrv = manifest["package"]["rust-version"]
+        ffi_manifest = tomllib.loads(
+            (
+                REPOSITORY_ROOT / "crates/synology-drive-sync-ffi/Cargo.toml"
+            ).read_text(encoding="utf-8")
+        )
+        self.assertEqual(ffi_manifest["package"]["rust-version"], msrv)
+        toolchain = f"{msrv}.0"
+        for workflow in ("ci.yml", "docs.yml", "release.yml"):
+            text = (REPOSITORY_ROOT / ".github/workflows" / workflow).read_text(
+                encoding="utf-8"
+            )
+            pins = re.findall(r"^\s+toolchain: (\S+)$", text, re.MULTILINE)
+            self.assertTrue(pins, workflow)
+            self.assertEqual(set(pins), {toolchain}, workflow)
+        ci = (REPOSITORY_ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8")
+        self.assertIn(f"- name: Rust {msrv} compatibility", ci)
+        # The test matrix keeps following the moving stable toolchain.
+        test_job = ci[ci.index("\n  test:") : ci.index("\n  coverage:")]
+        self.assertNotIn("toolchain:", test_job)
+        dockerfile = (REPOSITORY_ROOT / "Dockerfile").read_text(encoding="utf-8")
+        self.assertIn(f"FROM rust:{msrv}-bookworm@sha256:", dockerfile)
+        coverage_env = (REPOSITORY_ROOT / ".config/coverage.env").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn(f"RUST_TOOLCHAIN={toolchain}\n", coverage_env)
+        for document in (
+            "docs/installation.md",
+            "docs/dsm/package-development.md",
+        ):
+            text = (REPOSITORY_ROOT / document).read_text(encoding="utf-8")
+            self.assertIn(f"Rust {msrv} or newer", text, document)
+        readme = (REPOSITORY_ROOT / "readme.md").read_text(encoding="utf-8")
+        self.assertIn(f"rust-{msrv}%2B", readme)
+
     def test_ui_computed_browser_gate_is_authoritative_once(self):
         ci = (REPOSITORY_ROOT / ".github/workflows/ci.yml").read_text(
             encoding="utf-8"
@@ -1090,7 +1129,7 @@ class WorkflowWiringTests(unittest.TestCase):
         self.assertEqual(
             coverage_env.splitlines(),
             [
-                "RUST_TOOLCHAIN=1.90.0",
+                "RUST_TOOLCHAIN=1.100.0",
                 "CARGO_LLVM_COV_VERSION=0.9.0",
                 "COVERAGE_MIN_LINES=90",
                 "COVERAGE_DSM_MIN_LINES=74",

@@ -518,8 +518,10 @@ the idle TTL (`session_ttl_shortened`). New core log events: `session.borrowed`,
 
 ## Read this before upgrading
 
-- **Rust 1.90 or newer is needed to build from source** (was 1.88). The verified-pair index uses redb
-  4.4, which reports a damaged file as an error instead of crashing, and needs 1.90.
+- **Rust 1.100 or newer is needed to build from source** (was 1.88). The verified-pair index uses redb
+  4.4, which reports a damaged file as an error instead of crashing, and needs 1.90. Releases are
+  built with 1.100. Rust 1.99 built armv7 code that armv7 NAS models with VFPv3-D16 and no NEON
+  (such as the Armada 370) stop with an illegal instruction.
 - **Post-run reconciliation no longer re-reads the whole tree.** It still re-lists both sides in full,
   but verifies live only the pairs the run touched plus a canary of 25; untouched pairs whose facts
   did not move keep the plan pass's digests. A run that changed two files in 1,000 now asks the NAS for
