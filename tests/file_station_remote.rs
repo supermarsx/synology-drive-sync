@@ -948,11 +948,17 @@ fn a_rename_onto_a_taken_name_or_a_failing_rename_names_the_path_and_moves_nothi
     let client = connect(&server, 0);
     let root = RemoteRoot::parse("/team/rn").unwrap();
 
+    server.watch_file("/team/rn/A.txt");
     let taken = client
         .rename(&root, "/team/rn/a.txt", "A.txt")
         .expect_err("the new name is taken");
     assert_eq!(taken.refused_remote_path(), Some("/team/rn/a.txt"));
     assert_eq!(taken.api_code(), Some(414));
+    assert_eq!(
+        server.file_history("/team/rn/A.txt"),
+        vec![("start".to_owned(), Some(b"A".to_vec()))],
+        "a refused rename never touched the taken name"
+    );
 
     server.fail_api_operation_times("SYNO.FileStation.Rename.rename", 900, 2);
     for _ in 0..2 {
@@ -969,6 +975,53 @@ fn a_rename_onto_a_taken_name_or_a_failing_rename_names_the_path_and_moves_nothi
     assert!(
         escaped.is_err(),
         "a new name is one component inside the root"
+    );
+}
+
+/// The mock's other Rename model: rename(2), which replaces a file with a file in one step. The
+/// atomic deposit is tested under both; which one DSM 7.4.1 has is NAS question W2.
+#[test]
+fn a_mock_modelling_rename2_replaces_a_file_in_one_request_and_never_shows_it_absent() {
+    let server = MockFileStation::start();
+    server.rename_replaces_existing_files();
+    server.add_directory("/team/rn");
+    server.add_directory("/team/rn/dir");
+    server.add_file("/team/rn/new.txt", b"new", 1_700_000_100);
+    server.add_file("/team/rn/final.txt", b"old", 1_700_000_000);
+    server.add_file("/team/rn/other.txt", b"other", 1_700_000_000);
+    server.watch_file("/team/rn/final.txt");
+    let client = connect(&server, 0);
+    let root = RemoteRoot::parse("/team/rn").unwrap();
+
+    let renamed = client
+        .rename(&root, "/team/rn/new.txt", "final.txt")
+        .expect("rename(2) replaces an existing file");
+
+    assert_eq!(renamed, "/team/rn/final.txt");
+    assert_eq!(
+        server.file_contents("/team/rn/final.txt"),
+        Some(b"new".to_vec())
+    );
+    assert!(server.file_contents("/team/rn/new.txt").is_none());
+    assert_eq!(
+        server.file_history("/team/rn/final.txt"),
+        vec![
+            ("start".to_owned(), Some(b"old".to_vec())),
+            (
+                "SYNO.FileStation.Rename.rename".to_owned(),
+                Some(b"new".to_vec())
+            ),
+        ],
+        "the final name went from old to new with nothing in between"
+    );
+    // A directory is never replaced, in either model.
+    let onto_directory = client
+        .rename(&root, "/team/rn/other.txt", "dir")
+        .expect_err("a directory is in the way");
+    assert_eq!(onto_directory.api_code(), Some(414));
+    assert_eq!(
+        server.file_contents("/team/rn/other.txt"),
+        Some(b"other".to_vec())
     );
 }
 

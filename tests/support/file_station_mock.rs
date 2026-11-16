@@ -199,6 +199,12 @@ struct ServerState {
     /// Requests whose client closed or reset the connection part-way through the body: a
     /// cancelled or stopped upload. Legitimate client behaviour, so counted rather than a panic.
     aborted_requests: usize,
+    /// Whether `Rename` onto an existing *file* replaces it, the way rename(2) does, instead of
+    /// refusing with 414 as DSM is documented to (NAS question W2). Off by default.
+    rename_replaces_files: bool,
+    /// Paths whose content is recorded after every request that changes it: what a reader of the
+    /// NAS could have seen at each request boundary. `None` is "absent".
+    watched: BTreeMap<String, Vec<(String, Option<Vec<u8>>)>>,
 }
 
 #[derive(Debug)]
@@ -341,6 +347,8 @@ impl MockFileStation {
             fail_next_copy_leaving_partial: None,
             partial_copy_tasks: BTreeMap::new(),
             aborted_requests: 0,
+            rename_replaces_files: false,
+            watched: BTreeMap::new(),
         }));
         let shutdown = Arc::new(AtomicBool::new(false));
         let connections = Arc::new(Mutex::new(Vec::new()));
@@ -584,6 +592,40 @@ impl MockFileStation {
     #[allow(dead_code)]
     pub fn fail_next_copy_task(&self) {
         self.state.lock().expect("mock state lock").fail_next_copy = true;
+    }
+
+    /// Make `Rename` onto an existing file replace it (rename(2) semantics) instead of refusing
+    /// with 414 (DSM's documented answer). The atomic deposit is tested under both, so the NAS's
+    /// answer to W2 only flips this.
+    #[allow(dead_code)]
+    pub fn rename_replaces_existing_files(&self) {
+        self.state
+            .lock()
+            .expect("mock state lock")
+            .rename_replaces_files = true;
+    }
+
+    /// Record `path`'s content after every request that changes it, starting from now.
+    #[allow(dead_code)]
+    pub fn watch_file(&self, path: &str) {
+        let mut state = self.state.lock().expect("mock state lock");
+        let now = state.files.get(path).map(|file| file.contents.clone());
+        state
+            .watched
+            .insert(path.to_owned(), vec![("start".to_owned(), now)]);
+    }
+
+    /// What a reader of `path` could have seen: its content after each request that changed it,
+    /// with that request's operation, from [`Self::watch_file`] on.
+    #[allow(dead_code)]
+    pub fn file_history(&self, path: &str) -> Vec<(String, Option<Vec<u8>>)> {
+        self.state
+            .lock()
+            .expect("mock state lock")
+            .watched
+            .get(path)
+            .cloned()
+            .unwrap_or_default()
     }
 
     /// Make `Upload` round the millisecond `mtime` to the nearest second, as a DSM might.
@@ -1150,6 +1192,7 @@ fn handle_connection(
             &headers,
             upload,
         );
+        record_watched(&mut state, &operation);
         if state
             .http_fault_after
             .as_ref()
@@ -1588,9 +1631,15 @@ fn route_request(
             }
             let name = source.rsplit('/').next().unwrap_or(&source);
             let destination = format!("{}/{}", destination_parent.trim_end_matches('/'), name);
-            if state.files.contains_key(&destination) || state.directories.contains(&destination) {
+            // `overwrite=true` replaces an existing file; otherwise an existing entry refuses the
+            // copy. `remove_src=true` makes it a move.
+            let overwrite = fields.get("overwrite").map(String::as_str) == Some("true");
+            if state.directories.contains(&destination)
+                || (state.files.contains_key(&destination) && !overwrite)
+            {
                 return api_error(414);
             }
+            let remove_source = fields.get("remove_src").map(String::as_str) == Some("true");
             let task = format!("copy-task-{}", state.next_task);
             state.next_task += 1;
             state.copy_tasks.insert(task.clone());
@@ -1616,6 +1665,9 @@ fn route_request(
                 copy.mtime_seconds = mtime_seconds;
             }
             state.files.insert(destination, copy);
+            if remove_source {
+                state.files.remove(&source);
+            }
             success(json!({"taskid": task}))
         }
         ("SYNO.FileStation.CopyMove", "status") => {
@@ -1658,8 +1710,14 @@ fn route_request(
                 return success(json!({"files": [{"path": renamed, "name": name}]}));
             }
             // Case-sensitive, as ext4 and btrfs are: a case-only rename is an ordinary rename,
-            // and only an entry that already holds the exact new name refuses it.
-            if state.files.contains_key(&renamed) || state.directories.contains(&renamed) {
+            // and only an entry that already holds the exact new name refuses it -- unless the
+            // mock models rename(2), which replaces a file with a file in one step.
+            let replaces = state.rename_replaces_files
+                && state.files.contains_key(&renamed)
+                && state.files.contains_key(&path);
+            if !replaces
+                && (state.files.contains_key(&renamed) || state.directories.contains(&renamed))
+            {
                 return api_error(414);
             }
             if let Some(mut file) = state.files.remove(&path) {
@@ -1721,6 +1779,17 @@ fn route_request(
             api_error(408)
         }
         _ => api_error(103),
+    }
+}
+
+/// Append each watched path's content when this request changed it.
+fn record_watched(state: &mut ServerState, operation: &str) {
+    let ServerState { watched, files, .. } = state;
+    for (path, history) in watched.iter_mut() {
+        let now = files.get(path).map(|file| file.contents.clone());
+        if history.last().map(|(_, seen)| seen) != Some(&now) {
+            history.push((operation.to_owned(), now));
+        }
     }
 }
 
