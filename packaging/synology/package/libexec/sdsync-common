@@ -2740,6 +2740,34 @@ run_state_reauth=
 run_state_tasks=
 run_state_keepalive=
 run_state_unchecked=
+run_state_dep_warnings=
+run_state_dep_unsettled=
+run_state_dep_issue=
+run_state_dep_detail=
+
+# write_deposit_facts WARNINGS UNSETTLED ISSUE DETAIL: the atomic deposit's line
+# of a run or profile record, each written only when it is well formed; the
+# issue code is `deposit-` and lowercase words, the detail one printable line of
+# at most 160 bytes. Written only when the run's result carried a deposit report.
+write_deposit_facts() {
+    case ${1:-} in ''|*[!0-9]*) return 0 ;; esac
+    printf 'deposit_warnings=%s\n' "$1" || return 1
+    case ${2:-} in ''|*[!0-9]*) ;; *) printf 'deposit_unsettled=%s\n' "$2" || return 1 ;; esac
+    case ${3:-} in
+        deposit-*)
+            case $3 in
+                *[!a-z-]*) ;;
+                *) [ "${#3}" -le 64 ] && { printf 'deposit_issue=%s\n' "$3" || return 1; } ;;
+            esac
+            ;;
+    esac
+    case ${4:-} in
+        ''|*[![:print:]]*) ;;
+        *) [ "${#4}" -le 160 ] && { printf 'deposit_issue_detail=%s\n' "$4" || return 1; } ;;
+    esac
+    return 0
+}
+
 write_run_state_extras() {
     case ${run_state_outcome:-} in
         succeeded|partial|failed|busy|cancelled) printf 'outcome=%s\n' "$run_state_outcome" || return 1 ;;
@@ -2776,6 +2804,8 @@ write_run_state_extras() {
     case ${run_state_tasks:-} in ''|*[!0-9]*) ;; *) printf 'recovered_server_tasks_not_stopped=%s\n' "$run_state_tasks" || return 1 ;; esac
     case ${run_state_keepalive:-} in ''|*[!0-9]*) ;; *) printf 'recovered_keepalive_failures=%s\n' "$run_state_keepalive" || return 1 ;; esac
     case ${run_state_unchecked:-} in ''|*[!0-9]*) ;; *) printf 'link_guard_unchecked=%s\n' "$run_state_unchecked" || return 1 ;; esac
+    write_deposit_facts "${run_state_dep_warnings:-}" "${run_state_dep_unsettled:-}" \
+        "${run_state_dep_issue:-}" "${run_state_dep_detail:-}" || return 1
     return 0
 }
 
