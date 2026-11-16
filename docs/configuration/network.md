@@ -14,6 +14,23 @@ https://gateway.example.com/nas/
 An optional path prefix is supported. For `/nas/`, the proxy must rewrite `/nas/webapi/*` to DSM's
 `/webapi/*`. A File Station browser alias alone is not proof that WebAPI routing works.
 
+## QuickConnect
+
+QuickConnect addresses work as the configured URL for the CLI and the engine, in both forms:
+
+| Form | Hostname | Path |
+| --- | --- | --- |
+| Relay | `[alias].[relay_id].quickconnect.to` | Every request is forwarded by Synology's relay |
+| Direct | `[alias].direct.quickconnect.to` or `[ip].[alias].direct.quickconnect.to` | Resolves to the NAS itself; no relay in the data path |
+
+The relay adds latency (a relayed API discovery request takes around four seconds in the field,
+against milliseconds on a LAN), so a large tree syncs faster over the LAN address, the direct
+QuickConnect form, DDNS, or a VPN. `doctor` classifies the endpoint and tells you which path you are
+on in its *Intermediaries and reverse proxies* section, including a warning when a relay carries the
+run (see [Diagnostics](../diagnostics-and-batch.md)). Automated tests use mock servers; the relay
+behaviour above comes from real runs, so confirm it on your own NAS with the
+[acceptance runbook](../production-acceptance.md).
+
 ## Forward proxies from the environment
 
 The client honours the standard proxy environment variables, so traffic can leave through a forward

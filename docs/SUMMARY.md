@@ -6,6 +6,8 @@
 
 - [What it does and what it protects](getting-started/overview.md)
 - [Quick start](getting-started/quick-start.md)
+- [What a run looks like](getting-started/what-a-run-looks-like.md)
+- [Use cases, operations, and limits](getting-started/use-cases-and-limits.md)
 - [Installation and deployment](installation.md)
 
 # Configuration

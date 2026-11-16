@@ -4120,8 +4120,8 @@ function describeBridgeFailure(error, phase = "status") {
   });
   if ((status === 0 || status === 401) && code === "dsm_authentication_quickconnect_unsupported") {
     return issue(
-      "QuickConnect relay unsupported",
-      "DSM refused this session through the QuickConnect relay, which may not carry it for a third-party package. Connect through the NAS LAN address, DDNS, a VPN, a direct QuickConnect address ([alias].direct.quickconnect.to), or a separately tested DSM custom reverse proxy, then select Retry or reopen the app from the DSM desktop. This app does not retry by itself."
+      "DSM refused the session over QuickConnect",
+      "DSM refused this session after QuickConnect moved it onto its relay. DSM binds each session to the client address, so it can refuse a relayed session; this also happens to DSM's own apps. Connect through the NAS LAN address, DDNS, a VPN, a direct QuickConnect address ([alias].direct.quickconnect.to), or a tested DSM custom reverse proxy, then select Retry or reopen the app from the DSM desktop. This app does not retry by itself."
     );
   }
   if (status === 401) {

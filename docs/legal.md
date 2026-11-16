@@ -3,6 +3,10 @@
 `synology-drive-sync` is distributed under the
 [MIT License](https://github.com/supermarsx/synology-drive-sync/blob/main/license.md).
 
+This is an independent project. It is not affiliated with, endorsed by, or sponsored by Synology
+Inc. Synology, DiskStation, DSM, Synology Drive, QuickConnect, and File Station are trademarks of
+their owners and are used here only to describe what the software works with.
+
 The generated
 [third-party notices](https://github.com/supermarsx/synology-drive-sync/blob/main/third_party_licenses.html)
 record the locked Rust release-dependency graph and are shipped with release artifacts. CI regenerates

@@ -244,7 +244,7 @@ test("after one DSM authentication refusal the AppWindow makes no request until 
     const afterOpen = sent.length;
     assert.ok(afterOpen >= 1 && afterOpen <= 2, `opening sent ${afterOpen} requests`);
     assert.equal(context.snapshotFailureCode, "dsm_authentication_quickconnect_unsupported");
-    assert.equal(context.bridgeIssue.title, "QuickConnect relay unsupported");
+    assert.equal(context.bridgeIssue.title, "DSM refused the session over QuickConnect");
     assert.match(context.bridgeIssue.message, /does not retry by itself/);
     assert.equal(context.snapshotTimer, 0, "a poll was scheduled after the refusal");
 
@@ -287,7 +287,7 @@ test("after one DSM authentication refusal the AppWindow makes no request until 
 
 test("the desktop card names a QuickConnect refusal instead of an expired session", () => {
   const issue = widgetBridgeIssue({ status: 401, code: "dsm_authentication_quickconnect_unsupported" });
-  assert.equal(issue.title, "QuickConnect relay unsupported");
+  assert.equal(issue.title, "DSM refused the QuickConnect session");
   assert.match(issue.detail, /direct QuickConnect/);
   assert.equal(widgetBridgeIssue({ status: 401, code: "dsm_authentication_rejected" }).title, "DSM session expired");
 });

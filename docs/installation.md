@@ -101,6 +101,43 @@ the local source or remote target data. Stop the package before either operation
 examples, exact lifecycle commands and paths, build instructions, deletion controls, and the
 mandatory live two-NAS acceptance. No live NAS install has been validated by the automated suite.
 
+## One-line install
+
+For a quick per-user install of the native CLI there are two short scripts in the repository
+(`scripts/install.sh` for Linux and macOS, `scripts/install.ps1` for Windows PowerShell 5.1 and 7).
+They pick the asset for your OS and CPU, download it over HTTPS from github.com, verify it against
+the release `SHA256SUMS`, check that the binary reports the release version, and only then replace
+the installed file. They stop with a message on any failure (mismatch, missing asset, unsupported
+platform) and never install anything unverified. They install into `~/.local/bin` (or
+`$SDSYNC_INSTALL_DIR`) on Linux and macOS and into `%LOCALAPPDATA%\Programs\synology-drive-sync` on
+Windows, need no `sudo` or administrator rights, contact only github.com, and send no telemetry.
+Re-running one upgrades in place. They do not install the DSM package; use Package Center for that.
+
+```bash
+# Linux and macOS
+curl -fsSL https://raw.githubusercontent.com/supermarsx/synology-drive-sync/main/scripts/install.sh | sh
+# Safer: download, inspect, run
+curl -fsSLO https://raw.githubusercontent.com/supermarsx/synology-drive-sync/main/scripts/install.sh && less install.sh && sh install.sh
+# Pin a release or directory
+curl -fsSL https://raw.githubusercontent.com/supermarsx/synology-drive-sync/main/scripts/install.sh | SDSYNC_VERSION=26.66 SDSYNC_INSTALL_DIR="$HOME/bin" sh
+```
+
+```powershell
+# Windows
+irm https://raw.githubusercontent.com/supermarsx/synology-drive-sync/main/scripts/install.ps1 | iex
+# Safer: download, inspect, run
+irm https://raw.githubusercontent.com/supermarsx/synology-drive-sync/main/scripts/install.ps1 -OutFile install.ps1; Get-Content install.ps1; .\install.ps1
+# Pin a release
+$env:SDSYNC_VERSION = '26.66'; irm https://raw.githubusercontent.com/supermarsx/synology-drive-sync/main/scripts/install.ps1 | iex
+```
+
+On Linux and macOS the script prints the `export PATH=...` line to add when the directory is not on
+your `PATH`. On Windows it adds the directory to your **user** `PATH` (never the machine `PATH`);
+set `SDSYNC_NO_MODIFY_PATH=1` or pass `-NoModifyPath` to leave `PATH` alone. On macOS it clears the
+quarantine attribute from the one file it just verified, and says so. To uninstall, delete the
+installed file; profiles, logs, and saved credentials are kept. The release archives also ship the
+attested installers below, whose archive checks are stricter and which you can pin to a release.
+
 ## Verified native installer
 
 The installers detect OS and architecture, resolve only a strict `YY.N` release, download the matching archive plus `SHA256SUMS`, verify SHA-256, check the embedded binary version, and atomically replace only the selected executable. They do not invoke a package manager or silently change system-wide configuration.

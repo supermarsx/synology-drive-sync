@@ -479,7 +479,7 @@ test("a DSM authentication refusal stops the card until the session is accepted 
     }
     assert.equal(state.reads, 1, `${code}: the card presented a refused session again`);
     if (code === "dsm_authentication_quickconnect_unsupported") {
-      assert.equal(panelInstance.headline.title, "QuickConnect relay unsupported");
+      assert.equal(panelInstance.headline.title, "DSM refused the QuickConnect session");
     }
   }
   // An unnamed 401 keeps its backoff ladder.

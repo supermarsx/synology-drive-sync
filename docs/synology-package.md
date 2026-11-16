@@ -65,9 +65,13 @@ or an enabled Team Folder.
 > forwarding of `X-SDSYNC-Request: 1` as
 > `HTTP_X_SDSYNC_REQUEST=1`, or
 > synchronization between two live NAS devices. The native AppWindow obtains SynoToken only from the
-> official same-origin API and never inspects the DSM shell location for it. Synology explicitly
-> excludes third-party applications from QuickConnect support, so use LAN, DDNS, VPN, or a tested DSM
-> custom reverse proxy for acceptance. Complete the
+> official same-origin API and never inspects the DSM shell location for it. The dashboard works over
+> QuickConnect. DSM binds each login session to the client address, so when QuickConnect moves you
+> onto its relay mid-session DSM itself can refuse the session (`IP is not the same`), as it can for
+> DSM's own apps; the dashboard then names the refusal and does not retry by itself (select
+> **Retry**, or use the LAN address, `[alias].direct.quickconnect.to`, DDNS, or a VPN). Record
+> acceptance on a route you can repeat (LAN, DDNS, VPN, or a tested DSM custom reverse proxy) and
+> through QuickConnect separately. Complete the
 > [live-NAS acceptance](dsm/troubleshooting.md#live-nas-acceptance) on disposable folders, and keep
 > deletion disabled until its separate destructive test passes.
 

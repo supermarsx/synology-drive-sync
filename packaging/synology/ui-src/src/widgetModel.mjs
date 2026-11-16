@@ -552,7 +552,7 @@ export function widgetBridgeIssue(error) {
   const withCause = (level, title, detail) => issue(level, title, cause ? `${detail} (${cause})` : detail);
 
   if ((status === 0 || status === 401) && code === "dsm_authentication_quickconnect_unsupported") {
-    return issue(WIDGET_LEVELS.warn, "QuickConnect relay unsupported", "Use LAN, VPN, DDNS or direct QuickConnect.");
+    return issue(WIDGET_LEVELS.warn, "DSM refused the QuickConnect session", "Use LAN, VPN, DDNS or direct QuickConnect.");
   }
   if (status === 401) {
     return issue(WIDGET_LEVELS.warn, "DSM session expired", "Sign in to DSM again.");

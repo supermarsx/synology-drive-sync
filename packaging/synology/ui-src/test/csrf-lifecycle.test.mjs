@@ -274,8 +274,8 @@ test("DSM authentication failures provide code-specific recovery guidance", asyn
     {
       status: 401,
       code: "dsm_authentication_quickconnect_unsupported",
-      title: "QuickConnect relay unsupported",
-      guidance: /DSM refused this session through the QuickConnect relay/,
+      title: "DSM refused the session over QuickConnect",
+      guidance: /DSM refused this session after QuickConnect moved it onto its relay/,
       extra: /LAN address, DDNS, a VPN, a direct QuickConnect address .*This app does not retry by itself\./
     },
     {

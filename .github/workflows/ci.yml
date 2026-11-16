@@ -690,3 +690,55 @@ jobs:
 
           user=$(docker image inspect synology-drive-sync:local --format '{{.Config.User}}')
           [[ "$user" == '10001:10001' ]]
+
+  installers:
+    name: One-line installers (${{ matrix.os }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu
+            runner: ubuntu-24.04
+          - os: macos
+            runner: macos-26
+          - os: windows
+            runner: windows-2025-vs2026
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # Both installers run against a local fake release (scripts/tests/install): no request to
+      # GitHub, and the fixture override is honoured only for file:// and 127.0.0.1 URLs.
+      - name: Lint install.sh
+        if: matrix.os == 'ubuntu'
+        run: shellcheck --shell=sh scripts/install.sh scripts/tests/install/*.sh
+      - name: Test install.sh against a fake release
+        if: matrix.os != 'windows'
+        run: sh scripts/tests/install/test-install-sh.sh scripts/install.sh
+      - name: Lint install.ps1
+        if: matrix.os == 'windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if (-not (Get-Module -ListAvailable PSScriptAnalyzer)) {
+            Install-Module PSScriptAnalyzer -Scope CurrentUser -Force
+          }
+          $findings = Invoke-ScriptAnalyzer -Path scripts/install.ps1 -Severity Warning, Error
+          $findings | Format-Table RuleName, Severity, Line, Message -AutoSize -Wrap
+          if ($findings) { throw 'PSScriptAnalyzer reported findings for scripts/install.ps1' }
+      - name: Test install.ps1 under Windows PowerShell 5.1 and PowerShell 7
+        if: matrix.os == 'windows'
+        shell: pwsh
+        env:
+          SDSYNC_TEST_ALLOW_PATH_WRITE: "1"
+        run: |
+          $ErrorActionPreference = 'Stop'
+          foreach ($shellName in 'powershell', 'pwsh') {
+            Write-Host "== installer under $shellName"
+            pwsh -NoProfile -File scripts/tests/install/test-install-ps1.ps1 -Shell $shellName
+            if ($LASTEXITCODE -ne 0) { throw "install.ps1 tests failed under $shellName" }
+          }
