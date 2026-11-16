@@ -17,6 +17,25 @@ const DSM_MANAGED_NAMES: &[&str] = &[
     ".SynologyWorkingDirectory",
 ];
 
+/// Name prefixes the atomic deposit gives its own NAS entries: an upload's temporary copy, the
+/// previous version an overwrite moves aside, and a server copy's staging folder. Each is followed
+/// by the owner id, the run id and a sequence number (see [`crate::deposit`]).
+///
+/// They begin with `~` because Synology Drive does not synchronize such names (the same rule that
+/// refuses them as sources, see `drive_path_issue`), so an in-flight temporary copy does not reach
+/// Drive clients. They are reserved: the NAS walk treats them as managed (never compared, uploaded
+/// over or mirror-deleted by the planner; only the deposit's own recovery touches them, and only
+/// those its journal names), and a local source cannot hold them because a `~` name is refused.
+pub const DEPOSIT_RESERVED_PREFIXES: &[&str] =
+    &["~sdsync-part-", "~sdsync-prev-", "~sdsync-stage-"];
+
+/// Whether `name` (one path component) is in the atomic deposit's reserved namespace.
+pub fn is_deposit_reserved_name(name: &str) -> bool {
+    DEPOSIT_RESERVED_PREFIXES
+        .iter()
+        .any(|prefix| name.starts_with(prefix))
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RemoteRoot(String);
 
@@ -151,6 +170,9 @@ pub fn depth(relative: &str) -> usize {
     }
 }
 
+/// Whether any component of `relative` is managed rather than synchronized: by DSM (`@eaDir`,
+/// `#recycle`, ...) or by this tool's atomic deposit ([`DEPOSIT_RESERVED_PREFIXES`]). Managed
+/// entries are never compared, written over, or deleted by a plan.
 pub fn is_dsm_managed(relative: &str) -> bool {
     relative.split('/').any(is_dsm_managed_name)
 }
@@ -256,7 +278,7 @@ pub(crate) fn drive_path_issue(path: &str) -> Option<String> {
 }
 
 fn is_dsm_managed_name(name: &str) -> bool {
-    DSM_MANAGED_NAMES.contains(&name)
+    DSM_MANAGED_NAMES.contains(&name) || is_deposit_reserved_name(name)
 }
 
 fn unsafe_path(path: &str, reason: &str) -> Error {
@@ -306,6 +328,27 @@ mod tests {
         let near_limit = format!("/share/{}", "x".repeat(240));
         let root = RemoteRoot::parse(&near_limit).unwrap();
         assert!(root.join("a").is_err());
+    }
+
+    #[test]
+    fn the_deposit_namespace_is_managed_and_cannot_be_a_source_name() {
+        for name in [
+            "~sdsync-part-0123456789ab-0123456789ab-1",
+            "~sdsync-prev-0123456789ab-0123456789ab-1",
+            "~sdsync-stage-0123456789ab-0123456789ab",
+        ] {
+            assert!(is_deposit_reserved_name(name), "{name}");
+            assert!(is_dsm_managed(&format!("a/{name}")), "{name}");
+            assert!(drive_path_issue(name).is_some(), "{name}");
+        }
+        for name in [
+            "sdsync-part-x",
+            ".sdsync-part-x",
+            "~sdsync-partial",
+            "x~sdsync-part-1",
+        ] {
+            assert!(!is_deposit_reserved_name(name), "{name}");
+        }
     }
 
     #[test]
