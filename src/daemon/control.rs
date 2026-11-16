@@ -224,6 +224,9 @@ pub(crate) struct Settings {
     /// and runs stay child processes (redb can abort a process on some damaged
     /// files).
     pub(crate) pair_index_dir: Option<PathBuf>,
+    /// The atomic deposit's journal directory (`var/state/deposit`), passed to every plan and
+    /// sync as `--deposit-journal DIR`. `None` leaves the core its per-user default.
+    pub(crate) deposit_journal_dir: Option<PathBuf>,
     /// Publish `run.lock` for the bridge and shell readers (Linux).
     pub(crate) publish_run_lock: bool,
     /// How often an armed realtime routine syncs its whole tree anyway.
@@ -247,6 +250,7 @@ impl Default for Settings {
             mutation_deadline: Duration::from_secs(120),
             core_nice: None,
             pair_index_dir: None,
+            deposit_journal_dir: None,
             publish_run_lock: cfg!(target_os = "linux"),
             full_reconcile_every: Duration::from_secs(24 * 3600),
             observe_grace: Duration::from_secs(30),
@@ -2381,7 +2385,8 @@ impl Control {
             "routines",
             Level::Info,
             format!(
-                "Realtime change skipped: {dirs} changed folder(s) are as the last sync left them                  ({count} skipped since the last note)"
+                "Realtime change skipped: {dirs} changed folder(s) are as the last sync left them \
+                ({count} skipped since the last note)"
             ),
         );
     }
@@ -2791,6 +2796,10 @@ impl Control {
                 .into(),
             );
             args.push((&element.path).into());
+        }
+        if let Some(dir) = &self.settings.deposit_journal_dir {
+            args.push("--deposit-journal".into());
+            args.push(dir.into());
         }
         if let Some(dir) = &self.settings.pair_index_dir {
             args.push("--pair-index".into());
@@ -3312,7 +3321,7 @@ impl Control {
             RunOutcome::Partial => Level::Warn,
             RunOutcome::Failed => Level::Error,
         };
-        let message = if verdict.detail.is_empty() {
+        let mut message = if verdict.detail.is_empty() {
             format!("Package action {}", verdict.outcome.as_str())
         } else {
             format!(
@@ -3320,6 +3329,25 @@ impl Control {
                 verdict.outcome.as_str(),
                 sanitize_detail(&verdict.detail, 160)
             )
+        };
+        // What the atomic deposit named (a previous version kept beside another writer's file, a
+        // temporary copy it could not remove, an earlier run rolled back) reaches Activity on the
+        // run's own row, once per run however many files it concerns, and makes the row a warning.
+        let deposits = report
+            .records
+            .iter()
+            .filter_map(|record| record.facts.deposit.as_ref())
+            .collect::<Vec<_>>();
+        let level = match super::state::DepositFacts::activity_note(&deposits) {
+            Some(note) => {
+                message = format!("{message}; {}", sanitize_detail(&note, 200));
+                if level == Level::Info {
+                    Level::Warn
+                } else {
+                    level
+                }
+            }
+            None => level,
         };
         if !repeated_refusal && !self.activity(code, &request.scope, state, "sync", level, message)
         {
@@ -3851,7 +3879,8 @@ impl Control {
                         "scheduler",
                         "routine_events_ignored",
                         format!(
-                            "profile={routine} reason=delete_only_no_delete ignored_total={total}                              first_dir={}",
+                            "profile={routine} reason=delete_only_no_delete ignored_total={total} \
+                            first_dir={}",
                             sanitize_detail(&dir, 120)
                         ),
                     );
@@ -4605,6 +4634,13 @@ fn run_converged(report: &RunReport, verdict: &RunVerdict) -> bool {
                 && record.skipped == Some(0)
                 && record.facts.incomplete_listings == Some(0)
                 && record.facts.link_guard_unchecked == Some(0)
+                // A run that left a deposit for the next run's recovery has not converged. A
+                // record without a deposit member wrote nothing, so left nothing.
+                && record
+                    .facts
+                    .deposit
+                    .as_ref()
+                    .is_none_or(|deposit| deposit.unsettled == 0 && deposit.warnings == 0)
         })
 }
 

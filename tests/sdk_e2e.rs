@@ -43,6 +43,7 @@ impl SecretProvider for FixedSecrets {
 fn request(server: &MockFileStation, source: &TestDir) -> SyncRequest {
     SyncRequest::builder(server.base_url(), "e2e-user", source.path(), "/team/sdk")
         .allow_http(true)
+        .deposit_journal(source.deposit_journal())
         .build()
         .expect("build SDK request")
 }
@@ -486,6 +487,7 @@ fn an_ignored_upload_mtime_is_counted_in_the_sdk_outcome() {
     source.write("b.txt", b"b");
     let request = SyncRequest::builder(server.base_url(), "e2e-user", source.path(), "/team/sdk")
         .allow_http(true)
+        .deposit_journal(source.deposit_journal())
         .comparison(Comparison::Metadata)
         .build()
         .expect("build SDK request");
@@ -511,6 +513,7 @@ fn the_serialised_outcome_carries_what_the_run_recovered_from() {
     source.write("a.txt", b"a");
     let request = SyncRequest::builder(server.base_url(), "e2e-user", source.path(), "/team/sdk")
         .allow_http(true)
+        .deposit_journal(source.deposit_journal())
         .build()
         .expect("build SDK request");
 
@@ -579,6 +582,7 @@ fn an_incomplete_remote_listing_is_named_in_the_sdk_outcome() {
     source.write("abe/visible.txt", b"v");
     let request = SyncRequest::builder(server.base_url(), "e2e-user", source.path(), "/team/sdk")
         .allow_http(true)
+        .deposit_journal(source.deposit_journal())
         .build()
         .expect("build SDK request");
 
@@ -600,6 +604,7 @@ fn a_run_failing_mid_execution_reports_what_it_completed() {
     source.write("dir/x.txt", b"x");
     let request = SyncRequest::builder(server.base_url(), "e2e-user", source.path(), "/team/sdk")
         .allow_http(true)
+        .deposit_journal(source.deposit_journal())
         .build()
         .expect("build SDK request");
 
@@ -642,6 +647,7 @@ fn a_copy_fallback_is_counted_in_the_sdk_outcome() {
     server.fail_next_api_operation("SYNO.FileStation.CopyMove.start", 407);
     let request = SyncRequest::builder(server.base_url(), "e2e-user", source.path(), "/team/sdk")
         .allow_http(true)
+        .deposit_journal(source.deposit_journal())
         .comparison(Comparison::Content)
         .build()
         .expect("build SDK request");
@@ -668,6 +674,7 @@ fn an_unaddressable_remote_name_is_named_and_its_folder_kept_by_the_sdk() {
     source.write("a.txt", b"a");
     let request = SyncRequest::builder(server.base_url(), "e2e-user", source.path(), "/team/sdk")
         .allow_http(true)
+        .deposit_journal(source.deposit_journal())
         .deletion(DeletionPolicy::bounded(100).expect("deletion policy"))
         .build()
         .expect("build SDK request");
@@ -709,6 +716,7 @@ fn a_case_only_rename_is_visible_in_the_previewed_plan() {
     source.write("photos/a.jpg", b"jpeg-a");
     let request = SyncRequest::builder(server.base_url(), "e2e-user", source.path(), "/team/sdk")
         .allow_http(true)
+        .deposit_journal(source.deposit_journal())
         .comparison(Comparison::Content)
         .deletion(DeletionPolicy::bounded(100).expect("deletion policy"))
         .build()
@@ -828,6 +836,7 @@ fn a_slow_progress_observer_cannot_let_workers_outrun_the_refusal_breaker() {
     server.fail_api_operation_times(UPLOAD, 407, 1_000);
     let request = SyncRequest::builder(server.base_url(), "e2e-user", source.path(), "/team/sdk")
         .allow_http(true)
+        .deposit_journal(source.deposit_journal())
         .jobs(4)
         .build()
         .expect("build SDK request");

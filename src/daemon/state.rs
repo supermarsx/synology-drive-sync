@@ -280,6 +280,100 @@ pub(crate) struct ResultFacts {
     pub(crate) link_guard_unchecked: Option<u64>,
     /// What the verified-pair index did (`--pair-index`), when the run used it.
     pub(crate) index: Option<IndexFacts>,
+    /// What the atomic deposit named (`result.deposit`), when the run wrote anything.
+    pub(crate) deposit: Option<DepositFacts>,
+}
+
+/// The deposit lines of a run or profile record (`deposit_*` keys): how many warnings the
+/// atomic deposit named this run, the first of them with its NAS path and cause, and how many
+/// deposits are left for the next run's recovery. One summary per run, never one line per file.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct DepositFacts {
+    pub(crate) warnings: u64,
+    pub(crate) unsettled: u64,
+    /// The first warning's code (`deposit-backup-kept`, ...).
+    pub(crate) issue: Option<String>,
+    /// Its NAS path and cause on one line, at most 160 bytes.
+    pub(crate) issue_detail: Option<String>,
+}
+
+impl DepositFacts {
+    /// From a result record's `deposit` member; `None` when absent (the run wrote nothing).
+    pub(crate) fn from_value(value: &serde_json::Value) -> Option<Self> {
+        let issues = value.get("issues")?.as_array()?;
+        let warnings = issues
+            .iter()
+            .filter(|issue| {
+                issue.get("severity").and_then(serde_json::Value::as_str) == Some("warning")
+            })
+            .filter(|issue| {
+                issue
+                    .get("code")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(deposit_issue_token)
+            })
+            .collect::<Vec<_>>();
+        let first = warnings.first();
+        let text = |key: &str| {
+            first
+                .and_then(|issue| issue.get(key))
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("")
+                .to_owned()
+        };
+        let detail = first.map(|_| {
+            let full = sanitize_detail(&format!("{}: {}", text("path"), text("cause")), usize::MAX);
+            if full.len() <= 160 {
+                full
+            } else {
+                format!("{}...", &full[..157])
+            }
+        });
+        Some(Self {
+            warnings: warnings.len() as u64,
+            unsettled: value
+                .get("unsettled")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0),
+            issue: first.map(|_| text("code")),
+            issue_detail: detail,
+        })
+    }
+
+    fn render(&self, out: &mut String) {
+        out.push_str(&format!(
+            "deposit_warnings={}\ndeposit_unsettled={}\n",
+            self.warnings, self.unsettled
+        ));
+        if let Some(issue) = &self.issue {
+            out.push_str(&format!("deposit_issue={issue}\n"));
+        }
+        if let Some(detail) = self.issue_detail.as_deref().filter(|d| !d.is_empty()) {
+            out.push_str(&format!("deposit_issue_detail={detail}\n"));
+        }
+    }
+
+    /// The Activity summary of a run's deposit warnings, or `None` without any.
+    pub(crate) fn activity_note(facts: &[&DepositFacts]) -> Option<String> {
+        let warnings: u64 = facts.iter().map(|facts| facts.warnings).sum();
+        if warnings == 0 {
+            return None;
+        }
+        let first = facts.iter().find(|facts| facts.issue.is_some())?;
+        Some(format!(
+            "{warnings} deposit warning{}, first {}: {}",
+            if warnings == 1 { "" } else { "s" },
+            first.issue.as_deref().unwrap_or(""),
+            first.issue_detail.as_deref().unwrap_or("")
+        ))
+    }
+}
+
+/// A deposit issue code: `deposit-` and lowercase words.
+pub(crate) fn deposit_issue_token(code: &str) -> bool {
+    code.len() <= 64
+        && code.starts_with("deposit-")
+        && code.bytes().all(|b| b.is_ascii_lowercase() || b == b'-')
 }
 
 /// The verified-pair index line of a profile record (`index_*` keys): what the
@@ -481,6 +575,9 @@ impl ResultFacts {
         }
         if let Some(index) = &self.index {
             index.render(out);
+        }
+        if let Some(deposit) = &self.deposit {
+            deposit.render(out);
         }
     }
 }
@@ -1926,6 +2023,78 @@ mod tests {
                 "the staging name is gone: one link"
             );
             remove_run_lock(&run_dir).unwrap();
+        }
+
+        /// The deposit line reads back through the bridge as `deposit`, with a
+        /// `deposit_warnings` warning that makes the profile amber.
+        #[test]
+        fn the_deposit_line_reads_back_through_the_bridge_as_amber() {
+            let tree = Tree::new("deposit");
+            tree.private("home/config/profiles.d/photos.toml", b"");
+            let profile = ProfileRecord {
+                outcome: ProfileOutcome::Succeeded,
+                exit: 0,
+                reason: "ok".into(),
+                finished: 1_700_000_100,
+                aggregate: false,
+                deferred: Some(0),
+                skipped: Some(0),
+                core_ran: true,
+                facts: ResultFacts {
+                    deposit: Some(DepositFacts {
+                        warnings: 2,
+                        unsettled: 1,
+                        issue: Some("deposit-backup-kept".into()),
+                        issue_detail: Some("/team/b/~sdsync-prev-x: kept".into()),
+                    }),
+                    ..ResultFacts::default()
+                },
+                detail: None,
+                failed_path: None,
+            };
+            tree.private(
+                "var/state/profiles/photos.state",
+                &render_profile_state(&profile, "sync", None).unwrap(),
+            );
+            let outcomes = tree.outcomes();
+            assert_eq!(outcomes["errors"], json!([]), "{outcomes}");
+            let row = &outcomes["profiles"][0];
+            assert_eq!(row["deposit"]["warnings"], 2, "{outcomes}");
+            assert_eq!(row["deposit"]["unsettled"], 1);
+            assert_eq!(row["deposit"]["issue"], "deposit-backup-kept");
+            assert_eq!(
+                row["deposit"]["issue_detail"],
+                "/team/b/~sdsync-prev-x: kept"
+            );
+            assert!(
+                row["warnings"]
+                    .as_array()
+                    .unwrap()
+                    .contains(&json!("deposit_warnings")),
+                "a deposit warning makes the profile amber: {outcomes}"
+            );
+        }
+
+        /// One Activity note per run, whatever the number of profiles or files, naming the first
+        /// warning; none without a warning.
+        #[test]
+        fn the_activity_note_sums_a_runs_deposit_warnings_once() {
+            let quiet = DepositFacts::default();
+            assert_eq!(DepositFacts::activity_note(&[&quiet]), None);
+            let one = DepositFacts {
+                warnings: 1,
+                unsettled: 0,
+                issue: Some("deposit-rolled-back".into()),
+                issue_detail: Some("/team/a: restored".into()),
+            };
+            let two = DepositFacts {
+                warnings: 2,
+                ..one.clone()
+            };
+            assert_eq!(
+                DepositFacts::activity_note(&[&quiet, &one, &two]).as_deref(),
+                Some("3 deposit warnings, first deposit-rolled-back: /team/a: restored")
+            );
         }
 
         /// The index line reads back through the bridge as `index`, a corrupt

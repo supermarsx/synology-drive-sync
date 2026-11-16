@@ -21,6 +21,7 @@ use synology_drive_sync::api::{
 };
 use synology_drive_sync::batch::{BatchJob, ValidatedBatch};
 use synology_drive_sync::cancel::CancellationToken;
+use synology_drive_sync::deposit::{self, DepositContext, DepositReport};
 use synology_drive_sync::digest_evidence::{self, EvidenceReport, PlanCarry, TouchedPaths};
 use synology_drive_sync::local::{self, IgnoreRules, LocalEntry};
 use synology_drive_sync::memory_budget;
@@ -1816,6 +1817,8 @@ struct SyncCompletion {
     reconciliation: Option<ReconciliationEvidence>,
     /// What the verified-pair index did, when one was asked for.
     pair_index: Option<pair_index::IndexReport>,
+    /// What the deposit did: its mode, what recovery settled, and every named condition.
+    deposit: Option<DepositReport>,
 }
 
 /// How a run's reconciliation proved content: which mode, and what carried evidence did.
@@ -3016,6 +3019,10 @@ fn prepare_and_run_sync_reporting(
         Err(report) => index_report = Some(*report),
     }
 
+    // The atomic deposit: its journal is claimed and what an interrupted run left is settled
+    // inside the run; the journal is closed after it, whatever the run's outcome.
+    let mut deposit_context: Option<Arc<DepositContext>> = None;
+    let mut deposit_report = DepositReport::off(deposit_mode(settings));
     let operation = (|| {
         cancellation.check()?;
         log_event(
@@ -3024,6 +3031,22 @@ fn prepare_and_run_sync_reporting(
         )?;
         client.verify_destination_writable(&root)?;
         cancellation.check()?;
+        // Before the listing, so the plan is made against what recovery left. A `plan` writes
+        // nothing, so it neither recovers nor takes the journal.
+        let (deposit, journalled) = if plan_only {
+            (sync::Deposit::Direct, std::collections::BTreeSet::new())
+        } else {
+            let begun = begin_deposit(
+                profile,
+                settings,
+                &client,
+                &root,
+                cancellation,
+                &mut deposit_report,
+            )?;
+            deposit_context = begun.context.clone();
+            (begun.deposit, begun.journalled)
+        };
         log_event(
             logger.as_ref(),
             LogEvent::new(EventLogLevel::Info, EventCode::RemoteScanStarted),
@@ -3031,6 +3054,14 @@ fn prepare_and_run_sync_reporting(
         cancellation.phase("list_remote");
         let scanned =
             client.remote_inventory_scoped(&root, &scope, &rules, usize::MAX, cancellation)?;
+        if let Some(context) = &deposit_context {
+            deposit_report.issues.extend(deposit::unjournaled_reserved(
+                &root,
+                scanned.inventory.entries.keys().map(String::as_str),
+                context.journal.owner(),
+                &journalled,
+            ));
+        }
         let incomplete_directories = scanned.incomplete_directories;
         let skipped_remote = scanned.skipped;
         // A folder deleted on the NAS while the walk listed it clears by itself: named as a
@@ -3136,6 +3167,16 @@ fn prepare_and_run_sync_reporting(
 
         cancellation.phase("build_plan");
         let mut plan = plan::build_plan(&root, &local, &remote, &rules, &run_options)?;
+        // What recovery kept but could not prove whole is uploaded over, never adopted by a
+        // comparison that only looked at its size and time.
+        if !deposit_report.suspect.is_empty() {
+            let suspect = deposit_report
+                .suspect
+                .iter()
+                .filter_map(|path| root.relative(path).ok())
+                .collect();
+            plan::force_uploads(&root, &mut plan, &local, &remote, &suspect)?;
+        }
         plan.link_guard_unchecked = link_guard_unchecked;
         deferred.extend(sync::withhold_deletions_in_incomplete_listings(
             &mut plan,
@@ -3150,6 +3191,11 @@ fn prepare_and_run_sync_reporting(
         deferred.extend(sync::withhold_comma_ambiguous_mutations(
             &client, &mut plan, &remote,
         )?);
+        // For the same reason, a file the atomic deposit could not rename or delete around safely
+        // is deposited directly, by name.
+        if let Some(context) = &deposit_context {
+            context.deposit_directly(sync::comma_ambiguous_deposits(&client, &plan, &remote)?);
+        }
         // A folder the walk could not read, and a case-only rename planning could not finish, are
         // deferrals the plan names among its skips.
         let named_in_plan = sync::deferrals_in_plan_skips(&plan, &deferred);
@@ -3259,6 +3305,7 @@ fn prepare_and_run_sync_reporting(
                     ExecuteOptions {
                         jobs: usize::from(settings.behavior.jobs),
                         dry_run: false,
+                        deposit: deposit.clone(),
                     },
                     cancellation.clone(),
                     progress.observer_factory(),
@@ -3481,6 +3528,26 @@ fn prepare_and_run_sync_reporting(
         completion.transport = client.transport_counters();
         completion.request_floor = client.request_floor_counters();
     }
+    // The journal is closed after execution and reconciliation, whatever the outcome: settled
+    // deposits leave it, unsettled ones stay for the next run's recovery. Only a process that
+    // dies leaves it whole.
+    deposit::end(deposit_context.take(), &mut deposit_report);
+    // Named on stderr and in the log; a log that cannot take it fails the run after the session
+    // is handed back, like any other log failure, rather than leaving the session open.
+    let deposit_logged = if plan_only {
+        Ok(())
+    } else {
+        let logged = report_deposit(&deposit_report, &settings.output, logger.as_ref(), profile);
+        // Recovery that acted, or a named condition, is reported even by a run that then found
+        // nothing to do: it changed the NAS, or needs attention.
+        if completion_out.is_none() && operation.is_ok() && !deposit_report.issues.is_empty() {
+            *completion_out = Some(SyncCompletion::default());
+        }
+        if let Some(completion) = completion_out.as_mut() {
+            completion.deposit = Some(deposit_report);
+        }
+        logged
+    };
     finish_run_session(
         &mut client,
         session_binding.as_deref(),
@@ -3488,6 +3555,84 @@ fn prepare_and_run_sync_reporting(
         operation,
         logger.as_ref(),
     )
+    .and(deposit_logged)
+}
+
+fn deposit_mode(settings: &config::ResolvedSync) -> deposit::DepositMode {
+    match settings.behavior.deposit {
+        cli::DepositArg::Atomic => deposit::DepositMode::Atomic,
+        cli::DepositArg::Direct => deposit::DepositMode::Direct,
+    }
+}
+
+/// Start the run's deposit for this profile: see [`deposit::begin`].
+fn begin_deposit(
+    profile: &str,
+    settings: &config::ResolvedSync,
+    client: &ApiClient,
+    root: &RemoteRoot,
+    cancellation: &CancellationToken,
+    report: &mut DepositReport,
+) -> Result<deposit::Begun> {
+    let owner = deposit::DepositOwner::derive(
+        profile,
+        &settings.remote,
+        &settings.connection.url,
+        &settings.connection.username,
+    );
+    deposit::begin(
+        deposit_mode(settings),
+        settings.behavior.deposit_journal.as_deref(),
+        &owner,
+        client,
+        root,
+        cancellation,
+        report,
+    )
+}
+
+/// Name every deposit condition on standard error (warnings) and in the event log.
+fn report_deposit(
+    report: &DepositReport,
+    output: &config::ResolvedOutput,
+    logger: Option<&Arc<EventLogger>>,
+    profile: &str,
+) -> Result<()> {
+    for issue in &report.issues {
+        if issue.severity == deposit::Severity::Warning && !output.quiet {
+            eprintln!("warning: {}: {} ({})", issue.code, issue.cause, issue.path);
+        }
+        let (level, code) = match issue.severity {
+            deposit::Severity::Warning => (EventLogLevel::Warn, EventCode::DepositWarning),
+            deposit::Severity::Info => (EventLogLevel::Info, EventCode::DepositRecovered),
+        };
+        log_event(
+            logger,
+            LogEvent::new(level, code)
+                .reason(EventReason::DepositRecovery)
+                .profile(profile)
+                .path(&issue.path),
+        )?;
+    }
+    Ok(())
+}
+
+/// The `deposit` member of a result.
+fn deposit_value(report: &DepositReport) -> Value {
+    json!({
+        "mode": report.mode.as_str(),
+        "journal": report.journal.as_ref().map(|path| path.display().to_string()),
+        "published": report.published,
+        "replaced": report.replaced,
+        "recovered": report.recovered,
+        "unsettled": report.unsettled,
+        "issues": report.issues.iter().map(|issue| json!({
+            "code": issue.code,
+            "severity": issue.severity.as_str(),
+            "path": issue.path,
+            "cause": issue.cause,
+        })).collect::<Vec<_>>(),
+    })
 }
 
 /// SC-2: the memory check a run makes after its walk and after its listing.
@@ -3662,6 +3807,7 @@ fn defer_event_reason(reason: sync::DeferReason) -> EventReason {
         sync::DeferReason::ListingIncomplete => EventReason::RemoteResponseInvalid,
         sync::DeferReason::ServerCopyFailed => EventReason::ServerCopyFailed,
         sync::DeferReason::TreeTooLargeForMemory => EventReason::TreeTooLargeForMemory,
+        sync::DeferReason::DepositNotAtomicUnavailable => EventReason::DepositNotAtomicUnavailable,
     }
 }
 
@@ -9673,6 +9819,9 @@ fn execution_value(completion: &SyncCompletion, elapsed: Duration) -> Value {
         // What the verified-pair index did (`--pair-index`): pairs served from evidence, pairs
         // verified live, the canary, and every named condition. `null` when none was asked for.
         "pair_index": completion.pair_index.as_ref().map(run_index::value),
+        // How files reached the NAS (`atomic` or `direct`), what recovery settled of an
+        // interrupted run, and every named deposit condition. `null` for a run that wrote nothing.
+        "deposit": completion.deposit.as_ref().map(deposit_value),
         // Everything recovered from on the run's behalf, so none of it is silent.
         "recovered": {
             "retries": completion.transport.retries,
@@ -10941,7 +11090,8 @@ fn resolved_single_scope(settings: &config::ResolvedSync, command: &str) -> Resu
     let scope = resolved_scope(settings)?;
     if scope.single().is_none() {
         return Err(Error::Configuration(format!(
-            "{command} takes one --scope path, not a set ({}); --scope-shallow and a repeated              --scope are for sync and plan",
+            "{command} takes one --scope path, not a set ({}); --scope-shallow and a repeated \
+            --scope are for sync and plan",
             scope.describe()
         )));
     }
@@ -11284,6 +11434,8 @@ mod tests {
                 pair_index_max_age_days: 30,
                 pair_index_canary: 25,
                 pair_index_cache_mib: 8,
+                deposit: cli::DepositArg::Atomic,
+                deposit_journal: None,
             },
             safety: config::ResolvedSafety {
                 delete: false,
@@ -12205,6 +12357,7 @@ mod tests {
                 "deferred",
                 "deleted",
                 "deletes_skipped",
+                "deposit",
                 "directories_created",
                 "elapsed_ms",
                 "failed",
@@ -13249,6 +13402,7 @@ mod tests {
             link_guard_unchecked: 0,
             reconciliation: None,
             pair_index: None,
+            deposit: None,
         });
         outcome.elapsed = Some(Duration::from_millis(17));
         outcome.error = Some("retained diagnostic".to_owned());
@@ -13818,6 +13972,7 @@ mod tests {
             link_guard_unchecked: 0,
             reconciliation: None,
             pair_index: None,
+            deposit: None,
         };
         let mut human_output = resolved_output(cli::OutputFormat::Human);
         human_output.verbosity = 1;
@@ -13852,6 +14007,7 @@ mod tests {
                 link_guard_unchecked: 0,
                 reconciliation: None,
                 pair_index: None,
+                deposit: None,
             }),
             Duration::from_millis(17),
             &human_output,
@@ -13976,6 +14132,7 @@ mod tests {
             link_guard_unchecked: 0,
             reconciliation: None,
             pair_index: None,
+            deposit: None,
         });
         completed.elapsed = Some(Duration::from_millis(19));
         completed.error = Some("retained warning".to_owned());
@@ -15521,6 +15678,8 @@ mod status_command_tests {
                 pair_index_max_age_days: 30,
                 pair_index_canary: 25,
                 pair_index_cache_mib: 8,
+                deposit: cli::DepositArg::Atomic,
+                deposit_journal: None,
             },
             safety: config::ResolvedSafety {
                 delete: false,
@@ -16042,6 +16201,7 @@ mod resync_output_tests {
             link_guard_unchecked: 0,
             reconciliation: None,
             pair_index: None,
+            deposit: None,
         };
         let text = human(render(
             cli::OutputFormat::Human,

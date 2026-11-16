@@ -122,6 +122,10 @@ const REASONS = Object.freeze({
   tree_too_large_for_memory: ["the source holds more entries than this run has memory for, so nothing was synced", "Split the profile into smaller ones (a scope or subfolder profiles)."],
   entropy_unavailable: ["the NAS's random number generator did not answer within 15 seconds, so a secure connection could not start and nothing was synced (this DSM kernel has no getrandom, and its entropy pool is empty)", "It clears by itself once the NAS has gathered entropy (disk, network and login activity); the next run asks again. If it repeats for hours, restart the package or the NAS."],
   "tree-too-large-for-memory": ["not synced until you fix this: the source holds more entries than this run has memory for, so nothing was synced", "Split the profile into smaller ones (a scope or subfolder profiles)."],
+  deposit_journal_unavailable: ["the record of what a run is about to upload could not be used (its directory is not private, another run of this profile holds it, or it cannot be written or read), so nothing was uploaded", "Review Logs for the path and the cause (deposit-journal-locked clears when the other run ends); check free space on the package volume."],
+  deposit_not_atomic_unavailable: ["this DSM offers no File Station Rename, which uploading each file whole and then renaming it into place needs, so nothing was written", "Update DSM: File Station on DSM 7 offers Rename. From the command line, --deposit direct uploads without it (a run killed mid-upload can then leave a partial file)."],
+  "deposit-not-atomic-unavailable": ["not synced until you fix this: this DSM offers no File Station Rename, which uploading each file whole and then renaming it into place needs, so nothing was written", "Update DSM: File Station on DSM 7 offers Rename. From the command line, --deposit direct uploads without it (a run killed mid-upload can then leave a partial file)."],
+  deposit_recovery: ["a file an interrupted run was uploading needed settling, or could not be settled", "Review Logs for the NAS path and what was done; a kept ~sdsync-prev- file is the previous version, remove it by hand once you know which version you want."],
   "source-changed": ["files changed during the run", "They sync next run."],
   // Lasting, and clear by themselves: the run exits 0 and the file is tried every run. Their detail
   // names the file (`keeps_failing path=<p> runs=<n> ...`); keepsFailingSentence reads it.
@@ -390,6 +394,7 @@ export function reasonCopy(value) {
 function factsOf(record) {
   const r = obj(record);
   const rec = r.recovered && typeof r.recovered === "object" && !Array.isArray(r.recovered) ? r.recovered : null;
+  const dep = r.deposit && typeof r.deposit === "object" && !Array.isArray(r.deposit) ? r.deposit : null;
   return {
     incompleteListings: count(r.incomplete_listings),
     folders: (Array.isArray(r.incomplete_listing_folders) ? r.incomplete_listing_folders : [])
@@ -401,6 +406,13 @@ function factsOf(record) {
       reauthenticationFailures: count(rec.reauthentication_failures),
       serverTasksNotStopped: count(rec.server_tasks_not_stopped),
       keepaliveFailures: count(rec.keepalive_failures)
+    } : null,
+    // What the atomic deposit named this run: a count, and the first warning with its NAS path.
+    deposit: dep ? {
+      warnings: count(dep.warnings),
+      unsettled: count(dep.unsettled),
+      issue: typeof dep.issue === "string" && /^deposit-[a-z-]{1,56}$/.test(dep.issue) ? dep.issue : "",
+      detail: typeof dep.issue_detail === "string" ? dep.issue_detail.replace(/[^\x20-\x7e]/g, "?").slice(0, 160) : ""
     } : null
   };
 }
@@ -425,6 +437,13 @@ export function warningText(warning, r = {}) {
   if (warning === "server_tasks_not_stopped") return `${rec.serverTasksNotStopped > 0 ? n(rec.serverTasksNotStopped, "server-side task", "server-side tasks") : "Server-side tasks"} could not be stopped on the target; check its Task Manager`;
   if (warning === "keepalive_failures") return `Recovered from ${rec.keepaliveFailures > 0 ? n(rec.keepaliveFailures, "keep-alive failure", "keep-alive failures") : "keep-alive failures"}; check the network if it repeats`;
   if (warning === "link_guard_unchecked") return `${r.linkGuardUnchecked > 0 ? `Link check unavailable for ${n(r.linkGuardUnchecked, "folder", "folders")}` : "Link check unavailable for some folders"}: DSM gave no real path to check entries against, so links there could not be ruled out; nothing was refused. Run Doctor`;
+  if (warning === "deposit_warnings") {
+    const d = r.deposit || {};
+    const head = d.warnings > 0 ? n(d.warnings, "file deposit warning", "file deposit warnings") : "File deposit warnings";
+    const first = d.issue ? `; first ${d.issue}${d.detail ? `: ${d.detail}` : ""}` : "";
+    const left = d.unsettled > 0 ? `; ${n(d.unsettled, "deposit is", "deposits are")} left for the next run to settle` : "";
+    return `${head}${first}${left}. Review Logs (deposit.warning) for every path`;
+  }
   if (warning === "stall_unobservable") return "Cannot tell whether this run is stuck: the core's I/O counters are not readable here, so its progress cannot be observed and a stuck run would not be flagged";
   if (warning === "stalled") return "Run may be stuck: no progress for over 30 minutes";
   if (warning === "long_running") return `Running for ${r.runningFor !== null && r.runningFor !== undefined ? spanLabel(r.runningFor) : "a long time"}; check whether it is stuck`;

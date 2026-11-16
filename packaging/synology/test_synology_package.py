@@ -26708,6 +26708,147 @@ fi
             stopped = self.shell(self.lifecycle, "stop", timeout=15)
             self.assertEqual(stopped.returncode, 0, stopped.stdout + stopped.stderr)
 
+    def test_the_deposits_warnings_reach_the_records_and_one_warn_activity_row(self) -> None:
+        # The shell engine mirrors the daemon: what the atomic deposit named
+        # (result.deposit) reaches run.state and the profile record as the four
+        # deposit_* keys, and the run's own Activity row becomes a warning that
+        # names the count and the first warning, once per run. A path holding
+        # `{`, `|`, `%`, spaces and an escaped quote stays one field and reads
+        # back as the daemon renders it (`|` turned `/`); info notes and a
+        # malformed code are not warnings.
+        self.configure_with_password("alpha", self.source_one, True)
+        self.install_test_core(
+            'record=; previous=\n'
+            'for argument do [ "$previous" != --result-record ] || record=$argument; previous=$argument; done\n'
+            '[ -n "$record" ] || exit 64\n'
+            'printf \'%s\\n\' \'{"profile":"alpha","result":{"changed":true,"deferred":[],'
+            '"deposit":{"issues":['
+            '{"cause":"an earlier run was interrupted","code":"deposit-completed","path":"/home/Drive/alpha/x","severity":"info"},'
+            '{"cause":"x","code":"Bad Code","path":"/x","severity":"warning"},'
+            '{"cause":"kept beside another \\"writers\\" file","code":"deposit-backup-kept","path":"/home/Drive/alpha/a {b}|c%20 d/~sdsync-prev-1","severity":"warning"},'
+            '{"cause":"refused","code":"deposit-cleanup-failed","path":"/home/Drive/alpha/~sdsync-part-2","severity":"warning"}],'
+            '"journal":"/j","mode":"atomic","published":3,"recovered":1,"replaced":1,"unsettled":1},'
+            '"incomplete_listing_folders":[],"incomplete_listings":0,"mtime_not_kept":0,"outcome":"complete",'
+            '"recovered":{"keepalive_failures":0,"reauthentication_failures":0,"server_tasks_not_stopped":0},'
+            '"skipped":0},"schema":"sdsync.result-record.v1","status":"success"}\' > "$record"\n'
+            "exit 0\n"
+        )
+        started = self.shell(self.lifecycle, "start", timeout=15)
+        self.assertEqual(started.returncode, 0, started.stdout + started.stderr)
+        try:
+            runner = self.real_target / "libexec/sdsync-run"
+            self.capture.write_text("", encoding="utf-8")
+            ran = self.shell(
+                runner, "sync", "alpha", "false", "foreground", "-",
+                extra_environment={"SDSYNC_DSM_AUDIT_WRAPPED": "true"},
+            )
+            self.assertEqual(ran.returncode, 0, ran.stdout + ran.stderr)
+            # Every engine keeps the journal in the package's own state.
+            self.assertIn("--deposit-journal ", self.capture.read_text(encoding="utf-8"))
+            expected_detail = '/home/Drive/alpha/a {b}/c%20 d/~sdsync-prev-1: kept beside another "writers" file'
+            run_state = self.state_fields(self.real_var / "state/run.state")
+            profile = self.state_fields(self.real_var / "state/profiles/alpha.state")
+            for document in (run_state, profile):
+                self.assertEqual(document["deposit_warnings"], "2", document)
+                self.assertEqual(document["deposit_unsettled"], "1", document)
+                self.assertEqual(document["deposit_issue"], "deposit-backup-kept", document)
+                self.assertEqual(document["deposit_issue_detail"], expected_detail, document)
+            succeeded = [e for e in self.activity_records() if e["code"] == "run.succeeded" and e["profile"] == "alpha"]
+            self.assertEqual(len(succeeded), 1, succeeded)
+            self.assertEqual(succeeded[-1]["level"], "warn", succeeded)
+            self.assertIn(
+                "2 deposit warnings, first deposit-backup-kept: /home/Drive/alpha/a {b}/c%20 d/",
+                str(succeeded[-1]["message"]),
+            )
+        finally:
+            stopped = self.shell(self.lifecycle, "stop", timeout=15)
+            self.assertEqual(stopped.returncode, 0, stopped.stdout + stopped.stderr)
+
+    def test_an_aggregates_deposit_warnings_are_summed_into_one_activity_row(self) -> None:
+        # Each profile record carries its own deposit line; run.state sums the
+        # counts and names the first warning any profile named; Activity gets
+        # one row for the run, not one per profile or per file.
+        self.configure_with_password("alpha", self.source_one, True)
+        self.configure_with_password("beta", self.source_two, True)
+        self.install_test_core(
+            'record=; previous=\n'
+            'for argument do [ "$previous" != --result-record ] || record=$argument; previous=$argument; done\n'
+            '[ -n "$record" ] || exit 64\n'
+            '{\n'
+            'printf \'%s\\n\' \'{"profile":"alpha","result":{"changed":true,"deferred":[],'
+            '"deposit":{"issues":[{"cause":"restored","code":"deposit-rolled-back","path":"/home/Drive/alpha/a.txt","severity":"warning"}],'
+            '"journal":"/j","mode":"atomic","published":1,"recovered":1,"replaced":0,"unsettled":0},'
+            '"outcome":"complete","skipped":0},"schema":"sdsync.result-record.v1","status":"success"}\'\n'
+            'printf \'%s\\n\' \'{"profile":"beta","result":{"changed":true,"deferred":[],'
+            '"deposit":{"issues":[{"cause":"refused","code":"deposit-cleanup-failed","path":"/home/Drive/beta/~sdsync-part-1","severity":"warning"},'
+            '{"cause":"refused","code":"deposit-cleanup-failed","path":"/home/Drive/beta/~sdsync-part-2","severity":"warning"}],'
+            '"journal":"/j","mode":"atomic","published":0,"recovered":0,"replaced":0,"unsettled":2},'
+            '"outcome":"complete","skipped":0},"schema":"sdsync.result-record.v1","status":"success"}\'\n'
+            '} > "$record"\n'
+            "exit 0\n"
+        )
+        started = self.shell(self.lifecycle, "start", timeout=15)
+        self.assertEqual(started.returncode, 0, started.stdout + started.stderr)
+        try:
+            runner = self.real_target / "libexec/sdsync-run"
+            ran = self.shell(
+                runner, "sync", "all", "false", "foreground", "100",
+                extra_environment={"SDSYNC_DSM_AUDIT_WRAPPED": "true"},
+            )
+            self.assertEqual(ran.returncode, 0, ran.stdout + ran.stderr)
+            alpha = self.state_fields(self.real_var / "state/profiles/alpha.state")
+            beta = self.state_fields(self.real_var / "state/profiles/beta.state")
+            run_state = self.state_fields(self.real_var / "state/run.state")
+            self.assertEqual((alpha["deposit_warnings"], alpha["deposit_unsettled"]), ("1", "0"), alpha)
+            self.assertEqual(alpha["deposit_issue_detail"], "/home/Drive/alpha/a.txt: restored", alpha)
+            self.assertEqual((beta["deposit_warnings"], beta["deposit_unsettled"]), ("2", "2"), beta)
+            self.assertEqual(beta["deposit_issue"], "deposit-cleanup-failed", beta)
+            self.assertEqual((run_state["deposit_warnings"], run_state["deposit_unsettled"]), ("3", "2"), run_state)
+            self.assertEqual(run_state["deposit_issue"], "deposit-rolled-back", run_state)
+            rows = [e for e in self.activity_records() if "deposit" in str(e["message"])]
+            self.assertEqual(len(rows), 1, rows)
+            self.assertEqual((rows[0]["code"], rows[0]["profile"], rows[0]["level"]), ("run.succeeded", "all", "warn"), rows)
+            self.assertIn(
+                "3 deposit warnings, first deposit-rolled-back: /home/Drive/alpha/a.txt: restored",
+                str(rows[0]["message"]),
+            )
+        finally:
+            stopped = self.shell(self.lifecycle, "stop", timeout=15)
+            self.assertEqual(stopped.returncode, 0, stopped.stdout + stopped.stderr)
+
+    def test_a_run_whose_deposit_named_nothing_writes_a_quiet_deposit_line(self) -> None:
+        # A deposit report without a warning is a zero, not a warning; a result
+        # without one (a run that wrote nothing) writes no deposit line at all.
+        self.configure_with_password("alpha", self.source_one, True)
+        self.install_test_core(
+            'record=; previous=\n'
+            'for argument do [ "$previous" != --result-record ] || record=$argument; previous=$argument; done\n'
+            '[ -n "$record" ] || exit 64\n'
+            'printf \'%s\\n\' \'{"profile":"alpha","result":{"changed":true,"deferred":[],'
+            '"deposit":{"issues":[],"journal":"/j","mode":"atomic","published":1,"recovered":0,"replaced":0,"unsettled":0},'
+            '"incomplete_listing_folders":[],"incomplete_listings":0,"mtime_not_kept":0,"outcome":"complete",'
+            '"skipped":0},"schema":"sdsync.result-record.v1","status":"success"}\' > "$record"\n'
+            "exit 0\n"
+        )
+        started = self.shell(self.lifecycle, "start", timeout=15)
+        self.assertEqual(started.returncode, 0, started.stdout + started.stderr)
+        try:
+            runner = self.real_target / "libexec/sdsync-run"
+            ran = self.shell(
+                runner, "sync", "alpha", "false", "foreground", "-",
+                extra_environment={"SDSYNC_DSM_AUDIT_WRAPPED": "true"},
+            )
+            self.assertEqual(ran.returncode, 0, ran.stdout + ran.stderr)
+            run_state = self.state_fields(self.real_var / "state/run.state")
+            self.assertEqual((run_state["deposit_warnings"], run_state["deposit_unsettled"]), ("0", "0"), run_state)
+            self.assertNotIn("deposit_issue", run_state)
+            succeeded = [e for e in self.activity_records() if e["code"] == "run.succeeded" and e["profile"] == "alpha"]
+            self.assertEqual(succeeded[-1]["level"], "info", succeeded)
+            self.assertNotIn("deposit", str(succeeded[-1]["message"]))
+        finally:
+            stopped = self.shell(self.lifecycle, "stop", timeout=15)
+            self.assertEqual(stopped.returncode, 0, stopped.stdout + stopped.stderr)
+
     # ------------------------------------------------------------------
     # Controller resilience (fix2-ctl, ADV-C-1..16). Each test names the
     # finding it pins. Every wait is bounded and driven by the fake clock:

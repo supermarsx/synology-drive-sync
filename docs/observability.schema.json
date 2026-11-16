@@ -13,6 +13,50 @@
     { "$ref": "#/$defs/resultRecord" }
   ],
   "$defs": {
+    "deposit": {
+      "type": "object",
+      "description": "How files reached the NAS. `atomic` (the default): each file is uploaded to a temporary `~sdsync-part-` name in its own folder, verified there, and renamed to its final name; an overwrite first renames the previous version aside to `~sdsync-prev-` and deletes it once the new one is in place, so the final name holds the old version or the new one, never a partial file (absent for the one request between the two renames, and after a crash inside it until the next run puts the old version back). Every deposit is journalled locally before its first byte is sent, and the next run settles what an interrupted run left. `direct`: straight to the final name, named `deposit-not-atomic`.",
+      "additionalProperties": false,
+      "required": ["mode", "journal", "published", "replaced", "recovered", "unsettled", "issues"],
+      "properties": {
+        "mode": { "enum": ["atomic", "direct"] },
+        "journal": { "description": "The journal file, or null for a direct deposit.", "oneOf": [{ "type": "null" }, { "type": "string" }] },
+        "published": { "description": "Files published under a name that was empty.", "$ref": "#/$defs/nonNegativeInteger" },
+        "replaced": { "description": "Files published over a previous version.", "$ref": "#/$defs/nonNegativeInteger" },
+        "recovered": { "description": "Interrupted deposits of earlier runs this run's recovery acted on.", "$ref": "#/$defs/nonNegativeInteger" },
+        "unsettled": { "description": "Journalled deposits still unsettled at the end of the run; the next run settles them.", "$ref": "#/$defs/nonNegativeInteger" },
+        "issues": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["code", "severity", "path", "cause"],
+            "properties": {
+              "code": {
+                "enum": [
+                  "deposit-not-atomic",
+                  "deposit-not-atomic-unavailable",
+                  "deposit-temp-removed",
+                  "deposit-rolled-back",
+                  "deposit-completed",
+                  "deposit-backup-kept",
+                  "deposit-recovery-failed",
+                  "deposit-cleanup-failed",
+                  "deposit-orphan-unjournaled",
+                  "deposit-copy-partial-removed",
+                  "deposit-copy-kept",
+                  "deposit-journal-torn",
+                  "deposit-mtime-not-kept"
+                ]
+              },
+              "severity": { "enum": ["info", "warning"] },
+              "path": { "type": "string" },
+              "cause": { "type": "string" }
+            }
+          }
+        }
+      }
+    },
     "pairIndex": {
       "type": "object",
       "description": "What the verified-pair index (`--pair-index`) did for this run. A stored digest only ever suppresses an upload; every condition that kept the index from being used is in `issues` and the run verified those pairs live.",
@@ -242,7 +286,9 @@
             "session.borrowed_rejected",
             "session.handover_unused",
             "session.channel_unusable",
-            "session.handback_failed"
+            "session.handback_failed",
+            "deposit.recovered",
+            "deposit.warning"
           ]
         },
         "operation_id": { "$ref": "#/$defs/nullableNonNegativeInteger" },
@@ -309,7 +355,10 @@
         "pair_index_unusable",
         "pair_index_store_failed",
         "tree_too_large_for_memory",
-        "entropy_unavailable"
+        "entropy_unavailable",
+        "deposit_journal_unavailable",
+        "deposit_not_atomic_unavailable",
+        "deposit_recovery"
       ]
     },
     "buildIdentity": {
@@ -336,7 +385,8 @@
         "SYNO.FileStation.MD5",
         "SYNO.FileStation.Download",
         "SYNO.FileStation.CopyMove",
-        "SYNO.FileStation.CheckPermission"
+        "SYNO.FileStation.CheckPermission",
+        "SYNO.FileStation.Rename"
       ]
     },
     "boundedToken": {
@@ -875,7 +925,7 @@
           "type": "boolean"
         },
         "outcome": {
-          "description": "The run's verdict. `complete`: everything converged. `partial`: everything converged except the transient paths in `deferred` (every reason but `unrepresentable-name`, `unsupported-local-entry`, `listing-incomplete`, `remote-unreadable`, `local-permission-denied`, `delete-not-permitted`, `remote-refused`, `remote-skipped`, `unsupported-entry`, `case-rename-pending`, `tree-too-large-for-memory`, `file-keeps-changing`, `source-stays-unreadable`, `remote-digest-keeps-failing` and `delete-keeps-failing`), which the next run picks up; the process exits 3. Lasting skips and lasting deferrals are reported and logged but leave the outcome `complete` and the exit code 0. `failed`: the run stopped (see `failed`).",
+          "description": "The run's verdict. `complete`: everything converged. `partial`: everything converged except the transient paths in `deferred` (every reason but `unrepresentable-name`, `unsupported-local-entry`, `listing-incomplete`, `remote-unreadable`, `local-permission-denied`, `delete-not-permitted`, `remote-refused`, `remote-skipped`, `unsupported-entry`, `case-rename-pending`, `tree-too-large-for-memory`, `file-keeps-changing`, `source-stays-unreadable`, `remote-digest-keeps-failing`, `delete-keeps-failing` and `deposit-not-atomic-unavailable`), which the next run picks up; the process exits 3. Lasting skips and lasting deferrals are reported and logged but leave the outcome `complete` and the exit code 0. `failed`: the run stopped (see `failed`).",
           "enum": ["complete", "partial", "failed"]
         },
         "deferred": {
@@ -929,6 +979,10 @@
         "pair_index": {
           "description": "What the verified-pair index did, or `null` when none was asked for.",
           "oneOf": [{ "type": "null" }, { "$ref": "#/$defs/pairIndex" }]
+        },
+        "deposit": {
+          "description": "How files reached the NAS and what the deposit's recovery settled, or `null` for a run that wrote nothing.",
+          "oneOf": [{ "type": "null" }, { "$ref": "#/$defs/deposit" }]
         },
         "reconciliation": {
           "description": "How the post-run reconciliation proved content, or `null` when the run did not reconcile (nothing was executed). Reconciliation re-lists both sides in full and verifies live every pair the run touched plus a canary sample; every other pair whose size, times and identity did not move on either side keeps the digests the plan pass proved (`carried`). A canary that disagrees makes the same pass re-verify every carried pair live and is named in `canary_mismatch`; it never changes the outcome or the exit code by itself.",
@@ -1104,7 +1158,8 @@
             "file-keeps-changing",
             "source-stays-unreadable",
             "remote-digest-keeps-failing",
-            "delete-keeps-failing"
+            "delete-keeps-failing",
+            "deposit-not-atomic-unavailable"
           ]
         },
         "detail": {

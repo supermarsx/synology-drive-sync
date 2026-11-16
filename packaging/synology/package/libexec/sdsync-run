@@ -199,7 +199,8 @@ profile_counts_lines() {
     fi
     write_result_facts "${profile_fact_listings:-}" "${profile_fact_folders:-}" "${profile_fact_mtime:-}" \
         "${profile_fact_reauth:-}" "${profile_fact_tasks:-}" "${profile_fact_keepalive:-}" \
-        "${profile_fact_unchecked:-}"
+        "${profile_fact_unchecked:-}" "${profile_fact_dep_warnings:-}" "${profile_fact_dep_unsettled:-}" \
+        "${profile_fact_dep_issue:-}" "${profile_fact_dep_detail:-}"
 }
 
 # The core result's lasting facts (contract v1.5), each written only when the
@@ -218,6 +219,7 @@ write_result_facts() {
     case ${5:-} in ''|*[!0-9]*) ;; *) printf 'recovered_server_tasks_not_stopped=%s\n' "$5" || return 1 ;; esac
     case ${6:-} in ''|*[!0-9]*) ;; *) printf 'recovered_keepalive_failures=%s\n' "$6" || return 1 ;; esac
     case ${7:-} in ''|*[!0-9]*) ;; *) printf 'link_guard_unchecked=%s\n' "$7" || return 1 ;; esac
+    write_deposit_facts "${8:-}" "${9:-}" "${10:-}" "${11:-}" || return 1
     return 0
 }
 
@@ -1037,6 +1039,9 @@ fi
 if [ "$allow_delete" != true ]; then
     set -- "$@" --no-delete
 fi
+# The atomic deposit's journal lives in the package's own state, as the daemon
+# engine's runs keep it: one journal per profile, shared by every engine.
+set -- "$@" --deposit-journal "$state_root/deposit"
 # Appended to the core's own argv, before the supervisor wrap below, so the
 # supervisor's fixed prefix -- pid, start, boot, --core-nice, -- -- keeps the
 # exact shape its identity check depends on. A plan or a sync is per-file work
@@ -1331,11 +1336,15 @@ fi
 #   <kind> <profile|-> <status|-> <outcome|-> <deferred|-> <skipped|->
 #   <incomplete_listings|-> <mtime_not_kept|-> <reauthentication_failures|->
 #   <server_tasks_not_stopped|-> <keepalive_failures|-> <link_guard_unchecked|->
+#   <deposit_warnings|-> <deposit_unsettled|-> <deposit_issue|-> <deposit_issue_detail|->
 #   <folders...>
 # with the folders last (they may hold spaces): the first five
 # incomplete_listing_folders, raw JSON string text with every byte outside
 # printable ASCII and every `|` turned into `?`, each cut to 120 bytes, joined
-# by `|`, or `-`.
+# by `|`, or `-`. The deposit fields are what the atomic deposit named: how many
+# of its issues are warnings, how many deposits are left for the next run, and
+# the first warning's code and `<path>: <cause>` exactly as the daemon renders
+# them, with `%` and space written `%25` and `%20` so it stays one field.
 #
 # The result object is read from its own `"result":{` onward, which with
 # serde's sorted keys comes after the (possibly very large) plan members, and
@@ -1391,6 +1400,63 @@ if [ -n "$run_records_source" ]; then
             }
             return count ? out : "-"
         }
+        function json_text(text, key,   start, n, i, c, escaped, out) {
+            start = index(text, "\"" key "\":\"")
+            if (start == 0) return ""
+            text = substr(text, start + length(key) + 4)
+            out = ""; escaped = 0
+            n = length(text)
+            if (n > 4096) n = 4096
+            for (i = 1; i <= n; i++) {
+                c = substr(text, i, 1)
+                if (escaped) {
+                    escaped = 0
+                    # serde writes raw UTF-8 and escapes only control bytes:
+                    # a newline ends the line, any other control byte reads `?`.
+                    if (c == "n") out = out "\n"
+                    else if (c == "u") { out = out "?"; i += 4 }
+                    else if (c ~ /[btfr]/) out = out "?"
+                    else out = out c
+                    continue
+                }
+                if (c == "\\") { escaped = 1; continue }
+                if (c == "\"") break
+                out = out c
+            }
+            return out
+        }
+        function deposit_fields(result,   start, body, issues, at, issue, open_at, newline_at, code, detail, warnings) {
+            start = index(result, "\"deposit\":{")
+            if (start == 0) return "- - - -"
+            body = substr(result, start)
+            issues = array_body(body, "issues")
+            warnings = 0; code = "-"; detail = "-"
+            # As the daemon reads it: a warning counts only with a well-formed
+            # code; the first of them gives `<path>: <cause>`, its first line, bytes
+            # outside printable ASCII `?`, `|` `/`, over 160 bytes cut to 157 and `...`.
+            while ((at = index(issues, "\"severity\":\"warning\"")) > 0) {
+                issue = substr(issues, 1, at)
+                issues = substr(issues, at + 1)
+                # The issue object that holds it opens at its last `{"cause":"` (keys are
+                # sorted; inside a JSON string that text would carry escaped quotes).
+                while ((open_at = index(issue, "{\"cause\":\"")) > 0) issue = substr(issue, open_at + 1)
+                if (!match(issue, /"code":"deposit-[a-z-]+"/) || RLENGTH - 9 > 64) continue
+                if (warnings == 0) {
+                    code = substr(issue, RSTART + 8, RLENGTH - 9)
+                    detail = json_text(issue, "path") ": " json_text(issue, "cause")
+                    newline_at = index(detail, "\n")
+                    if (newline_at > 0) detail = substr(detail, 1, newline_at - 1)
+                    gsub(/[^ -~]/, "?", detail)
+                    gsub(/\|/, "/", detail)
+                    if (length(detail) > 160) detail = substr(detail, 1, 157) "..."
+                    gsub(/%/, "%25", detail)
+                    gsub(/ /, "%20", detail)
+                    if (detail == "") detail = "-"
+                }
+                warnings++
+            }
+            return warnings " " number(body, "unsettled") " " code " " detail
+        }
         {
             job = index($0, "\"schema\":\"sdsync.batch-job.v1\"") > 0 \
                 || index($0, "\"schema\":\"sdsync.result-record.v1\"") > 0
@@ -1398,6 +1464,7 @@ if [ -n "$run_records_source" ]; then
             if (!job && !completion) next
             profile = "-"; status = "-"; outcome = "-"; deferred = "-"; skipped = "-"
             listings = "-"; mtime = "-"; reauth = "-"; tasks = "-"; keepalive = "-"; unchecked = "-"; listed = "-"
+            deposit = "- - - -"
             if (job) {
                 if (match($0, /"profile":"[A-Za-z0-9_-]+"/)) profile = substr($0, RSTART + 11, RLENGTH - 12)
                 if (match($0, /"status":"[a-z-]+"/)) status = substr($0, RSTART + 10, RLENGTH - 11)
@@ -1422,9 +1489,10 @@ if [ -n "$run_records_source" ]; then
                 keepalive = number(result, "keepalive_failures")
                 unchecked = number(result, "link_guard_unchecked")
                 listed = folders(array_body(result, "incomplete_listing_folders"))
+                deposit = deposit_fields(result)
             }
             print (job ? "job" : "run"), profile, status, outcome, deferred, skipped, \
-                listings, mtime, reauth, tasks, keepalive, unchecked, listed
+                listings, mtime, reauth, tasks, keepalive, unchecked, deposit, listed
         }
     ' "$run_records_source") || run_records_status=$?
     [ "$run_records_status" -eq 0 ] || run_records=
@@ -1562,7 +1630,11 @@ take_record_facts() {
     profile_fact_tasks=$4
     profile_fact_keepalive=$5
     profile_fact_unchecked=$6
-    profile_fact_folders=$7
+    profile_fact_dep_warnings=$7
+    profile_fact_dep_unsettled=$8
+    profile_fact_dep_issue=$9
+    profile_fact_dep_detail=${10}
+    profile_fact_folders=${11}
     # One explicit branch per fact: a value that is not a count is dropped from
     # this profile's record, and a count is added to the run's total and
     # marks that total as known.
@@ -1596,15 +1668,41 @@ take_record_facts() {
             run_fact_folders=${run_fact_folders:+$run_fact_folders|}$profile_fact_folders
             ;;
     esac
+    # The deposit's warnings and what is left unsettled are summed; the first
+    # warning named by any profile is the run's.
+    case $profile_fact_dep_warnings in
+        ''|*[!0-9]*) profile_fact_dep_warnings= ;;
+        *) run_fact_dep_warnings=$((run_fact_dep_warnings + profile_fact_dep_warnings)); run_fact_dep_known=true ;;
+    esac
+    case $profile_fact_dep_unsettled in
+        ''|*[!0-9]*) profile_fact_dep_unsettled= ;;
+        *) run_fact_dep_unsettled=$((run_fact_dep_unsettled + profile_fact_dep_unsettled)) ;;
+    esac
+    case $profile_fact_dep_issue in
+        deposit-*) case $profile_fact_dep_issue in *[!a-z-]*) profile_fact_dep_issue= ;; esac ;;
+        *) profile_fact_dep_issue= ;;
+    esac
+    case $profile_fact_dep_detail in
+        ''|-) profile_fact_dep_detail= ;;
+        *)
+            profile_fact_dep_detail=$(printf '%s' "$profile_fact_dep_detail" | sed -e 's/%20/ /g' -e 's/%25/%/g')
+            ;;
+    esac
+    if [ -n "$profile_fact_dep_issue" ] && [ -z "$run_fact_dep_issue" ]; then
+        run_fact_dep_issue=$profile_fact_dep_issue
+        run_fact_dep_detail=$profile_fact_dep_detail
+    fi
 }
 clear_record_facts() {
     profile_fact_listings= profile_fact_mtime= profile_fact_reauth= profile_fact_tasks=
     profile_fact_keepalive= profile_fact_unchecked= profile_fact_folders=
+    profile_fact_dep_warnings= profile_fact_dep_unsettled= profile_fact_dep_issue= profile_fact_dep_detail=
 }
 run_fact_listings=0 run_fact_mtime=0 run_fact_reauth=0 run_fact_tasks=0 run_fact_keepalive=0
 run_fact_unchecked=0
 run_fact_listings_known=false run_fact_mtime_known=false run_fact_reauth_known=false
 run_fact_tasks_known=false run_fact_keepalive_known=false run_fact_unchecked_known=false run_fact_folders=
+run_fact_dep_warnings=0 run_fact_dep_unsettled=0 run_fact_dep_known=false run_fact_dep_issue= run_fact_dep_detail=
 clear_record_facts
 
 # A profile the preflight refused makes the aggregate a failure even when every
@@ -1660,14 +1758,16 @@ RUN_RECORDS
         esac
         clear_record_facts
         if [ -n "$covered_facts" ]; then
-            # shellcheck disable=SC2086 -- six numbers, then the folder text
+            # shellcheck disable=SC2086 -- ten fields, then the folder text
             set -f
-            read -r fact_listings fact_mtime fact_reauth fact_tasks fact_keepalive fact_unchecked fact_folders <<RECORD_FACTS
+            read -r fact_listings fact_mtime fact_reauth fact_tasks fact_keepalive fact_unchecked \
+                fact_dep_warnings fact_dep_unsettled fact_dep_issue fact_dep_detail fact_folders <<RECORD_FACTS
 $covered_facts
 RECORD_FACTS
             set +f
             take_record_facts "$fact_listings" "$fact_mtime" "$fact_reauth" "$fact_tasks" "$fact_keepalive" \
-                "$fact_unchecked" "$fact_folders"
+                "$fact_unchecked" "$fact_dep_warnings" "$fact_dep_unsettled" "$fact_dep_issue" \
+                "$fact_dep_detail" "$fact_folders"
         fi
         take_profile_cause "$covered_profile"
         case $covered_status in
@@ -1725,12 +1825,14 @@ RUN_RECORDS
     clear_record_facts
     if [ -n "$single_facts" ]; then
         set -f
-        read -r fact_listings fact_mtime fact_reauth fact_tasks fact_keepalive fact_unchecked fact_folders <<RECORD_FACTS
+        read -r fact_listings fact_mtime fact_reauth fact_tasks fact_keepalive fact_unchecked \
+            fact_dep_warnings fact_dep_unsettled fact_dep_issue fact_dep_detail fact_folders <<RECORD_FACTS
 $single_facts
 RECORD_FACTS
         set +f
         take_record_facts "$fact_listings" "$fact_mtime" "$fact_reauth" "$fact_tasks" "$fact_keepalive" \
-            "$fact_unchecked" "$fact_folders"
+            "$fact_unchecked" "$fact_dep_warnings" "$fact_dep_unsettled" "$fact_dep_issue" \
+            "$fact_dep_detail" "$fact_folders"
     fi
     take_profile_cause "$run_scope" "${run_cause_line:-$run_detail}"
     case $final_state:$run_partial in
@@ -1753,6 +1855,12 @@ fi
 [ "$run_fact_tasks_known" != true ] || run_state_tasks=$run_fact_tasks
 [ "$run_fact_keepalive_known" != true ] || run_state_keepalive=$run_fact_keepalive
 [ "$run_fact_unchecked_known" != true ] || run_state_unchecked=$run_fact_unchecked
+if [ "$run_fact_dep_known" = true ]; then
+    run_state_dep_warnings=$run_fact_dep_warnings
+    run_state_dep_unsettled=$run_fact_dep_unsettled
+    run_state_dep_issue=$run_fact_dep_issue
+    run_state_dep_detail=$run_fact_dep_detail
+fi
 # Five folders in all, across profiles, as the contract bounds them.
 if [ -n "$run_fact_folders" ]; then
     run_state_folders=$(printf '%s' "$run_fact_folders" | LC_ALL=C awk -F'|' '
@@ -1789,6 +1897,13 @@ else
     else
         activity_message="Package action failed (exit $run_exit_code)"
     fi
+fi
+# What the atomic deposit named reaches Activity on the run's own row, once per
+# run however many files or profiles it concerns, and makes the row a warning.
+if [ "$run_fact_dep_known" = true ] && [ "$run_fact_dep_warnings" -gt 0 ]; then
+    if [ "$run_fact_dep_warnings" -eq 1 ]; then dep_noun=warning; else dep_noun=warnings; fi
+    activity_message="$activity_message; $run_fact_dep_warnings deposit $dep_noun, first ${run_fact_dep_issue:-deposit-warning}: ${run_fact_dep_detail:-see the sync log}"
+    [ "$activity_level" != info ] || activity_level=warn
 fi
 runner_activity "$activity_code" "$run_label" "$activity_state" "$activity_message" "$run_activity_category" "$activity_level"
 if [ "$run_remote_log_dropped" = true ]; then

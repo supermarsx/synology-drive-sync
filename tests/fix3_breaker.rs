@@ -145,11 +145,13 @@ impl Fixture {
         self.command("sync", destination, extra)
     }
 
+    /// Requests for `operation`, the atomic deposit's own renames and deletes of its reserved
+    /// names left out: these tests count renames and deletions of user data.
     fn count(&self, operation: &str) -> usize {
         self.server
             .requests()
             .iter()
-            .filter(|request| request.operation() == operation)
+            .filter(|request| request.operation() == operation && !request.is_deposit_bookkeeping())
             .count()
     }
 
@@ -181,10 +183,10 @@ fn three_refused_folders_among_many_writes_do_not_fail_the_run() {
         fixture.write(&format!("keep/f{index}.txt"), b"payload");
     }
     for index in 0..3 {
-        fixture.write(&format!("longfoldername{index}/a.txt"), b"x");
+        fixture.write(&format!("longfoldername_padded_past_this_mock_volumes_sixty_four_byte_name_limit{index}/a.txt"), b"x");
     }
     fixture.write("ok/a.txt", b"x");
-    fixture.server.refuse_names_over_bytes(12, 418);
+    fixture.server.refuse_names_over_bytes(64, 418);
     let output = fixture.sync("/team/re2", &[]);
     assert_eq!(output.status.code(), Some(0), "{}", describe(&output));
     assert_eq!(fixture.count(UPLOAD), 31);
@@ -192,7 +194,9 @@ fn three_refused_folders_among_many_writes_do_not_fail_the_run() {
     for index in 0..3 {
         assert!(
             deferred.contains(&(
-                format!("longfoldername{index}"),
+                format!(
+                    "longfoldername_padded_past_this_mock_volumes_sixty_four_byte_name_limit{index}"
+                ),
                 "remote-refused".to_owned()
             )),
             "{deferred:?}"
@@ -230,13 +234,13 @@ fn the_contents_of_refused_folders_do_not_dilute_or_convict() {
     fixture.server.add_directory("/team/dilute");
     for folder in 0..3 {
         for index in 0..100 {
-            fixture.write(&format!("longfoldername{folder}/f{index}.txt"), b"payload");
+            fixture.write(&format!("longfoldername_padded_past_this_mock_volumes_sixty_four_byte_name_limit{folder}/f{index}.txt"), b"payload");
         }
     }
     for index in 0..30 {
         fixture.write(&format!("r{index}.txt"), b"payload");
     }
-    fixture.server.refuse_names_over_bytes(12, 418);
+    fixture.server.refuse_names_over_bytes(64, 418);
     let output = fixture.sync("/team/dilute", &[]);
     assert_eq!(output.status.code(), Some(0), "{}", describe(&output));
     assert_eq!(fixture.count(UPLOAD), 30);
@@ -376,9 +380,14 @@ fn lasting_refusals_on_a_synced_share_stay_amber_on_every_run() {
         fixture.write(&format!("f{index}.txt"), b"payload");
     }
     for index in 0..3 {
-        fixture.write(&format!("averylongname{index}.txt"), b"x");
+        fixture.write(
+            &format!(
+                "averylongname_padded_past_this_mock_volumes_sixty_four_byte_name_limit{index}.txt"
+            ),
+            b"x",
+        );
     }
-    fixture.server.refuse_names_over_bytes(12, 418);
+    fixture.server.refuse_names_over_bytes(64, 418);
     for round in 1..=3 {
         let output = fixture.sync("/team/bk1", &[]);
         assert_eq!(
@@ -446,15 +455,43 @@ fn a_deterministically_failing_server_copy_is_uploaded_in_the_same_run() {
     assert_eq!(fixture.count(UPLOAD), 1, "nothing more to upload");
 }
 
-/// G-4: a failed copy that left a partial file at the destination is not uploaded over in that
-/// run. It is the transient `server-copy-failed` once, and the next run replaces it.
+/// Atomic deposit: a failed copy that left a partial file at its destination (which was absent
+/// when the copy started, so nobody else wrote it) has the partial file deleted, named
+/// `deposit-copy-partial-removed`, and the file is uploaded in the same run.
+#[test]
+fn a_failed_copy_that_left_a_partial_file_is_removed_and_uploaded_in_the_same_run() {
+    let fixture = moved_file_fixture("fix3-partial-atomic", "/team/partial");
+    fixture
+        .server
+        .fail_next_copy_status_with_envelope_leaving_partial(1006, 4);
+    let first = fixture.sync("/team/partial", &[]);
+    assert_eq!(first.status.code(), Some(0), "{}", describe(&first));
+    assert_eq!(
+        fixture.text("/team/partial/new/item.bin").as_deref(),
+        String::from_utf8(copy_payload(b"copy-me-on-nas"))
+            .ok()
+            .as_deref()
+    );
+    let document = json(&first);
+    assert!(deferred(&document).is_empty(), "{document}");
+    let issues = document["result"]["deposit"]["issues"].to_string();
+    assert!(issues.contains("deposit-copy-partial-removed"), "{issues}");
+    assert_eq!(
+        document["result"]["recovered"]["server_copy_fallbacks"], 1,
+        "{document}"
+    );
+}
+
+/// G-4, direct deposit: a failed copy that left a partial file at the destination is not
+/// uploaded over in that run. It is the transient `server-copy-failed` once, and the next run
+/// replaces it.
 #[test]
 fn a_failed_copy_that_left_a_partial_file_converges_in_one_more_run() {
     let fixture = moved_file_fixture("fix3-partial", "/team/partial");
     fixture
         .server
         .fail_next_copy_status_with_envelope_leaving_partial(1006, 4);
-    let first = fixture.sync("/team/partial", &[]);
+    let first = fixture.sync("/team/partial", &["--deposit", "direct"]);
     assert_eq!(first.status.code(), Some(3), "{}", describe(&first));
     let deferred = json(&first)["result"]["deferred"].clone();
     assert_eq!(deferred[0]["reason"], "server-copy-failed", "{deferred}");
@@ -465,7 +502,7 @@ fn a_failed_copy_that_left_a_partial_file_converges_in_one_more_run() {
             .contains("the destination now holds an entry"),
         "{deferred}"
     );
-    let second = fixture.sync("/team/partial", &[]);
+    let second = fixture.sync("/team/partial", &["--deposit", "direct"]);
     assert_eq!(second.status.code(), Some(0), "{}", describe(&second));
     assert_eq!(
         fixture.text("/team/partial/new/item.bin").as_deref(),

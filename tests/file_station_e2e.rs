@@ -2138,10 +2138,38 @@ fn additive_plan_then_sync_preserves_folder_parity_and_verifies_every_upload() {
         .filter(|request| request.operation() == "SYNO.FileStation.Upload.upload")
         .collect::<Vec<_>>();
     assert_eq!(uploads.len(), 2);
-    assert_eq!(uploads[0].upload_filename.as_deref(), Some("alpha.txt"));
+    // Each upload goes to a temporary name in its destination folder, and is published under its
+    // final name by one Rename once verified (crash-atomic deposit).
+    assert!(
+        uploads[0]
+            .upload_filename
+            .as_deref()
+            .is_some_and(|name| name.starts_with("~sdsync-part-")),
+        "{:?}",
+        uploads[0].upload_filename
+    );
+    assert_eq!(
+        uploads[0].fields.get("path").map(String::as_str),
+        Some("/team/sync")
+    );
     assert_eq!(uploads[0].upload_bytes, Some(5));
-    assert_eq!(uploads[1].upload_filename.as_deref(), Some("beta.bin"));
+    assert!(
+        uploads[1]
+            .upload_filename
+            .as_deref()
+            .is_some_and(|name| name.starts_with("~sdsync-part-"))
+    );
+    assert_eq!(
+        uploads[1].fields.get("path").map(String::as_str),
+        Some("/team/sync/nested")
+    );
     assert_eq!(uploads[1].upload_bytes, Some(9));
+    let published = sync_requests
+        .iter()
+        .filter(|request| request.operation() == "SYNO.FileStation.Rename.rename")
+        .map(|request| request.fields.get("name").cloned().unwrap_or_default())
+        .collect::<Vec<_>>();
+    assert_eq!(published, [r#"["alpha.txt"]"#, r#"["beta.bin"]"#]);
     assert_eq!(
         sync_requests
             .iter()
@@ -2204,18 +2232,24 @@ fn additive_plan_then_sync_preserves_folder_parity_and_verifies_every_upload() {
             // still sent, so an idle timeout is answered by a login rather than a failed upload.
             "SYNO.FileStation.CreateFolder.create",
             "SYNO.FileStation.CreateFolder.create",
-            // The destination's precondition, then the upload, then its size, then its digest
-            // computed on the NAS. None of them carries the file back.
+            // The upload to a temporary name, then its size, then its digest computed on the NAS.
+            // None of them carries the file back. Then the atomic deposit publishes it: the
+            // destination's precondition (asked once, as late as it can be), the Rename, and the
+            // check of the published file.
+            "SYNO.FileStation.Upload.upload",
+            "SYNO.FileStation.List.getinfo",
+            "SYNO.FileStation.MD5.start",
+            "SYNO.FileStation.MD5.status",
+            "SYNO.FileStation.List.getinfo",
+            "SYNO.FileStation.Rename.rename",
             "SYNO.FileStation.List.getinfo",
             "SYNO.FileStation.Upload.upload",
             "SYNO.FileStation.List.getinfo",
             "SYNO.FileStation.MD5.start",
             "SYNO.FileStation.MD5.status",
             "SYNO.FileStation.List.getinfo",
-            "SYNO.FileStation.Upload.upload",
+            "SYNO.FileStation.Rename.rename",
             "SYNO.FileStation.List.getinfo",
-            "SYNO.FileStation.MD5.start",
-            "SYNO.FileStation.MD5.status",
             // The reconciliation names every ancestor in one request again: the run may have
             // created folders since the plan pass read them.
             "SYNO.FileStation.List.getinfo",

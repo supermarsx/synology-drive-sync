@@ -88,11 +88,13 @@ impl Fixture {
         run(&arguments)
     }
 
+    /// Requests for `operation`, the atomic deposit's own renames and deletes of its reserved
+    /// names left out: these tests count renames and deletions of user data.
     fn count(&self, operation: &str) -> usize {
         self.server
             .requests()
             .iter()
-            .filter(|request| request.operation() == operation)
+            .filter(|request| request.operation() == operation && !request.is_deposit_bookkeeping())
             .count()
     }
 
@@ -300,7 +302,8 @@ fn refused_case_rename_deletes_nothing_and_is_retried() {
     server.add_directory("/team/e1r/Photos/notes");
     server.add_file("/team/e1r/Photos/notes/n.txt", b"note", 1_700_000_000);
     server.add_file("/team/e1r/Photos/a.jpg", b"jpeg-a", 1_700_000_000);
-    server.fail_next_api_operation(RENAME, 900);
+    // The case rename, not the deposit's own renames of the files beneath it.
+    server.fail_next_api_operation_on(RENAME, r#"["photos"]"#, 900);
 
     let first = fixture.sync("/team/e1r", &["--delete"]);
     assert_eq!(first.status.code(), Some(0), "{}", describe(&first));
@@ -353,7 +356,8 @@ fn refused_file_case_rename_keeps_edits_flowing() {
     let server = &fixture.server;
     server.add_directory("/team/e1f");
     server.add_file("/team/e1f/Report.pdf", b"v1", 1_700_000_000);
-    server.fail_next_api_operation(RENAME, 900);
+    // The case rename, not the deposit's own renames of the edit.
+    server.fail_next_api_operation_on(RENAME, r#"["report.pdf"]"#, 900);
 
     let first = fixture.sync("/team/e1f", &["--delete"]);
     assert_eq!(first.status.code(), Some(0), "{}", describe(&first));

@@ -19619,7 +19619,49 @@ fn result_facts(
             Value::Null
         },
     );
+    facts.insert(
+        "deposit".to_owned(),
+        deposit_value(record, warnings, errors),
+    );
     facts
+}
+
+/// The atomic deposit's line of a run or profile record (`deposit_*`, written by the daemon
+/// from the run's `deposit` report): how many warnings it named this run, the first with its NAS
+/// path and cause, and how many deposits are left for the next run. `null` for a run that wrote
+/// nothing (or an older writer). Warnings make the run and the profile amber.
+#[cfg(target_os = "linux")]
+fn deposit_value(
+    record: &OutcomeRecord<'_>,
+    warnings: &mut Vec<&'static str>,
+    errors: &mut OutcomeErrors,
+) -> Value {
+    let Some(count) = record.number("deposit_warnings", errors) else {
+        return Value::Null;
+    };
+    if count > 0 {
+        warnings.push("deposit_warnings");
+    }
+    let issue = record.text("deposit_issue", errors).and_then(|code| {
+        let valid = code.len() <= 64
+            && code.starts_with(b"deposit-")
+            && code.iter().all(|b| b.is_ascii_lowercase() || *b == b'-');
+        if valid {
+            String::from_utf8(code).ok()
+        } else {
+            errors.push(record.source, "malformed");
+            None
+        }
+    });
+    let issue_detail = record
+        .text("deposit_issue_detail", errors)
+        .map(|detail| shown_index_detail(&detail));
+    json!({
+        "warnings": count,
+        "unsettled": record.number("deposit_unsettled", errors),
+        "issue": issue,
+        "issue_detail": issue_detail,
+    })
 }
 
 /// Merge `result_facts` into an outcome object built with `json!`.

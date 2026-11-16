@@ -194,7 +194,8 @@ impl SdkError {
             Error::InvalidSource(_)
             | Error::UnsupportedLocalEntry { .. }
             | Error::FileIo { .. }
-            | Error::SourceChanged(_) => ErrorCode::LocalFilesystem,
+            | Error::SourceChanged(_)
+            | Error::DepositJournal { .. } => ErrorCode::LocalFilesystem,
             Error::Http { .. }
             | Error::HttpBody { .. }
             | Error::HttpStatus { .. }
@@ -358,6 +359,8 @@ pub struct SyncRequest {
     comparison: Comparison,
     deletion: DeletionPolicy,
     jobs: usize,
+    deposit: crate::deposit::DepositMode,
+    deposit_journal: Option<PathBuf>,
 }
 
 impl SyncRequest {
@@ -387,6 +390,8 @@ impl SyncRequest {
                 comparison: Comparison::Content,
                 deletion: DeletionPolicy::disabled(),
                 jobs: DEFAULT_JOBS,
+                deposit: crate::deposit::DepositMode::Atomic,
+                deposit_journal: None,
             },
         }
     }
@@ -494,6 +499,25 @@ impl SyncRequestBuilder {
     #[must_use]
     pub fn jobs(mut self, jobs: usize) -> Self {
         self.request.jobs = jobs;
+        self
+    }
+
+    /// How files reach their NAS name. [`crate::deposit::DepositMode::Atomic`] (the default):
+    /// uploaded to a temporary name, verified, then renamed into place, journalled so the next
+    /// run settles whatever an interrupted one left; a DSM without Rename gets nothing written.
+    /// [`crate::deposit::DepositMode::Direct`]: straight to the final name, as before, named
+    /// `deposit-not-atomic` in every outcome.
+    #[must_use]
+    pub fn deposit(mut self, mode: crate::deposit::DepositMode) -> Self {
+        self.request.deposit = mode;
+        self
+    }
+
+    /// Where the atomic deposit keeps its journal; default
+    /// [`crate::deposit::default_journal_dir`]. It must be private to this user.
+    #[must_use]
+    pub fn deposit_journal(mut self, directory: impl Into<PathBuf>) -> Self {
+        self.request.deposit_journal = Some(directory.into());
         self
     }
 
@@ -851,6 +875,9 @@ pub enum DeferredReason {
     RemoteDigestKeepsFailing,
     /// The NAS refused its deletion in several consecutive runs; lasting. Engine-only.
     DeleteKeepsFailing,
+    /// Atomic deposit is on and this DSM offers no Rename to publish a verified copy, so nothing
+    /// was written. Lasting until the DSM offers it or the request opts into direct deposit.
+    DepositNotAtomicUnavailable,
 }
 
 impl DeferredReason {
@@ -886,6 +913,7 @@ impl DeferredReason {
             Self::SourceStaysUnreadable => sync::DeferReason::SourceStaysUnreadable,
             Self::RemoteDigestKeepsFailing => sync::DeferReason::RemoteDigestKeepsFailing,
             Self::DeleteKeepsFailing => sync::DeferReason::DeleteKeepsFailing,
+            Self::DepositNotAtomicUnavailable => sync::DeferReason::DepositNotAtomicUnavailable,
         }
     }
 }
@@ -915,6 +943,7 @@ impl From<sync::DeferReason> for DeferredReason {
             sync::DeferReason::SourceStaysUnreadable => Self::SourceStaysUnreadable,
             sync::DeferReason::RemoteDigestKeepsFailing => Self::RemoteDigestKeepsFailing,
             sync::DeferReason::DeleteKeepsFailing => Self::DeleteKeepsFailing,
+            sync::DeferReason::DepositNotAtomicUnavailable => Self::DepositNotAtomicUnavailable,
         }
     }
 }
@@ -1094,6 +1123,59 @@ pub struct SyncOutcome {
     link_guard_unchecked: usize,
     /// How reconciliation proved content, when the run reconciled. See [`ReconciliationSummary`].
     reconciliation: Option<ReconciliationSummary>,
+    /// How files reached the NAS, what recovery settled of an interrupted run, and every named
+    /// deposit condition. See [`DepositSummary`].
+    deposit: DepositSummary,
+}
+
+/// What the deposit did in one run: see [`crate::deposit`].
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
+pub struct DepositSummary {
+    /// `atomic` or `direct`.
+    pub mode: &'static str,
+    /// Files published under a name that was empty.
+    pub published: usize,
+    /// Files published over a previous version.
+    pub replaced: usize,
+    /// Earlier runs' interrupted deposits this run settled.
+    pub recovered: usize,
+    /// Journalled deposits still unsettled; the next run settles them.
+    pub unsettled: usize,
+    /// Every named condition, by code (`deposit-rolled-back`, `deposit-backup-kept`, ...).
+    pub issues: Vec<DepositIssueSummary>,
+}
+
+/// One named deposit condition.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct DepositIssueSummary {
+    pub code: &'static str,
+    /// `info` or `warning`.
+    pub severity: &'static str,
+    /// The NAS entry (or the journal file) concerned.
+    pub path: String,
+    pub cause: String,
+}
+
+impl DepositSummary {
+    fn from_report(report: &crate::deposit::DepositReport) -> Self {
+        Self {
+            mode: report.mode.as_str(),
+            published: report.published,
+            replaced: report.replaced,
+            recovered: report.recovered,
+            unsettled: report.unsettled,
+            issues: report
+                .issues
+                .iter()
+                .map(|issue| DepositIssueSummary {
+                    code: issue.code,
+                    severity: issue.severity.as_str(),
+                    path: issue.path.clone(),
+                    cause: issue.cause.clone(),
+                })
+                .collect(),
+        }
+    }
 }
 
 /// How a run's post-execution reconciliation proved content (SC-3).
@@ -1143,6 +1225,11 @@ impl SyncOutcome {
     /// How reconciliation proved content; `None` when the run did not reconcile.
     pub fn reconciliation(&self) -> Option<&ReconciliationSummary> {
         self.reconciliation.as_ref()
+    }
+
+    /// What the deposit did: its mode, what recovery settled, and every named condition.
+    pub fn deposit(&self) -> &DepositSummary {
+        &self.deposit
     }
 
     pub fn plan(&self) -> &PlanSummary {
@@ -1290,6 +1377,12 @@ impl Engine {
         )?;
         authenticate(&mut client, &request.username, secrets, cancellation)?;
 
+        // The atomic deposit's journal is claimed and an interrupted run's deposits are settled
+        // inside the operation, before the NAS is listed; the journal is closed after it,
+        // whatever its outcome. Settling happens even for a plan that is then only previewed:
+        // it touches only names this request's own journal records.
+        let mut deposit_report = crate::deposit::DepositReport::off(request.deposit);
+        let mut deposit_context = None;
         let operation = catch_unwind(AssertUnwindSafe(|| {
             emit(
                 cancellation,
@@ -1301,6 +1394,25 @@ impl Engine {
             client
                 .verify_destination_writable(&root)
                 .map_err(SdkError::from_core)?;
+            let owner = crate::deposit::DepositOwner::derive(
+                "",
+                &request.remote,
+                &request.endpoint,
+                &request.username,
+            );
+            let begun = crate::deposit::begin(
+                request.deposit,
+                request.deposit_journal.as_deref(),
+                &owner,
+                &client,
+                &root,
+                cancellation,
+                &mut deposit_report,
+            )
+            .map_err(SdkError::from_core)?;
+            deposit_context = begun.context.clone();
+            let deposit = begun.deposit;
+            let journalled = begun.journalled;
             emit(
                 cancellation,
                 &mut on_event,
@@ -1317,6 +1429,16 @@ impl Engine {
                     cancellation,
                 )
                 .map_err(SdkError::from_core)?;
+            if let Some(context) = &deposit_context {
+                deposit_report
+                    .issues
+                    .extend(crate::deposit::unjournaled_reserved(
+                        &root,
+                        scanned.inventory.entries.keys().map(String::as_str),
+                        context.journal.owner(),
+                        &journalled,
+                    ));
+            }
             let incomplete_directories = scanned.incomplete_directories;
             let skipped_remote = scanned.skipped;
             let link_guard_unchecked = scanned.link_guard_unchecked;
@@ -1387,7 +1509,15 @@ impl Engine {
                     phase: Phase::Planning,
                 },
             )?;
+            let suspect = deposit_report
+                .suspect
+                .iter()
+                .filter_map(|path| root.relative(path).ok())
+                .collect::<std::collections::BTreeSet<String>>();
             let mut plan = plan::build_plan(&root, &local, &remote, &rules, &options)
+                .map_err(SdkError::from_core)?;
+            // What recovery kept but could not prove whole is uploaded over, never adopted.
+            plan::force_uploads(&root, &mut plan, &local, &remote, &suspect)
                 .map_err(SdkError::from_core)?;
             plan.link_guard_unchecked = link_guard_unchecked;
             merge_deferred(
@@ -1407,6 +1537,14 @@ impl Engine {
                 sync::withhold_comma_ambiguous_mutations(&client, &mut plan, &remote)
                     .map_err(SdkError::from_core)?,
             );
+            // For the same reason, a file the atomic deposit could not rename or delete around
+            // safely is deposited directly, by name.
+            if let Some(context) = &deposit_context {
+                context.deposit_directly(
+                    sync::comma_ambiguous_deposits(&client, &plan, &remote)
+                        .map_err(SdkError::from_core)?,
+                );
+            }
             let named_in_plan = sync::deferrals_in_plan_skips(&plan, &deferred);
             merge_deferred(&mut deferred, named_in_plan);
             // This plan is executed, so its uploads need the strong digest the upload path
@@ -1448,6 +1586,7 @@ impl Engine {
                     incomplete_listings: incomplete_directories.clone(),
                     link_guard_unchecked,
                     reconciliation: None,
+                    deposit: DepositSummary::default(),
                 });
             }
             check_cancellation(cancellation)?;
@@ -1477,6 +1616,7 @@ impl Engine {
                         ExecuteOptions {
                             jobs: request.jobs,
                             dry_run: false,
+                            deposit: deposit.clone(),
                         },
                         cancellation.clone(),
                         observer_factory,
@@ -1582,6 +1722,7 @@ impl Engine {
                 incomplete_listings: incomplete_directories,
                 link_guard_unchecked,
                 reconciliation,
+                deposit: DepositSummary::default(),
             })
         }));
         let operation = match operation {
@@ -1594,6 +1735,12 @@ impl Engine {
                 resume_unwind(payload);
             }
         };
+        // Closed whatever the operation's outcome; the outcome carries what the deposit did.
+        crate::deposit::end(deposit_context.take(), &mut deposit_report);
+        let operation = operation.map(|mut outcome| {
+            outcome.deposit = DepositSummary::from_report(&deposit_report);
+            outcome
+        });
 
         let logout_start = catch_unwind(AssertUnwindSafe(|| {
             emit(

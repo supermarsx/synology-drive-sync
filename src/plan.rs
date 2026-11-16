@@ -319,7 +319,9 @@ impl Scope {
                     relative: relative.clone(),
                     reason: SkipReason::TypeConflict {
                         detail: format!(
-                            "the source holds a {} and the NAS a {} here, inside a folder this                              run reads shallow ({}); the folder's contents were not read, so                              neither is replaced, and a whole-tree run settles it",
+                            "the source holds a {} and the NAS a {} here, inside a folder this run \
+                            reads shallow ({}); the folder's contents were not read, so neither is \
+                            replaced, and a whole-tree run settles it",
                             local_kind.as_str(),
                             remote_kind.as_str(),
                             self.describe()
@@ -1180,7 +1182,8 @@ pub fn build_plan(
                 // whole. `Scope::confine` keeps a shallow folder out of here; this is the backstop.
                 if !options.scope.contains(&remote_entry.relative, true) {
                     return Err(Error::Message(format!(
-                        "scope_unconfined: {:?} is a folder on the NAS this run did not list                          whole ({}); nothing was planned",
+                        "scope_unconfined: {:?} is a folder on the NAS this run did not list whole \
+                        ({}); nothing was planned",
                         remote_entry.relative,
                         options.scope.describe()
                     )));
@@ -2091,6 +2094,57 @@ fn schedule_upload(
     Ok(())
 }
 
+/// Upload over these NAS files whatever the comparison found, so none is adopted unverified:
+/// what an interrupted server copy left, which recovery could not prove whole (`relatives` are
+/// destination-relative). A path already written, deleted or copied by the plan, or with no local
+/// file of the same spelling, is left to the plan. Returns how many uploads were added.
+pub fn force_uploads(
+    root: &RemoteRoot,
+    plan: &mut SyncPlan,
+    local: &LocalInventory,
+    remote: &RemoteInventory,
+    relatives: &BTreeSet<String>,
+) -> Result<usize> {
+    let mut forced = 0;
+    for relative in relatives {
+        let planned = plan
+            .uploads
+            .iter()
+            .any(|action| action.local.relative == *relative)
+            || plan
+                .copies
+                .iter()
+                .any(|action| action.to_relative == *relative)
+            || plan
+                .pre_deletes
+                .iter()
+                .chain(&plan.post_deletes)
+                .any(|action| action.relative == *relative);
+        if planned {
+            continue;
+        }
+        let (Some(entry), Some(remote_entry)) =
+            (local.entries.get(relative), remote.entries.get(relative))
+        else {
+            continue;
+        };
+        if entry.kind != EntryKind::File || remote_entry.kind != EntryKind::File {
+            continue;
+        }
+        schedule_upload(
+            root,
+            plan,
+            entry,
+            relative,
+            ChangeReason::Forced,
+            Some(overwritten_snapshot(remote_entry)),
+        )?;
+        plan.unchanged_files = plan.unchanged_files.saturating_sub(1);
+        forced += 1;
+    }
+    Ok(forced)
+}
+
 /// The plan-time state of a remote file an upload is about to overwrite.
 fn overwritten_snapshot(remote: &RemoteEntry) -> RemoteSnapshot {
     RemoteSnapshot {
@@ -2204,7 +2258,8 @@ fn require_confined(scope: &Scope, local: &LocalInventory, remote: &RemoteInvent
         .find(|(relative, kind)| !scope.admits(relative, *kind));
     match unconfined {
         Some((relative, kind)) => Err(Error::Message(format!(
-            "scope_unconfined: {relative:?} ({}) reached the planner outside the scope {};              nothing was planned",
+            "scope_unconfined: {relative:?} ({}) reached the planner outside the scope {}; nothing \
+            was planned",
             kind.as_str(),
             scope.describe()
         ))),
@@ -3313,6 +3368,48 @@ mod tests {
             scope: Scope::root(),
             ..options(delete)
         }
+    }
+
+    /// What deposit recovery kept but could not prove whole is uploaded over even when the
+    /// comparison calls it unchanged; a path the plan already writes is not scheduled twice.
+    #[test]
+    fn a_file_recovery_could_not_prove_is_uploaded_over_whatever_the_comparison_said() {
+        let local = local(&[
+            ("copied.bin", EntryKind::File, 4, 3_500),
+            ("changed.txt", EntryKind::File, 4, 5_000),
+            ("gone.txt", EntryKind::File, 4, 3_500),
+        ]);
+        let remote = remote(&[
+            ("copied.bin", EntryKind::File, 4, 3),
+            ("changed.txt", EntryKind::File, 4, 4),
+        ]);
+        let root = RemoteRoot::parse("/share/root").unwrap();
+        let mut plan = build_plan(&root, &local, &remote, &rules(&[]), &options(false)).unwrap();
+        assert_eq!(plan.unchanged_files, 1, "the comparison adopted copied.bin");
+        let suspect = BTreeSet::from([
+            "copied.bin".to_owned(),
+            "changed.txt".to_owned(),
+            "absent.bin".to_owned(),
+        ]);
+
+        let forced = force_uploads(&root, &mut plan, &local, &remote, &suspect).unwrap();
+
+        assert_eq!(forced, 1);
+        assert_eq!(plan.unchanged_files, 0);
+        let copied = plan
+            .uploads
+            .iter()
+            .find(|action| action.local.relative == "copied.bin")
+            .expect("forced");
+        assert_eq!(copied.reason, ChangeReason::Forced);
+        assert_eq!(copied.expected_remote.as_ref().map(|s| s.size), Some(4));
+        assert_eq!(
+            plan.uploads
+                .iter()
+                .filter(|action| action.local.relative == "changed.txt")
+                .count(),
+            1
+        );
     }
 
     #[test]

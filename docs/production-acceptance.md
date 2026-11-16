@@ -372,7 +372,7 @@ limited to matching content already present within the one target NAS.
 ## Questions only a real NAS can answer
 
 The File Station mock reproduces what DSM is documented to do. It cannot say what DSM actually does in
-twenty places where a safeguard of the client rests on an assumption. Each is a question to put to a
+twenty-four places where a safeguard of the client rests on an assumption. Each is a question to put to a
 disposable share on the exact DSM build in service, and each answer changes what the client or the
 dashboard can be trusted to do. Run them against a scratch path only, with a throwaway account, and
 record the result in the [acceptance record](#acceptance-record). Where a probe gives an expected
@@ -414,7 +414,8 @@ UP() { # UP /share/folder local-file [extra curl -F options]
      names the path and asks for `--compare content` or a resync of it. Nothing persists the
      suspicion: a cancelled run (Ctrl-C) and the *next* run have no such defence, so the question of
      whether DSM really leaves a full-size, new-mtime torn file after an interrupted overwrite is
-     still open until you have answered it.
+     still open until you have answered it. This matters only for `deposit = "direct"`: the default
+     atomic deposit uploads to a temporary name and never lets a torn file reach the final name.
 3. **What does a failed server-side copy look like?** `CopyMove.start` `/share/a/f.bin` into `/share/b`
    where `b/f.bin` already exists (fields `path=["/share/a/f.bin"]`, `dest_folder_path=/share/b`,
    `remove_src=false`, `accurate_progress=false`; CopyMove is version 3), then poll `CopyMove.status`
@@ -592,6 +593,29 @@ UP() { # UP /share/folder local-file [extra curl -F options]
       of the `--watch` process under the shell engine; under the daemon the watcher runs inside the
       `sdsync-dsm-api --daemon` process, so compare that process before and after arming): about 6 MiB is
       expected at 20,000 directories and about 16 MiB at 100,000.
+21. **Does `Rename` refuse a name that is taken, and keep the modification time?** The atomic deposit
+    rests on both ([Crash-atomic deposit](deposit.md)). In a scratch folder: `UP` a file as `.x` and
+    another as `y`, then `SYNO.FileStation.Rename` `rename` (version 2, `path=["/share/t/.x"]`,
+    `name=["y"]`), and again with `name=["z"]`. Over SSH, `stat -c '%i %Y %Z' ` both before and after.
+    - Expected: the first rename fails with 414 and touches neither file; the second succeeds with the
+      same inode and modification time and a new change time. A Rename that replaces `y` instead
+      means the deposit could publish an overwrite in one step with no gap: report it.
+22. **Is an `Upload` written in place, or staged and renamed?** While a large upload with
+    `--limit-rate` runs, list the destination folder and `<volume>/@tmp/webfm` over SSH every 200 ms.
+    - A file growing under the final name is an in-place write (a killed upload can tear it); a file
+      growing in `@tmp/webfm` and appearing under the final name at the end is staged and renamed
+      (DSM's own `Upload` is then never partial by name). Either way the atomic deposit never shows
+      a partial file, but the second answer means an overwrite by plain `Upload` has no gap, which
+      would change which overwrite protocol is cheapest.
+23. **Is a `CopyMove` move with `overwrite=true` one rename?** Move `stage/y` onto an existing `y`
+    twenty times while an inotify trace (or a tight `stat` loop) watches the folder. Only
+    `MOVED_FROM`/`MOVED_TO` and the moved file's inode under `y` mean an atomic replace; a `DELETE` of
+    `y` first, or a new inode, means it is not. Record both, and what a copy with `overwrite=true`
+    does to `y` (same inode written in place, or a new one).
+24. **Does an API `Delete` go to the recycle bin?** On a share with the recycle bin on, delete a
+    scratch file through File Station's API and look in `#recycle`. If it is there, every overwrite
+    the atomic deposit makes leaves the previous version in the recycle bin until its retention
+    empties it.
 
 ## Acceptance record
 

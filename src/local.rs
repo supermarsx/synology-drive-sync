@@ -1407,7 +1407,11 @@ fn scan_dir(
         // never payload, and pruning them before metadata lookup guarantees that a linked or
         // otherwise unusual managed entry is not traversed. Remote planning protects the same
         // names, so mirror mode cannot interpret the omission as authorization to delete them.
-        if is_dsm_managed(&relative) {
+        // The atomic deposit's reserved names are managed on the NAS but never silently dropped
+        // here: a local file holding one is refused by name below.
+        let reserved =
+            crate::path::is_deposit_reserved_name(relative.rsplit('/').next().unwrap_or(&relative));
+        if is_dsm_managed(&relative) && !reserved {
             if context.include_excluded && context.scope.matches(&relative) {
                 output.excluded.insert(relative);
             }
@@ -1463,10 +1467,18 @@ fn scan_dir(
         // A name or path the tool will not carry -- anything beginning with `~`, a Windows device
         // stem like `aux.h`, a component over 255 characters or bytes -- is that path's skip. It
         // used to fail the whole scan, so one Word `~WRL0001.tmp` anywhere meant nothing synced.
-        let refusal = match validate_relative(&relative) {
-            Err(Error::UnsafeRemotePath { reason, .. }) => Some(reason),
-            Err(other) => Some(other.to_string()),
-            Ok(()) => drive_path_issue(&relative),
+        let refusal = if reserved {
+            Some(
+                "the name is reserved for synology-drive-sync's own temporary NAS files (the \
+                 atomic deposit's ~sdsync-part-, ~sdsync-prev- and ~sdsync-stage- names); rename it"
+                    .to_owned(),
+            )
+        } else {
+            match validate_relative(&relative) {
+                Err(Error::UnsafeRemotePath { reason, .. }) => Some(reason),
+                Err(other) => Some(other.to_string()),
+                Ok(()) => drive_path_issue(&relative),
+            }
         };
         if let Some(reason) = refusal {
             if !output.skip(relative, unsupported_entry(reason), context.budget) {

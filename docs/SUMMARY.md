@@ -17,6 +17,7 @@
 - [Passwords, TOTP, and secret sources](configuration/credentials.md)
 - [Network, reverse proxy, and TLS](configuration/network.md)
 - [Comparison, exclusions, and deletion](configuration/safety.md)
+- [Crash-atomic deposit](deposit.md)
 - [Full configuration example](configuration/example.md)
 - [Output, logs, and monitoring](observability.md)
 

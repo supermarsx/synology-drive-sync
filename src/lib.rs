@@ -3,6 +3,7 @@
 pub mod api;
 pub mod batch;
 pub mod cancel;
+pub mod deposit;
 pub mod digest_evidence;
 pub mod entropy;
 pub mod error;
@@ -481,7 +482,9 @@ mod tests {
             for needle in FORBIDDEN {
                 assert!(
                     !source.contains(needle),
-                    "{name} constructs a reqwest client directly ({needle});                      use blocking_client_builder() or async_client_builder() so                      the crypto provider cannot be missed"
+                    "{name} constructs a reqwest client directly ({needle}); use \
+                    blocking_client_builder() or async_client_builder() so the crypto provider \
+                    cannot be missed"
                 );
             }
         }

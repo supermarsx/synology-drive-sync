@@ -134,6 +134,18 @@ scope keeps its own count and its own last-notification time in `state/alerts-<s
 healthy profile's success no longer resets a failing profile's count, and one scope's cooldown does not
 silence another's alert.
 
+**What the atomic deposit named.** Each run and profile outcome carries `deposit`: `warnings` (how
+many warnings the [crash-atomic deposit](../deposit.md) named this run), `unsettled` (deposits left for
+the next run's recovery), and the first warning's `issue` code and `issue_detail` (its NAS path and
+cause, at most 160 bytes), or `null` for a run that wrote nothing. Any warning adds the token
+`deposit_warnings`, so the run and the profile read "Succeeded with warnings", not plain success, and
+the run's own Activity row becomes a warning whose message ends with the count and the first warning:
+one row per run, however many files. The `deposit.warning` events in the sync log name every path.
+Package profiles always deposit atomically; a DSM without File Station Rename gets nothing written and
+every planned path deferred as `deposit-not-atomic-unavailable`, which shows amber like any lasting
+deferral. A run that leaves a deposit unsettled does not count as converged, so the next realtime
+change is not skipped.
+
 **A run that is still going.** While `outcomes.run.outcome` is `running`, `running_for_seconds` says
 how long, and `long_running` turns true past six hours (adding the warning token `long_running`). A
 core waiting on a hung mount or a request with no deadline never fails; it just never finishes, and it

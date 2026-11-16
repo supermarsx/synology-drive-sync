@@ -463,6 +463,23 @@ test("a succeeded record with warnings is never plain success", () => {
   assert.equal(attentionItems(normalizeOutcomes(block({ run: runWith({ outcome: "failed", reason: "core_partial" }) })), NOW)[0].level, "fail");
 });
 
+test("the atomic deposit's warnings render as one warn line naming the first path", () => {
+  const facts = {
+    warnings: ["deposit_warnings"],
+    deposit: { warnings: 3, unsettled: 1, issue: "deposit-backup-kept", issue_detail: "/home/a/~sdsync-prev-x: another writer\u0001" }
+  };
+  const normalized = normalizeOutcomes(block({ run: runWith(facts), profiles: [profileEntry("photos", facts)] }));
+  const item = attentionItems(normalized, NOW).find((candidate) => candidate.id === "run-warnings");
+  assert.equal(item.level, "warn");
+  assert.match(item.detail, /3 file deposit warnings; first deposit-backup-kept: \/home\/a\/~sdsync-prev-x: another writer\?; 1 deposit is left for the next run to settle\. Review Logs/);
+  const row = profileOutcomeRow(normalized.profiles[0], NOW);
+  assert.equal(row.level, "warn");
+  assert.equal(row.label, "Succeeded with warnings");
+  // A malformed code is not shown as if it were one.
+  const odd = normalizeOutcomes(block({ run: runWith({ warnings: ["deposit_warnings"], deposit: { warnings: 1, issue: "rm -rf" } }) }));
+  assert.doesNotMatch(attentionItems(odd, NOW).find((c) => c.id === "run-warnings").detail, /rm -rf/);
+});
+
 test("v1.5 result facts render as warn lines on the run and on profiles", () => {
   const facts = {
     warnings: ["incomplete_listings", "mtime_not_kept", "reauthentication_failures", "server_tasks_not_stopped", "keepalive_failures", "novel_fact"],

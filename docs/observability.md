@@ -149,6 +149,7 @@ pair_index.store_failed
 memory.tree_too_large          memory.budget_unchecked
 session.borrowed               session.borrowed_rejected       session.handover_unused
 session.channel_unusable       session.handback_failed
+deposit.recovered              deposit.warning
 ```
 
 Every JSON log record has the same seven base fields. `operation_id` and `attempt` are `null` when
@@ -166,7 +167,7 @@ not have them, so every record listed before this release renders byte for byte 
 | `call` | `api_call.*`, `retry.scheduled`, `getinfo.batch_fallback` | One HTTP round trip: see below. |
 | `reason` | `dns.pin_dropped`, `run.failed`, `run.partial`, `upload.failed`, `entry.skipped`, `entry.deferred`, `result_record.failed` | The class of the failure, skip or deferral: one token from the closed list below. Never error text. |
 | `profile` | records attributable to one profile | The profile name (`[A-Za-z0-9_-]`). Every record of a profile's sync or plan job carries it, including the transport's `api_call.*` and `retry.scheduled`. |
-| `path` | `upload.failed`, `entry.skipped`, `entry.deferred`, `result_record.failed`, and `run.failed` when the failure concerns one entry | Relative path of the entry concerned, percent-encoded so it stays one safe token and decodes exactly: every byte outside `A-Z a-z 0-9 . - _ / : ,` (non-ASCII, space and `%` included) is written `%XX`. Cut at 255 characters with a trailing `~`, which never splits an escape. Never on authentication or connection records. |
+| `path` | `upload.failed`, `entry.skipped`, `entry.deferred`, `result_record.failed`, `deposit.recovered`, `deposit.warning`, and `run.failed` when the failure concerns one entry | Relative path of the entry concerned, percent-encoded so it stays one safe token and decodes exactly: every byte outside `A-Z a-z 0-9 . - _ / : ,` (non-ASCII, space and `%` included) is written `%XX`. Cut at 255 characters with a trailing `~`, which never splits an escape. Never on authentication or connection records. |
 
 `run.partial` replaces `run.completed` for a run that finished without error but left entries for
 the next run (changed during the run, a kept deletion, a refused server-side copy); the entries
@@ -187,6 +188,7 @@ changed_during_run        delete_bound              server_copy_fallback      ex
 upload_failed
 evidence_canary_mismatch  pair_index_unusable       pair_index_store_failed   tree_too_large_for_memory
 entropy_unavailable
+deposit_journal_unavailable deposit_not_atomic_unavailable deposit_recovery
 ```
 
 `reconcile.evidence` counts the pairs post-run reconciliation carried from the plan pass
@@ -195,7 +197,14 @@ disagreed. `pair_index.*` reports the [verified-pair index](pair-index.md): `ser
 served and verified live, the others with the path and one of the reasons above.
 The result's `pair_index` object (and the plan's) carries the pairs the index holds after the run in
 `entries`, or `null` when it was never opened; the DSM package shows it as the `index:` line of
-a profile. `memory.tree_too_large` carries the entry count and the estimate in bytes;
+a profile. `deposit.recovered` (info) and `deposit.warning` (warning) name, with reason
+`deposit_recovery` and the NAS path, every action and condition of the
+[crash-atomic deposit](deposit.md): what recovery settled of an interrupted run, a previous version
+kept beside another writer's file, a temporary copy that could not be removed, a run in direct mode.
+The result's `deposit` object carries the mode, the journal, how many files were `published` and
+`replaced`, how many interrupted deposits recovery acted on (`recovered`) and left (`unsettled`),
+and each condition in `issues` (`code`, `severity`, `path`, `cause`); it is `null` for a run that
+wrote nothing. `memory.tree_too_large` carries the entry count and the estimate in bytes;
 `memory.budget_unchecked` says the host exposed no limits to check against.
 
 A failed HTTP request is classified by its cause: one that timed out at the transport is `timeout`,
@@ -429,6 +438,7 @@ that clears by itself (a file still changing, a lock, a checksum the NAS could n
 | `source-stays-unreadable` | `source-unreadable` for the same path in three consecutive runs: a file locked for good, or one whose reads keep failing. Tried on every run and named, with `keeps_failing path=<path> runs=<n> cause=source-unreadable` and the last error in its detail; cleared the first run it is read. Counted as `file-keeps-changing` is. | yes |
 | `remote-digest-keeps-failing` | `remote-digest-unavailable` for the same path in three consecutive runs: the NAS keeps failing to checksum it. Compared again on every run and named (`keeps_failing ...`); cleared the first run it can be compared. | yes |
 | `delete-keeps-failing` | `delete-failed` (a DSM code other than permission) for the same path in three consecutive runs. Tried on every run and named (`keeps_failing ...`); cleared the first run the deletion takes. | yes |
+| `deposit-not-atomic-unavailable` | Atomic deposit is on (the default) and this DSM offers no `SYNO.FileStation.Rename`, which publishing a verified copy needs. Nothing of the run was written: no upload, server copy, folder, deletion or rename. Every planned path is named until the DSM offers Rename or the profile sets `deposit = "direct"`. See [Crash-atomic deposit](deposit.md). | yes |
 
 `result.skipped` is a count and `plan.skipped[]` is `{path, reason, detail}` for paths the plan
 declines to carry for a lasting reason. The scan no longer aborts on them:
@@ -479,7 +489,8 @@ token. Deferrals map as follows: `source-changed`, `source-vanished` and `file-k
 `remote-digest-unavailable`, `remote-digest-keeps-failing`, `remote-unreadable`, `delete-failed`,
 `delete-keeps-failing` and `case-rename-pending` to `dsm_api_error`, `remote-refused`, `remote-skipped` and `delete-not-permitted` to
 `remote_path_refused`, `remote-changed` to `remote_changed`, `listing-incomplete` to
-`remote_response_invalid`, and `server-copy-failed` to `server_copy_failed`. Skips map to
+`remote_response_invalid`, `server-copy-failed` to `server_copy_failed`, and
+`deposit-not-atomic-unavailable` to `deposit_not_atomic_unavailable`. Skips map to
 `local_entry_unsupported` (attributes, links, placeholders), `changed_during_run` (`deferred`) or
 `protected_conflict` (collisions, the case rename, `type-conflict`, `remote-link` and
 `protected-descendant`). The NDJSON plan stream carries no `skipped` records; read them from the JSON plan or

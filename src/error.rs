@@ -279,9 +279,23 @@ pub enum Error {
     /// a drained one (see [`crate::entropy`]). It clears when the system gathers entropy, so the
     /// next run asks again.
     #[error(
-        "entropy_unavailable: the system random number generator did not answer within          {waited_secs} s ({cause}); this system's kernel has no getrandom(2), so TLS cannot start          until its entropy pool fills; nothing was synced, and the next run asks again"
+        "entropy_unavailable: the system random number generator did not answer within \
+        {waited_secs} s ({cause}); this system's kernel has no getrandom(2), so TLS cannot start \
+        until its entropy pool fills; nothing was synced, and the next run asks again"
     )]
     EntropyUnavailable { waited_secs: u64, cause: String },
+
+    /// The atomic deposit's local journal cannot be used: its directory is not private, another
+    /// run of this profile holds it, it cannot be written, or an earlier one cannot be read.
+    /// Nothing is uploaded without it, because a deposit it does not record could be left on the
+    /// NAS for no recovery to find. `code` is `deposit-journal-unavailable`, `-locked`, `-unsafe`
+    /// or `-corrupt`.
+    #[error("{code}: {detail} ({})", path.display())]
+    DepositJournal {
+        code: &'static str,
+        path: PathBuf,
+        detail: String,
+    },
 
     #[error("{0}")]
     Message(String),

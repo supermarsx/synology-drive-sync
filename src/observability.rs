@@ -195,6 +195,12 @@ pub enum EventCode {
     SessionChannelUnusable,
     /// The run could not hand its session back to the daemon, and logged it out instead.
     SessionHandbackFailed,
+    /// The atomic deposit's recovery settled what an interrupted run left (a temporary copy
+    /// removed, a replacement completed); `path` names the NAS entry.
+    DepositRecovered,
+    /// The atomic deposit could not do something it needed to (roll back, clean up, publish over
+    /// another writer's file), or the run deposits directly; `path` names the NAS entry.
+    DepositWarning,
 }
 
 impl EventCode {
@@ -203,7 +209,7 @@ impl EventCode {
     /// Exhaustive by construction: a new variant that is not listed here fails
     /// `every_event_code_has_a_stable_machine_and_human_name`, so no code can ship without a
     /// stable machine name and human message.
-    pub const ALL: [Self; 47] = [
+    pub const ALL: [Self; 49] = [
         Self::RunBuild,
         Self::RunStarted,
         Self::RunCompleted,
@@ -251,6 +257,8 @@ impl EventCode {
         Self::SessionHandoverUnused,
         Self::SessionChannelUnusable,
         Self::SessionHandbackFailed,
+        Self::DepositRecovered,
+        Self::DepositWarning,
     ];
 
     /// The stable machine name, as `docs/observability.schema.json` publishes it.
@@ -303,6 +311,8 @@ impl EventCode {
             Self::SessionHandoverUnused => "session.handover_unused",
             Self::SessionChannelUnusable => "session.channel_unusable",
             Self::SessionHandbackFailed => "session.handback_failed",
+            Self::DepositRecovered => "deposit.recovered",
+            Self::DepositWarning => "deposit.warning",
         }
     }
 
@@ -377,6 +387,8 @@ impl EventCode {
             Self::SessionHandbackFailed => {
                 "the session could not be handed back to the package service; it was logged out"
             }
+            Self::DepositRecovered => "an interrupted deposit of an earlier run was settled",
+            Self::DepositWarning => "the atomic deposit needs attention for a NAS entry",
         }
     }
 }
@@ -439,11 +451,18 @@ pub enum EventReason {
     /// The system random number generator did not answer within its bound, so TLS could not
     /// start; it clears by itself once the kernel's entropy pool fills.
     EntropyUnavailable,
+    /// The atomic deposit's local journal could not be used, so nothing was uploaded.
+    DepositJournalUnavailable,
+    /// Atomic deposit was required and this DSM offers no Rename, so nothing was uploaded.
+    DepositNotAtomicUnavailable,
+    /// What the atomic deposit did or could not do for one NAS entry (`deposit.recovered`,
+    /// `deposit.warning`); the result record's `deposit.issues` names the exact condition.
+    DepositRecovery,
 }
 
 impl EventReason {
     /// Every reason, so the published vocabulary can be checked against this enum.
-    pub const ALL: [Self; 41] = [
+    pub const ALL: [Self; 44] = [
         Self::Authentication,
         Self::Network,
         Self::HttpStatus,
@@ -485,6 +504,9 @@ impl EventReason {
         Self::PairIndexStoreFailed,
         Self::TreeTooLargeForMemory,
         Self::EntropyUnavailable,
+        Self::DepositJournalUnavailable,
+        Self::DepositNotAtomicUnavailable,
+        Self::DepositRecovery,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -530,6 +552,9 @@ impl EventReason {
             Self::PairIndexStoreFailed => "pair_index_store_failed",
             Self::TreeTooLargeForMemory => "tree_too_large_for_memory",
             Self::EntropyUnavailable => "entropy_unavailable",
+            Self::DepositJournalUnavailable => "deposit_journal_unavailable",
+            Self::DepositNotAtomicUnavailable => "deposit_not_atomic_unavailable",
+            Self::DepositRecovery => "deposit_recovery",
         }
     }
 
@@ -583,6 +608,7 @@ impl EventReason {
             Error::RemoteRefusalsShareWide { .. } => Self::RemoteRefusedShareWide,
             Error::RemoteRealPathUnusable { .. } => Self::RemoteRealPathUnusable,
             Error::EntropyUnavailable { .. } => Self::EntropyUnavailable,
+            Error::DepositJournal { .. } => Self::DepositJournalUnavailable,
             Error::Message(_) => Self::Unclassified,
         }
     }
@@ -655,6 +681,7 @@ pub fn failure_path(error: &crate::error::Error, source: Option<&Path>) -> Optio
         | Error::RemoteRefusalsShareWide { .. }
         | Error::RemoteRealPathUnusable { .. }
         | Error::EntropyUnavailable { .. }
+        | Error::DepositJournal { .. }
         | Error::Message(_) => None,
     }
 }
