@@ -15,7 +15,7 @@
   "$defs": {
     "deposit": {
       "type": "object",
-      "description": "How files reached the NAS. `atomic` (the default): each file is uploaded to a temporary `~sdsync-part-` name in its own folder, verified there, and renamed to its final name; an overwrite first renames the previous version aside to `~sdsync-prev-` and deletes it once the new one is in place, so the final name holds the old version or the new one, never a partial file (absent only for the one request between the two renames). Every deposit is journalled locally before its first byte is sent, and the next run settles what an interrupted run left. `direct`: straight to the final name, named `deposit-not-atomic`.",
+      "description": "How files reached the NAS. `atomic` (the default): each file is uploaded to a temporary `~sdsync-part-` name in its own folder, verified there, and renamed to its final name; an overwrite first renames the previous version aside to `~sdsync-prev-` and deletes it once the new one is in place, so the final name holds the old version or the new one, never a partial file (absent for the one request between the two renames, and after a crash inside it until the next run puts the old version back). Every deposit is journalled locally before its first byte is sent, and the next run settles what an interrupted run left. `direct`: straight to the final name, named `deposit-not-atomic`.",
       "additionalProperties": false,
       "required": ["mode", "journal", "published", "replaced", "recovered", "unsettled", "issues"],
       "properties": {

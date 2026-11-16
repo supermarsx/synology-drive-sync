@@ -1,8 +1,9 @@
 //! Crash-atomic deposit under process death: `abort()` at every step of the protocol (the
 //! `fault-inject` feature's `SDSYNC_FAULT_ABORT=deposit:<step>`), and SIGKILL at arbitrary
-//! moments. After each, the NAS holds the old version or the new one under the final name --
-//! never a partial file, never anything else -- and the next run settles what was left, names
-//! it, and converges.
+//! moments. After each, the final name holds the old version or the new one -- never a partial
+//! file, never anything else -- or, killed between a replacement's two renames, nothing, with the
+//! old version whole under its reserved name; the next run settles what was left, names it, and
+//! converges.
 //!
 //! `cargo test --features fault-inject --test atomic_deposit_faults`
 #![cfg(all(unix, feature = "fault-inject"))]

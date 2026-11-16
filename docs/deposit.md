@@ -1,8 +1,11 @@
 # Crash-atomic deposit
 
-A file reaches its final NAS name only once it is whole and verified, and a crash, `kill -9`,
-power loss, dropped link or DSM restart at any moment leaves the old version or the new one under
-that name: never a partial file, and never neither. This is the default (`deposit = "atomic"`).
+A file reaches its final NAS name only once it is whole and verified. A crash, `kill -9`, power
+loss, dropped link or DSM restart at any moment never leaves a partial file under that name: it
+holds the old version or the new one. The one exception is a replacement interrupted in the single
+round trip between its two renames (below): the name is then empty, the old version is kept whole
+under its `~sdsync-prev-` name, and the next run puts it back. This is the default
+(`deposit = "atomic"`).
 
 ## How a file is written
 

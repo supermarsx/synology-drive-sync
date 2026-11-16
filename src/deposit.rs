@@ -1,5 +1,7 @@
 //! Crash-atomic deposit: a file appears under its final NAS name only once it is complete and
-//! verified, and a crash at any point leaves the old version or the new one, never neither.
+//! verified, and a crash at any point leaves the old version or the new one, never a partial file.
+//! Only a replacement interrupted between its two renames leaves the final name empty, with the old
+//! version whole under its reserved name until the next run puts it back.
 //!
 //! # The protocol
 //!

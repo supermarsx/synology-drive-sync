@@ -23,7 +23,8 @@ lists its own commits.
   Station's MD5), and only then renamed to its final name; a replaced file's previous version is
   renamed aside first and deleted once the new one is in place. A crash, `kill -9`, power loss or
   dropped link leaves the old version or the new one under the final name, never a partial file;
-  during a replacement the name is absent for one round trip. A local journal records every upload
+  during a replacement the name is absent for one round trip, and a crash inside that round trip
+  leaves it empty, the old version kept whole beside it, until the next run puts it back. A local journal records every upload
   before it starts, and the next run finishes or rolls back what an interrupted run left
   (`deposit-rolled-back`, `deposit-completed`, `deposit-temp-removed`, ...), touching only names its
   journal lists. A DSM without File Station Rename gets nothing written
