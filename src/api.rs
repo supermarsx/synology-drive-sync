@@ -5055,6 +5055,48 @@ impl ApiClient {
     /// path, or this fails with [`Error::ContentVerificationFailed`] naming it. A refusal of this
     /// path (414: the new name is taken) is [`Error::RemoteRefused`].
     pub fn rename(&self, root: &RemoteRoot, remote_path: &str, new_name: &str) -> Result<String> {
+        let destination = self.rename_request(root, remote_path, new_name)?;
+        match self.remote_path_state(&destination) {
+            Ok(RemotePathState::Absent) => Err(Error::ContentVerificationFailed(destination)),
+            Ok(_) => Ok(destination),
+            Err(error) => Err(naming_remote_path(error, &destination)),
+        }
+    }
+
+    /// [`Self::rename`], answering with what the new path holds: the `getinfo` that verifies the
+    /// rename is also the deposit's check of the published file, so it is not asked twice.
+    pub fn rename_reporting(
+        &self,
+        root: &RemoteRoot,
+        remote_path: &str,
+        new_name: &str,
+    ) -> Result<RemotePathState> {
+        let destination = self.rename_request(root, remote_path, new_name)?;
+        match self.remote_path_state(&destination) {
+            Ok(RemotePathState::Absent) => Err(Error::ContentVerificationFailed(destination)),
+            Ok(state) => Ok(state),
+            Err(error) => Err(naming_remote_path(error, &destination)),
+        }
+    }
+
+    /// The `Rename` request alone, unverified: for a step whose outcome the next step proves (the
+    /// deposit moving a previous version aside, which the publishing rename and its `getinfo`
+    /// settle). Same validation, same single attempt.
+    pub fn rename_unverified(
+        &self,
+        root: &RemoteRoot,
+        remote_path: &str,
+        new_name: &str,
+    ) -> Result<()> {
+        self.rename_request(root, remote_path, new_name).map(|_| ())
+    }
+
+    fn rename_request(
+        &self,
+        root: &RemoteRoot,
+        remote_path: &str,
+        new_name: &str,
+    ) -> Result<String> {
         validate_mutation_target(root, remote_path)?;
         let (parent, _) = parent_and_name(remote_path)?;
         let destination = format!("{parent}/{new_name}");
@@ -5072,11 +5114,7 @@ impl ApiClient {
         ];
         self.call::<Value>("SYNO.FileStation.Rename", 2, "rename", parameters, false)
             .map_err(|error| self.path_refusal(error, remote_path))?;
-        match self.remote_path_state(&destination) {
-            Ok(RemotePathState::Absent) => Err(Error::ContentVerificationFailed(destination)),
-            Ok(_) => Ok(destination),
-            Err(error) => Err(naming_remote_path(error, &destination)),
-        }
+        Ok(destination)
     }
 
     pub fn upload(&self, local: &LocalEntry, remote_file: &str) -> Result<()> {
