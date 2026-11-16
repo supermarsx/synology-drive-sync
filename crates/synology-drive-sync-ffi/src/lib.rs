@@ -223,6 +223,17 @@ struct RequestDocument {
     comparison: Option<RequestComparison>,
     deletion: Option<RequestDeletion>,
     jobs: Option<u32>,
+    /// `atomic` (the default) or `direct`.
+    deposit: Option<RequestDeposit>,
+    /// Where the atomic deposit keeps its journal; the per-user state directory by default.
+    deposit_journal: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+enum RequestDeposit {
+    Atomic,
+    Direct,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize)]
@@ -723,6 +734,15 @@ fn build_request(document: RequestDocument) -> std::result::Result<SyncRequest, 
     }
     if let Some(jobs) = document.jobs {
         builder = builder.jobs(jobs as usize);
+    }
+    if let Some(deposit) = document.deposit {
+        builder = builder.deposit(match deposit {
+            RequestDeposit::Atomic => synology_drive_sync::deposit::DepositMode::Atomic,
+            RequestDeposit::Direct => synology_drive_sync::deposit::DepositMode::Direct,
+        });
+    }
+    if let Some(directory) = document.deposit_journal {
+        builder = builder.deposit_journal(directory);
     }
     builder
         .build()

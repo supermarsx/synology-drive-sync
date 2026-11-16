@@ -283,6 +283,18 @@ pub enum Error {
     )]
     EntropyUnavailable { waited_secs: u64, cause: String },
 
+    /// The atomic deposit's local journal cannot be used: its directory is not private, another
+    /// run of this profile holds it, it cannot be written, or an earlier one cannot be read.
+    /// Nothing is uploaded without it, because a deposit it does not record could be left on the
+    /// NAS for no recovery to find. `code` is `deposit-journal-unavailable`, `-locked`, `-unsafe`
+    /// or `-corrupt`.
+    #[error("{code}: {detail} ({})", path.display())]
+    DepositJournal {
+        code: &'static str,
+        path: PathBuf,
+        detail: String,
+    },
+
     #[error("{0}")]
     Message(String),
 }

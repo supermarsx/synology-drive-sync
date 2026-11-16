@@ -619,6 +619,38 @@ Repeat --scope, or add --scope-shallow, to restrict sync and plan to a set of pa
     /// The index's page cache, in MiB (default 8, at most 64).
     #[arg(long, value_name = "MIB", requires = "pair_index", value_parser = clap::value_parser!(u64).range(1..=64), hide = true, help_heading = "Sync")]
     pub pair_index_cache_mib: Option<u64>,
+
+    /// How files are written on the NAS: atomic (default) or direct.
+    #[arg(
+        long,
+        value_name = "MODE",
+        value_enum,
+        help_heading = "Sync",
+        long_help = "How a file reaches its NAS name. `atomic` (the default): it is uploaded to a temporary ~sdsync-part- name in the same folder, verified there (length, modification time and File Station's MD5), and only then renamed to its final name; an existing file is first renamed aside to a ~sdsync-prev- name and deleted once the new one is in place. A reader of the NAS never sees a partial file under the final name, and a crash, kill or power loss at any point leaves the old version or the new one; the next run finishes or rolls back what was interrupted. During a replacement the final name is absent for one round trip between the two renames. Needs SYNO.FileStation.Rename; a DSM without it gets nothing written and every planned path named `deposit-not-atomic-unavailable`.
+
+`direct`: upload straight to the final name, as before. Fewer requests per file, but a run killed mid-upload can leave a partial or torn file under the final name. Every run in this mode is named `deposit-not-atomic`."
+    )]
+    pub deposit: Option<DepositArg>,
+
+    /// Where the atomic deposit keeps its journal (default: the per-user state directory).
+    #[arg(
+        long,
+        value_name = "DIRECTORY",
+        help_heading = "Sync",
+        long_help = "Keep the atomic deposit's journal in DIRECTORY: one `<owner>.journal` and `<owner>.lock` per profile and destination, where the owner is twelve hex digits of a SHA-256 over the profile, the NAS destination, the server and the account. Every upload and server copy is recorded there before its first byte is sent, so the next run can finish or roll back whatever an interrupted run left, and only ever touches NAS files this journal names. The lock keeps two runs of one profile from interleaving. The directory must be private (no group or other write access). If the journal cannot be written, nothing is uploaded and the run fails with `deposit-journal-unavailable`, `-locked`, `-unsafe` or `-corrupt`.
+
+Default: $XDG_STATE_HOME/synology-drive-sync/deposit (or ~/.local/state/...) on Linux, ~/Library/Application Support/synology-drive-sync/deposit on macOS, %LOCALAPPDATA%\\synology-drive-sync\\deposit on Windows. The DSM package uses its own state directory."
+    )]
+    pub deposit_journal: Option<PathBuf>,
+}
+
+/// How files reach their NAS name. See [`SyncBehaviorArgs::deposit`].
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, ValueEnum, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum DepositArg {
+    #[default]
+    Atomic,
+    Direct,
 }
 
 /// How post-run reconciliation proves content. See [`SyncBehaviorArgs::reconcile`].

@@ -17,9 +17,9 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::cli::{
-    AuthenticationArgs, CompareArg, ConnectionArgs, CredentialProfileArgs, DoctorArgs, DoctorLevel,
-    LogFormat, LogLevel, NetworkArgs, OutputArgs, OutputFormat, ProgressMode, REMOTE_LOG_TOKEN_ENV,
-    ReconcileArg, RemoteLogMode, SafetyArgs, SyncArgs, SyncBehaviorArgs,
+    AuthenticationArgs, CompareArg, ConnectionArgs, CredentialProfileArgs, DepositArg, DoctorArgs,
+    DoctorLevel, LogFormat, LogLevel, NetworkArgs, OutputArgs, OutputFormat, ProgressMode,
+    REMOTE_LOG_TOKEN_ENV, ReconcileArg, RemoteLogMode, SafetyArgs, SyncArgs, SyncBehaviorArgs,
 };
 
 const MAX_CONFIG_BYTES: usize = 1024 * 1024;
@@ -94,6 +94,8 @@ pub struct Profile {
     pub jobs: Option<u8>,
     #[serde(default)]
     pub excludes: Vec<String>,
+    /// `atomic` (the default) or `direct`. See `--deposit`.
+    pub deposit: Option<DepositArg>,
 
     pub delete: Option<bool>,
     pub allow_empty_source: Option<bool>,
@@ -371,6 +373,10 @@ pub struct ResolvedSyncBehavior {
     pub pair_index_max_age_days: u32,
     pub pair_index_canary: usize,
     pub pair_index_cache_mib: u64,
+    /// How files reach their NAS name (`--deposit`, or the profile's `deposit`).
+    pub deposit: DepositArg,
+    /// `--deposit-journal`: where the atomic deposit's journal lives. Command line only.
+    pub deposit_journal: Option<PathBuf>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -832,6 +838,8 @@ fn resolve_behavior(
             .pair_index_canary
             .unwrap_or_else(|| synology_drive_sync::digest_evidence::default_canary(whole_tree)),
         pair_index_cache_mib: arguments.pair_index_cache_mib.unwrap_or(8),
+        deposit: arguments.deposit.or(profile.deposit).unwrap_or_default(),
+        deposit_journal: arguments.deposit_journal.clone(),
     })
 }
 
@@ -2290,6 +2298,8 @@ mod scope_and_force_tests {
             pair_index_max_age: None,
             pair_index_canary: None,
             pair_index_cache_mib: None,
+            deposit: None,
+            deposit_journal: None,
         }
     }
 

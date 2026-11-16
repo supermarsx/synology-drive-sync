@@ -3,6 +3,7 @@
 pub mod api;
 pub mod batch;
 pub mod cancel;
+pub mod deposit;
 pub mod digest_evidence;
 pub mod entropy;
 pub mod error;

@@ -110,6 +110,35 @@ trait SyncOperations: Clone + Send + Sync {
         observer: Option<UploadObserver>,
         cancellation: &CancellationToken,
     ) -> Result<()>;
+    /// A verified rename that answers with what the new path holds. The default asks twice; the
+    /// real client folds the answer into the rename's own verification.
+    fn rename_reporting(
+        &self,
+        root: &RemoteRoot,
+        remote_path: &str,
+        new_name: &str,
+    ) -> Result<RemotePathState> {
+        let destination = self.rename(root, remote_path, new_name)?;
+        self.remote_path_state(&destination)
+    }
+    /// A rename whose outcome the caller's next step proves.
+    fn rename_unverified(
+        &self,
+        root: &RemoteRoot,
+        remote_path: &str,
+        new_name: &str,
+    ) -> Result<()> {
+        self.rename(root, remote_path, new_name).map(|_| ())
+    }
+    /// The names in `folder`, when they can be listed completely. Deposit recovery asks one
+    /// listing per folder instead of one `getinfo` per name; without one it asks name by name.
+    fn complete_child_names(
+        &self,
+        _folder: &str,
+        _cancellation: &CancellationToken,
+    ) -> Option<BTreeSet<String>> {
+        None
+    }
 }
 
 impl SyncOperations for ApiClient {
@@ -216,6 +245,98 @@ impl SyncOperations for ApiClient {
         cancellation: &CancellationToken,
     ) -> Result<()> {
         self.upload_observed(local, remote_path, observer, cancellation)
+    }
+
+    fn rename_reporting(
+        &self,
+        root: &RemoteRoot,
+        remote_path: &str,
+        new_name: &str,
+    ) -> Result<RemotePathState> {
+        ApiClient::rename_reporting(self, root, remote_path, new_name)
+    }
+
+    fn rename_unverified(
+        &self,
+        root: &RemoteRoot,
+        remote_path: &str,
+        new_name: &str,
+    ) -> Result<()> {
+        ApiClient::rename_unverified(self, root, remote_path, new_name)
+    }
+
+    fn complete_child_names(
+        &self,
+        folder: &str,
+        cancellation: &CancellationToken,
+    ) -> Option<BTreeSet<String>> {
+        match self.list_child_names(folder, cancellation) {
+            Ok(listed) if listed.complete => Some(listed.names.into_iter().collect()),
+            _ => None,
+        }
+    }
+}
+
+/// Every engine client deposits through the operations it already has.
+impl<O: SyncOperations> crate::deposit::DepositOps for O {
+    fn deposit_upload(
+        &self,
+        local: &LocalEntry,
+        remote_path: &str,
+        observer: Option<UploadObserver>,
+        cancellation: &CancellationToken,
+    ) -> Result<()> {
+        self.upload(local, remote_path, observer, cancellation)
+    }
+
+    fn deposit_state(&self, remote_path: &str) -> Result<RemotePathState> {
+        self.remote_path_state(remote_path)
+    }
+
+    fn deposit_rename(
+        &self,
+        root: &RemoteRoot,
+        remote_path: &str,
+        new_name: &str,
+        verify: bool,
+    ) -> Result<Option<RemotePathState>> {
+        if verify {
+            self.rename_reporting(root, remote_path, new_name).map(Some)
+        } else {
+            self.rename_unverified(root, remote_path, new_name)
+                .map(|()| None)
+        }
+    }
+
+    fn deposit_delete(&self, root: &RemoteRoot, remote_path: &str) -> Result<()> {
+        match self.delete_non_recursive(root, remote_path) {
+            Ok(()) => Ok(()),
+            // Already gone is what the caller wanted.
+            Err(error) if error.api_code() == Some(408) => Ok(()),
+            Err(error) => Err(error),
+        }
+    }
+
+    fn deposit_list(
+        &self,
+        folder: &str,
+        cancellation: &CancellationToken,
+    ) -> Option<BTreeSet<String>> {
+        self.complete_child_names(folder, cancellation)
+    }
+
+    fn deposit_md5_matches(
+        &self,
+        remote_path: &str,
+        size: u64,
+        md5: crate::integrity::ContentMd5,
+        cancellation: &CancellationToken,
+    ) -> Result<bool> {
+        match self.verify_uploaded_content(remote_path, size, md5, cancellation) {
+            Ok(()) => Ok(true),
+            Err(Error::ContentVerificationFailed(_)) => Ok(false),
+            Err(error) => Err(error),
+        }
     }
 }
 
@@ -623,10 +744,272 @@ fn upload_precondition_holds<O: SyncOperations>(
     })
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub struct ExecuteOptions {
     pub jobs: usize,
     pub dry_run: bool,
+    /// How files reach the NAS. [`Deposit::Direct`] for a caller that set nothing; the command
+    /// line, the SDK and the package pass [`Deposit::Atomic`] unless a profile opts out.
+    pub deposit: Deposit,
+}
+
+/// How a run deposits files on the NAS. See [`crate::deposit`].
+#[derive(Clone, Debug, Default)]
+pub enum Deposit {
+    /// Straight to the final name, as before atomic deposit existed.
+    #[default]
+    Direct,
+    /// Through a journalled temporary name, verified, then published by rename.
+    Atomic(Arc<crate::deposit::DepositContext>),
+}
+
+impl Deposit {
+    fn context(&self) -> Option<&crate::deposit::DepositContext> {
+        match self {
+            Self::Direct => None,
+            Self::Atomic(context) => Some(context),
+        }
+    }
+}
+
+/// The deposits a run declared before it wrote anything, by destination.
+#[derive(Default)]
+struct DeclaredDeposits {
+    uploads: Mutex<BTreeMap<String, crate::deposit::Intent>>,
+    copies: BTreeMap<String, crate::deposit::Intent>,
+    /// Copies whose failure left something the run could not remove: the next run settles them.
+    kept_copies: Mutex<BTreeSet<String>>,
+}
+
+impl DeclaredDeposits {
+    /// Declare every upload and server copy the plan holds, in one journal write, before any of
+    /// them is attempted. A journal that cannot be written fails the run here, with nothing sent.
+    fn for_plan(deposit: &Deposit, plan: &SyncPlan) -> Result<Self> {
+        use crate::deposit::{IntentKind, NewIntent};
+        let Some(context) = deposit.context() else {
+            return Ok(Self::default());
+        };
+        let mut entries = plan
+            .uploads
+            .iter()
+            .map(|action| NewIntent::upload(&action.local, &action.remote_path))
+            .collect::<Vec<_>>();
+        entries.extend(plan.copies.iter().map(|action| NewIntent {
+            final_path: action.to_remote_path.clone(),
+            kind: IntentKind::Copy,
+            size: action.expected_size,
+            md5: Some(action.content_md5),
+            mtime_ms: action.local.mtime_ms,
+        }));
+        let intents = context.journal.declare(&entries)?;
+        let mut declared = Self::default();
+        for intent in intents {
+            match intent.kind {
+                IntentKind::Upload => {
+                    declared
+                        .uploads
+                        .get_mut()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .insert(intent.final_path.clone(), intent);
+                }
+                IntentKind::Copy => {
+                    declared.copies.insert(intent.final_path.clone(), intent);
+                }
+            }
+        }
+        Ok(declared)
+    }
+
+    /// The upload intent for `remote_path`: the one declared with the plan, or a new declaration
+    /// for an upload the run discovered (a copy's fallback, a kept deletion's re-upload).
+    fn upload_intent(
+        &self,
+        context: &crate::deposit::DepositContext,
+        local: &LocalEntry,
+        remote_path: &str,
+    ) -> Result<crate::deposit::Intent> {
+        let planned = self
+            .uploads
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(remote_path);
+        match planned {
+            Some(intent) if intent.size == local.size && intent.mtime_ms == local.mtime_ms => {
+                Ok(intent)
+            }
+            // Declared with other facts, or never: the old declaration wrote nothing, and what is
+            // really about to be written is declared before it is.
+            planned => {
+                if let Some(intent) = planned {
+                    context.journal.resolve(&intent);
+                }
+                let mut fresh = context
+                    .journal
+                    .declare(&[crate::deposit::NewIntent::upload(local, remote_path)])?;
+                Ok(fresh.remove(0))
+            }
+        }
+    }
+
+    /// Settle every declared deposit the run never attempted: nothing of them is on the NAS.
+    fn settle_unattempted(&self, deposit: &Deposit) {
+        let Some(context) = deposit.context() else {
+            return;
+        };
+        let uploads = std::mem::take(
+            &mut *self
+                .uploads
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        );
+        for intent in uploads.values() {
+            context.journal.resolve(intent);
+        }
+        let kept = self
+            .kept_copies
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for (destination, intent) in &self.copies {
+            if !kept.contains(destination) {
+                context.journal.resolve(intent);
+            }
+        }
+    }
+
+    /// A failed copy left something at its destination the run could not remove.
+    fn keep_copy(&self, destination: &str) {
+        self.kept_copies
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(destination.to_owned());
+    }
+
+    /// Settle a declared copy that wrote nothing (it never started, or it was never attempted).
+    fn settle_copy(&self, deposit: &Deposit, destination: &str) {
+        if let (Some(context), Some(intent)) = (deposit.context(), self.copies.get(destination)) {
+            context.journal.resolve(intent);
+        }
+    }
+}
+
+/// Upload one file through the run's deposit. `Ok(Some(detail))`: the destination is not what
+/// the plan saw, nothing was published, and the path is deferred as `remote-changed`.
+#[allow(clippy::too_many_arguments)]
+fn upload_through_deposit<O: SyncOperations>(
+    client: &O,
+    root: &RemoteRoot,
+    deposit: &Deposit,
+    declared: &DeclaredDeposits,
+    local: &LocalEntry,
+    remote_path: &str,
+    expected: Option<&RemoteSnapshot>,
+    observer: Option<UploadObserver>,
+    cancellation: &CancellationToken,
+) -> Result<Option<String>> {
+    let Some(context) = deposit.context() else {
+        return client
+            .upload(local, remote_path, observer, cancellation)
+            .map(|()| None);
+    };
+    if context.is_direct(remote_path) {
+        // A path the deposit cannot rename or delete around safely (a comma, N1): a plain upload,
+        // named. Its declaration wrote nothing.
+        if let Some(intent) = declared
+            .uploads
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(remote_path)
+        {
+            context.journal.resolve(&intent);
+        }
+        context.issue(crate::deposit::DepositIssue::warning(
+            "deposit-not-atomic",
+            remote_path,
+            "uploaded straight to its final name: a comma in its path whose part before it is              another NAS entry makes a Rename or Delete of a temporary copy beside it unsafe until              it is known how DSM parses a comma in a path list",
+        ));
+        return client
+            .upload(local, remote_path, observer, cancellation)
+            .map(|()| None);
+    }
+    let intent = declared.upload_intent(context, local, remote_path)?;
+    match crate::deposit::deposit_file(
+        client,
+        root,
+        context,
+        &intent,
+        local,
+        expected,
+        observer,
+        cancellation,
+    )? {
+        crate::deposit::Deposited::New | crate::deposit::Deposited::Replaced => Ok(None),
+        crate::deposit::Deposited::DestinationChanged(detail) => Ok(Some(detail)),
+    }
+}
+
+/// After a server copy failed or could not be verified: remove what it left at its destination,
+/// which no one else wrote (a copy only runs to a destination that was absent, and DSM's copy
+/// refuses an existing one), and settle its journal entry. `true` when the destination is empty.
+fn remove_partial_copy<O: SyncOperations>(
+    client: &O,
+    root: &RemoteRoot,
+    deposit: &Deposit,
+    declared: &DeclaredDeposits,
+    action: &crate::plan::CopyAction,
+    cause: &Error,
+) -> bool {
+    let Some(context) = deposit.context() else {
+        return false;
+    };
+    let Some(intent) = declared.copies.get(&action.to_remote_path) else {
+        return false;
+    };
+    match client.remote_path_state(&action.to_remote_path) {
+        Ok(RemotePathState::Absent) => {
+            context.journal.resolve(intent);
+            true
+        }
+        Ok(RemotePathState::File { size, .. }) => {
+            match crate::deposit::DepositOps::deposit_delete(client, root, &action.to_remote_path) {
+                Ok(()) => {
+                    context.journal.resolve(intent);
+                    context.issue(crate::deposit::DepositIssue::warning(
+                        "deposit-copy-partial-removed",
+                        &action.to_remote_path,
+                        format!(
+                            "the server-side copy to it failed ({cause}) and left {size} of {} \
+                             bytes; the partial file was deleted",
+                            action.expected_size
+                        ),
+                    ));
+                    true
+                }
+                Err(error) => {
+                    context.issue(crate::deposit::DepositIssue::warning(
+                        "deposit-cleanup-failed",
+                        &action.to_remote_path,
+                        format!(
+                            "the server-side copy to it failed ({cause}) and what it left could \
+                             not be deleted ({error}); the next run's recovery settles it"
+                        ),
+                    ));
+                    false
+                }
+            }
+        }
+        Ok(RemotePathState::Directory) => false,
+        Err(error) => {
+            context.issue(crate::deposit::DepositIssue::warning(
+                "deposit-cleanup-failed",
+                &action.to_remote_path,
+                format!(
+                    "the server-side copy to it failed ({cause}) and what it left could not be \
+                     read ({error}); the next run's recovery settles it"
+                ),
+            ));
+            false
+        }
+    }
 }
 
 /// Why a planned mirror deletion was kept instead of performed.
@@ -734,6 +1117,11 @@ pub enum DeferReason {
     /// `delete-failed` (a DSM code other than permission) for the same path in consecutive runs.
     /// Lasting, tried on every run, cleared the first run the deletion takes.
     DeleteKeepsFailing,
+    /// Atomic deposit is on (the default) and this DSM offers no `SYNO.FileStation.Rename`, which
+    /// publishing a verified copy needs. Nothing was written: no upload, server copy, folder or
+    /// deletion of the run. Lasting, until the DSM offers Rename or the profile sets
+    /// `deposit = "direct"` explicitly.
+    DepositNotAtomicUnavailable,
 }
 
 impl DeferReason {
@@ -761,6 +1149,7 @@ impl DeferReason {
             Self::SourceStaysUnreadable => "source-stays-unreadable",
             Self::RemoteDigestKeepsFailing => "remote-digest-keeps-failing",
             Self::DeleteKeepsFailing => "delete-keeps-failing",
+            Self::DepositNotAtomicUnavailable => "deposit-not-atomic-unavailable",
         }
     }
 
@@ -823,6 +1212,9 @@ impl DeferReason {
             Self::DeleteKeepsFailing => {
                 "the NAS refused its deletion in each of the last runs; tried again every run and named until it takes"
             }
+            Self::DepositNotAtomicUnavailable => {
+                "this DSM offers no Rename, which atomic deposit needs to publish a verified copy; nothing was written; set deposit = \"direct\" to upload without it"
+            }
         }
     }
 
@@ -850,6 +1242,7 @@ impl DeferReason {
                 | Self::SourceStaysUnreadable
                 | Self::RemoteDigestKeepsFailing
                 | Self::DeleteKeepsFailing
+                | Self::DepositNotAtomicUnavailable
         )
     }
 
@@ -880,7 +1273,7 @@ impl DeferReason {
     }
 
     /// Every reason, so readers can be checked against the whole vocabulary.
-    pub const ALL: [Self; 22] = [
+    pub const ALL: [Self; 23] = [
         Self::SourceChanged,
         Self::SourceVanished,
         Self::SourceUnreadable,
@@ -903,6 +1296,7 @@ impl DeferReason {
         Self::SourceStaysUnreadable,
         Self::RemoteDigestKeepsFailing,
         Self::DeleteKeepsFailing,
+        Self::DepositNotAtomicUnavailable,
     ];
 
     /// The reason a failure reading one local file defers it, or `None` when the failure is not
@@ -1545,6 +1939,26 @@ fn execute_with_observer<O: SyncOperations>(
     }
     let mut deferrals = DeferralIndex::default();
 
+    // Atomic deposit publishes a verified copy with Rename. A DSM that offers none gets nothing
+    // written at all -- not the uploads, and not the folders, deletions and renames planned
+    // alongside them -- and every planned path is named with a lasting reason until the DSM
+    // offers it or the profile opts into direct deposit. Never a silent fall back to direct.
+    if let Some(context) = options.deposit.context()
+        && !client.supports_rename()
+        && (!plan.uploads.is_empty() || !plan.copies.is_empty())
+    {
+        context.issue(crate::deposit::DepositIssue::warning(
+            "deposit-not-atomic-unavailable",
+            root.as_str(),
+            "this DSM offers no SYNO.FileStation.Rename, which atomic deposit needs to publish a \
+             verified copy; nothing was written; set deposit = \"direct\" to upload without it",
+        ));
+        defer_whole_plan(plan, completed, &mut deferrals, &mut report);
+        return Ok(());
+    }
+    // Every upload and server copy is in the journal before the first byte is sent.
+    let declared = DeclaredDeposits::for_plan(&options.deposit, plan)?;
+
     // Open every scheduled source before a type-conflict deletion can remove remote data. The
     // question here is whether the transfer can still happen at all, not whether the content is
     // still what was planned -- the upload itself fingerprints the bytes it sends and fails on a
@@ -1750,7 +2164,20 @@ fn execute_with_observer<O: SyncOperations>(
             }
             result => result?,
         }
-        match client.copy_file_verified(root, action, &cancellation) {
+        let copy_result = client.copy_file_verified(root, action, &cancellation);
+        match &copy_result {
+            // A copy that failed or could not be proved leaves its destination empty again when
+            // the run deposits atomically; one that never started wrote nothing.
+            Ok(()) | Err(Error::ServerCopyNotStarted) => {
+                declared.settle_copy(&options.deposit, &action.to_remote_path);
+            }
+            Err(error) => {
+                if !remove_partial_copy(client, root, &options.deposit, &declared, action, error) {
+                    declared.keep_copy(&action.to_remote_path);
+                }
+            }
+        }
+        match copy_result {
             Ok(()) => {
                 breaker.accepted();
                 completed.copied += 1;
@@ -1813,24 +2240,44 @@ fn execute_with_observer<O: SyncOperations>(
                 // with no observer a multi-gigabyte fallback reported no progress at all.
                 // Cancellation no longer depends on the observer — `ObservedReader` consults the
                 // token itself — but the bytes still have to be visible.
-                if let Err(error) = client.upload(
+                match upload_through_deposit(
+                    client,
+                    root,
+                    &options.deposit,
+                    &declared,
                     &action.local,
                     &action.to_remote_path,
+                    None,
                     observer_factory(&action.local),
                     &cancellation,
                 ) {
-                    // A refusal of the fallback is a refusal like any other upload's, and counts
-                    // towards the share-wide verdict; anything that is not about this path (a
-                    // full volume, 415/416) fails the run here.
-                    breaker.settled_by(&error, &action.to_relative);
-                    completed.defer_local(
-                        &mut deferrals,
-                        &action.to_relative,
-                        error,
-                        &mut report,
-                    )?;
-                    breaker.check()?;
-                    continue;
+                    Ok(None) => {}
+                    Ok(Some(detail)) => {
+                        breaker.excluded();
+                        completed.defer(
+                            &mut deferrals,
+                            &action.to_relative,
+                            DeferReason::RemoteChanged,
+                            detail,
+                            &mut report,
+                        );
+                        breaker.check()?;
+                        continue;
+                    }
+                    Err(error) => {
+                        // A refusal of the fallback is a refusal like any other upload's, and
+                        // counts towards the share-wide verdict; anything that is not about this
+                        // path (a full volume, 415/416) fails the run here.
+                        breaker.settled_by(&error, &action.to_relative);
+                        completed.defer_local(
+                            &mut deferrals,
+                            &action.to_relative,
+                            error,
+                            &mut report,
+                        )?;
+                        breaker.check()?;
+                        continue;
+                    }
                 }
                 breaker.accepted();
                 completed.uploaded += 1;
@@ -1909,6 +2356,8 @@ fn execute_with_observer<O: SyncOperations>(
                 let worker_client = (*client).clone();
                 let observer_factory = Arc::clone(&observer_factory);
                 let cancellation = cancellation.clone();
+                let deposit = &options.deposit;
+                let declared = &declared;
                 scope.spawn(move || {
                     loop {
                         if stop.load(Ordering::Acquire) || cancellation.is_cancelled() {
@@ -1933,11 +2382,21 @@ fn execute_with_observer<O: SyncOperations>(
                         };
                         let relative = action.local.relative.clone();
                         let size = action.local.size;
-                        let outcome = match upload_precondition_holds(
-                            &worker_client,
-                            &action.remote_path,
-                            action.expected_remote.as_ref(),
-                        ) {
+                        // A direct upload writes the destination itself, so it is checked
+                        // first. An atomic deposit writes a temporary name and checks the
+                        // destination right before publishing over it (a Rename refuses a name
+                        // that appeared meanwhile), which is later and so stricter; asking here
+                        // as well would be one more request per file that settles nothing.
+                        let precondition = if deposit.context().is_some() {
+                            Ok(true)
+                        } else {
+                            upload_precondition_holds(
+                                &worker_client,
+                                &action.remote_path,
+                                action.expected_remote.as_ref(),
+                            )
+                        };
+                        let outcome = match precondition {
                             Ok(false) => UploadOutcome::Deferred(
                                 DeferReason::RemoteChanged,
                                 remote_changed_detail(&action.remote_path),
@@ -1970,13 +2429,25 @@ fn execute_with_observer<O: SyncOperations>(
                                             && !cancellation_for_observer.is_cancelled()
                                             && !stop_for_observer.load(Ordering::Acquire)
                                     }));
-                                match worker_client.upload(
+                                match upload_through_deposit(
+                                    &worker_client,
+                                    root,
+                                    deposit,
+                                    declared,
                                     &action.local,
                                     &action.remote_path,
+                                    action.expected_remote.as_ref(),
                                     observer,
                                     &cancellation,
                                 ) {
-                                    Ok(()) => UploadOutcome::Uploaded,
+                                    Ok(None) => UploadOutcome::Uploaded,
+                                    // Someone else wrote the destination while this file was on
+                                    // its way; it is kept and nothing was published over it.
+                                    Ok(Some(detail)) => UploadOutcome::Deferred(
+                                        DeferReason::RemoteChanged,
+                                        detail,
+                                        None,
+                                    ),
                                     // One file that changed under its own transfer, or whose
                                     // name DSM refuses, is that file's problem; its peers keep
                                     // going.
@@ -2431,14 +2902,32 @@ fn execute_with_observer<O: SyncOperations>(
             continue;
         }
         let bytes = local.size;
-        if let Err(error) = client.upload(
+        match upload_through_deposit(
+            client,
+            root,
+            &options.deposit,
+            &declared,
             &local,
             &target.remote_path,
+            Some(&target.snapshot),
             observer_factory(&local),
             &cancellation,
         ) {
-            completed.defer_local(&mut deferrals, relative, error, &mut report)?;
-            continue;
+            Ok(None) => {}
+            Ok(Some(detail)) => {
+                completed.defer(
+                    &mut deferrals,
+                    relative,
+                    DeferReason::RemoteChanged,
+                    detail,
+                    &mut report,
+                );
+                continue;
+            }
+            Err(error) => {
+                completed.defer_local(&mut deferrals, relative, error, &mut report)?;
+                continue;
+            }
         }
         completed.uploaded += 1;
         completed.kept_deletes_uploaded += 1;
@@ -2450,6 +2939,7 @@ fn execute_with_observer<O: SyncOperations>(
         });
     }
 
+    declared.settle_unattempted(&options.deposit);
     execute_renames(
         client,
         root,
@@ -2459,6 +2949,46 @@ fn execute_with_observer<O: SyncOperations>(
         &mut deferrals,
         &mut report,
     )
+}
+
+/// Name every path of the plan as left out for `deposit-not-atomic-unavailable`: nothing of it
+/// was written.
+fn defer_whole_plan(
+    plan: &SyncPlan,
+    completed: &mut ExecutionReport,
+    deferrals: &mut DeferralIndex,
+    report: &mut impl FnMut(ExecutionEvent),
+) {
+    let detail = "this DSM offers no SYNO.FileStation.Rename, which atomic deposit needs; nothing \
+                  in this run was written; set deposit = \"direct\" to upload without it";
+    let paths = plan
+        .uploads
+        .iter()
+        .map(|action| action.local.relative.as_str())
+        .chain(plan.copies.iter().map(|action| action.to_relative.as_str()))
+        .chain(plan.creates.iter().map(|action| action.relative.as_str()))
+        .chain(
+            plan.pre_deletes
+                .iter()
+                .map(|action| action.relative.as_str()),
+        )
+        .chain(
+            plan.post_deletes
+                .iter()
+                .map(|action| action.relative.as_str()),
+        )
+        .chain(plan.renames.iter().map(|action| action.relative.as_str()))
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    for relative in paths {
+        completed.defer(
+            deferrals,
+            &relative,
+            DeferReason::DepositNotAtomicUnavailable,
+            detail.to_owned(),
+            report,
+        );
+    }
 }
 
 /// Carry the plan's case-only renames, last, deepest first.
@@ -3404,6 +3934,65 @@ pub fn withhold_comma_ambiguous_mutations(
     }
     plan.copies = copies;
     Ok(deferred)
+}
+
+/// The uploads the atomic deposit cannot make safely, by destination: the folder's path, or (for
+/// an overwrite) the destination itself, has a comma whose part before it is another NAS entry
+/// (NAS question N1). The deposit's `Rename` and `Delete` of its temporary copy or of the
+/// previous version name such a path in a path list, which could address that other entry. A
+/// plain `Upload` names its folder as a string and is safe, so these are deposited directly, and
+/// each is named `deposit-not-atomic` with its path: never a silent fall back.
+pub fn comma_ambiguous_deposits(
+    client: &impl RemoteEntryLookup,
+    plan: &SyncPlan,
+    remote: &RemoteInventory,
+) -> Result<BTreeSet<String>> {
+    let listed: HashSet<&str> = remote
+        .entries
+        .values()
+        .map(|entry| entry.remote_path.as_str())
+        .collect();
+    let mut probed: BTreeMap<String, bool> = BTreeMap::new();
+    let mut addressable = |remote_path: &str| -> Result<bool> {
+        let Some(prefix) = crate::api::comma_split_prefix(remote_path) else {
+            return Ok(false);
+        };
+        if listed.contains(prefix) {
+            return Ok(true);
+        }
+        if let Some(exists) = probed.get(prefix) {
+            return Ok(*exists);
+        }
+        let exists = client.remote_entry_exists(prefix)?;
+        probed.insert(prefix.to_owned(), exists);
+        Ok(exists)
+    };
+    let mut direct = BTreeSet::new();
+    let destinations = plan
+        .uploads
+        .iter()
+        .map(|action| {
+            (
+                action.remote_path.as_str(),
+                action.expected_remote.is_some(),
+            )
+        })
+        .chain(
+            plan.copies
+                .iter()
+                .map(|action| (action.to_remote_path.as_str(), false)),
+        );
+    for (remote_path, overwrite) in destinations {
+        let Ok((parent, _)) = crate::path::parent_and_name(remote_path) else {
+            continue;
+        };
+        // Any reserved name in the folder stands for the temporary copy and the previous version.
+        let sibling = format!("{parent}/{}", crate::deposit::TEMP_PREFIX);
+        if addressable(&sibling)? || (overwrite && addressable(remote_path)?) {
+            direct.insert(remote_path.to_owned());
+        }
+    }
+    Ok(direct)
 }
 
 /// Fail the run when the remote walk found link boundaries, or folders it may not list, almost
@@ -4454,6 +5043,7 @@ mod tests {
             ExecuteOptions {
                 jobs: 1,
                 dry_run: true,
+                deposit: Deposit::default(),
             },
             |_| {},
         )
@@ -4477,6 +5067,7 @@ mod tests {
             ExecuteOptions {
                 jobs: 1,
                 dry_run: false,
+                deposit: Deposit::default(),
             },
             cancellation,
             Arc::new(|_| None),
@@ -4500,6 +5091,7 @@ mod tests {
             ExecuteOptions {
                 jobs: 1,
                 dry_run: false,
+                deposit: Deposit::default(),
             },
             |_| {},
         );
@@ -4523,6 +5115,7 @@ mod tests {
             ExecuteOptions {
                 jobs: 1,
                 dry_run: false,
+                deposit: Deposit::default(),
             },
             |_| {},
         );
@@ -4549,6 +5142,7 @@ mod tests {
             ExecuteOptions {
                 jobs: 1,
                 dry_run: false,
+                deposit: Deposit::default(),
             },
             |_| {},
         );
@@ -4570,6 +5164,7 @@ mod tests {
             ExecuteOptions {
                 jobs: 1,
                 dry_run: false,
+                deposit: Deposit::default(),
             },
             |_| {},
         )
@@ -4612,6 +5207,7 @@ mod tests {
             ExecuteOptions {
                 jobs: 1,
                 dry_run: false,
+                deposit: Deposit::default(),
             },
             |event| events.push(event),
         )
@@ -4675,6 +5271,7 @@ mod tests {
             ExecuteOptions {
                 jobs: 1,
                 dry_run: false,
+                deposit: Deposit::default(),
             },
             |_| {},
         )
@@ -4729,6 +5326,7 @@ mod tests {
             ExecuteOptions {
                 jobs: 1,
                 dry_run: false,
+                deposit: Deposit::default(),
             },
             |_| {},
         )
@@ -4782,6 +5380,7 @@ mod tests {
             ExecuteOptions {
                 jobs: 1,
                 dry_run: false,
+                deposit: Deposit::default(),
             },
             |event| events.push(event),
         )
@@ -4851,6 +5450,7 @@ mod tests {
             ExecuteOptions {
                 jobs: 1,
                 dry_run: false,
+                deposit: Deposit::default(),
             },
             |_| {},
         )
@@ -4926,6 +5526,7 @@ mod tests {
             ExecuteOptions {
                 jobs: 1,
                 dry_run: false,
+                deposit: Deposit::default(),
             },
             |event| events.push(event),
         )
@@ -5020,6 +5621,7 @@ mod tests {
             ExecuteOptions {
                 jobs: 1,
                 dry_run: false,
+                deposit: Deposit::default(),
             },
             |_| {},
         )
@@ -5064,6 +5666,7 @@ mod tests {
             ExecuteOptions {
                 jobs: 1,
                 dry_run: false,
+                deposit: Deposit::default(),
             },
             |_| {},
         )
@@ -5157,6 +5760,7 @@ mod tests {
             ExecuteOptions {
                 jobs: 1,
                 dry_run: false,
+                deposit: Deposit::default(),
             },
             |event| events.push(event),
         )
@@ -5231,6 +5835,7 @@ mod tests {
             ExecuteOptions {
                 jobs: 1,
                 dry_run: false,
+                deposit: Deposit::default(),
             },
             |_| {},
         )
@@ -5258,6 +5863,7 @@ mod tests {
             ExecuteOptions {
                 jobs: 1,
                 dry_run: false,
+                deposit: Deposit::default(),
             },
             |_| {},
         )
@@ -5430,6 +6036,7 @@ mod tests {
             ExecuteOptions {
                 jobs: 1,
                 dry_run: false,
+                deposit: Deposit::default(),
             },
             |_| {},
         )
@@ -5564,6 +6171,7 @@ mod tests {
             ExecuteOptions {
                 jobs: 1,
                 dry_run: false,
+                deposit: Deposit::default(),
             },
             |_| {},
         )
@@ -5608,6 +6216,7 @@ mod tests {
             ExecuteOptions {
                 jobs: 1,
                 dry_run: false,
+                deposit: Deposit::default(),
             },
             |_| {},
         )
@@ -5772,6 +6381,7 @@ mod tests {
             ExecuteOptions {
                 jobs: 1,
                 dry_run: false,
+                deposit: Deposit::default(),
             },
             |_| {},
         )
@@ -6001,6 +6611,7 @@ mod tests {
             ExecuteOptions {
                 jobs: 1,
                 dry_run: false,
+                deposit: Deposit::default(),
             },
             |_| {},
         )
@@ -6044,6 +6655,7 @@ mod tests {
                 ExecuteOptions {
                     jobs: 1,
                     dry_run: false,
+                    deposit: Deposit::default(),
                 },
                 |_| {},
             )
@@ -6082,6 +6694,7 @@ mod tests {
                 ExecuteOptions {
                     jobs: 1,
                     dry_run: false,
+                    deposit: Deposit::default(),
                 },
                 |_| {},
             )
@@ -6155,6 +6768,7 @@ mod tests {
             ExecuteOptions {
                 jobs: 1,
                 dry_run: false,
+                deposit: Deposit::default(),
             },
             |_| {},
         )
@@ -6203,6 +6817,7 @@ mod tests {
             ExecuteOptions {
                 jobs: 2,
                 dry_run: false,
+                deposit: Deposit::default(),
             },
             |_| {},
         )
@@ -6257,6 +6872,7 @@ mod tests {
             ExecuteOptions {
                 jobs: 2,
                 dry_run: false,
+                deposit: Deposit::default(),
             },
             |_| {},
         )
@@ -6295,6 +6911,7 @@ mod tests {
             ExecuteOptions {
                 jobs: 1,
                 dry_run: false,
+                deposit: Deposit::default(),
             },
             cancellation,
             // Stand in for the operator's Ctrl-C: the token is set while the transfer is in
@@ -6445,6 +7062,7 @@ mod tests {
             ExecuteOptions {
                 jobs: 1,
                 dry_run: false,
+                deposit: Deposit::default(),
             },
             |line| reported.push(line),
         )
@@ -6925,6 +7543,7 @@ mod tests {
             ExecuteOptions {
                 jobs: 1,
                 dry_run: false,
+                deposit: Deposit::default(),
             },
             |_| {},
         )
@@ -6954,6 +7573,7 @@ mod tests {
                 ExecuteOptions {
                     jobs: 1,
                     dry_run: false,
+                    deposit: Deposit::default(),
                 },
                 |_| {},
             )
@@ -7014,6 +7634,7 @@ mod tests {
             ExecuteOptions {
                 jobs: 1,
                 dry_run: false,
+                deposit: Deposit::default(),
             },
             |event| events.push(event),
         )
@@ -7054,6 +7675,7 @@ mod tests {
             ExecuteOptions {
                 jobs: 1,
                 dry_run: false,
+                deposit: Deposit::default(),
             },
             |_| {},
         )
@@ -7244,6 +7866,7 @@ mod tests {
             ExecuteOptions {
                 jobs: 1,
                 dry_run: false,
+                deposit: Deposit::default(),
             },
             |_| {},
         );
@@ -7280,6 +7903,7 @@ mod tests {
             ExecuteOptions {
                 jobs: 1,
                 dry_run: false,
+                deposit: Deposit::default(),
             },
             |_| {},
         );
@@ -7323,6 +7947,7 @@ mod tests {
             ExecuteOptions {
                 jobs: 1,
                 dry_run: false,
+                deposit: Deposit::default(),
             },
             |_| {},
         );
