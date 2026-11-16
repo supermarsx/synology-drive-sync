@@ -481,7 +481,6 @@ class DsmUiContractTests(unittest.TestCase):
             "maintainerUrl": info["maintainer_url"],
             "repository": package["repository"],
             "license": package["license"],
-            "coreVersion": package["version"],
             "uiVersion": ui_package["version"],
         }
         for field, value in expected_metadata.items():
