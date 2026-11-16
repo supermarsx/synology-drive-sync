@@ -3,9 +3,10 @@
 Choose a deployment target and this page will resolve it to one release asset. For a DSM
 package, the decision checks three independent facts: the exact Synology model, the installed
 Synology OS line/version, and the processor architecture reported by the NAS. An exact build is
-required on DSM 7.0 to prove the package minimum and on DSM 7.4 to prove the package maximum. It is
-optional on DSM 7.1–7.3. DSM 7.4 must not exceed the SPK manifest maximum of `7.4-99999`. A missing
-boundary build or mismatch stops the selector instead of guessing.
+required on DSM 7.0 to prove the package minimum and on DSM 7.4 to prove the package maximum when
+you pick the branch yourself. It is optional on DSM 7.1–7.3, and the default **Automatic** branch
+(see below) does not need it. DSM 7.4 must not exceed the SPK manifest maximum of `7.4-99999`. A
+missing boundary build or mismatch stops the selector instead of guessing.
 
 The 233-model physical catalog is a factual snapshot captured on **2026-08-26**. It contains all
 231 records in Synology's
@@ -45,13 +46,18 @@ Choosing a model fills in the other two inputs, and you can override both:
   instead. A value that disagrees with the catalog still stops the selector. Models marked **manual
   review / no SPK**, and the not-listed option, fill nothing and keep the stop.
 - **Installed OS branch** and **product line** default to **Automatic**. Automatic uses the newest
-  DSM the model supports, from the lifecycle data in this page, within the package's supported range
-  (DSM 7.0 up to `7.4-99999`), and shows the resolved value (for example, "Automatic: DSM 7.4 for
-  this model"). If you also enter the exact build, its branch is used. A model whose last supported
-  DSM is below 7.0, or a build from DSM 7.5 or later, stops with the same message an explicit pick
-  gives. The boundary rules are unchanged: DSM 7.0 and 7.4 still need the exact installed build, and
-  a web page cannot read it from your NAS, so Automatic asks for it instead of guessing. You can still
-  pick a branch by hand.
+  DSM the model supports, from the lifecycle data in this page, and shows the resolved value (for
+  example, "Automatic: DSM 7.4 for this model"). It needs no exact build when that DSM is 7.1 to
+  7.4: the package accepts `7.0-40759` through `7.4-99999`, the model's newest DSM is above the
+  minimum, and DSM build numbers have five digits, so every 7.4 build is within the maximum. So
+  DS416 with Automatic resolves to the ARMv7 SPK with nothing typed. Only a model whose newest DSM
+  were exactly 7.0 would still ask for the build, because the build decides whether `7.0-40759` is
+  met. If you enter an exact build anyway, its branch is used and it is checked against the
+  package range. A model whose last supported DSM is below 7.0, or a build from DSM 7.5 or later,
+  stops with the same message an explicit pick gives. Automatic assumes the NAS runs the newest
+  DSM its model supports; if yours is older (for example still on DSM 6.2), pick the branch by
+  hand or enter the exact build. A manual pick of DSM 7.0 or 7.4 keeps the existing rule and
+  still requires the exact build.
 
 > **DSM package safety hold:** do not install `.spk` assets from releases `26.5`, `26.6`, or
 > `26.20`. Release `26.20` rejects DSM's standard `system:system` authentication helper. The selector
@@ -138,7 +144,7 @@ reviewed and updated.
 <div class="selector-field">
 <label for="dsm-version">Exact installed version/build</label>
 <input id="dsm-version" name="dsmVersion" inputmode="text" placeholder="7.2.2-72806" data-dsm-version aria-describedby="dsm-version-help">
-<small id="dsm-version-help">Required for DSM 7.0 and 7.4 to prove the package's minimum or maximum; optional for DSM 7.1–7.3. Use the complete version and build after the hyphen. With Automatic, an exact build also sets the branch.</small>
+<small id="dsm-version-help">Required for DSM 7.0 and 7.4 to prove the package's minimum or maximum; optional for DSM 7.1–7.3. Use the complete version and build after the hyphen. With Automatic, the build is optional for DSM 7.1–7.4 and, when entered, sets the branch.</small>
 </div>
 <div class="selector-field">
 <label for="reported-arch">Reported processor architecture</label>
@@ -291,8 +297,8 @@ grep -E '^(majorversion|minorversion|productversion|buildnumber|smallfixnumber)=
 ```
 
 Search for the printed hardware model in the model field and choose it; the processor architecture
-and DSM branch fill in automatically. Enter the exact product version plus build number (required for
-DSM 7.0 or 7.4, optional for DSM 7.1–7.3), and use **Override** on the architecture field only if
+and DSM branch fill in automatically. Enter the exact product version plus build number (required if you pick DSM 7.0 or 7.4 yourself,
+optional with Automatic and for DSM 7.1–7.3), and use **Override** on the architecture field only if
 `uname -m` reports something different from the catalog. If Synology has added a model
 after the snapshot date, consult the live
 [official CPU table](https://kb.synology.com/en-us/DSM/tutorial/What_kind_of_CPU_does_my_NAS_have)

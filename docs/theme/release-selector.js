@@ -432,16 +432,21 @@
             );
         }
 
-        const boundary = compatibility.maxMinor === 0 || compatibility.maxMinor === 4;
+        // The SPK accepts DSM 7.0-40759 through 7.4-99999. A model whose newest DSM is 7.1 to 7.4
+        // is above the minimum, and DSM build numbers have five digits, so every 7.4 build is within
+        // the maximum: no exact build is needed. Only a model whose newest DSM is 7.0 would need the
+        // build, because 7.0 builds can fall below the 7.0-40759 minimum.
+        const needsBuild = compatibility.maxMinor === 0;
+        const newest = `DSM 7.${compatibility.maxMinor}`;
 
         return Object.freeze({
             ok: true,
             source: "model",
             osVersion: parseOsVersionSelection(`dsm-7.${compatibility.maxMinor}`),
-            requiresBuild: boundary,
-            text: boundary
-                ? `Automatic: DSM 7.${compatibility.maxMinor} for this model (the newest it supports). DSM 7.${compatibility.maxMinor} also needs the exact installed build, which a web page cannot read from your NAS.`
-                : `Automatic: DSM 7.${compatibility.maxMinor} for this model (the newest it supports).`,
+            requiresBuild: needsBuild,
+            text: needsBuild
+                ? `Automatic: ${newest} for this model (the newest it supports). ${newest} needs the exact installed build to prove the package minimum, which a web page cannot read from your NAS.`
+                : `Automatic: ${newest} for this model (the newest it supports). No exact build is needed.`,
         });
     }
 
@@ -746,7 +751,14 @@
                 "The exact build, when supplied, must use a complete form such as 7.2.2-72806.",
             );
         }
-        if ((osVersion.minor === 0 || osVersion.minor === 4) && !version) {
+        // A manual pick of 7.0 or 7.4 keeps requiring the exact build. Automatic resolved from the
+        // model needs it only where the build decides the answer (7.0), never for 7.1 to 7.4.
+        const automaticFromModel = Boolean(automaticDsm && automaticDsm.source === "model");
+
+        if (
+            !version &&
+            (osVersion.minor === 0 || (osVersion.minor === 4 && !automaticFromModel))
+        ) {
             const boundary = osVersion.minor === 0 ? "minimum" : "maximum";
             const manifestVersion =
                 osVersion.minor === 0 ? "DSM 7.0-40759" : DSM_PACKAGE_MAXIMUM.display;

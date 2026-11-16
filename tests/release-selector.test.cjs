@@ -664,15 +664,16 @@ test("choosing DS416 auto-fills armv7 with its source, and Override can disagree
         /Auto-filled from Synology's CPU table, captured 2026-08-26: DS416 is Package Arch alpine4k, which maps to the armv7 SPK \(synology-drive-sync-YY\.N-armv7\.spk\)/,
     );
     assert.match(harness.osAuto.textContent, /Automatic: DSM 7\.4 for this model/);
-    assert.match(harness.osAuto.textContent, /exact installed build/);
+    assert.match(harness.osAuto.textContent, /No exact build is needed/);
 
-    // Automatic with the 7.4 boundary and no build stops and says why instead of guessing.
+    // DS416 + Automatic resolves to the armv7 SPK with no build entered.
+    assert.equal(harness.dsmVersion.value, "");
     await harness.submit();
-    assert.equal(harness.result.dataset.state, "blocked");
-    assert.match(elementText(harness.result), /Automatic resolved DSM 7\.4 for DS416/);
-    assert.match(elementText(harness.result), /will not assume one/);
+    assert.equal(harness.result.dataset.state, "fallback");
+    assert.match(elementText(harness.result), /synology-drive-sync-YY\.N-armv7\.spk/);
+    assert.match(elementText(harness.result), /DSM 7\.4 \(Automatic: newest for this model; exact build not supplied\)/);
 
-    // An exact build sets the branch, and the whole path resolves end to end to the armv7 SPK.
+    // An exact build sets the branch, and the whole path still resolves to the armv7 SPK.
     harness.dsmVersion.value = "7.2.2-72806";
     harness.dsmVersion.dispatch("input");
     assert.match(harness.osAuto.textContent, /Automatic: DSM 7\.2, read from the exact build 7\.2\.2-72806/);
@@ -1620,20 +1621,38 @@ test("Automatic DSM resolves per model lifecycle within the SPK range", () => {
     assert.equal(old.ok, true);
     assert.equal(old.osVersion.display, "DSM 7.1");
     assert.equal(old.requiresBuild, false);
-    assert.equal(old.text, "Automatic: DSM 7.1 for this model (the newest it supports).");
+    assert.equal(
+        old.text,
+        "Automatic: DSM 7.1 for this model (the newest it supports). No exact build is needed.",
+    );
     assert.equal(resolveAuto({ model: "DS414", reportedArch: "armv7" }).ok, true);
     assert.match(resolveAuto({ model: "DS414", reportedArch: "armv7" }).detected, /DSM 7\.1 \(Automatic/);
 
-    // DSM 7.x-7.4 models resolve to 7.4, whose exact build cannot be known automatically.
+    // DSM 7.x-7.4 models resolve to 7.4 with no build: every 7.4 build is within 7.4-99999 and the
+    // model's newest DSM is above the 7.0-40759 minimum.
     const newest = auto("DS923+", "");
     assert.equal(newest.osVersion.display, "DSM 7.4");
-    assert.equal(newest.requiresBuild, true);
-    assert.match(newest.text, /^Automatic: DSM 7\.4 for this model/);
-    const stop = resolveAuto({ model: "DS923+", reportedArch: "x86_64" });
-    assert.equal(stop.code, "dsm_build_required");
-    assert.match(stop.message, /Automatic resolved DSM 7\.4 for DS923\+/);
-    assert.match(stop.details, /7\.4-99999/);
-    assert.match(stop.details, /will not assume one/);
+    assert.equal(newest.requiresBuild, false);
+    assert.match(newest.text, /^Automatic: DSM 7\.4 for this model.*No exact build is needed\.$/);
+    const resolved = resolveAuto({ model: "DS923+", reportedArch: "x86_64" });
+    assert.equal(resolved.ok, true);
+    assert.equal(resolved.assetTemplate, "synology-drive-sync-{tag}-x86_64.spk");
+    assert.equal(resolveAuto({ reportedArch: "armv7" }).assetTemplate, "synology-drive-sync-{tag}-armv7.spk");
+    assert.equal(resolveAuto({ reportedArch: "armv7" }).ok, true, "DS416 + Automatic needs no build");
+    // Models first published in 7.4.1 resolve too: they cannot run an older image.
+    for (const model of ["RS11626xs+", "DS1525neo+", "DS925neo+", "DVA7400"]) {
+        assert.equal(resolveAuto({ model, reportedArch: "x86_64" }).ok, true, model);
+    }
+    // Manual picks keep today's rule: DSM 7.0 and 7.4 need the exact build.
+    assert.equal(
+        resolveAuto({ model: "DS923+", reportedArch: "x86_64", osVersion: "dsm-7.4" }).code,
+        "dsm_build_required",
+    );
+    assert.equal(
+        resolveAuto({ reportedArch: "armv7", osVersion: "dsm-7.0" }).code,
+        "dsm_build_required",
+    );
+    assert.equal(resolveAuto({ reportedArch: "armv7", osVersion: "dsm-7.2" }).ok, true);
 
     // An exact build is honoured and sets the branch, including the 7.0 and 7.4 boundaries.
     assert.equal(resolveAuto({ dsmVersion: "7.2.2-72806" }).ok, true);
@@ -1712,6 +1731,35 @@ test("a model whose newest DSM exceeds the SPK maximum stops under Automatic", (
         }).ok,
         true,
     );
+});
+
+test("Automatic needs the exact build only where the build decides: a model whose newest DSM is 7.0", () => {
+    const data = mutableSelectorData();
+    const group = data.compatibilityGroups.find((candidate) => candidate.models.includes("DS416"));
+
+    group.maxMinor = 0;
+    const patched = loadSelectorWithData(data);
+    const input = {
+        purpose: "dsm-spk",
+        model: "DS416",
+        productLine: "auto",
+        osVersion: "auto",
+        dsmVersion: "",
+        reportedArch: "armv7",
+    };
+    const auto = patched.resolveAutomaticDsm("DS416", "");
+
+    assert.equal(auto.ok, true);
+    assert.equal(auto.requiresBuild, true);
+    assert.match(auto.text, /DSM 7\.0 needs the exact installed build/);
+
+    const stop = patched.resolveSelection(input);
+
+    assert.equal(stop.code, "dsm_build_required");
+    assert.match(stop.message, /Automatic resolved DSM 7\.0 for DS416/);
+    assert.match(stop.details, /7\.0-40759/);
+    assert.equal(patched.resolveSelection({ ...input, dsmVersion: "7.0.1-42218" }).ok, true);
+    assert.equal(patched.resolveSelection({ ...input, dsmVersion: "7.0-40758" }).code, "dsm_too_old");
 });
 
 test("DS416 resolves end to end to the armv7 SPK, and the release rules still apply", () => {
