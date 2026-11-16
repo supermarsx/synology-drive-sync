@@ -3320,7 +3320,7 @@ impl Control {
             RunOutcome::Partial => Level::Warn,
             RunOutcome::Failed => Level::Error,
         };
-        let message = if verdict.detail.is_empty() {
+        let mut message = if verdict.detail.is_empty() {
             format!("Package action {}", verdict.outcome.as_str())
         } else {
             format!(
@@ -3328,6 +3328,25 @@ impl Control {
                 verdict.outcome.as_str(),
                 sanitize_detail(&verdict.detail, 160)
             )
+        };
+        // What the atomic deposit named (a previous version kept beside another writer's file, a
+        // temporary copy it could not remove, an earlier run rolled back) reaches Activity on the
+        // run's own row, once per run however many files it concerns, and makes the row a warning.
+        let deposits = report
+            .records
+            .iter()
+            .filter_map(|record| record.facts.deposit.as_ref())
+            .collect::<Vec<_>>();
+        let level = match super::state::DepositFacts::activity_note(&deposits) {
+            Some(note) => {
+                message = format!("{message}; {}", sanitize_detail(&note, 200));
+                if level == Level::Info {
+                    Level::Warn
+                } else {
+                    level
+                }
+            }
+            None => level,
         };
         if !repeated_refusal && !self.activity(code, &request.scope, state, "sync", level, message)
         {
@@ -4613,6 +4632,13 @@ fn run_converged(report: &RunReport, verdict: &RunVerdict) -> bool {
                 && record.skipped == Some(0)
                 && record.facts.incomplete_listings == Some(0)
                 && record.facts.link_guard_unchecked == Some(0)
+                // A run that left a deposit for the next run's recovery has not converged. A
+                // record without a deposit member wrote nothing, so left nothing.
+                && record
+                    .facts
+                    .deposit
+                    .as_ref()
+                    .is_none_or(|deposit| deposit.unsettled == 0 && deposit.warnings == 0)
         })
 }
 

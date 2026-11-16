@@ -34,7 +34,7 @@ before its first byte is sent. The next run of the same profile reads it before 
 | between the two renames | the old version as `~sdsync-prev-`, the final name absent | renames the old version back, then uploads again | `deposit-rolled-back` |
 | after publishing, before deleting the old version | the new version, and `~sdsync-prev-` | checks the final name is the new version (length, time, MD5), deletes the old one | `deposit-completed` |
 | as above, but someone else wrote the final name meanwhile | their file, and `~sdsync-prev-` | keeps both | `deposit-backup-kept` (warning, every run until you remove one) |
-| a server copy, mid-copy | a partial file at the final name | keeps it; the comparison finds it differs and replaces it through an atomic deposit | `deposit-copy-kept` |
+| a server copy, mid-copy | a partial file at the final name | keeps it (someone may have written the name since), and this run uploads over it whatever its comparison says, through an atomic deposit: it is never adopted | `deposit-copy-kept` |
 
 A run that is cancelled or fails cleans up its own temporary copies as it stops; anything it cannot
 remove is named (`deposit-cleanup-failed`) and left in the journal for the next run. A server copy
@@ -44,8 +44,9 @@ that fails, times out or does not verify has its partial destination deleted at 
 Recovery only ever touches names this profile's journal lists. A `~sdsync-` name it does not
 account for (a journal that was lost, another installation's) is named
 `deposit-orphan-unjournaled` and left alone: check it and remove it by hand. The NAS walk treats
-every `~sdsync-part-`, `~sdsync-prev-` and `~sdsync-stage-` name as managed: it is never compared,
-uploaded over or deleted by a mirror run. A local file with such a name is refused by name.
+every `~sdsync-part-`, `~sdsync-prev-` and `~sdsync-stage-` name as managed, and the same names with a
+leading dot (`.sdsync-part-`, ..., a spelling a development build may have written): it is never
+compared, uploaded over or deleted by a mirror run. A local file with such a name is refused by name.
 
 ## The journal
 

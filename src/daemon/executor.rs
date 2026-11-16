@@ -24,7 +24,7 @@ use std::time::Duration;
 
 use serde_json::Value;
 
-use super::state::{IndexFacts, ResultFacts, RunOutcome, RunStatus, sanitize_detail};
+use super::state::{DepositFacts, IndexFacts, ResultFacts, RunOutcome, RunStatus, sanitize_detail};
 
 /// How much of the child's stderr is kept (matches `run-stderr.log`).
 pub(crate) const STDERR_TAIL_BYTES: usize = 16 * 1024;
@@ -288,6 +288,7 @@ pub(crate) fn parse_result_record(bytes: &[u8]) -> Result<Vec<JobRecord>, String
                 keepalive_failures: recovered["keepalive_failures"].as_u64(),
                 link_guard_unchecked: result["link_guard_unchecked"].as_u64(),
                 index: IndexFacts::from_value(&result["pair_index"]),
+                deposit: DepositFacts::from_value(&result["deposit"]),
             },
         });
     }
@@ -1650,6 +1651,27 @@ mod tests {
         );
         assert_eq!(stderr_cause(b"one\ntwo\n\n"), "two");
         assert_eq!(stderr_cause(b""), "");
+    }
+
+    /// The deposit report of a run reaches the daemon: its warnings counted, the first named
+    /// with its path and cause, what is left for the next run; info notes and malformed codes are
+    /// not warnings, and a run that wrote nothing carries no deposit line.
+    #[test]
+    fn the_deposit_report_is_read_with_its_warnings() {
+        let records = parse_result_record(
+            br#"{"schema":"sdsync.result-record.v1","profile":"photos","status":"succeeded","error":null,"result":{"deposit":{"mode":"atomic","journal":"/j","published":3,"replaced":1,"recovered":2,"unsettled":1,"issues":[{"code":"deposit-completed","severity":"info","path":"/team/a","cause":"done"},{"code":"deposit-backup-kept","severity":"warning","path":"/team/b/~sdsync-prev-x","cause":"someone else wrote /team/b"},{"code":"Bad Code","severity":"warning","path":"/x","cause":"y"},{"code":"deposit-cleanup-failed","severity":"warning","path":"/team/c","cause":"refused"}]}}}
+{"schema":"sdsync.result-record.v1","profile":"docs","status":"succeeded","error":null,"result":{"deposit":null}}
+"#,
+        )
+        .unwrap();
+        let deposit = records[0].facts.deposit.clone().unwrap();
+        assert_eq!((deposit.warnings, deposit.unsettled), (2, 1));
+        assert_eq!(deposit.issue.as_deref(), Some("deposit-backup-kept"));
+        assert_eq!(
+            deposit.issue_detail.as_deref(),
+            Some("/team/b/~sdsync-prev-x: someone else wrote /team/b")
+        );
+        assert_eq!(records[1].facts.deposit, None);
     }
 
     /// The index report of a run reaches the daemon: entries, hits, misses, the

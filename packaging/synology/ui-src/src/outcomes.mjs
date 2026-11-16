@@ -394,6 +394,7 @@ export function reasonCopy(value) {
 function factsOf(record) {
   const r = obj(record);
   const rec = r.recovered && typeof r.recovered === "object" && !Array.isArray(r.recovered) ? r.recovered : null;
+  const dep = r.deposit && typeof r.deposit === "object" && !Array.isArray(r.deposit) ? r.deposit : null;
   return {
     incompleteListings: count(r.incomplete_listings),
     folders: (Array.isArray(r.incomplete_listing_folders) ? r.incomplete_listing_folders : [])
@@ -405,6 +406,13 @@ function factsOf(record) {
       reauthenticationFailures: count(rec.reauthentication_failures),
       serverTasksNotStopped: count(rec.server_tasks_not_stopped),
       keepaliveFailures: count(rec.keepalive_failures)
+    } : null,
+    // What the atomic deposit named this run: a count, and the first warning with its NAS path.
+    deposit: dep ? {
+      warnings: count(dep.warnings),
+      unsettled: count(dep.unsettled),
+      issue: typeof dep.issue === "string" && /^deposit-[a-z-]{1,56}$/.test(dep.issue) ? dep.issue : "",
+      detail: typeof dep.issue_detail === "string" ? dep.issue_detail.replace(/[^\x20-\x7e]/g, "?").slice(0, 160) : ""
     } : null
   };
 }
@@ -429,6 +437,13 @@ export function warningText(warning, r = {}) {
   if (warning === "server_tasks_not_stopped") return `${rec.serverTasksNotStopped > 0 ? n(rec.serverTasksNotStopped, "server-side task", "server-side tasks") : "Server-side tasks"} could not be stopped on the target; check its Task Manager`;
   if (warning === "keepalive_failures") return `Recovered from ${rec.keepaliveFailures > 0 ? n(rec.keepaliveFailures, "keep-alive failure", "keep-alive failures") : "keep-alive failures"}; check the network if it repeats`;
   if (warning === "link_guard_unchecked") return `${r.linkGuardUnchecked > 0 ? `Link check unavailable for ${n(r.linkGuardUnchecked, "folder", "folders")}` : "Link check unavailable for some folders"}: DSM gave no real path to check entries against, so links there could not be ruled out; nothing was refused. Run Doctor`;
+  if (warning === "deposit_warnings") {
+    const d = r.deposit || {};
+    const head = d.warnings > 0 ? n(d.warnings, "file deposit warning", "file deposit warnings") : "File deposit warnings";
+    const first = d.issue ? `; first ${d.issue}${d.detail ? `: ${d.detail}` : ""}` : "";
+    const left = d.unsettled > 0 ? `; ${n(d.unsettled, "deposit is", "deposits are")} left for the next run to settle` : "";
+    return `${head}${first}${left}. Review Logs (deposit.warning) for every path`;
+  }
   if (warning === "stall_unobservable") return "Cannot tell whether this run is stuck: the core's I/O counters are not readable here, so its progress cannot be observed and a stuck run would not be flagged";
   if (warning === "stalled") return "Run may be stuck: no progress for over 30 minutes";
   if (warning === "long_running") return `Running for ${r.runningFor !== null && r.runningFor !== undefined ? spanLabel(r.runningFor) : "a long time"}; check whether it is stuck`;
