@@ -1509,7 +1509,15 @@ impl Engine {
                     phase: Phase::Planning,
                 },
             )?;
+            let suspect = deposit_report
+                .suspect
+                .iter()
+                .filter_map(|path| root.relative(path).ok())
+                .collect::<std::collections::BTreeSet<String>>();
             let mut plan = plan::build_plan(&root, &local, &remote, &rules, &options)
+                .map_err(SdkError::from_core)?;
+            // What recovery kept but could not prove whole is uploaded over, never adopted.
+            plan::force_uploads(&root, &mut plan, &local, &remote, &suspect)
                 .map_err(SdkError::from_core)?;
             plan.link_guard_unchecked = link_guard_unchecked;
             merge_deferred(

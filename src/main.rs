@@ -3167,6 +3167,16 @@ fn prepare_and_run_sync_reporting(
 
         cancellation.phase("build_plan");
         let mut plan = plan::build_plan(&root, &local, &remote, &rules, &run_options)?;
+        // What recovery kept but could not prove whole is uploaded over, never adopted by a
+        // comparison that only looked at its size and time.
+        if !deposit_report.suspect.is_empty() {
+            let suspect = deposit_report
+                .suspect
+                .iter()
+                .filter_map(|path| root.relative(path).ok())
+                .collect();
+            plan::force_uploads(&root, &mut plan, &local, &remote, &suspect)?;
+        }
         plan.link_guard_unchecked = link_guard_unchecked;
         deferred.extend(sync::withhold_deletions_in_incomplete_listings(
             &mut plan,

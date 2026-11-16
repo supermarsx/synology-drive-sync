@@ -826,6 +826,11 @@ fn recovery_keeps_an_interrupted_server_copy_it_cannot_prove_for_the_comparison_
 
     assert!(carried.is_empty());
     assert_eq!(codes(&report), vec!["deposit-copy-kept"]);
+    assert_eq!(
+        report.suspect,
+        BTreeSet::from([path.clone()]),
+        "kept, and uploaded over by this run, never adopted"
+    );
     assert_eq!(nas.content(&path).as_deref(), Some(&b"01234"[..]));
 }
 
