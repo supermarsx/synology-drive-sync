@@ -17,7 +17,7 @@
 //! write, a rename-over or a chmod all set it to the time they happen and nothing
 //! in user space can set it back, so a digest taken before such a change can
 //! never equal one taken after it, provided the digest was not itself taken
-//! inside the timestamp's granularity ([`RACY_MARGIN`]). A directory with a child
+//! inside the timestamp's granularity (`RACY_MARGIN`). A directory with a child
 //! that changed that recently is read as racy and is never recorded.
 //!
 //! The manifest is memory only. It is empty after a restart (the first dispatch

@@ -1271,7 +1271,7 @@ impl RedbPairIndex {
     /// Open the index, verified. A damaged, repaired or foreign-format file is set aside and
     /// replaced by an empty one; locked, read-only and unsafe files give no backend at all, and
     /// neither does an index this system has shown it cannot keep (`pair-index-unkeepable`, see
-    /// [`Rebuilds`]). Every case but a clean pass is named.
+    /// `Rebuilds`). Every case but a clean pass is named.
     pub fn open(paths: IndexPaths, cache_mib: u64) -> Opened {
         let mut backend = Self {
             paths,

@@ -17297,7 +17297,7 @@ fn activity_version(
 
 /// Attach `history` to an Activity feed either rung produced: how many rotated files exist
 /// and when the oldest retained record was written, so the dashboard can say "history starts
-/// <date>" instead of letting a rotated-away failure look like no failure. An oldest file that
+/// `<date>`" instead of letting a rotated-away failure look like no failure. An oldest file that
 /// cannot be read is named in `history.error` rather than failing the feed.
 #[cfg(target_os = "linux")]
 fn attach_activity_history(

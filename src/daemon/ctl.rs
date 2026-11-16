@@ -893,7 +893,7 @@ fn evict(slots: &Slots, log: &CtlLog, socket: &Path, victim: &UnreadEntry) {
     }
 }
 
-/// "cannot connect to <path>: <cause>", the path said once: a full backlog already names the
+/// "cannot connect to `<path>: <cause>`", the path said once: a full backlog already names the
 /// socket in its own words (`connect_with_timeout`), and repeating it read as two sockets.
 fn connect_failure(path: &Path, error: &io::Error) -> String {
     let cause = error.to_string();

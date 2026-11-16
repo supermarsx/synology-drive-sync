@@ -1026,7 +1026,7 @@ pub fn populate_content_md5(
 ///
 /// Skipping is only safe because of what the supplier proved before filling the field: that the
 /// file's size, modification time and filesystem identity are unchanged since the digest was taken.
-/// That is the same evidence [`verify_metadata_snapshot`] accepts as proof a file did not change
+/// That is the same evidence `verify_metadata_snapshot` accepts as proof a file did not change
 /// underneath a read — held across runs rather than across one read, which is the whole of the
 /// difference, and the reason no mutation path may fill this field from stored evidence.
 ///
