@@ -205,7 +205,9 @@ main() {
     mkdir "$work/extract"
     tar -xzf "$work/$asset" -C "$work/extract" "$member" || fail "could not extract $member"
     candidate=$work/extract/$member
-    [ -f "$candidate" ] && [ ! -L "$candidate" ] || fail "the extracted $BINARY is not a regular file"
+    if [ ! -f "$candidate" ] || [ -L "$candidate" ]; then
+        fail "the extracted $BINARY is not a regular file"
+    fi
     chmod 0755 "$candidate"
     reported=$("$candidate" --version 2>&1) || fail "the downloaded binary did not run: $reported"
     [ "$reported" = "$BINARY $version" ] ||
@@ -215,8 +217,9 @@ main() {
     install_dir=$(CDPATH='' cd -- "$install_dir" && pwd -P) || fail "could not enter $install_dir"
     target=$install_dir/$BINARY
     if [ -e "$target" ] || [ -L "$target" ]; then
-        [ -f "$target" ] && [ ! -L "$target" ] ||
+        if [ ! -f "$target" ] || [ -L "$target" ]; then
             fail "$target exists and is not a regular file; remove it first"
+        fi
         previous=$("$target" --version 2>/dev/null || true)
     else
         previous=
