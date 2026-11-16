@@ -147,8 +147,12 @@ events, error codes and cancellation, and the
   modification time alone never triggers an upload, and uploads are verified.
 - **Secrets stay yours.** Passwords and one-time codes arrive through a callback into zeroizing
   buffers and are never logged or written to configuration files.
-- **Honest limits.** Uploads and guarded deletions are **not crash-atomic**, and a plan is not a
-  backup: keep independent, tested recovery.
+- **Honest limits.** A file's own upload is crash-atomic (`deposit = "atomic"`, the default): while
+  a file is being replaced its name is missing for one request, and a crash at that moment leaves
+  the old version whole beside it until the next run puts it back (see
+  [Crash-atomic deposit](https://supermarsx.github.io/synology-drive-sync/deposit.html)). Deletion,
+  type replacement and a run as a whole are **not crash-atomic**, and a plan is not a backup: keep
+  independent, tested recovery.
 - **Young software.** It has been exercised against few NAS models and DSM builds, and the
   automated tests use mock servers rather than a live NAS. Rehearse against a disposable
   destination before you point it at data you would miss. See the

@@ -1,6 +1,6 @@
 # Crash-atomic deposit
 
-A file reaches its final NAS name only once it is whole and verified. A crash, `kill -9`, power
+An uploaded file reaches its final NAS name only once it is whole and verified. A crash, `kill -9`, power
 loss, dropped link or DSM restart at any moment never leaves a partial file under that name: it
 holds the old version or the new one. The one exception is a replacement interrupted in the single
 round trip between its two renames (below): the name is then empty, the old version is kept whole

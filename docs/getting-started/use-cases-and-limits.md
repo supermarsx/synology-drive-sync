@@ -159,7 +159,11 @@ prevent overlap, and allow enough time for the complete scan-transfer-verify wor
   and protect a renamed folder's NAS spelling too, but content an exclude newly covers stays on the NAS
   as it is: delete it by hand.
 - There is no two-way reconciliation, Drive conflict protocol, block-level delta, resumable upload,
-  transactional multi-profile rollback, or crash-atomic overwrite/type replacement.
+  transactional multi-profile rollback, run-level transaction, or crash-atomic deletion/type
+  replacement. A file's own upload is crash-atomic (`deposit = "atomic"`, the default): while a file
+  is being replaced its name is missing for one request, and a crash at that moment leaves the old
+  version whole beside it until the next run puts it back; see
+  [Crash-atomic deposit](../deposit.md).
 - File content, hierarchy, names, and file mtime are in scope. ACLs, ownership, modes, xattrs, hard
   links, sparse layout, and directory mtime are not preserved. Different URLs that reach the same
   NAS are aliases the client cannot identify.

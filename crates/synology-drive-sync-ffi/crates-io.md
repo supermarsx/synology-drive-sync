@@ -148,8 +148,12 @@ request fields, status codes, ownership and threading rules.
   has returned.
 - **One direction, additive by default.** The source is authoritative and is opened read-only;
   an edit made on the NAS is never brought back.
-- **Honest limits.** Uploads and guarded deletions are **not crash-atomic**, and a synchronisation
-  is not a backup. This is young software that has been exercised against few NAS models and DSM
+- **Honest limits.** A file's own upload is crash-atomic (`deposit` `atomic`, the default): while a
+  file is being replaced its name is missing for one request, and a crash at that moment leaves the
+  old version whole beside it until the next run puts it back (see
+  [Crash-atomic deposit](https://supermarsx.github.io/synology-drive-sync/deposit.html)). Deletion,
+  type replacement and a run as a whole are **not crash-atomic**, and a synchronisation is not a
+  backup. This is young software that has been exercised against few NAS models and DSM
   builds; rehearse against a disposable destination first.
 
 ## Links

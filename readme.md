@@ -179,6 +179,12 @@ Containers, the Rust SDK, the C ABI, profiles, and batches are covered in the
 > remote type replacement are guarded, but they are not transactional or crash-atomic. Review `plan`,
 > use deliberately small caps, keep both trees quiescent, and test recovery before enabling deletion.
 > `--no-delete` defeats deletion selected by a profile or environment for one run.
+>
+> File uploads are crash-atomic (`deposit = "atomic"`, the default): each file is uploaded under a
+> temporary name, verified and renamed into place, so a crash never leaves a partial or mixed file
+> under its name. While an existing file is being replaced its name is absent for one request, and a
+> crash at that moment leaves the old version whole under a `~sdsync-prev-` name until the next run
+> puts it back. See [Crash-atomic deposit](docs/deposit.md).
 
 > [!IMPORTANT]
 > Passwords, TOTP seeds, and tokens never belong in TOML or on a command line: use the OS vault, a
@@ -199,7 +205,11 @@ Containers, the Rust SDK, the C ABI, profiles, and batches are covered in the
   and reported by name, never uploaded and never deleted from the NAS. A file that changes mid-run is
   deferred and the run exits `3` so it is retried.
 - There is no two-way reconciliation, Drive conflict protocol, block-level delta, resumable upload,
-  transactional multi-profile rollback, or crash-atomic overwrite or type replacement.
+  transactional multi-profile rollback, run-level transaction, or crash-atomic deletion/type
+  replacement. A file's own upload is crash-atomic (`deposit = "atomic"`, the default): while a file
+  is being replaced its name is missing for one request, and a crash at that moment leaves the old
+  version whole beside it until the next run puts it back; see
+  [Crash-atomic deposit](docs/deposit.md).
 
 The full list, the comparison modes, the operation table, and every exit code are in
 [use cases, operations, and limits](https://supermarsx.github.io/synology-drive-sync/getting-started/use-cases-and-limits.html)
