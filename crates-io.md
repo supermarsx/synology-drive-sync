@@ -17,8 +17,9 @@ headless Linux box, another NAS, a container or a scheduled job.
 - **One-way deposit, not two-way sync.** The local folder is authoritative. An edit made on the
   NAS is never brought back, and the next local change to that path overwrites it.
 - **Reaches the NAS the way you already do.** Point it at a DSM HTTPS address, a reverse proxy, or
-  a QuickConnect address. Relay connections work but are slower, and Synology does not list
-  third-party apps as supported for QuickConnect, so prefer a direct address where you have one.
+  a QuickConnect address. QuickConnect is supported in both its relay and direct forms; the relay
+  is slower, so prefer the LAN address or the direct form where you have one, and `doctor` tells
+  you which path a run is on.
 - **Synology Drive can still pick the files up.** When the destination is the account's My Drive
   or an enabled Team Folder, Drive indexes what File Station wrote.
 - **A finite process, not a daemon.** Every run scans, plans, transfers, verifies and exits, so
