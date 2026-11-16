@@ -19,7 +19,7 @@
 //!
 //! **It is throttled, because the reader cannot see faster.** The dashboard's result poll ramps to
 //! one request every 2 000 ms, so a record written more often than that is written for nobody. The
-//! cost of an emission is stated in [`ProgressRecorder::write_now`].
+//! cost of an emission is stated in `ProgressRecorder::write_now`.
 
 use std::fs::{self, OpenOptions};
 use std::io::Write;

@@ -563,7 +563,6 @@
                   <div><dt>Installed package version</dt><dd><code>{{ installedPackageVersion }}</code></dd></div>
                   <div><dt>Installed package build</dt><dd><code>{{ installedPackageBuild }}</code></dd></div>
                   <div v-if="serviceEngineLabel"><dt>Service engine</dt><dd><code>{{ serviceEngineLabel }}</code></dd></div>
-                  <div><dt>Core source version</dt><dd><code>{{ aboutMetadata.coreVersion }}</code></dd></div>
                   <div><dt>DSM UI build version</dt><dd><code>{{ aboutMetadata.uiVersion }}</code></dd></div>
                   <div><dt>API schema</dt><dd><code>{{ aboutMetadata.apiSchema }}</code></dd></div>
                 </dl>
@@ -1867,7 +1866,6 @@ const ABOUT_METADATA = Object.freeze({
   repository: "https://github.com/supermarsx/synology-drive-sync",
   license: "MIT",
   licenseUrl: "https://github.com/supermarsx/synology-drive-sync/blob/main/license.md",
-  coreVersion: "0.1.0",
   uiVersion: "1.0.0",
   apiSchema: SNAPSHOT_SCHEMA,
   releasesUrl: "https://github.com/supermarsx/synology-drive-sync/releases",

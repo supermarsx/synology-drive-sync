@@ -1,26 +1,39 @@
 [package]
 name = "synology-drive-sync"
-version = "0.1.0"
+# Crates.io versions are `0.YY.N` for calendar release `YY.N` (26.66 is 0.26.66). The release
+# workflow stamps the real value with `.github/scripts/crate-version.py stamp` before it
+# publishes, because the calendar number is allocated after a commit lands on main. The value
+# committed here is the last number stamped by hand; `crate-version.py check` (run by CI) only
+# requires that every place naming it agrees.
+version = "0.26.66"
 edition = "2024"
 rust-version = "1.100"
-description = "Lean one-way folder sync to Synology Drive-backed folders through File Station WebAPI"
+description = "Lean one-way file deposit to a Synology NAS over the DSM File Station API: a CLI and a Rust SDK for machines that cannot run Synology Drive Client. QuickConnect supported."
 license = "MIT"
-readme = "readme.md"
+readme = "crates-io.md"
 repository = "https://github.com/supermarsx/synology-drive-sync"
-keywords = ["synology", "file-station", "sync", "backup", "cli"]
-categories = ["command-line-utilities", "filesystem"]
+homepage = "https://supermarsx.github.io/synology-drive-sync/"
+documentation = "https://docs.rs/synology-drive-sync"
+keywords = ["synology", "nas", "file-station", "backup", "sync"]
+categories = ["command-line-utilities", "filesystem", "network-programming"]
+# The .crate carries what building, the docs and the SDK example need and nothing else: no DSM
+# package sources (`packaging/`), no dashboard bundle, no documentation site, and no `tests/`
+# (the integration tests drive the DSM package tree and the FFI crate, which a registry download
+# does not contain). `cargo package --list` is the authority.
 include = [
     "/Cargo.lock",
     "/license.md",
-    "/readme.md",
+    "/crates-io.md",
     "/third_party_licenses.html",
     "/build.rs",
     "/config.example.toml",
-    "/docs/observability.schema.json",
     "/examples/sdk/**",
     "/src/**",
-    "/tests/**",
 ]
+
+[package.metadata.docs.rs]
+# docs.rs builds on Linux; the cfg(unix) modules are the superset the docs should show.
+targets = ["x86_64-unknown-linux-gnu"]
 
 [[example]]
 name = "sdk-basic"

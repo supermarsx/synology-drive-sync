@@ -3383,7 +3383,7 @@ fn remote_digest_reason(error: &Error) -> DeferReason {
 
 /// Whether a plan skip is a deferral the next run is expected to pick up.
 ///
-/// Every deferral named in a plan is tagged `<reason>: <cause>` (see [`withhold`] and
+/// Every deferral named in a plan is tagged `<reason>: <cause>` (see `withhold` and
 /// [`record_deferrals_in_plan`]), so a plan with no result section can still tell a transient
 /// deferral from a lasting one.
 pub fn skip_is_transient_deferral(entry: &crate::local::SkippedEntry) -> bool {

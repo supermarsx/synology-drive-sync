@@ -181,7 +181,6 @@ test("About metadata, dependency versions, and update links match repository sou
     ["maintainerUrl", maintainerUrl],
     ["repository", cargoValue("repository")],
     ["license", cargoValue("license")],
-    ["coreVersion", cargoValue("version")],
     ["uiVersion", uiPackage.version]
   ]) {
     assert.match(app, new RegExp(`${field}: "${value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}"`));

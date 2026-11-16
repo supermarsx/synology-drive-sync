@@ -461,7 +461,7 @@ pub struct PlanCarry<'plan> {
     /// The racy windows ([`crate::pair_index::RacyWindows::for_host`] outside tests).
     pub racy: crate::pair_index::RacyWindows,
     /// Pairs the carry would have served but for a NAS clock this host's clock does not bound
-    /// (see [`PlanCarry::nas_clock_is_bounded`]); counted by [`EvidenceSource::vouch`] and read
+    /// (see `PlanCarry::nas_clock_is_bounded`); counted by [`EvidenceSource::vouch`] and read
     /// back with [`EvidenceSource::plan_clock_unbounded`].
     pub clock_unbounded: std::cell::Cell<usize>,
 }

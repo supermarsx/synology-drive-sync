@@ -1153,7 +1153,7 @@ impl ChannelProbe {
 /// One safe, read-only capability probe to make.
 ///
 /// `api`, `method`, and `cgi_path` are supplied by the caller. The first two are compile-time
-/// literals; the path is routed through [`endpoint_url`], which confines it to the configured
+/// literals; the path is routed through `endpoint_url`, which confines it to the configured
 /// origin and `webapi/` prefix, so a server-supplied path cannot redirect a probe elsewhere.
 #[derive(Clone, Debug)]
 pub struct CapabilityProbeSpec {
@@ -1679,7 +1679,7 @@ impl ApiClient {
 
     /// Install the way this client re-establishes an expired session.
     ///
-    /// Without one, DSM's session codes are fatal exactly as before; see [`retryable`]. With one, a
+    /// Without one, DSM's session codes are fatal exactly as before; see `retryable`. With one, a
     /// request DSM refused for its session (106 timed out, 107 interrupted by a duplicate login,
     /// 119 invalid, and 105 when a liveness probe confirms the session is what failed) is sent
     /// again once, after a single re-authentication shared by every clone of this client. Those
@@ -1847,7 +1847,7 @@ impl ApiClient {
     /// the session goes through the same recovery and reports its own error.
     ///
     /// Skipped, and counted, when a real request was answered within the last
-    /// [`SESSION_RECENT_ACTIVITY`]: that answer is the proof this touch exists to obtain, and DSM's
+    /// `SESSION_RECENT_ACTIVITY`: that answer is the proof this touch exists to obtain, and DSM's
     /// idle timer (minutes) is not what a minute-old session is at risk from. A client that has
     /// made no request yet (a borrowed session, a fresh login that nothing has used) always touches.
     pub fn touch_session(&self) {
@@ -1938,7 +1938,7 @@ impl ApiClient {
     }
 
     /// How long one upload attempt may go without progress, and wait for DSM's answer after its
-    /// last byte (`--timeout`). Not a total deadline any more; see [`UploadBounds`].
+    /// last byte (`--timeout`). Not a total deadline any more; see `UploadBounds`.
     #[must_use]
     pub fn upload_timeout(&self) -> Duration {
         self.upload_timeout
@@ -4690,7 +4690,7 @@ impl ApiClient {
 
     /// Read everything DSM advertises, not merely the ten APIs this tool requires.
     ///
-    /// Deliberately separate from [`Self::discover`]. Discovery feeds `required_spec` and
+    /// Deliberately separate from `Self::discover`. Discovery feeds `required_spec` and
     /// therefore every call this client makes, and its map is decoded all-or-nothing: one
     /// third-party package advertising a malformed entry would break connection establishment
     /// itself. This read decodes entry by entry into an all-optional type instead, so a bad entry
@@ -4929,7 +4929,7 @@ impl ApiClient {
     /// Exercise one advertised, read-only capability and report only how DSM answered.
     ///
     /// The API name, method, and version are compile-time literals from the caller, and the CGI
-    /// path is routed through [`endpoint_url`], which confines it to the configured origin and
+    /// path is routed through `endpoint_url`, which confines it to the configured origin and
     /// `webapi/` prefix. Nothing here can reach an API the caller did not name.
     pub fn probe_capability(&self, spec: CapabilityProbeSpec) -> Result<CapabilityProbe> {
         let session = self.required_session()?;

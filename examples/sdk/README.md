@@ -1,14 +1,21 @@
 # Rust SDK example
 
-Calendar releases identify audited repository snapshots. Until the Rust crate
-adopts a calendar-compatible semantic package version, depend on an exact Git
-tag instead of pretending the package's `0.1.0` version changes on every push:
+Calendar releases identify audited repository snapshots, and each one is published to crates.io
+as crate version `0.YY.N` (release 26.66 is `0.26.66`). Depend on an exact version, because Cargo
+treats every `0.26.x` as compatible:
+
+```toml
+[dependencies]
+synology-drive-sync = "=0.26.66"
+```
+
+To build from an unpublished commit, depend on the Git tag instead:
 
 ```toml
 [dependencies]
 synology-drive-sync = {
   git = "https://github.com/supermarsx/synology-drive-sync",
-  tag = "26.1"
+  tag = "26.66"
 }
 ```
 

@@ -31,9 +31,11 @@ const DEFAULT_MAX_DELETE: usize = 100;
 const MAX_RETRIES: u32 = 5;
 const MAX_JOBS: usize = 16;
 
-/// Product build version embedded by the approved release workflow. This is a
-/// calendar release such as `26.1`; it is intentionally distinct from Cargo's
-/// semantic package version and the C ABI major.
+/// Product build version embedded by the approved release workflow. In an official release binary
+/// this is the calendar release such as `26.66`. A build that does not set `SDSYNC_BUILD_VERSION`,
+/// such as `cargo install synology-drive-sync` from crates.io, reports the Cargo package version
+/// instead, which numbers the same release as `0.26.66`. Either way it is distinct from the C ABI
+/// major.
 pub const fn build_version() -> &'static str {
     env!("SDSYNC_VERSION")
 }

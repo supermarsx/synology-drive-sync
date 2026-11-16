@@ -1,4 +1,130 @@
+//! One-way file deposit to a Synology NAS through the DSM File Station API.
+//!
+//! `synology-drive-sync` scans a readable local folder, compares it with a File Station path on
+//! a NAS, plans the difference, transfers it over HTTPS, verifies the result, logs out and
+//! returns. The source is opened read-only and is never intentionally changed. It is for
+//! machines that cannot (or may not) run Synology Drive Client: it writes through File Station,
+//! not through Drive's private protocol, and Synology Drive can index what it deposited when the
+//! destination is a My Drive or Team Folder path.
+//!
+//! This crate is both the Rust SDK and the `synology-drive-sync` command-line program
+//! (`cargo install synology-drive-sync`). The C ABI for the same engine is the separate
+//! [`synology-drive-sync-ffi`](https://docs.rs/synology-drive-sync-ffi) crate.
+//!
+//! # Quick example
+//!
+//! [`sdk::Engine`] is the supported entry point. It owns the ordering of every step, so a caller
+//! can inspect the immutable plan and decide whether to apply it, but cannot reach a remote
+//! mutation without the scanner and planner having run first. The run below only previews; it
+//! needs a NAS, so it is compiled but not executed.
+//!
+//! ```no_run
+//! use synology_drive_sync::cancel::CancellationToken;
+//! use synology_drive_sync::sdk::{
+//!     Engine, EventControl, OtpChallenge, PlanDecision, Secret, SecretProvider,
+//!     SecretProviderError, SyncRequest,
+//! };
+//!
+//! struct Secrets;
+//!
+//! impl SecretProvider for Secrets {
+//!     fn password(&mut self) -> Result<Secret, SecretProviderError> {
+//!         // Fetch from your own secret store; this crate never reads the environment for you.
+//!         std::env::var("DSM_PASSWORD")
+//!             .map(Secret::new)
+//!             .map_err(|_| SecretProviderError::Unavailable)
+//!     }
+//!
+//!     fn otp(&mut self, _challenge: OtpChallenge) -> Result<Option<Secret>, SecretProviderError> {
+//!         Ok(None) // asked only if DSM demands a second factor
+//!     }
+//! }
+//!
+//! # fn main() -> Result<(), Box<dyn std::error::Error>> {
+//! let request = SyncRequest::builder(
+//!     "https://nas.example.com", // DSM address, or a QuickConnect address
+//!     "deposit-bot",             // a dedicated, non-administrator DSM account
+//!     "./export",                // local source folder
+//!     "/TeamShare/Project",      // File Station path, never /volume1/...
+//! )
+//! .exclude("*.tmp")
+//! .build()?;
+//!
+//! let outcome = Engine.run(
+//!     &request,
+//!     &mut Secrets,
+//!     &CancellationToken::default(),
+//!     |plan| {
+//!         println!("{} planned changes, {} bytes to upload", plan.changes().len(), plan.upload_bytes());
+//!         PlanDecision::PreviewOnly // return PlanDecision::Apply to perform it
+//!     },
+//!     |_event| EventControl::Continue,
+//! )?;
+//! assert!(!outcome.applied());
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! # What the engine promises, and what it does not
+//!
+//! - **Additive by default.** Remote-only entries are kept. Deletion happens only when the
+//!   request carries a positive, bounded [`sdk::DeletionPolicy`].
+//! - **Plan before mutation.** The plan is complete and immutable before the first remote
+//!   change; returning [`sdk::PlanDecision::PreviewOnly`] performs none.
+//! - **Content comparison by default.** A same-path file matches on size and server-side MD5;
+//!   modification time alone never triggers an upload. Uploads are verified.
+//! - **Secrets stay with the caller.** They arrive through [`sdk::SecretProvider`] at the
+//!   authentication boundary, are held in zeroizing buffers, and are redacted from `Debug`.
+//! - **One direction.** An edit made on the NAS is never brought back, and the next local
+//!   change to that path overwrites it.
+//! - **Not a backup.** The current state is sent one way and no history of what it replaced is
+//!   kept. Uploads and guarded deletions are not crash-atomic.
+//! - **Young software.** It has been exercised against few NAS models and DSM builds. Rehearse
+//!   against a disposable destination before pointing it at data you would miss.
+//!
+//! # Platforms
+//!
+//! Linux, macOS and Windows are supported for the SDK and the CLI. The verified-pair index
+//! (`pair_index_redb`) is Unix-only, so the docs.rs build, which runs on Linux, shows a superset
+//! of what a Windows build offers. Operating-system credential stores (Windows Credential
+//! Manager, macOS Keychain, Linux Secret Service) back the CLI's stored passwords.
+//!
+//! # Versions
+//!
+//! Releases are calendar-numbered `YY.N` and published to crates.io as `0.YY.N` (calendar
+//! release 26.66 is crate version 0.26.66). Cargo treats every `0.26.x` as compatible, so pin
+//! an exact version (`synology-drive-sync = "=0.26.66"`) when API stability matters. A binary
+//! built from this crate reports the crate version unless the build sets `SDSYNC_BUILD_VERSION`
+//! (the official release binaries report the calendar number); see [`sdk::build_version`].
+//!
+//! # Feature flags
+//!
+//! There are no default features and the crate documents no feature a normal build should
+//! enable.
+//!
+//! - `fault-inject`: test hooks that make the realtime watcher's directory walk block on
+//!   demand. For this crate's own test suite; never enable it in a release build.
+//!
+//! # Module map
+//!
+//! [`sdk`] is the supported, stable-minded surface. [`api`], [`plan`], [`sync`], [`local`],
+//! [`path`] and the other public modules are the engine's building blocks, used by the CLI and
+//! the DSM package; composing them directly makes the caller responsible for the ordering,
+//! freshness, deletion and logout invariants [`sdk::Engine`] enforces.
+//!
+//! # Trademarks
+//!
+//! Synology, DSM, File Station, QuickConnect and Synology Drive are trademarks of Synology Inc.
+//! This is an independent open-source project; it is not affiliated with, endorsed by or
+//! supported by Synology.
+
 #![forbid(unsafe_code)]
+
+// Every Rust code block in the crates.io readme is compiled as a doctest, so the example that
+// crates.io shows cannot drift from the API.
+#[cfg(doctest)]
+#[doc = include_str!("../crates-io.md")]
+struct CratesIoReadme;
 
 pub mod api;
 pub mod batch;

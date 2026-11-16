@@ -83,7 +83,10 @@ FIXED_INFO = {
     "os_max_ver": DSM_MAXIMUM,
     "displayname": "Synology Drive Sync",
     "description": (
-        "One-way local-folder sync to configurable remote Synology File Station folders"
+        "Push folders from this NAS to a File Station folder on another Synology, one way, "
+        "on a schedule or in real time. Manage profiles, routines, diagnostics and logs from "
+        "a DSM dashboard. Plans every run first and deletes remote files only if you enable "
+        "it. Independent project, not made by Synology."
     ),
     "maintainer": "supermarsx",
     "maintainer_url": "https://github.com/supermarsx/synology-drive-sync",

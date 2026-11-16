@@ -578,6 +578,7 @@ class WorkflowWiringTests(unittest.TestCase):
             "dtolnay/rust-toolchain": "39008827e6b4319a349e9a42dfc90579dd25f1ca",
             "lycheeverse/lychee-action": "e7477775783ea5526144ba13e8db5eec57747ce8",
             "pnpm/action-setup": "73e46992e05b19abd31f2f3c20e0e7370d762115",
+            "rust-lang/crates-io-auth-action": "3268eb413133e2960fa4ae0e963ca76380c54cd9",
             "taiki-e/install-action": "ab49d3c64680143e184118bed66a46419fc15519",
         }
         uses_values = re.findall(
@@ -939,6 +940,63 @@ class WorkflowWiringTests(unittest.TestCase):
         self.assertIn("release-contract.py verify-remote-assets", workflow)
         self.assertGreaterEqual(workflow.count("verify-remote-assets"), 2)
         self.assertIn("name: staged-release-contract", workflow)
+
+    def test_crates_are_published_after_the_release_with_trusted_publishing(self):
+        workflow = (REPOSITORY_ROOT / ".github/workflows/release.yml").read_text(
+            encoding="utf-8"
+        )
+        start = workflow.index("\n  publish-crates:")
+        block = workflow[start:]
+        self.assertLess(workflow.index("\n  publish-release:"), start)
+        self.assertRegex(block, r"needs: \[[^\]]*publish-release[^\]]*\]")
+        self.assertIn("needs.version.outputs.already_published != 'true'", block)
+        self.assertIn("needs.version.outputs.dry_run != 'true'", block)
+        self.assertIn("environment: crates-io", block)
+        self.assertIn("id-token: write", block)
+        self.assertNotIn("contents: write", block)
+        # Trusted Publishing only: the action is pinned by commit and no token secret exists.
+        self.assertRegex(
+            block,
+            r"uses: rust-lang/crates-io-auth-action@[0-9a-f]{40} # v1\.",
+        )
+        self.assertIn("CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}", block)
+        self.assertNotIn("secrets.", block)
+        self.assertNotIn("CARGO_REGISTRY_TOKEN: ${{ secrets", workflow)
+        # The calendar tag is stamped into the checkout before anything is built or uploaded.
+        stamp = block.index('crate-version.py stamp "$TAG"')
+        package = block.index("cargo package --workspace --locked --allow-dirty")
+        auth = block.index("rust-lang/crates-io-auth-action@")
+        upload = block.index('cargo publish -p "$name" --locked --allow-dirty')
+        self.assertLess(stamp, package)
+        self.assertLess(package, auth)
+        self.assertLess(auth, upload)
+        # The root crate goes first, then the index is awaited, then the FFI crate follows; each
+        # crate whose version crates.io already has is skipped rather than failed.
+        self.assertLess(
+            block.index("\n          publish_crate synology-drive-sync\n"),
+            block.index("\n          publish_crate synology-drive-sync-ffi\n"),
+        )
+        self.assertIn('wait_for_index "$name"', block)
+        self.assertIn("https://index.crates.io/", block)
+        self.assertIn('crates.io already has $name $version; skipping its upload', block)
+        self.assertIn("crates.io answered HTTP $status", block)
+        # A failed upload is only forgiven when the registry shows the version.
+        self.assertIn("cargo publish failed and crates.io has no $name $version", block)
+        # The rehearsal for a manual dry run uploads nothing and cannot reach the token action.
+        rehearsal = workflow[
+            workflow.index("\n  verify-crates:") : workflow.index("\n  publish-crates:")
+        ]
+        self.assertIn("needs.version.outputs.dry_run == 'true'", rehearsal)
+        self.assertNotIn("cargo publish", rehearsal.replace("cargo package", ""))
+        self.assertNotIn("id-token", rehearsal)
+
+    def test_ci_packages_both_crates_and_keeps_their_versions_in_step(self):
+        ci = (REPOSITORY_ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8")
+        self.assertIn("python3 .github/scripts/crate-version.py check", ci)
+        self.assertIn("cargo package --workspace --locked\n", ci)
+        self.assertIn("cargo package -p synology-drive-sync-ffi --locked --allow-dirty --list", ci)
+        # A committed version is a floor, so CI must not ask crates.io about it.
+        self.assertNotIn("run: cargo publish", ci)
 
     def test_release_concurrency_isolates_ineligible_workflow_completions(self):
         workflow = (REPOSITORY_ROOT / ".github/workflows/release.yml").read_text(

@@ -2,7 +2,18 @@
 
 ## Add the dependency
 
-Pin the calendar tag that matches the release you verified:
+Every calendar release `YY.N` is also published to [crates.io](https://crates.io/crates/synology-drive-sync)
+as crate version `0.YY.N` (release 26.66 is `0.26.66`; when the year rolls over, 27.1 becomes
+`0.27.1`). Cargo treats every `0.26.x` as compatible, so pin the exact version you verified:
+
+```toml
+[dependencies]
+synology-drive-sync = "=0.YY.N"
+```
+
+`cargo add synology-drive-sync` adds the latest release; the API reference for each version is on
+[docs.rs](https://docs.rs/synology-drive-sync). To build from an unpublished commit instead, pin the
+calendar tag from Git:
 
 ```toml
 [dependencies]
