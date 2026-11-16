@@ -39,20 +39,20 @@ class DsmUiContractTests(unittest.TestCase):
 
         with self.assertRaisesRegex(validate_spk.ValidationError, "workspace must override"):
             validate_spk.validate_ui_dependency_resolution(
-                workspace.replace(b"postcss: 8.5.26", b"postcss: 8.5.17", 1),
+                workspace.replace(b"postcss: 8.5.33", b"postcss: 8.5.17", 1),
                 lockfile,
             )
         with self.assertRaisesRegex(validate_spk.ValidationError, "lockfile must record"):
             validate_spk.validate_ui_dependency_resolution(
                 workspace,
-                lockfile.replace(b"postcss: 8.5.26", b"postcss: 8.5.17", 1),
+                lockfile.replace(b"postcss: 8.5.33", b"postcss: 8.5.17", 1),
             )
         with self.assertRaisesRegex(validate_spk.ValidationError, "resolve every PostCSS"):
             validate_spk.validate_ui_dependency_resolution(
                 workspace,
                 lockfile.replace(
-                    b"  postcss@8.5.26:",
-                    b"  postcss@7.0.39:\n\n  postcss@8.5.26:",
+                    b"  postcss@8.5.33:",
+                    b"  postcss@7.0.39:\n\n  postcss@8.5.33:",
                     1,
                 ),
             )

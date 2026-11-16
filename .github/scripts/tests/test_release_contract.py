@@ -511,12 +511,12 @@ class WorkflowWiringTests(unittest.TestCase):
         lockfile = (
             REPOSITORY_ROOT / "packaging/synology/ui-src/pnpm-lock.yaml"
         ).read_text(encoding="utf-8")
-        override = r"(?m)^overrides:\n  postcss: 8\.5\.26$"
+        override = r"(?m)^overrides:\n  postcss: 8\.5\.33$"
         self.assertRegex(workspace, override)
         self.assertRegex(lockfile, override)
         self.assertEqual(
             set(re.findall(r"(?m)^  postcss@([^:\s]+):$", lockfile)),
-            {"8.5.26"},
+            {"8.5.33"},
         )
 
         dependabot = (REPOSITORY_ROOT / ".github/dependabot.yml").read_text(
@@ -535,13 +535,13 @@ class WorkflowWiringTests(unittest.TestCase):
     def test_release_container_bases_are_current_and_immutable(self):
         dockerfile = (REPOSITORY_ROOT / "Dockerfile").read_text(encoding="utf-8")
         self.assertIn(
-            "FROM rust:1.90-bookworm@sha256:"
-            "3914072ca0c3b8aad871db9169a651ccfce30cf58303e5d6f2db16d1d8a7e58f AS builder",
+            "FROM rust:1.100-bookworm@sha256:"
+            "ade39a710ef85f3506cffcfec3e8a24ba090badef1dff2fb798f71d878833fea AS builder",
             dockerfile,
         )
         self.assertIn(
-            "FROM debian:bookworm-slim@sha256:"
-            "3783cc01769c7b2b1b83a5c5ad96c815348e28ed7da68e2e3687004faa906251 AS runtime",
+            "FROM debian:trixie-slim@sha256:"
+            "a72b4433de1cf7d6bae0c4cee74d0547f58601a643b3375f070c51600d63b6b2 AS runtime",
             dockerfile,
         )
         for instruction in re.findall(r"^FROM\s+([^\s]+)", dockerfile, re.MULTILINE):
@@ -550,10 +550,10 @@ class WorkflowWiringTests(unittest.TestCase):
         notice_generator = (
             REPOSITORY_ROOT / ".github/scripts/generate-third-party-notices.sh"
         ).read_text(encoding="utf-8")
-        self.assertIn("version=0.9.2", notice_generator)
+        self.assertIn("version=0.9.3", notice_generator)
         self.assertIn(
             "archive_sha256="
-            "9099a59e820c38a68b9d65f300662a567d56562f9a10f6aa4c7e86c17c2566af",
+            "3ad1e94ea1e63d69d1961f4fb15ccbbe9575d906111f96d2cb4dce6df48f71b4",
             notice_generator,
         )
 
@@ -573,12 +573,12 @@ class WorkflowWiringTests(unittest.TestCase):
             "actions/deploy-pages": "368f82528645a54fb793d4d04e342629a3f51346",
             "actions/download-artifact": "9000827ccba6bdab643e8b6fd33ac0654aef8333",
             "actions/setup-node": "949feb2413d6458794dcd2491c4babbbce0c15c1",
-            "actions/upload-artifact": "043fb46d1a93c77aae656e7c1c64a875d1fc6a0a",
+            "actions/upload-artifact": "cf430e030ddbb5b0abf93d22962f4752f3646cd9",
             "actions/upload-pages-artifact": "fc324d3547104276b827a68afc52ff2a11cc49c9",
-            "dtolnay/rust-toolchain": "4360b52568e2003a75bf9bc1d59f33a8e3fc893c",
+            "dtolnay/rust-toolchain": "39008827e6b4319a349e9a42dfc90579dd25f1ca",
             "lycheeverse/lychee-action": "e7477775783ea5526144ba13e8db5eec57747ce8",
-            "pnpm/action-setup": "ea17c68df8912ef543352723c149a84f56e3d413",
-            "taiki-e/install-action": "86f7a0ffb25f40114606501a311ebcfaf882ea32",
+            "pnpm/action-setup": "73e46992e05b19abd31f2f3c20e0e7370d762115",
+            "taiki-e/install-action": "ab49d3c64680143e184118bed66a46419fc15519",
         }
         uses_values = re.findall(
             r"^\s*(?:-\s+)?uses:\s+([^#\s]+)(?:\s+#.*)?$",
@@ -598,11 +598,11 @@ class WorkflowWiringTests(unittest.TestCase):
 
         self.assertEqual(
             re.findall(r"^\s*node-version:\s*([^#\s]+)", workflows, re.MULTILINE),
-            ["24.20.0"] * 4,
+            ["26.13.1"] * 4,
         )
         self.assertNotIn("mlugg/setup-zig", workflows)
         self.assertNotIn("ACTIONS_ALLOW_USE_UNSECURE_NODE_VERSION", workflows)
-        self.assertEqual(workflows.count("tool: cargo-zigbuild@0.23.3"), 3)
+        self.assertEqual(workflows.count("tool: cargo-zigbuild@0.24.1"), 3)
 
         runner_labels = set(
             re.findall(r"^\s*(?:runs-on:|- runner:)\s+([^$\s][^\s]*)\s*$", workflows, re.MULTILINE)
@@ -746,15 +746,15 @@ class WorkflowWiringTests(unittest.TestCase):
         }
         zig_installer = "run: bash .github/scripts/install-zig.sh"
         installer_action = (
-            "taiki-e/install-action@86f7a0ffb25f40114606501a311ebcfaf882ea32"
+            "taiki-e/install-action@ab49d3c64680143e184118bed66a46419fc15519"
         )
         qemu_image = (
             "docker.io/tonistiigi/binfmt:qemu-v10.2.3@sha256:"
             "400a4873b838d1b89194d982c45e5fb3cda4593fbfd7e08a02e76b03b21166f0"
         )
         alpine_image = (
-            "docker.io/library/alpine:3.24.1@sha256:"
-            "28bd5fe8b56d1bd048e5babf5b10710ebe0bae67db86916198a6eec434943f8b"
+            "docker.io/library/alpine:3.24.4@sha256:"
+            "f59abe656b692d901e184be3445e084786602108599d2a51d229c0f5a48c71bf"
         )
 
         for section in sections:
@@ -766,7 +766,7 @@ class WorkflowWiringTests(unittest.TestCase):
             self.assertIn(zig_installer, section)
             self.assertNotIn("setup-zig", section)
             self.assertIn(installer_action, section)
-            self.assertIn("tool: cargo-zigbuild@0.23.3", section)
+            self.assertIn("tool: cargo-zigbuild@0.24.1", section)
             self.assertIn(qemu_image, section)
             self.assertIn(alpine_image, section)
             self.assertIn("qemu_binary: qemu-i386", section)
@@ -807,6 +807,24 @@ class WorkflowWiringTests(unittest.TestCase):
             self.assertNotIn("Status: 401 Unauthorized", section)
             self.assertIn("Version5 EABI", section)
             self.assertIn("hard-float ABI", section)
+            # Every armv7 instruction is read, after the last step that uses the binaries,
+            # since the instruction check relinks them.
+            self.assertIn("components: llvm-tools", section)
+            guard = 'bash .github/scripts/check-armv7-fpu.sh "$RUST_TARGET"'
+            self.assertEqual(section.count(guard), 1)
+            guard_step = section[
+                section.index(
+                    "- name: Refuse D16-D31 and NEON instructions in the armv7 binaries"
+                ) : section.index(guard)
+            ]
+            self.assertIn("if: matrix.synology_arch == 'armv7'", guard_step)
+            self.assertLess(
+                section.index("- name: Assemble and validate installable SPK"),
+                section.index(guard),
+            )
+            self.assertLess(
+                section.index("--test pair_index_codegen"), section.index(guard)
+            )
             self.assertIn("elf_class: ELF32", section)
             self.assertNotIn("armv5", section.lower())
             self.assertNotIn("powerpc", section.lower())
@@ -818,15 +836,54 @@ class WorkflowWiringTests(unittest.TestCase):
         zig_script = (REPOSITORY_ROOT / ".github/scripts/install-zig.sh").read_text(
             encoding="utf-8"
         )
-        self.assertIn('readonly zig_version="0.16.0"', zig_script)
+        self.assertIn('readonly zig_version="0.17.1"', zig_script)
         self.assertIn(
-            "70e49664a74374b48b51e6f3fdfbf437f6395d42509050588bd49abe52ba3d00",
+            "3581863e3cbcfd0fce0efc682ce7e9e93da96668a977791d356a26d2a7e9b17a",
             zig_script,
         )
         self.assertIn(
-            "ea4b09bfb22ec6f6c6ceac57ab63efb6b46e17ab08d21f69f3a48b38e1534f17",
+            "a1546d5646eb184437918d6635ca6b762a0e889eac09cef720ee7a1ed3fe7795",
             zig_script,
         )
+
+    def test_pinned_rust_toolchain_is_the_msrv_everywhere(self):
+        manifest = tomllib.loads(
+            (REPOSITORY_ROOT / "Cargo.toml").read_text(encoding="utf-8")
+        )
+        msrv = manifest["package"]["rust-version"]
+        ffi_manifest = tomllib.loads(
+            (
+                REPOSITORY_ROOT / "crates/synology-drive-sync-ffi/Cargo.toml"
+            ).read_text(encoding="utf-8")
+        )
+        self.assertEqual(ffi_manifest["package"]["rust-version"], msrv)
+        toolchain = f"{msrv}.0"
+        for workflow in ("ci.yml", "docs.yml", "release.yml"):
+            text = (REPOSITORY_ROOT / ".github/workflows" / workflow).read_text(
+                encoding="utf-8"
+            )
+            pins = re.findall(r"^\s+toolchain: (\S+)$", text, re.MULTILINE)
+            self.assertTrue(pins, workflow)
+            self.assertEqual(set(pins), {toolchain}, workflow)
+        ci = (REPOSITORY_ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8")
+        self.assertIn(f"- name: Rust {msrv} compatibility", ci)
+        # The test matrix keeps following the moving stable toolchain.
+        test_job = ci[ci.index("\n  test:") : ci.index("\n  coverage:")]
+        self.assertNotIn("toolchain:", test_job)
+        dockerfile = (REPOSITORY_ROOT / "Dockerfile").read_text(encoding="utf-8")
+        self.assertIn(f"FROM rust:{msrv}-bookworm@sha256:", dockerfile)
+        coverage_env = (REPOSITORY_ROOT / ".config/coverage.env").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn(f"RUST_TOOLCHAIN={toolchain}\n", coverage_env)
+        for document in (
+            "docs/installation.md",
+            "docs/dsm/package-development.md",
+        ):
+            text = (REPOSITORY_ROOT / document).read_text(encoding="utf-8")
+            self.assertIn(f"Rust {msrv} or newer", text, document)
+        readme = (REPOSITORY_ROOT / "readme.md").read_text(encoding="utf-8")
+        self.assertIn(f"rust-{msrv}%2B", readme)
 
     def test_ui_computed_browser_gate_is_authoritative_once(self):
         ci = (REPOSITORY_ROOT / ".github/workflows/ci.yml").read_text(
@@ -1022,7 +1079,7 @@ class WorkflowWiringTests(unittest.TestCase):
         )
         self.assertIn('macos_deployment_target: "10.12"', workflow)
         self.assertIn('macos_deployment_target: "11.0"', workflow)
-        self.assertEqual(workflow.count("tool: cargo-zigbuild@0.23.3"), 2)
+        self.assertEqual(workflow.count("tool: cargo-zigbuild@0.24.1"), 2)
         self.assertIn("name: Verify emitted macOS deployment floors", workflow)
         self.assertIn('build_metadata=$(xcrun vtool -show-build "$artifact")', workflow)
         self.assertIn('[[ "$minos" == "$MACOS_DEPLOYMENT_TARGET" ]]', workflow)
@@ -1090,8 +1147,8 @@ class WorkflowWiringTests(unittest.TestCase):
         self.assertEqual(
             coverage_env.splitlines(),
             [
-                "RUST_TOOLCHAIN=1.90.0",
-                "CARGO_LLVM_COV_VERSION=0.9.0",
+                "RUST_TOOLCHAIN=1.100.0",
+                "CARGO_LLVM_COV_VERSION=0.9.1",
                 "COVERAGE_MIN_LINES=90",
                 "COVERAGE_DSM_MIN_LINES=74",
             ],

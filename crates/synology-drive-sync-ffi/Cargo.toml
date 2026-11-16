@@ -2,7 +2,7 @@
 name = "synology-drive-sync-ffi"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.90"
+rust-version = "1.100"
 description = "Stable C ABI for the synology-drive-sync synchronous SDK"
 license = "MIT"
 repository = "https://github.com/supermarsx/synology-drive-sync"
@@ -14,9 +14,9 @@ crate-type = ["rlib", "cdylib"]
 
 [dependencies]
 serde = { version = "1.0.229", features = ["derive"] }
-serde_json = "1.0.151"
+serde_json = "1.0.154"
 synology-drive-sync = { path = "../.." }
-zeroize = "1.9.0"
+zeroize = "1.9.1"
 
 [dev-dependencies]
 md-5 = { version = "0.11.0", default-features = false }

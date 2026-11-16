@@ -274,9 +274,9 @@ jobs:
         with:
           ref: ${{ needs.version.outputs.sha }}
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable (2026-08-05)
+      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable (2026-11-15)
         with:
-          toolchain: 1.90.0
+          toolchain: 1.100.0
           targets: ${{ matrix.target }}
       - name: Install pinned Zig linker for the Linux ABI baseline
         if: matrix.platform == 'linux'
@@ -284,9 +284,9 @@ jobs:
         run: bash .github/scripts/install-zig.sh
       - name: Install pinned cargo-zigbuild for the Linux ABI baseline
         if: matrix.platform == 'linux'
-        uses: taiki-e/install-action@86f7a0ffb25f40114606501a311ebcfaf882ea32 # v2.88.0
+        uses: taiki-e/install-action@ab49d3c64680143e184118bed66a46419fc15519 # v2.90.5
         with:
-          tool: cargo-zigbuild@0.23.3
+          tool: cargo-zigbuild@0.24.1
       - name: Build native release binary
         shell: bash
         env:
@@ -508,7 +508,7 @@ jobs:
           fi
           install -m 0755 "$library" "$sdk_package/lib/$(basename -- "$library")"
           tar -czf "$sdk_root.tar.gz" -C package "$sdk_root"
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: release-${{ matrix.platform }}-${{ matrix.architecture }}
           path: |
@@ -540,9 +540,9 @@ jobs:
         with:
           ref: ${{ needs.version.outputs.sha }}
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable (2026-08-05)
+      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable (2026-11-15)
         with:
-          toolchain: 1.90.0
+          toolchain: 1.100.0
           targets: ${{ matrix.target }}
       - name: Build native release binary
         env:
@@ -708,7 +708,7 @@ jobs:
           }
           Copy-Item -LiteralPath $generatedImportLibrary -Destination (Join-Path $libraryRoot 'sdsync.lib')
           Compress-Archive -Path $sdkPackage -DestinationPath "$sdkRoot.zip"
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: release-windows-${{ matrix.architecture }}
           path: |
@@ -772,9 +772,9 @@ jobs:
           persist-credentials: false
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
-          node-version: 24.20.0
+          node-version: 26.13.1
           package-manager-cache: false
-      - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+      - uses: pnpm/action-setup@73e46992e05b19abd31f2f3c20e0e7370d762115 # v6.1.1
         with:
           package_json_file: packaging/synology/ui-src/package.json
       - name: Build native DSM AppWindow assets
@@ -786,19 +786,20 @@ jobs:
           pnpm test
           pnpm run build
           git diff --exit-code -- dist
-      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable (2026-08-05)
+      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable (2026-11-15)
         with:
-          toolchain: 1.90.0
+          toolchain: 1.100.0
           targets: ${{ matrix.rust_target }}
+          components: llvm-tools
       - name: Install pinned Zig cross-linker
         if: matrix.cross_compile == true
         shell: bash
         run: bash .github/scripts/install-zig.sh
       - name: Install pinned cargo-zigbuild
         if: matrix.cross_compile == true
-        uses: taiki-e/install-action@86f7a0ffb25f40114606501a311ebcfaf882ea32 # v2.88.0
+        uses: taiki-e/install-action@ab49d3c64680143e184118bed66a46419fc15519 # v2.90.5
         with:
-          tool: cargo-zigbuild@0.23.3
+          tool: cargo-zigbuild@0.24.1
       - name: Extract pinned QEMU user emulator
         if: matrix.cross_compile == true
         env:
@@ -978,11 +979,25 @@ jobs:
             --api-binary "$api_binary" \
             --arch "$SYNOLOGY_ARCH" \
             "$spk"
+      - name: Refuse D16-D31 and NEON instructions in the armv7 binaries
+        if: matrix.synology_arch == 'armv7'
+        shell: bash
+        env:
+          RUST_TARGET: ${{ matrix.rust_target }}
+          SDSYNC_BUILD_VERSION: ${{ needs.version.outputs.tag }}
+        run: |
+          set -euo pipefail
+          # D16-only armv7 cores without NEON (Armada 370 and its kin) have no d16-d31 and no
+          # Advanced SIMD. rustc 1.99.1 emitted both throughout std and our code while the smoke
+          # above still passed, because none of its paths reached a float. This reads every
+          # instruction; only ring's NEON assembly, which runs after a run-time check, may hold
+          # one. It relinks the binaries, so it runs after every step that uses them.
+          bash .github/scripts/check-armv7-fpu.sh "$RUST_TARGET"
       - name: Exercise real DSM supervisor lifecycle under BusyBox
         if: matrix.synology_arch == 'x86_64'
         shell: bash
         env:
-          ALPINE_IMAGE: docker.io/library/alpine:3.24.1@sha256:28bd5fe8b56d1bd048e5babf5b10710ebe0bae67db86916198a6eec434943f8b
+          ALPINE_IMAGE: docker.io/library/alpine:3.24.4@sha256:f59abe656b692d901e184be3445e084786602108599d2a51d229c0f5a48c71bf
           TAG: ${{ needs.version.outputs.tag }}
         run: >-
           docker run --rm --network none --platform linux/amd64
@@ -990,7 +1005,7 @@ jobs:
           "$ALPINE_IMAGE"
           /bin/sh /workspace/packaging/synology/test_real_supervisor.sh
           "/workspace/dist/synology-drive-sync-$TAG-x86_64.spk"
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: release-synology-${{ matrix.synology_arch }}
           path: dist/synology-drive-sync-${{ needs.version.outputs.tag }}-${{ matrix.synology_arch }}.spk
@@ -1010,9 +1025,9 @@ jobs:
         with:
           ref: ${{ needs.version.outputs.sha }}
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable (2026-08-05)
+      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable (2026-11-15)
         with:
-          toolchain: 1.90.0
+          toolchain: 1.100.0
       - name: Validate the Rust SDK package
         run: cargo package -p synology-drive-sync --locked
       - name: Generate CycloneDX JSON
@@ -1147,7 +1162,7 @@ jobs:
             --input-format json \
             --input-version v1_5 \
             --fail-on-errors
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: release-sbom
           path: synology-drive-sync-${{ needs.version.outputs.tag }}.cdx.json
@@ -1259,7 +1274,7 @@ jobs:
             echo "image binary version did not exactly match $expected: $reported" >&2
             exit 1
           }
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: needs.version.outputs.dry_run != 'true'
         with:
           # Matrix legs share one `outputs:` block and would clobber each other,
@@ -1630,7 +1645,7 @@ jobs:
             --input "$remote_index" \
             --tag "$TAG" \
             --directory dist
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: needs.version.outputs.dry_run != 'true'
         with:
           name: staged-release-contract
@@ -1646,7 +1661,7 @@ jobs:
           mkdir -p dry-run
           cp -r dist dry-run/assets
           cp -- "$RUNNER_TEMP/sdsync-release-notes.md" dry-run/RELEASE_NOTES.md
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: needs.version.outputs.dry_run == 'true'
         with:
           # The dry run publishes nothing, so the exact asset set it would have

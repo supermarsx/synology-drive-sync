@@ -1878,7 +1878,7 @@ const ABOUT_RUST_DEPENDENCIES = Object.freeze([
   { name: "clap", pin: "4.6.7", scope: "All platforms", url: "https://crates.io/crates/clap" },
   { name: "clap_complete", pin: "4.6.11", scope: "All platforms", url: "https://crates.io/crates/clap_complete" },
   { name: "clap_mangen", pin: "0.3.3", scope: "All platforms", url: "https://crates.io/crates/clap_mangen" },
-  { name: "crc32fast", pin: "1.5.3", scope: "All platforms", url: "https://crates.io/crates/crc32fast" },
+  { name: "crc32fast", pin: "1.5.5", scope: "All platforms", url: "https://crates.io/crates/crc32fast" },
   { name: "ctrlc", pin: "3.5.2", scope: "All platforms", url: "https://crates.io/crates/ctrlc" },
   { name: "http-body", pin: "1.1.0", scope: "All platforms", url: "https://crates.io/crates/http-body" },
   { name: "icu_normalizer", pin: "2.4.0", scope: "All platforms", url: "https://crates.io/crates/icu_normalizer" },
@@ -1888,14 +1888,14 @@ const ABOUT_RUST_DEPENDENCIES = Object.freeze([
   { name: "hmac", pin: "0.13.0", scope: "All platforms", url: "https://crates.io/crates/hmac" },
   { name: "reqwest", pin: "0.13.5", scope: "All platforms", url: "https://crates.io/crates/reqwest" },
   { name: "rustls", pin: "0.23.46", scope: "All platforms", url: "https://crates.io/crates/rustls" },
-  { name: "rpassword", pin: "7.5.4", scope: "All platforms", url: "https://crates.io/crates/rpassword" },
+  { name: "rpassword", pin: "7.5.5", scope: "All platforms", url: "https://crates.io/crates/rpassword" },
   { name: "serde", pin: "1.0.229", scope: "All platforms", url: "https://crates.io/crates/serde" },
   { name: "serde_json", pin: "1.0.154", scope: "All platforms", url: "https://crates.io/crates/serde_json" },
   { name: "sha2", pin: "0.11.1", scope: "All platforms", url: "https://crates.io/crates/sha2" },
   { name: "subtle", pin: "2.6.1", scope: "All platforms", url: "https://crates.io/crates/subtle" },
   { name: "thiserror", pin: "2.0.21", scope: "All platforms", url: "https://crates.io/crates/thiserror" },
   { name: "tokio", pin: "1.54.1", scope: "All platforms", url: "https://crates.io/crates/tokio" },
-  { name: "toml", pin: "1.1.8+spec-1.1.0", scope: "All platforms", url: "https://crates.io/crates/toml" },
+  { name: "toml", pin: "1.2.1+spec-1.1.0", scope: "All platforms", url: "https://crates.io/crates/toml" },
   { name: "totp-rs", pin: "6.0.0", scope: "All platforms", url: "https://crates.io/crates/totp-rs" },
   { name: "zeroize", pin: "1.9.1", scope: "All platforms", url: "https://crates.io/crates/zeroize" },
   { name: "windows-native-keyring-store", pin: "1.1.0", scope: "Windows", url: "https://crates.io/crates/windows-native-keyring-store" },
@@ -1903,10 +1903,10 @@ const ABOUT_RUST_DEPENDENCIES = Object.freeze([
   { name: "libc", pin: "0.2.191", scope: "Linux", url: "https://crates.io/crates/libc" },
   { name: "nix", pin: "0.31.3", scope: "Linux", url: "https://crates.io/crates/nix" },
   { name: "zbus-secret-service-keyring-store", pin: "1.0.1", scope: "Linux", url: "https://crates.io/crates/zbus-secret-service-keyring-store" },
-  { name: "redb", pin: "4.4.0", scope: "Linux and macOS", url: "https://crates.io/crates/redb" }
+  { name: "redb", pin: "4.6.0", scope: "Linux and macOS", url: "https://crates.io/crates/redb" }
 ]);
 const ABOUT_UI_DEPENDENCIES = Object.freeze([
-  { name: "@babel/core", pin: "8.0.9", scope: "devDependency", url: "https://www.npmjs.com/package/@babel/core" },
+  { name: "@babel/core", pin: "8.1.2", scope: "devDependency", url: "https://www.npmjs.com/package/@babel/core" },
   { name: "@babel/preset-env", pin: "8.0.7", scope: "devDependency", url: "https://www.npmjs.com/package/@babel/preset-env" },
   { name: "babel-loader", pin: "10.1.1", scope: "devDependency", url: "https://www.npmjs.com/package/babel-loader" },
   { name: "css-loader", pin: "7.1.5", scope: "devDependency", url: "https://www.npmjs.com/package/css-loader" },
@@ -1915,8 +1915,8 @@ const ABOUT_UI_DEPENDENCIES = Object.freeze([
   { name: "vue-loader", pin: "15.11.1", scope: "devDependency", url: "https://www.npmjs.com/package/vue-loader" },
   { name: "vue-template-compiler", pin: "2.7.16", scope: "devDependency", url: "https://www.npmjs.com/package/vue-template-compiler" },
   { name: "webpack", pin: "5.112.2", scope: "devDependency", url: "https://www.npmjs.com/package/webpack" },
-  { name: "webpack-cli", pin: "7.2.3", scope: "devDependency", url: "https://www.npmjs.com/package/webpack-cli" },
-  { name: "pnpm", pin: "pnpm@11.25.0", scope: "packageManager", url: "https://pnpm.io/" }
+  { name: "webpack-cli", pin: "7.3.1", scope: "devDependency", url: "https://www.npmjs.com/package/webpack-cli" },
+  { name: "pnpm", pin: "pnpm@12.21.0", scope: "packageManager", url: "https://pnpm.io/" }
 ]);
 const CONTROL_HELP = Object.freeze({
   "profile-filter": "Search configured profiles by name, local source, File Station URL, DSM account, or destination path.",

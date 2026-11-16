@@ -113,7 +113,7 @@ dedicated CI packaging gate also rebuilds twice and compares bundle hashes for d
 
 ## Native x86-64 example
 
-Build both binaries with Rust 1.90 or newer and a matching musl linker:
+Build both binaries with Rust 1.100 or newer and a matching musl linker:
 
 ```bash
 rustup target add x86_64-unknown-linux-musl
@@ -141,15 +141,15 @@ copying a path blindly.
 
 ## ARMv7 cross-build example
 
-The supported release/local cross-build path uses Rust 1.90.0, Zig 0.16.0, and
-`cargo-zigbuild` 0.23.3:
+The supported release/local cross-build path uses Rust 1.100.0, Zig 0.17.1, and
+`cargo-zigbuild` 0.24.1:
 
 ```bash
-rustup toolchain install 1.90.0 --profile minimal \
+rustup toolchain install 1.100.0 --profile minimal \
   --target armv7-unknown-linux-musleabihf
-cargo install --locked cargo-zigbuild --version 0.23.3
+cargo install --locked cargo-zigbuild --version 0.24.1
 
-cargo +1.90.0 zigbuild \
+cargo +1.100.0 zigbuild \
   --release --locked \
   --package synology-drive-sync \
   --bins \
@@ -166,6 +166,13 @@ bash packaging/synology/build-spk.sh \
 Do not use plain `cargo build` on an x86 host without a compatible ARM musl cross-linker. Release CI
 also executes both resulting target binaries under the pinned architecture emulator before accepting
 the SPK; static archive validation alone is not an execution proof.
+
+The armv7 package must run on CPUs with VFPv3-D16 and no NEON, such as the Armada 370. Rust 1.99
+built armv7 code, standard library included, that uses the VFP registers d16-d31, which those CPUs
+do not have, so do not build armv7 with it. An emulator run only reaches the code it executes, so
+CI also reads every instruction of the armv7 binaries after the release build:
+`bash .github/scripts/check-armv7-fpu.sh armv7-unknown-linux-musleabihf` (it needs the `llvm-tools`
+component). Only ring's NEON assembly, which ring selects at run time, may use those registers.
 
 Use `cargo zigbuild --bins` with the corresponding target for `i686`; use a native matching musl
 toolchain or reviewed cross-toolchain for ARM64.

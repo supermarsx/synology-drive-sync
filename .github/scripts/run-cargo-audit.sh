@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-version=0.22.2
+version=0.23.0
 target=x86_64-unknown-linux-gnu
 archive_name="cargo-audit-$target-v$version.tgz"
 package_name="cargo-audit-$target-v$version"
-archive_sha256=ab28a1bdb54db4d5d8ad5981cf1f959410370b3d28250dbd35f6a44248620e39
+archive_sha256=b77993532b253fcbf550996d7716465ec3d734d4e74e7f87bfb65a19add0fb59
 download_url="https://github.com/rustsec/rustsec/releases/download/cargo-audit/v$version/$archive_name"
 
 temporary_root=$(mktemp -d "${TMPDIR:-/tmp}/sdsync-cargo-audit.XXXXXXXX")
@@ -47,6 +47,6 @@ chmod 0755 "$tool"
 # -0372 (zvariant_derive) are "unmaintained" notices, not vulnerabilities. The crates are
 # Linux-only and transitive via zbus-secret-service-keyring-store 1.0.1 -> secret-service
 # 5.2.0 -> zbus 5.19; no released maintained path exists: zbus 6 needs Rust 1.89, which the
-# 1.90 MSRV now meets, but the keyring store still pins zbus 5. Revisit when the store moves to
+# MSRV (now 1.100) meets, but the keyring store still pins zbus 5. Revisit when the store moves to
 # zbus 6, then drop these.
 "$tool" audit --file Cargo.lock --deny warnings --color never     --ignore RUSTSEC-2026-0370 --ignore RUSTSEC-2026-0371 --ignore RUSTSEC-2026-0372

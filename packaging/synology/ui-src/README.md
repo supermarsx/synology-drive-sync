@@ -18,7 +18,7 @@ pnpm build
 ```
 
 `pnpm-workspace.yaml` forces every build-tool consumer, including Vue Loader
-15's legacy component compiler helper, onto the audited PostCSS 8.5.26 release.
+15's legacy component compiler helper, onto the audited PostCSS 8.5.33 release.
 The high-severity audit gate must remain clean. The registry still reports one
 low Vue 2 advisory and one moderate `vue-template-compiler` advisory with no
 Vue 2 patch; both packages are build-time-only here, source input is restricted

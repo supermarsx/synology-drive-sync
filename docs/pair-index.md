@@ -142,7 +142,7 @@ The index is a cache: deleting the directory is always safe and only costs one f
 
 ## Where it lives
 
-One file per profile, `DIR/<profile>.redb` (redb 4.4), mode 0600, in a 0700 directory claimed by a
+One file per profile, `DIR/<profile>.redb` (redb 4.6), mode 0600, in a 0700 directory claimed by a
 `.sdsync-pair-index` marker. A profile name longer than 64 characters cannot be a file name here,
 so its files are named by the first 48 characters, a hyphen and the first 16 hex digits of the
 name's SHA-256 (`printf '%s' "$name" | sha256sum | cut -c1-16`): `DIR/<first 48>-<hash>.redb`.
@@ -155,7 +155,7 @@ time, and the same redb header, which every commit by any writer rewrites. Anyth
 verified again. This keeps one full read of the file per run instead of four or five. An
 interrupted write leaves the last complete commit.
 
-redb 4.4 can panic while it opens a file with a damaged allocator-state page, before any check
+redb (4.4 through 4.6) can panic while it opens a file with a damaged allocator-state page, before any check
 can run; a release build stops there. A panic inside redb on an index file is recorded beside it
 as `<profile>.redb.panicked`, and the next run sets the file aside instead of opening it, so one
 crashed run heals the index. Only a panic raised in redb's own sources is recorded (the hook reads
