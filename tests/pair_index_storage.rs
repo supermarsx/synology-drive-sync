@@ -176,7 +176,24 @@ fn pairs_round_trip_through_a_real_file_and_the_directory_is_claimed() {
 /// What one damaged file must give: a named condition and a usable empty index, or a clean read
 /// of exactly what was written. Never a panic, never a partial or wrong read.
 fn assert_survives(dir: &Dir, case: &str) {
-    let opened = RedbPairIndex::open(paths(dir), 8);
+    // redb can panic inside its open on some damage to its saved allocator state, before any
+    // check can run, and a release build aborts there (see
+    // `a_panic_inside_redb_is_recorded_and_the_next_open_heals`). Since redb 4.6 starts a file at
+    // 72 KiB instead of about 1 MiB, more of the pages a sweep hits hold that state. Such an open
+    // must leave the panic record, so the next one retires the file instead of panicking again.
+    let record_path = dir.0.join("photos.redb.panicked");
+    let opened = match std::panic::catch_unwind(|| RedbPairIndex::open(paths(dir), 8)) {
+        Ok(opened) => opened,
+        Err(_) => {
+            assert!(record_path.is_file(), "{case}: the panic was recorded");
+            let opened = RedbPairIndex::open(paths(dir), 8);
+            assert!(
+                !record_path.exists(),
+                "{case}: the record goes with the file"
+            );
+            opened
+        }
+    };
     let codes: Vec<&str> = opened.issues.iter().map(|issue| issue.code).collect();
     let mut backend = opened
         .backend
