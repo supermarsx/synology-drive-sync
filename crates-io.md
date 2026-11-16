@@ -36,6 +36,9 @@ The command-line program:
 cargo install synology-drive-sync
 ```
 
+`cargo install` also installs `sdsync-dsm-api`, the helper the DSM package runs on a NAS; on a
+workstation you only need `synology-drive-sync`.
+
 The Rust SDK, as a library dependency:
 
 ```bash

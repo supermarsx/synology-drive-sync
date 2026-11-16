@@ -85,9 +85,9 @@
 //! # Platforms
 //!
 //! Linux, macOS and Windows are supported for the SDK and the CLI. The verified-pair index
-//! (`pair_index_redb`) and the DSM package integration are Unix-only; the docs.rs build shows
-//! the Linux surface. Operating-system credential stores (Windows Credential Manager, macOS
-//! Keychain, Linux Secret Service) back the CLI's stored passwords.
+//! (`pair_index_redb`) is Unix-only, so the docs.rs build, which runs on Linux, shows a superset
+//! of what a Windows build offers. Operating-system credential stores (Windows Credential
+//! Manager, macOS Keychain, Linux Secret Service) back the CLI's stored passwords.
 //!
 //! # Versions
 //!
