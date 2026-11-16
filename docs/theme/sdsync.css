@@ -411,7 +411,142 @@ code {
     background: var(--table-alternate-bg, #0d1117);
 }
 
+/* Model combobox: ARIA 1.2 combobox + listbox, sized for touch. */
+
+.model-combobox {
+    position: relative;
+}
+
+.selector-field input.model-input {
+    padding-right: 0.9em;
+}
+
+.model-listbox {
+    position: absolute;
+    z-index: 30;
+    top: 100%;
+    right: 0;
+    left: 0;
+    box-sizing: border-box;
+    max-height: min(22rem, 60vh);
+    margin: 4px 0 0;
+    padding: 4px;
+    overflow-y: auto;
+    border: 1px solid var(--selector-accent);
+    border-radius: 8px;
+    background: var(--selector-surface-raised);
+    box-shadow: 0 12px 32px rgba(0, 0, 0, 0.35);
+    list-style: none;
+    overscroll-behavior: contain;
+}
+
+.model-listbox[hidden] {
+    display: none;
+}
+
+.model-option {
+    display: block;
+    min-height: 44px;
+    box-sizing: border-box;
+    padding: 6px 10px;
+    border-radius: 6px;
+    cursor: pointer;
+    line-height: 1.35;
+}
+
+.model-option:hover,
+.model-option[data-active="true"] {
+    background: var(--theme-hover);
+}
+
+.model-option[data-active="true"] {
+    outline: 2px solid var(--selector-accent);
+    outline-offset: -2px;
+}
+
+.model-option-name,
+.model-option-meta {
+    display: block;
+}
+
+.model-option-name {
+    color: var(--fg);
+    font-weight: 700;
+}
+
+.model-option-meta {
+    color: var(--sidebar-fg);
+    font-size: 0.85em;
+    overflow-wrap: anywhere;
+}
+
+.model-option-unknown {
+    margin-top: 4px;
+    border-top: 1px solid var(--selector-border);
+    border-radius: 0 0 6px 6px;
+}
+
+.model-option-note {
+    padding: 8px 10px;
+    color: var(--sidebar-fg);
+    font-size: 0.85em;
+}
+
+.arch-row {
+    display: flex;
+    align-items: stretch;
+    gap: 8px;
+}
+
+.arch-row input {
+    flex: 1 1 auto;
+    min-width: 0;
+}
+
+.arch-row input[readonly] {
+    border-style: dashed;
+}
+
+.selector-secondary {
+    flex: 0 0 auto;
+    min-height: 44px;
+    padding: 0 14px;
+    border: 1px solid var(--selector-accent);
+    border-radius: 5px;
+    background: transparent;
+    color: var(--selector-accent);
+    font: inherit;
+    font-weight: 700;
+    cursor: pointer;
+}
+
+.selector-secondary:hover {
+    background: var(--theme-hover);
+}
+
+.selector-secondary[hidden] {
+    display: none;
+}
+
+.selector-visually-hidden,
+.selector-field small.selector-visually-hidden {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    min-height: 0;
+    margin: -1px;
+    padding: 0;
+    overflow: hidden;
+    clip: rect(0, 0, 0, 0);
+    white-space: nowrap;
+    border: 0;
+}
+
 @media (max-width: 720px) {
+    .model-listbox {
+        max-height: 50vh;
+    }
+
     .doc-grid,
     .contract-strip,
     .selector-grid,

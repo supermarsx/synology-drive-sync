@@ -45,12 +45,16 @@ function resolve(overrides) {
 function createFakeElement(tagName) {
     return {
         tagName: String(tagName).toUpperCase(),
+        id: "",
+        className: "",
         attributes: new Map(),
         children: [],
         dataset: {},
         disabled: false,
+        focused: false,
         hidden: false,
         listeners: new Map(),
+        readOnly: false,
         textContent: "",
         value: "",
         addEventListener(type, listener) {
@@ -67,53 +71,98 @@ function createFakeElement(tagName) {
                 }
             }
         },
-        dispatch(type) {
-            for (const listener of this.listeners.get(type) || []) {
-                listener({ preventDefault() {} });
-            }
+        closest(selectorText) {
+            return selectorText === "[role=option]" && this.attributes.get("role") === "option"
+                ? this
+                : null;
         },
-        focus() {},
+        dispatch(type, properties) {
+            const event = {
+                defaultPrevented: false,
+                preventDefault() {
+                    event.defaultPrevented = true;
+                },
+                results: [],
+                ...(properties || {}),
+            };
+
+            for (const listener of this.listeners.get(type) || []) {
+                event.results.push(listener(event));
+            }
+            return event;
+        },
+        focus() {
+            this.focused = true;
+        },
+        getAttribute(name) {
+            return this.attributes.has(name) ? this.attributes.get(name) : null;
+        },
         querySelector() {
             return null;
         },
         querySelectorAll() {
             return [];
         },
+        removeAttribute(name) {
+            this.attributes.delete(name);
+        },
         replaceChildren(...children) {
             this.children = children;
         },
+        scrollIntoView() {},
         setAttribute(name, value) {
             this.attributes.set(name, String(value));
         },
     };
 }
 
+function elementText(element) {
+    return [element.textContent, ...(element.children || []).map(elementText)].join(" ");
+}
+
 function createSelectorDomHarness() {
-    const purpose = createFakeElement("select");
-    const modelSelect = createFakeElement("select");
-    const modelCount = createFakeElement("span");
-    const modelFact = createFakeElement("small");
-    const status = createFakeElement("span");
-    const result = createFakeElement("section");
-    const dsmFields = createFakeElement("fieldset");
-    const desktopFields = createFakeElement("fieldset");
-    const form = createFakeElement("form");
-    const container = createFakeElement("div");
-    const placeholder = createFakeElement("option");
-    const unknown = createFakeElement("option");
-
-    purpose.value = "dsm-spk";
-    placeholder.value = "";
-    placeholder.textContent = "Choose an exact Synology model";
-    unknown.value = "__unknown__";
-    unknown.textContent = "My model is not listed — manual review / no SPK";
-    modelSelect.append(placeholder, unknown);
-
+    const names = [
+        "purpose",
+        "modelInput",
+        "modelValue",
+        "listbox",
+        "modelResults",
+        "modelCount",
+        "modelFact",
+        "osVersion",
+        "osAuto",
+        "dsmVersion",
+        "archInput",
+        "archSource",
+        "archOverride",
+        "productLine",
+        "status",
+        "result",
+        "dsmFields",
+        "desktopFields",
+        "form",
+        "container",
+    ];
+    const els = Object.fromEntries(names.map((name) => [name, createFakeElement("div")]));
     const documentRef = {
         defaultView: {
-            FormData: class UnusedFormData {
-                constructor() {
-                    throw new Error("the initialization harness must not submit the form");
+            FormData: class FakeFormData {
+                constructor(form) {
+                    assert.equal(form, els.form);
+                    this.values = new Map([
+                        ["purpose", els.purpose.value],
+                        ["model", els.modelValue.value],
+                        ["productLine", els.productLine.value],
+                        ["osVersion", els.osVersion.value],
+                        ["dsmVersion", els.dsmVersion.value],
+                        ["reportedArch", els.archInput.value],
+                        ["desktopOs", "linux"],
+                        ["desktopCpu", "x86_64"],
+                    ]);
+                }
+
+                get(name) {
+                    return this.values.has(name) ? this.values.get(name) : null;
                 }
             },
         },
@@ -124,47 +173,72 @@ function createSelectorDomHarness() {
         },
         createElement: createFakeElement,
         querySelectorAll(selectorText) {
-            return selectorText === "[data-release-selector]" ? [container] : [];
+            return selectorText === "[data-release-selector]" ? [els.container] : [];
         },
     };
 
-    for (const element of [
-        purpose,
-        modelSelect,
-        modelCount,
-        modelFact,
-        status,
-        result,
-        dsmFields,
-        desktopFields,
-        form,
-        container,
-    ]) {
+    els.purpose.value = "dsm-spk";
+    els.osVersion.value = "auto";
+    els.productLine.value = "auto";
+    els.archOverride.hidden = true;
+    els.listbox.id = "synology-model-list";
+    els.listbox.hidden = true;
+    els.modelInput.disabled = true;
+    for (const element of Object.values(els)) {
         element.ownerDocument = documentRef;
     }
 
-    form.querySelector = function querySelector(selectorText) {
-        return new Map([
-            ["[name=purpose]", purpose],
-            ["[data-model-select]", modelSelect],
-        ]).get(selectorText) || null;
+    els.form.querySelector = function querySelector(selectorText) {
+        return selectorText === "[name=purpose]" ? els.purpose : null;
     };
-    dsmFields.querySelectorAll = function querySelectorAll(selectorText) {
-        return selectorText === "input, select" ? [modelSelect] : [];
+    els.dsmFields.querySelectorAll = function querySelectorAll(selectorText) {
+        return selectorText === "input, select" ? [els.modelInput] : [];
     };
-    container.querySelector = function querySelector(selectorText) {
+    els.container.querySelector = function querySelector(selectorText) {
         return new Map([
-            ["form", form],
-            ["[data-model-count]", modelCount],
-            ["[data-model-fact]", modelFact],
-            ["[data-selector-status]", status],
-            ["[data-selector-result]", result],
-            ["[data-dsm-fields]", dsmFields],
-            ["[data-desktop-fields]", desktopFields],
+            ["form", els.form],
+            ["[data-model-input]", els.modelInput],
+            ["[data-model-select]", els.modelValue],
+            ["[data-model-listbox]", els.listbox],
+            ["[data-model-results]", els.modelResults],
+            ["[data-model-count]", els.modelCount],
+            ["[data-model-fact]", els.modelFact],
+            ["[data-os-version]", els.osVersion],
+            ["[data-os-auto]", els.osAuto],
+            ["[data-dsm-version]", els.dsmVersion],
+            ["[data-arch-input]", els.archInput],
+            ["[data-arch-source]", els.archSource],
+            ["[data-arch-override]", els.archOverride],
+            ["[data-selector-status]", els.status],
+            ["[data-selector-result]", els.result],
+            ["[data-dsm-fields]", els.dsmFields],
+            ["[data-desktop-fields]", els.desktopFields],
         ]).get(selectorText) || null;
     };
 
-    return { container, documentRef, modelCount, modelFact, modelSelect };
+    return {
+        ...els,
+        documentRef,
+        optionValues() {
+            return els.listbox.children
+                .filter((child) => child.getAttribute("role") === "option")
+                .map((child) => child.dataset.value);
+        },
+        options() {
+            return els.listbox.children.filter((child) => child.getAttribute("role") === "option");
+        },
+        type(text) {
+            els.modelInput.value = text;
+            els.modelInput.dispatch("input");
+        },
+        key(name) {
+            return els.modelInput.dispatch("keydown", { key: name });
+        },
+        async submit() {
+            const event = els.form.dispatch("submit");
+            await Promise.all(event.results);
+        },
+    };
 }
 
 test("selector form remains one raw HTML block for mdBook", () => {
@@ -194,14 +268,35 @@ test("selector form remains one raw HTML block for mdBook", () => {
     }
     assert.match(block[1], /Required for DSM 7\.0 and 7\.4/);
     assert.match(block[1], /optional for DSM 7\.1–7\.3/);
+    // One accessible combobox plus a hidden field that only an explicit choice can set.
     assert.match(
         block[1],
-        /<select\b(?=[^>]*\bname="model")(?=[^>]*\bdata-model-select\b)[^>]*>/,
+        /<input\b(?=[^>]*\bid="synology-model")(?=[^>]*\brole="combobox")(?=[^>]*\baria-autocomplete="list")(?=[^>]*\baria-expanded="false")(?=[^>]*\baria-controls="synology-model-list")(?=[^>]*\bdata-model-input\b)[^>]*>/,
     );
-    assert.match(block[1], /<option value="__unknown__">[^<]*manual review \/ no SPK<\/option>/);
+    assert.match(
+        block[1],
+        /<input\b(?=[^>]*\btype="hidden")(?=[^>]*\bname="model")(?=[^>]*\bvalue=""\s)(?=[^>]*\bdata-model-select\b)[^>]*>/,
+    );
+    assert.match(
+        block[1],
+        /<ul\b(?=[^>]*\bid="synology-model-list")(?=[^>]*\brole="listbox")(?=[^>]*\bdata-model-listbox\b)[^>]*>/,
+    );
+    assert.doesNotMatch(block[1], /<select\b[^>]*\bname="model"/);
     assert.match(block[1], /data-model-count/);
+    assert.match(block[1], /aria-live="polite" data-model-results/);
+    assert.match(block[1], /<noscript>[^<]*JavaScript[^<]*<\/noscript>/);
     assert.doesNotMatch(block[1], /<datalist\b|\blist="synology-models"/);
-    assert.match(source, /loads all 233 exact model names/);
+    // Automatic is the default for the product line and DSM branch, with a resolved-value line.
+    assert.match(block[1], /<select id="product-line"[^>]*>\s*<option value="auto" selected>/);
+    assert.match(block[1], /<select id="os-version"[^>]*data-os-version[^>]*>\s*<option value="auto" selected>/);
+    assert.match(block[1], /data-os-auto aria-live="polite"/);
+    // The architecture is filled from the model and can be overridden.
+    assert.match(block[1], /\bname="reportedArch"[^>]*data-arch-input/);
+    assert.match(block[1], /data-arch-source aria-live="polite"/);
+    assert.match(block[1], /<button type="button" class="selector-secondary" data-arch-override hidden>/);
+    assert.match(source, /searches all 233 exact model names/);
+    assert.doesNotMatch(source, /native, visibly populated select/);
+    assert.match(source, /Free\s+text never resolves to a nearest-looking model/);
     const submitButton = block[1].match(/<button type="submit">([\s\S]*?)<\/button>/);
     assert.ok(submitButton, "release selector submit button is missing");
     assert.match(submitButton[1], /<svg\b[^>]*class="selector-action-icon"/);
@@ -406,54 +501,251 @@ test("model lifecycle and explicit asset mapping partition every selectable mode
     });
 });
 
-test("selector initialization renders every exact model with processor, package, and asset facts", () => {
+function chooseModel(harness, text, value) {
+    harness.type(text);
+    const option = harness.options().find((candidate) => candidate.dataset.value === value);
+
+    assert.ok(option, `${value} must be offered for "${text}"`);
+    harness.listbox.dispatch("click", { target: option });
+}
+
+test("selector initialization builds an ARIA combobox over every exact model with processor, package, and asset facts", () => {
     const harness = createSelectorDomHarness();
     const models = selector.listModels();
-    const knownModels = new Set(models.map((model) => model.model));
 
     selector.initSelectors(harness.documentRef, null);
 
-    const renderedModels = harness.modelSelect.children.filter((option) =>
-        knownModels.has(option.value),
-    );
-    assert.equal(renderedModels.length, 233);
+    assert.equal(harness.modelInput.disabled, false);
+    assert.equal(harness.modelInput.getAttribute("aria-expanded"), "false");
+    assert.equal(harness.listbox.hidden, true);
     assert.equal(harness.modelCount.textContent, "233 exact models loaded");
+    assert.equal(harness.modelValue.value, "");
 
+    harness.modelInput.dispatch("focus");
+    assert.equal(harness.listbox.hidden, false);
+    assert.equal(harness.modelInput.getAttribute("aria-expanded"), "true");
+    assert.equal(harness.options().length, 61, "60 rendered models plus the manual-review option");
+    assert.match(elementText(harness.listbox), /Showing 60 of 233 models/);
+
+    // Typing a unique prefix renders each remaining option with its facts.
     for (const model of models) {
         const compatibility = selector.modelCompatibility(model);
-        const option = renderedModels.find((candidate) => candidate.value === model.model);
         const assetLabel = compatibility.status === "supported" && model.assetArch
             ? `synology-drive-sync-YY.N-${model.assetArch}.spk`
             : "manual review / no SPK";
 
+        harness.type(model.model);
+        const option = harness.options().find((candidate) => candidate.dataset.value === model.model);
+
         assert.ok(option, model.model);
+        assert.equal(option.getAttribute("role"), "option", model.model);
         assert.equal(
-            option.textContent.startsWith(
-                `${model.model} — processor ${model.cpuArch} — Package Arch ${model.packageArch} — ${assetLabel}`,
+            elementText(option).includes(
+                `processor ${model.cpuArch} · Package Arch ${model.packageArch} · ${assetLabel}`,
             ),
             true,
             model.model,
         );
+        assert.equal(harness.options().at(-1).dataset.value, "__unknown__", model.model);
+        assert.equal(harness.modelValue.value, "", "typing must never select");
     }
 
-    harness.modelSelect.value = "DS419slim";
-    harness.modelSelect.dispatch("input");
-    assert.match(
-        harness.modelFact.textContent,
-        /processor armv7 · Package Arch armada38x · Release synology-drive-sync-YY\.N-armv7\.spk/,
-    );
+    selector.initSelectors(harness.documentRef, null);
+    harness.type("");
+    assert.equal(harness.options().length, 61, "initialization must be idempotent");
+});
 
-    harness.modelSelect.value = "__unknown__";
-    harness.modelSelect.dispatch("input");
-    assert.match(harness.modelFact.textContent, /No SPK is recommended/);
-    assert.match(harness.modelFact.textContent, /manual review/);
+test("typing filters with fuzzy-normalised matching but never selects; Enter needs an active option or an exact name", () => {
+    const harness = createSelectorDomHarness();
 
     selector.initSelectors(harness.documentRef, null);
+
+    harness.type("ds416");
+    assert.deepEqual(harness.optionValues(), [
+        "DS416",
+        "DS416j",
+        "DS416play",
+        "DS416slim",
+        "__unknown__",
+    ]);
+    assert.equal(harness.modelValue.value, "");
+    assert.match(harness.modelResults.textContent, /4 of 233 models match/);
+
+    harness.type("DS 416");
+    assert.equal(harness.optionValues()[0], "DS416");
+    harness.type("rs11626");
+    assert.deepEqual(harness.optionValues(), ["RS11626xs+", "__unknown__"]);
+    harness.type("zzzz");
+    assert.deepEqual(harness.optionValues(), ["__unknown__"]);
+    assert.match(harness.modelResults.textContent, /No catalog model matches/);
+
+    // Partial text plus Enter does nothing: free text never resolves to a nearest model.
+    harness.type("ds41");
+    const partial = harness.key("Enter");
+    assert.equal(partial.defaultPrevented, true);
+    assert.equal(harness.modelValue.value, "");
+    assert.equal(harness.archInput.value, "");
+
+    // Text that is exactly one catalog model name may be committed with Enter.
+    harness.type("ds 416");
+    harness.key("Enter");
+    assert.equal(harness.modelValue.value, "DS416");
+    assert.equal(harness.modelInput.value, "DS416");
+    assert.equal(harness.listbox.hidden, true);
+
+    // Editing the chosen text clears the choice and the fields derived from it.
+    harness.type("DS416x");
+    assert.equal(harness.modelValue.value, "");
+    assert.equal(harness.archInput.value, "");
+    assert.equal(harness.archInput.readOnly, false);
+});
+
+test("combobox keyboard, mouse, and touch selection follow the ARIA 1.2 pattern", () => {
+    const harness = createSelectorDomHarness();
+
+    selector.initSelectors(harness.documentRef, null);
+    harness.type("ds416");
+
+    const down = harness.key("ArrowDown");
+    assert.equal(down.defaultPrevented, true);
+    assert.equal(harness.modelInput.getAttribute("aria-activedescendant"), harness.options()[0].id);
+    assert.equal(harness.options()[0].getAttribute("aria-selected"), "true");
+    harness.key("ArrowUp");
     assert.equal(
-        harness.modelSelect.children.filter((option) => knownModels.has(option.value)).length,
-        233,
-        "initialization must be idempotent",
+        harness.modelInput.getAttribute("aria-activedescendant"),
+        harness.options().at(-1).id,
+        "ArrowUp wraps to the last option",
     );
+    harness.key("ArrowDown");
+    harness.key("ArrowDown");
+    harness.key("Enter");
+    assert.equal(harness.modelValue.value, "DS416j");
+    assert.equal(harness.modelInput.getAttribute("aria-expanded"), "false");
+
+    // Escape closes an open list, then clears the text and the choice.
+    harness.modelInput.dispatch("focus");
+    assert.equal(harness.listbox.hidden, false);
+    harness.key("Escape");
+    assert.equal(harness.listbox.hidden, true);
+    assert.equal(harness.modelValue.value, "DS416j", "the first Escape only closes the list");
+    harness.key("Escape");
+    assert.equal(harness.modelInput.value, "");
+    assert.equal(harness.modelValue.value, "");
+
+    // Pointer and touch taps arrive as mousedown (focus is kept) then click.
+    harness.type("ds416");
+    const mouseDown = harness.listbox.dispatch("mousedown");
+    assert.equal(mouseDown.defaultPrevented, true);
+    harness.listbox.dispatch("click", { target: harness.options()[0] });
+    assert.equal(harness.modelValue.value, "DS416");
+    assert.equal(harness.modelInput.focused, true);
+
+    // Blur restores the chosen label and an unchosen draft stays unselected.
+    harness.type("ds4");
+    harness.modelInput.dispatch("blur");
+    assert.equal(harness.modelValue.value, "");
+    assert.equal(harness.listbox.hidden, true);
+});
+
+test("choosing DS416 auto-fills armv7 with its source, and Override can disagree with the catalog", async () => {
+    const harness = createSelectorDomHarness();
+
+    selector.initSelectors(harness.documentRef, null);
+    chooseModel(harness, "ds416", "DS416");
+
+    assert.equal(harness.modelValue.value, "DS416");
+    assert.equal(harness.archInput.value, "armv7");
+    assert.equal(harness.archInput.readOnly, true);
+    assert.equal(harness.archInput.dataset.autofilled, "true");
+    assert.equal(harness.archOverride.hidden, false);
+    assert.equal(harness.archOverride.textContent, "Override");
+    assert.match(
+        harness.archSource.textContent,
+        /Auto-filled from Synology's CPU table, captured 2026-08-26: DS416 is Package Arch alpine4k, which maps to the armv7 SPK \(synology-drive-sync-YY\.N-armv7\.spk\)/,
+    );
+    assert.match(harness.osAuto.textContent, /Automatic: DSM 7\.4 for this model/);
+    assert.match(harness.osAuto.textContent, /exact installed build/);
+
+    // Automatic with the 7.4 boundary and no build stops and says why instead of guessing.
+    await harness.submit();
+    assert.equal(harness.result.dataset.state, "blocked");
+    assert.match(elementText(harness.result), /Automatic resolved DSM 7\.4 for DS416/);
+    assert.match(elementText(harness.result), /will not assume one/);
+
+    // An exact build sets the branch, and the whole path resolves end to end to the armv7 SPK.
+    harness.dsmVersion.value = "7.2.2-72806";
+    harness.dsmVersion.dispatch("input");
+    assert.match(harness.osAuto.textContent, /Automatic: DSM 7\.2, read from the exact build 7\.2\.2-72806/);
+    await harness.submit();
+    assert.equal(harness.result.dataset.state, "fallback");
+    assert.match(elementText(harness.result), /synology-drive-sync-YY\.N-armv7\.spk/);
+    assert.match(elementText(harness.result), /Release alpine4k|Package Arch alpine4k/);
+
+    // Override, then a mismatch with the catalog stops the selector as before.
+    harness.archOverride.dispatch("click");
+    assert.equal(harness.archInput.readOnly, false);
+    assert.equal(harness.archOverride.textContent, "Use the auto-filled value");
+    assert.match(harness.archSource.textContent, /Manual override/);
+    harness.archInput.value = "x86_64";
+    await harness.submit();
+    assert.equal(harness.result.dataset.state, "blocked");
+    assert.match(elementText(harness.result), /says armv7\/alpine4k, but the reported architecture resolves to x86_64/);
+
+    // The auto-filled value comes back on request.
+    harness.archOverride.dispatch("click");
+    assert.equal(harness.archInput.value, "armv7");
+    assert.equal(harness.archInput.readOnly, true);
+
+    // Picking a branch by hand remains possible.
+    harness.osVersion.value = "dsm-7.1";
+    harness.osVersion.dispatch("change");
+    harness.dsmVersion.value = "";
+    assert.equal(harness.osAuto.textContent, "");
+    await harness.submit();
+    assert.equal(harness.result.dataset.state, "fallback");
+});
+
+test("manual-review and no-SPK models auto-fill nothing and keep the stop", async () => {
+    const harness = createSelectorDomHarness();
+
+    selector.initSelectors(harness.documentRef, null);
+
+    chooseModel(harness, "ds416", "DS416");
+    assert.equal(harness.archInput.value, "armv7");
+
+    // The explicit manual-review option clears the auto-filled value.
+    harness.type("my brand new nas");
+    harness.listbox.dispatch("click", {
+        target: harness.options().find((option) => option.dataset.value === "__unknown__"),
+    });
+    assert.equal(harness.modelValue.value, "__unknown__");
+    assert.equal(harness.modelInput.value, "My model is not listed — manual review / no SPK");
+    assert.equal(harness.archInput.value, "");
+    assert.equal(harness.archInput.readOnly, false);
+    assert.equal(harness.archOverride.hidden, true);
+    assert.match(harness.archSource.textContent, /Nothing auto-filled/);
+    harness.archInput.value = "armv7l";
+    await harness.submit();
+    assert.equal(harness.result.dataset.state, "blocked");
+    assert.match(elementText(harness.result), /not in the captured physical Synology model catalog/);
+
+    // A catalog model with no DSM 7 package fills nothing and stops with its lifecycle message.
+    harness.archInput.value = "";
+    chooseModel(harness, "ds1511", "DS1511+");
+    assert.equal(harness.archInput.value, "");
+    assert.match(harness.archSource.textContent, /DS1511\+ is manual review \/ no SPK/);
+    assert.match(harness.osAuto.textContent, /Automatic stops: DS1511\+ cannot run DSM 7/);
+    harness.archInput.value = "x86_64";
+    await harness.submit();
+    assert.equal(harness.result.dataset.state, "blocked");
+    assert.match(elementText(harness.result), /last upgradable DSM as 6\.2/);
+
+    // With nothing chosen at all, the selector refuses instead of guessing from typed text.
+    harness.type("DS416x");
+    assert.equal(harness.modelValue.value, "");
+    await harness.submit();
+    assert.equal(harness.result.dataset.state, "blocked");
+    assert.match(elementText(harness.result), /typed text alone never selects a model/);
 });
 
 test("ARMv7-A model resolves to the shared hard-float SPK", () => {
@@ -1224,4 +1516,246 @@ test("live release tags and GitHub asset URLs must be canonical", () => {
         assert.equal(result.exact, false, url);
         assert.equal(result.name, "synology-drive-sync-YY.N-armv7.spk", url);
     }
+});
+
+function resolveAuto(overrides) {
+    return selector.resolveSelection({
+        purpose: "dsm-spk",
+        model: "DS416",
+        productLine: "auto",
+        osVersion: "auto",
+        dsmVersion: "",
+        reportedArch: "armv7",
+        ...overrides,
+    });
+}
+
+test("model search ignores case, spaces, and plus, ranks exact names first, and covers the catalog", () => {
+    const names = (query) => selector.searchModels(query).map((record) => record.model);
+
+    assert.deepEqual(names("ds416"), ["DS416", "DS416j", "DS416play", "DS416slim"]);
+    assert.deepEqual(names("DS 416"), names("ds416"));
+    assert.deepEqual(names("  d s-4_1.6 "), names("ds416"));
+    assert.deepEqual(names("rs11626"), ["RS11626xs+"]);
+    assert.deepEqual(names("RS 11626 XS"), ["RS11626xs+"]);
+    assert.deepEqual(names("rs11626xs+"), ["RS11626xs+"]);
+    // "+" is ignored when filtering, but an exact name ranks first.
+    assert.deepEqual(names("ds216"), ["DS216", "DS216+", "DS216+II", "DS216j", "DS216play", "DS216se"]);
+    assert.deepEqual(names("ds216+").slice(0, 2), ["DS216+", "DS216"]);
+    assert.deepEqual(names("DS216+II")[0], "DS216+II");
+    assert.deepEqual(names("alpine4k"), ["DS215+", "DS416"], "Package Arch is searchable");
+    assert.deepEqual(names("zzzz"), []);
+    assert.equal(selector.searchModels("").length, 233);
+    assert.equal(selector.searchModels("   ").length, 233);
+    assert.equal(selector.searchModels("ds", 10).length, 10);
+
+    // Every one of the 233 models is found by its own name and by a spaced, lower-case form.
+    for (const record of selector.listModels()) {
+        assert.equal(names(record.model)[0], record.model, record.model);
+        assert.ok(names(record.model.toLowerCase().replace(/(\d)/, " $1")).includes(record.model), record.model);
+    }
+});
+
+test("typed text never resolves to a model unless it is exactly one catalog name", () => {
+    assert.equal(selector.exactModelForText("ds416").model, "DS416");
+    assert.equal(selector.exactModelForText(" DS 416 ").model, "DS416");
+    assert.equal(selector.exactModelForText("ds216+").model, "DS216+");
+    assert.equal(selector.exactModelForText("rs11626xs+").model, "RS11626xs+");
+    for (const text of ["", "ds41", "ds", "DS416x", "rs11626", "synology"]) {
+        assert.equal(selector.exactModelForText(text), null, text);
+    }
+    assert.equal(selector.exactModelForText("ds41"), null);
+    assert.equal(selector.exactModelForText("rs11626"), null);
+    assert.equal(selector.exactModelForText("DS99999"), null);
+    // Resolution itself has no nearest-model rule either.
+    assert.equal(resolveAuto({ model: "ds41" }).code, "unknown_model");
+    assert.equal(resolveAuto({ model: "DS 4160" }).code, "unknown_model");
+    assert.equal(resolveAuto({ model: "" }).code, "unknown_model");
+    assert.match(resolveAuto({ model: "" }).message, /typed text alone never selects/);
+});
+
+test("architecture auto-fill follows the catalog and the explicit asset mapping", () => {
+    const ds416 = selector.autofillArchitecture("DS416");
+
+    assert.equal(ds416.value, "armv7");
+    assert.equal(ds416.packageArch, "alpine4k");
+    assert.equal(ds416.assetName, "synology-drive-sync-YY.N-armv7.spk");
+    assert.equal(ds416.source, "Synology's CPU table, captured 2026-08-26");
+    assert.equal(selector.autofillArchitecture("DS923+").value, "x86_64");
+    assert.equal(selector.autofillArchitecture("DS418").value, "armv8");
+    assert.equal(selector.autofillArchitecture("DS214play").value, "i686");
+    assert.equal(selector.autofillArchitecture("DS419slim").packageArch, "armada38x");
+
+    // Legacy, Enterprise, unknown and unmapped models fill nothing.
+    for (const model of ["DS1511+", "DS3611xs", "DS110+", "DS213+", "PAS7700", "DS99999", "", null]) {
+        assert.equal(selector.autofillArchitecture(model), null, String(model));
+    }
+    for (const record of selector.listModels()) {
+        const compatibility = selector.modelCompatibility(record);
+        const fill = selector.autofillArchitecture(record);
+
+        if (compatibility.status === "supported" && record.assetArch) {
+            assert.equal(fill.value, record.assetArch, record.model);
+            assert.equal(selector.normalizeCpuArch(fill.value), selector.normalizeCpuArch(record.cpuArch), record.model);
+            // The filled value always satisfies the same check a user-supplied value would.
+            const dsmVersion = compatibility.maxMinor === 4 ? "7.4-90075" : "";
+            const resolved = resolveAuto({
+                model: record.model,
+                reportedArch: fill.value,
+                dsmVersion: compatibility.minBuild === null ? dsmVersion : "7.4.1-90080",
+            });
+            assert.notEqual(resolved.code, "architecture_conflict", record.model);
+            assert.notEqual(resolved.code, "unknown_reported_arch", record.model);
+        } else {
+            assert.equal(fill, null, record.model);
+        }
+    }
+});
+
+test("Automatic DSM resolves per model lifecycle within the SPK range", () => {
+    const auto = selector.resolveAutomaticDsm;
+
+    // DSM 7.0-7.1 models resolve to 7.1 and need no exact build.
+    const old = auto("DS414", "");
+    assert.equal(old.ok, true);
+    assert.equal(old.osVersion.display, "DSM 7.1");
+    assert.equal(old.requiresBuild, false);
+    assert.equal(old.text, "Automatic: DSM 7.1 for this model (the newest it supports).");
+    assert.equal(resolveAuto({ model: "DS414", reportedArch: "armv7" }).ok, true);
+    assert.match(resolveAuto({ model: "DS414", reportedArch: "armv7" }).detected, /DSM 7\.1 \(Automatic/);
+
+    // DSM 7.x-7.4 models resolve to 7.4, whose exact build cannot be known automatically.
+    const newest = auto("DS923+", "");
+    assert.equal(newest.osVersion.display, "DSM 7.4");
+    assert.equal(newest.requiresBuild, true);
+    assert.match(newest.text, /^Automatic: DSM 7\.4 for this model/);
+    const stop = resolveAuto({ model: "DS923+", reportedArch: "x86_64" });
+    assert.equal(stop.code, "dsm_build_required");
+    assert.match(stop.message, /Automatic resolved DSM 7\.4 for DS923\+/);
+    assert.match(stop.details, /7\.4-99999/);
+    assert.match(stop.details, /will not assume one/);
+
+    // An exact build is honoured and sets the branch, including the 7.0 and 7.4 boundaries.
+    assert.equal(resolveAuto({ dsmVersion: "7.2.2-72806" }).ok, true);
+    assert.equal(auto("DS416", "7.2.2-72806").osVersion.display, "DSM 7.2");
+    assert.equal(resolveAuto({ dsmVersion: "7.4.1-90080" }).ok, true);
+    assert.equal(resolveAuto({ dsmVersion: "7.4-99999" }).ok, true);
+    assert.equal(resolveAuto({ dsmVersion: "7.0.1-42218" }).ok, true);
+    assert.equal(resolveAuto({ dsmVersion: "7.0-40758" }).code, "dsm_too_old");
+    assert.equal(resolveAuto({ dsmVersion: "7.4-100000" }).code, "dsm_too_new");
+
+    // DSM 7.5+ and anything older than 7.0 stop with fail-closed messages.
+    assert.equal(resolveAuto({ dsmVersion: "7.5-100000" }).code, "unsupported_dsm_line");
+    assert.match(resolveAuto({ dsmVersion: "7.5-100000" }).message, /outside the reviewed DSM 7\.0–7\.4 range/);
+    assert.equal(resolveAuto({ dsmVersion: "8.0-1000" }).code, "unsupported_dsm_line");
+    assert.equal(resolveAuto({ dsmVersion: "6.2.4-25556" }).code, "unsupported_dsm_line");
+    assert.equal(resolveAuto({ dsmVersion: "seven" }).code, "invalid_dsm_version");
+
+    // A build outside the model's own interval still conflicts, as with an explicit pick.
+    assert.equal(
+        resolveAuto({ model: "DS414", reportedArch: "armv7", dsmVersion: "7.2.2-72806" }).code,
+        "model_dsm_conflict",
+    );
+    assert.equal(
+        resolveAuto({ model: "DS923+", reportedArch: "x86_64", dsmVersion: "7.0.1-42218" }).code,
+        "model_dsm_conflict",
+    );
+
+    // Models first published in 7.4.1 keep their build floor under Automatic.
+    assert.equal(resolveAuto({ model: "RS11626xs+", reportedArch: "x86_64", dsmVersion: "7.4.1-90080" }).ok, true);
+    assert.equal(
+        resolveAuto({ model: "RS11626xs+", reportedArch: "x86_64", dsmVersion: "7.4-90075" }).code,
+        "model_build_too_old",
+    );
+
+    // Last supported DSM below 7.0 resolves to the existing fail-closed stop.
+    for (const model of ["DS1511+", "DS3611xs", "DS110+"]) {
+        const legacy = auto(model, "");
+
+        assert.equal(legacy.ok, false, model);
+        assert.equal(legacy.code, "model_dsm_conflict", model);
+        assert.match(legacy.message, /last upgradable DSM as (5\.2|6\.2)/, model);
+        assert.equal(resolveAuto({ model, reportedArch: "x86_64" }).code, "model_dsm_conflict", model);
+    }
+
+    // DSM Enterprise keeps its own stop, with Automatic or an explicit product line.
+    assert.equal(auto("PAS7700", "").code, "unsupported_product_line");
+    assert.equal(resolveAuto({ model: "PAS7700", reportedArch: "x86_64" }).code, "unsupported_product_line");
+    assert.equal(
+        resolveAuto({ model: "DS416", productLine: "dsm-enterprise" }).code,
+        "product_line_conflict",
+    );
+    assert.equal(resolveAuto({ productLine: "bogus" }).code, "invalid_product_line");
+
+    // An unknown model never resolves.
+    assert.equal(auto("DS99999", "").code, "unknown_model");
+});
+
+test("a model whose newest DSM exceeds the SPK maximum stops under Automatic", () => {
+    const data = mutableSelectorData();
+    const group = data.compatibilityGroups.find((candidate) => candidate.models.includes("DS416"));
+
+    group.maxMinor = 5;
+    const patched = loadSelectorWithData(data);
+
+    assert.equal(patched.resolveAutomaticDsm("DS416", "").code, "dsm_too_new");
+    assert.match(patched.resolveAutomaticDsm("DS416", "").message, /7\.4-99999/);
+    // An explicit, in-range pick on the same data is unaffected.
+    assert.equal(
+        patched.resolveSelection({
+            purpose: "dsm-spk",
+            model: "DS416",
+            productLine: "dsm",
+            osVersion: "dsm-7.2",
+            dsmVersion: "7.2.2-72806",
+            reportedArch: "armv7",
+        }).ok,
+        true,
+    );
+});
+
+test("DS416 resolves end to end to the armv7 SPK, and the release rules still apply", () => {
+    const fill = selector.autofillArchitecture("DS416");
+    const resolved = resolveAuto({ reportedArch: fill.value, dsmVersion: "7.2.2-72806" });
+    const release = (tag) => ({
+        tag_name: tag,
+        draft: false,
+        prerelease: false,
+        assets: [
+            {
+                name: `synology-drive-sync-${tag}-armv7.spk`,
+                state: "uploaded",
+                size: 42,
+                browser_download_url: `https://github.com/supermarsx/synology-drive-sync/releases/download/${tag}/synology-drive-sync-${tag}-armv7.spk`,
+            },
+        ],
+    });
+
+    assert.equal(resolved.ok, true);
+    assert.equal(resolved.assetTemplate, "synology-drive-sync-{tag}-armv7.spk");
+    assert.match(resolved.detected, /DS416 · Product line DSM · Processor armv7 · Package Arch alpine4k · Release asset armv7/);
+
+    const exact = selector.materializeRecommendation(resolved, release("26.30"));
+
+    assert.equal(exact.exact, true);
+    assert.equal(
+        exact.downloadUrl,
+        "https://github.com/supermarsx/synology-drive-sync/releases/download/26.30/synology-drive-sync-26.30-armv7.spk",
+    );
+    assert.equal(selector.materializeRecommendation(resolved, null).exact, false);
+    assert.doesNotMatch(selector.materializeRecommendation(resolved, null).downloadUrl, /\/releases\/download\//);
+    for (const tag of ["26.5", "26.6", "26.20"]) {
+        const held = selector.materializeRecommendation(resolved, release(tag));
+
+        assert.equal(held.ok, false, tag);
+        assert.equal(held.code, "known_invalid_dsm_spk_release", tag);
+    }
+
+    // Overriding the architecture so it disagrees with the catalog stops the selector.
+    const mismatch = resolveAuto({ reportedArch: "x86_64", dsmVersion: "7.2.2-72806" });
+
+    assert.equal(mismatch.ok, false);
+    assert.equal(mismatch.code, "architecture_conflict");
+    assert.equal(resolveAuto({ reportedArch: "", dsmVersion: "7.2.2-72806" }).code, "unknown_reported_arch");
+    assert.equal(resolveAuto({ reportedArch: "aarch64", dsmVersion: "7.2.2-72806" }).code, "architecture_conflict");
 });
