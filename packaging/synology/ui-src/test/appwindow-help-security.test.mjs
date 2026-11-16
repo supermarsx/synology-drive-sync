@@ -280,7 +280,7 @@ test("About metadata, dependency versions, and update links match repository sou
   const compilerUtilsRequire = createRequire(compilerUtilsPackage);
   assert.equal(
     compilerUtilsRequire("postcss/package.json").version,
-    "8.5.26",
+    "8.5.33",
     "Vue 2 compiler-utils must execute with the audited PostCSS override"
   );
   for (const name of ["vue-loader", "webpack"]) {

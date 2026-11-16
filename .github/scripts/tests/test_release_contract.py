@@ -511,12 +511,12 @@ class WorkflowWiringTests(unittest.TestCase):
         lockfile = (
             REPOSITORY_ROOT / "packaging/synology/ui-src/pnpm-lock.yaml"
         ).read_text(encoding="utf-8")
-        override = r"(?m)^overrides:\n  postcss: 8\.5\.26$"
+        override = r"(?m)^overrides:\n  postcss: 8\.5\.33$"
         self.assertRegex(workspace, override)
         self.assertRegex(lockfile, override)
         self.assertEqual(
             set(re.findall(r"(?m)^  postcss@([^:\s]+):$", lockfile)),
-            {"8.5.26"},
+            {"8.5.33"},
         )
 
         dependabot = (REPOSITORY_ROOT / ".github/dependabot.yml").read_text(

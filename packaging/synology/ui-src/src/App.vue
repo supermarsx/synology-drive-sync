@@ -1906,7 +1906,7 @@ const ABOUT_RUST_DEPENDENCIES = Object.freeze([
   { name: "redb", pin: "4.6.0", scope: "Linux and macOS", url: "https://crates.io/crates/redb" }
 ]);
 const ABOUT_UI_DEPENDENCIES = Object.freeze([
-  { name: "@babel/core", pin: "8.0.9", scope: "devDependency", url: "https://www.npmjs.com/package/@babel/core" },
+  { name: "@babel/core", pin: "8.1.2", scope: "devDependency", url: "https://www.npmjs.com/package/@babel/core" },
   { name: "@babel/preset-env", pin: "8.0.7", scope: "devDependency", url: "https://www.npmjs.com/package/@babel/preset-env" },
   { name: "babel-loader", pin: "10.1.1", scope: "devDependency", url: "https://www.npmjs.com/package/babel-loader" },
   { name: "css-loader", pin: "7.1.5", scope: "devDependency", url: "https://www.npmjs.com/package/css-loader" },
@@ -1915,8 +1915,8 @@ const ABOUT_UI_DEPENDENCIES = Object.freeze([
   { name: "vue-loader", pin: "15.11.1", scope: "devDependency", url: "https://www.npmjs.com/package/vue-loader" },
   { name: "vue-template-compiler", pin: "2.7.16", scope: "devDependency", url: "https://www.npmjs.com/package/vue-template-compiler" },
   { name: "webpack", pin: "5.112.2", scope: "devDependency", url: "https://www.npmjs.com/package/webpack" },
-  { name: "webpack-cli", pin: "7.2.3", scope: "devDependency", url: "https://www.npmjs.com/package/webpack-cli" },
-  { name: "pnpm", pin: "pnpm@11.25.0", scope: "packageManager", url: "https://pnpm.io/" }
+  { name: "webpack-cli", pin: "7.3.1", scope: "devDependency", url: "https://www.npmjs.com/package/webpack-cli" },
+  { name: "pnpm", pin: "pnpm@12.21.0", scope: "packageManager", url: "https://pnpm.io/" }
 ]);
 const CONTROL_HELP = Object.freeze({
   "profile-filter": "Search configured profiles by name, local source, File Station URL, DSM account, or destination path.",

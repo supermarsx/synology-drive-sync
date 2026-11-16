@@ -101,7 +101,7 @@ FIXED_INFO = {
 }
 REQUIRED_INFO = set(FIXED_INFO) | {"version", "arch", "extractsize", "checksum"}
 NOTIFICATION_KEYS = {"sync_succeeded", "sync_failed", "doctor_failed"}
-POSTCSS_BUILD_PIN = "8.5.26"
+POSTCSS_BUILD_PIN = "8.5.33"
 
 
 class ValidationError(AssertionError):
