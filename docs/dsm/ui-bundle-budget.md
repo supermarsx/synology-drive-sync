@@ -229,5 +229,5 @@ python -c "print(open('packaging/synology/ui-src/dist/SynologyDriveSync.js','rb'
 rebuild and commit it with any change that affects it.
 
 The build is reproducible across Node patch releases, not only under the pinned one: the committed
-`dist/` has been rebuilt byte-for-byte under both Node 24.20.0 (CI's pin until it moved to 26.13.1) and a local 24.14.1. A local
-rebuild that differs is therefore a real signal about the change, not about the Node version.
+`dist/` has been rebuilt byte-for-byte under Node 26.13.1 (CI's pin), and before that under 24.20.0 and a
+local 24.14.1, across a Node major. A local rebuild that differs is therefore a real signal about the change, not about the Node version.
