@@ -205,6 +205,8 @@ jobs:
   # The DSM realtime watcher against real inotify, beyond what the test matrix
   # runs: the walk deadline under the fault hook only the fault-inject feature
   # compiles, and the kernel's own per-user watch limit, lowered for this job.
+  # The same feature's process aborts prove the crash-atomic deposit recovers
+  # from death at every step of its protocol.
   # The sysctl is global to the runner VM, which exists only for this job, and
   # is restored before the step ends either way.
   native-watcher:
@@ -223,6 +225,8 @@ jobs:
           key: native-watcher
       - name: Walk deadline under fault injection
         run: cargo test --locked --features fault-inject --test watch_cli
+      - name: Crash-atomic deposit under abort and SIGKILL
+        run: cargo test --locked --features fault-inject --test atomic_deposit_faults
       - name: Build the watcher tests before the limit is lowered
         run: cargo test --locked --test watch_inotify --test watch_cli --no-run
       - name: Named watch_limit under a lowered max_user_watches
