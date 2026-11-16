@@ -1813,6 +1813,29 @@ fn wait_answers_with_the_runs_own_ending() {
     );
 }
 
+/// Every plan and sync gets the deposit journal directory, so a run the daemon starts and one
+/// started by hand as the package user share one journal per profile.
+#[test]
+fn runs_are_given_the_deposit_journal_directory() {
+    let h = Harness::tuned(
+        "deposit-journal",
+        |home, _| profile(home, "alpha"),
+        |settings| settings.deposit_journal_dir = Some(PathBuf::from("/var/state/deposit")),
+    );
+    assert_eq!(h.ask(run("alpha"))["ok"], true);
+    h.wait_for("the run", PATIENT, |h| h.launched() >= 1);
+    let args = h.world.lock().unwrap().launched[0]
+        .args
+        .iter()
+        .map(|a| a.to_string_lossy().into_owned())
+        .collect::<Vec<_>>();
+    assert!(
+        args.windows(2)
+            .any(|w| w[0] == "--deposit-journal" && w[1] == "/var/state/deposit"),
+        "{args:?}"
+    );
+}
+
 /// Every plan and sync gets the verified-pair index directory.
 #[test]
 fn runs_are_given_the_pair_index_directory() {

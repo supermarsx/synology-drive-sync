@@ -802,6 +802,9 @@ pub(crate) fn run_daemon(options: &Options) -> ExitCode {
         // `$cache_root/pairs`: one `<profile>.redb` per profile; the core
         // creates the directory 0700 and claims it with its marker.
         pair_index_dir: Some(options.var.join("state/cache/pairs")),
+        // One `<owner>.journal` and `<owner>.lock` per profile and destination; the core creates
+        // the directory 0700 and refuses one others may write.
+        deposit_journal_dir: Some(options.var.join("state/deposit")),
         session_ttl: Some(super::session::configured_ttl()),
         ..Settings::default()
     };

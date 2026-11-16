@@ -1037,6 +1037,9 @@ fi
 if [ "$allow_delete" != true ]; then
     set -- "$@" --no-delete
 fi
+# The atomic deposit's journal lives in the package's own state, as the daemon
+# engine's runs keep it: one journal per profile, shared by every engine.
+set -- "$@" --deposit-journal "$state_root/deposit"
 # Appended to the core's own argv, before the supervisor wrap below, so the
 # supervisor's fixed prefix -- pid, start, boot, --core-nice, -- -- keeps the
 # exact shape its identity check depends on. A plan or a sync is per-file work

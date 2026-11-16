@@ -224,6 +224,9 @@ pub(crate) struct Settings {
     /// and runs stay child processes (redb can abort a process on some damaged
     /// files).
     pub(crate) pair_index_dir: Option<PathBuf>,
+    /// The atomic deposit's journal directory (`var/state/deposit`), passed to every plan and
+    /// sync as `--deposit-journal DIR`. `None` leaves the core its per-user default.
+    pub(crate) deposit_journal_dir: Option<PathBuf>,
     /// Publish `run.lock` for the bridge and shell readers (Linux).
     pub(crate) publish_run_lock: bool,
     /// How often an armed realtime routine syncs its whole tree anyway.
@@ -247,6 +250,7 @@ impl Default for Settings {
             mutation_deadline: Duration::from_secs(120),
             core_nice: None,
             pair_index_dir: None,
+            deposit_journal_dir: None,
             publish_run_lock: cfg!(target_os = "linux"),
             full_reconcile_every: Duration::from_secs(24 * 3600),
             observe_grace: Duration::from_secs(30),
@@ -2791,6 +2795,10 @@ impl Control {
                 .into(),
             );
             args.push((&element.path).into());
+        }
+        if let Some(dir) = &self.settings.deposit_journal_dir {
+            args.push("--deposit-journal".into());
+            args.push(dir.into());
         }
         if let Some(dir) = &self.settings.pair_index_dir {
             args.push("--pair-index".into());
