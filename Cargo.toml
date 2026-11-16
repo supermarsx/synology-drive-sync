@@ -107,7 +107,8 @@ overflow-checks = false
 # next open ("Database page size 0", set aside and rebuilt on every run). Found by
 # `-opt-bisect-limit` on the redb crate; i686 and x86_64 are unaffected. Several units keep
 # write_header out of the context that triggers it; `tests/pair_index_codegen.rs`, run in release
-# under QEMU in CI, is what shows a toolchain or redb update still does.
+# under QEMU in CI, is what shows a toolchain or redb update still does. rustc 1.100.0 does not
+# reproduce it (that test passes with redb in one unit too); the setting stays, as it costs little.
 [profile.release.package.redb]
 codegen-units = 16
 
