@@ -28,6 +28,8 @@ class CoverageMetrics:
     general_count: int
     dsm_covered: int
     dsm_count: int
+    # (spelling summed, spelling it was summed into), both as llvm-cov wrote them.
+    merged: Tuple[Tuple[str, str], ...] = ()
 
 
 def _unique_object(pairs: Sequence[Tuple[str, Any]]) -> Dict[str, Any]:
@@ -61,11 +63,16 @@ def _canonical_input_path(value: Any, label: str) -> str:
         raise CoveragePolicyError(f"{label} must be a non-empty path")
     if not os.path.isabs(value):
         raise CoveragePolicyError(f"{label} must be absolute")
-    components = value.replace("\\", "/").split("/")
-    if any(component in {".", ".."} for component in components):
-        raise CoveragePolicyError(f"{label} must not contain traversal components")
-    absolute = os.path.abspath(value)
+    # Since Rust 1.100, llvm-cov names a module that a binary includes with `#[path = "../x.rs"]`
+    # as written (`src/bin/../dsm_api.rs`). Resolve `.` and `..` lexically, then through the
+    # filesystem, so every spelling of a file is judged as that one file; containment in the
+    # repository and the exact DSM set are checked on the result.
+    absolute = os.path.normpath(value)
     return os.path.normcase(os.path.realpath(absolute))
+
+
+def _has_traversal(value: str) -> bool:
+    return any(part in {".", ".."} for part in value.replace("\\", "/").split("/"))
 
 
 def _canonical_source_path(value: Any, label: str) -> str:
@@ -127,7 +134,9 @@ def validate_summary(summary_path: Path, repository_root: Path) -> CoverageMetri
         for relative in DSM_BOUNDARY
     }
     seen_dsm_paths = set()
-    seen_paths = set()
+    seen_filenames = set()
+    first_spelling: Dict[str, str] = {}
+    merged: List[Tuple[str, str]] = []
     dsm_covered = 0
     dsm_count = 0
     general_covered = 0
@@ -140,9 +149,8 @@ def validate_summary(summary_path: Path, repository_root: Path) -> CoverageMetri
         label = f"files[{index}]"
         if not isinstance(entry, dict):
             raise CoveragePolicyError(f"{label} must be an object")
-        path = _canonical_source_path(
-            _required_property(entry, "filename", label), f"{label}.filename"
-        )
+        filename = _required_property(entry, "filename", label)
+        path = _canonical_source_path(filename, f"{label}.filename")
         try:
             inside_repository = os.path.commonpath((repository, path)) == repository
         except ValueError:
@@ -151,9 +159,22 @@ def validate_summary(summary_path: Path, repository_root: Path) -> CoverageMetri
             raise CoveragePolicyError(
                 f"instrumented path is outside the repository: {path}"
             )
-        if path in seen_paths:
-            raise CoveragePolicyError(f"duplicate instrumented path: {path}")
-        seen_paths.add(path)
+        # The same spelling twice is a malformed export. Two spellings of one file (a module the
+        # library compiles and a binary includes through `#[path]`) are two llvm-cov entries that
+        # its unfiltered aggregate counts separately, so they are summed here as well.
+        if filename in seen_filenames:
+            raise CoveragePolicyError(f"duplicate instrumented path: {filename}")
+        seen_filenames.add(filename)
+        if path in first_spelling:
+            earlier = first_spelling[path]
+            if _has_traversal(earlier) and not _has_traversal(filename):
+                # Name the clean spelling as the file the other was summed into.
+                merged.append((earlier, filename))
+                first_spelling[path] = filename
+            else:
+                merged.append((filename, earlier))
+        else:
+            first_spelling[path] = filename
 
         covered, count = _line_counts(entry, label)
         if path in expected_dsm_paths:
@@ -198,7 +219,23 @@ def validate_summary(summary_path: Path, repository_root: Path) -> CoverageMetri
         general_count=general_count,
         dsm_covered=dsm_covered,
         dsm_count=dsm_count,
+        merged=tuple(merged),
     )
+
+
+def merge_notes(metrics: CoverageMetrics, repository_root: Path) -> List[str]:
+    """One line per file whose second spelling was summed into its first."""
+
+    root = str(repository_root.resolve()).replace("\\", "/").rstrip("/") + "/"
+
+    def shown(filename: str) -> str:
+        spelled = filename.replace("\\", "/")
+        return spelled[len(root) :] if spelled.startswith(root) else filename
+
+    return [
+        f"note: merged {shown(summed)} into {shown(into)}"
+        for summed, into in metrics.merged
+    ]
 
 
 def enforce_thresholds(
@@ -241,6 +278,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         print(f"Invalid coverage summary: {error}", file=sys.stderr)
         return 2
 
+    for note in merge_notes(metrics, args.repository):
+        print(note)
     print(
         "Non-DSM line coverage: "
         f"{metrics.general_covered}/{metrics.general_count} = "

@@ -1,5 +1,7 @@
+import contextlib
 import copy
 import importlib.util
+import io
 import json
 import os
 import shutil
@@ -131,11 +133,25 @@ class CoveragePolicyTests(unittest.TestCase):
         )
         self.assert_invalid(duplicate_general)
 
+        # llvm-cov on Rust 1.100 spells a `#[path]` module of a binary as written
+        # (src/bin/../dsm_api.rs): a traversal inside the repository is that same file.
         traversal = valid_document()
         traversal["data"][0]["files"][2]["filename"] = str(
             REPOSITORY_ROOT / "src" / ".." / "src" / "api.rs"
         )
-        self.assert_invalid(traversal)
+        traversal["data"][0]["files"][0]["filename"] = str(
+            REPOSITORY_ROOT / "src" / "bin" / ".." / "dsm_api.rs"
+        )
+        metrics = self.validate(traversal)
+        self.assertEqual((metrics.general_covered, metrics.general_count), (90, 100))
+        self.assertEqual((metrics.dsm_covered, metrics.dsm_count), (74, 100))
+        self.assertEqual(metrics.merged, ())
+
+        escaping = valid_document()
+        escaping["data"][0]["files"][2]["filename"] = str(
+            REPOSITORY_ROOT / "src" / ".." / ".." / "forged-coverage-source.rs"
+        )
+        self.assert_invalid(escaping)
 
         outside = valid_document()
         outside["data"][0]["files"][2]["filename"] = str(
@@ -148,6 +164,45 @@ class CoveragePolicyTests(unittest.TestCase):
             REPOSITORY_ROOT / "src" / "forged-coverage-source.rs"
         )
         self.assert_invalid(nonexistent_inside)
+
+    def test_two_spellings_of_one_file_are_summed_and_named(self):
+        # A module the library compiles and a binary includes through `#[path]` is two
+        # llvm-cov entries; both count in its aggregate, and the merge is never silent.
+        document = valid_document()
+        # Spelled as llvm-cov writes it, not resolved.
+        second = coverage_file(REPOSITORY_ROOT / "src" / "api.rs", 5, 10)
+        second["filename"] = str(REPOSITORY_ROOT / "src" / "bin" / ".." / "api.rs")
+        document["data"][0]["files"].insert(2, second)
+        document["data"][0]["totals"]["lines"] = {"covered": 169, "count": 210}
+        metrics = self.validate(document)
+        self.assertEqual((metrics.general_covered, metrics.general_count), (95, 110))
+        expected = ["note: merged src/bin/../api.rs into src/api.rs"]
+        self.assertEqual(coverage_policy.merge_notes(metrics, REPOSITORY_ROOT), expected)
+
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            status = coverage_policy.main(
+                [
+                    "--summary",
+                    str(self.summary_path),
+                    "--repository",
+                    str(REPOSITORY_ROOT),
+                    "--minimum-general",
+                    "80",
+                    "--minimum-dsm",
+                    "70",
+                    "--enforce",
+                ]
+            )
+        self.assertEqual(status, 0)
+        self.assertEqual(output.getvalue().splitlines()[0], expected[0])
+
+        # The same spelling twice is still a malformed export.
+        repeated = copy.deepcopy(document)
+        repeated["data"][0]["files"].append(
+            copy.deepcopy(repeated["data"][0]["files"][2])
+        )
+        self.assert_invalid(repeated)
 
     def test_counts_and_unfiltered_aggregate_fail_closed(self):
         for invalid_count in (True, 1.0, -1):
