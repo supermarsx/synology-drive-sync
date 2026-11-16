@@ -13,7 +13,7 @@
 //! key or `meta` value that does not decode. Every key and value is `&[u8]` and checked here, so
 //! no stored byte can reach a decoder that unwraps.
 //!
-//! redb also panics inside `create_file`, before `check_integrity` can run, on some corruptions
+//! redb also panics inside its open, before `check_integrity` can run, on some corruptions
 //! of its saved allocator state (a single flipped byte, found by a byte-flip sweep). A release
 //! build aborts on a panic, so such a file would crash every run. While a thread is inside redb
 //! for an index file, a panic hook records the panic beside it (`<stem>.redb.panicked`); the next
@@ -1159,7 +1159,9 @@ fn open_database(
     loop {
         let file = open_file_safely(paths).map_err(Opening::Issue)?;
         let found = Fingerprint::of(&file);
-        match builder(cache_mib).create_file(file) {
+        let backend =
+            redb::backends::FileBackend::new(file).map_err(|error| Opening::Redb(error.into()))?;
+        match builder(cache_mib).create_with_backend(backend) {
             Ok(database) => return Ok((database, found)),
             Err(redb::DatabaseError::DatabaseAlreadyOpen) if started.elapsed() < LOCK_WAIT => {
                 std::thread::sleep(LOCK_RETRY);
