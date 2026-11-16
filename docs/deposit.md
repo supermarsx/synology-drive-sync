@@ -77,7 +77,9 @@ sets `deposit = "direct"`. There is never a silent fall back.
 `deposit = "direct"` (or `--deposit direct`) uploads straight to the final name, as before. It
 costs fewer requests per file, but a run killed mid-upload can leave a partial or torn file under
 the final name, and a `--compare metadata` or `size-only` run may then call a torn file unchanged.
-Every run in this mode is named `deposit-not-atomic`.
+Every run in this mode is named `deposit-not-atomic`. The DSM package's profile editor does not
+offer the opt-out: a package profile always deposits atomically (File Station on DSM 7 offers
+Rename).
 
 ## Cost
 

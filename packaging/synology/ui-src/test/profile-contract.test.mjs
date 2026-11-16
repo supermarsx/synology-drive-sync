@@ -112,9 +112,11 @@ test("profile editor, browser API, and Rust bridge share one exact configurable 
   const configuredCoreFields = new Set(rustFields
     .filter((field) => !["name", "make_default"].includes(field))
     .map((field) => mutationToCore[field] || field));
+  // `deposit` is not offered by the DSM editor: a package profile always deposits atomically
+  // (every DSM 7 File Station offers Rename), and the direct opt-out is for the command line.
   assert.deepEqual(
     coreFields.filter((field) => !configuredCoreFields.has(field)).sort(),
-    ["log_file", "no_vault", "password_file", "remote_log_token_env", "remote_log_token_file", "totp_secret_file"]
+    ["deposit", "log_file", "no_vault", "password_file", "remote_log_token_env", "remote_log_token_file", "totp_secret_file"]
   );
 
   for (const field of rustFields) {
