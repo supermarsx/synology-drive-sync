@@ -573,12 +573,12 @@ class WorkflowWiringTests(unittest.TestCase):
             "actions/deploy-pages": "368f82528645a54fb793d4d04e342629a3f51346",
             "actions/download-artifact": "9000827ccba6bdab643e8b6fd33ac0654aef8333",
             "actions/setup-node": "949feb2413d6458794dcd2491c4babbbce0c15c1",
-            "actions/upload-artifact": "043fb46d1a93c77aae656e7c1c64a875d1fc6a0a",
+            "actions/upload-artifact": "cf430e030ddbb5b0abf93d22962f4752f3646cd9",
             "actions/upload-pages-artifact": "fc324d3547104276b827a68afc52ff2a11cc49c9",
-            "dtolnay/rust-toolchain": "4360b52568e2003a75bf9bc1d59f33a8e3fc893c",
+            "dtolnay/rust-toolchain": "39008827e6b4319a349e9a42dfc90579dd25f1ca",
             "lycheeverse/lychee-action": "e7477775783ea5526144ba13e8db5eec57747ce8",
-            "pnpm/action-setup": "ea17c68df8912ef543352723c149a84f56e3d413",
-            "taiki-e/install-action": "86f7a0ffb25f40114606501a311ebcfaf882ea32",
+            "pnpm/action-setup": "73e46992e05b19abd31f2f3c20e0e7370d762115",
+            "taiki-e/install-action": "ab49d3c64680143e184118bed66a46419fc15519",
         }
         uses_values = re.findall(
             r"^\s*(?:-\s+)?uses:\s+([^#\s]+)(?:\s+#.*)?$",
@@ -746,7 +746,7 @@ class WorkflowWiringTests(unittest.TestCase):
         }
         zig_installer = "run: bash .github/scripts/install-zig.sh"
         installer_action = (
-            "taiki-e/install-action@86f7a0ffb25f40114606501a311ebcfaf882ea32"
+            "taiki-e/install-action@ab49d3c64680143e184118bed66a46419fc15519"
         )
         qemu_image = (
             "docker.io/tonistiigi/binfmt:qemu-v10.2.3@sha256:"
