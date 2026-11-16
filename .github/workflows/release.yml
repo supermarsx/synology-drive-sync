@@ -1965,3 +1965,165 @@ jobs:
           subject-digest: ${{ steps.digest.outputs.value }}
           sbom-path: sbom/synology-drive-sync-${{ needs.version.outputs.tag }}.cdx.json
           push-to-registry: true
+
+  verify-crates:
+    name: Rehearse crates.io packages
+    # Rehearsal only: a manual dry run publishes nothing, but it should still prove that both crates
+    # package and build from their own archives at the stamped version. A real release does the same
+    # inside `publish-crates`, immediately before it uploads.
+    needs: version
+    if: >-
+      needs.version.outputs.already_published != 'true' &&
+      needs.version.outputs.dry_run == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.version.outputs.sha }}
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable (2026-08-05)
+        with:
+          toolchain: 1.90.0
+      - name: Stamp the crate version, then package and build both crates from their archives
+        env:
+          TAG: ${{ needs.version.outputs.tag }}
+        run: |
+          set -euo pipefail
+          python3 .github/scripts/crate-version.py stamp "$TAG"
+          cargo package --workspace --locked --allow-dirty
+
+  publish-crates:
+    name: Publish crates to crates.io
+    # Runs only after the GitHub Release is live, so crates.io never carries a version the release
+    # does not. Failure here leaves a published release without its crates; recovery is "Re-run
+    # failed jobs" on this same run (a fresh run is a no-op for an already published SHA). Each crate
+    # is skipped when crates.io already has the version, so a re-run after a partial publish only
+    # finishes the missing one.
+    #
+    # Authentication is crates.io Trusted Publishing: the job asks GitHub for an OpenID Connect token
+    # (`id-token: write`) and `crates-io-auth-action` exchanges it for a short-lived, revoked-on-exit
+    # crates.io token. No long-lived token secret exists. The owner enables Trusted Publishing for
+    # each crate on crates.io (repository supermarsx/synology-drive-sync, workflow release.yml,
+    # environment crates-io); the first version of a crate must be published by hand.
+    needs: [version, publish-release]
+    # MUTATION GUARD: uploads to crates.io, which cannot be undone.
+    if: >-
+      needs.version.outputs.already_published != 'true' &&
+      needs.version.outputs.dry_run != 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    environment: crates-io
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.version.outputs.sha }}
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable (2026-08-05)
+        with:
+          toolchain: 1.90.0
+      - name: Stamp the crate version from the calendar tag
+        env:
+          TAG: ${{ needs.version.outputs.tag }}
+          SHA: ${{ needs.version.outputs.sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$(git rev-parse HEAD)" == "$SHA" ]] || {
+            echo "checkout does not match approved release SHA $SHA" >&2
+            exit 1
+          }
+          # The calendar number is allocated after a commit lands on main, so this checkout (and
+          # only this one) gets its crate version here: both manifests, the FFI crate's exact
+          # requirement on the root crate, and Cargo.lock.
+          python3 .github/scripts/crate-version.py stamp "$TAG"
+      - name: Prove both crates package and build from their own archives
+        # `cargo package`, not a dry-run publish: a re-run after a partial publish must still get
+        # past this step, and a dry-run publish refuses a version crates.io already has.
+        run: cargo package --workspace --locked --allow-dirty
+      - id: auth
+        name: Exchange the OIDC token for a short-lived crates.io token
+        uses: rust-lang/crates-io-auth-action@3268eb413133e2960fa4ae0e963ca76380c54cd9 # v1.0.6
+      - name: Publish synology-drive-sync, wait for the index, then synology-drive-sync-ffi
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
+          TAG: ${{ needs.version.outputs.tag }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$TAG" =~ ^[0-9]{2}\.[1-9][0-9]*$ ]] || {
+            echo "refusing to publish for a malformed calendar tag: $TAG" >&2
+            exit 1
+          }
+          version=$(python3 .github/scripts/crate-version.py version "$TAG")
+          user_agent="synology-drive-sync-release (https://github.com/$GITHUB_REPOSITORY)"
+
+          # Prints `exists` or `missing`. Anything else (a 5xx, a rate limit, a network failure) is
+          # an error: publishing on an unknown state could not be undone.
+          crate_state() {
+            local name=$1 body status
+            body="$RUNNER_TEMP/sdsync-crates-$name.json"
+            status=$(curl --silent --show-error --location \
+              --proto '=https' --tlsv1.2 --retry 4 --retry-all-errors \
+              --user-agent "$user_agent" \
+              --output "$body" --write-out '%{http_code}' \
+              "https://crates.io/api/v1/crates/$name/$version")
+            case "$status" in
+              200) echo exists ;;
+              404) echo missing ;;
+              *)
+                echo "crates.io answered HTTP $status for $name $version" >&2
+                return 1
+                ;;
+            esac
+          }
+
+          # Waits until the sparse index lists the version, which is what cargo resolves against
+          # when it verifies the next crate.
+          wait_for_index() {
+            local name=$1 path attempt
+            path="${name:0:2}/${name:2:2}/$name"
+            for attempt in $(seq 1 60); do
+              if curl --silent --fail --location \
+                --proto '=https' --tlsv1.2 --user-agent "$user_agent" \
+                "https://index.crates.io/$path" 2>/dev/null \
+                | jq -e -s --arg version "$version" 'any(.[]; .vers == $version)' >/dev/null 2>&1; then
+                echo "$name $version is in the crates.io index"
+                return 0
+              fi
+              echo "waiting for $name $version to appear in the crates.io index (attempt $attempt of 60)"
+              sleep 15
+            done
+            echo "$name $version did not appear in the crates.io index within 15 minutes" >&2
+            return 1
+          }
+
+          publish_crate() {
+            local name=$1 state
+            state=$(crate_state "$name")
+            if [[ "$state" == exists ]]; then
+              echo "crates.io already has $name $version; skipping its upload"
+            else
+              echo "publishing $name $version"
+              if ! cargo publish -p "$name" --locked --allow-dirty; then
+                # An earlier or concurrent attempt may have uploaded it. Trust the registry, not
+                # the exit status, and only continue if the version really is there.
+                state=$(crate_state "$name")
+                [[ "$state" == exists ]] || {
+                  echo "cargo publish failed and crates.io has no $name $version" >&2
+                  return 1
+                }
+                echo "cargo publish reported a failure but crates.io has $name $version; continuing"
+              fi
+            fi
+            wait_for_index "$name"
+          }
+
+          # The FFI crate depends on the root crate at exactly this version, so the root goes first.
+          publish_crate synology-drive-sync
+          publish_crate synology-drive-sync-ffi

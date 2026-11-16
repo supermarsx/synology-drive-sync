@@ -12,7 +12,7 @@ jobs:
   supply-chain:
     name: RustSec and license notices
     runs-on: ubuntu-24.04
-    timeout-minutes: 15
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -27,30 +27,49 @@ jobs:
         run: bash .github/scripts/generate-third-party-notices.sh "$RUNNER_TEMP/third_party_licenses.html"
       - name: Refuse stale third-party notices
         run: cmp --silent third_party_licenses.html "$RUNNER_TEMP/third_party_licenses.html"
+      - name: Verify the crate version and published metadata agree
+        run: python3 .github/scripts/crate-version.py check
       - name: Verify Rust crate membership
         shell: bash
         run: |
           set -euo pipefail
           members="$RUNNER_TEMP/sdsync-cargo-package-members.txt"
+          ffi_members="$RUNNER_TEMP/sdsync-cargo-package-ffi-members.txt"
           cargo package -p synology-drive-sync --locked --allow-dirty --list > "$members"
-          for expected in license.md readme.md third_party_licenses.html; do
+          cargo package -p synology-drive-sync-ffi --locked --allow-dirty --list > "$ffi_members"
+          for expected in license.md crates-io.md third_party_licenses.html build.rs src/lib.rs; do
             count=$(grep -Fxc "$expected" "$members" || true)
             [[ "$count" == 1 ]] || {
               echo "Cargo package must contain root $expected exactly once" >&2
               exit 1
             }
           done
-          if grep -Eq '(^|/)node_modules/|^packaging/' "$members"; then
-            echo 'Cargo package leaked UI/build-only files:' >&2
-            grep -E '(^|/)node_modules/|^packaging/' "$members" >&2
-            exit 1
-          fi
-          for forbidden in LICENSE README.md SECURITY.md CONTRIBUTING.md THIRD_PARTY_LICENSES.html; do
-            if grep -Fxq "$forbidden" "$members"; then
-              echo "Cargo package contains legacy root filename $forbidden" >&2
+          for expected in license.md crates-io.md include/sdsync.h src/lib.rs; do
+            count=$(grep -Fxc "$expected" "$ffi_members" || true)
+            [[ "$count" == 1 ]] || {
+              echo "FFI Cargo package must contain $expected exactly once" >&2
+              exit 1
+            }
+          done
+          for list in "$members" "$ffi_members"; do
+            if grep -Eq '(^|/)node_modules/|^packaging/|^tests/|^docs/|^target/' "$list"; then
+              echo "Cargo package leaked UI, test, documentation or build-only files:" >&2
+              grep -E '(^|/)node_modules/|^packaging/|^tests/|^docs/|^target/' "$list" >&2
               exit 1
             fi
           done
+          for forbidden in LICENSE README.md readme.md SECURITY.md CONTRIBUTING.md THIRD_PARTY_LICENSES.html; do
+            if grep -Fxq "$forbidden" "$members" "$ffi_members"; then
+              echo "Cargo package contains legacy or repository-only root filename $forbidden" >&2
+              exit 1
+            fi
+          done
+      - name: Package both crates and build each from its own archive
+        # Builds each crate from its own packaged archive, as crates.io would see it, with the FFI
+        # crate resolved against the freshly packaged root crate. Uploads nothing. `cargo package`
+        # rather than `cargo publish --dry-run`: the committed version is only a floor, and once it
+        # has been published a dry-run publish would refuse it as already existing.
+        run: cargo package --workspace --locked
 
   test:
     name: Test ${{ matrix.platform }} ${{ matrix.architecture }}
