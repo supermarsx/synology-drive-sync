@@ -60,8 +60,19 @@ impl TestDir {
     }
 }
 
+impl TestDir {
+    /// A private directory beside this one (never inside it, so a source tree never holds it),
+    /// for the atomic deposit's journal; removed with this directory.
+    pub fn deposit_journal(&self) -> PathBuf {
+        let mut name = self.0.as_os_str().to_owned();
+        name.push(".deposit-journal");
+        PathBuf::from(name)
+    }
+}
+
 impl Drop for TestDir {
     fn drop(&mut self) {
         let _ = fs::remove_dir_all(&self.0);
+        let _ = fs::remove_dir_all(self.deposit_journal());
     }
 }

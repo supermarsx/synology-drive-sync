@@ -27,7 +27,26 @@ impl CapturedRequest {
     pub fn operation(&self) -> String {
         format!("{}.{}", self.api, self.method)
     }
+
+    /// Whether this is the atomic deposit's own bookkeeping: a `Rename` or `Delete` of one of its
+    /// reserved names (publishing a temporary copy, moving a previous version aside, deleting it).
+    /// Not a rename or deletion of user data. The upload of a temporary copy is not bookkeeping:
+    /// it is the upload.
+    #[allow(dead_code)]
+    pub fn is_deposit_bookkeeping(&self) -> bool {
+        matches!(
+            self.api.as_str(),
+            "SYNO.FileStation.Rename" | "SYNO.FileStation.Delete"
+        ) && self
+            .fields
+            .values()
+            .any(|value| value.contains("/~sdsync-") || value.contains("\"~sdsync-"))
+    }
 }
+
+/// What a reader of one path could have seen: its content (`None`: absent) after each request
+/// that changed it, with that request's operation.
+pub type FileHistory = Vec<(String, Option<Vec<u8>>)>;
 
 #[derive(Clone, Debug)]
 struct FileNode {
@@ -204,7 +223,9 @@ struct ServerState {
     rename_replaces_files: bool,
     /// Paths whose content is recorded after every request that changes it: what a reader of the
     /// NAS could have seen at each request boundary. `None` is "absent".
-    watched: BTreeMap<String, Vec<(String, Option<Vec<u8>>)>>,
+    watched: BTreeMap<String, FileHistory>,
+    /// APIs discovery leaves out, the way a DSM that does not offer them answers.
+    withheld_apis: BTreeSet<String>,
 }
 
 #[derive(Debug)]
@@ -255,6 +276,8 @@ enum FaultResponse {
 struct InjectedFault {
     operation: String,
     request_path: Option<String>,
+    /// Only a request one of whose fields contains this, when set.
+    subject: Option<String>,
     phase: FaultPhase,
     response: FaultResponse,
     remaining: usize,
@@ -349,6 +372,7 @@ impl MockFileStation {
             aborted_requests: 0,
             rename_replaces_files: false,
             watched: BTreeMap::new(),
+            withheld_apis: BTreeSet::new(),
         }));
         let shutdown = Arc::new(AtomicBool::new(false));
         let connections = Arc::new(Mutex::new(Vec::new()));
@@ -605,6 +629,16 @@ impl MockFileStation {
             .rename_replaces_files = true;
     }
 
+    /// Leave `api` out of discovery, as a DSM that does not offer it does.
+    #[allow(dead_code)]
+    pub fn withhold_api(&self, api: &str) {
+        self.state
+            .lock()
+            .expect("mock state lock")
+            .withheld_apis
+            .insert(api.to_owned());
+    }
+
     /// Record `path`'s content after every request that changes it, starting from now.
     #[allow(dead_code)]
     pub fn watch_file(&self, path: &str) {
@@ -618,7 +652,7 @@ impl MockFileStation {
     /// What a reader of `path` could have seen: its content after each request that changed it,
     /// with that request's operation, from [`Self::watch_file`] on.
     #[allow(dead_code)]
-    pub fn file_history(&self, path: &str) -> Vec<(String, Option<Vec<u8>>)> {
+    pub fn file_history(&self, path: &str) -> FileHistory {
         self.state
             .lock()
             .expect("mock state lock")
@@ -770,6 +804,7 @@ impl MockFileStation {
         self.inject_fault(InjectedFault {
             operation: operation.to_owned(),
             request_path: None,
+            subject: None,
             phase: FaultPhase::BeforeOperation,
             response: FaultResponse::DropConnection,
             remaining: 1,
@@ -782,6 +817,7 @@ impl MockFileStation {
         self.inject_fault(InjectedFault {
             operation: "SYNO.FileStation.Upload.upload".to_owned(),
             request_path: None,
+            subject: None,
             phase: FaultPhase::AfterCommit,
             response: FaultResponse::DropConnection,
             remaining: 1,
@@ -940,6 +976,7 @@ impl MockFileStation {
         self.inject_fault(InjectedFault {
             operation: "SYNO.API.Info.query".to_owned(),
             request_path: Some("/prefix/webapi/entry.cgi".to_owned()),
+            subject: None,
             phase: FaultPhase::BeforeOperation,
             response: FaultResponse::HttpStatus(status),
             remaining: 1,
@@ -950,6 +987,7 @@ impl MockFileStation {
         self.inject_fault(InjectedFault {
             operation: operation.to_owned(),
             request_path: None,
+            subject: None,
             phase: FaultPhase::BeforeOperation,
             response: FaultResponse::HttpStatus(status),
             remaining: 1,
@@ -974,6 +1012,22 @@ impl MockFileStation {
         self.inject_fault(InjectedFault {
             operation: operation.to_owned(),
             request_path: None,
+            subject: None,
+            phase: FaultPhase::BeforeOperation,
+            response: FaultResponse::ApiError(code),
+            remaining: 1,
+        });
+    }
+
+    /// Answer the next request for `operation` one of whose fields contains `subject` (a JSON
+    /// array such as `["photos"]` names one entry exactly) with DSM error `code`, before acting: a
+    /// refusal of one entry, not of every request of its kind.
+    #[allow(dead_code)]
+    pub fn fail_next_api_operation_on(&self, operation: &str, subject: &str, code: i64) {
+        self.inject_fault(InjectedFault {
+            operation: operation.to_owned(),
+            request_path: None,
+            subject: Some(subject.to_owned()),
             phase: FaultPhase::BeforeOperation,
             response: FaultResponse::ApiError(code),
             remaining: 1,
@@ -986,6 +1040,7 @@ impl MockFileStation {
         self.inject_fault(InjectedFault {
             operation: operation.to_owned(),
             request_path: None,
+            subject: None,
             phase: FaultPhase::BeforeOperation,
             response: FaultResponse::ApiError(code),
             remaining: times,
@@ -996,6 +1051,7 @@ impl MockFileStation {
         self.inject_fault(InjectedFault {
             operation: "SYNO.FileStation.Upload.upload".to_owned(),
             request_path: None,
+            subject: None,
             phase: FaultPhase::AfterCommit,
             response: FaultResponse::HttpStatus(status),
             remaining: 1,
@@ -1202,6 +1258,7 @@ fn handle_connection(
             state.faults.push(InjectedFault {
                 operation: target,
                 request_path: None,
+                subject: None,
                 phase: FaultPhase::BeforeOperation,
                 response: FaultResponse::HttpStatus(status),
                 remaining: 1,
@@ -1255,17 +1312,24 @@ fn route_request(
         api,
         method,
         FaultPhase::BeforeOperation,
+        fields,
     ) {
         return response;
     }
     if api == "SYNO.API.Info" && method == "query" {
         // `query=all` is a different question from the ten-name allowlist query, and this mock
         // answers it differently so a test can tell which one the client asked.
-        return if fields.get("query").map(String::as_str) == Some("all") {
-            MockResponse::Json(full_api_map(state.advertise_malformed_api))
+        let mut answer = if fields.get("query").map(String::as_str) == Some("all") {
+            full_api_map(state.advertise_malformed_api)
         } else {
-            MockResponse::Json(discovery())
+            discovery()
         };
+        if let Some(map) = answer["data"].as_object_mut() {
+            for api in &state.withheld_apis {
+                map.remove(api);
+            }
+        }
+        return MockResponse::Json(answer);
     }
     if api == "SYNO.API.Auth" && method == "login" {
         if let Some(marker) = &state.reflected_login_failure {
@@ -1561,9 +1625,14 @@ fn route_request(
             state
                 .files
                 .insert(path, FileNode::written(upload.contents, mtime_seconds));
-            if let Some(response) =
-                take_injected_fault(state, request_path, api, method, FaultPhase::AfterCommit)
-            {
+            if let Some(response) = take_injected_fault(
+                state,
+                request_path,
+                api,
+                method,
+                FaultPhase::AfterCommit,
+                fields,
+            ) {
                 return response;
             }
             success(Value::Null)
@@ -1705,6 +1774,13 @@ fn route_request(
             if name.is_empty() || name.contains('/') {
                 return api_error(418);
             }
+            // The volume's name limit holds for a rename as it does for an upload: the atomic
+            // deposit uploads under a short temporary name and meets the limit here.
+            if let Some((limit, code)) = state.refuse_names_over_bytes
+                && name.len() > limit
+            {
+                return api_error(code);
+            }
             let renamed = format!("{parent}/{name}");
             if renamed == path {
                 return success(json!({"files": [{"path": renamed, "name": name}]}));
@@ -1799,6 +1875,7 @@ fn take_injected_fault(
     api: &str,
     method: &str,
     phase: FaultPhase,
+    fields: &BTreeMap<String, String>,
 ) -> Option<MockResponse> {
     let operation = format!("{api}.{method}");
     let fault = state.faults.iter_mut().find(|fault| {
@@ -1809,6 +1886,10 @@ fn take_injected_fault(
                 .request_path
                 .as_deref()
                 .is_none_or(|expected| expected == request_path)
+            && fault
+                .subject
+                .as_deref()
+                .is_none_or(|subject| fields.values().any(|value| value.contains(subject)))
     })?;
     fault.remaining -= 1;
     Some(match fault.response {
