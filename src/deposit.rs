@@ -306,6 +306,9 @@ pub struct DepositReport {
     /// Journalled deposits still unsettled when the run ended (carried to the next run).
     pub unsettled: usize,
     pub issues: Vec<DepositIssue>,
+    /// NAS files recovery kept but could not prove whole (an interrupted server copy): this run
+    /// uploads over them whatever its comparison says (`plan::force_uploads`).
+    pub suspect: BTreeSet<String>,
 }
 
 impl DepositReport {
@@ -1376,7 +1379,8 @@ pub fn begin(
         report.issues.push(DepositIssue::warning(
             "deposit-not-atomic",
             root.as_str(),
-            "deposit = \"direct\": files are uploaded straight to their final names, so a run              killed mid-upload can leave a partial or torn file there",
+            "deposit = \"direct\": files are uploaded straight to their final names, so a run \
+             killed mid-upload can leave a partial or torn file there",
         ));
         return Ok(Begun {
             deposit: crate::sync::Deposit::Direct,
@@ -1390,7 +1394,8 @@ pub fn begin(
             return Err(journal_error(
                 "deposit-journal-unavailable",
                 Path::new(""),
-                "there is no per-user state directory (HOME or LOCALAPPDATA is not set); give                  the journal a directory (--deposit-journal)",
+                "there is no per-user state directory (HOME or LOCALAPPDATA is not set); give \
+                 the journal a directory (--deposit-journal)",
             ));
         }
     };
@@ -1418,7 +1423,8 @@ pub fn end(context: Option<std::sync::Arc<DepositContext>>, report: &mut Deposit
             "deposit-recovery-failed",
             &context.journal.path().display().to_string(),
             format!(
-                "the deposit journal could not be closed ({error}); the next run re-checks every                  deposit it names"
+                "the deposit journal could not be closed ({error}); the next run re-checks every \
+                 deposit it names"
             ),
         ));
     }
@@ -1475,6 +1481,12 @@ pub(crate) fn recover<O: DepositOps>(
         ) {
             Ok((settled, issue)) => {
                 let acted = issue.is_some();
+                if issue
+                    .as_ref()
+                    .is_some_and(|issue| issue.code == "deposit-copy-kept")
+                {
+                    report.suspect.insert(intent.final_path.clone());
+                }
                 if let Some(issue) = issue {
                     report.issues.push(issue);
                 }
@@ -1668,9 +1680,9 @@ fn recover_one<O: DepositOps>(
                 return Ok((true, None));
             }
             // Not provably the interrupted copy: time has passed, and someone else may have
-            // written the name since. It is kept and named; the comparison that follows recovery
-            // finds it differs from the source and replaces it through an atomic deposit, as it
-            // would any file that differs.
+            // written the name since. It is kept and named, and never adopted: this run uploads
+            // over it whatever its comparison says (`DepositReport::suspect`), through an atomic
+            // deposit like any other overwrite.
             let _ = journal_started;
             Ok((
                 true,
@@ -1678,7 +1690,9 @@ fn recover_one<O: DepositOps>(
                     "deposit-copy-kept",
                     final_path,
                     format!(
-                        "an earlier run's server-side copy to it was interrupted; it holds {size}                          bytes where the copy would hold {}, so it is kept and this run's                          comparison replaces it",
+                        "an earlier run's server-side copy to it was interrupted; it holds {size} \
+                         bytes where the copy would hold {}, so it is kept and this run's \
+                         comparison replaces it",
                         intent.size
                     ),
                 )),

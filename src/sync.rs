@@ -925,7 +925,9 @@ fn upload_through_deposit<O: SyncOperations>(
         context.issue(crate::deposit::DepositIssue::warning(
             "deposit-not-atomic",
             remote_path,
-            "uploaded straight to its final name: a comma in its path whose part before it is              another NAS entry makes a Rename or Delete of a temporary copy beside it unsafe until              it is known how DSM parses a comma in a path list",
+            "uploaded straight to its final name: a comma in its path whose part before it is \
+             another NAS entry makes a Rename or Delete of a temporary copy beside it unsafe until \
+             it is known how DSM parses a comma in a path list",
         ));
         return client
             .upload(local, remote_path, observer, cancellation)
