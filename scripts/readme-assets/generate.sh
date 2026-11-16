@@ -28,7 +28,7 @@ out=$(mktemp -d)
 trap 'rm -rf "$out"' EXIT
 if mount_out=$(cd "$out" && pwd -W 2>/dev/null); then :; else mount_out=$out; fi
 
-rust_image=rust:1.90.0-bookworm
+rust_image=rust:1.100.0-bookworm
 assets_image=sdsync-readme-assets
 
 docker build -q -t "$assets_image" "$mount_root/scripts/readme-assets"

@@ -64,7 +64,7 @@ class RepositoryStateTests(unittest.TestCase):
             with self.subTest(crate=package["name"]):
                 self.assertLessEqual(len(package["description"]), 200)
                 self.assertLessEqual(len(package["keywords"]), 5)
-                self.assertEqual(package["rust-version"], "1.90")
+                self.assertEqual(package["rust-version"], "1.100")
                 self.assertEqual(package["license"], "MIT")
                 self.assertEqual(
                     package["repository"], "https://github.com/supermarsx/synology-drive-sync"
