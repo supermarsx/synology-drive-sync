@@ -540,8 +540,8 @@ class WorkflowWiringTests(unittest.TestCase):
             dockerfile,
         )
         self.assertIn(
-            "FROM debian:bookworm-slim@sha256:"
-            "3783cc01769c7b2b1b83a5c5ad96c815348e28ed7da68e2e3687004faa906251 AS runtime",
+            "FROM debian:trixie-slim@sha256:"
+            "a72b4433de1cf7d6bae0c4cee74d0547f58601a643b3375f070c51600d63b6b2 AS runtime",
             dockerfile,
         )
         for instruction in re.findall(r"^FROM\s+([^\s]+)", dockerfile, re.MULTILINE):
@@ -753,8 +753,8 @@ class WorkflowWiringTests(unittest.TestCase):
             "400a4873b838d1b89194d982c45e5fb3cda4593fbfd7e08a02e76b03b21166f0"
         )
         alpine_image = (
-            "docker.io/library/alpine:3.24.1@sha256:"
-            "28bd5fe8b56d1bd048e5babf5b10710ebe0bae67db86916198a6eec434943f8b"
+            "docker.io/library/alpine:3.24.4@sha256:"
+            "f59abe656b692d901e184be3445e084786602108599d2a51d229c0f5a48c71bf"
         )
 
         for section in sections:
