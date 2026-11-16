@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-readonly zig_version="0.16.0"
+readonly zig_version="0.17.1"
 readonly download_base="https://ziglang.org/download/$zig_version"
 
 die() {
@@ -37,11 +37,11 @@ machine_arch=$(uname -m)
 case "$machine_arch" in
     x86_64)
         archive_arch="x86_64"
-        archive_sha256="70e49664a74374b48b51e6f3fdfbf437f6395d42509050588bd49abe52ba3d00"
+        archive_sha256="3581863e3cbcfd0fce0efc682ce7e9e93da96668a977791d356a26d2a7e9b17a"
         ;;
     aarch64)
         archive_arch="aarch64"
-        archive_sha256="ea4b09bfb22ec6f6c6ceac57ab63efb6b46e17ab08d21f69f3a48b38e1534f17"
+        archive_sha256="a1546d5646eb184437918d6635ca6b762a0e889eac09cef720ee7a1ed3fe7795"
         ;;
     *)
         die "unsupported Linux architecture: $machine_arch"

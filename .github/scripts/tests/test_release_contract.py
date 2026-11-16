@@ -550,10 +550,10 @@ class WorkflowWiringTests(unittest.TestCase):
         notice_generator = (
             REPOSITORY_ROOT / ".github/scripts/generate-third-party-notices.sh"
         ).read_text(encoding="utf-8")
-        self.assertIn("version=0.9.2", notice_generator)
+        self.assertIn("version=0.9.3", notice_generator)
         self.assertIn(
             "archive_sha256="
-            "9099a59e820c38a68b9d65f300662a567d56562f9a10f6aa4c7e86c17c2566af",
+            "3ad1e94ea1e63d69d1961f4fb15ccbbe9575d906111f96d2cb4dce6df48f71b4",
             notice_generator,
         )
 
@@ -598,11 +598,11 @@ class WorkflowWiringTests(unittest.TestCase):
 
         self.assertEqual(
             re.findall(r"^\s*node-version:\s*([^#\s]+)", workflows, re.MULTILINE),
-            ["24.20.0"] * 4,
+            ["26.13.1"] * 4,
         )
         self.assertNotIn("mlugg/setup-zig", workflows)
         self.assertNotIn("ACTIONS_ALLOW_USE_UNSECURE_NODE_VERSION", workflows)
-        self.assertEqual(workflows.count("tool: cargo-zigbuild@0.23.3"), 3)
+        self.assertEqual(workflows.count("tool: cargo-zigbuild@0.24.1"), 3)
 
         runner_labels = set(
             re.findall(r"^\s*(?:runs-on:|- runner:)\s+([^$\s][^\s]*)\s*$", workflows, re.MULTILINE)
@@ -766,7 +766,7 @@ class WorkflowWiringTests(unittest.TestCase):
             self.assertIn(zig_installer, section)
             self.assertNotIn("setup-zig", section)
             self.assertIn(installer_action, section)
-            self.assertIn("tool: cargo-zigbuild@0.23.3", section)
+            self.assertIn("tool: cargo-zigbuild@0.24.1", section)
             self.assertIn(qemu_image, section)
             self.assertIn(alpine_image, section)
             self.assertIn("qemu_binary: qemu-i386", section)
@@ -836,13 +836,13 @@ class WorkflowWiringTests(unittest.TestCase):
         zig_script = (REPOSITORY_ROOT / ".github/scripts/install-zig.sh").read_text(
             encoding="utf-8"
         )
-        self.assertIn('readonly zig_version="0.16.0"', zig_script)
+        self.assertIn('readonly zig_version="0.17.1"', zig_script)
         self.assertIn(
-            "70e49664a74374b48b51e6f3fdfbf437f6395d42509050588bd49abe52ba3d00",
+            "3581863e3cbcfd0fce0efc682ce7e9e93da96668a977791d356a26d2a7e9b17a",
             zig_script,
         )
         self.assertIn(
-            "ea4b09bfb22ec6f6c6ceac57ab63efb6b46e17ab08d21f69f3a48b38e1534f17",
+            "a1546d5646eb184437918d6635ca6b762a0e889eac09cef720ee7a1ed3fe7795",
             zig_script,
         )
 
@@ -1079,7 +1079,7 @@ class WorkflowWiringTests(unittest.TestCase):
         )
         self.assertIn('macos_deployment_target: "10.12"', workflow)
         self.assertIn('macos_deployment_target: "11.0"', workflow)
-        self.assertEqual(workflow.count("tool: cargo-zigbuild@0.23.3"), 2)
+        self.assertEqual(workflow.count("tool: cargo-zigbuild@0.24.1"), 2)
         self.assertIn("name: Verify emitted macOS deployment floors", workflow)
         self.assertIn('build_metadata=$(xcrun vtool -show-build "$artifact")', workflow)
         self.assertIn('[[ "$minos" == "$MACOS_DEPLOYMENT_TARGET" ]]', workflow)
@@ -1148,7 +1148,7 @@ class WorkflowWiringTests(unittest.TestCase):
             coverage_env.splitlines(),
             [
                 "RUST_TOOLCHAIN=1.100.0",
-                "CARGO_LLVM_COV_VERSION=0.9.0",
+                "CARGO_LLVM_COV_VERSION=0.9.1",
                 "COVERAGE_MIN_LINES=90",
                 "COVERAGE_DSM_MIN_LINES=74",
             ],

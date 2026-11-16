@@ -84,7 +84,7 @@ Install those prerequisites before running a report:
 
 ```bash
 rustup toolchain install 1.100.0 --component llvm-tools-preview
-cargo +1.100.0 install cargo-llvm-cov --version 0.9.0 --locked
+cargo +1.100.0 install cargo-llvm-cov --version 0.9.1 --locked
 ```
 
 Run the full report or the same hard check used by CI:

@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-version=0.22.2
+version=0.23.0
 target=x86_64-unknown-linux-gnu
 archive_name="cargo-audit-$target-v$version.tgz"
 package_name="cargo-audit-$target-v$version"
-archive_sha256=ab28a1bdb54db4d5d8ad5981cf1f959410370b3d28250dbd35f6a44248620e39
+archive_sha256=b77993532b253fcbf550996d7716465ec3d734d4e74e7f87bfb65a19add0fb59
 download_url="https://github.com/rustsec/rustsec/releases/download/cargo-audit/v$version/$archive_name"
 
 temporary_root=$(mktemp -d "${TMPDIR:-/tmp}/sdsync-cargo-audit.XXXXXXXX")

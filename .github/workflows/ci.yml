@@ -288,7 +288,7 @@ jobs:
           persist-credentials: false
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
-          node-version: 24.20.0
+          node-version: 26.13.1
           package-manager-cache: false
       - uses: pnpm/action-setup@73e46992e05b19abd31f2f3c20e0e7370d762115 # v6.1.1
         with:
@@ -318,7 +318,7 @@ jobs:
         if: matrix.cross_compile == true
         uses: taiki-e/install-action@ab49d3c64680143e184118bed66a46419fc15519 # v2.90.5
         with:
-          tool: cargo-zigbuild@0.23.3
+          tool: cargo-zigbuild@0.24.1
       - name: Extract pinned QEMU user emulator
         if: matrix.cross_compile == true
         env:
@@ -579,7 +579,7 @@ jobs:
           persist-credentials: false
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
-          node-version: 24.20.0
+          node-version: 26.13.1
           package-manager-cache: false
       - uses: pnpm/action-setup@73e46992e05b19abd31f2f3c20e0e7370d762115 # v6.1.1
         with:

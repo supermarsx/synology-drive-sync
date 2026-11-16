@@ -141,13 +141,13 @@ copying a path blindly.
 
 ## ARMv7 cross-build example
 
-The supported release/local cross-build path uses Rust 1.100.0, Zig 0.16.0, and
-`cargo-zigbuild` 0.23.3:
+The supported release/local cross-build path uses Rust 1.100.0, Zig 0.17.1, and
+`cargo-zigbuild` 0.24.1:
 
 ```bash
 rustup toolchain install 1.100.0 --profile minimal \
   --target armv7-unknown-linux-musleabihf
-cargo install --locked cargo-zigbuild --version 0.23.3
+cargo install --locked cargo-zigbuild --version 0.24.1
 
 cargo +1.100.0 zigbuild \
   --release --locked \
