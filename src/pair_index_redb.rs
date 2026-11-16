@@ -47,7 +47,7 @@ use crate::pair_index::{
 };
 
 /// The redb release the index is written by, recorded in `meta.writer`.
-pub const REDB_VERSION: &str = "4.4.0";
+pub const REDB_VERSION: &str = "4.6.0";
 /// The directory marker.
 pub const MARKER: &str = ".sdsync-pair-index";
 const MARKER_PREFIX: &str = "sdsync.pair-index.";

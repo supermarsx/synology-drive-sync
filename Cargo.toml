@@ -72,7 +72,7 @@ zeroize = "1.9.1"
 # status-change time, which Windows does not expose through a path stat, so it is never used
 # there. 4.2 and later report damaged files as errors instead of panicking.
 [target.'cfg(unix)'.dependencies]
-redb = "4.4.0"
+redb = "4.6.0"
 
 [target.'cfg(target_os = "windows")'.dependencies]
 windows-native-keyring-store = { version = "1.1.0", default-features = false }
