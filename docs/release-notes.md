@@ -18,6 +18,19 @@ lists its own commits.
   (`code=audit_event_caller_refused manager=…`), not `code: None`, and runs refused
   `audit_unavailable` back off from 30 seconds to at most 30 minutes, with one Activity row and one
   alert for the episode and `degraded=audit_unavailable` in `controller.state` while it lasts.
+- **Files reach the NAS whole, or not at all.** Each file is uploaded to a temporary
+  `~sdsync-part-` name in its own folder, verified there (length, modification time and File
+  Station's MD5), and only then renamed to its final name; a replaced file's previous version is
+  renamed aside first and deleted once the new one is in place. A crash, `kill -9`, power loss or
+  dropped link leaves the old version or the new one under the final name, never a partial file;
+  during a replacement the name is absent for one round trip. A local journal records every upload
+  before it starts, and the next run finishes or rolls back what an interrupted run left
+  (`deposit-rolled-back`, `deposit-completed`, `deposit-temp-removed`, ...), touching only names its
+  journal lists. A DSM without File Station Rename gets nothing written
+  (`deposit-not-atomic-unavailable`); `deposit = "direct"` restores the old behaviour and is named
+  on every run. A failed server copy's partial destination is deleted and the file uploaded in the
+  same run. Each file costs two to five more requests; bytes on the wire are unchanged. See
+  [Crash-atomic deposit](deposit.md).
 - **A moved file under 8 MiB is uploaded instead of copied on the NAS.** A server-side copy first
   downloads the old copy to prove it, then runs a copy task and checks the result, which for small
   files took longer than sending them: a 10-file folder move went from about 40 s to about 18 s at

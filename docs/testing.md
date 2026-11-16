@@ -64,6 +64,15 @@ The deterministic suite has these complementary layers:
   walk deadline under the `fault-inject` feature (compiled only there), and the kernel's own per-user
   limit, lowered to 512 with `sysctl` for that job, to prove the named `watch_limit` refusal against
   real ENOSPC. The package suite covers the controller side with a fake watcher.
+- **Crash-atomic deposit tests.** `src/deposit/tests.rs` runs the protocol, the journal and the
+  recovery against an in-memory NAS whose Rename either refuses a taken name (DSM's documented
+  answer) or replaces a file (rename(2)), recording what a reader could have seen under every name
+  after every request. `tests/atomic_deposit.rs` runs the CLI against the mock, whose
+  `watch_file`/`file_history` assert request by request that a final name never held a partial file.
+  `tests/atomic_deposit_faults.rs` (the `fault-inject` feature, Linux, in the `native-watcher` CI job)
+  aborts the process at every step of the protocol (`SDSYNC_FAULT_ABORT=deposit:<step>[:<n>]`) and
+  sends SIGKILL at arbitrary moments, then asserts the next run settles what was left, names it and
+  converges with no reserved name left on the NAS.
 - **Dashboard surface tests** (`packaging/synology/ui-src/test/outcomes-surface.test.mjs` and the
   widget and AppWindow contract tests) feed every outcome, every reason code, unknown tokens and
   hostile input through the pure `outcomes.mjs` model and assert that nothing renders as plain success

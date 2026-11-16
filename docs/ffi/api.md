@@ -45,6 +45,8 @@ following fields are accepted:
 | `comparison` | string or null | `content` | `content`, `metadata`, or `size-only`. |
 | `deletion` | object or null | disabled | Explicit bounded mirror-deletion policy. |
 | `jobs` | unsigned integer or null | `2` | Concurrent mutation-worker count, from `1` through `16`. |
+| `deposit` | string or null | `atomic` | `atomic`: each file is uploaded to a temporary name, verified, and renamed into place, journalled so the next run settles whatever an interrupted one left (see [Crash-atomic deposit](../deposit.md)); a DSM without File Station Rename gets nothing written. `direct`: straight to the final name, named `deposit-not-atomic` in the outcome. |
+| `deposit_journal` | string or null | per-user state directory | Private directory for the atomic deposit's journal. If it cannot be used the run fails with `local_filesystem` and nothing is uploaded. |
 
 When `deletion.enabled` is `true`, `deletion.max_delete` is required and must be positive.
 `deletion.allow_empty_source` defaults to `false`. When deletion is disabled, neither a maximum nor

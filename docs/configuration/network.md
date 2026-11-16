@@ -131,7 +131,9 @@ What is retried, and what never is:
   `Delete`, `Rename`, or server-copy start is sent once.
 - **A torn overwrite** (the destination has the right size and modification time but the wrong
   checksum after the last attempt) gets exactly one more full attempt in the same run. If that also
-  fails, the error names the path and the repair.
+  fails, the error names the path and the repair. With the default atomic deposit the upload goes
+  to a temporary name, so a torn attempt never reaches the final name; see
+  [Crash-atomic deposit](../deposit.md).
 - **Session expiry.** DSM ending the session mid-run is recovered by logging in again, at most 4 times
   in any 10 minutes and at most `4 + elapsed / 15 minutes` over the run. When the allowance is spent
   the original session error is reported with "DSM ended N sessions in M minutes, so re-authentication

@@ -369,8 +369,10 @@ No layer borrows permission from another.
 
 The core additionally enforces destination containment, empty-source protection unless explicitly
 overridden, DSM-managed-path protection, remote mount boundaries, fresh snapshots, caps, and
-failure-before-delete ordering. File Station operations are still not atomic; retain snapshots or
-version history and test deletion separately.
+failure-before-delete ordering. Each file is deposited atomically (uploaded to a temporary name,
+verified, then renamed into place; see [Crash-atomic deposit](../deposit.md)), but a run as a whole,
+a deletion and a type replacement are not transactions; retain snapshots or version history and test
+deletion separately.
 
 ## Remove versus disable
 
