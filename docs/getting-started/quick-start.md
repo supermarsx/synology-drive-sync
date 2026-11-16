@@ -7,7 +7,8 @@ before trusting important data or enabling deletion.
 
 Download the matching release archive or DSM package, its `SHA256SUMS`, and optionally verify the
 GitHub artifact attestation. The platform installers verify the checksum before replacing an
-existing installation.
+existing installation. For a per-user install in one command (`curl ... | sh` on Linux and macOS,
+`irm ... | iex` on Windows) see the [one-line install](../installation.md#one-line-install).
 
 See [installation and deployment](../installation.md) for native, container, DSM, and source-build
 instructions, and [release artifacts and verification](../releases.md) for the exact trust chain.

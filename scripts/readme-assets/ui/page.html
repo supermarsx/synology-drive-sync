@@ -1,0 +1,56 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Synology Drive Sync (README screenshot harness)</title>
+<meta name="viewport" content="width=1280">
+<link rel="stylesheet" href="/dist/style.css">
+<style>
+  html, body { margin: 0; height: 100%; }
+  body {
+    background: radial-gradient(1200px 700px at 20% 10%, #3b4a63 0%, #232b3a 55%, #171c26 100%);
+    font-family: -apple-system, "Segoe UI", "Liberation Sans", Helvetica, Arial, sans-serif;
+  }
+  #app { position: absolute; inset: 24px 28px; }
+  .demo-app-instance, .demo-window { height: 100%; }
+  .demo-window {
+    display: flex; flex-direction: column; overflow: hidden; border-radius: 10px;
+    box-shadow: 0 18px 50px rgba(0, 0, 0, .55), 0 0 0 1px rgba(255, 255, 255, .08);
+    background: #1b2029;
+  }
+  .demo-window-bar {
+    flex: 0 0 38px; display: flex; align-items: center; justify-content: space-between;
+    padding: 0 14px; background: #262d3a; color: #dfe5ee; font-size: 13px; font-weight: 600;
+    border-bottom: 1px solid rgba(255, 255, 255, .08);
+  }
+  .demo-window-controls { display: inline-flex; gap: 8px; }
+  .demo-window-controls i { width: 11px; height: 11px; border-radius: 50%; background: #5d6879; display: block; }
+  .demo-window-body { flex: 1 1 auto; min-height: 0; position: relative; }
+  .demo-window-body > .sdsync-app { height: 100%; }
+  /* Plain buttons standing in for DSM's v-button. */
+  .demo-button {
+    display: inline-flex; align-items: center; gap: 6px; padding: 6px 14px; border-radius: 6px;
+    border: 1px solid #4a5568; background: #2b3342; color: #e6ebf2; font: inherit; font-size: 13px; cursor: default;
+  }
+  .demo-button.suffix-main { background: #2f6fed; border-color: #2f6fed; color: #fff; }
+  .demo-button.type-styleless { background: transparent; border-color: transparent; }
+  .demo-button[disabled] { opacity: .5; }
+  .demo-button-icon { display: inline-flex; }
+</style>
+</head>
+<body>
+<div id="app"></div>
+<script src="/vue.js"></script>
+<script src="/dsm-stubs.js"></script>
+<script src="/dist/SynologyDriveSync.js"></script>
+<script>
+  // What DSM does when it opens the app: instantiate the registered AppWindow class.
+  window.__mounted = false;
+  var Instance = window.SYNO.SDS.App.SynologyDriveSync.Instance;
+  var host = document.createElement("div");
+  document.getElementById("app").appendChild(host);
+  new Instance().$mount(host);
+  window.__mounted = true;
+</script>
+</body>
+</html>
