@@ -78,7 +78,10 @@
 //! - **One direction.** An edit made on the NAS is never brought back, and the next local
 //!   change to that path overwrites it.
 //! - **Not a backup.** The current state is sent one way and no history of what it replaced is
-//!   kept. Uploads and guarded deletions are not crash-atomic.
+//!   kept. A file's own upload is crash-atomic ([`deposit::DepositMode::Atomic`], the default:
+//!   while a file is being replaced its name is missing for one request, and a crash at that
+//!   moment leaves the old version whole beside it until the next run puts it back). Deletion,
+//!   type replacement and a run as a whole are not crash-atomic.
 //! - **Young software.** It has been exercised against few NAS models and DSM builds. Rehearse
 //!   against a disposable destination before pointing it at data you would miss.
 //!

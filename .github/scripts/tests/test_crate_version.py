@@ -93,6 +93,10 @@ class RepositoryStateTests(unittest.TestCase):
                     )
                 self.assertNotIn("<img", text)
                 self.assertIn("not crash-atomic", text)
+                # The deposit made a file's upload crash-atomic, with one named gap.
+                self.assertIn("A file's own upload is crash-atomic", text)
+                self.assertIn("missing for one request", text.replace("\n", " ").replace("  ", " "))
+                self.assertNotIn("Uploads and guarded deletions are", text)
                 self.assertIn("not affiliated with, endorsed by or supported by", text.replace("\n", " ").replace("  ", " "))
                 self.assertNotIn("crash-safe", text)
                 self.assertNotIn("atomic uploads", text)
