@@ -201,11 +201,18 @@ fn a_run_asks_for_its_ancestors_once_and_does_not_touch_a_session_it_just_used()
         0,
         "a touch right after a request is a wasted round trip"
     );
-    // The plan pass and the reconciliation each name the ancestors once, and each upload costs
-    // its precondition and its size check.
+    // The plan pass and the reconciliation each name the ancestors once. Each upload costs three:
+    // the size check of its temporary copy, the last look at the final name before publishing it
+    // (the precondition, asked once, as late as it can be), and the check of the published file
+    // that verifies the Rename.
     assert_eq!(
         count(&changed, "SYNO.FileStation.List.getinfo"),
-        2 + 2 * 2,
+        2 + 2 * 3,
+        "{changed:?}"
+    );
+    assert_eq!(
+        count(&changed, "SYNO.FileStation.Rename.rename"),
+        2,
         "{changed:?}"
     );
 }

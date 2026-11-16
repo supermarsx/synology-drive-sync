@@ -128,11 +128,13 @@ fn result_document(output: &Output) -> Value {
     serde_json::from_slice(&output.stdout).unwrap_or(Value::Null)
 }
 
+/// Requests for `operation`, the atomic deposit's own renames and deletes of its reserved names
+/// left out: these tests count renames and deletions of user data.
 fn count(server: &MockFileStation, operation: &str) -> usize {
     server
         .requests()
         .iter()
-        .filter(|request| request.operation() == operation)
+        .filter(|request| request.operation() == operation && !request.is_deposit_bookkeeping())
         .count()
 }
 

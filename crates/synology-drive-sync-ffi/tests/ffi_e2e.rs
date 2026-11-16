@@ -174,7 +174,8 @@ fn run_with_options(
         "username": "e2e-user",
         "source": source.path(),
         "remote": "/team/ffi",
-        "allow_http": true
+        "allow_http": true,
+        "deposit_journal": source.deposit_journal()
     }))
     .expect("request JSON");
     let mut context = CallbackContext {
