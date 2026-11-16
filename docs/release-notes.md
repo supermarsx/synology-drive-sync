@@ -6,6 +6,45 @@ changes below are in the first release built after the audit fix round documente
 [observability reference](observability.md). Older notes are not kept here: each release's GitHub page
 lists its own commits.
 
+## Unreleased: crash-atomic uploads, Rust 1.100, installers and crates.io
+
+- **File uploads are crash-atomic** (`deposit = "atomic"`, the default). Each file is uploaded to
+  a temporary `~sdsync-part-` name in its own folder, verified there (length, modification time and
+  File Station's MD5) and only then renamed to its final name, so a crash, `kill -9`, power loss or
+  dropped link never leaves a partial or mixed file under that name. While an existing file is being
+  replaced its name is absent for one request, and a crash at that moment leaves the old version
+  whole under a `~sdsync-prev-` name until the next run puts it back. A local journal records every
+  upload before it starts, and the next run settles what an interrupted one left
+  (`deposit-rolled-back`, `deposit-completed`, `deposit-temp-removed`, ...), touching only names its
+  journal lists; the dashboard shows those warnings on the run's row. A DSM without File Station
+  Rename gets nothing written (`deposit-not-atomic-unavailable`); `deposit = "direct"` restores the
+  old behaviour and is named on every run. Deletion, type replacement, a server copy and a run as a
+  whole are not crash-atomic. Each file costs two to five more requests; bytes on the wire are
+  unchanged. See [Crash-atomic deposit](deposit.md).
+- **Rust 1.100.** Building from source needs Rust 1.100 or newer, and releases are built with
+  1.100.0. Rust 1.99 emitted armv7 instructions that VFPv3-D16 CPUs without NEON (such as the Armada
+  370) stop on with an illegal instruction; CI now disassembles every armv7 DSM binary and refuses
+  them (`check-armv7-fpu.sh`), besides running the binaries on such a CPU under QEMU.
+- **Dependencies.** redb 4.6 (the index opens its file through `create_with_backend`), the newest
+  compatible Rust crates, the dashboard toolchain on Node 26.13.1 and pnpm 12.21.0 (the bundle
+  rebuilds byte for byte), and new pins for the GitHub Actions, Docker base images and CI tools.
+  Third-party notices are regenerated.
+- **Installers.** `scripts/install.sh` (Linux, macOS) and `scripts/install.ps1` (Windows) install
+  the CLI in one line: they pick the release asset for the OS and architecture, verify it against
+  the release `SHA256SUMS`, check the binary's version and only then replace it. See
+  [Installation](installation.md).
+- **Documentation site.** A light and dark theme, a landing page, and a release finder that
+  searches the Synology model catalog and fills in the processor architecture and DSM version for
+  the right `.spk`. The README is shorter, with images generated from the real CLI and dashboard.
+  QuickConnect is supported for the CLI and engine in both relay and direct forms; the dashboard
+  works over it too, unless DSM's own session IP check refuses a relayed session.
+- **crates.io metadata.** Both crates (`synology-drive-sync`, `synology-drive-sync-ffi`) carry a
+  description, readme and docs.rs settings, and calendar release `YY.N` is crate version `0.YY.N`.
+  The release workflow publishes them only once the repository variable `CRATES_IO_PUBLISH` is
+  `true`; until then it says so on every release. See [Releases](releases.md#cratesio-packages).
+  Package Center's description now says what the package does, and About no longer shows the
+  crate version.
+
 ## Unreleased: the daemon is the DSM service engine
 
 - **Runs are audited again on DSM (26.65 refused every run `audit_unavailable`).** The daemon writes
@@ -18,20 +57,6 @@ lists its own commits.
   (`code=audit_event_caller_refused manager=…`), not `code: None`, and runs refused
   `audit_unavailable` back off from 30 seconds to at most 30 minutes, with one Activity row and one
   alert for the episode and `degraded=audit_unavailable` in `controller.state` while it lasts.
-- **Files reach the NAS whole, or not at all.** Each file is uploaded to a temporary
-  `~sdsync-part-` name in its own folder, verified there (length, modification time and File
-  Station's MD5), and only then renamed to its final name; a replaced file's previous version is
-  renamed aside first and deleted once the new one is in place. A crash, `kill -9`, power loss or
-  dropped link leaves the old version or the new one under the final name, never a partial file;
-  during a replacement the name is absent for one round trip, and a crash inside that round trip
-  leaves it empty, the old version kept whole beside it, until the next run puts it back. A local journal records every upload
-  before it starts, and the next run finishes or rolls back what an interrupted run left
-  (`deposit-rolled-back`, `deposit-completed`, `deposit-temp-removed`, ...), touching only names its
-  journal lists. A DSM without File Station Rename gets nothing written
-  (`deposit-not-atomic-unavailable`); `deposit = "direct"` restores the old behaviour and is named
-  on every run. A failed server copy's partial destination is deleted and the file uploaded in the
-  same run. Each file costs two to five more requests; bytes on the wire are unchanged. See
-  [Crash-atomic deposit](deposit.md).
 - **A moved file under 8 MiB is uploaded instead of copied on the NAS.** A server-side copy first
   downloads the old copy to prove it, then runs a copy task and checks the result, which for small
   files took longer than sending them: a 10-file folder move went from about 40 s to about 18 s at
@@ -533,7 +558,7 @@ the idle TTL (`session_ttl_shortened`). New core log events: `session.borrowed`,
 ## Read this before upgrading
 
 - **Rust 1.100 or newer is needed to build from source** (was 1.88). The verified-pair index uses redb
-  4.4, which reports a damaged file as an error instead of crashing, and needs 1.90. Releases are
+  4.6, which reports a damaged file as an error instead of crashing. Releases are
   built with 1.100. Rust 1.99 built armv7 code that armv7 NAS models with VFPv3-D16 and no NEON
   (such as the Armada 370) stop with an illegal instruction. CI now reads every instruction of the
   armv7 binaries and refuses that code, as well as running them on such a CPU.
