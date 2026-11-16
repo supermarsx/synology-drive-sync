@@ -58,7 +58,7 @@ jobs:
       - name: Build Rust SDK API reference
         run: cargo doc --locked --no-deps --lib -p synology-drive-sync
 
-      - name: Build dark-first searchable book
+      - name: Build themed searchable book
         shell: bash
         run: |
           set -euo pipefail
@@ -72,7 +72,7 @@ jobs:
           compgen -G 'target/site/book-*.js' > /dev/null
           compgen -G 'target/site/docs/theme/sdsync-*.css' > /dev/null
           test -s target/site/api/synology_drive_sync/index.html
-          grep -Fq 'const default_light_theme = "navy";' target/site/index.html
+          grep -Fq 'const default_light_theme = "light";' target/site/index.html
           grep -Fq 'const default_dark_theme = "navy";' target/site/index.html
           grep -Eq 'searchindex-[0-9a-f]+\.js' target/site/index.html
           grep -Fq 'SDSYNC_MAX_RATE' target/site/searchindex-*.js
