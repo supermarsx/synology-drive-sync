@@ -12,8 +12,9 @@ synology-drive-sync = "=0.YY.N"
 ```
 
 `cargo add synology-drive-sync` adds the latest release; the API reference for each version is on
-[docs.rs](https://docs.rs/synology-drive-sync). To build from an unpublished commit instead, pin the
-calendar tag from Git:
+[docs.rs](https://docs.rs/synology-drive-sync). Publishing to crates.io is switched on by the
+maintainer (see [crates.io packages](../releases.md#cratesio-packages)); for a release that crates.io
+does not list, or for an unpublished commit, pin the calendar tag from Git instead:
 
 ```toml
 [dependencies]

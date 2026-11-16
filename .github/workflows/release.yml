@@ -2023,6 +2023,11 @@ jobs:
     # crates.io token. No long-lived token secret exists. The owner enables Trusted Publishing for
     # each crate on crates.io (repository supermarsx/synology-drive-sync, workflow release.yml,
     # environment crates-io); the first version of a crate must be published by hand.
+    #
+    # OPT-IN: nothing is uploaded unless the repository variable CRATES_IO_PUBLISH is exactly
+    # `true` (Settings > Secrets and variables > Actions > Variables). Set it only after both crates
+    # exist on crates.io and Trusted Publishing is configured for them. Until then the job still
+    # runs and says, as a notice on the run, that publishing is disabled; it never fails the release.
     needs: [version, publish-release]
     # MUTATION GUARD: uploads to crates.io, which cannot be undone.
     if: >-
@@ -2035,14 +2040,39 @@ jobs:
       contents: read
       id-token: write
     steps:
+      - id: gate
+        name: Check that crates.io publishing is enabled
+        env:
+          CRATES_IO_PUBLISH: ${{ vars.CRATES_IO_PUBLISH }}
+          TAG: ${{ needs.version.outputs.tag }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "$CRATES_IO_PUBLISH" == true ]]; then
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+            echo "crates.io publishing is enabled (CRATES_IO_PUBLISH=true); publishing the crates for $TAG"
+            exit 0
+          fi
+          echo "enabled=false" >> "$GITHUB_OUTPUT"
+          if [[ -z "$CRATES_IO_PUBLISH" ]]; then
+            reason="the repository variable CRATES_IO_PUBLISH is not set"
+          else
+            reason="the repository variable CRATES_IO_PUBLISH is '$CRATES_IO_PUBLISH', not 'true'"
+          fi
+          message="crates.io publishing is disabled: $reason, so no crate was uploaded for $TAG. Set it to true once both crates exist on crates.io and Trusted Publishing is configured for them (see docs/releases.md)."
+          echo "::notice title=crates.io publishing disabled::$message"
+          echo "$message" >> "$GITHUB_STEP_SUMMARY"
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: steps.gate.outputs.enabled == 'true'
         with:
           ref: ${{ needs.version.outputs.sha }}
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable (2026-11-15)
+        if: steps.gate.outputs.enabled == 'true'
         with:
           toolchain: 1.100.0
       - name: Stamp the crate version from the calendar tag
+        if: steps.gate.outputs.enabled == 'true'
         env:
           TAG: ${{ needs.version.outputs.tag }}
           SHA: ${{ needs.version.outputs.sha }}
@@ -2058,13 +2088,16 @@ jobs:
           # requirement on the root crate, and Cargo.lock.
           python3 .github/scripts/crate-version.py stamp "$TAG"
       - name: Prove both crates package and build from their own archives
+        if: steps.gate.outputs.enabled == 'true'
         # `cargo package`, not a dry-run publish: a re-run after a partial publish must still get
         # past this step, and a dry-run publish refuses a version crates.io already has.
         run: cargo package --workspace --locked --allow-dirty
       - id: auth
         name: Exchange the OIDC token for a short-lived crates.io token
+        if: steps.gate.outputs.enabled == 'true'
         uses: rust-lang/crates-io-auth-action@3268eb413133e2960fa4ae0e963ca76380c54cd9 # v1.0.6
       - name: Publish synology-drive-sync, wait for the index, then synology-drive-sync-ffi
+        if: steps.gate.outputs.enabled == 'true'
         env:
           CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
           TAG: ${{ needs.version.outputs.tag }}

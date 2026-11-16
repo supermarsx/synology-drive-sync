@@ -123,7 +123,8 @@ synology-drive-sync = { git = "https://github.com/supermarsx/synology-drive-sync
 
 ### crates.io packages
 
-Each calendar release also publishes two crates to [crates.io](https://crates.io): the
+Once the maintainer enables it (see below), each calendar release also publishes two crates to
+[crates.io](https://crates.io): the
 `synology-drive-sync` Rust library and command-line program (`cargo install synology-drive-sync`),
 and `synology-drive-sync-ffi`, the C ABI crate. Calendar release `YY.N` becomes crate version
 `0.YY.N` (26.66 is `0.26.66`; 27.1 will be `0.27.1`). The calendar number is allocated after a commit
@@ -141,6 +142,13 @@ first version of each crate is uploaded by hand (`synology-drive-sync` first, th
 GitHub publisher with repository owner `supermarsx`, repository `synology-drive-sync`, workflow
 filename `release.yml` and environment `crates-io`. The release workflow's `publish-crates` job then
 needs no stored token.
+
+Publishing is off until the maintainer turns it on. The `publish-crates` job uploads only when the
+repository variable `CRATES_IO_PUBLISH` (**Settings > Secrets and variables > Actions > Variables**)
+is exactly `true`; set it after the first manual upload and the Trusted Publishing setup above. While
+the variable is unset or has any other value, the job still runs on every release, uploads nothing,
+and reports `crates.io publishing is disabled: ...` as a notice on the run and in its job summary; the
+GitHub Release itself is unaffected.
 
 The C SDK is published for every native OS/architecture pair:
 

@@ -982,6 +982,26 @@ class WorkflowWiringTests(unittest.TestCase):
         self.assertIn("crates.io answered HTTP $status", block)
         # A failed upload is only forgiven when the registry shows the version.
         self.assertIn("cargo publish failed and crates.io has no $name $version", block)
+        # Publishing is opt-in through the CRATES_IO_PUBLISH repository variable. The job is not
+        # skipped at job level when it is off: it runs, its first step says so as a notice, and
+        # every later step (checkout, toolchain, stamp, package, token exchange, upload) is gated
+        # on that step's output, so a release without the variable neither fails nor goes silent.
+        steps = block[block.index("\n    steps:\n") :]
+        job_header = block[: block.index("\n    steps:\n")]
+        self.assertNotIn("CRATES_IO_PUBLISH", job_header.split("    needs:")[1])
+        self.assertTrue(steps.startswith("\n    steps:\n      - id: gate\n"), steps[:80])
+        gate = steps[: steps.index("\n      - uses: actions/checkout@")]
+        self.assertIn("CRATES_IO_PUBLISH: ${{ vars.CRATES_IO_PUBLISH }}", gate)
+        self.assertIn('if [[ "$CRATES_IO_PUBLISH" == true ]]; then', gate)
+        self.assertIn('echo "enabled=true" >> "$GITHUB_OUTPUT"', gate)
+        self.assertIn('echo "enabled=false" >> "$GITHUB_OUTPUT"', gate)
+        self.assertIn('echo "::notice title=crates.io publishing disabled::$message"', gate)
+        self.assertIn('>> "$GITHUB_STEP_SUMMARY"', gate)
+        self.assertNotIn("exit 1", gate)
+        later_steps = re.split(r"\n      - ", steps[len(gate) :])[1:]
+        self.assertEqual(len(later_steps), 6)
+        for step in later_steps:
+            self.assertIn("if: steps.gate.outputs.enabled == 'true'", step, step[:120])
         # The rehearsal for a manual dry run uploads nothing and cannot reach the token action.
         rehearsal = workflow[
             workflow.index("\n  verify-crates:") : workflow.index("\n  publish-crates:")
