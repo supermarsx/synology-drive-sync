@@ -807,6 +807,24 @@ class WorkflowWiringTests(unittest.TestCase):
             self.assertNotIn("Status: 401 Unauthorized", section)
             self.assertIn("Version5 EABI", section)
             self.assertIn("hard-float ABI", section)
+            # Every armv7 instruction is read, after the last step that uses the binaries,
+            # since the instruction check relinks them.
+            self.assertIn("components: llvm-tools", section)
+            guard = 'bash .github/scripts/check-armv7-fpu.sh "$RUST_TARGET"'
+            self.assertEqual(section.count(guard), 1)
+            guard_step = section[
+                section.index(
+                    "- name: Refuse D16-D31 and NEON instructions in the armv7 binaries"
+                ) : section.index(guard)
+            ]
+            self.assertIn("if: matrix.synology_arch == 'armv7'", guard_step)
+            self.assertLess(
+                section.index("- name: Assemble and validate installable SPK"),
+                section.index(guard),
+            )
+            self.assertLess(
+                section.index("--test pair_index_codegen"), section.index(guard)
+            )
             self.assertIn("elf_class: ELF32", section)
             self.assertNotIn("armv5", section.lower())
             self.assertNotIn("powerpc", section.lower())

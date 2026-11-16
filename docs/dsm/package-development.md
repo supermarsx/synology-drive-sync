@@ -167,6 +167,13 @@ Do not use plain `cargo build` on an x86 host without a compatible ARM musl cros
 also executes both resulting target binaries under the pinned architecture emulator before accepting
 the SPK; static archive validation alone is not an execution proof.
 
+The armv7 package must run on CPUs with VFPv3-D16 and no NEON, such as the Armada 370. Rust 1.99
+built armv7 code, standard library included, that uses the VFP registers d16-d31, which those CPUs
+do not have, so do not build armv7 with it. An emulator run only reaches the code it executes, so
+CI also reads every instruction of the armv7 binaries after the release build:
+`bash .github/scripts/check-armv7-fpu.sh armv7-unknown-linux-musleabihf` (it needs the `llvm-tools`
+component). Only ring's NEON assembly, which ring selects at run time, may use those registers.
+
 Use `cargo zigbuild --bins` with the corresponding target for `i686`; use a native matching musl
 toolchain or reviewed cross-toolchain for ARM64.
 

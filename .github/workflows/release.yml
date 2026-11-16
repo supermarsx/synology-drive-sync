@@ -790,6 +790,7 @@ jobs:
         with:
           toolchain: 1.100.0
           targets: ${{ matrix.rust_target }}
+          components: llvm-tools
       - name: Install pinned Zig cross-linker
         if: matrix.cross_compile == true
         shell: bash
@@ -978,6 +979,20 @@ jobs:
             --api-binary "$api_binary" \
             --arch "$SYNOLOGY_ARCH" \
             "$spk"
+      - name: Refuse D16-D31 and NEON instructions in the armv7 binaries
+        if: matrix.synology_arch == 'armv7'
+        shell: bash
+        env:
+          RUST_TARGET: ${{ matrix.rust_target }}
+          SDSYNC_BUILD_VERSION: ${{ needs.version.outputs.tag }}
+        run: |
+          set -euo pipefail
+          # D16-only armv7 cores without NEON (Armada 370 and its kin) have no d16-d31 and no
+          # Advanced SIMD. rustc 1.99.1 emitted both throughout std and our code while the smoke
+          # above still passed, because none of its paths reached a float. This reads every
+          # instruction; only ring's NEON assembly, which runs after a run-time check, may hold
+          # one. It relinks the binaries, so it runs after every step that uses them.
+          bash .github/scripts/check-armv7-fpu.sh "$RUST_TARGET"
       - name: Exercise real DSM supervisor lifecycle under BusyBox
         if: matrix.synology_arch == 'x86_64'
         shell: bash
