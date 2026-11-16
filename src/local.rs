@@ -1469,7 +1469,8 @@ fn scan_dir(
         // used to fail the whole scan, so one Word `~WRL0001.tmp` anywhere meant nothing synced.
         let refusal = if reserved {
             Some(
-                "the name is reserved for synology-drive-sync's own temporary NAS files (the                  atomic deposit's ~sdsync-part-, ~sdsync-prev- and ~sdsync-stage- names); rename it"
+                "the name is reserved for synology-drive-sync's own temporary NAS files (the \
+                 atomic deposit's ~sdsync-part-, ~sdsync-prev- and ~sdsync-stage- names); rename it"
                     .to_owned(),
             )
         } else {

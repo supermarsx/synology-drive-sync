@@ -26,8 +26,17 @@ const DSM_MANAGED_NAMES: &[&str] = &[
 /// Drive clients. They are reserved: the NAS walk treats them as managed (never compared, uploaded
 /// over or mirror-deleted by the planner; only the deposit's own recovery touches them, and only
 /// those its journal names), and a local source cannot hold them because a `~` name is refused.
-pub const DEPOSIT_RESERVED_PREFIXES: &[&str] =
-    &["~sdsync-part-", "~sdsync-prev-", "~sdsync-stage-"];
+pub const DEPOSIT_RESERVED_PREFIXES: &[&str] = &[
+    "~sdsync-part-",
+    "~sdsync-prev-",
+    "~sdsync-stage-",
+    // The spelling the design first proposed. No release wrote it, but a development build may
+    // have: such a name is never compared, uploaded over, deleted or adopted either, and recovery
+    // never touches it (no journal names it), so it is reported and left alone.
+    ".sdsync-part-",
+    ".sdsync-prev-",
+    ".sdsync-stage-",
+];
 
 /// Whether `name` (one path component) is in the atomic deposit's reserved namespace.
 pub fn is_deposit_reserved_name(name: &str) -> bool {
@@ -341,9 +350,18 @@ mod tests {
             assert!(is_dsm_managed(&format!("a/{name}")), "{name}");
             assert!(drive_path_issue(name).is_some(), "{name}");
         }
+        // The dot spelling a development build may have written is reserved too.
+        for name in [
+            ".sdsync-part-0123456789ab-0123456789ab-1",
+            ".sdsync-prev-0123456789ab-0123456789ab-1",
+            ".sdsync-stage-0123456789ab-0123456789ab",
+        ] {
+            assert!(is_deposit_reserved_name(name), "{name}");
+            assert!(is_dsm_managed(&format!("a/{name}")), "{name}");
+        }
         for name in [
             "sdsync-part-x",
-            ".sdsync-part-x",
+            ".sdsync-partx",
             "~sdsync-partial",
             "x~sdsync-part-1",
         ] {
