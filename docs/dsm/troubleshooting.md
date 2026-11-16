@@ -169,9 +169,11 @@ codes are:
 - `dsm_authentication_rejected` with status 401: the executable direct helper did not authenticate
   the native cookie;
 - `dsm_authentication_quickconnect_unsupported` with status 401: the same direct-helper rejection
-  arrived with a strictly parsed `*.quickconnect.to` authority. Synology excludes third-party
-  applications from QuickConnect support, so retry through LAN, DDNS, VPN, or a separately tested
-  DSM custom reverse proxy. This code is diagnostic only and never changes authentication;
+  arrived with a strictly parsed `*.quickconnect.to` authority. QuickConnect is supported, but DSM
+  binds each session to the client address, and when QuickConnect moves the session onto its relay
+  DSM itself can refuse it. Select **Retry**, or use the LAN address,
+  `[alias].direct.quickconnect.to`, DDNS, or a VPN. The code's name is historical (`api.log`, the
+  UI and the shell tests pin it); it is diagnostic only and never changes authentication;
 - `dsm_authentication_forbidden` with status 403: the direct-helper identity did not satisfy the
   independent account/administrator requirement;
 - `dsm_authentication_webapi_unavailable` with status 503: the kernel-inaccessible-helper fallback
@@ -189,7 +191,8 @@ or the card (see [security](security.md)). Sign in again or change the route, th
 or reopen the app; that sends one request, and the rest follow only if DSM accepts it. Through a
 QuickConnect relay DSM may refuse the session: a 401 together with `IP is not the same` lines in
 `/var/log/messages` means DSM judged the session from the relay tunnel's address rather than the one
-it bound the session to. Use LAN, DDNS, VPN, or `[alias].direct.quickconnect.to`.
+it bound the session to. This also happens to DSM's own apps. Select **Retry**, or use the LAN
+address, `[alias].direct.quickconnect.to`, DDNS, or a VPN.
 
 Collect the helper chain and package-UID execute result with read-only checks:
 
@@ -247,10 +250,10 @@ request environment, query, cookie, token, username, or path. An unsafe/corrupt 
 path fails closed, so preserve the semantic response itself when no diagnostic was persisted.
 
 Synology's
-[QuickConnect support list](https://kb.synology.com/en-eu/DSM/tutorial/Which_services_support_QuickConnect)
-marks every third-party service and application unsupported. Its
 [QuickConnect white paper](https://global.download.synology.com/download/Document/Software/WhitePaper/Os/DSM/All/enu/Synology_QuickConnect_White_Paper_enu.pdf)
-also distinguishes direct, relay, and WebRTC paths. Do not copy proxy-origin headers into the helper
+distinguishes direct, relay, and WebRTC paths; its
+[QuickConnect service list](https://kb.synology.com/en-eu/DSM/tutorial/Which_services_support_QuickConnect)
+is the reference for what DSM itself routes. Do not copy proxy-origin headers into the helper
 or replace `REMOTE_ADDR` to work around a rejection: DSM's native source/session validation remains
 authoritative. The package recognizes a valid QuickConnect hostname only after rejection to improve
 the error code; it neither authorizes the request nor invokes the private loopback user service on
@@ -1134,6 +1137,7 @@ validation only on `EACCES`. The private `SYNO.Core.Desktop.Initdata` response s
 by saved first-party DSM runtime sources, not by the supplied HTTP capture; Synology does not publicly
 promise it as a package API. The daemon invokes neither authentication path. Webman's package-owner
 CGI identity, official token response, package-private header bridge, and selected direct/fallback
-branch remain live-DSM acceptance requirements. QuickConnect relay access is outside Synology's
-third-party application support; use a supported route for that acceptance record. A complete record
-from the exact environment is the acceptance evidence.
+branch remain live-DSM acceptance requirements. Record acceptance on a route you can repeat (LAN,
+DDNS, VPN, or a tested custom reverse proxy), and through QuickConnect separately, because DSM can
+refuse a session that QuickConnect moves onto its relay. A complete record from the exact
+environment is the acceptance evidence.

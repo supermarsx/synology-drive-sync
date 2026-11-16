@@ -184,17 +184,20 @@ DSM/glibc NSS modules (though an available NSCD path may serve lookups), so loca
 administrator/non-administrator accounts—including qualified, Unicode, nested-group, and
 name-collision cases—remain a required physical-DSM acceptance matrix.
 
-QuickConnect is not an authentication compatibility target for this third-party package. Synology's
-[supported-services list](https://kb.synology.com/en-eu/DSM/tutorial/Which_services_support_QuickConnect)
-explicitly excludes all third-party services and applications, while its
+The dashboard works over QuickConnect. Synology's
 [QuickConnect white paper](https://global.download.synology.com/download/Document/Software/WhitePaper/Os/DSM/All/enu/Synology_QuickConnect_White_Paper_enu.pdf)
-documents direct, relay, and WebRTC connection modes. A relay can therefore present a different
-native request/source context to `authenticate.cgi`; DSM authentication remains authoritative. The
+documents direct, relay, and WebRTC connection modes, and
+[which services support QuickConnect](https://kb.synology.com/en-eu/DSM/tutorial/Which_services_support_QuickConnect)
+is the reference for the first-party list. DSM binds each login session to the client address, so
+when QuickConnect switches a session onto its relay, `authenticate.cgi` can see a different
+native request/source context and DSM itself can refuse the session (`IP is not the same`); that also
+happens to DSM's own apps. DSM authentication remains authoritative. The
 package does not trust or replay `X-Forwarded-*`/`X-Real-IP`, and an executable-helper rejection
 never falls back to the private user service. After such a rejection, only a strictly parsed
 `*.quickconnect.to` `HTTP_HOST` changes the fixed diagnostic code to
-`dsm_authentication_quickconnect_unsupported`; it cannot change acceptance. Use LAN, DDNS, VPN, or a
-separately tested DSM reverse-proxy/custom-domain route for physical acceptance.
+`dsm_authentication_quickconnect_unsupported` (the name is historical and is kept because
+`api.log`, the UI and the shell tests pin it); it cannot change acceptance. When it appears, select
+Retry, or use the LAN address, `[alias].direct.quickconnect.to`, DDNS, or a VPN.
 
 Every package request presents the user's DSM session to DSM, and DSM judges each presentation,
 including the client address it bound the session to. Through a QuickConnect relay,
@@ -569,6 +572,6 @@ direct protected-helper execution on a DSM where it is permitted, the private lo
 behavior on every DSM branch,
 package-identity execution of `synodsmnotify`, DSM forwarding of `X-SDSYNC-Request: 1` as
 `HTTP_X_SDSYNC_REQUEST=1`, or reverse-proxy/origin behavior of a physical DSM release. QuickConnect
-relay access is explicitly outside third-party package support; validate supported LAN, DDNS, VPN,
-or custom reverse-proxy routes on every supported DSM branch before calling the dashboard
-production-ready.
+relay behavior (DSM can refuse a session that QuickConnect moves onto its relay) is validated
+separately from the LAN, DDNS, VPN, or custom reverse-proxy routes; validate each route you intend to
+use on every supported DSM branch before calling the dashboard production-ready.

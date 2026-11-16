@@ -360,7 +360,10 @@ prevent overlap, and allow enough time for the complete scan-transfer-verify wor
 
 - The one configured endpoint must use HTTPS by default and route the File Station WebAPI. Use a
   private CA certificate when needed; insecure HTTP or certificate bypasses are for controlled
-  testing only. QuickConnect is not supported—use LAN, DDNS, VPN, or a tested reverse proxy.
+  testing only. QuickConnect is supported for the CLI and engine, in both the relay
+  (`<alias>.<relay>.quickconnect.to`) and direct (`<alias>.direct.quickconnect.to`) forms. The relay
+  adds latency, so the LAN address or the direct form is faster; `doctor` tells you which path you
+  are on.
 - Passwords and supported authenticator-app TOTP can come from an OS vault, protected files,
   standard input, prompts, or dedicated environment variables. DSM Secure SignIn approval and
   hardware/security-key challenges are not supported by the documented File Station login flow.
