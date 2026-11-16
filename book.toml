@@ -1,7 +1,7 @@
 [book]
-title = "synology-drive-sync documentation"
+title = "synology-drive-sync: Push files to your Synology NAS"
 authors = ["synology-drive-sync contributors"]
-description = "Installation, configuration, operations, Rust integration, and release verification for synology-drive-sync."
+description = "A fast, one-way file deposit to a Synology NAS over DSM's File Station API with a normal DSM account, for servers, containers, CI and other machines that can't run Synology Drive Client. Use it from the CLI, Rust SDK, C ABI or the included DSM package."
 src = "docs"
 language = "en"
 text-direction = "ltr"
@@ -14,7 +14,7 @@ create-missing = false
 edition = "2024"
 
 [output.html]
-default-theme = "navy"
+default-theme = "light"
 preferred-dark-theme = "navy"
 smart-punctuation = true
 definition-lists = true

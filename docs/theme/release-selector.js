@@ -262,6 +262,194 @@
         return MODEL_COMPATIBILITY_INDEX.get(normalizedModel(key)) || null;
     }
 
+    const UNKNOWN_MODEL = "__unknown__";
+    const AUTOMATIC = "auto";
+
+    // Search keys ignore case, whitespace, "+", and common separators so "ds 416" finds DS416 and
+    // "rs11626" finds RS11626xs+. A key is only ever used to FILTER the catalog; it never selects.
+    function modelSearchKey(value) {
+        return String(value || "")
+            .toUpperCase()
+            .replace(/[\s+\-_.]+/g, "");
+    }
+
+    function modelLiteralKey(value) {
+        return String(value || "").toUpperCase().replace(/\s+/g, "");
+    }
+
+    function searchModels(query, limit) {
+        const models = listModels();
+        const cap = Number.isInteger(limit) && limit > 0 ? limit : models.length;
+        const needle = modelSearchKey(query);
+        const literal = modelLiteralKey(query);
+
+        if (!needle) {
+            return models.slice(0, cap);
+        }
+
+        const archNeedle = needle.length >= 3 ? needle.toLowerCase() : null;
+        const ranked = [];
+
+        models.forEach(function rankModel(record, order) {
+            const key = modelSearchKey(record.model);
+            let rank = null;
+
+            if (modelLiteralKey(record.model) === literal) {
+                rank = 0;
+            } else if (key === needle) {
+                rank = 1;
+            } else if (key.startsWith(needle)) {
+                rank = 2;
+            } else if (key.includes(needle)) {
+                rank = 3;
+            } else if (
+                archNeedle &&
+                (record.packageArch.includes(archNeedle) || record.cpuArch.includes(archNeedle))
+            ) {
+                rank = 4;
+            }
+            if (rank !== null) {
+                ranked.push({ rank, order, record });
+            }
+        });
+        ranked.sort(function byRank(left, right) {
+            return left.rank - right.rank || left.order - right.order;
+        });
+
+        return ranked.slice(0, cap).map(function unwrap(entry) {
+            return entry.record;
+        });
+    }
+
+    // The one case where typed text may stand for a catalog entry: it equals exactly one model name
+    // (case and spaces aside, "+" significant). Anything else needs an explicit choice from the list.
+    function exactModelForText(text) {
+        const literal = modelLiteralKey(text);
+
+        if (!literal) {
+            return null;
+        }
+        const matches = listModels().filter(function equalsLiteral(record) {
+            return modelLiteralKey(record.model) === literal;
+        });
+
+        return matches.length === 1 ? matches[0] : null;
+    }
+
+    // Reported processor architecture for a model, from the captured CPU table and the explicit
+    // Package Arch -> SPK asset mapping. Models with no SPK ("manual review") fill nothing.
+    function autofillArchitecture(modelInput) {
+        const record =
+            typeof modelInput === "string" ? lookupModel(modelInput) : modelInput || null;
+        const compatibility = record ? modelCompatibility(record) : null;
+
+        if (
+            !record ||
+            !compatibility ||
+            compatibility.status !== "supported" ||
+            !record.assetArch
+        ) {
+            return null;
+        }
+
+        return Object.freeze({
+            value: record.assetArch,
+            model: record.model,
+            cpuArch: record.cpuArch,
+            packageArch: record.packageArch,
+            assetArch: record.assetArch,
+            assetName: modelAssetLabel(record, compatibility),
+            source: `Synology's CPU table, captured ${data.snapshotCapturedDate}`,
+            sourceUrl: data.sourceUrl,
+        });
+    }
+
+    function isAutomatic(value) {
+        return String(value || "").trim().toLowerCase() === AUTOMATIC;
+    }
+
+    // "Automatic" DSM: the newest DSM the model supports (lifecycle data), inside the SPK's
+    // supported 7.0 to 7.4-99999 range. When the user also supplies the exact build, the branch is
+    // read from that build instead. Anything outside the range stops, as an explicit pick would.
+    function resolveAutomaticDsm(modelInput, versionInput) {
+        const record =
+            typeof modelInput === "string" ? lookupModel(modelInput) : modelInput || null;
+        const compatibility = record ? modelCompatibility(record) : null;
+
+        if (!record || !compatibility) {
+            return failure(
+                "unknown_model",
+                "Automatic DSM needs an exact catalog model.",
+                "Choose a model from the list first.",
+            );
+        }
+        if (compatibility.status === "unsupported-product-line") {
+            return failure(
+                "unsupported_product_line",
+                `${record.model} runs DSM Enterprise ${compatibility.lastVersion}; no ordinary DSM SPK is offered.`,
+                `DSM Enterprise has a separate package lifecycle that this release does not publish or claim to support. Confirm the product in Synology's Download Center: ${data.enterpriseSourceUrl}`,
+            );
+        }
+        if (compatibility.status !== "supported") {
+            return failure(
+                "model_dsm_conflict",
+                `${record.model} cannot run DSM 7; Synology lists its last upgradable DSM as ${compatibility.lastVersion}, below the 7.0 minimum.`,
+                `Automatic has no supported DSM version to resolve. Use the official lifecycle table (${data.lifecycleSourceUrl}) and Download Center for that exact model. No incompatible DSM 7 asset is offered; use the desktop CLI or container on another supported system instead.`,
+            );
+        }
+
+        const exactInput = String(versionInput || "").trim();
+
+        if (exactInput) {
+            const version = parseDsmVersion(exactInput);
+
+            if (!version) {
+                return failure(
+                    "invalid_dsm_version",
+                    "The exact build, when supplied, must use a complete form such as 7.2.2-72806.",
+                );
+            }
+            if (version.major !== 7 || version.minor > DSM_PACKAGE_MAXIMUM.minor) {
+                return failure(
+                    "unsupported_dsm_line",
+                    `DSM ${version.major}.${version.minor} is outside the reviewed DSM 7.0–7.4 range.`,
+                    `This release publishes DSM 7 SPKs with a declared maximum of ${DSM_PACKAGE_MAXIMUM.display}. DSM 7.5 or a later major release stops without a recommendation until the snapshot is reviewed and updated.`,
+                );
+            }
+
+            return Object.freeze({
+                ok: true,
+                source: "build",
+                osVersion: parseOsVersionSelection(`dsm-7.${version.minor}`),
+                text: `Automatic: DSM 7.${version.minor}, read from the exact build ${version.display}.`,
+            });
+        }
+        if (compatibility.maxMinor > DSM_PACKAGE_MAXIMUM.minor) {
+            return failure(
+                "dsm_too_new",
+                `${record.model}'s newest supported DSM is newer than this package's declared maximum of ${DSM_PACKAGE_MAXIMUM.display}.`,
+                "A later DSM needs a package whose INFO compatibility ceiling has been reviewed and tested; the selector will not recommend this artifact beyond its declared maximum.",
+            );
+        }
+
+        // The SPK accepts DSM 7.0-40759 through 7.4-99999. A model whose newest DSM is 7.1 to 7.4
+        // is above the minimum, and DSM build numbers have five digits, so every 7.4 build is within
+        // the maximum: no exact build is needed. Only a model whose newest DSM is 7.0 would need the
+        // build, because 7.0 builds can fall below the 7.0-40759 minimum.
+        const needsBuild = compatibility.maxMinor === 0;
+        const newest = `DSM 7.${compatibility.maxMinor}`;
+
+        return Object.freeze({
+            ok: true,
+            source: "model",
+            osVersion: parseOsVersionSelection(`dsm-7.${compatibility.maxMinor}`),
+            requiresBuild: needsBuild,
+            text: needsBuild
+                ? `Automatic: ${newest} for this model (the newest it supports). ${newest} needs the exact installed build to prove the package minimum, which a web page cannot read from your NAS.`
+                : `Automatic: ${newest} for this model (the newest it supports). No exact build is needed.`,
+        });
+    }
+
     function normalizeCpuArch(value) {
         const raw = String(value || "").trim().toLowerCase();
         const families = new Set();
@@ -459,14 +647,23 @@
         if (!catalogModel) {
             return failure(
                 "unknown_model",
-                "That model is not in the captured physical Synology model catalog.",
+                String(input.model || "").trim()
+                    ? "That model is not in the captured physical Synology model catalog."
+                    : "No exact model is chosen. Pick one from the model list; typed text alone never selects a model.",
                 `Check Synology's live CPU/Package Arch table and model-specific archives (snapshot captured ${data.snapshotCapturedDate}), then report the exact model, DSM build, and Package Arch. The selector will not guess from a model year or marketing name.`,
             );
         }
 
         const compatibility = modelCompatibility(catalogModel);
-        const productLine = normalizeProductLine(input.productLine);
-        const osVersion = parseOsVersionSelection(input.osVersion);
+        const expectedProductLine =
+            compatibility.productLine === "DSM Enterprise" ? "dsm-enterprise" : "dsm";
+        // "Automatic" product line and DSM version are read from the exact catalog model.
+        const productLine = isAutomatic(input.productLine)
+            ? expectedProductLine
+            : normalizeProductLine(input.productLine);
+        const automaticOs = isAutomatic(input.osVersion);
+        let osVersion = automaticOs ? null : parseOsVersionSelection(input.osVersion);
+        let automaticDsm = null;
 
         if (!productLine || !PRODUCT_LINES.has(productLine)) {
             return failure(
@@ -475,23 +672,20 @@
                 "Choose DiskStation Manager (DSM) or DSM Enterprise; sharing a CPU family does not make their package lifecycles interchangeable.",
             );
         }
-        if (!osVersion) {
+        if (!automaticOs && !osVersion) {
             return failure(
                 "invalid_os_version_selection",
                 "Select one of the catalogued Synology OS versions.",
                 `The selector covers DSM 7.0 through 7.4, informational DSM 6.x or earlier, and DSM Enterprise 1.0 as captured ${data.snapshotCapturedDate}. Newer or unknown lines fail closed until the catalog is refreshed.`,
             );
         }
-        if (productLine !== osVersion.productLine) {
+        if (!automaticOs && productLine !== osVersion.productLine) {
             return failure(
                 "os_selection_conflict",
                 "The selected product line and OS version belong to different Synology products.",
                 "Choose a DSM version with DiskStation Manager, or DSM Enterprise 1.0 with DSM Enterprise.",
             );
         }
-
-        const expectedProductLine =
-            compatibility.productLine === "DSM Enterprise" ? "dsm-enterprise" : "dsm";
 
         if (productLine !== expectedProductLine) {
             return failure(
@@ -506,6 +700,13 @@
                 `${catalogModel.model} runs DSM Enterprise ${compatibility.lastVersion}; no ordinary DSM SPK is offered.`,
                 `DSM Enterprise has a separate package lifecycle that this release does not publish or claim to support. Confirm the product in Synology's Download Center: ${data.enterpriseSourceUrl}`,
             );
+        }
+        if (automaticOs) {
+            automaticDsm = resolveAutomaticDsm(catalogModel, input.dsmVersion);
+            if (!automaticDsm.ok) {
+                return automaticDsm;
+            }
+            osVersion = automaticDsm.osVersion;
         }
         if (!osVersion.supported) {
             const lastKnown = compatibility.lastVersion
@@ -550,15 +751,28 @@
                 "The exact build, when supplied, must use a complete form such as 7.2.2-72806.",
             );
         }
-        if ((osVersion.minor === 0 || osVersion.minor === 4) && !version) {
+        // A manual pick of 7.0 or 7.4 keeps requiring the exact build. Automatic resolved from the
+        // model needs it only where the build decides the answer (7.0), never for 7.1 to 7.4.
+        const automaticFromModel = Boolean(automaticDsm && automaticDsm.source === "model");
+
+        if (
+            !version &&
+            (osVersion.minor === 0 || (osVersion.minor === 4 && !automaticFromModel))
+        ) {
             const boundary = osVersion.minor === 0 ? "minimum" : "maximum";
             const manifestVersion =
                 osVersion.minor === 0 ? "DSM 7.0-40759" : DSM_PACKAGE_MAXIMUM.display;
 
             return failure(
                 "dsm_build_required",
-                `${osVersion.display} requires the exact installed build before an SPK can be recommended.`,
-                `The package ${boundary} is ${manifestVersion}. Enter the complete installed version/build so the selector can prove that compatibility boundary.`,
+                automaticDsm
+                    ? `Automatic resolved ${osVersion.display} for ${catalogModel.model}, but that branch requires the exact installed build before an SPK can be recommended.`
+                    : `${osVersion.display} requires the exact installed build before an SPK can be recommended.`,
+                `The package ${boundary} is ${manifestVersion}. Enter the complete installed version/build so the selector can prove that compatibility boundary.${
+                    automaticDsm
+                        ? " A web page cannot read the build from your NAS and the selector will not assume one; the newest DSM the model supports is only a starting point. Run the read-only commands in Collect the NAS values below, or pick the installed branch yourself."
+                        : ""
+                }`,
             );
         }
         if (
@@ -678,7 +892,9 @@
         });
         const versionDisplay = version
             ? version.display
-            : `7.${selectedMinor} (exact build not supplied)`;
+            : automaticDsm
+              ? `7.${selectedMinor} (Automatic: newest for this model; exact build not supplied)`
+              : `7.${selectedMinor} (exact build not supplied)`;
 
         return Object.freeze({
             ok: true,
@@ -1033,6 +1249,274 @@
         };
     }
 
+    const MODEL_LIST_RENDER_LIMIT = 60;
+
+    function modelOptionParts(model) {
+        const compatibility = modelCompatibility(model);
+
+        return {
+            title: model.model,
+            meta: `processor ${model.cpuArch} · Package Arch ${model.packageArch} · ${modelAssetLabel(model, compatibility)}`,
+            label: `${model.model} — processor ${model.cpuArch} — Package Arch ${model.packageArch} — ${modelAssetLabel(model, compatibility)} — ${compatibilityLabel(compatibility)}`,
+        };
+    }
+
+    // ARIA 1.2 combobox with a listbox popup. Typed text only filters; the hidden "model" field
+    // changes solely when an option is chosen (click/tap, Enter on the active option, or Enter on
+    // text that equals exactly one catalog model). Nothing ever resolves to a "nearest" model.
+    function initModelCombobox(container, documentRef, hooks) {
+        const input = container.querySelector("[data-model-input]");
+        const hidden = container.querySelector("[data-model-select]");
+        const listbox = container.querySelector("[data-model-listbox]");
+        const live = container.querySelector("[data-model-results]");
+
+        if (!input || !hidden || !listbox) {
+            throw new Error("release selector model combobox markup is incomplete");
+        }
+
+        const listId = listbox.id || "synology-model-list";
+        const unknownLabel = "My model is not listed — manual review / no SPK";
+        let items = [];
+        let activeIndex = -1;
+        let open = false;
+        let selectedLabel = "";
+
+        function optionId(index) {
+            return `${listId}-option-${index}`;
+        }
+
+        function setExpanded(value) {
+            open = value;
+            input.setAttribute("aria-expanded", value ? "true" : "false");
+            listbox.hidden = !value;
+            if (!value) {
+                input.removeAttribute("aria-activedescendant");
+            }
+        }
+
+        function setActive(index) {
+            activeIndex = index;
+            items.forEach(function mark(item, position) {
+                item.element.setAttribute("aria-selected", position === index ? "true" : "false");
+                item.element.dataset.active = position === index ? "true" : "false";
+            });
+            if (index >= 0 && items[index]) {
+                input.setAttribute("aria-activedescendant", optionId(index));
+                if (typeof items[index].element.scrollIntoView === "function") {
+                    items[index].element.scrollIntoView({ block: "nearest" });
+                }
+            } else {
+                input.removeAttribute("aria-activedescendant");
+            }
+        }
+
+        function announce(text) {
+            if (live) {
+                live.textContent = text;
+            }
+        }
+
+        function render() {
+            const query = input.value;
+            const matches = searchModels(query);
+            const shown = matches.slice(0, MODEL_LIST_RENDER_LIMIT);
+            const children = [];
+
+            items = [];
+            shown.forEach(function addModel(model, index) {
+                const parts = modelOptionParts(model);
+                const option = documentRef.createElement("li");
+                const title = documentRef.createElement("span");
+                const meta = documentRef.createElement("span");
+
+                option.id = optionId(index);
+                option.setAttribute("role", "option");
+                option.setAttribute("aria-selected", "false");
+                option.className = "model-option";
+                option.dataset.value = model.model;
+                title.className = "model-option-name";
+                title.textContent = parts.title;
+                meta.className = "model-option-meta";
+                meta.textContent = parts.meta;
+                option.append(title, meta);
+                items.push({ value: model.model, label: model.model, element: option });
+                children.push(option);
+            });
+
+            const unknown = documentRef.createElement("li");
+            const unknownTitle = documentRef.createElement("span");
+            const unknownMeta = documentRef.createElement("span");
+            const unknownIndex = items.length;
+
+            unknown.id = optionId(unknownIndex);
+            unknown.setAttribute("role", "option");
+            unknown.setAttribute("aria-selected", "false");
+            unknown.className = "model-option model-option-unknown";
+            unknown.dataset.value = UNKNOWN_MODEL;
+            unknownTitle.className = "model-option-name";
+            unknownTitle.textContent = unknownLabel;
+            unknownMeta.className = "model-option-meta";
+            unknownMeta.textContent = "Stops the selector so the model can be reviewed by hand";
+            unknown.append(unknownTitle, unknownMeta);
+            items.push({ value: UNKNOWN_MODEL, label: unknownLabel, element: unknown });
+            children.push(unknown);
+
+            if (matches.length > shown.length) {
+                const more = documentRef.createElement("li");
+
+                more.setAttribute("role", "presentation");
+                more.className = "model-option-note";
+                more.textContent = `Showing ${shown.length} of ${matches.length} models. Keep typing to narrow the list.`;
+                children.push(more);
+            }
+
+            listbox.replaceChildren(...children);
+            activeIndex = -1;
+            input.removeAttribute("aria-activedescendant");
+            announce(
+                String(query || "").trim()
+                    ? matches.length
+                        ? `${matches.length} of ${data.modelCount} models match.`
+                        : "No catalog model matches. You can choose the manual-review option."
+                    : `${data.modelCount} models. Type to filter.`,
+            );
+        }
+
+        function openList() {
+            render();
+            setExpanded(true);
+        }
+
+        function closeList() {
+            setExpanded(false);
+            activeIndex = -1;
+        }
+
+        function select(value) {
+            const model = value === UNKNOWN_MODEL ? null : lookupModel(value);
+
+            if (value !== UNKNOWN_MODEL && !model) {
+                return false;
+            }
+            hidden.value = model ? model.model : UNKNOWN_MODEL;
+            selectedLabel = model ? model.model : unknownLabel;
+            input.value = selectedLabel;
+            closeList();
+            hooks.changed();
+            return true;
+        }
+
+        function clearSelection() {
+            if (hidden.value) {
+                hidden.value = "";
+                selectedLabel = "";
+                hooks.changed();
+            }
+        }
+
+        function move(delta) {
+            if (!open) {
+                openList();
+            }
+            if (!items.length) {
+                return;
+            }
+            setActive(
+                activeIndex < 0
+                    ? delta > 0
+                        ? 0
+                        : items.length - 1
+                    : (activeIndex + delta + items.length) % items.length,
+            );
+        }
+
+        input.addEventListener("input", function typed() {
+            clearSelection();
+            openList();
+        });
+        input.addEventListener("focus", function focused() {
+            if (!open) {
+                openList();
+            }
+        });
+        input.addEventListener("click", function clicked() {
+            if (!open) {
+                openList();
+            }
+        });
+        input.addEventListener("blur", function blurred() {
+            closeList();
+            if (hidden.value) {
+                input.value = selectedLabel;
+            }
+        });
+        input.addEventListener("keydown", function keyed(event) {
+            switch (event.key) {
+                case "ArrowDown":
+                    event.preventDefault();
+                    move(1);
+                    break;
+                case "ArrowUp":
+                    event.preventDefault();
+                    move(-1);
+                    break;
+                case "Enter":
+                    if (!open) {
+                        break;
+                    }
+                    event.preventDefault();
+                    if (activeIndex >= 0 && items[activeIndex]) {
+                        select(items[activeIndex].value);
+                    } else {
+                        const exact = exactModelForText(input.value);
+
+                        if (exact) {
+                            select(exact.model);
+                        }
+                    }
+                    break;
+                case "Escape":
+                    if (open) {
+                        event.preventDefault();
+                        closeList();
+                        if (hidden.value) {
+                            input.value = selectedLabel;
+                        }
+                    } else if (input.value) {
+                        event.preventDefault();
+                        input.value = "";
+                        clearSelection();
+                    }
+                    break;
+                case "Tab":
+                    closeList();
+                    break;
+                default:
+                    break;
+            }
+        });
+        // Keep focus in the input while the pointer or a finger is on an option.
+        listbox.addEventListener("mousedown", function holdFocus(event) {
+            event.preventDefault();
+        });
+        listbox.addEventListener("click", function chosen(event) {
+            const target = event.target && typeof event.target.closest === "function"
+                ? event.target.closest("[role=option]")
+                : null;
+
+            if (target && target.dataset && target.dataset.value) {
+                select(target.dataset.value);
+                input.focus();
+            }
+        });
+
+        input.disabled = false;
+        input.setAttribute("aria-expanded", "false");
+        listbox.hidden = true;
+
+        return Object.freeze({ select, openList, closeList });
+    }
+
     function initSelector(container, fetchImpl) {
         if (container.dataset.selectorReady === "true") {
             return;
@@ -1041,51 +1525,135 @@
 
         const form = container.querySelector("form");
         const purpose = form.querySelector("[name=purpose]");
-        const modelInput = form.querySelector("[data-model-select]");
+        const modelValue = container.querySelector("[data-model-select]");
         const modelCount = container.querySelector("[data-model-count]");
         const modelFact = container.querySelector("[data-model-fact]");
+        const osVersion = container.querySelector("[data-os-version]");
+        const osAuto = container.querySelector("[data-os-auto]");
+        const dsmVersion = container.querySelector("[data-dsm-version]");
+        const archInput = container.querySelector("[data-arch-input]");
+        const archSource = container.querySelector("[data-arch-source]");
+        const archOverride = container.querySelector("[data-arch-override]");
         const status = container.querySelector("[data-selector-status]");
         const documentRef = container.ownerDocument;
         const releasePromise = fetchLatestRelease(fetchImpl).catch(function unavailable() {
             return null;
         });
+        let archMode = "manual";
 
-        if (modelInput) {
-            const fragment = documentRef.createDocumentFragment();
-            const models = listModels();
-
-            for (const model of models) {
-                const option = documentRef.createElement("option");
-                const compatibility = modelCompatibility(model);
-                option.value = model.model;
-                option.textContent = `${model.model} — processor ${model.cpuArch} — Package Arch ${model.packageArch} — ${modelAssetLabel(model, compatibility)} — ${compatibilityLabel(compatibility)}`;
-                fragment.append(option);
-            }
-
-            modelInput.append(fragment);
-            if (modelCount) {
-                modelCount.textContent = `${models.length} exact models loaded`;
-            }
+        if (modelCount) {
+            modelCount.textContent = `${listModels().length} exact models loaded`;
         }
 
         function updateModelFact() {
-            const model = lookupModel(modelInput.value);
+            const model = lookupModel(modelValue.value);
             const compatibility = modelCompatibility(model);
             if (model) {
                 modelFact.textContent = `Official snapshot: processor ${model.cpuArch} · Package Arch ${model.packageArch} · Release ${modelAssetLabel(model, compatibility)} · Product line ${compatibility.productLine} · ${compatibilityLabel(compatibility)}`;
-            } else if (modelInput.value === "__unknown__") {
+            } else if (modelValue.value === UNKNOWN_MODEL) {
                 modelFact.textContent = `This model is outside the ${data.snapshotCapturedDate} physical catalog. No SPK is recommended; use Synology's live CPU table and model-specific archives for manual review.`;
             } else {
-                modelFact.textContent = `Choose one of the ${data.modelCount} exact models in the captured physical catalog.`;
+                modelFact.textContent = `Choose one of the ${data.modelCount} exact models in the captured physical catalog. Typing only filters the list.`;
             }
         }
 
+        function setArchMode(mode, autofill) {
+            archMode = mode;
+            if (!archInput) {
+                return;
+            }
+            archInput.readOnly = mode === "auto";
+            archInput.dataset.autofilled = mode === "auto" ? "true" : "false";
+            if (archOverride) {
+                archOverride.hidden = mode === "manual";
+                archOverride.textContent =
+                    mode === "auto" ? "Override" : "Use the auto-filled value";
+                archOverride.setAttribute("aria-pressed", mode === "override" ? "true" : "false");
+            }
+            if (archSource) {
+                if (mode === "auto" && autofill) {
+                    archSource.textContent = `Auto-filled from ${autofill.source}: ${autofill.model} is Package Arch ${autofill.packageArch}, which maps to the ${autofill.assetArch} SPK (${autofill.assetName}).`;
+                } else if (mode === "override") {
+                    archSource.textContent =
+                        "Manual override. If it does not match the catalog for this model, the selector stops.";
+                } else {
+                    archSource.textContent = "";
+                }
+            }
+        }
+
+        function applyArchitectureAutofill() {
+            const model = lookupModel(modelValue.value);
+            const autofill = model ? autofillArchitecture(model) : null;
+
+            if (autofill && archInput) {
+                archInput.value = autofill.value;
+                setArchMode("auto", autofill);
+            } else {
+                if (archInput && archMode !== "manual") {
+                    archInput.value = "";
+                }
+                setArchMode("manual", null);
+                if (archSource && model) {
+                    archSource.textContent = `Nothing auto-filled: ${model.model} is ${modelAssetLabel(model, modelCompatibility(model))}, so the selector will stop for manual review.`;
+                } else if (archSource && modelValue.value === UNKNOWN_MODEL) {
+                    archSource.textContent =
+                        "Nothing auto-filled: a model outside the catalog needs manual review.";
+                }
+            }
+        }
+
+        function updateAutomaticDsm() {
+            if (!osAuto || !osVersion) {
+                return;
+            }
+            if (!isAutomatic(osVersion.value)) {
+                osAuto.textContent = "";
+
+                return;
+            }
+            const model = lookupModel(modelValue.value);
+
+            if (!model) {
+                osAuto.textContent =
+                    "Automatic: choose a model and the newest DSM it supports is used.";
+
+                return;
+            }
+            const resolved = resolveAutomaticDsm(model, dsmVersion ? dsmVersion.value : "");
+
+            osAuto.textContent = resolved.ok ? resolved.text : `Automatic stops: ${resolved.message}`;
+        }
+
+        function modelChanged() {
+            updateModelFact();
+            applyArchitectureAutofill();
+            updateAutomaticDsm();
+        }
+
+        initModelCombobox(container, documentRef, { changed: modelChanged });
+
+        if (archOverride) {
+            archOverride.addEventListener("click", function overrideClicked() {
+                if (archMode === "auto") {
+                    setArchMode("override", null);
+                    archInput.focus();
+                } else {
+                    applyArchitectureAutofill();
+                }
+            });
+        }
+        if (osVersion) {
+            osVersion.addEventListener("change", updateAutomaticDsm);
+        }
+        if (dsmVersion) {
+            dsmVersion.addEventListener("input", updateAutomaticDsm);
+        }
         purpose.addEventListener("change", function purposeChanged() {
             setPurposeFields(container, purpose.value);
         });
-        modelInput.addEventListener("input", updateModelFact);
         setPurposeFields(container, purpose.value);
-        updateModelFact();
+        modelChanged();
 
         form.addEventListener("submit", async function submitted(event) {
             event.preventDefault();
@@ -1127,6 +1695,8 @@
     return Object.freeze({
         FALLBACK_TAG,
         RELEASE_API_URL,
+        autofillArchitecture,
+        exactModelForText,
         dsmMinorBounds,
         initSelectors,
         listModels,
@@ -1136,6 +1706,8 @@
         normalizeCpuArch,
         parseDsmVersion,
         parseOsVersionSelection,
+        resolveAutomaticDsm,
         resolveSelection,
+        searchModels,
     });
 });

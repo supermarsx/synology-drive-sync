@@ -1,10 +1,24 @@
 <div class="hero">
-  <p class="hero-kicker">One-way File Station synchronization</p>
-  <h1>Move local folders with an explicit safety contract.</h1>
+  <div class="hero-brand">
+    <img class="hero-logo" src="theme/logo.svg" alt="" width="44" height="44">
+    <p class="hero-kicker">synology-drive-sync</p>
+  </div>
+  <h1>Push files to your Synology NAS</h1>
+  <p class="hero-tagline">A fast, one-way file deposit for machines that can't run Synology Drive Client.</p>
   <p class="hero-summary">
-    <code>synology-drive-sync</code> plans and pushes a local directory into a chosen Synology
-    File Station path through one reverse-proxy URL. These docs cover installation, every
-    configuration layer, unattended operation, library integration, and release verification.
+    <code>synology-drive-sync</code> pushes files from any machine to a Synology NAS over DSM's
+    File Station API, using a normal DSM account (QuickConnect addresses work too). It is built for
+    servers, containers, CI runners and other systems where Synology Drive Client is unsupported or
+    not permitted. Use it from scripts and pipelines through the CLI, the Rust SDK or the C ABI, or
+    install the included DSM package for a dashboard. It deposits files one way and does not replace
+    Drive's two-way sync. This is an independent project, not affiliated with or endorsed by Synology.
+  </p>
+  <p class="hero-links">
+    <a class="hero-link hero-link-primary" href="getting-started/quick-start.html">Quick start</a>
+    <a class="hero-link" href="installation.html">Install</a>
+    <a class="hero-link" href="synology-package.html">DSM package</a>
+    <a class="hero-link" href="reference/cli.html">CLI reference</a>
+    <a class="hero-link" href="operations/troubleshooting.html">Troubleshooting</a>
   </p>
 </div>
 
