@@ -279,7 +279,9 @@ pub enum Error {
     /// a drained one (see [`crate::entropy`]). It clears when the system gathers entropy, so the
     /// next run asks again.
     #[error(
-        "entropy_unavailable: the system random number generator did not answer within          {waited_secs} s ({cause}); this system's kernel has no getrandom(2), so TLS cannot start          until its entropy pool fills; nothing was synced, and the next run asks again"
+        "entropy_unavailable: the system random number generator did not answer within \
+        {waited_secs} s ({cause}); this system's kernel has no getrandom(2), so TLS cannot start \
+        until its entropy pool fills; nothing was synced, and the next run asks again"
     )]
     EntropyUnavailable { waited_secs: u64, cause: String },
 

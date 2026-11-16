@@ -2385,7 +2385,8 @@ impl Control {
             "routines",
             Level::Info,
             format!(
-                "Realtime change skipped: {dirs} changed folder(s) are as the last sync left them                  ({count} skipped since the last note)"
+                "Realtime change skipped: {dirs} changed folder(s) are as the last sync left them \
+                ({count} skipped since the last note)"
             ),
         );
     }
@@ -3878,7 +3879,8 @@ impl Control {
                         "scheduler",
                         "routine_events_ignored",
                         format!(
-                            "profile={routine} reason=delete_only_no_delete ignored_total={total}                              first_dir={}",
+                            "profile={routine} reason=delete_only_no_delete ignored_total={total} \
+                            first_dir={}",
                             sanitize_detail(&dir, 120)
                         ),
                     );

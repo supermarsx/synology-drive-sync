@@ -319,7 +319,9 @@ impl Scope {
                     relative: relative.clone(),
                     reason: SkipReason::TypeConflict {
                         detail: format!(
-                            "the source holds a {} and the NAS a {} here, inside a folder this                              run reads shallow ({}); the folder's contents were not read, so                              neither is replaced, and a whole-tree run settles it",
+                            "the source holds a {} and the NAS a {} here, inside a folder this run \
+                            reads shallow ({}); the folder's contents were not read, so neither is \
+                            replaced, and a whole-tree run settles it",
                             local_kind.as_str(),
                             remote_kind.as_str(),
                             self.describe()
@@ -1180,7 +1182,8 @@ pub fn build_plan(
                 // whole. `Scope::confine` keeps a shallow folder out of here; this is the backstop.
                 if !options.scope.contains(&remote_entry.relative, true) {
                     return Err(Error::Message(format!(
-                        "scope_unconfined: {:?} is a folder on the NAS this run did not list                          whole ({}); nothing was planned",
+                        "scope_unconfined: {:?} is a folder on the NAS this run did not list whole \
+                        ({}); nothing was planned",
                         remote_entry.relative,
                         options.scope.describe()
                     )));
@@ -2255,7 +2258,8 @@ fn require_confined(scope: &Scope, local: &LocalInventory, remote: &RemoteInvent
         .find(|(relative, kind)| !scope.admits(relative, *kind));
     match unconfined {
         Some((relative, kind)) => Err(Error::Message(format!(
-            "scope_unconfined: {relative:?} ({}) reached the planner outside the scope {};              nothing was planned",
+            "scope_unconfined: {relative:?} ({}) reached the planner outside the scope {}; nothing \
+            was planned",
             kind.as_str(),
             scope.describe()
         ))),

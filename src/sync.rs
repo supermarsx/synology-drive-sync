@@ -3734,7 +3734,8 @@ pub fn withhold_scope_spelling_conflicts(
                         &relative,
                         crate::local::SkipReason::Deferred {
                             detail: format!(
-                                "{}: the NAS listing of {:?} was incomplete, so a differently                                  spelled {name:?} there cannot be ruled out; nothing was created",
+                                "{}: the NAS listing of {:?} was incomplete, so a differently \
+                                spelled {name:?} there cannot be ruled out; nothing was created",
                                 DeferReason::ListingIncomplete,
                                 if parent.is_empty() {
                                     "."

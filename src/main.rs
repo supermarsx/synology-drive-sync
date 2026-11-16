@@ -11090,7 +11090,8 @@ fn resolved_single_scope(settings: &config::ResolvedSync, command: &str) -> Resu
     let scope = resolved_scope(settings)?;
     if scope.single().is_none() {
         return Err(Error::Configuration(format!(
-            "{command} takes one --scope path, not a set ({}); --scope-shallow and a repeated              --scope are for sync and plan",
+            "{command} takes one --scope path, not a set ({}); --scope-shallow and a repeated \
+            --scope are for sync and plan",
             scope.describe()
         )));
     }
